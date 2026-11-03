@@ -224,15 +224,14 @@ fn subject(
 ) -> String {
     // A value the validating walk itself withheld is a withheld value and not an absent
     // one: the walk drops a `@sensitive` member's value as it records the violation, so
-    // an EMPTY value half is not evidence that the member was absent.
-    if violation.sensitive {
+    // an EMPTY value half is not evidence that the member was absent. A value that DID
+    // reach this clause is held to the model's own reading of the member, which is what
+    // answers a member the walk did not mark.
+    if violation.sensitive || (violation.value.is_some() && is_sensitive(input, path)) {
         return "Value".to_string();
     }
     if violation.value.is_none() {
         return "Value null".to_string();
-    }
-    if is_sensitive(input, path) {
-        return "Value".to_string();
     }
     if let Some(rendered) = lists.get(path) {
         return format!("Value '{rendered}'");

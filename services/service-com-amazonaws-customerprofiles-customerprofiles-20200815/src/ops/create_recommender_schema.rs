@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRecommenderSchema
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRecommenderSchema`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Defines a recommender schema under its domain: it persists the dataset-type ->
+//! column-definitions map the request carries, mints the schema's ARN, and answers from
+//! the record it stored, so a later `GetRecommenderSchema` reports the same schema.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRecommenderSchema::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A schema names the set of data columns available for training, so every dataset type it
+//! carries columns for has to be one the service defines (`_webAnalytics`, `_catalogItem`)
+//! AND one the DOMAIN holds a data table for — the object type the domain ingests that
+//! data through. A dataset type with no data table has no columns for a schema to select,
+//! and the create is refused `BadRequestException` (400) with nothing persisted; so is a
+//! column list outside the length `RecommenderSchemaFieldList` declares, a column defined
+//! twice, a feature type on a column holding numbers, and a tag key outside the bounds
+//! `TagKey` declares — the three rules no boundary walk reaches, because a list that is a
+//! map VALUE and a map's KEY are both walked against their enclosing member's schema.
+//!
+//! `RecommenderSchemaName` is the schema's identity within the domain (it is the
+//! operation's `@httpLabel`, and the doc says "The name must be unique within the
+//! domain"), so this is a CREATE and not a replace: the name is looked up and inserted
+//! under ONE hold of the store lock, so of any number of concurrent creates of one name
+//! exactly one is admitted and every other is refused `BadRequestException` (400) without
+//! touching what the winner stored.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +175,230 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRecommenderSchema` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRecommenderSchemaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRecommenderSchema"))
+        // Every dataset type the schema carries columns for must be one the service
+        // supports; the map's own size is already bounded by the model.
+        if let Some(unsupported) = unsupported_dataset_type(&input.fields) {
+            return Err(bad_request(unsupported_dataset_type_message(&unsupported)));
+        }
+        // The columns of one dataset type: each one defined once, and a feature type only
+        // on a column whose values are text.
+        if let Some(message) = column_violation(&input.fields) {
+            return Err(bad_request(message));
+        }
+        // A tag key is the one half of a tag map the boundary's constraint walk does not
+        // validate, so the model's own bounds on it are applied here.
+        if let Some(message) = crate::state::first_tag_key_violation("Tags", input.tags.as_ref()) {
+            return Err(bad_request(message));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let domain = store
+            .domains
+            .get_mut(&input.domain_name)
+            .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+
+        // A schema selects COLUMNS OF a data table, so every dataset type it names has to
+        // be one the domain holds a data table for: that table is the object type the
+        // domain ingests that data through, and a domain holding none for the dataset type
+        // has no columns for the schema to select.
+        let mut dataset_types: Vec<&String> = input.fields.keys().collect();
+        dataset_types.sort();
+        if let Some(absent) = dataset_types
+            .into_iter()
+            .find(|dataset_type| !domain.holds_data_table(dataset_type))
+        {
+            return Err(bad_request(crate::state::data_table_not_found(absent)));
+        }
+
+        // The name identifies the schema within the domain, so a name the domain already
+        // holds is a conflict and never an overwrite. The lookup and the insert below
+        // happen under this one hold of the store lock, which is what makes the
+        // check-and-insert atomic: a concurrent create of the same name either finds
+        // nothing and wins, or finds the winner's record and is refused here.
+        if domain
+            .recommender_schemas
+            .contains_key(&input.recommender_schema_name)
+        {
+            return Err(bad_request(recommender_schema_exists(
+                &input.recommender_schema_name,
+            )));
+        }
+        if domain.recommender_schemas.len() >= crate::state::MAX_RECOMMENDER_SCHEMAS_PER_DOMAIN {
+            return Err(bad_request(format!(
+                "The maximum number of recommender schemas for domain {} has been reached: {}",
+                input.domain_name,
+                crate::state::MAX_RECOMMENDER_SCHEMAS_PER_DOMAIN
+            )));
+        }
+
+        let stored = crate::state::StoredRecommenderSchema {
+            arn: crate::state::recommender_schema_arn(
+                &region,
+                &input.domain_name,
+                &input.recommender_schema_name,
+            ),
+            name: input.recommender_schema_name,
+            fields: input.fields,
+            tags: input.tags,
+            created_at: now,
+        };
+
+        // The response is the record that was just stored, so it is the same schema the
+        // readers serve.
+        let output = CreateRecommenderSchemaOutput {
+            recommender_schema_arn: stored.arn.clone(),
+            recommender_schema_name: stored.name.clone(),
+            fields: stored.fields.clone(),
+            created_at: crate::state::to_date_time(stored.created_at),
+            status: stored.status(),
+            tags: stored.tags.clone(),
+        };
+
+        domain
+            .recommender_schemas
+            .insert(stored.name.clone(), stored);
+        Ok(output)
     }
+}
+
+/// The dataset type in `Fields` the service does not support, if the request carries one.
+/// The keys are examined in sorted order, so a request carrying several unsupported ones
+/// is always refused for the same one.
+fn unsupported_dataset_type(
+    fields: &::std::collections::HashMap<String, Vec<RecommenderSchemaField>>,
+) -> Option<String> {
+    let mut unsupported: Vec<&String> = fields
+        .keys()
+        .filter(|dataset_type| {
+            !crate::state::SUPPORTED_RECOMMENDER_DATASET_TYPES
+                .contains(&dataset_type.as_str())
+        })
+        .collect();
+    unsupported.sort();
+    unsupported.first().map(|dataset_type| dataset_type.to_string())
+}
+
+/// The `BadRequestException` message for a `Fields` key naming a dataset type the service
+/// does not define: the rejected key, and the dataset types the member documents as
+/// supported, so the caller can fix the request from the text alone.
+fn unsupported_dataset_type_message(dataset_type: &str) -> String {
+    format!(
+        "Fields contains an unsupported dataset type {dataset_type}. The supported dataset types are {}",
+        crate::state::SUPPORTED_RECOMMENDER_DATASET_TYPES.join(", ")
+    )
+}
+
+/// Why the COLUMNS one of `fields`' dataset types carries are not a schema this service
+/// defines, or `None` when every column of every dataset type is one it does.
+///
+/// Three rules, applied to every dataset type the request carries (walked in sorted order,
+/// so one request earns one sentence however the map happened to iterate):
+///
+/// * the number of columns is the one `RecommenderSchemaFieldList` declares (1..9). That
+///   bound is the MODEL's, and it is applied here because the boundary's constraint walk
+///   cannot reach it: the list is a map VALUE, and a collection that is itself a
+///   collection element is walked against its enclosing member's schema, so its own
+///   `@length` goes unenforced there (`vendor/smithy-schema-server`'s list walk says so);
+/// * a column is defined ONCE per dataset type — `TargetFieldName` names the column, so a
+///   dataset type listing one twice says two things about it;
+/// * `FeatureType` says "how the column is treated for model training" and its values
+///   (`CATEGORICAL`, `TEXTUAL`) are both treatments of TEXT, so it belongs to a column
+///   whose `ContentType` is `STRING` (the member's documented default) and not to one
+///   holding numbers.
+fn column_violation(
+    fields: &::std::collections::HashMap<String, Vec<RecommenderSchemaField>>,
+) -> Option<String> {
+    let mut dataset_types: Vec<&String> = fields.keys().collect();
+    dataset_types.sort();
+    for dataset_type in dataset_types {
+        let columns = fields.get(dataset_type)?;
+        if let Some(message) = column_count_violation(dataset_type, columns.len()) {
+            return Some(message);
+        }
+        let mut defined: Vec<&str> = Vec::with_capacity(columns.len());
+        for column in columns {
+            if defined.contains(&column.target_field_name.as_str()) {
+                return Some(format!(
+                    "Fields[{dataset_type}] defines the column {} more than once",
+                    column.target_field_name
+                ));
+            }
+            defined.push(&column.target_field_name);
+            if let (Some(feature_type), Some(content_type)) =
+                (column.feature_type.as_deref(), column.content_type.as_deref())
+            {
+                if content_type == crate::state::CONTENT_TYPE_NUMBER {
+                    return Some(format!(
+                        "Fields[{dataset_type}] column {} has FeatureType {feature_type}, \
+                         which applies only to a column whose ContentType is {}",
+                        column.target_field_name,
+                        crate::state::CONTENT_TYPE_STRING
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Why `columns` is not a column count `RecommenderSchemaFieldList` admits for
+/// `dataset_type`, or `None` when it is one.
+///
+/// The sentence is NOT written here: it is built from the framework's own violation, at the
+/// path and in the `<n> items` rendering its own collection check would have used, and
+/// rendered by its one envelope — so this refusal reads exactly like the one the boundary
+/// states for a list it does reach.
+fn column_count_violation(dataset_type: &str, columns: usize) -> Option<String> {
+    use ::aws_smithy_schema_server::constraints::{envelope, path, Violation, ViolationKind};
+
+    let kind = if columns < crate::state::MIN_RECOMMENDER_SCHEMA_COLUMNS {
+        ViolationKind::MinLength(crate::state::MIN_RECOMMENDER_SCHEMA_COLUMNS as i64)
+    } else if columns > crate::state::MAX_RECOMMENDER_SCHEMA_COLUMNS {
+        ViolationKind::MaxLength(crate::state::MAX_RECOMMENDER_SCHEMA_COLUMNS as i64)
+    } else {
+        return None;
+    };
+    let violation = Violation {
+        path: path::join(&[path::member("Fields"), path::entry(dataset_type)]),
+        kind,
+        value: Some(format!("{columns} items")),
+        sensitive: false,
+    };
+    envelope(std::slice::from_ref(&violation))
+}
+
+/// The `BadRequestException` message for a recommender schema name the domain already
+/// holds: the service's fixed sentence for an already-existing schema, with the name the
+/// request's `{RecommenderSchemaName}` label carried as its only variable part.
+fn recommender_schema_exists(recommender_schema_name: &str) -> String {
+    format!("Recommender schema with name {recommender_schema_name} already exists")
+}
+
+/// The request is invalid — HTTP 400, the error code a client branches on to learn that
+/// the schema it asked for cannot be defined as asked.
+fn bad_request(message: String) -> CreateRecommenderSchemaError {
+    CreateRecommenderSchemaErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A domain the request names is not stored.
+fn not_found(message: String) -> CreateRecommenderSchemaError {
+    CreateRecommenderSchemaErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> CreateRecommenderSchemaError {
+    CreateRecommenderSchemaErrorModeled::InternalServerException(
+        crate::state::store_unavailable(),
+    )
+    .into()
 }

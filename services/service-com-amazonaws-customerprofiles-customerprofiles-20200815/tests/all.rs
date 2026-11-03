@@ -25,6 +25,8 @@ mod merge_profiles;
 mod profile_object_type_identity;
 #[path = "all/profile_object_types.rs"]
 mod profile_object_types;
+#[path = "all/recommender_schemas.rs"]
+mod recommender_schemas;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/upload_jobs.rs"]

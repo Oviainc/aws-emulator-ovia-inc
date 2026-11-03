@@ -249,14 +249,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the code is the modelled `ValidationException` (HTTP 400) the framework would
         // also have named: only the words change.
         match refusal {
-            Refusal::Invalid(violations) => Some(Refused {
-                code: VALIDATION_EXCEPTION.to_string(),
-                message: violations
-                    .iter()
-                    .find_map(refused_arn)
-                    .or_else(|| violations.iter().find_map(refused_policy_entry_quota))
-                    .or_else(|| validation::envelope(violations))?,
-            }),
+            Refusal::Invalid(violations) => worded_refusal(violations),
             // `Refusal` is `#[non_exhaustive]`: a refusal this service has no wording of
             // its own for keeps the framework's — an authentication refusal, say, which is
             // not an input-constraint failure at all.
@@ -379,6 +372,24 @@ impl<Op, Eng> Gated<Op, Eng> {
             engine,
         }
     }
+}
+
+/// The refusal this service words for `violations`: its own ARN sentence first, then the
+/// guardrail entry quota, then the one formatter in [`validation`] for every other
+/// input-constraint failure.
+///
+/// Reached from `override_refusal` AND from [`Gated`], which answers the same refusal one
+/// layer earlier for the request whose value the validating walk withheld — so both states
+/// one refusal in one voice.
+fn worded_refusal(violations: &[Violation]) -> Option<Refused> {
+    Some(Refused {
+        code: VALIDATION_EXCEPTION.to_string(),
+        message: violations
+            .iter()
+            .find_map(refused_arn)
+            .or_else(|| violations.iter().find_map(refused_policy_entry_quota))
+            .or_else(|| validation::envelope(violations))?,
+    })
 }
 
 impl<Op: Operation, Eng: Send + Sync + 'static> ErasedOperation for Gated<Op, Eng> {

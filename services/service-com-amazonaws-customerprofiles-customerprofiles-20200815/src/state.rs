@@ -18,8 +18,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AttributeDetails, Conditions, CreateCalculatedAttributeDefinitionInput, DataStoreResponse,
-    Filter, MatchingResponse, ObjectTypeField, ObjectTypeKey, Profile, Readiness, ResultsSummary,
-    RuleBasedMatchingResponse,
+    Filter, MatchingResponse, ObjectTypeField, ObjectTypeKey, Profile, Readiness,
+    RecommenderSchemaField, ResultsSummary, RuleBasedMatchingResponse,
 };
 
 /// How long after `CreateDomain` the asynchronous work a new domain kicks off is treated
@@ -94,6 +94,53 @@ pub const MAX_CALCULATED_ATTRIBUTES_PER_DOMAIN: usize = 1_000;
 /// non-zero: a caller that reads the definition back immediately must still observe the
 /// transient status the create call reported.
 pub const HISTORICAL_DATA_INDEXING_SPAN: Duration = Duration::from_secs(3);
+
+/// Emulator resource guard, NOT an AWS quota: the most recommender schemas this emulator
+/// stores for one domain. Set well above any realistic emulator workload, and checked
+/// before the insert so repeated `CreateRecommenderSchema` calls cannot grow the store
+/// without bound.
+pub const MAX_RECOMMENDER_SCHEMAS_PER_DOMAIN: usize = 1_000;
+
+/// The `RecommenderSchemaStatus` a stored recommender schema reports. The status has two
+/// modelled values, `ACTIVE` and `DELETING`, and a schema is usable for training as soon
+/// as it is defined, so a stored one is active and nothing but its removal moves it.
+pub const RECOMMENDER_SCHEMA_ACTIVE: &str = "ACTIVE";
+
+/// The dataset types a recommender schema may carry columns for, as
+/// `CreateRecommenderSchemaRequest$Fields` states them: "The `_webAnalytics` and
+/// `_catalogItem` keys are supported." Sorted, so a refusal lists them in one order.
+pub const SUPPORTED_RECOMMENDER_DATASET_TYPES: [&str; 2] = ["_catalogItem", "_webAnalytics"];
+
+/// The `ContentType` of a column holding text — the value
+/// `RecommenderSchemaField$ContentType` documents as its default.
+pub const CONTENT_TYPE_STRING: &str = "STRING";
+
+/// The `ContentType` of a column holding numbers.
+pub const CONTENT_TYPE_NUMBER: &str = "NUMBER";
+
+/// The `BadRequestException` message for a dataset type the domain holds no data table
+/// for, worded as this service words a resource of a kind it cannot find: the kind, the
+/// name the request carried, and "not found" (the same form `ObjectType {name} not found`
+/// takes).
+pub fn data_table_not_found(dataset_type: &str) -> String {
+    format!("DataTable {dataset_type} not found")
+}
+
+/// The fewest columns one dataset type of a recommender schema may list: the `@length`
+/// minimum of `RecommenderSchemaFieldList`.
+pub const MIN_RECOMMENDER_SCHEMA_COLUMNS: usize = 1;
+
+/// The most columns one dataset type of a recommender schema may list: the `@length`
+/// maximum of `RecommenderSchemaFieldList`.
+pub const MAX_RECOMMENDER_SCHEMA_COLUMNS: usize = 9;
+
+/// This service's ARN namespace — the `profile` every `Arn` on its wire carries
+/// (`^arn:([a-z\d-]+):profile:.*:.*:.+$`), which is also its SigV4 signing name.
+pub const ARN_SERVICE: &str = "profile";
+
+/// The region an ARN is built in when the request carries no SigV4 credential scope to
+/// read one from: the emulator's documented default region.
+pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// `ReadinessStatus` while the historical data a calculated attribute asked for is still
 /// being indexed — the first of the modelled statuses.
@@ -189,6 +236,11 @@ pub struct Domain {
     /// calculated-attribute operation), so the (domain, name) pair identifies exactly
     /// one definition. A `BTreeMap`, so a listing walks them in one stable order.
     pub calculated_attributes: BTreeMap<String, StoredCalculatedAttribute>,
+    /// The domain's recommender schemas, keyed by `RecommenderSchemaName` — the name is
+    /// the schema's identity within the domain (`@httpLabel` on every recommender-schema
+    /// operation), so the (domain, name) pair identifies exactly one schema. A
+    /// `BTreeMap`, so a listing walks them in one stable order.
+    pub recommender_schemas: BTreeMap<String, StoredRecommenderSchema>,
     /// `KeyName` -> `Value` -> the ids of the profiles indexed under that pair. This is
     /// what `SearchProfiles` reads; [`Domain::put_profile`] fills it and
     /// [`Domain::remove_profile`] empties it. Nested rather than keyed by a
@@ -418,6 +470,36 @@ impl StoredCalculatedAttribute {
     }
 }
 
+/// One stored recommender schema: "the set of data columns available for training
+/// recommenders and filters under a domain" (`CreateRecommenderSchema`), as the create
+/// persisted it, plus the ARN it was minted with and the instant it was created.
+///
+/// `Status` is NOT stored: a defined schema is usable, so it reports
+/// [`RECOMMENDER_SCHEMA_ACTIVE`] for as long as the record exists.
+#[derive(Debug, Clone)]
+pub struct StoredRecommenderSchema {
+    /// `RecommenderSchemaName`, as stored (also this record's key in
+    /// [`Domain::recommender_schemas`]).
+    pub name: String,
+    /// `RecommenderSchemaArn`: minted once, when the schema was created, so a later read
+    /// reports the ARN the schema was created with.
+    pub arn: String,
+    /// `Fields`, as stored: the dataset type -> column definitions map the request
+    /// carried.
+    pub fields: HashMap<String, Vec<RecommenderSchemaField>>,
+    /// `Tags`, as stored.
+    pub tags: Option<HashMap<String, String>>,
+    /// `CreatedAt`: generated once, when the schema was created, and never recomputed.
+    pub created_at: SystemTime,
+}
+
+impl StoredRecommenderSchema {
+    /// `Status` as the wire reports it: a stored schema is active.
+    pub fn status(&self) -> String {
+        RECOMMENDER_SCHEMA_ACTIVE.to_string()
+    }
+}
+
 /// One stored profile: the modelled shape plus the timestamps the service keeps for it.
 #[derive(Debug, Clone)]
 pub struct StoredProfile {
@@ -453,8 +535,18 @@ impl Domain {
             object_types: BTreeMap::new(),
             upload_jobs: BTreeMap::new(),
             calculated_attributes: BTreeMap::new(),
+            recommender_schemas: BTreeMap::new(),
             key_index: HashMap::new(),
         }
+    }
+
+    /// Whether this domain holds a data table for `dataset_type`.
+    ///
+    /// A dataset type's data table is the domain's OBJECT TYPE of that name — the
+    /// definition the domain ingests that data through — so a domain that defines none for
+    /// a dataset type holds no columns a recommender schema could select from it.
+    pub fn holds_data_table(&self, dataset_type: &str) -> bool {
+        self.object_types.contains_key(dataset_type)
     }
 
     /// Whether the work [`ASYNC_WORK_SPAN`] covers is due as of `now`.
@@ -675,6 +767,85 @@ pub fn to_date_time(instant: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
 }
 
+/// The longest a tag key may be: the `@length` maximum of `TagMap`'s key shape `TagKey`.
+pub const MAX_TAG_KEY_LENGTH: usize = 128;
+
+/// The expression `TagKey` declares, as the model spells it. Its leading negative
+/// lookahead is what reserves the `aws:` prefix.
+pub const TAG_KEY_PATTERN: &str = r"^(?!aws:)[a-zA-Z+-=._:/]+$";
+
+/// The prefix the `TagKey` pattern's lookahead excludes: AWS keeps it for its own tags.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Why `key` is not a tag key `TagMap` admits at `member`, or `None` when it is one.
+///
+/// The constraints are the model's own, on the map's KEY shape: `@length(min 1, max 128)`
+/// and [`TAG_KEY_PATTERN`]. They are enforced here because a map's key is not a leaf the
+/// boundary's constraint walk validates — it captures the key as the path segment of that
+/// entry's VALUE, so a key reaches a handler unchecked — and this is the one place a tag
+/// key is held to them, shared by every operation that takes a tag map.
+///
+/// The sentence is NOT written here: it is built from the framework's own violation and
+/// rendered by its one envelope, so a key refused by a handler reads exactly like a value
+/// the boundary refused for the same constraint class.
+pub fn tag_key_violation(member: &str, key: &str) -> Option<String> {
+    let length = key.chars().count();
+    let kind = if length < 1 {
+        ::aws_smithy_schema_server::constraints::ViolationKind::MinLength(1)
+    } else if length > MAX_TAG_KEY_LENGTH {
+        ::aws_smithy_schema_server::constraints::ViolationKind::MaxLength(
+            MAX_TAG_KEY_LENGTH as i64,
+        )
+    } else if !admits_tag_key(key) {
+        ::aws_smithy_schema_server::constraints::ViolationKind::Pattern(
+            TAG_KEY_PATTERN.to_string(),
+        )
+    } else {
+        return None;
+    };
+    let violation = ::aws_smithy_schema_server::constraints::Violation {
+        path: ::aws_smithy_schema_server::constraints::path::member(member),
+        kind,
+        // Already held to the key's own modelled maximum, because `Violation::message`
+        // interpolates the value verbatim and a key arrives as long as the caller chose.
+        value: Some(echoed_tag_key(key)),
+        sensitive: false,
+    };
+    ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
+}
+
+/// The first tag key of `tags` that [`tag_key_violation`] refuses, in ascending key order
+/// so one request earns one sentence however the map happened to iterate.
+pub fn first_tag_key_violation(
+    member: &str,
+    tags: Option<&HashMap<String, String>>,
+) -> Option<String> {
+    let mut keys: Vec<&String> = tags?.keys().collect();
+    keys.sort();
+    keys.into_iter()
+        .find_map(|key| tag_key_violation(member, key))
+}
+
+/// Whether every character of `key` is one [`TAG_KEY_PATTERN`] admits, and the key does
+/// not carry the reserved prefix.
+///
+/// The character set is the pattern's own: ASCII letters, the `+`-to-`=` range it spells
+/// (which covers the digits and `, - . /` and `: ; < =`), and `.`, `_`, `:`, `/`.
+fn admits_tag_key(key: &str) -> bool {
+    !key.starts_with(RESERVED_TAG_KEY_PREFIX)
+        && key.chars().all(|character| {
+            character.is_ascii_alphabetic()
+                || ('+'..='=').contains(&character)
+                || matches!(character, '.' | '_' | ':' | '/')
+        })
+}
+
+/// `key` as a refusal quotes it: at most the key's own modelled maximum of characters, so
+/// a message cannot be sized by the request.
+fn echoed_tag_key(key: &str) -> String {
+    key.chars().take(MAX_TAG_KEY_LENGTH).collect()
+}
+
 /// The server fault every handler answers with when the store cannot be reached. One
 /// wording, so a caller sees the same failure whichever operation it called.
 pub fn store_unavailable() -> crate::ops::types::InternalServerException {
@@ -696,6 +867,39 @@ pub fn object_type_not_found(object_type_name: &str) -> String {
 /// request carried.
 pub fn domain_not_found(domain_name: &str) -> String {
     format!("The domain {domain_name} does not exist")
+}
+
+/// The `ResourceNotFoundException` message for a recommender schema a domain does not
+/// hold, worded like every other per-domain resource this service reports absent: the
+/// resource kind, the name the request carried, and the domain it was looked for in.
+pub fn recommender_schema_not_found(domain_name: &str, recommender_schema_name: &str) -> String {
+    format!(
+        "The recommender schema {recommender_schema_name} does not exist in domain {domain_name}"
+    )
+}
+
+/// One recommender schema's `RecommenderSchemaArn`: this service's ARN namespace, the
+/// region the schema was created in, and the domain-scoped resource path the schema is
+/// addressed by — the same path its operations are bound to.
+pub fn recommender_schema_arn(
+    region: &str,
+    domain_name: &str,
+    recommender_schema_name: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("domains/{domain_name}/recommender-schemas/{recommender_schema_name}"),
+    )
+}
+
+/// The region to build a new resource's ARN in: the one the caller signed for, else
+/// [`DEFAULT_REGION`]. An ARN is minted once and stored, so a later read from another
+/// region still reports the ARN the resource was created with.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

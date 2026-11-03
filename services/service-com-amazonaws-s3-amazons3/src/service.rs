@@ -586,6 +586,25 @@ const SESSION_SUBRESOURCE: &str = "session";
 /// which is the operation bound to that method and path with no subresource.
 const LISTING_WITHOUT_SUBRESOURCE: &str = "ListObjects";
 
+/// The refusal S3 publishes for a body member whose value the validating walk WITHHELD.
+///
+/// The walk drops the value of a member the model marks `@sensitive`
+/// (`SSEKMSEncryption$KMSKeyArn` is one), and S3's published refusal for that member names
+/// WHY the submitted ARN is not one — a reason read off the value itself
+/// ([`crate::state::malformed_arn_reason`]). So the value half is restored from the door's
+/// own echo of the request and the clause is then worded by [`s3_refusal`], the one place
+/// S3's refusal rules live: a value this service publishes a refusal for keeps that
+/// refusal, and everything else keeps exactly the wording the walk behind the door would
+/// have given it.
+fn submitted_value_wording(
+    refused: &[(Violation, ::service_common::validation::SubmittedEcho)],
+) -> Option<Refused> {
+    let (violation, echo) = refused.first()?;
+    let restored =
+        ::service_common::validation_message::quoting_the_whole_submitted_value(violation.clone(), echo);
+    Some(s3_refusal(&restored))
+}
+
 /// The `com-amazonaws-s3-amazons3` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -604,6 +623,14 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// changes about the generated one: the output document of the operations the model
     /// marks `s3UnwrappedXmlOutput` carries no envelope.
     protocol: UnwrappedXmlRestXml,
+    /// `UpdateObjectEncryption`, served behind this service's front door so the refusal of
+    /// a KMS key ARN that is not one still names WHY ([`published_refusal`]): that reason is
+    /// read off the submitted ARN, and the validating walk withholds the value of that
+    /// member because the model marks it `@sensitive`, so the clause cannot be worded from
+    /// the violation alone. The door re-reads the request it is handed and restores that
+    /// value from its own echo; built from the SAME shared engine, so the wrapped operation
+    /// reads and writes the one store.
+    kms_arn_door: smithy_server_runtime::OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -618,11 +645,29 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         let buckets = Arc::clone(&engine);
         let holds_bucket: wire::BucketLookup =
             Arc::new(move |name: &str| holds_bucket_in(&*buckets, name));
+        let mut kms_arn_door = ::service_common::front_door::FrontDoorTable::worded(
+            submitted_value_wording,
+        );
+        kms_arn_door.serve(
+            crate::ops::update_object_encryption::UpdateObjectEncryption::new(Arc::clone(&engine)),
+        );
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             engine,
             protocol: UnwrappedXmlRestXml::new().with_buckets(holds_bucket),
+            kms_arn_door: kms_arn_door.finish(),
         }
+    }
+
+    /// The front-door entry for `req`, when the operation its address names is the one
+    /// served behind the door ([`Self::kms_arn_door`]), else `None` so the generated
+    /// routing table resolves the request exactly as it always did.
+    ///
+    /// The key is the one the ENTRY's protocol resolves — the same key the generated table
+    /// is read by — so this names no route of its own.
+    fn front_door_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.kms_arn_door.get(key)
     }
 
     /// Whether `name` is a bucket this emulator holds — the question an ADDRESS resolves
@@ -907,9 +952,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // `{Bucket}` label from that same normalized path (see
         // [`wire::UnwrappedXmlRestXml::deserialize_input`]).
         //
-        // `None` for every path-style request, which leaves the generated routing table to
-        // resolve it exactly as before.
-        let bucket = self.host_addressed_bucket(req, wire::request_path(req.uri()))?;
+        // For a PATH-STYLE request the generated routing table resolves it exactly as
+        // before, except for the one operation served behind the front door below.
+        let Some(bucket) = self.host_addressed_bucket(req, wire::request_path(req.uri())) else {
+            return self.front_door_operation(req);
+        };
         let rewritten = with_path_style_address(req, bucket)?;
         // The ENTRY's protocol, which is the one carrying this service's model-derived
         // routes (this file's own `self.protocol` serializes and deserializes; it was built
@@ -920,7 +967,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             .routing_key(&rewritten)
             .ok()?
             .to_string();
-        self.entry.routing_table().get(&operation)
+        self.front_door_operation(&rewritten)
+            .or_else(|| self.entry.routing_table().get(&operation))
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
