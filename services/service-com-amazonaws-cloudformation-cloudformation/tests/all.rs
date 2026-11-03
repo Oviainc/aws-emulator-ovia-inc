@@ -23,6 +23,8 @@ mod bucket_analytics_configurations;
 mod bucket_intelligent_tiering_configurations;
 #[path = "all/bucket_inventory_configurations.rs"]
 mod bucket_inventory_configurations;
+#[path = "all/bucket_lifecycle_tag_filters.rs"]
+mod bucket_lifecycle_tag_filters;
 #[path = "all/bucket_metrics_and_lifecycle_configurations.rs"]
 mod bucket_metrics_and_lifecycle_configurations;
 #[path = "all/bucket_notification_configuration.rs"]

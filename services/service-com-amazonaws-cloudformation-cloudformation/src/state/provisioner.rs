@@ -5436,6 +5436,16 @@ fn lifecycle_not_sendable(named: &str, error: &dyn ::std::fmt::Display) -> Refus
 /// scope naming ONE predicate is that predicate's own member, a scope naming several is the
 /// conjunction of them, and a scope naming none is the EMPTY filter, which is the rule that
 /// applies to every object in the bucket.
+///
+/// A scope narrowing by a TAG is the one exception, and it is a property of this translation
+/// rather than of the API: a declared `TagFilters` list travels as the `And` conjunction
+/// WHATEVER its length, and that conjunction states a `Prefix` — the declared one, or the
+/// EMPTY prefix for a rule that declares none — so one declared tag reads back as
+/// `And{Prefix, Tags:[the tag]}` rather than as the single `Tag` member. `Filter.Tag` is what
+/// a configuration written straight through `PutBucketLifecycleConfiguration` carries for the
+/// same single tag; the two forms narrow by the same objects, and a client walking rules a
+/// stack declared branches on the conjunction. Recorded behaviour: the flat-to-nested
+/// translation is not part of the API model.
 fn lifecycle_rule_filter(
     declared: &Value,
     named: &str,
@@ -5446,18 +5456,22 @@ fn lifecycle_rule_filter(
     let greater_than = declared_object_size(declared, "ObjectSizeGreaterThan");
     let less_than = declared_object_size(declared, "ObjectSizeLessThan");
     let tags = declared_tag_filters(declared, LIFECYCLE_CONFIGURATION, named)?;
+    let tagged = !tags.is_empty();
     let predicates = usize::from(prefix.is_some())
         + usize::from(greater_than.is_some())
         + usize::from(less_than.is_some())
         + tags.len();
-    if predicates > 1 {
+    if tagged || predicates > 1 {
         return Ok(LifecycleRuleFilter::builder()
             .and(
                 LifecycleRuleAndOperator::builder()
-                    .set_prefix(prefix)
+                    // A tag-narrowed conjunction states a prefix either way, the empty one
+                    // standing for "every key"; a conjunction of the two object-size bounds
+                    // alone narrows no prefix at all, which is not the same as the empty one.
+                    .set_prefix(prefix.or_else(|| tagged.then(String::new)))
                     // A conjunction of the two object-size bounds alone carries no tag at
                     // all, which is not the same as an empty tag list.
-                    .set_tags((!tags.is_empty()).then_some(tags))
+                    .set_tags(tagged.then_some(tags))
                     .set_object_size_greater_than(greater_than)
                     .set_object_size_less_than(less_than)
                     .build(),
@@ -5466,7 +5480,6 @@ fn lifecycle_rule_filter(
     }
     Ok(LifecycleRuleFilter::builder()
         .set_prefix(prefix)
-        .set_tag(tags.into_iter().next())
         .set_object_size_greater_than(greater_than)
         .set_object_size_less_than(less_than)
         .build())
