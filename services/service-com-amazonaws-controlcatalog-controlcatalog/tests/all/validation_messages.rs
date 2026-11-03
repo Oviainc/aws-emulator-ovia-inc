@@ -18,12 +18,29 @@
 //! written out in full, and every row is additionally checked against the invariants
 //! of the rule, so a row whose text drifted back to echoing the value fails twice.
 //!
+//! One clause is not stated at the member the walk reported: a constraint broken by a
+//! COLLECTION's ELEMENT is stated once at the collection member, over the element
+//! shape's WHOLE declared constraint set nested inside
+//! `Member must satisfy constraint: [ … ]` — never at a synthetic `<n>.member` path and
+//! never as the one constraint that happened to fail.
+//! [`an_element_constraint_is_stated_at_the_collection_over_the_whole_set`] spans that half
+//! of the class on its own.
+//!
 //! Every constraint quoted here comes from the model, via
 //! `smithy_query(query="closure", operation="GetControl,ListControls,ListControlMappings,ListDomains,ListObjectives,ListCommonControls",
 //! model_path="services/service-com-amazonaws-controlcatalog-controlcatalog/smithy-model/com-amazonaws-controlcatalog-controlcatalog.json")`.
 
 use crate::control_catalog::{error_code, Emulator};
 use service_com_amazonaws_controlcatalog_controlcatalog::state::{page_refusal, PageError};
+
+/// The requirement a clause states at a COLLECTION member whose ELEMENTS broke a
+/// constraint: the element shape's whole declared set, nested in AWS's wrapper.
+fn element_set(requirements: &[&str]) -> String {
+    format!(
+        "Member must satisfy constraint: [{}]",
+        requirements.join(", ")
+    )
+}
 
 /// `ControlArn`'s `@pattern`, with the anchors the model spells it with stripped —
 /// which is exactly what a clause reporting it must state.
@@ -268,11 +285,22 @@ async fn filter_constraints_name_the_nested_member_and_the_constraint_only() {
             )),
         ),
         (
+            // A constraint an ELEMENT broke is stated at the collection member, over
+            // `ControlArn`'s whole declared set (shape `ControlArn`).
             "a malformed ARN inside ControlArns".to_string(),
             "/list-control-mappings".to_string(),
             r#"{"Filter":{"ControlArns":["arn:aws:controlcatalog:::domain/abcdefghijklmnopqrstuvwxy"]}}"#
                 .to_string(),
-            one(&control_arn_pattern_clause("filter.controlArns.1.member")),
+            one(&clause(
+                "filter.controlArns",
+                &element_set(&[
+                    "Member must have length less than or equal to 2048",
+                    "Member must have length greater than or equal to 34",
+                    &format!(
+                        "Member must satisfy regular expression pattern: {CONTROL_ARN_PATTERN}"
+                    ),
+                ]),
+            )),
         ),
         (
             "two GovernedProviders in a ControlFilter".to_string(),
@@ -284,14 +312,22 @@ async fn filter_constraints_name_the_nested_member_and_the_constraint_only() {
             )),
         ),
         (
+            // The recorded instance: the element set is `GovernedProvider`'s whole
+            // declared set (shape `GovernedProvider`), not the one constraint that
+            // failed.
             "a lowercase GovernedProvider".to_string(),
             "/list-controls".to_string(),
             r#"{"Filter":{"GovernedProviders":["aws"]}}"#.to_string(),
             one(&clause(
-                "filter.governedProviders.1.member",
-                &format!(
-                    "Member must satisfy regular expression pattern: {GOVERNED_PROVIDER_PATTERN}"
-                ),
+                "filter.governedProviders",
+                &element_set(&[
+                    "Member must have length less than or equal to 64",
+                    "Member must have length greater than or equal to 2",
+                    &format!(
+                        "Member must satisfy regular expression pattern: \
+                         {GOVERNED_PROVIDER_PATTERN}"
+                    ),
+                ]),
             )),
         ),
         (
@@ -322,6 +358,153 @@ async fn filter_constraints_name_the_nested_member_and_the_constraint_only() {
             one(&clause(
                 "commonControlFilter.objectives.1.member.arn",
                 &format!("Member must satisfy regular expression pattern: {OBJECTIVE_ARN_PATTERN}"),
+            )),
+        ),
+    ];
+    assert_table(rows).await;
+}
+
+/// A constraint one of a COLLECTION's ELEMENTS broke is stated once at the collection
+/// member, over the element shape's WHOLE declared constraint set.
+///
+/// The table spans every list of constrained scalars the service's input surface declares
+/// — the three members of `ControlMappingFilter`, `ControlFilter.GovernedProviders` and
+/// both members of `ImplementationFilter` — and what the rule generalises over: the
+/// constraint the element broke (`@pattern`, `@length`, an enum value set), how many of the
+/// element's constraints it broke (one, and two at once), and how many elements broke one
+/// (one, and two). The clause is the same in every case, because the set is the model's and
+/// not the request's. A violation inside a STRUCTURE element keeps its own indexed path and
+/// its own single requirement — the rows for `ObjectiveFilter.Domains` and
+/// `CommonControlFilter.Objectives` in
+/// [`filter_constraints_name_the_nested_member_and_the_constraint_only`] are the other side
+/// of this rule.
+#[tokio::test]
+async fn an_element_constraint_is_stated_at_the_collection_over_the_whole_set() {
+    // Each element shape's whole declared set, in the order a clause states it
+    // (`smithy_query(query="shape",shape="ControlArn,CommonControlArn,MappingType,\
+    // GovernedProvider,ImplementationType,ImplementationIdentifier")`).
+    let control_arn_set = element_set(&[
+        "Member must have length less than or equal to 2048",
+        "Member must have length greater than or equal to 34",
+        &format!("Member must satisfy regular expression pattern: {CONTROL_ARN_PATTERN}"),
+    ]);
+    let common_control_arn_set = element_set(&[
+        "Member must have length less than or equal to 2048",
+        "Member must have length greater than or equal to 41",
+        "Member must satisfy regular expression pattern: \
+         arn:(aws(?:[-a-z]*)?):controlcatalog:::common-control/[0-9a-z]+",
+    ]);
+    // `MappingType`'s values as this service lists them: the reverse of the model's
+    // declaration order.
+    let mapping_type_set = element_set(&[
+        "Member must satisfy enum value set: [RELATED_CONTROL, COMMON_CONTROL, FRAMEWORK]",
+    ]);
+    let governed_provider_set = element_set(&[
+        "Member must have length less than or equal to 64",
+        "Member must have length greater than or equal to 2",
+        &format!("Member must satisfy regular expression pattern: {GOVERNED_PROVIDER_PATTERN}"),
+    ]);
+    let implementation_type_set = element_set(&[
+        "Member must have length less than or equal to 2048",
+        "Member must have length greater than or equal to 7",
+        r"Member must satisfy regular expression pattern: [A-Za-z0-9]+(::[A-Za-z0-9_]+){2,3}",
+    ]);
+    let implementation_identifier_set = element_set(&[
+        "Member must have length less than or equal to 256",
+        "Member must have length greater than or equal to 1",
+        r"Member must satisfy regular expression pattern: [a-zA-Z0-9_\.-]+",
+    ]);
+    // The clause a list whose `@length` maximum of 1 was broken states, which a row
+    // sending two elements meets BESIDE the element clause.
+    let two_elements = |collection: &str| {
+        clause(
+            collection,
+            "Member must have length less than or equal to 1",
+        )
+    };
+
+    let rows = vec![
+        (
+            "a control ARN of the wrong resource type in ControlArns".to_string(),
+            "/list-control-mappings".to_string(),
+            r#"{"Filter":{"ControlArns":["arn:aws:controlcatalog:::domain/abcdefghijklmnopqrstuvwxy"]}}"#
+                .to_string(),
+            one(&clause("filter.controlArns", &control_arn_set)),
+        ),
+        (
+            // Shorter than the minimum AND outside the pattern: two constraints of one
+            // element, stated as ONE validation error about one member.
+            "a control ARN both too short and unmatched in ControlArns".to_string(),
+            "/list-control-mappings".to_string(),
+            r#"{"Filter":{"ControlArns":["nope"]}}"#.to_string(),
+            one(&clause("filter.controlArns", &control_arn_set)),
+        ),
+        (
+            "a catalog ARN of the wrong resource type in CommonControlArns".to_string(),
+            "/list-control-mappings".to_string(),
+            r#"{"Filter":{"CommonControlArns":["arn:aws:controlcatalog:::domain/abcdefghijklmnopqrstuvwxy"]}}"#
+                .to_string(),
+            one(&clause(
+                "filter.commonControlArns",
+                &common_control_arn_set,
+            )),
+        ),
+        (
+            // The recorded instance of the enum case.
+            "a mapping type outside the value set".to_string(),
+            "/list-control-mappings".to_string(),
+            r#"{"Filter":{"MappingTypes":["NOT_A_REAL_MAPPING_TYPE"]}}"#.to_string(),
+            one(&clause("filter.mappingTypes", &mapping_type_set)),
+        ),
+        (
+            "a mapping type in the wrong case".to_string(),
+            "/list-control-mappings".to_string(),
+            r#"{"Filter":{"MappingTypes":["framework"]}}"#.to_string(),
+            one(&clause("filter.mappingTypes", &mapping_type_set)),
+        ),
+        (
+            // The recorded instance of the length-and-pattern case.
+            "a lowercase governed provider".to_string(),
+            "/list-controls".to_string(),
+            r#"{"Filter":{"GovernedProviders":["aws"]}}"#.to_string(),
+            one(&clause("filter.governedProviders", &governed_provider_set)),
+        ),
+        (
+            "a governed provider both too short and unmatched".to_string(),
+            "/list-controls".to_string(),
+            r#"{"Filter":{"GovernedProviders":["a"]}}"#.to_string(),
+            one(&clause("filter.governedProviders", &governed_provider_set)),
+        ),
+        (
+            // TWO offending elements of one list: the elements are the SAME one clause
+            // however many broke it, and the list's own `@length` is a second clause
+            // after it (the walk reports a collection's own bound after its elements).
+            "two unmatched governed providers".to_string(),
+            "/list-controls".to_string(),
+            r#"{"Filter":{"GovernedProviders":["aws","azure"]}}"#.to_string(),
+            format!(
+                "2 validation errors detected: {}; {}",
+                clause("filter.governedProviders", &governed_provider_set),
+                two_elements("filter.governedProviders"),
+            ),
+        ),
+        (
+            "an implementation type with too few segments".to_string(),
+            "/list-controls".to_string(),
+            r#"{"Filter":{"Implementations":{"Types":["AWS::Config"]}}}"#.to_string(),
+            one(&clause(
+                "filter.implementations.types",
+                &implementation_type_set,
+            )),
+        ),
+        (
+            "an implementation identifier outside the character class".to_string(),
+            "/list-controls".to_string(),
+            r#"{"Filter":{"Implementations":{"Identifiers":["not a valid identifier"]}}}"#
+                .to_string(),
+            one(&clause(
+                "filter.implementations.identifiers",
+                &implementation_identifier_set,
             )),
         ),
     ];
@@ -523,13 +706,10 @@ fn an_out_of_range_page_size_is_worded_by_the_same_renderer() {
 
     for (requested, modeled_max, requirement) in rows {
         let case = format!("maxResults={requested} against a maximum of {modeled_max}");
-        let message = page_refusal(
-            "ListDomains",
-            PageError::MaxResultsOutOfRange {
-                requested,
-                modeled_max,
-            },
-        );
+        let message = page_refusal(PageError::MaxResultsOutOfRange {
+            requested,
+            modeled_max,
+        });
         assert_eq!(
             message,
             one(&clause("maxResults", requirement)),

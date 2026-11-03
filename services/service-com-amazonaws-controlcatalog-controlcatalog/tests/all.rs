@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/associated_parent_summary.rs"]
 mod associated_parent_summary;
+#[path = "all/authorization.rs"]
+mod authorization;
 #[path = "all/catalog_resource_identity.rs"]
 mod catalog_resource_identity;
 #[path = "all/control_arn_resolution.rs"]

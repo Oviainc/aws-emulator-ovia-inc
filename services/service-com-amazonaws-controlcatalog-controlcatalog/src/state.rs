@@ -714,21 +714,26 @@ fn decode_page_token(
     Ok(last_key.to_string())
 }
 
+/// What Control Catalog answers a `NextToken` it did not issue, or one that has expired,
+/// with: ONE fixed sentence for the whole class.
+///
+/// The whole message is fixed text, with no part taken from the request: it names neither
+/// the submitted token, nor the operation, nor the parameters the token was issued for — so
+/// every one of this service's five paginated listings refuses an unusable cursor with
+/// byte-identical text.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "The NextToken parameter is not valid or expired.";
+
 /// How a list operation words a [`PageError`] in the service's modeled
-/// `ValidationException`: each message names the input member at fault, the way the
-/// boundary validator's own refusals do, and is built the same way for all five list
-/// operations.
+/// `ValidationException`, built the same way for all five list operations.
 ///
 /// A `MaxResults` outside the modeled range is a violation of that `@range`, so it is
 /// worded by the one renderer this service words every constraint violation with
 /// ([`crate::service::constraint_envelope`]) rather than by a sentence of its own —
-/// member and constraint, with no rendering of the rejected value.
-pub fn page_refusal(operation: &str, error: PageError) -> String {
+/// member and constraint, with no rendering of the rejected value. An unusable
+/// `NextToken` is the one fixed sentence [`INVALID_NEXT_TOKEN_MESSAGE`] states.
+pub fn page_refusal(error: PageError) -> String {
     match error {
-        PageError::InvalidToken => format!(
-            "nextToken is not a pagination token issued by a previous {operation} call \
-             with the same parameters"
-        ),
+        PageError::InvalidToken => INVALID_NEXT_TOKEN_MESSAGE.to_string(),
         PageError::MaxResultsOutOfRange {
             requested,
             modeled_max,

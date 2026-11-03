@@ -183,8 +183,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation reads none of it.
-        let _ = ctx;
+        // AWS takes the authorization decision at the IAM layer, ahead of the service
+        // reading anything, so a caller whose identity-based policies do not allow this
+        // action is refused without being told anything about the catalog. This listing
+        // addresses no resource of its own, so it is judged against the resource IAM
+        // writes for such a request.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::service::authorization::ANY_RESOURCE,
+        )
+        .map_err(ListCommonControlsErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListCommonControlsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -240,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(|error| {
             ListCommonControlsErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::page_refusal("ListCommonControls", error)),
+                message: Some(crate::state::page_refusal(error)),
             })
         })?;
 

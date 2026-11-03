@@ -100,7 +100,11 @@
 //! `Member must satisfy constraint: [ … ]` and no value at all.
 //! [`aws_validation_refusal_over_elements`] is that rendering, for a service whose
 //! recordings show it; the set is read off the MODEL (the schemas the caller hands over),
-//! because the refusal carries only the constraints that failed.
+//! because the refusal carries only the constraints that failed. A service whose OTHER
+//! clauses it cannot state — one withholding the value a present member submitted while
+//! still reporting an absent member as the `null` it was, which no per-member-path decision
+//! expresses — reads that same set through [`element_constraint_set`] and nests it with
+//! [`element_set_requirement`], so the wrapper and the set stay here either way.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -1061,6 +1065,52 @@ pub fn aws_validation_refusal_over_elements_withholding(
     )
 }
 
+/// The constraints the ELEMENT shape of the collection member `collection` declares, in the
+/// order a clause states them — for a service that renders the requirement SENTENCES itself
+/// instead of delegating the whole refusal to [`aws_validation_refusal_over_elements`].
+///
+/// A service needs this when the clauses it states around the nested set are its own: one
+/// whose refusals withhold the value a PRESENT member submitted while still stating the
+/// `null` an ABSENT one is reported with cannot express that per member path, which is the
+/// only decision the grouped entry points above take. It gets the same reading of the same
+/// schemas they use, so the set cannot differ between the two.
+///
+/// `shapes` are shapes of the calling service whose own members are looked up — its
+/// operation inputs, and the structures its inputs nest, since a member schema carries its
+/// own traits and not the members of the shape it targets. `collection` is the member as a
+/// violation path spells it (lowerCamel, [`aws_smithy_schema_server::constraints::path`]),
+/// so a nested member is looked up by its own name in the shape that declares it.
+///
+/// `None` when no handed-over shape declares an element constraint set for that member, and
+/// `None` when two of them declare DIFFERENT sets: the refusal does not say which operation
+/// it came from, so a guessed set would not be known to be true of the request. A
+/// `@pattern` comes back as the MODEL writes it, which leaves the rendering of the
+/// expression to the caller exactly as the grouped entry points leave it.
+#[must_use]
+pub fn element_constraint_set(
+    shapes: &[&'static Schema],
+    collection: &str,
+) -> Option<Vec<ViolationKind>> {
+    let mut declared = shapes
+        .iter()
+        .filter_map(|schema| element_constraints_declared(schema, collection));
+    let set = declared.next()?;
+    declared.all(|other| other == set).then_some(set)
+}
+
+/// The requirement a clause states at a COLLECTION member for a constraint its ELEMENTS
+/// broke: the element shape's whole declared set, nested inside
+/// `Member must satisfy constraint: [ … ]`.
+///
+/// The wrapper lives here and nowhere else, so a service that states the clause itself
+/// ([`element_constraint_set`]) and one that delegates the whole refusal
+/// ([`aws_validation_refusal_over_elements`]) cannot word it differently. `requirements` are
+/// the element shape's requirement sentences, in the order the clause states them.
+#[must_use]
+pub fn element_set_requirement(requirements: &[String]) -> String {
+    format!("{ELEMENT_SET_OPEN}{}]", requirements.join(", "))
+}
+
 /// The ONE body behind both grouped entry points: the framework's envelope over the
 /// framework's clauses, with a violation at a list ELEMENT stated at the collection member
 /// carrying the element shape's whole set, and the value half dropped from a clause that
@@ -1154,8 +1204,8 @@ fn element_set_clause(
         None => "Value at".to_string(),
     };
     Some(format!(
-        "{stated_value} '{collection}' failed to satisfy constraint: {ELEMENT_SET_OPEN}{}]",
-        set.join(", ")
+        "{stated_value} '{collection}' failed to satisfy constraint: {}",
+        element_set_requirement(&set)
     ))
 }
 
@@ -1163,18 +1213,43 @@ fn element_set_clause(
 /// the order a clause states them, or `None` when that member is not a collection of
 /// constrained scalars.
 ///
-/// The ORDER is the one AWS's element-constraint clauses state: the `@length` maximum, then
-/// its minimum, then the numeric bounds the same way, then the `@pattern`, then an
-/// enumerated value set. A `@length` with no declared minimum states `0`, the smallest
-/// length a Smithy `@length` can bound.
-///
-/// Every sentence is the framework's own ([`requirement`]), so a requirement nested into a
+/// Every sentence is the framework's own ([`requirement`]) over the constraints
+/// [`element_constraints_declared`] read off the model, so a requirement nested into a
 /// collection clause reads exactly like one a reported member gets.
 fn element_requirements(
     input_schema: &Schema,
     collection: &str,
     quote_pattern: &dyn Fn(&str) -> String,
 ) -> Option<Vec<String>> {
+    let declared = element_constraints_declared(input_schema, collection)?;
+    Some(
+        declared
+            .into_iter()
+            .map(|kind| match kind {
+                // The CHECK used the model's pattern as written; only the rendering of the
+                // expression is the caller's choice.
+                ViolationKind::Pattern(pattern) => {
+                    requirement(ViolationKind::Pattern(quote_pattern(&pattern)))
+                }
+                other => requirement(other),
+            })
+            .collect(),
+    )
+}
+
+/// Every constraint the ELEMENT shape of `input_schema`'s `collection` member declares, in
+/// the order a clause states them, or `None` when that member is not a collection of
+/// constrained scalars.
+///
+/// The ORDER is the one AWS's element-constraint clauses state: the `@length` maximum, then
+/// its minimum, then the numeric bounds the same way, then the `@pattern`, then an
+/// enumerated value set. A `@length` with no declared minimum states `0`, the smallest
+/// length a Smithy `@length` can bound. A `@pattern` is carried as the MODEL writes it, so
+/// whoever states it chooses the rendering of the expression.
+fn element_constraints_declared(
+    input_schema: &Schema,
+    collection: &str,
+) -> Option<Vec<ViolationKind>> {
     let member = input_schema.members().iter().find(|member| {
         member
             .member_name()
@@ -1186,33 +1261,29 @@ fn element_requirements(
     )?
     .inner();
 
-    let mut requirements: Vec<String> = Vec::new();
+    let mut declared: Vec<ViolationKind> = Vec::new();
     if let Some(length) = constraint_trait::<LengthTrait>(traits, &LengthTrait::TRAIT_ID) {
         if let Some(max) = length.max {
-            requirements.push(requirement(ViolationKind::MaxLength(max)));
+            declared.push(ViolationKind::MaxLength(max));
         }
-        requirements.push(requirement(ViolationKind::MinLength(
-            length.min.unwrap_or(0),
-        )));
+        declared.push(ViolationKind::MinLength(length.min.unwrap_or(0)));
     }
     if let Some(range) = constraint_trait::<RangeTrait>(traits, &RangeTrait::TRAIT_ID) {
         if let Some(max) = range.max {
-            requirements.push(requirement(ViolationKind::MaxValue(rendered_bound(max))));
+            declared.push(ViolationKind::MaxValue(rendered_bound(max)));
         }
         if let Some(min) = range.min {
-            requirements.push(requirement(ViolationKind::MinValue(rendered_bound(min))));
+            declared.push(ViolationKind::MinValue(rendered_bound(min)));
         }
     }
     if let Some(pattern) = constraint_trait::<PatternTrait>(traits, &PatternTrait::TRAIT_ID) {
-        requirements.push(requirement(ViolationKind::Pattern(quote_pattern(
-            pattern.regex,
-        ))));
+        declared.push(ViolationKind::Pattern(pattern.regex.to_owned()));
     }
     if let Some(allowed) = constraint_trait::<EnumTrait>(traits, &EnumTrait::TRAIT_ID) {
         let values: Vec<String> = allowed.values.iter().map(|value| (*value).to_owned()).collect();
-        requirements.push(requirement(ViolationKind::EnumValue(values)));
+        declared.push(ViolationKind::EnumValue(values));
     }
-    (!requirements.is_empty()).then_some(requirements)
+    (!declared.is_empty()).then_some(declared)
 }
 
 /// One constraint trait off a trait map, downcast to the type carrying its bounds.

@@ -27,6 +27,7 @@ use service_com_amazonaws_controlcatalog_controlcatalog::state::ComAmazonawsCont
 
 use crate::catalog_resource_identity::{in_partition, PARTITIONS};
 use crate::control_catalog::{drain, error_code, Emulator};
+use crate::pagination_token_spelling::INVALID_NEXT_TOKEN;
 use crate::validation_messages::message_of;
 
 /// An identifier of the length the catalog's own ARNs carry that nothing is published
@@ -40,8 +41,6 @@ struct FilteredListing {
     route: &'static str,
     /// Response member carrying that operation's items.
     items_key: &'static str,
-    /// The operation name its own refusals are worded with.
-    operation: &'static str,
     /// The input member holding the filter structure.
     filter_member: &'static str,
     /// The filter structure's list member, holding the resource entries.
@@ -66,16 +65,6 @@ impl FilteredListing {
     /// An ARN of this listing's parent kind carrying `identifier`, written in `partition`.
     fn arn_in(&self, partition: &str, identifier: &str) -> String {
         format!("arn:{partition}:controlcatalog:::{}/{identifier}", self.kind)
-    }
-
-    /// The sentence this operation refuses a `NextToken` it did not issue for the
-    /// requested parameters with.
-    fn invalid_token_sentence(&self) -> String {
-        format!(
-            "nextToken is not a pagination token issued by a previous {} call with the \
-             same parameters",
-            self.operation
-        )
     }
 
     /// The first page of one item under `body`, and the token it carries — `None` when
@@ -108,7 +97,6 @@ fn filtered_listings() -> Vec<FilteredListing> {
         FilteredListing {
             route: "/objectives",
             items_key: "Objectives",
-            operation: "ListObjectives",
             filter_member: "ObjectiveFilter",
             list_member: "Domains",
             parent_member: "Domain",
@@ -118,7 +106,6 @@ fn filtered_listings() -> Vec<FilteredListing> {
         FilteredListing {
             route: "/common-controls",
             items_key: "CommonControls",
-            operation: "ListCommonControls",
             filter_member: "CommonControlFilter",
             list_member: "Objectives",
             parent_member: "Objective",
@@ -306,7 +293,7 @@ async fn a_filter_token_is_refused_under_a_different_filter_on_both_filtered_lis
     }
 }
 
-/// Replaying `token` on `listing` under `body` is refused with that operation's
+/// Replaying `token` on `listing` under `body` is refused with the service's one
 /// invalid-token sentence.
 async fn assert_refused(
     emulator: &Emulator,
@@ -332,7 +319,7 @@ async fn assert_refused(
     );
     let message = message_of(&response)
         .unwrap_or_else(|| panic!("case {case:?}: the refusal carries no message: {response:?}"));
-    let expected = listing.invalid_token_sentence();
+    let expected = INVALID_NEXT_TOKEN;
     assert_eq!(
         message, expected,
         "case {case:?}: expected {expected:?}, got {message:?}"

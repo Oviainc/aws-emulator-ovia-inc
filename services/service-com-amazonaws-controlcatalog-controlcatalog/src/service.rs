@@ -45,11 +45,43 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+use ::aws_smithy_schema::Schema;
+use ::service_common::validation::{list_of_element, unanchored};
+use ::service_common::validation_message::{element_constraint_set, element_set_requirement};
+
+/// Whether IAM lets a request to this service perform the action it asks for.
+pub mod authorization;
+
 /// The error code Control Catalog answers an input-constraint violation with: the
 /// modeled `ValidationException`, which every one of this service's six operations
 /// declares with `@httpError 400` (the framework's own default code for a refusal,
 /// restated here because `override_refusal` replaces code and message together).
 const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The shapes a refused COLLECTION member is looked up in, to state the whole constraint
+/// set that member's ELEMENTS have to satisfy.
+///
+/// Every list of constrained scalars in this service's input surface sits inside a filter
+/// STRUCTURE rather than at the top level of an operation's input
+/// (`smithy_query(query="closure",operation="GetControl,ListControls,ListControlMappings,\
+/// ListDomains,ListObjectives,ListCommonControls")`), and a member schema carries its own
+/// traits and not the members of the shape it targets — so the shapes handed over are the
+/// five filter structures that declare a list member, which between them own every one:
+/// `ControlArns`, `CommonControlArns` and `MappingTypes`, `GovernedProviders`, `Types` and
+/// `Identifiers`, `Domains` and `Objectives`. The last two are lists of STRUCTURES, which
+/// declare no element constraint set of their own, so a violation inside one of their
+/// entries keeps the member path it was reported at.
+const FILTER_SHAPES: &[&Schema] = {
+    use crate::ops::types;
+
+    &[
+        types::CONTROL_MAPPING_FILTER_SCHEMA,
+        types::CONTROL_FILTER_SCHEMA,
+        types::IMPLEMENTATION_FILTER_SCHEMA,
+        types::OBJECTIVE_FILTER_SCHEMA,
+        types::COMMON_CONTROL_FILTER_SCHEMA,
+    ]
+};
 
 /// What Control Catalog answers a lookup whose control ARN names no published control
 /// with.
@@ -77,12 +109,36 @@ pub(crate) const INVALID_FILTER_MESSAGE: &str =
 /// Render one constraint violation the way Control Catalog states it: the member
 /// path and the violated constraint, and NOTHING of the value that was rejected.
 ///
+/// A constraint one of a COLLECTION's elements broke is not stated at that element: it is
+/// stated once at the collection member, over the element shape's whole declared constraint
+/// set ([`element_set_clause`]).
+///
 /// Returns `None` for a violation class this service has no wording for, which lets
 /// [`constraint_envelope`] decline the whole refusal and keep the framework's
 /// wording rather than invent a sentence for it ([`ViolationKind`] is
 /// `#[non_exhaustive]`, so a class can be added upstream).
 pub(crate) fn constraint_clause(violation: &Violation) -> Option<String> {
-    let requirement = match &violation.kind {
+    if let Some(clause) = element_set_clause(&violation.path) {
+        return Some(clause);
+    }
+    let requirement = requirement(&violation.kind)?;
+    // An absent member has no submitted value at all, so it is reported as the null
+    // it was: that is a fact of the request's shape, not a rendering of a value the
+    // caller sent. Every other violation names the member only.
+    let subject = match &violation.kind {
+        ViolationKind::MissingRequiredMember => "Value null",
+        _ => "Value",
+    };
+    Some(format!(
+        "{subject} at '{}' failed to satisfy constraint: {requirement}",
+        violation.path
+    ))
+}
+
+/// The one requirement sentence this service states a constraint with, or `None` for a
+/// class it has no wording for.
+fn requirement(kind: &ViolationKind) -> Option<String> {
+    Some(match kind {
         ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
         ViolationKind::MinLength(min) => {
             format!("Member must have length greater than or equal to {min}")
@@ -103,52 +159,80 @@ pub(crate) fn constraint_clause(violation: &Violation) -> Option<String> {
             "Member must satisfy regular expression pattern: {}",
             unanchored(pattern)
         ),
-        ViolationKind::EnumValue(allowed) => {
-            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
-        }
+        ViolationKind::EnumValue(allowed) => format!(
+            "Member must satisfy enum value set: [{}]",
+            stated_enum_values(allowed).join(", ")
+        ),
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
         _ => return None,
-    };
-    // An absent member has no submitted value at all, so it is reported as the null
-    // it was: that is a fact of the request's shape, not a rendering of a value the
-    // caller sent. Every other violation names the member only.
-    let subject = match &violation.kind {
-        ViolationKind::MissingRequiredMember => "Value null",
-        _ => "Value",
-    };
-    Some(format!(
-        "{subject} at '{}' failed to satisfy constraint: {requirement}",
-        violation.path
-    ))
+    })
 }
 
-/// A `@pattern` expression without the anchors a model may spell it with. A `$`
-/// escaped by a backslash is a literal dollar sign inside the expression, not the
-/// end anchor, so it stays.
-fn unanchored(pattern: &str) -> &str {
-    let body = pattern.strip_prefix('^').unwrap_or(pattern);
-    match body.strip_suffix('$') {
-        Some(trimmed) => {
-            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
-            if backslashes % 2 == 0 {
-                trimmed
-            } else {
-                body
-            }
-        }
-        None => body,
+/// An enumerated type's admissible values as a refusal of this service LISTS them: in the
+/// REVERSE of the order the model declares them in.
+///
+/// A validation clause states the value set as the remediation hint a caller is shown, and
+/// the order is the service's rather than the model's. No AWS document fixes it, and the
+/// evidence for it is ONE data point, which is all this service's input surface can offer:
+/// `MappingType` is its only enumerated member (`smithy_query(query="shape",
+/// shape="MappingType")` declares `[FRAMEWORK, COMMON_CONTROL, RELATED_CONTROL]`) and is
+/// recorded stated as `[RELATED_CONTROL, COMMON_CONTROL, FRAMEWORK]`. Reversing the declared
+/// order is the rule that states that, and it is COMPUTED from the declared set rather than
+/// tabulated for the one type, so an enumerated member the model grows is listed by the same
+/// rule instead of falling back to a membership nothing recorded. Sibling services differ
+/// here — the order is part of each service's validation-message dialect, not a fleet-wide
+/// one — so this stays beside this service's own recording.
+fn stated_enum_values(declared: &[String]) -> Vec<String> {
+    declared.iter().rev().cloned().collect()
+}
+
+/// The clause a constraint broken by a COLLECTION's ELEMENTS is stated at — the collection
+/// member, carrying the whole constraint set the element shape declares — or `None` when
+/// `path` is not a scalar element's.
+///
+/// AWS reports such a violation once at the collection and lists the element shape's ENTIRE
+/// set, not the one constraint a value happened to break, so the clause is the same whatever
+/// an element got wrong and however many elements got it wrong. The set is read off the
+/// model (the refusal carries only what failed) and the `Member must satisfy constraint:
+/// [ … ]` wrapper comes from the shared rendering, so this chooses only WHICH shapes the
+/// member is looked up in and how each requirement is worded ([`requirement`]).
+fn element_set_clause(path: &str) -> Option<String> {
+    let collection = list_of_element(path)?;
+    // The member declares its constraints in the shape that owns it, under its own name:
+    // the leading segments of the path are the structures it is nested in.
+    let member = collection
+        .rsplit_once('.')
+        .map_or(collection, |(_, member)| member);
+    let declared = element_constraint_set(FILTER_SHAPES, member)?;
+    let requirements: Vec<String> = declared.iter().filter_map(requirement).collect();
+    // A set this service has no wording for every member of is not stated at all, which
+    // keeps the framework's own per-element clause rather than an incomplete set.
+    if requirements.len() != declared.len() {
+        return None;
     }
+    Some(format!(
+        "Value at '{collection}' failed to satisfy constraint: {}",
+        element_set_requirement(&requirements)
+    ))
 }
 
 /// The `ValidationException` message for a refusal: the AWS envelope
 /// (`N validation error(s) detected: `) over one clause per violation.
 ///
+/// A clause already stated is not stated twice: a collection whose elements broke a
+/// constraint is named ONCE however many of its elements the framework's walk reported,
+/// because every one of them produces the same clause. The scan is quadratic in the clause
+/// count, which the framework's own walk caps.
+///
 /// `None` declines the whole refusal — see [`constraint_clause`].
 pub(crate) fn constraint_envelope(violations: &[Violation]) -> Option<String> {
-    let clauses: Vec<String> = violations
-        .iter()
-        .map(constraint_clause)
-        .collect::<Option<Vec<_>>>()?;
+    let mut clauses: Vec<String> = Vec::new();
+    for violation in violations {
+        let clause = constraint_clause(violation)?;
+        if !clauses.contains(&clause) {
+            clauses.push(clause);
+        }
+    }
     match clauses.len() {
         0 => None,
         1 => Some(format!("1 validation error detected: {}", clauses[0])),

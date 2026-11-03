@@ -15,23 +15,33 @@
 //! one respelling picked by hand. The harness (`Emulator`) is the one `control_catalog.rs`
 //! drives the service through: the same `MultiServiceRouter` front door.
 
+use std::collections::BTreeSet;
+
 use serde_json::Value;
 
 use crate::control_catalog::{error_code, Emulator};
 use crate::validation_messages::message_of;
 
-/// The five paginated list operations: route, the response member carrying the items,
-/// and the operation name its own refusals are worded with (`OPERATIONS.md`).
-const LIST_OPERATIONS: [(&str, &str, &str); 5] = [
-    ("/domains", "Domains", "ListDomains"),
-    ("/objectives", "Objectives", "ListObjectives"),
-    ("/common-controls", "CommonControls", "ListCommonControls"),
-    ("/list-controls", "Controls", "ListControls"),
-    (
-        "/list-control-mappings",
-        "ControlMappings",
-        "ListControlMappings",
-    ),
+/// The sentence AWS refuses an unusable `NextToken` with — the whole message is fixed text,
+/// naming neither the submitted token, nor the operation, nor the parameters the token was
+/// issued for.
+///
+/// Spelled out here rather than read off the service's own constant, so a drift in that
+/// wording fails this suite instead of being compared against itself. `pub(crate)` so the
+/// sibling suite that replays a token under a different filter
+/// (`single_resource_filter_paging`) holds the service to the same sentence rather than to a
+/// second spelling of it.
+pub(crate) const INVALID_NEXT_TOKEN: &str = "The NextToken parameter is not valid or expired.";
+
+/// The five paginated list operations: route and the response member carrying the
+/// items. The refusal a token no call issued meets is ONE sentence for the whole
+/// service, so no operation name enters it (`OPERATIONS.md`).
+const LIST_OPERATIONS: [(&str, &str); 5] = [
+    ("/domains", "Domains"),
+    ("/objectives", "Objectives"),
+    ("/common-controls", "CommonControls"),
+    ("/list-controls", "Controls"),
+    ("/list-control-mappings", "ControlMappings"),
 ];
 
 /// Respell `token` by upper-casing the hex digits whose letter positions `select`
@@ -108,7 +118,7 @@ async fn first_page(emulator: &Emulator, route: &str, items_key: &str) -> (Strin
 #[tokio::test]
 async fn a_respelt_token_carries_the_same_cursor_bytes_as_the_issued_one() {
     let emulator = Emulator::new();
-    for (route, items_key, _operation) in LIST_OPERATIONS {
+    for (route, items_key) in LIST_OPERATIONS {
         let (issued, _items) = first_page(&emulator, route, items_key).await;
         let issued_bytes = hex::decode(&issued)
             .unwrap_or_else(|error| panic!("case {route}: an issued token is hex: {error}"));
@@ -134,7 +144,10 @@ async fn a_respelt_token_carries_the_same_cursor_bytes_as_the_issued_one() {
 #[tokio::test]
 async fn every_list_operation_refuses_a_respelt_token_and_resumes_the_issued_one() {
     let emulator = Emulator::new();
-    for (route, items_key, operation) in LIST_OPERATIONS {
+    // Every sentence the five operations answered with: the refusal is a property of the
+    // CLASS, so the set must hold exactly one.
+    let mut sentences: BTreeSet<String> = BTreeSet::new();
+    for (route, items_key) in LIST_OPERATIONS {
         let (issued, first_items) = first_page(&emulator, route, items_key).await;
 
         for (case, respelt) in respellings(&issued) {
@@ -150,16 +163,21 @@ async fn every_list_operation_refuses_a_respelt_token_and_resumes_the_issued_one
                 "ValidationException",
                 "case {route} {case}: expected a ValidationException, got {response:?}"
             );
-            let expected = format!(
-                "nextToken is not a pagination token issued by a previous {operation} call \
-                 with the same parameters"
-            );
             let actual = message_of(&response);
             assert_eq!(
                 actual.as_deref(),
-                Some(expected.as_str()),
+                Some(INVALID_NEXT_TOKEN),
                 "case {route} {case}: expected the unissued-token refusal, got {actual:?}"
             );
+            // No part of the refusal comes from the request or from the operation: the
+            // token the caller sent and the operation it called are both absent from it.
+            let message = actual.unwrap_or_default();
+            assert!(
+                !message.contains(&respelt) && !message.contains(&issued),
+                "case {route} {case}: the refusal echoes the submitted token, got \
+                 {message:?}"
+            );
+            sentences.insert(message);
         }
 
         // The positive control: the token as the service spelt it still resumes, and
@@ -177,4 +195,11 @@ async fn every_list_operation_refuses_a_respelt_token_and_resumes_the_issued_one
              last entry returned"
         );
     }
+
+    assert_eq!(
+        sentences.len(),
+        1,
+        "the unissued-token sentence must be the same for every list operation and every \
+         respelling, got {sentences:?}"
+    );
 }
