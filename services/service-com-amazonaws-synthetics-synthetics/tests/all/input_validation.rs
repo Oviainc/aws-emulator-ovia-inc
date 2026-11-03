@@ -40,7 +40,10 @@ const ROLE_ARN_PATTERN: &str = r"^arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a-zA-Z
 /// `UUID`'s `@pattern` (`GetCanary$DryRunId`), likewise as declared.
 const UUID_PATTERN: &str = r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$";
 
-/// `ResourceArn`'s `@pattern` (`TagResource$ResourceArn`), likewise as declared.
+/// `ResourceArn`'s `@pattern` (`TagResource$ResourceArn`), likewise as declared. The
+/// tagging operations, whose error set declares no `ValidationException`, quote it WITHOUT
+/// the whole-value pair — see `tests/all/pattern_requirement_wording.rs`, which owns that
+/// rule and both dialects.
 const RESOURCE_ARN_PATTERN: &str = r"^arn:(aws[a-zA-Z-]*)?:synthetics:[a-z]{2,4}(-[a-z]{2,4})?-[a-z]+-\d{1}:\d{12}:(canary|group):[0-9a-z_\-]+$";
 
 /// How Synthetics words a malformed artifact location (`src/state.rs`).
