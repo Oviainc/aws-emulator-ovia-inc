@@ -47,6 +47,8 @@ mod entity_owners;
 mod form_type_deletion;
 #[path = "all/form_type_revisions.rs"]
 mod form_type_revisions;
+#[path = "all/glossary_deletion.rs"]
+mod glossary_deletion;
 #[path = "all/glossary_lifecycle.rs"]
 mod glossary_lifecycle;
 #[path = "all/glossary_terms.rs"]

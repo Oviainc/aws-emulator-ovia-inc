@@ -448,6 +448,21 @@ impl Domain {
             })
     }
 
+    /// Whether any glossary TERM stored in this domain is still an entry of the glossary
+    /// `glossary_id`, which is what prevents that glossary's deletion.
+    ///
+    /// What depends on a glossary is what is filed UNDER it: its terms, each of which
+    /// records the glossary it is an entry of ([`GlossaryTerm::glossary_id`]). Nothing
+    /// else stored here references a glossary — an asset's or a project's
+    /// `glossaryTerms` name TERMS, which this same walk already covers. A linear scan
+    /// over a map bounded by [`MAX_GLOSSARY_TERMS_PER_DOMAIN`], the same trade
+    /// [`Self::domain_unit_blocker`] makes.
+    pub fn glossary_has_terms(&self, glossary_id: &str) -> bool {
+        self.glossary_terms
+            .values()
+            .any(|term| term.glossary_id == glossary_id)
+    }
+
     /// Remember that the domain unit `unit_id` was deleted from this domain.
     ///
     /// The ids are kept oldest first and bounded by
@@ -481,6 +496,23 @@ pub const HIERARCHY_KIND_PROJECT: &str = "project";
 
 /// The kind name a DOMAIN carries there — what a domain's root unit is held by.
 pub const HIERARCHY_KIND_DOMAIN: &str = "domain";
+
+/// The `ConflictException` message DataZone answers a `DeleteGlossary` whose glossary
+/// still has terms filed under it ([`Domain::glossary_has_terms`]).
+///
+/// Recorded behaviour, and FIXED text: the service names neither the glossary nor the
+/// term, so nothing the caller sent and nothing from the store appears in it.
+pub const GLOSSARY_HAS_TERMS_MESSAGE: &str =
+    "Glossary can't be deleted while having glossary terms attached";
+
+/// The `ConflictException` message DataZone answers a `DeleteGlossary` whose glossary is
+/// not in DISABLED state yet — the other prerequisite the operation documents.
+///
+/// Worded in the form [`GLOSSARY_HAS_TERMS_MESSAGE`] takes, with the one variable part
+/// read from the STORE: the `GlossaryStatus` the glossary is actually in.
+pub fn glossary_not_disabled_message(status: &str) -> String {
+    format!("Glossary can't be deleted while it is in {status} state")
+}
 
 /// One object of a domain's ownership hierarchy as a deletion refusal names it:
 /// `<kind> <identifier>`, the kind followed by the object's own identifier within the
