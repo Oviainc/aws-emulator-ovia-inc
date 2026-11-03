@@ -187,6 +187,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &input.object_type_name,
                 ))
             })?;
+        let objects_held = domain
+            .profile_object_count(&input.object_type_name, ::std::time::SystemTime::now());
 
         Ok(GetProfileObjectTypeOutput {
             object_type_name: stored.name.clone(),
@@ -198,9 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source_last_updated_timestamp_format: stored
                 .source_last_updated_timestamp_format
                 .clone(),
-            // No operation stores profile objects yet, so none of the count assigned to
-            // this type is consumed.
-            max_available_profile_object_count: stored.max_available_profile_object_count(0),
+            // The unused part of the count assigned to this type: what it was assigned,
+            // less the objects the domain holds under it.
+            max_available_profile_object_count: stored
+                .max_available_profile_object_count(objects_held),
             max_profile_object_count: stored.max_profile_object_count,
             source_priority: stored.source_priority,
             fields: stored.fields.clone(),

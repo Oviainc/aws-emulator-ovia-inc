@@ -162,6 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
+        // "Deletes the standard customer profile and all data pertaining to the profile":
+        // the objects ingested onto it are that data, so they go with it.
+        domain.remove_profile_objects(|_, profile| profile == input.profile_id);
 
         Ok(DeleteProfileOutput {
             message: Some(format!("Profile {} deleted", input.profile_id)),

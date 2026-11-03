@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProfileObjects
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProfileObjects`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProfileObjects::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the objects one profile has under one profile object type, in ascending
+//! unique-key order, one page at a time, optionally narrowed to the objects carrying a
+//! given index value. A domain, or an object type within it, the store does not hold is
+//! `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +152,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProfileObjects` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProfileObjectsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProfileObjects"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // The model bounds how many keys a filter names (one) but not how many values
+        // that key may carry, so the total is capped here and an oversized filter is
+        // refused BEFORE any object is read — the message names the member and the limit.
+        if let Some(filter) = &input.object_filter {
+            if filter.values.len() > crate::state::MAX_SEARCH_VALUES {
+                return Err(bad_request(format!(
+                    "An ObjectFilter may carry at most {} values; this request carried {}",
+                    crate::state::MAX_SEARCH_VALUES,
+                    filter.values.len()
+                )));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // Everything that needs the store happens inside this block, so the shared state
+        // lock is released before the response is built. Objects are stored in
+        // unique-key order within one (object type, profile) pair, so one page's cursor
+        // resumes the next.
+        let (items, next_token) = {
+            let mut store = state.lock();
+            let domain = store
+                .domains
+                .get_mut(&input.domain_name)
+                .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+            // The retention the clock has already run out is materialised before the
+            // page is picked, so a listing never reports data the domain should no
+            // longer hold.
+            domain.expire_profile_objects(now);
+            if !domain.object_types.contains_key(&input.object_type_name) {
+                return Err(not_found(crate::state::object_type_not_found(
+                    &input.object_type_name,
+                )));
+            }
+
+            let listed = domain
+                .profile_objects_of(&input.object_type_name, &input.profile_id)
+                .filter(|stored| match &input.object_filter {
+                    // "The filter applied to ListProfileObjects response to include
+                    // profile objects with the specified index values."
+                    Some(filter) => stored.matches_filter(&filter.key_name, &filter.values),
+                    None => true,
+                })
+                .map(|stored| (stored.unique_key.clone(), stored.as_item()));
+            crate::state::paginate(listed, input.next_token.as_deref(), input.max_results)
+        };
+
+        Ok(ListProfileObjectsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
+}
+
+/// The request is invalid — HTTP 400, the error code a client branches on.
+fn bad_request(message: String) -> ListProfileObjectsError {
+    ListProfileObjectsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A domain or object type the request names is not stored.
+fn not_found(message: String) -> ListProfileObjectsError {
+    ListProfileObjectsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> ListProfileObjectsError {
+    ListProfileObjectsErrorModeled::InternalServerException(crate::state::store_unavailable())
+        .into()
 }

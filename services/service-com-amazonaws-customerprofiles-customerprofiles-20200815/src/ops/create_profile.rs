@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let profile_id = new_profile_id();
+        let profile_id = crate::state::new_profile_id();
         let profile = Profile {
             profile_id: Some(profile_id.clone()),
             account_number: input.account_number,
@@ -251,12 +251,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(CreateProfileOutput { profile_id })
     }
-}
-
-/// A fresh `ProfileId`: the 32 lowercase hex characters the modelled pattern
-/// `^[a-f0-9]{32}$` requires, taken from a v4 UUID's simple (undashed) form.
-fn new_profile_id() -> String {
-    ::uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// The store is unreachable — a server fault, not a bad request.

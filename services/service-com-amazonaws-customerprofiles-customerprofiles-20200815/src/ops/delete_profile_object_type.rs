@@ -153,12 +153,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             not_found(crate::state::domain_not_found(&input.domain_name))
         })?;
 
-        // Removing the entry removes the whole of what this domain holds under the name.
-        // Anything stored under an object type belongs to that entry — no operation
-        // stores profile objects yet, so there is none to drop beside the definition —
-        // and a standard profile's fields are written by the caller that created it
-        // rather than populated from an object type, so this removal leaves no field
-        // sourced from the deleted type behind.
+        // Removing the entry removes the whole of what this domain holds under the name:
+        // the definition, and every object ingested through it ("Removes a ProfileObjectType
+        // from a specific domain"). A standard profile's fields are written by the caller
+        // that created it rather than populated from an object type, so this removal
+        // leaves no field sourced from the deleted type behind.
         domain
             .object_types
             .remove(&input.object_type_name)
@@ -167,6 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &input.object_type_name,
                 ))
             })?;
+        domain.remove_profile_objects(|object_type, _| object_type == input.object_type_name);
 
         Ok(DeleteProfileObjectTypeOutput {
             message: format!("Object type {} deleted", input.object_type_name),

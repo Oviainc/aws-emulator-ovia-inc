@@ -17,9 +17,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AttributeDetails, Conditions, CreateCalculatedAttributeDefinitionInput, DataStoreResponse,
-    Filter, MatchingRequest, MatchingResponse, ObjectTypeField, ObjectTypeKey, Profile, Readiness,
-    RecommenderSchemaField, ResultsSummary, RuleBasedMatchingRequest, RuleBasedMatchingResponse,
+    Address, AttributeDetails, Conditions, CreateCalculatedAttributeDefinitionInput,
+    DataStoreResponse, Filter, MatchingRequest, MatchingResponse, ObjectTypeField, ObjectTypeKey,
+    Profile, Readiness, RecommenderSchemaField, ResultsSummary, RuleBasedMatchingRequest,
+    RuleBasedMatchingResponse,
 };
 
 /// How long after the call that configures it the asynchronous work a domain kicks off
@@ -85,6 +86,17 @@ pub const MAX_ATTRIBUTES_PER_PROFILE: usize = 1_000;
 /// checked before the insert so repeated `PutProfileObjectType` calls cannot grow the
 /// store without bound.
 pub const MAX_OBJECT_TYPES_PER_DOMAIN: usize = 1_000;
+
+/// Emulator resource guard, NOT an AWS quota (the service publishes no per-domain
+/// profile object limit): the most profile objects this emulator stores for one domain,
+/// across every object type and profile in it. Checked before the insert, so repeated
+/// `PutProfileObject` calls cannot grow the store without bound, and set well above any
+/// realistic emulator workload.
+pub const MAX_PROFILE_OBJECTS_PER_DOMAIN: usize = 10_000;
+
+/// Seconds in one day — the unit every expiry this service measures in days is held in
+/// (`ProfileObjectType$ExpirationDays`, `Domain$DefaultExpirationDays`).
+pub const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 /// Emulator resource guard, NOT an AWS quota: the most upload jobs this emulator stores
 /// for one domain. Set well above any realistic emulator workload, and checked before
@@ -274,6 +286,11 @@ pub struct Domain {
     /// The domain's profile object types, keyed by `ObjectTypeName` — the name is the
     /// object type's identity (`@httpLabel` on every object-type operation).
     pub object_types: BTreeMap<String, StoredObjectType>,
+    /// The domain's ingested profile objects, keyed by [`ProfileObjectId`]. The object
+    /// type and the profile lead the key, so the objects `ListProfileObjects` serves for
+    /// one of those pairs are a contiguous range walked in ascending unique-key order —
+    /// which is what makes that listing's `NextToken` cursor resumable.
+    pub profile_objects: BTreeMap<ProfileObjectId, StoredProfileObject>,
     /// The domain's upload jobs, keyed by the `JobId` `CreateUploadJob` minted — the id
     /// is the job's identity (`@httpLabel` on every upload-job operation). A `BTreeMap`,
     /// so a listing walks them in one stable order.
@@ -343,9 +360,8 @@ impl StoredObjectType {
     /// count available": the count assigned to this type less the profile objects held
     /// under it. A type with no assigned count reports none.
     ///
-    /// `objects_held` is the number of profile objects stored for this type, which the
-    /// caller counts: no operation stores profile objects yet, so every caller passes 0
-    /// today and the whole assignment is available.
+    /// `objects_held` is the number of profile objects the domain stores for this type,
+    /// which the caller counts — see [`Domain::profile_object_count`].
     pub fn max_available_profile_object_count(&self, objects_held: i32) -> Option<i32> {
         self.max_profile_object_count
             .map(|assigned| assigned.saturating_sub(objects_held).max(0))
@@ -560,6 +576,73 @@ pub struct StoredProfile {
     pub last_updated_at: SystemTime,
 }
 
+/// The identity of one ingested profile object within a domain: the `ObjectTypeName` it
+/// was ingested under, the `ProfileId` it is tied to, and its `ProfileObjectUniqueKey`.
+///
+/// The profile is empty for an object the ingest could tie to no profile. A `ProfileId`
+/// is 32 hexadecimal characters (`uuid`, `^[a-f0-9]{32}$`), so no `ListProfileObjects` or
+/// `DeleteProfileObject` request can name that profile: an object no profile claims is
+/// held, and is unreachable, exactly as the service leaves one it could not map.
+pub type ProfileObjectId = (String, String, String);
+
+/// One ingested profile object: the JSON `PutProfileObject` was given, the unique key the
+/// service derived for it, the profile it was tied to, and the index values its object
+/// type's keys select out of it.
+#[derive(Debug, Clone)]
+pub struct StoredProfileObject {
+    /// `ObjectTypeName`: the type the object was ingested under.
+    pub object_type_name: String,
+    /// `ProfileObjectUniqueKey`, as derived by [`profile_object_unique_key`].
+    pub unique_key: String,
+    /// `Object`: the JSON the request carried, stored as given so a listing reports the
+    /// object that was ingested rather than a re-rendering of it.
+    pub object: String,
+    /// The `ProfileId` this object is tied to, or empty when it is tied to none — see
+    /// [`ProfileObjectId`].
+    pub profile_id: String,
+    /// `KeyName` -> the values this object carries for that key: what an
+    /// `ObjectFilter` on `ListProfileObjects` selects by ("include profile objects with
+    /// the specified index values"). A `LOOKUP_ONLY` key contributes none, because it
+    /// "is only used to match a profile but is not persisted to be used for searching".
+    pub index_values: BTreeMap<String, BTreeSet<String>>,
+    /// When the object was first ingested. The retention its object type sets runs from
+    /// here.
+    pub created_at: SystemTime,
+    /// When the object was last ingested under the same unique key.
+    pub last_updated_at: SystemTime,
+}
+
+impl StoredProfileObject {
+    /// Whether this object's retention has run out as of `now`: `expiration_days` after
+    /// it was ingested. A retention of no days keeps it, because a domain always carries
+    /// a `DefaultExpirationDays` of at least one day and an object type's own
+    /// `ExpirationDays` is modelled at 1..1098.
+    pub fn is_expired(&self, expiration_days: i32, now: SystemTime) -> bool {
+        let days = u64::try_from(expiration_days).unwrap_or_default();
+        if days == 0 {
+            return false;
+        }
+        now >= self.created_at + Duration::from_secs(days * SECONDS_PER_DAY)
+    }
+
+    /// This object as one entry of a `ListProfileObjects` page.
+    pub fn as_item(&self) -> crate::ops::types::ListProfileObjectsItem {
+        crate::ops::types::ListProfileObjectsItem {
+            object_type_name: Some(self.object_type_name.clone()),
+            profile_object_unique_key: Some(self.unique_key.clone()),
+            object: Some(self.object.clone()),
+        }
+    }
+
+    /// Whether this object carries any of `values` for `key_name` — the test one
+    /// `ObjectFilter` applies.
+    pub fn matches_filter(&self, key_name: &str, values: &[String]) -> bool {
+        self.index_values
+            .get(key_name)
+            .is_some_and(|held| values.iter().any(|value| held.contains(value)))
+    }
+}
+
 impl Domain {
     /// A new domain holding no customer data: the two members `CreateDomain` requires,
     /// the timestamps it generated, and the instant the asynchronous work its creation
@@ -581,6 +664,7 @@ impl Domain {
             data_store_work: AsyncWork::started(now),
             profiles: BTreeMap::new(),
             object_types: BTreeMap::new(),
+            profile_objects: BTreeMap::new(),
             upload_jobs: BTreeMap::new(),
             calculated_attributes: BTreeMap::new(),
             recommender_schemas: BTreeMap::new(),
@@ -693,6 +777,157 @@ impl Domain {
             .cloned()
             .collect()
     }
+
+    /// How long an object ingested under `object_type_name` is kept, in days: the object
+    /// type's own `ExpirationDays` ("The number of days until the data in the object
+    /// expires") when it sets one, else the domain's `DefaultExpirationDays` ("The
+    /// default number of days until the data within the domain expires").
+    pub fn object_expiration_days(&self, object_type_name: &str) -> i32 {
+        self.object_types
+            .get(object_type_name)
+            .and_then(|object_type| object_type.expiration_days)
+            .unwrap_or(self.default_expiration_days)
+    }
+
+    /// Drop every ingested object whose retention has run out as of `now`.
+    ///
+    /// This materialises an expiry the CLOCK already made due — the data was owed
+    /// removal at that instant whether or not anybody called — so every operation that
+    /// touches this domain's objects does it first, and none of them reports data the
+    /// domain should no longer hold.
+    pub fn expire_profile_objects(&mut self, now: SystemTime) {
+        let expired: Vec<ProfileObjectId> = self
+            .profile_objects
+            .iter()
+            .filter(|(_, stored)| {
+                stored.is_expired(self.object_expiration_days(&stored.object_type_name), now)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            self.profile_objects.remove(&id);
+        }
+    }
+
+    /// Store `object`, replacing any object already held under the same identity: a
+    /// re-ingest of the same object type and unique key is the same object.
+    pub fn put_profile_object(&mut self, object: StoredProfileObject) {
+        self.profile_objects.insert(
+            (
+                object.object_type_name.clone(),
+                object.profile_id.clone(),
+                object.unique_key.clone(),
+            ),
+            object,
+        );
+    }
+
+    /// The objects tied to one profile under one object type, in ascending unique-key
+    /// order.
+    pub fn profile_objects_of<'a>(
+        &'a self,
+        object_type_name: &'a str,
+        profile_id: &'a str,
+    ) -> impl Iterator<Item = &'a StoredProfileObject> + 'a {
+        let from = (
+            object_type_name.to_string(),
+            profile_id.to_string(),
+            String::new(),
+        );
+        self.profile_objects
+            .range(from..)
+            .take_while(move |((object_type, profile, _), _)| {
+                object_type == object_type_name && profile == profile_id
+            })
+            .map(|(_, stored)| stored)
+    }
+
+    /// The number of objects the domain holds under one object type, across every
+    /// profile, counting only those whose retention has not run out as of `now` — what
+    /// `MaxAvailableProfileObjectCount` reports as consumed.
+    pub fn profile_object_count(&self, object_type_name: &str, now: SystemTime) -> i32 {
+        let expiration_days = self.object_expiration_days(object_type_name);
+        let held = self
+            .profile_objects
+            .iter()
+            .filter(|((object_type, _, _), stored)| {
+                object_type == object_type_name && !stored.is_expired(expiration_days, now)
+            })
+            .count();
+        i32::try_from(held).unwrap_or(i32::MAX)
+    }
+
+    /// Remove one object, answering the record that was removed.
+    pub fn remove_profile_object(
+        &mut self,
+        object_type_name: &str,
+        profile_id: &str,
+        unique_key: &str,
+    ) -> Option<StoredProfileObject> {
+        self.profile_objects.remove(&(
+            object_type_name.to_string(),
+            profile_id.to_string(),
+            unique_key.to_string(),
+        ))
+    }
+
+    /// Remove every object the given predicate over (object type, profile) selects, and
+    /// answer how many went. The one removal path behind deleting a profile, deleting an
+    /// object type, and anything else that drops a whole branch of this index.
+    pub fn remove_profile_objects(
+        &mut self,
+        selected: impl Fn(&str, &str) -> bool,
+    ) -> usize {
+        let dropped: Vec<ProfileObjectId> = self
+            .profile_objects
+            .keys()
+            .filter(|(object_type, profile, _)| selected(object_type, profile))
+            .cloned()
+            .collect();
+        let count = dropped.len();
+        for id in dropped {
+            self.profile_objects.remove(&id);
+        }
+        count
+    }
+
+    /// Move every object tied to `from` onto `to`, keeping each object's own unique key:
+    /// the objects of a profile merged into another belong to the profile that absorbed
+    /// it.
+    pub fn move_profile_objects(&mut self, from: &str, to: &str) {
+        let moved: Vec<ProfileObjectId> = self
+            .profile_objects
+            .keys()
+            .filter(|(_, profile, _)| profile == from)
+            .cloned()
+            .collect();
+        for id in moved {
+            let Some(mut stored) = self.profile_objects.remove(&id) else {
+                continue;
+            };
+            stored.profile_id = to.to_string();
+            self.put_profile_object(stored);
+        }
+    }
+
+    /// The profile an ingested object belongs to: the first profile already indexed under
+    /// one of `probes`, which are the (predefined key, value) pairs the object's keys
+    /// select, in the order the service searches them.
+    pub fn match_profile(&self, probes: &[(String, String)]) -> Option<String> {
+        probes.iter().find_map(|(key_name, value)| {
+            self.lookup(key_name, ::std::slice::from_ref(value))
+                .into_iter()
+                .next()
+        })
+    }
+}
+
+/// A fresh `ProfileId`: the 32 lowercase hex characters the modelled pattern
+/// `^[a-f0-9]{32}$` requires, taken from a v4 UUID's simple (undashed) form. One minter,
+/// so every profile this service stores — created by a call or inferred from an ingested
+/// object — carries an id of that one shape.
+pub fn new_profile_id() -> String {
+    ::uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// The predefined `SearchProfiles` keys a profile's OWN attributes populate.
@@ -701,8 +936,8 @@ impl Domain {
 /// `_assetId`, `_caseId`, `_orderId`, `_fullName`, `_phone`, `_email`, `_ctrContactId`,
 /// and the connector ids (`_marketoLeadId`, `_salesforce*`, `_zendesk*`,
 /// `_serviceNow*`, `_segmentUserId`, `_shopify*`). Only the five returned here are
-/// derivable from a profile itself; the rest are carried by ingested profile OBJECTS,
-/// which no operation stores yet.
+/// derivable from a profile itself; the rest are keys of ingested profile OBJECTS, which
+/// carry their own index values (see [`ProfileObjectIngest`]).
 ///
 /// Every email member feeds `_email` and every phone member feeds `_phone`, because
 /// those keys name a class of value rather than one member. The result is sorted and
@@ -746,6 +981,393 @@ fn full_name(profile: &Profile) -> Option<String> {
     .filter(|part| !part.is_empty())
     .collect();
     (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+// ---------------------------------------------------------------------------
+// Ingesting a profile object
+//
+// An ingest is given a JSON object and the name of the object type that describes it.
+// That type's `Fields` say where each piece of data sits in the object (`Source`) and
+// which member of the standard profile model it belongs to (`Target`); its `Keys` say
+// which of those fields form a key, and what each key may be used for
+// (`StandardIdentifiers`). Everything below reads an object through that definition, so
+// every operation that ingests one reads it the same way.
+// ---------------------------------------------------------------------------
+
+/// `StandardIdentifier` of a key that ties the object to a profile: "PROFILE ... means
+/// that this key can be used to tie an object to a PROFILE".
+const IDENTIFIER_PROFILE: &str = "PROFILE";
+
+/// `StandardIdentifier` of a key searched only after every `PROFILE` key: "If a key a is
+/// marked as SECONDARY, it will be used to search for profiles after all other PROFILE
+/// keys have been searched."
+const IDENTIFIER_SECONDARY: &str = "SECONDARY";
+
+/// `StandardIdentifier` of the key that identifies the OBJECT: "UNIQUE means that it can
+/// be used to uniquely identify an object."
+const IDENTIFIER_UNIQUE: &str = "UNIQUE";
+
+/// `StandardIdentifier` of a key that "is only used to match a profile but is not
+/// persisted to be used for searching of the profile".
+const IDENTIFIER_LOOKUP_ONLY: &str = "LOOKUP_ONLY";
+
+/// The prefix of an `ObjectTypeField$Target`: "the location of the data in the standard
+/// ProfileObject model. For example: _profile.Address.PostalCode".
+pub const PROFILE_TARGET_PREFIX: &str = "_profile.";
+
+/// The container a target names to reach one entry of the profile's `Attributes` map.
+const ATTRIBUTES_CONTAINER: &str = "Attributes";
+
+/// What separates the values of a multi-field UNIQUE key in the object identity derived
+/// from it: a character no modelled value of this service carries.
+const UNIQUE_VALUE_SEPARATOR: char = '\u{1f}';
+
+/// The predefined `SearchProfiles` keys a stored profile is indexed under, which are
+/// therefore the keys an ingest can look a profile up by. The same five
+/// [`standard_search_keys`] indexes a profile into.
+const PREDEFINED_PROFILE_KEYS: [&str; 5] =
+    [KEY_PROFILE_ID, KEY_ACCOUNT, KEY_EMAIL, KEY_PHONE, KEY_FULL_NAME];
+
+/// The values `PartyType` admits, as the model's enum spells them.
+const PARTY_TYPES: [&str; 3] = ["INDIVIDUAL", "BUSINESS", "OTHER"];
+
+/// The values `Gender` admits, as the model's enum spells them.
+const GENDERS: [&str; 3] = ["MALE", "FEMALE", "UNSPECIFIED"];
+
+/// The values `ProfileType` admits, as the model's enum spells them.
+const PROFILE_TYPES: [&str; 2] = ["ACCOUNT_PROFILE", "PROFILE"];
+
+/// What one ingested profile object yields, read through its object type's definition.
+#[derive(Debug, Default)]
+pub struct ProfileObjectIngest {
+    /// `KeyName` -> the values the object carries for that key: what a
+    /// `ListProfileObjects` `ObjectFilter` selects by.
+    pub index_values: BTreeMap<String, BTreeSet<String>>,
+    /// The value of the type's UNIQUE key, when it defines one and the object carries a
+    /// value for it: what identifies this object among the objects of its type.
+    pub unique_value: Option<String>,
+    /// The (predefined key, value) pairs that identify the profile this object belongs
+    /// to, in the order they are searched: every `PROFILE` key first, then every
+    /// `SECONDARY` key, which is searched "after all other PROFILE keys".
+    pub probes: Vec<(String, String)>,
+    /// The standard profile the object's data maps into through its fields' `Target`s —
+    /// the profile an ingest creates when it finds none to tie the object to.
+    pub mapped_profile: Profile,
+    /// Whether any of the object's data reached that profile. With none there is nothing
+    /// to infer a profile FROM, so an object that maps nothing creates none.
+    pub maps_profile_data: bool,
+}
+
+/// Read one ingested object through the definition of the object type it names.
+pub fn read_profile_object(
+    object_type: &StoredObjectType,
+    object: &::serde_json::Value,
+) -> ProfileObjectIngest {
+    let mut ingest = ProfileObjectIngest::default();
+
+    // Every field the type defines maps one piece of the object onto one member of the
+    // standard profile model, so the mapped profile is built from all of them, not only
+    // from the ones a key names.
+    let mut fields: Vec<(&String, &ObjectTypeField)> =
+        object_type.fields.iter().flatten().collect();
+    fields.sort_by(|left, right| left.0.cmp(right.0));
+    for (field_name, field) in &fields {
+        let Some(value) = field_value(field_name, Some(field), object) else {
+            continue;
+        };
+        if let Some(target) = field.target.as_deref() {
+            ingest.maps_profile_data |=
+                apply_profile_target(&mut ingest.mapped_profile, target, value);
+        }
+    }
+
+    let mut keys: Vec<(&String, &Vec<ObjectTypeKey>)> = object_type.keys.iter().flatten().collect();
+    keys.sort_by(|left, right| left.0.cmp(right.0));
+    let mut searched_last: Vec<(String, String)> = Vec::new();
+    for (key_name, definitions) in &keys {
+        for definition in definitions.iter() {
+            let identifiers: Vec<&str> = definition
+                .standard_identifiers
+                .iter()
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            let mut values: Vec<(Option<&str>, String)> = Vec::new();
+            for field_name in definition.field_names.iter().flatten() {
+                let field = object_type
+                    .fields
+                    .as_ref()
+                    .and_then(|fields| fields.get(field_name));
+                if let Some(value) = field_value(field_name, field, object) {
+                    values.push((field.and_then(|field| field.target.as_deref()), value));
+                }
+            }
+            if values.is_empty() {
+                continue;
+            }
+
+            // A `LOOKUP_ONLY` key is the one kind that contributes no index value: it
+            // "is not persisted to be used for searching of the profile".
+            if !identifiers.contains(&IDENTIFIER_LOOKUP_ONLY) {
+                ingest
+                    .index_values
+                    .entry((*key_name).clone())
+                    .or_default()
+                    .extend(values.iter().map(|(_, value)| value.clone()));
+            }
+            // "Each ProfileObject can have only 1 UNIQUE key", so the first one defined
+            // identifies the object.
+            if identifiers.contains(&IDENTIFIER_UNIQUE) && ingest.unique_value.is_none() {
+                ingest.unique_value = Some(
+                    values
+                        .iter()
+                        .map(|(_, value)| value.as_str())
+                        .collect::<Vec<&str>>()
+                        .join(&UNIQUE_VALUE_SEPARATOR.to_string()),
+                );
+            }
+
+            let ties_to_profile = identifiers.contains(&IDENTIFIER_PROFILE);
+            let secondary = identifiers.contains(&IDENTIFIER_SECONDARY);
+            if !ties_to_profile && !secondary {
+                continue;
+            }
+            let mut probes: Vec<(String, String)> = Vec::new();
+            for (target, value) in &values {
+                // A key NAMED after one of the predefined profile keys looks the profile
+                // up under that key directly; otherwise the field's `Target` says which
+                // member of the standard profile the value belongs to, and that member's
+                // predefined key is the one to look under.
+                if is_predefined_profile_key(key_name) {
+                    probes.push(((*key_name).clone(), value.clone()));
+                }
+                if let Some(search_key) = target.and_then(standard_search_key_for_target) {
+                    probes.push((search_key.to_string(), value.clone()));
+                }
+            }
+            if ties_to_profile {
+                ingest.probes.extend(probes);
+            } else {
+                searched_last.extend(probes);
+            }
+        }
+    }
+    ingest.probes.extend(searched_last);
+
+    // An object type that defines neither fields nor keys says nothing about where the
+    // object's data belongs, so the object's own members do: a member named after a
+    // member of the standard profile model is read as that member — the mapping the
+    // service's own definitions spell out when they name the two alike.
+    if fields.is_empty() && keys.is_empty() {
+        let mut members: Vec<(&String, &::serde_json::Value)> =
+            object.as_object().into_iter().flatten().collect();
+        members.sort_by(|left, right| left.0.cmp(right.0));
+        for (member, value) in members {
+            let Some(text) = scalar_text(value) else {
+                continue;
+            };
+            let target = format!("{PROFILE_TARGET_PREFIX}{member}");
+            ingest.maps_profile_data |=
+                apply_profile_target(&mut ingest.mapped_profile, &target, text.clone());
+            if let Some(search_key) = standard_search_key_for_target(&target) {
+                ingest.probes.push((search_key.to_string(), text));
+            }
+        }
+        // A profile named by its own id IS the profile, so that look-up comes first.
+        ingest
+            .probes
+            .sort_by_key(|(key_name, _)| usize::from(key_name != KEY_PROFILE_ID));
+    }
+
+    ingest
+}
+
+/// The value one field of an object type selects out of an ingested object.
+///
+/// `ObjectTypeField$Source` is the path the data sits at ("_source.FirstName, where
+/// “_source” is a ProfileObjectType"); a field reference the type defines no field for is
+/// read as the object member of that name, which is the only path the reference itself
+/// spells.
+fn field_value(
+    field_name: &str,
+    field: Option<&ObjectTypeField>,
+    object: &::serde_json::Value,
+) -> Option<String> {
+    let source = field
+        .and_then(|field| field.source.as_deref())
+        .unwrap_or(field_name);
+    source_value(object, source)
+}
+
+/// The value a `Source` path selects out of an ingested object.
+///
+/// The leading segment of a path with more than one segment names the object type the
+/// data came from, so the path into the object itself starts after it; a single-segment
+/// path is a member of the object.
+pub fn source_value(object: &::serde_json::Value, source: &str) -> Option<String> {
+    let mut segments = source.split('.').peekable();
+    let mut current = object;
+    if source.split('.').count() > 1 {
+        segments.next();
+    }
+    for segment in segments {
+        current = current.get(segment)?;
+    }
+    scalar_text(current)
+}
+
+/// One JSON scalar as the text a key value or a profile member carries. An array, an
+/// object and a null are not values either can hold, so they select nothing.
+fn scalar_text(value: &::serde_json::Value) -> Option<String> {
+    match value {
+        ::serde_json::Value::String(text) => (!text.is_empty()).then(|| text.clone()),
+        ::serde_json::Value::Number(number) => Some(number.to_string()),
+        ::serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+
+/// Whether `key_name` is one of the predefined keys a profile is indexed under.
+fn is_predefined_profile_key(key_name: &str) -> bool {
+    PREDEFINED_PROFILE_KEYS.contains(&key_name)
+}
+
+/// The predefined `SearchProfiles` key the standard-profile member a `Target` names is
+/// indexed under, or `None` for a member no predefined key covers.
+///
+/// This is the inverse of [`standard_search_keys`], so a value extracted from an ingested
+/// object probes exactly the index a profile carrying that value was indexed into.
+/// `_fullName` is not reachable: it is the concatenation of three members, so no single
+/// member feeds it.
+pub fn standard_search_key_for_target(target: &str) -> Option<&'static str> {
+    match target.strip_prefix(PROFILE_TARGET_PREFIX)? {
+        "ProfileId" => Some(KEY_PROFILE_ID),
+        "AccountNumber" => Some(KEY_ACCOUNT),
+        "EmailAddress" | "PersonalEmailAddress" | "BusinessEmailAddress" => Some(KEY_EMAIL),
+        "PhoneNumber" | "MobilePhoneNumber" | "HomePhoneNumber" | "BusinessPhoneNumber" => {
+            Some(KEY_PHONE)
+        }
+        _ => None,
+    }
+}
+
+/// Write the value a field's `Target` names onto `profile`, answering whether the target
+/// named a member of the standard profile model.
+///
+/// The member path is what follows [`PROFILE_TARGET_PREFIX`]: one of the profile's own
+/// members, an entry of its `Attributes` map, or a member of one of its four addresses.
+/// `ProfileId` is not among them — the service generates a profile's id, so a target
+/// naming it carries no data onto the profile.
+pub fn apply_profile_target(profile: &mut Profile, target: &str, value: String) -> bool {
+    let Some(path) = target.strip_prefix(PROFILE_TARGET_PREFIX) else {
+        return false;
+    };
+    if let Some((container, member)) = path.split_once('.') {
+        return match container {
+            ATTRIBUTES_CONTAINER => apply_attribute(profile, member, value),
+            "Address" => apply_address_target(&mut profile.address, member, value),
+            "ShippingAddress" => apply_address_target(&mut profile.shipping_address, member, value),
+            "MailingAddress" => apply_address_target(&mut profile.mailing_address, member, value),
+            "BillingAddress" => apply_address_target(&mut profile.billing_address, member, value),
+            _ => false,
+        };
+    }
+    match path {
+        "AccountNumber" => profile.account_number = Some(value),
+        "AdditionalInformation" => profile.additional_information = Some(value),
+        "BusinessName" => profile.business_name = Some(value),
+        "FirstName" => profile.first_name = Some(value),
+        "MiddleName" => profile.middle_name = Some(value),
+        "LastName" => profile.last_name = Some(value),
+        "BirthDate" => profile.birth_date = Some(value),
+        "PhoneNumber" => profile.phone_number = Some(value),
+        "MobilePhoneNumber" => profile.mobile_phone_number = Some(value),
+        "HomePhoneNumber" => profile.home_phone_number = Some(value),
+        "BusinessPhoneNumber" => profile.business_phone_number = Some(value),
+        "EmailAddress" => profile.email_address = Some(value),
+        "PersonalEmailAddress" => profile.personal_email_address = Some(value),
+        "BusinessEmailAddress" => profile.business_email_address = Some(value),
+        "PartyTypeString" => profile.party_type_string = Some(value),
+        "GenderString" => profile.gender_string = Some(value),
+        // An enum-valued member carries only a value its enum admits, so data outside
+        // the enum maps onto nothing.
+        "PartyType" => return apply_enum_member(&mut profile.party_type, &PARTY_TYPES, value),
+        "Gender" => return apply_enum_member(&mut profile.gender, &GENDERS, value),
+        "ProfileType" => return apply_enum_member(&mut profile.profile_type, &PROFILE_TYPES, value),
+        _ => return false,
+    }
+    true
+}
+
+/// Write one entry of the profile's `Attributes` map, up to the cap on how many
+/// attributes one profile holds.
+fn apply_attribute(profile: &mut Profile, member: &str, value: String) -> bool {
+    let attributes = profile.attributes.get_or_insert_with(HashMap::new);
+    if attributes.len() >= MAX_ATTRIBUTES_PER_PROFILE && !attributes.contains_key(member) {
+        return false;
+    }
+    attributes.insert(member.to_string(), value);
+    true
+}
+
+/// Write one member of one of the profile's addresses, answering whether the name is a
+/// member `Address` declares. The address is stored only when it is.
+fn apply_address_target(slot: &mut Option<Address>, member: &str, value: String) -> bool {
+    let mut address = slot.clone().unwrap_or_default();
+    match member {
+        "Address1" => address.address1 = Some(value),
+        "Address2" => address.address2 = Some(value),
+        "Address3" => address.address3 = Some(value),
+        "Address4" => address.address4 = Some(value),
+        "City" => address.city = Some(value),
+        "County" => address.county = Some(value),
+        "State" => address.state = Some(value),
+        "Province" => address.province = Some(value),
+        "Country" => address.country = Some(value),
+        "PostalCode" => address.postal_code = Some(value),
+        _ => return false,
+    }
+    *slot = Some(address);
+    true
+}
+
+/// Write `value` onto an enum-valued member of a profile, but only when the model's enum
+/// admits it.
+fn apply_enum_member(member: &mut Option<String>, admitted: &[&str], value: String) -> bool {
+    if !admitted.contains(&value.as_str()) {
+        return false;
+    }
+    *member = Some(value);
+    true
+}
+
+/// What identifies one ingested object: the value of its type's UNIQUE key when the type
+/// defines one, else the object's own JSON. Either way the same data ingested twice has
+/// the same identity, and so is the same object.
+pub fn profile_object_identity(
+    unique_value: Option<&str>,
+    object: &::serde_json::Value,
+) -> String {
+    match unique_value {
+        Some(value) => value.to_string(),
+        None => object.to_string(),
+    }
+}
+
+/// The `ProfileObjectUniqueKey` of an ingested object: "the unique identifier of the
+/// profile object generated by the service".
+///
+/// A digest over the object type and the object's identity, so the key is opaque, is
+/// within the member's modelled 1..255 characters whatever the object's size, and is
+/// STABLE: re-ingesting an object of the same identity derives the same key and so
+/// replaces that object instead of storing a second copy of it.
+pub fn profile_object_unique_key(object_type_name: &str, identity: &str) -> String {
+    use ::sha2::Digest as _;
+    let mut digest = ::sha2::Sha256::new();
+    digest.update(object_type_name.as_bytes());
+    digest.update([0u8]);
+    digest.update(identity.as_bytes());
+    ::hex::encode(digest.finalize())
 }
 
 /// Take one page out of `items`, already in ascending cursor order.
@@ -950,6 +1572,14 @@ pub fn domain_not_found(domain_name: &str) -> String {
 /// of them was called.
 pub fn profile_not_found(domain_name: &str, profile_id: &str) -> String {
     format!("The profile {profile_id} does not exist in domain {domain_name}")
+}
+
+/// The `ResourceNotFoundException` message for a profile object the domain holds no
+/// record of under the object type and profile the request named, worded like every other
+/// per-resource absence this service reports: the resource kind, the identifier the
+/// request carried, and "not found" (the form `object_type_not_found` takes).
+pub fn profile_object_not_found(profile_object_unique_key: &str) -> String {
+    format!("ProfileObject {profile_object_unique_key} not found")
 }
 
 /// The `ResourceNotFoundException` message for a recommender schema a domain does not

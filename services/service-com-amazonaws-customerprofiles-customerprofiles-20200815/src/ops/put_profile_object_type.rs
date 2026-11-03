@@ -259,6 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The response is the record that was just stored, so it is the same definition
         // `GetProfileObjectType` serves.
+        let objects_held = domain.profile_object_count(&input.object_type_name, now);
         let output = PutProfileObjectTypeOutput {
             object_type_name: stored.name.clone(),
             description: stored.description.clone(),
@@ -270,9 +271,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .source_last_updated_timestamp_format
                 .clone(),
             max_profile_object_count: stored.max_profile_object_count,
-            // No operation stores profile objects yet, so none of the count assigned
-            // to this type is consumed.
-            max_available_profile_object_count: stored.max_available_profile_object_count(0),
+            // The unused part of the count assigned to this type: what it was assigned,
+            // less the objects the domain holds under it.
+            max_available_profile_object_count: stored
+                .max_available_profile_object_count(objects_held),
             source_priority: stored.source_priority,
             fields: stored.fields.clone(),
             keys: stored.keys.clone(),

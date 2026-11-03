@@ -40,8 +40,8 @@ pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The same engine the router handed the service, so a test can seed the store
     /// directly when driving a store bound through thousands of HTTP calls would only
-    /// make the test slow.
-    engine: Arc<engine::InMemoryEngine>,
+    /// make the test slow, or when what has to be set is a retention measured in days.
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {

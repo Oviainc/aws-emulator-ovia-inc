@@ -296,6 +296,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // keys it just inherited.
         for (id, _) in participants.iter().skip(1) {
             domain.remove_profile(id);
+            // The data of a merged profile belongs to the profile that absorbed it, so
+            // the objects ingested onto it move rather than go.
+            domain.move_profile_objects(id, &input.main_profile_id);
         }
         domain.put_profile(crate::state::StoredProfile {
             profile: merged,
