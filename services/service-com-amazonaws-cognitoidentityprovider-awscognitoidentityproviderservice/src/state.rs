@@ -630,6 +630,16 @@ fn password_policy_message(wording: PasswordPolicyWording, requirement: &str) ->
     format!("{}{requirement}", wording.prefix())
 }
 
+/// The message the refusal of a password the pool's history policy restricts
+/// carries: a `PasswordHistoryPolicyViolationException` is "the message returned
+/// when a user's new password matches a previous password and doesn't comply with
+/// the password-history policy" (this service's model), so the refusal reports
+/// that the submitted password is one the user has already had and names neither
+/// the password nor how many the policy keeps. It carries no policy prefix: this
+/// is not a `PasswordPolicyType` requirement the password missed
+/// ([`PasswordPolicyWording`]), it is the one password-history refusal.
+pub const PASSWORD_REUSED_MESSAGE: &str = "Password has previously been used";
+
 // ---------------------------------------------------------------------------
 // Threat protection (risk configuration)
 // ---------------------------------------------------------------------------
@@ -1320,6 +1330,13 @@ pub const MAX_GROUPS_PER_POOL: usize = 1_000;
 /// not recognise stores one, so the device authenticated longest ago is evicted
 /// past this cap: repeated sign-ins cannot grow one user without limit.
 pub const MAX_DEVICES_PER_USER: usize = 200;
+
+/// The most superseded passwords one user holds, beside the one it holds now:
+/// `PasswordHistorySizeType` is modelled with a maximum of 24
+/// (`smithy_query(query="shape",shape="PasswordHistorySizeType")`), so no pool
+/// policy can restrict reuse of more passwords than this and the password set
+/// longest ago is dropped past the cap.
+pub const MAX_PASSWORD_HISTORY_PER_USER: usize = 24;
 
 /// The most resource servers one user pool holds.
 pub const MAX_RESOURCE_SERVERS_PER_POOL: usize = 1_000;
@@ -2879,6 +2896,30 @@ impl UserPool {
             return Some(password_policy_message(wording, PASSWORD_NEEDS_SYMBOLS));
         }
         None
+    }
+
+    /// Whether this pool's password policy restricts `user` from reusing
+    /// `password`.
+    ///
+    /// "The number of previous passwords that you want Amazon Cognito to
+    /// restrict each user from reusing. Users can't set a password that matches
+    /// any of `n` previous passwords, where `n` is the value of
+    /// `PasswordHistorySize`" (`PasswordPolicyType.PasswordHistorySize` in this
+    /// service's model): the restricted set is the `n` passwords this user set
+    /// most recently — the one it holds now among them, being the one set last
+    /// ([`User::recent_passwords`]) — so a password set further back than the
+    /// window reaches can be set again. A pool whose policy configures no size
+    /// restricts none, which is what a pool created with the default policy
+    /// does.
+    pub fn restricts_password_reuse(&self, user: &User, password: &str) -> bool {
+        let restricted = self
+            .password_policy()
+            .password_history_size
+            .and_then(|size| usize::try_from(size).ok())
+            .unwrap_or(0);
+        user.recent_passwords()
+            .take(restricted)
+            .any(|previous| previous == password)
     }
 
     /// How long a temporary password this pool issues stays usable.
@@ -4490,6 +4531,14 @@ pub struct User {
     /// the user's value yet.
     pub pending_attributes: BTreeMap<String, String>,
     pub password: Option<String>,
+    /// The passwords this user held BEFORE the one it holds now, most recently
+    /// superseded first: "users can't set a password that matches any of `n`
+    /// previous passwords, where `n` is the value of `PasswordHistorySize`"
+    /// (`PasswordPolicyType.PasswordHistorySize` in this service's model), so
+    /// every path that replaces a password records the one it replaced here
+    /// ([`User::set_password`]). Never rendered — no modelled member reports a
+    /// password — and bounded by [`MAX_PASSWORD_HISTORY_PER_USER`].
+    pub password_history: Vec<String>,
     /// Whether [`User::password`] is permanent; a temporary one must be changed
     /// at the next sign-in and expires with the pool's policy.
     pub password_permanent: bool,
@@ -4843,6 +4892,35 @@ impl User {
     /// pool's passkey configuration to decide ([`UserPool::passkeys_satisfy_mfa`]).
     pub fn activates_passkey_mfa(&self) -> bool {
         self.web_authn_mfa_enabled.is_none_or(|enabled| enabled)
+    }
+
+    /// Replace this user's password with `password`, as of `now`, recording the
+    /// password it replaces in this user's history.
+    ///
+    /// Every path that sets a password for an EXISTING user goes through here,
+    /// so the history a pool's `PasswordHistorySize` is read against
+    /// ([`UserPool::restricts_password_reuse`]) holds every password the user
+    /// has had, whichever operation set it. `permanent` is whether the user may
+    /// sign in with it straight away or owes a change at its next sign-in
+    /// ([`User::password_permanent`]).
+    pub fn set_password(&mut self, password: String, permanent: bool, now: SystemTime) {
+        if let Some(replaced) = self.password.replace(password) {
+            self.password_history.insert(0, replaced);
+            self.password_history.truncate(MAX_PASSWORD_HISTORY_PER_USER);
+        }
+        self.password_permanent = permanent;
+        self.password_set_at = Some(now);
+        self.user_last_modified_date = now;
+    }
+
+    /// This user's passwords, most recently set FIRST: the one it holds now,
+    /// then the ones it held before it, as far back as
+    /// [`MAX_PASSWORD_HISTORY_PER_USER`] keeps them.
+    pub fn recent_passwords(&self) -> impl Iterator<Item = &str> {
+        self.password
+            .as_deref()
+            .into_iter()
+            .chain(self.password_history.iter().map(String::as_str))
     }
 
     /// Whether the stored password is a temporary one that has outlived

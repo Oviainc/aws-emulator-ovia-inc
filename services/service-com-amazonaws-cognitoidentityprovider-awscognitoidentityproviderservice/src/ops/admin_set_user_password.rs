@@ -204,13 +204,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(invalid_password(message));
         }
+        let stored = pool.user(&input.username).ok_or_else(user_not_found)?;
+        // A password this pool's history policy restricts the user from reusing is
+        // refused here too: the model declares
+        // `PasswordHistoryPolicyViolationException` for this operation, so the window
+        // is read whoever sets the password.
+        if pool.restricts_password_reuse(stored, &input.password) {
+            return Err(password_reused());
+        }
         let user = pool
             .user_mut(&input.username)
             .ok_or_else(user_not_found)?;
 
-        user.password = Some(input.password);
-        user.password_permanent = input.permanent;
-        user.password_set_at = Some(now);
+        // The password an administrator sets replaces the one the user held, which
+        // joins that user's password history: a later change is judged against every
+        // password the user has had, whichever call set it.
+        user.set_password(input.password, input.permanent, now);
         // "Set to true to set a password that the user can immediately sign in
         // with. Set to false to set a temporary password that the user must
         // change on their next sign-in." (`AdminSetUserPassword.Permanent`).
@@ -247,6 +256,17 @@ fn invalid_password(message: String) -> AdminSetUserPasswordError {
     AdminSetUserPasswordErrorModeled::InvalidPasswordException(InvalidPasswordException {
         message: Some(message),
     })
+    .into()
+}
+
+/// This operation's refusal of a password the pool's history policy restricts
+/// the user from reusing.
+fn password_reused() -> AdminSetUserPasswordError {
+    AdminSetUserPasswordErrorModeled::PasswordHistoryPolicyViolationException(
+        PasswordHistoryPolicyViolationException {
+            message: Some(crate::state::PASSWORD_REUSED_MESSAGE.to_string()),
+        },
+    )
     .into()
 }
 

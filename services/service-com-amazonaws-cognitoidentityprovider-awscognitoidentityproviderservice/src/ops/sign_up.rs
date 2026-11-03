@@ -389,6 +389,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // next sign-in: it is permanent, unlike the one `AdminCreateUser` sets.
             password_permanent: true,
             password_set_at: password.map(|_| now),
+            // A user that just registered has held no password before the one it
+            // registered with, so it owes its history nothing.
+            password_history: Vec::new(),
             // "When you get this exception in the response, the user is successfully
             // created and is in an UNCONFIRMED state" (this operation's own doc): a
             // signed-up user is unconfirmed until a confirmation confirms it.

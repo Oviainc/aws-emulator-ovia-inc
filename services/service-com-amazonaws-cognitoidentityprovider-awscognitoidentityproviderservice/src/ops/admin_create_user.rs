@@ -434,6 +434,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The status below is the same either way.
             password: input.temporary_password.clone(),
             password_permanent: false,
+            // A user this call just created has had no password before the one
+            // it is created with, so it owes its history nothing.
+            password_history: Vec::new(),
             password_set_at: input.temporary_password.as_ref().map(|_| now),
             // An administrator-created user must change the password it signs in with.
             status: crate::state::UserStatus::ForceChangePassword,

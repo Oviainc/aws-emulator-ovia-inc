@@ -437,6 +437,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 return Err(invalid_session());
             }
+            // A password this pool's policy restricts the user from reusing is
+            // refused before anything is written, as on every other path where
+            // the user itself chooses the password it will sign in with.
+            if pool.restricts_password_reuse(stored, &new_password) {
+                return Err(password_reused());
+            }
             let username = stored.username.clone();
             let mut attributes = stored.attributes.clone();
             for (name, value) in requested {
@@ -470,12 +476,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let user = pool.user_mut(&username).ok_or_else(user_not_found)?;
             user.attributes = attributes;
             // The challenge is answered, so the password the user signs in with from
-            // now on is the one it just chose, and it owes no further change.
-            user.password = Some(new_password);
-            user.password_permanent = true;
-            user.password_set_at = Some(now);
+            // now on is the one it just chose, and it owes no further change; the one
+            // it replaces joins this user's password history.
+            user.set_password(new_password, true, now);
             user.status = crate::state::UserStatus::Confirmed;
-            user.user_last_modified_date = now;
 
             // The session answered its challenge, so it is spent.
             guard.end_session(&session_token);
@@ -641,6 +645,17 @@ fn invalid_password(message: String) -> AdminRespondToAuthChallengeError {
     AdminRespondToAuthChallengeErrorModeled::InvalidPasswordException(InvalidPasswordException {
         message: Some(message),
     })
+    .into()
+}
+
+/// This operation's refusal of a password the pool's history policy restricts
+/// the user from reusing.
+fn password_reused() -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::PasswordHistoryPolicyViolationException(
+        PasswordHistoryPolicyViolationException {
+            message: Some(crate::state::PASSWORD_REUSED_MESSAGE.to_string()),
+        },
+    )
     .into()
 }
 

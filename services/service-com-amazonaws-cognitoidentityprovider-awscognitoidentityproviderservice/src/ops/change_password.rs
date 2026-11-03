@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ChangePassword
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ChangePassword`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ChangePassword::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The signed-in user's own password change: the `AccessToken` names the user
+//! ([`crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::signed_in_user`]),
+//! the `PreviousPassword` has to be the one that user holds, and the
+//! `ProposedPassword` becomes the password it signs in with from then on —
+//! stored, so every later sign-in and read of the same user sees it.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +177,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ChangePassword` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ChangePasswordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ChangePassword"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // An access token's lifetime is read against the clock, so an expired token is
+        // refused whether or not anything has swept it.
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        // Decide the whole write FIRST — which stored user it applies to, and whether
+        // the proposed password may be stored for that user at all — so a refused
+        // request leaves that user's credential exactly as it was.
+        let (user_pool_id, username) = {
+            let (pool, user) = guard
+                .signed_in_user(&input.access_token, now)
+                .map_err(token_rejected)?;
+            if !user.enabled {
+                return Err(not_authorized("User is disabled."));
+            }
+            // A user that never confirmed its registration has no password change to
+            // make: this operation declares its own error for that state.
+            if user.status == crate::state::UserStatus::Unconfirmed {
+                return Err(user_not_confirmed());
+            }
+            // "The user's previous password. Required if the user has a password. If
+            // the user has no password and only signs in with passwordless
+            // authentication options, you can omit this parameter"
+            // (`ChangePassword.PreviousPassword` in this service's model) — so the
+            // parameter is required of exactly the users that hold a password, and it
+            // is the STORED password it is checked against.
+            match (user.password.as_deref(), input.previous_password.as_deref()) {
+                (Some(_), None) => return Err(missing_parameter("PreviousPassword")),
+                (stored, Some(presented)) if stored != Some(presented) => {
+                    return Err(incorrect_credentials());
+                }
+                _ => {}
+            }
+            // The password the user proposes has to comply with the pool's own policy,
+            // as every other password this API accepts from a user does, and it is
+            // judged BEFORE anything is written.
+            if let Some(message) = pool.check_password(
+                &input.proposed_password,
+                crate::state::PasswordPolicyWording::UserSuppliesPassword,
+            ) {
+                return Err(invalid_password(message));
+            }
+            // A password the pool's history policy restricts this user from reusing is
+            // refused with the error the model declares for exactly that.
+            if pool.restricts_password_reuse(user, &input.proposed_password) {
+                return Err(password_reused());
+            }
+            // The username as STORED, which a case-insensitive pool may case
+            // differently from the one the token's sign-in named.
+            (pool.id.clone(), user.username.clone())
+        };
+
+        let user = guard
+            .pool_mut(&user_pool_id)
+            .and_then(|pool| pool.user_mut(&username))
+            .ok_or_else(internal_error)?;
+        // The password the user signs in with from now on is the one it just chose, and
+        // it owes no further change: the user chose this one itself, unlike a temporary
+        // password an administrator set. The one it replaces joins the user's history.
+        user.set_password(input.proposed_password, true, now);
+        // A user Amazon Cognito was waiting on a new password from owes none now:
+        // "after the user sets a new password [...] their status becomes `Confirmed`"
+        // (`AdminSetUserPassword` in this service's model).
+        if user.status == crate::state::UserStatus::ForceChangePassword {
+            user.status = crate::state::UserStatus::Confirmed;
+        }
+
+        // This operation models no output member: what it asserts is the stored
+        // credential every later sign-in of the same user is judged against.
+        Ok(ChangePasswordOutput {})
     }
+}
+
+/// This operation's answer to an `AccessToken` that names no signed-in user.
+///
+/// Every rejection of the token itself answers `NotAuthorizedException`, which "is
+/// thrown when a user isn't authorized" (this service's model), while a token whose
+/// pool or user has since been deleted answers the error for the resource that is
+/// gone. No message names a stored value, so the refusal reports why the token was
+/// not accepted and nothing else.
+fn token_rejected(rejection: crate::state::TokenRejection) -> ChangePasswordError {
+    match rejection {
+        crate::state::TokenRejection::NotAnAccessToken => not_authorized("Invalid Access Token"),
+        // A token this emulator issued and a sign-out or a revocation has since
+        // invalidated, which is told apart from a value that resolves to no access
+        // token at all.
+        crate::state::TokenRejection::Revoked => {
+            not_authorized(crate::state::ACCESS_TOKEN_REVOKED_MESSAGE)
+        }
+        crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        // The token is live and authorizes this operation, but Amazon Cognito is
+        // waiting on a password RESET for the user it names, which only an
+        // administrator or the forgotten-password flow completes — this operation
+        // declares its own error for that state.
+        crate::state::TokenRejection::PasswordResetRequired => {
+            ChangePasswordErrorModeled::PasswordResetRequiredException(
+                PasswordResetRequiredException {
+                    message: Some(crate::state::PASSWORD_RESET_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+            .into()
+        }
+        crate::state::TokenRejection::MissingRequiredScopes => {
+            not_authorized(crate::state::MISSING_REQUIRED_SCOPES_MESSAGE)
+        }
+        crate::state::TokenRejection::PoolGone => {
+            ChangePasswordErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                // The caller named no pool — the token did — so this message names
+                // none either.
+                message: Some("User pool does not exist.".to_string()),
+            })
+            .into()
+        }
+        crate::state::TokenRejection::UserGone => {
+            ChangePasswordErrorModeled::UserNotFoundException(UserNotFoundException {
+                message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into()
+        }
+    }
+}
+
+/// The refusal a `PreviousPassword` that is not the one the user holds earns. It
+/// reports nothing about the stored password beyond that this is not it, which is
+/// also what a wrong password is answered with where it is presented to sign in.
+fn incorrect_credentials() -> ChangePasswordError {
+    not_authorized("Incorrect username or password.")
+}
+
+/// The refusal for a parameter this request required and did not carry.
+fn missing_parameter(parameter: &str) -> ChangePasswordError {
+    ChangePasswordErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(format!("Missing required parameter {parameter}")),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `UserNotConfirmedException` for a user in `UNCONFIRMED`.
+fn user_not_confirmed() -> ChangePasswordError {
+    ChangePasswordErrorModeled::UserNotConfirmedException(UserNotConfirmedException {
+        message: Some("User is not confirmed.".to_string()),
+    })
+    .into()
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> ChangePasswordError {
+    ChangePasswordErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidPasswordException`, carrying `message`.
+fn invalid_password(message: String) -> ChangePasswordError {
+    ChangePasswordErrorModeled::InvalidPasswordException(InvalidPasswordException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's refusal of a password the pool's history policy restricts the
+/// user from reusing.
+fn password_reused() -> ChangePasswordError {
+    ChangePasswordErrorModeled::PasswordHistoryPolicyViolationException(
+        PasswordHistoryPolicyViolationException {
+            message: Some(crate::state::PASSWORD_REUSED_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> ChangePasswordError {
+    ChangePasswordErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

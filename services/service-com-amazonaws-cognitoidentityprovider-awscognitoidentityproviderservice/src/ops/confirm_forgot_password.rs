@@ -288,6 +288,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 return Err(invalid_password(message));
             }
+            // A password this pool's history policy restricts the user from
+            // reusing is refused for the same reason and at the same point: the
+            // reset is still outstanding, so a different password can complete it.
+            if pool.restricts_password_reuse(user, &input.password) {
+                return Err(password_reused());
+            }
 
             let user = guard
                 .pool_mut(&user_pool_id)
@@ -295,10 +301,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(internal_error)?;
             // The password the user signs in with from now on is the one it just chose, and
             // it owes no further change: this is the user's own choice, not a temporary one
-            // an administrator set.
-            user.password = Some(input.password.clone());
-            user.password_permanent = true;
-            user.password_set_at = Some(now);
+            // an administrator set. The password it replaces joins this user's history.
+            user.set_password(input.password.clone(), true, now);
             // A user Amazon Cognito was waiting on a new password from owes none now.
             if matches!(
                 user.status,
@@ -424,6 +428,17 @@ fn invalid_password(message: String) -> ConfirmForgotPasswordError {
     ConfirmForgotPasswordErrorModeled::InvalidPasswordException(InvalidPasswordException {
         message: Some(message),
     })
+    .into()
+}
+
+/// This operation's refusal of a password the pool's history policy restricts
+/// the user from reusing.
+fn password_reused() -> ConfirmForgotPasswordError {
+    ConfirmForgotPasswordErrorModeled::PasswordHistoryPolicyViolationException(
+        PasswordHistoryPolicyViolationException {
+            message: Some(crate::state::PASSWORD_REUSED_MESSAGE.to_string()),
+        },
+    )
     .into()
 }
 

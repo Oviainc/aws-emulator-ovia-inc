@@ -107,6 +107,7 @@ fn stored_user(password_permanent: bool, password_set_at: Option<SystemTime>) ->
         password: Some(GOOD_PASSWORD.to_string()),
         password_permanent,
         password_set_at,
+        password_history: Vec::new(),
         status: state::UserStatus::ForceChangePassword,
         enabled: true,
         mfa_options: Vec::new(),

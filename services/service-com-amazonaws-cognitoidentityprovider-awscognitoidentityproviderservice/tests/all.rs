@@ -47,6 +47,8 @@ mod app_client_refusal_wording;
 mod auth_flow_not_enabled;
 #[path = "all/authentication_success_shape.rs"]
 mod authentication_success_shape;
+#[path = "all/change_password.rs"]
+mod change_password;
 #[path = "all/client_secret_not_found_message.rs"]
 mod client_secret_not_found_message;
 #[path = "all/clock_dependent_state.rs"]
