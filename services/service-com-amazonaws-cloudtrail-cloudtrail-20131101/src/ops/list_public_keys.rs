@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPublicKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPublicKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the public halves of the key pairs CloudTrail signs this Region's digest files
+//! with, over the time range the request asks about.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPublicKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A signing key is not a caller-created resource: CloudTrail owns the key pairs, one per
+//! Region at a time, and rotates them on a schedule of its own, so WHICH keys exist follows
+//! from the Region and the clock ([`keys_in_window`]) rather than from anything a client
+//! stored. Each key's bits are derived from the Region and the period it signs in, so every
+//! call reports the same key for the same period, and a different one per Region — "CloudTrail
+//! uses different private and public key pairs per Region".
+//!
+//! A listing is a REPORTING call: it derives the schedule and writes nothing, so two
+//! identical calls answer the same keys and a later caller sees exactly what an earlier one
+//! did.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +89,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::pkcs1::der::Encode;
+use ::sha2::Digest;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -156,18 +163,213 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPublicKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPublicKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPublicKeys"))
+        // Nothing in this answer depends on the store: CloudTrail owns the digest-signing
+        // key pairs and rotates them on its own schedule, so no call creates, changes or
+        // removes one, and a listing persists nothing.
+        let _ = &self.engine;
+
+        // "CloudTrail uses different private and public key pairs per Region. Each digest
+        // file is signed with a private key unique to its Region", so the keys a listing
+        // reports are the ones of the Region the request was made in.
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::millis_of(::std::time::SystemTime::now());
+
+        // "Optionally specifies, in UTC, the start of the time range … If not specified, the
+        // current time is used, and the current public key is returned" / "the end of the
+        // time range … If not specified, the current time is used": an absent bound is the
+        // instant of the call, so a request that states neither asks about right now.
+        let from = input
+            .start_time
+            .as_ref()
+            .map_or(now, crate::state::datetime_millis);
+        let to = input
+            .end_time
+            .as_ref()
+            .map_or(now, crate::state::datetime_millis);
+        // `InvalidTimeRangeException` "occurs if the timestamp values are not valid. Either
+        // the start time occurs after the end time, or the time range is outside the range of
+        // possible values": a window whose start is after its end is refused, in the fixed
+        // sentence this operation words that refusal with ([`INVERTED_WINDOW_MESSAGE`]).
+        if from > to {
+            return Err(ListPublicKeysErrorModeled::InvalidTimeRangeException(
+                InvalidTimeRangeException {
+                    message: Some(INVERTED_WINDOW_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        // `NextToken` is "Reserved for future use" on the request and on the response alike,
+        // and so is the `InvalidTokenException` a token would be refused with: this operation
+        // paginates nothing yet, so a token names no continuation and selects no keys, and
+        // the refusal reserved for one is not raised. The member is read here and nowhere
+        // else, which is what keeps that visible.
+        let _reserved_for_future_use = &input.next_token;
+
+        Ok(ListPublicKeysOutput {
+            public_key_list: Some(keys_in_window(&region, from, to, now)?),
+            // "Reserved for future use": the service issues no page marker, so the keys of
+            // the whole window are one answer.
+            next_token: None,
+        })
     }
+}
+
+/// How this operation words a window whose start is after its end: the fixed sentence for
+/// that error class, carrying no part of the request.
+///
+/// `InvalidTimeRangeException` "occurs if the timestamp values are not valid. Either the
+/// start time occurs after the end time, or the time range is outside the range of possible
+/// values", and the recorded refusal of an inverted window here is this one sentence. It is
+/// NOT the sentence `LookupEvents` carries for the same error shape ("The start time precedes
+/// the end time.", `crate::ops::lookup_events`): the two operations word this refusal
+/// differently, so each keeps the wording recorded for it.
+const INVERTED_WINDOW_MESSAGE: &str = "Invalid input parameter! Start time is after end time";
+
+/// The first instant of this service's key schedule: the date of the API version this
+/// service's model is named for (`CloudTrail_20131101`, API version 2013-11-01), in whole
+/// milliseconds since the epoch. No digest file — and so no key that signed one — predates
+/// the service itself, which is what bounds how far back a listing can reach.
+const KEY_SCHEDULE_START_MILLIS: i64 = 1_383_264_000_000;
+
+/// How long one key pair signs a Region's digest files for before CloudTrail rotates it.
+///
+/// The service publishes no rotation interval, so this span is the emulator's own choice.
+/// What the model does state is what a caller sees either way: a key carries a validity
+/// range, and "the returned public keys may have validity time ranges that overlap".
+const KEY_VALIDITY_SPAN_MILLIS: i64 = 90 * 24 * 60 * 60 * 1_000;
+
+/// The keys whose validity range overlaps the window `[from, to]`, oldest first.
+///
+/// The validity ranges tile the schedule — each key takes over the instant the previous
+/// one's range ends — so exactly one key is current at any instant, and the keys a window
+/// selects are the consecutive run of periods it spans. Two bounds hold whatever the request
+/// asks for: nothing before the schedule's start exists, and neither does a key for a period
+/// that has not begun at `now`, because CloudTrail has not generated it yet.
+fn keys_in_window(
+    region: &str,
+    from: i64,
+    to: i64,
+    now: i64,
+) -> Result<Vec<PublicKey>, ListPublicKeysError> {
+    let current = period_of(now);
+    let first = period_of(from).max(0);
+    let last = period_of(to).min(current);
+    if first > last {
+        return Ok(Vec::new());
+    }
+    (first..=last)
+        .map(|period| key_of(region, period))
+        .collect()
+}
+
+/// The period of the schedule the instant `millis` falls in, counted from
+/// [`KEY_SCHEDULE_START_MILLIS`]. Negative for an instant before the schedule began, which
+/// is how [`keys_in_window`] reads a window reaching back past it.
+fn period_of(millis: i64) -> i64 {
+    millis
+        .saturating_sub(KEY_SCHEDULE_START_MILLIS)
+        .div_euclid(KEY_VALIDITY_SPAN_MILLIS)
+}
+
+/// "The starting time of validity of the public key" of `period`.
+fn validity_start_millis(period: i64) -> i64 {
+    KEY_SCHEDULE_START_MILLIS.saturating_add(period.saturating_mul(KEY_VALIDITY_SPAN_MILLIS))
+}
+
+/// "The ending time of validity of the public key" of `period`: the last instant before the
+/// next key takes over, so the ranges tile the schedule rather than leaving a gap.
+fn validity_end_millis(period: i64) -> i64 {
+    validity_start_millis(period.saturating_add(1)).saturating_sub(1)
+}
+
+/// The modelled `PublicKey` of the key pair `region` signs with in `period`.
+fn key_of(region: &str, period: i64) -> Result<PublicKey, ListPublicKeysError> {
+    let value = public_key_der(region, period)?;
+    Ok(PublicKey {
+        fingerprint: Some(fingerprint_of(&value)),
+        value: Some(value),
+        validity_start_time: Some(::aws_smithy_types::DateTime::from_millis(
+            validity_start_millis(period),
+        )),
+        validity_end_time: Some(::aws_smithy_types::DateTime::from_millis(
+            validity_end_millis(period),
+        )),
+    })
+}
+
+/// How many bytes the modulus of one of these keys has: 256, a 2048-bit RSA modulus.
+const MODULUS_BYTES: usize = 256;
+
+/// The public exponent every one of these keys carries, big-endian: 65537, the exponent an
+/// RSA key pair is generated with.
+const PUBLIC_EXPONENT: [u8; 3] = [0x01, 0x00, 0x01];
+
+/// "The DER encoded public key value in PKCS#1 format" (`PublicKey$Value`) of the key pair
+/// `region` signs with in `period`.
+///
+/// The emulator holds no key store, so there is no generated key pair to export: the modulus
+/// is DERIVED from the Region and the period, which is what makes a key stable — every call
+/// reports the same bytes for the same Region and period — and distinct per Region, as the
+/// model states the real keys are. The ENCODING is the real one: the `pkcs1` crate writes the
+/// RFC 8017 `RSAPublicKey` structure, so the body a caller receives parses as the format the
+/// member documents. Nothing in the emulator signs or verifies with it.
+///
+/// Nothing a caller sends can make this fail: the Region only feeds the digest below, whose
+/// output is always [`MODULUS_BYTES`] bytes with its top bit set, and an unsigned DER integer
+/// is refused only for an empty value or one with a leading zero byte. The failure is
+/// reported rather than asserted away so that no request can panic this handler, and the
+/// error it reports is the one the model has for an answer this service cannot give
+/// (`UnsupportedOperationException`, "thrown when the requested operation is not
+/// supported"). The sentence is the emulator's own and is UNOBSERVABLE: no request reaches
+/// it, so there is no recorded wording of the real service's to reproduce here, and nothing
+/// a caller can send will ever read it.
+fn public_key_der(region: &str, period: i64) -> Result<Vec<u8>, ListPublicKeysError> {
+    encode_public_key(&modulus_of(region, period)).ok_or_else(|| {
+        ListPublicKeysErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+            message: Some(format!(
+                "The public key of {region} could not be written in PKCS#1 format"
+            )),
+        })
+        .into()
+    })
+}
+
+/// The DER of the PKCS#1 `RSAPublicKey` with this modulus and [`PUBLIC_EXPONENT`].
+fn encode_public_key(modulus: &[u8]) -> Option<Vec<u8>> {
+    ::pkcs1::RsaPublicKey {
+        modulus: ::pkcs1::der::asn1::UintRef::new(modulus).ok()?,
+        public_exponent: ::pkcs1::der::asn1::UintRef::new(&PUBLIC_EXPONENT).ok()?,
+    }
+    .to_der()
+    .ok()
+}
+
+/// The modulus of the key pair `region` signs with in `period`: [`MODULUS_BYTES`] bytes of
+/// SHA-256 run in counter mode over the Region and the period, so the value is the same on
+/// every call and no two Regions or periods share one.
+///
+/// The top bit is set, so the value really is a 2048-bit integer rather than a shorter one
+/// with leading zero bits, and the low bit is set, as the product of two odd primes is.
+fn modulus_of(region: &str, period: i64) -> Vec<u8> {
+    let mut modulus = Vec::with_capacity(MODULUS_BYTES);
+    let mut block = 0u32;
+    while modulus.len() < MODULUS_BYTES {
+        modulus.extend_from_slice(&::sha2::Sha256::digest(format!("{region}:{period}:{block}")));
+        block += 1;
+    }
+    modulus.truncate(MODULUS_BYTES);
+    if let Some(first) = modulus.first_mut() {
+        *first |= 0x80;
+    }
+    if let Some(last) = modulus.last_mut() {
+        *last |= 0x01;
+    }
+    modulus
+}
+
+/// "The fingerprint of the public key" (`PublicKey$Fingerprint`): the MD5 digest of the DER
+/// public key, hex-encoded — the same form a digest file records the key that signed it by,
+/// so a client can match the two.
+fn fingerprint_of(der: &[u8]) -> String {
+    ::hex::encode(::md5::Md5::digest(der))
 }

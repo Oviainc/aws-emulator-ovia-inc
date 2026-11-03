@@ -55,12 +55,26 @@ hex = { workspace = true }
 # and `UpdateTrail` resolve the destination `S3BucketName` in the one object store
 # (`state::destination_bucket_exists`) rather than in a copy of it here.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# Writes the DER PKCS#1 `RSAPublicKey` body a digest-signing public key is reported as
+# (`ListPublicKeys`, `PublicKey$Value`: "The DER encoded public key value in PKCS#1
+# format"), so that structure comes from an ASN.1 crate rather than from hand-written DER.
+# `alloc` is what carries the DER WRITER (`to_der`), and it is the only feature asked for:
+# `pem` is left off because the member is DER, not PEM, and nothing here reads or writes a
+# private key.
+pkcs1 = { version = "0.7", default-features = false, features = ["alloc"] }
+# The MD5 digest a public key's `Fingerprint` is, over that DER body.
+md-5 = "0.10"
+# Derives the bits of the per-Region, per-period digest-signing keys `ListPublicKeys`
+# reports, so the same Region and period always answer the same key.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
+# Reads the base64 an `awsJson1_1` body carries a blob member in, so a suite can decode the
+# DER public key `ListPublicKeys` reported and parse it back.
+base64 = "0.22"
 
 [lints]
 workspace = true

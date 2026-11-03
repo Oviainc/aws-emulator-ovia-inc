@@ -192,3 +192,8 @@ mod selectors_that_log_nothing;
 // configuration call is judged on its parameters before its target.
 #[path = "all/request_validation.rs"]
 mod request_validation;
+// `digest_signing_public_keys` pins `ListPublicKeys`: which of the Region's digest-signing
+// keys a window selects, what a reported key is, and how an inverted window and a page
+// marker the service never issued are refused.
+#[path = "all/digest_signing_public_keys.rs"]
+mod digest_signing_public_keys;

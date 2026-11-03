@@ -98,6 +98,20 @@ pub fn limit_not_valid_message(member: &str, bound: &str) -> String {
     format!("The limit at '{member}' is not valid: it must have value {bound}.")
 }
 
+/// An instant as whole milliseconds since the epoch — the resolution this service compares a
+/// recorded time and a caller-supplied window bound at.
+pub fn millis_of(at: SystemTime) -> i64 {
+    datetime_millis(&::aws_smithy_types::DateTime::from(at))
+}
+
+/// A caller-supplied timestamp as whole milliseconds since the epoch ([`millis_of`]).
+pub fn datetime_millis(value: &::aws_smithy_types::DateTime) -> i64 {
+    value
+        .secs()
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(value.subsec_nanos() / 1_000_000))
+}
+
 /// From the model doc for `TagsLimitExceededException`: "The number of tags per
 /// trail, event data store, dashboard, or channel has exceeded the permitted amount.
 /// Currently, the limit is 50."

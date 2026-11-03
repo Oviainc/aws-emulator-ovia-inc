@@ -121,6 +121,11 @@ use ::service_common::management_events::{
     ManagementEvent, EVENT_CATEGORY_INSIGHT, EVENT_CATEGORY_MANAGEMENT, EVENT_RETENTION,
 };
 
+// A timestamp and an instant read as whole milliseconds: the SERVICE's readings
+// (`crate::state`), because every operation that compares a time to a window compares them
+// the same way.
+use crate::state::{datetime_millis, millis_of};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -306,6 +311,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `InvalidTimeRangeException` "occurs if the timestamp values are not valid. Either the
 /// start time occurs after the end time, or the time range is outside the range of
 /// possible values", and the recorded refusal of an inverted window is this one sentence.
+/// It is this OPERATION's wording: `ListPublicKeys` refuses an inverted window in the same
+/// error shape and a different sentence, each as recorded for it.
 const INVERTED_TIME_RANGE_MESSAGE: &str = "The start time precedes the end time.";
 
 /// How CloudTrail words a `NextToken` it cannot read: the fixed sentence for that
@@ -557,22 +564,6 @@ fn read_token(token: &str, fingerprint: &str) -> Option<(i64, u64)> {
     let millis = fields.next()?.parse().ok()?;
     let seq = fields.next()?.parse().ok()?;
     fields.next().is_none().then_some((millis, seq))
-}
-
-/// A caller-supplied timestamp as whole milliseconds since the epoch — the resolution a
-/// recorded event's time is compared at.
-fn datetime_millis(value: &::aws_smithy_types::DateTime) -> i64 {
-    value
-        .secs()
-        .saturating_mul(1_000)
-        .saturating_add(i64::from(value.subsec_nanos() / 1_000_000))
-}
-
-/// An instant as whole milliseconds since the epoch.
-fn millis_of(at: ::std::time::SystemTime) -> i64 {
-    at.duration_since(::std::time::UNIX_EPOCH)
-        .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 /// The retention window in milliseconds.
