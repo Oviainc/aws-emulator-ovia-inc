@@ -41,6 +41,8 @@ mod revision_finalization;
 mod revisions;
 #[path = "all/signed_url_uploads.rs"]
 mod signed_url_uploads;
+#[path = "all/start_job.rs"]
+mod start_job;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/timestamp_wire_form.rs"]
