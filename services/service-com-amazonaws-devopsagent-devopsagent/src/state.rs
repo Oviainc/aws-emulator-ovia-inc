@@ -450,12 +450,16 @@ pub fn not_a_file_of_the_asset_message(path: &str) -> String {
 /// The refusal message a file create answers with when the asset's content IS one
 /// file and the asset already holds it.
 ///
-/// An asset whose content is a single file has no room for a second one, whatever
-/// path the request names, so the refusal names the asset the request asked for and
-/// the file it already holds, taken from the store, so the caller can tell it from
-/// a path that is merely taken.
-pub fn asset_holds_one_file_message(asset_id: &str, path: &str) -> String {
-    format!("Asset {asset_id} contains a single file at {path}, so another file cannot be created in it")
+/// How many files an asset holds is a property of its TYPE, so that is what the
+/// refusal reports: the fixed text is "Assets of type '<assetType>' support only
+/// one file. Use UpdateAssetFile to replace the existing file.", whose only
+/// variable part is the asset's own `assetType`, read from the stored asset. It
+/// names neither the asset nor the path it already holds, and it points the caller
+/// at the operation that replaces a stored file.
+pub fn asset_type_holds_one_file_message(asset_type: &str) -> String {
+    format!(
+        "Assets of type '{asset_type}' support only one file. Use UpdateAssetFile to replace the existing file."
+    )
 }
 
 /// The refusal message a file create answers with when the asset already holds a
@@ -843,10 +847,14 @@ pub struct AssetRecord {
     pub asset_id: String,
     pub agent_space_id: String,
     pub asset_type: String,
-    /// The metadata describing this asset. `Asset$metadata` is required on the
-    /// wire, so an asset created without any is stored with an empty set of
-    /// members rather than nothing.
+    /// The metadata the CALLER described this asset with. `Asset$metadata` is
+    /// required on the wire, so an asset created without any is stored with an
+    /// empty set of members rather than nothing; what the SERVICE maintains in
+    /// that document is added where the asset is served ([`AssetRecord::to_api`]).
     pub metadata: ::aws_smithy_types::Document,
+    /// The lifecycle state of this asset, reported as the `status` member of the
+    /// metadata document every read of it serves.
+    pub status: String,
     pub version: i32,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
@@ -881,7 +889,10 @@ impl AssetRecord {
         Asset {
             asset_id: self.asset_id.clone(),
             asset_type: self.asset_type.clone(),
-            metadata: self.metadata.clone(),
+            metadata: metadata_with_maintained(
+                Some(&self.metadata),
+                &[(METADATA_STATUS_FIELD, &self.status)],
+            ),
             version: self.version,
             created_at: to_date_time(self.created_at),
             updated_at: to_date_time(self.updated_at),
@@ -952,11 +963,21 @@ impl AssetFileRecord {
         AssetFile {
             path: self.path.clone(),
             content: self.body.clone(),
-            metadata: self.metadata.clone(),
+            metadata: self.metadata_to_api(),
             version: self.version,
             created_at: to_date_time(self.created_at),
             updated_at: to_date_time(self.updated_at),
         }
+    }
+
+    /// The metadata document served for this file: the members the caller
+    /// described it with, completed with the media type of the content stored for
+    /// it ([`metadata_with_maintained`]).
+    fn metadata_to_api(&self) -> Option<::aws_smithy_types::Document> {
+        Some(metadata_with_maintained(
+            self.metadata.as_ref(),
+            &[(METADATA_MIME_TYPE_FIELD, file_media_type(&self.body))],
+        ))
     }
 
     /// The size of this file's content, in bytes: the bytes themselves, or the
@@ -995,6 +1016,72 @@ pub fn document_kind(document: &::aws_smithy_types::Document) -> &'static str {
 /// when the create named none.
 pub fn empty_metadata() -> ::aws_smithy_types::Document {
     ::aws_smithy_types::Document::Object(HashMap::new())
+}
+
+/// The `status` member of an asset's metadata: the lifecycle state the service
+/// keeps for the asset itself.
+pub const METADATA_STATUS_FIELD: &str = "status";
+
+/// The lifecycle state of an asset that exists and is readable.
+///
+/// The model leaves `Asset$metadata` an open `Document` and names no lifecycle
+/// member, so this is the service's own behaviour: an asset is created ready —
+/// `CreateAsset` answers with it already readable — so there is no transient state
+/// to pass through and no later state but gone, which `DeleteAsset` reaches by
+/// removing the asset.
+pub const ASSET_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `mimeType` member of an asset file's metadata: the media type of the
+/// content the service holds for that file.
+pub const METADATA_MIME_TYPE_FIELD: &str = "mimeType";
+
+/// The media type of one stored file's content.
+///
+/// The model types a file's content as either TEXT (`AssetFileText`) or BYTES
+/// (`AssetFileBytes`), and that is what the service knows about it: text content is
+/// the markdown this service's assets are authored in, and bytes are an opaque
+/// stream, because nothing about them says what they are.
+pub fn file_media_type(body: &AssetFileBody) -> &'static str {
+    match body {
+        AssetFileBody::Text(_) => MEDIA_TYPE_MARKDOWN,
+        AssetFileBody::Bytes(_) => MEDIA_TYPE_OCTET_STREAM,
+    }
+}
+
+/// The media type of text content an asset holds.
+pub const MEDIA_TYPE_MARKDOWN: &str = "text/markdown";
+
+/// The media type of binary content an asset holds: a stream of bytes whose
+/// meaning the service is told nothing about.
+pub const MEDIA_TYPE_OCTET_STREAM: &str = "application/octet-stream";
+
+/// The metadata document this service SERVES for a resource, given the document
+/// the caller described it with.
+///
+/// A `metadata` document describes its resource, and part of that description is
+/// the service's own rather than the caller's: the lifecycle state of an asset, the
+/// media type of a file's content. Those members are reported alongside the ones
+/// the caller described and never replace one of them, so a document a caller
+/// round-trips through this service comes back carrying exactly the members they
+/// wrote, plus what the service knows about the resource itself.
+///
+/// A described document that is not a set of members has no members to complete, so
+/// it is reported as it was stored.
+pub fn metadata_with_maintained(
+    described: Option<&::aws_smithy_types::Document>,
+    maintained: &[(&str, &str)],
+) -> ::aws_smithy_types::Document {
+    let mut members = match described {
+        Some(::aws_smithy_types::Document::Object(described)) => described.clone(),
+        Some(other) => return other.clone(),
+        None => HashMap::new(),
+    };
+    for (field, value) in maintained {
+        members
+            .entry((*field).to_string())
+            .or_insert_with(|| ::aws_smithy_types::Document::String((*value).to_string()));
+    }
+    ::aws_smithy_types::Document::Object(members)
 }
 
 /// A persisted Trigger: the schedule it fires on, the action it performs, and the

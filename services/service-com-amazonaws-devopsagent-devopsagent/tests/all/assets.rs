@@ -278,9 +278,13 @@ async fn created_asset_is_returned_unchanged_by_get() {
             "case {case:?}: assetType came back as {:?}",
             asset["assetType"]
         );
-        // `Asset$metadata` is required: what the request described, or an empty
-        // set of members when it described none.
-        let expected_metadata = input.get("metadata").cloned().unwrap_or_else(|| json!({}));
+        // `Asset$metadata` is required: the members the request described, or none
+        // at all, completed with the lifecycle state the SERVICE maintains in that
+        // document — see the `status` rule in `asset_metadata_and_deletion`.
+        let mut expected_metadata = input.get("metadata").cloned().unwrap_or_else(|| json!({}));
+        expected_metadata["status"] = json!(
+            service_com_amazonaws_devopsagent_devopsagent::state::ASSET_STATUS_ACTIVE
+        );
         assert_eq!(
             asset["metadata"], expected_metadata,
             "case {case:?}: metadata came back as {:?}",

@@ -367,8 +367,21 @@ async fn an_update_mints_a_revision_and_the_previous_one_keeps_its_content() {
             "case {name:?}: content came back as {:?}",
             file["content"]
         );
+        // `AssetFile$metadata` carries the members the file holds after the update,
+        // completed with the media type of the content the service stored for it —
+        // see the `mimeType` rule in `probe_mime`. The content can change body
+        // variant, so the media type follows the content the update left.
+        let mut expected_metadata = match &case.expected_metadata {
+            Value::Null => json!({}),
+            described => described.clone(),
+        };
+        expected_metadata["mimeType"] = json!(if case.expected_content.get("text").is_some() {
+            service_com_amazonaws_devopsagent_devopsagent::state::MEDIA_TYPE_MARKDOWN
+        } else {
+            service_com_amazonaws_devopsagent_devopsagent::state::MEDIA_TYPE_OCTET_STREAM
+        });
         assert_eq!(
-            file["metadata"], case.expected_metadata,
+            file["metadata"], expected_metadata,
             "case {name:?}: metadata came back as {:?}",
             file["metadata"]
         );

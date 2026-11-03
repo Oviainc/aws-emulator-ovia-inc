@@ -239,6 +239,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             agent_space_id: input.agent_space_id.clone(),
             asset_type: input.asset_type,
             metadata,
+            // An asset is created ready: this response already serves it, so it
+            // enters its readable lifecycle state here rather than passing through
+            // a transient one.
+            status: crate::state::ASSET_STATUS_ACTIVE.to_string(),
             version: crate::state::INITIAL_ASSET_VERSION,
             created_at: now,
             updated_at: now,

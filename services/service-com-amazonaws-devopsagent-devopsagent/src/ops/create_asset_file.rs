@@ -250,15 +250,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // (a bundle, or an import) takes one more, up to what this service stores
             // for an asset.
             //
-            // Such an asset always holds exactly that one file — the create that minted
-            // it stored the file its content named — so the refusal can always name it.
-            if asset.content_is_one_file {
-                if let Some(existing) = asset.files.keys().next() {
-                    return Err(invalid_path(crate::state::asset_holds_one_file_message(
-                        &input.asset_id,
-                        existing,
-                    )));
-                }
+            // How many files an asset holds follows from its TYPE, so that is what the
+            // refusal reports, and the caller is pointed at the operation that replaces
+            // the file the asset already holds.
+            if asset.content_is_one_file && !asset.files.is_empty() {
+                return Err(invalid_path(
+                    crate::state::asset_type_holds_one_file_message(&asset.asset_type),
+                ));
             }
             if asset.files.len() >= crate::state::MAX_ASSET_FILES {
                 return Err(CreateAssetFileErrorModeled::ServiceQuotaExceededException(

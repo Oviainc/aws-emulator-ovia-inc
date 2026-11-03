@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAssetFile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAssetFile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAssetFile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes one file from an asset's content in [`crate::state`], and
+//! with it the asset whose content IS that file.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +140,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAssetFile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAssetFileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAssetFile"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAssetFileErrorModeled::InternalServerException(InternalServerException {
+                message: "the DevOps Agent state store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // The asset plane authorises the caller against the named Agent Space before it
+        // can know whether anything inside it exists, so an `agentSpaceId` that names
+        // no space is an authorization failure; only inside a space the caller reaches
+        // is a missing asset or file reported as one.
+        let space = store
+            .agent_spaces
+            .get_mut(&input.agent_space_id)
+            .ok_or_else(|| {
+                DeleteAssetFileErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+                })
+            })?;
+        let asset = space.assets.get_mut(&input.asset_id).ok_or_else(|| {
+            DeleteAssetFileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::asset_not_found_message(&input.asset_id),
+            })
+        })?;
+
+        // The greedy `{path+}` label carries every character after the asset's files
+        // prefix, so a value the modelled pattern admits can still walk out of the
+        // asset or start at a root: such a path names no file of this asset.
+        if !crate::state::names_a_file_of_the_asset(&input.path) {
+            let message = crate::state::not_a_file_of_the_asset_message(&input.path);
+            return Err(DeleteAssetFileErrorModeled::ValidationException(
+                ValidationException {
+                    message: message.clone(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        path: "path".to_string(),
+                        message,
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // A delete removes a file the asset holds, so a path it holds no file at names
+        // nothing to delete — `@idempotent` means a repeat causes no second deletion,
+        // not that a missing file is reported as a success.
+        if !asset.files.contains_key(&input.path) {
+            return Err(DeleteAssetFileErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::asset_file_not_found_message(&input.path),
+                },
+            )
+            .into());
+        }
+
+        // A revision of an asset is a snapshot of its content, so removing a file moves
+        // the asset to its next revision and freezes the content the previous one was
+        // read with — the same way replacing a file's content does.
+        asset.begin_next_version(now);
+        asset.files.remove(&input.path);
+
+        // An asset created from a SINGLE file IS that file: "Provide a single file, a
+        // zip bundle, or a sourceUrl to import from", so deleting the one file its
+        // content named leaves no asset behind, and the asset goes with it. An asset
+        // whose content is a SET of files keeps the rest of them.
+        let asset_is_gone = asset.content_is_one_file && asset.files.is_empty();
+        if asset_is_gone {
+            space.assets.remove(&input.asset_id);
+        }
+
+        // The idempotency-token entries that named the deleted file, or the asset it
+        // took with it, can never replay anything now: reclaim them rather than
+        // leaving them to wait out their TTL.
+        let mut gone: Vec<String> = vec![input.path.clone()];
+        if asset_is_gone {
+            gone.push(input.asset_id.clone());
+        }
+        store.forget_client_tokens_for(&gone);
+
+        Ok(DeleteAssetFileOutput {})
     }
 }

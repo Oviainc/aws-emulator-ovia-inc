@@ -254,9 +254,17 @@ async fn created_file_round_trips_through_get() {
             "case {case:?}: content came back as {:?}",
             file["content"]
         );
+        // `AssetFile$metadata` carries the members the request described for the
+        // file, completed with the media type of the content the service stored
+        // for it — see the `mimeType` rule in `probe_mime`.
+        let mut expected_metadata = input.get("metadata").cloned().unwrap_or_else(|| json!({}));
+        expected_metadata["mimeType"] = json!(if input["content"].get("text").is_some() {
+            service_com_amazonaws_devopsagent_devopsagent::state::MEDIA_TYPE_MARKDOWN
+        } else {
+            service_com_amazonaws_devopsagent_devopsagent::state::MEDIA_TYPE_OCTET_STREAM
+        });
         assert_eq!(
-            file["metadata"],
-            input.get("metadata").cloned().unwrap_or(Value::Null),
+            file["metadata"], expected_metadata,
             "case {case:?}: metadata came back as {:?}",
             file["metadata"]
         );
@@ -320,8 +328,9 @@ async fn created_file_round_trips_through_get() {
 
 /// RULE: an asset whose content IS one file holds exactly that file, so a request
 /// to create another file in it is refused with HTTP 400 `ValidationException`
-/// naming the file it already holds; an asset whose content is a SET of files (a
-/// bundle, or an import that materialises none) takes a created file.
+/// reporting how many files an asset of its TYPE supports; an asset whose content
+/// is a SET of files (a bundle, or an import that materialises none) takes a
+/// created file.
 #[tokio::test]
 async fn an_asset_whose_content_is_one_file_takes_no_other_file() {
     let router = new_router();
@@ -387,7 +396,7 @@ async fn an_asset_whose_content_is_one_file_takes_no_other_file() {
             )
             .await;
             match holds_one_file_at {
-                Some(existing) => {
+                Some(_) => {
                     assert_eq!(
                         status, 400,
                         "case {case:?} adding {added:?}: expected 400, got {status}: {body}"
@@ -400,9 +409,8 @@ async fn an_asset_whose_content_is_one_file_takes_no_other_file() {
                     );
                     assert_eq!(
                         error_message(&body),
-                        format!(
-                            "Asset {asset} contains a single file at {existing}, so another file cannot be created in it"
-                        ),
+                        "Assets of type 'artifact' support only one file. \
+                         Use UpdateAssetFile to replace the existing file.",
                         "case {case:?} adding {added:?}: message was {:?}",
                         error_message(&body)
                     );

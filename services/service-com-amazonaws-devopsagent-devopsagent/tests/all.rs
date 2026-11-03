@@ -19,12 +19,16 @@ mod agent_space_not_found_refusal;
 mod asset_file_updates;
 #[path = "all/asset_files.rs"]
 mod asset_files;
+#[path = "all/asset_metadata_and_deletion.rs"]
+mod asset_metadata_and_deletion;
 #[path = "all/assets.rs"]
 mod assets;
 #[path = "all/backlog_task_refusal_arms.rs"]
 mod backlog_task_refusal_arms;
 #[path = "all/operator_app.rs"]
 mod operator_app;
+#[path = "all/probe_mime.rs"]
+mod probe_mime;
 #[path = "all/recommendation_reads.rs"]
 mod recommendation_reads;
 #[path = "all/state_roundtrip.rs"]
