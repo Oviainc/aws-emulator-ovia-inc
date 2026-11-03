@@ -9,7 +9,7 @@
 //! whether the referring record requires it or only names the one the request supplied,
 //! and whether or not that record is a resource with an id of its own — so no delete ever
 //! leaves a stored record reporting an id no reader resolves. The refusal names the
-//! resource being deleted and every referring KIND, and nothing else; it changes nothing;
+//! resource being deleted by its kind and its id, and nothing else; it changes nothing;
 //! and the identical call succeeds once the references are gone.
 //!
 //! `crate::delete_link` and `crate::delete_device` already pin the two kinds of association
@@ -55,26 +55,22 @@ const CONNECTION: &str = "connection";
 /// See [`LINK_ASSOCIATION`].
 const TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATION: &str = "transit gateway connect peer association";
 
-/// The message this service's dependency refusal carries, listing `blocking` in the order
-/// the refusal does — pinned here so the rows assert the whole message rather than the
-/// presence of a word.
-fn refusal_message(parent: &str, blocking: &[&str]) -> String {
-    let listed = match blocking.split_last() {
-        None => panic!("a refusal names at least one blocking kind"),
-        Some((last, [])) => (*last).to_string(),
-        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
-    };
-    format!("{parent} cannot be deleted due to an existing {listed} associated with it.")
+/// The message this service's dependency refusal carries: the resource being deleted, by
+/// kind and by the id the request addressed it with, and then the fixed statement that an
+/// existing association blocks the delete — pinned here so the rows assert the whole
+/// message rather than the presence of a word.
+pub(crate) fn refusal_message(parent: &str, parent_id: &str) -> String {
+    format!("{parent} with ID {parent_id} cannot be deleted due to existing association.")
 }
 
-/// Assert `body` is the dependency refusal for `parent`, naming exactly `blocking`: HTTP
+/// Assert `body` is the dependency refusal for the `parent` resource `parent_id`: HTTP
 /// 400, `ValidationException`, the catch-all reason, no field at fault.
 fn assert_reference_refusal(
     case: &str,
     parent: &str,
+    parent_id: &str,
     status: u16,
     body: &Value,
-    blocking: &[&str],
 ) {
     assert_eq!(
         status, 400,
@@ -95,7 +91,7 @@ fn assert_reference_refusal(
         Value::Null,
         "case {case:?}: a dependency refusal blames no field, got {body}"
     );
-    let expected = refusal_message(parent, blocking);
+    let expected = refusal_message(parent, parent_id);
     assert_eq!(
         body["Message"].as_str(),
         Some(expected.as_str()),
@@ -205,7 +201,9 @@ enum End {
     First,
     /// The member of its second end (`ConnectedLinkId` / `ConnectedDeviceId`).
     Second,
-    /// Both members, so one record holds two references to the one resource.
+    /// Both members, so one record holds two references to the one resource. A LINK may be
+    /// named at both ends of one connection; a DEVICE may not (`CreateConnection` refuses
+    /// the two required device members naming one device), so no device row uses this.
     Both,
 }
 
@@ -224,8 +222,8 @@ struct LinkCase {
     /// Whether a SIBLING link of the same site is named by its own connection, which must
     /// block nothing here.
     sibling_connection: bool,
-    /// The kinds the refusal must name, in the order it lists them; empty when the delete
-    /// has to succeed.
+    /// The kinds of record left naming the link, which the refusal does NOT enumerate;
+    /// empty when the delete has to succeed.
     blocking: &'static [&'static str],
 }
 
@@ -408,7 +406,7 @@ async fn delete_link_is_refused_while_any_stored_record_still_names_the_link() {
             continue;
         }
 
-        assert_reference_refusal(name, LINK_PARENT, status, &body, case.blocking);
+        assert_reference_refusal(name, LINK_PARENT, &link, status, &body);
 
         // The refusal changed nothing: the link is still readable, the records naming it
         // still report it, and the two readers still agree.
@@ -515,7 +513,7 @@ struct DeviceCase {
 /// connections name it, and which kinds name it at once; the rows that hold nothing of the
 /// device are the controls. A device member of a connection is REQUIRED, unlike the link
 /// members above, which is the other half of what the rule generalises over.
-const DEVICE_CASES: [DeviceCase; 6] = [
+const DEVICE_CASES: [DeviceCase; 5] = [
     DeviceCase {
         name: "no record names the device",
         associated: false,
@@ -534,13 +532,6 @@ const DEVICE_CASES: [DeviceCase; 6] = [
         name: "a connection holding the device at its second end",
         associated: false,
         connections: &[End::Second],
-        sibling_connection: false,
-        blocking: &[CONNECTION],
-    },
-    DeviceCase {
-        name: "one connection holding the device at both of its ends",
-        associated: false,
-        connections: &[End::Both],
         sibling_connection: false,
         blocking: &[CONNECTION],
     },
@@ -581,7 +572,11 @@ async fn delete_device_is_refused_while_any_stored_record_still_names_the_device
             let body = match end {
                 End::First => json!({ "DeviceId": device, "ConnectedDeviceId": partner }),
                 End::Second => json!({ "DeviceId": partner, "ConnectedDeviceId": device }),
-                End::Both => json!({ "DeviceId": device, "ConnectedDeviceId": device }),
+                // A connection between one device and itself cannot be created, so no
+                // device row asks for one.
+                End::Both => panic!(
+                    "case {name:?}: a connection names two different devices, never one twice"
+                ),
             };
             connections.push(id_of(
                 &create_connection_ok(&emulator, &network, body).await,
@@ -618,7 +613,7 @@ async fn delete_device_is_refused_while_any_stored_record_still_names_the_device
             continue;
         }
 
-        assert_reference_refusal(name, DEVICE_PARENT, status, &body, case.blocking);
+        assert_reference_refusal(name, DEVICE_PARENT, &device, status, &body);
         assert!(
             device_ids(&emulator, &network).await.contains(&device),
             "case {name:?}: a refused delete removed the device {device}"
@@ -696,9 +691,9 @@ async fn an_update_that_drops_the_reference_unblocks_the_delete_of_the_resource_
     assert_reference_refusal(
         "the link the connection names",
         LINK_PARENT,
+        &first,
         status,
         &blocked,
-        &[CONNECTION],
     );
     // The link the connection does NOT name is deletable the whole time, so the refusal is
     // about the reference rather than about the operation or the global network.

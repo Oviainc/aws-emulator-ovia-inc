@@ -6,8 +6,12 @@
 //! `PolicyVersionId`, which starts the change set that version has to go through before it
 //! can be put in force. The LIVE policy is NOT touched — restoring submits a version, it
 //! does not execute one — so the core network keeps answering from the document in force
-//! until a change set execution replaces it. This is the ONLY file to touch for this
-//! operation.
+//! until a change set execution replaces it. What a restore names is a PREVIOUS version, so
+//! the version the `LIVE` alias already points at is not restorable: its document is the
+//! one in force, and submitting it again would mint a version whose change set describes no
+//! change at all, so naming it is refused with the modelled `ValidationException`
+//! (HTTP 400), carrying the catch-all `Reason` and no `Fields` entry, and nothing is
+//! appended. This is the ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -185,6 +189,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 )
             })?;
+        // A restore re-submits a PREVIOUS version's document so that it can be made the one
+        // in force again — "Restores a previous policy version as a new, immutable version
+        // of a core network policy" — so the version the LIVE alias already points at is
+        // not a version there is anything to restore: its document IS the policy in force,
+        // and submitting it again would mint a version and a change set describing no
+        // change at all. That precondition is a validation failure of the request against
+        // the policy history (HTTP 400 `ValidationException`, `Other`, no member at fault)
+        // rather than this service's concurrent-state conflict, and it is answered before
+        // anything is appended.
+        if core_network.live_policy_version == Some(input.policy_version_id) {
+            return Err(
+                RestoreCoreNetworkPolicyVersionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "Live policy cannot be restored.".to_string(),
+                        reason: Some(crate::state::VALIDATION_REASON_OTHER.to_string()),
+                        fields: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
         let document = restored.document.clone();
         // The description travels with the document: restoring reproduces that version's
         // submission, and this call carries no description of its own to replace it with.

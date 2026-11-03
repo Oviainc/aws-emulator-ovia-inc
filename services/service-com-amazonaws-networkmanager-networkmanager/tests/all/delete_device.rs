@@ -391,25 +391,19 @@ async fn a_device_still_associated_with_a_link_or_a_gateway_is_refused_until_it_
         let message = body["Message"]
             .as_str()
             .unwrap_or_else(|| panic!("case {name:?}: no Message in {body}"));
-        assert!(
-            message.contains("Device"),
-            "case {name:?}: expected the message to name the resource being deleted, got {message:?}"
+        let expected =
+            crate::delete_live_reference_refusal::refusal_message("Device", &device);
+        assert_eq!(
+            message, expected,
+            "case {name:?}: expected the message {expected:?}, got {message:?}"
         );
-        for label in case.blocking {
-            assert!(
-                message.contains(label),
-                "case {name:?}: expected the message to name the blocking {label}, got {message:?}"
-            );
-        }
-        // A kind that does NOT block is never named, so the refusal reports what is stored
-        // rather than every kind the operation can refuse for.
+        // The refusal names the resource being deleted and NOT which kind of record still
+        // names it, whichever kinds those are.
         for label in ["link association", "customer gateway association"] {
-            if !case.blocking.contains(&label) {
-                assert!(
-                    !message.contains(label),
-                    "case {name:?}: no {label} blocks this delete, so the message must not name one, got {message:?}"
-                );
-            }
+            assert!(
+                !message.contains(label),
+                "case {name:?}: the refusal must not name a {label}, got {message:?}"
+            );
         }
 
         // The refusal changed nothing: the device is still readable, with the state the

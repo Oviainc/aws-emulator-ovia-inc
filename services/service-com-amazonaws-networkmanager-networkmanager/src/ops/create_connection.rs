@@ -214,6 +214,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "Creates a connection between two devices" with `ConnectedDeviceId` as "The ID of
+        // the second device in the connection" (`smithy_query query="doc"
+        // shape="CreateConnection"`, `member="ConnectedDeviceId"`): a connection has two
+        // ENDS, so the two required device members have to name two different devices. One
+        // device named at both ends is a precondition failure of the request itself — no
+        // stored state decides it — and it is refused with the operation's modelled
+        // `ValidationException` (HTTP 400) before anything is minted, so no stored
+        // connection is ever a self-loop a topology walk can double-count. The prose is
+        // entirely fixed: it carries no id from the request.
+        if input.device_id == input.connected_device_id {
+            return Err(CreateConnectionErrorModeled::ValidationException(
+                ValidationException {
+                    message: "Connection cannot be created between the same device.".to_string(),
+                    reason: Some(crate::state::VALIDATION_REASON_OTHER.to_string()),
+                    fields: None,
+                },
+            )
+            .into());
+        }
+
         // "Creates a connection between two devices" (`smithy_query query="doc"
         // shape="CreateConnection"`): both devices are required references, each resolved
         // WITHIN that global network — a device that never existed, one that was deleted

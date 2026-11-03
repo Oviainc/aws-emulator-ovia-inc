@@ -603,13 +603,20 @@ pub const VALIDATION_REASON_OTHER: &str = "Other";
 /// and succeeds once the core network is gone.
 ///
 /// The prose names the blocking kinds the same way the recorded message does — the parent
-/// in [`kind_title`], the dependents as their ARN resource types read as words — and the
-/// identifying detail stays out of it: no `Fields` entry, because no input field is at
-/// fault, and `Reason` is [`VALIDATION_REASON_OTHER`].
+/// in [`kind_title`], the dependents as their ARN resource types read as words, which the
+/// recorded refusal of a global network that still owns a core network spells exactly
+/// ("Global Network cannot be deleted due to an existing core network associated with it.")
+/// — and the identifying detail stays out of it: no `Fields` entry, because no input field
+/// is at fault, and `Reason` is [`VALIDATION_REASON_OTHER`].
 ///
-/// `parent_kind` is the kind being deleted ([`GLOBAL_NETWORK_KIND`], [`SITE_KIND`], …) and
-/// `dependents` pairs each child kind with how many of it the parent still holds, in the
-/// order the message should list them; a zero count never blocks and is never named.
+/// This is the refusal of a delete addressed at a CONTAINER: the global network itself, a
+/// core network, an attachment, a peering, a transit gateway registration. A delete
+/// addressed at one of the global network's own OBJECTS answers the other recorded template
+/// instead ([`object_dependents_block_delete`]).
+///
+/// `parent_kind` is the kind being deleted ([`GLOBAL_NETWORK_KIND`], [`CORE_NETWORK_KIND`],
+/// …) and `dependents` pairs each child kind with how many of it the parent still holds, in
+/// the order the message should list them; a zero count never blocks and is never named.
 pub fn dependents_block_delete(
     parent_kind: &str,
     dependents: &[(&str, usize)],
@@ -628,6 +635,41 @@ pub fn dependents_block_delete(
         message: format!(
             "{} cannot be deleted due to an existing {listed} associated with it.",
             kind_title(parent_kind)
+        ),
+        reason: Some(VALIDATION_REASON_OTHER.to_string()),
+        fields: None,
+    })
+}
+
+/// The same refusal for a delete addressed at one of a global network's OWN OBJECTS — a
+/// device, a link or a site, the three kinds `DeleteGlobalNetwork`'s documentation groups as
+/// "all global network objects (devices, links, and sites)" — which carries the other
+/// recorded template, or `None` when nothing blocks the delete (every count is zero).
+///
+/// Here the prose names the OBJECT and not the dependent: its kind in [`kind_title`], the id
+/// the request addressed it with, and then the fixed statement that an existing association
+/// blocks the delete — which is what the recorded refusals of a site that still holds a
+/// device ("Site with ID <SiteId> cannot be deleted due to existing association.") and of a
+/// link that is still associated carry. The envelope is the one
+/// [`dependents_block_delete`] builds: HTTP 400 `ValidationException`, no `Fields` entry
+/// because no input field is at fault, and [`VALIDATION_REASON_OTHER`].
+///
+/// `object_kind` is the kind being deleted ([`DEVICE_KIND`], [`LINK_KIND`], [`SITE_KIND`]),
+/// `object_id` the id that object was addressed by, and `dependents` pairs each referring
+/// kind with how many records of it still name the object — the kinds are what the counts
+/// belong to at the call site; this template names none of them.
+pub fn object_dependents_block_delete(
+    object_kind: &str,
+    object_id: &str,
+    dependents: &[(&str, usize)],
+) -> Option<ValidationException> {
+    if dependents.iter().all(|(_, held)| *held == 0) {
+        return None;
+    }
+    Some(ValidationException {
+        message: format!(
+            "{} with ID {object_id} cannot be deleted due to existing association.",
+            kind_title(object_kind)
         ),
         reason: Some(VALIDATION_REASON_OTHER.to_string()),
         fields: None,
@@ -731,26 +773,25 @@ pub fn is_telemetry_resource_type(resource_type: &str) -> bool {
 pub const FIELD_RESOURCE_TYPE: &str = "ResourceType";
 
 /// The modelled `ValidationException` (HTTP 400) for a `ResourceType` outside the set the
-/// operation reports on: `scope` says, in the member's own terms, what those values are the
-/// types of and `supported` lists them in the order they are declared.
+/// operation reports on.
+///
+/// The prose is the recorded one: the fixed statement that the member's value is invalid,
+/// naming ONLY the member. The offending value is not echoed back and the set of accepted
+/// values is not enumerated — a caller reads the accepted set from the member's own
+/// documentation, not from a refusal — so the message is the same whichever value and
+/// whichever of the two sets ([`NETWORK_RESOURCE_TYPES`], [`TELEMETRY_RESOURCE_TYPES`])
+/// failed it.
 ///
 /// The ONE construction of that refusal for this service, reached through the two checks
 /// below: an operation's own predicate decides which set applies, but the refusal — its
 /// `Reason`, its `Message` and the single `Fields` entry [`field_rejection`] gives the
 /// member — is built here, so one rule on one member cannot answer two different bodies
 /// depending on which operation refused it.
-fn unsupported_resource_type(
-    resource_type: &str,
-    scope: &str,
-    supported: &[&str],
-) -> ValidationException {
+fn unsupported_resource_type() -> ValidationException {
     field_rejection(
         FIELD_RESOURCE_TYPE,
         REASON_FIELD_VALIDATION_FAILED,
-        format!(
-            "ResourceType {resource_type:?} is not one of {scope}: {}",
-            supported.join(", ")
-        ),
+        format!("{FIELD_RESOURCE_TYPE} is invalid"),
     )
 }
 
@@ -764,13 +805,9 @@ fn unsupported_resource_type(
 /// the predicate and the refusal cannot drift apart between them.
 pub fn check_network_resource_type(resource_type: Option<&str>) -> Result<(), ValidationException> {
     match resource_type {
-        Some(resource_type) if !is_network_resource_type(resource_type) => Err(
-            unsupported_resource_type(
-                resource_type,
-                "the supported network resource types",
-                &NETWORK_RESOURCE_TYPES,
-            ),
-        ),
+        Some(resource_type) if !is_network_resource_type(resource_type) => {
+            Err(unsupported_resource_type())
+        }
         _ => Ok(()),
     }
 }
@@ -782,13 +819,9 @@ pub fn check_telemetry_resource_type(
     resource_type: Option<&str>,
 ) -> Result<(), ValidationException> {
     match resource_type {
-        Some(resource_type) if !is_telemetry_resource_type(resource_type) => Err(
-            unsupported_resource_type(
-                resource_type,
-                "the resource types telemetry is reported for",
-                &TELEMETRY_RESOURCE_TYPES,
-            ),
-        ),
+        Some(resource_type) if !is_telemetry_resource_type(resource_type) => {
+            Err(unsupported_resource_type())
+        }
         _ => Ok(()),
     }
 }
@@ -6745,12 +6778,12 @@ fn check_tag_key(member: &'static str, key: &str) -> Result<(), TagRejection> {
             format!("a tag key must be at most {MAX_TAG_KEY_CHARS} characters, but {length} were given"),
         ));
     }
+    // The recorded refusal is fixed text naming the reserved prefix and nothing else: the
+    // offending key is not echoed back.
     if key.to_lowercase().starts_with(RESERVED_TAG_PREFIX) {
         return Err(TagRejection::new(
             member,
-            format!(
-                "tag key {key:?} uses the {RESERVED_TAG_PREFIX} prefix, which is reserved for AWS"
-            ),
+            format!("Tag cannot start with {RESERVED_TAG_PREFIX}"),
         ));
     }
     Ok(())

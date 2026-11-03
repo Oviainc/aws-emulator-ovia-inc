@@ -5,8 +5,13 @@
 //! Deletes one version from a core network's policy history and answers the version it
 //! removed. A policy version is immutable, so a delete is the only way one leaves the
 //! history — except the version in force, which cannot: "You can't delete the current LIVE
-//! policy" (`smithy_query query="doc" shape="DeleteCoreNetworkPolicyVersion"`), refused
-//! with this operation's modelled `ConflictException` (HTTP 409).
+//! policy" (`smithy_query query="doc" shape="DeleteCoreNetworkPolicyVersion"`). That
+//! precondition is a request invalid against the state of the policy it addresses, and no
+//! retry of this call can make it valid — the caller has to put another version in force
+//! first — so it is refused with this operation's modelled `ValidationException`
+//! (HTTP 400), carrying the catch-all `Reason` and no `Fields` entry, and NOT with
+//! `ConflictException` (409), which stays this service's retryable concurrent-state
+//! conflict.
 //!
 //! The versions live on the core network record
 //! ([`crate::state::CoreNetworkRecord::policy_versions`]), which
@@ -188,25 +193,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You can't delete the current LIVE policy": the version whose document is in
         // force stays, because removing it would leave the core network reporting a
-        // topology derived from a policy it no longer holds. Nothing has been removed by
-        // the time this refusal is answered.
+        // topology derived from a policy it no longer holds. The refusal is a validation
+        // failure of the request against the policy history — HTTP 400
+        // `ValidationException`, `Other`, no input member at fault — and NOT this service's
+        // concurrent-state `ConflictException` (409): no retry of this call can clear it,
+        // the caller has to promote another version first, so a waiter or a retry loop must
+        // see a terminal 400. The prose is entirely fixed: it carries no id from the request.
+        // Nothing has been removed by the time it is answered.
         if live_version == Some(input.policy_version_id) {
-            return Err(DeleteCoreNetworkPolicyVersionErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "policy version {} is the {} policy of core network {} and cannot be deleted",
-                        input.policy_version_id,
-                        crate::state::POLICY_ALIAS_LIVE,
-                        input.core_network_id
-                    ),
-                    resource_id: crate::state::policy_version_resource_id(
-                        &input.core_network_id,
-                        input.policy_version_id,
-                    ),
-                    resource_type: crate::state::CORE_NETWORK_POLICY_KIND.to_string(),
-                },
-            )
-            .into());
+            return Err(
+                DeleteCoreNetworkPolicyVersionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "Cannot delete the live version of the core network ID."
+                            .to_string(),
+                        reason: Some(crate::state::VALIDATION_REASON_OTHER.to_string()),
+                        fields: None,
+                    },
+                )
+                .into(),
+            );
         }
 
         let removed = entry.remove();

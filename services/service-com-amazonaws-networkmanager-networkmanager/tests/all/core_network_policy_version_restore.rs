@@ -8,7 +8,9 @@
 //! `PolicyVersionId`, its own `CreatedAt`, the alias `LATEST`, and a change set that is
 //! `PENDING_GENERATION` until the span the clock owes falls due and `READY_TO_EXECUTE`
 //! after it. A restore prepares that change set and executes nothing, so the version
-//! restored from is untouched and the policy in force stays the `LIVE` one. A version the
+//! restored from is untouched and the policy in force stays the `LIVE` one. The version the
+//! `LIVE` alias already points at is the one version there is nothing to restore, so naming
+//! it is refused with HTTP 400 and appends nothing. A version the
 //! core network does not hold — never minted, or since deleted — is restored by nobody: the
 //! call is refused with HTTP 404 and appends nothing, and so is a restore past the
 //! history's cap, with HTTP 400.
@@ -149,9 +151,9 @@ struct RestoreCase {
 fn restore_cases() -> Vec<RestoreCase> {
     vec![
         RestoreCase {
-            name: "a one-version history, restoring the version in force",
-            held: 1,
-            restores: &[1],
+            name: "a two-version history, restoring the version not in force",
+            held: 2,
+            restores: &[2],
         },
         RestoreCase {
             name: "a three-version history, restoring a middle version then the newest",
@@ -159,9 +161,9 @@ fn restore_cases() -> Vec<RestoreCase> {
             restores: &[2, 3],
         },
         RestoreCase {
-            name: "restoring the version in force of a longer history, repeatedly",
+            name: "restoring the newest version of a longer history, repeatedly",
             held: 4,
-            restores: &[1, 1],
+            restores: &[4, 4],
         },
         RestoreCase {
             name: "restoring the version an earlier restore minted",
@@ -578,7 +580,7 @@ async fn a_restore_past_the_history_cap_is_refused_and_appends_nothing() {
     for version_id in 2..MAX_POLICY_VERSIONS {
         put_version(&emulator, case, &core_network_id, version_id).await;
     }
-    let (status, body) = restore(&emulator, &core_network_id, 1).await;
+    let (status, body) = restore(&emulator, &core_network_id, 2).await;
     assert_eq!(
         status, 200,
         "case {case:?}: the restore that fills the last slot expected 200, got {status} with {body}"
@@ -637,7 +639,7 @@ async fn a_restore_past_the_history_cap_is_refused_and_appends_nothing() {
         status, 200,
         "case {case:?}: DeleteCoreNetworkPolicyVersion expected 200, got {status} with {body}"
     );
-    let (status, body) = restore(&emulator, &core_network_id, 1).await;
+    let (status, body) = restore(&emulator, &core_network_id, 3).await;
     assert_eq!(
         status, 200,
         "case {case:?}: a restore after a delete expected 200, got {status} with {body}"

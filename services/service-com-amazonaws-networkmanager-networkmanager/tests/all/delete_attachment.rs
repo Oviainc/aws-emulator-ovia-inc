@@ -40,9 +40,9 @@ const ATTACHMENT: &str = "attachment";
 
 /// The message this service composes for a delete still blocked by a dependent: the parent
 /// kind read as a title, then the dependent kind read as words — the same wording
-/// `DeleteGlobalNetwork` and `DeleteSite` answer, with the attachment as both the parent and
-/// the blocking kind. The message rule makes this an EXAMPLE, not a requirement; it is
-/// asserted exactly so the refusal cannot quietly start naming a different resource.
+/// `DeleteGlobalNetwork` answers, with the attachment as both the parent and the blocking
+/// kind. The message rule makes this an EXAMPLE, not a requirement; it is asserted exactly
+/// so the refusal cannot quietly start naming a different resource.
 const DEPENDENCY_REFUSAL_MESSAGE: &str =
     "Attachment cannot be deleted due to an existing attachment associated with it.";
 

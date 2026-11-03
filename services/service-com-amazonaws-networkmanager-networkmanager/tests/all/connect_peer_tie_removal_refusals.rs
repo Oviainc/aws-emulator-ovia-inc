@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 
 use crate::connect_peer_association_lifecycle::{fixture as cloud_wan_fixture, CASES};
 use crate::device_lifecycle::create_device_ok;
+use crate::delete_live_reference_refusal::refusal_message;
 use crate::disassociate_connect_peer::disassociate as disassociate_connect_peer;
 use crate::global_network_lifecycle::{error_code, Emulator};
 use crate::link_lifecycle::{create_link_ok, plain_link};
@@ -42,20 +43,28 @@ use crate::transit_gateway_registration_lifecycle::{arns_of, deregister, get_reg
 
 /// The message a refused `DeregisterTransitGateway` carries while one of the global
 /// network's transit gateway Connect peer associations could only have stood on the
-/// registration it removes: the dependency wording this service refuses every removal with,
-/// naming the registration as the subject and the blocking tie's kind as the dependent.
+/// registration it removes: the dependency wording this service refuses the removal of a
+/// CONTAINER with, naming the registration as the subject and the blocking tie's kind as the
+/// dependent.
 const REGISTRATION_BLOCKED: &str = "Transit Gateway Registration cannot be deleted due to an existing transit gateway connect peer association associated with it.";
+
+/// How a refusal spells each global network OBJECT this suite asks a delete of, as
+/// `crate::delete_live_reference_refusal` spells them: every word of the ARN resource type
+/// capitalised.
+const DEVICE_PARENT: &str = "Device";
+/// See [`DEVICE_PARENT`].
+const LINK_PARENT: &str = "Link";
 
 /// Assert `body` is this service's dependency refusal, carrying `message` exactly: HTTP 400,
 /// `ValidationException`, the catch-all `Reason` (no input field is at fault) and no
 /// `Fields` entry.
 ///
-/// `crate::delete_dependency_refusal` asserts the same envelope about the deletes it covers,
-/// but checks the message by SUBSTRING, because what its rows vary is which dependent kinds
-/// are named. Here the whole message is the expectation: one kind's name is a substring of
-/// another's ("connect peer association" of "transit gateway connect peer association"), so
-/// only the exact wording can show that the refusal named the kind that blocks and not the
-/// other one.
+/// `crate::delete_dependency_refusal` asserts the same envelope about the deletes it covers.
+/// Here the whole message is the expectation: for the registration, because one kind's name
+/// is a substring of another's ("connect peer association" of "transit gateway connect peer
+/// association"), so only the exact wording can show that the refusal named the kind that
+/// blocks and not the other one; for a device or a link, because their recorded template
+/// names the object and no dependent at all.
 ///
 /// `pub(crate)` because `tests/all/disassociate_link_tie_scope.rs` holds the same refusal
 /// to the same envelope, so both suites assert it through one helper.
@@ -428,7 +437,7 @@ async fn deleting_the_device_or_link_a_transit_gateway_connect_peer_association_
         "the device the peering is reached over",
         status,
         &refused,
-        "Device cannot be deleted due to an existing link association and transit gateway connect peer association associated with it.",
+        &refusal_message(DEVICE_PARENT, &built.sited_device),
     );
 
     let (status, refused) = delete_device(&emulator, &built.id, &built.siteless_device).await;
@@ -436,7 +445,7 @@ async fn deleting_the_device_or_link_a_transit_gateway_connect_peer_association_
         "the device of a peering that names no link",
         status,
         &refused,
-        "Device cannot be deleted due to an existing transit gateway connect peer association associated with it.",
+        &refusal_message(DEVICE_PARENT, &built.siteless_device),
     );
 
     let (status, refused) = delete_link(&emulator, &built.id, &built.link).await;
@@ -444,7 +453,7 @@ async fn deleting_the_device_or_link_a_transit_gateway_connect_peer_association_
         "the link the peering is carried over",
         status,
         &refused,
-        "Link cannot be deleted due to an existing link association and transit gateway connect peer association associated with it.",
+        &refusal_message(LINK_PARENT, &built.link),
     );
 
     // The device/link tie the peering was made over cannot be untied either: the refusal
@@ -524,7 +533,7 @@ async fn deleting_the_device_or_link_a_core_network_connect_peer_association_nam
         "the device the peering is reached over",
         status,
         &refused,
-        "Device cannot be deleted due to an existing link association and connect peer association associated with it.",
+        &refusal_message(DEVICE_PARENT, &built.sited_device),
     );
 
     let (status, refused) =
@@ -533,7 +542,7 @@ async fn deleting_the_device_or_link_a_core_network_connect_peer_association_nam
         "the device of a peering that names no link",
         status,
         &refused,
-        "Device cannot be deleted due to an existing connect peer association associated with it.",
+        &refusal_message(DEVICE_PARENT, &built.siteless_device),
     );
 
     let (status, refused) = delete_link(&emulator, &built.global_network, &built.link).await;
@@ -541,7 +550,7 @@ async fn deleting_the_device_or_link_a_core_network_connect_peer_association_nam
         "the link the peering is carried over",
         status,
         &refused,
-        "Link cannot be deleted due to an existing link association and connect peer association associated with it.",
+        &refusal_message(LINK_PARENT, &built.link),
     );
 
     let (status, refused) = disassociate_link(

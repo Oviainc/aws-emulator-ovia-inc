@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // associated with either is refused rather than deleted in a way that leaves the
         // association pointing at a device nobody can read. The refusal is the dependency
         // ValidationException (400) every delete of this service raises through
-        // `crate::state::dependents_block_delete`.
+        // `crate::state::object_dependents_block_delete`.
         //
         // What is left pointing at the device decides it, not what kind of record does the
         // pointing: an association carries no id of its own, a connection does, and either
@@ -183,9 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which filters the same way the reader of each of those records does and lists the
         // kinds the documentation names first, in its order.
         let dependents = store.device_dependents(&input.global_network_id, &input.device_id);
-        if let Some(refusal) =
-            crate::state::dependents_block_delete(crate::state::DEVICE_KIND, &dependents)
-        {
+        if let Some(refusal) = crate::state::object_dependents_block_delete(
+            crate::state::DEVICE_KIND,
+            &input.device_id,
+            &dependents,
+        ) {
             return Err(DeleteDeviceErrorModeled::ValidationException(refusal).into());
         }
 

@@ -8,8 +8,9 @@
 //! a zero count. The rule under test is that the refusal is ONE body whichever operation
 //! answered it: HTTP 400 with `x-amzn-errortype: ValidationException`, `Reason` =
 //! `FieldValidationFailed`, and exactly one `Fields` entry whose `Name` is `ResourceType`
-//! and whose `Message` is the top-level `Message` — the prose naming the offending value and
-//! enumerating the set. A client keying on `Fields[].Message` therefore reads one answer for
+//! and whose `Message` is the top-level `Message` — the fixed prose naming the member and
+//! nothing else: the offending value is not echoed back and the accepted set is not
+//! enumerated. A client keying on `Fields[].Message` therefore reads one answer for
 //! one rule, not one per operation.
 //!
 //! The rows span the operations the rule reaches (the three that report out of a global
@@ -47,8 +48,6 @@ struct Selector {
     operation: &'static str,
     /// The path segment under `/global-networks/{GlobalNetworkId}` the operation is bound to.
     path: &'static str,
-    /// How the refusal's prose names the set: what those values are the types OF.
-    scope: &'static str,
     /// The values the operation accepts.
     supported: &'static [&'static str],
 }
@@ -59,28 +58,31 @@ const SELECTORS: [Selector; 4] = [
     Selector {
         operation: "GetNetworkResources",
         path: "network-resources",
-        scope: "the supported network resource types",
         supported: NETWORK_TYPES,
     },
     Selector {
         operation: "GetNetworkResourceCounts",
         path: "network-resource-count",
-        scope: "the supported network resource types",
         supported: NETWORK_TYPES,
     },
     Selector {
         operation: "GetNetworkResourceRelationships",
         path: "network-resource-relationships",
-        scope: "the supported network resource types",
         supported: NETWORK_TYPES,
     },
     Selector {
         operation: "GetNetworkTelemetry",
         path: "network-telemetry",
-        scope: "the resource types telemetry is reported for",
         supported: &TELEMETRY_TYPES,
     },
 ];
+
+/// The prose every refusal of this member carries, whichever operation and whichever value
+/// was refused: the member named, and the fixed statement that its value is invalid.
+///
+/// `pub(crate)` because `crate::refusal_wording` tables the same refusal for one of these
+/// operations, so one rule keeps one expected string.
+pub(crate) const INVALID_RESOURCE_TYPE: &str = "ResourceType is invalid";
 
 impl Selector {
     /// The operation's URI against `network`, selecting `resource_type` when one is given.
@@ -90,16 +92,6 @@ impl Selector {
             Some(resource_type) => format!("{path}?resourceType={}", escape(resource_type)),
             None => path,
         }
-    }
-
-    /// The prose this operation's refusal of `resource_type` carries: the offending value as
-    /// the request spelled it, then the set it was checked against.
-    fn expected_message(&self, resource_type: &str) -> String {
-        format!(
-            "ResourceType {resource_type:?} is not one of {}: {}",
-            self.scope,
-            self.supported.join(", ")
-        )
     }
 }
 
@@ -144,10 +136,10 @@ async fn assert_refusal(
         Some("FieldValidationFailed"),
         "case {case}: expected Reason FieldValidationFailed, got {body}"
     );
-    let expected = selector.expected_message(resource_type);
+    let expected = INVALID_RESOURCE_TYPE;
     assert_eq!(
         body["Message"].as_str(),
-        Some(expected.as_str()),
+        Some(expected),
         "case {case}: expected Message {expected:?}, got {body}"
     );
     assert_eq!(

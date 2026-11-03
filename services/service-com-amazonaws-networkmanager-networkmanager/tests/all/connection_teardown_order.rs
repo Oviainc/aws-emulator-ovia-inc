@@ -28,7 +28,7 @@
 use serde_json::{json, Value};
 
 use crate::connection_lifecycle::{create_connection_ok, get_connections, id_of, ids_in};
-use crate::delete_dependency_refusal::assert_dependency_refusal;
+use crate::delete_dependency_refusal::{assert_dependency_refusal, assert_object_dependency_refusal};
 use crate::delete_live_reference_refusal::assert_every_reference_resolves;
 use crate::device_lifecycle::create_device_ok;
 use crate::global_network_lifecycle::{error_code, Emulator};
@@ -47,13 +47,9 @@ const LINK_PARENT: &str = "Link";
 
 /// How a refusal spells each kind of record that can block one of the deletes below: the
 /// resource kind read as words.
-const CONNECTION: &str = "connection";
-/// See [`CONNECTION`].
 const DEVICE: &str = "device";
-/// See [`CONNECTION`].
+/// See [`DEVICE`].
 const SITE: &str = "site";
-/// See [`CONNECTION`].
-const LINK: &str = "link";
 
 /// One connection of a row: which of the row's devices it ties together, and which of the
 /// row's links each of its two ends is reached over (`None` for an end naming no link).
@@ -76,10 +72,10 @@ struct TeardownCase {
 }
 
 /// The rows differ along how many connections stand at once, how many devices they share,
-/// whether one connection names the same device at both ends, and whether an end is reached
-/// over a link — everything the reference rule generalises over. The first row holds no
-/// connection at all, so it is the control: the identical teardown runs without a single
-/// refusal on the way.
+/// whether both ends of one connection are reached over the same link, and whether an end is
+/// reached over a link at all — everything the reference rule generalises over. The first row
+/// holds no connection at all, so it is the control: the identical teardown runs without a
+/// single refusal on the way.
 const TEARDOWN_CASES: [TeardownCase; 6] = [
     TeardownCase {
         name: "no connection at all",
@@ -110,14 +106,14 @@ const TEARDOWN_CASES: [TeardownCase; 6] = [
         }],
     },
     TeardownCase {
-        name: "one connection holding the same device at both ends",
-        devices: 1,
+        name: "one connection reached over the same link at both ends",
+        devices: 2,
         links: 1,
         connections: &[Wiring {
             first_device: 0,
-            second_device: 0,
+            second_device: 1,
             first_link: Some(0),
-            second_link: None,
+            second_link: Some(0),
         }],
     },
     TeardownCase {
@@ -308,13 +304,8 @@ async fn a_global_network_holding_connections_empties_only_in_the_order_its_refe
             // the row has them, its links).
             let (status, body) = emulator.delete(&format!("/global-networks/{network}")).await;
             assert_dependency_refusal(name, GLOBAL_NETWORK_PARENT, status, &body, &[DEVICE, SITE]);
-            let blocking_at_the_site: &[&str] = if links.is_empty() {
-                &[DEVICE]
-            } else {
-                &[DEVICE, LINK]
-            };
             let (status, body) = delete_site(&emulator, &network, &site).await;
-            assert_dependency_refusal(name, SITE_PARENT, status, &body, blocking_at_the_site);
+            assert_object_dependency_refusal(name, SITE_PARENT, &site, status, &body);
 
             // Every device and link a standing connection names is refused, and the refusal
             // names the connection as what blocks it.
@@ -330,11 +321,11 @@ async fn a_global_network_holding_connections_empties_only_in_the_order_its_refe
             }
             for device in &blocked_devices {
                 let (status, body) = delete_device(&emulator, &network, device).await;
-                assert_dependency_refusal(name, DEVICE_PARENT, status, &body, &[CONNECTION]);
+                assert_object_dependency_refusal(name, DEVICE_PARENT, device, status, &body);
             }
             for link in &blocked_links {
                 let (status, body) = delete_link(&emulator, &network, link).await;
-                assert_dependency_refusal(name, LINK_PARENT, status, &body, &[CONNECTION]);
+                assert_object_dependency_refusal(name, LINK_PARENT, link, status, &body);
             }
 
             // Every standing connection is still addressable: the reader lists exactly

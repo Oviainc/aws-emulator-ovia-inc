@@ -10,10 +10,10 @@
 //! owes it (its changes `IN_PROGRESS` -> `COMPLETE`, the core network `UPDATING` ->
 //! `AVAILABLE`), and every OTHER change set still waiting is superseded — it described
 //! differences from a document no longer in force — so it reports `OUT_OF_DATE`. Only a
-//! change set that is `READY_TO_EXECUTE` can be executed: any other state is a conflict
-//! that leaves the policy in force where it was, and an unknown core network or a version
-//! the core network does not hold is a not-found. Nothing here reaches into `crate::state`:
-//! every effect is read back through an operation.
+//! change set that is `READY_TO_EXECUTE` can be executed: any other state is a terminal
+//! validation failure that leaves the policy in force where it was, and an unknown core
+//! network or a version the core network does not hold is a not-found. Nothing here reaches
+//! into `crate::state`: every effect is read back through an operation.
 //!
 //! The table below spans that class: documents differing in what the execution puts in
 //! force — an added edge location and an added segment, a removed edge location and a
@@ -43,6 +43,13 @@ const OUT_OF_DATE: &str = "OUT_OF_DATE";
 /// The `ResourceType` a refusal about one policy of a core network reports, which is also
 /// this service's ARN resource type for it.
 const CORE_NETWORK_POLICY: &str = "core-network-policy";
+
+/// The prose a refused `ExecuteCoreNetworkChangeSet` carries whatever state the addressed
+/// change set is in: fixed text naming neither that state nor any id from the request.
+///
+/// `pub(crate)` because `crate::refusal_wording` tables the same refusal, so one rule keeps
+/// one expected string.
+pub(crate) const CHANGE_SET_STATE_INVALID: &str = "Change set state for policy is invalid.";
 
 /// A policy document configuring one edge in each entry of `edges` — each naming its own
 /// `asn`, so no edge takes one from `asn-ranges` — with the inside CIDR blocks the entry
@@ -364,8 +371,9 @@ async fn change_set(
         .clone()
 }
 
-/// Assert that executing `version_id`'s change set is refused as the conflict a change set
-/// in `state` is, and that the refusal leaves the policy in force where it was.
+/// Assert that executing `version_id`'s change set is refused as the terminal validation
+/// failure a change set in `state` is, and that the refusal leaves the policy in force where
+/// it was.
 async fn assert_not_executable(
     emulator: &Emulator,
     case: &str,
@@ -382,28 +390,27 @@ async fn assert_not_executable(
     );
     let (status, body) = execute(emulator, core_network_id, version_id).await;
     assert_eq!(
-        status, 409,
-        "case {case:?}: expected 409, got {status} with {body}"
+        status, 400,
+        "case {case:?}: expected 400, got {status} with {body}"
     );
     assert_eq!(
         error_code(&body),
-        "ConflictException",
-        "case {case:?}: expected ConflictException, got {body}"
+        "ValidationException",
+        "case {case:?}: expected ValidationException, got {body}"
     );
     assert_eq!(
-        body["ResourceId"],
-        json!(format!("{core_network_id}/{version_id}")),
-        "case {case:?}: the refusal must name the policy asked for, got {body}"
+        body["Reason"],
+        json!("Other"),
+        "case {case:?}: no input member is at fault, so the reason is the modelled Other, got {body}"
     );
-    assert_eq!(
-        body["ResourceType"],
-        json!(CORE_NETWORK_POLICY),
-        "case {case:?}: the refusal must name the policy's resource type, got {body}"
+    assert!(
+        body["Fields"].is_null(),
+        "case {case:?}: the refusal blames no input member, got {body}"
     );
     let message = body["Message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains(state) && message.contains(READY_TO_EXECUTE),
-        "case {case:?}: the refusal must name the state the change set is in and the one it would have to be in, got {body}"
+    assert_eq!(
+        message, CHANGE_SET_STATE_INVALID,
+        "case {case:?}: expected the message {CHANGE_SET_STATE_INVALID:?}, got {body}"
     );
     let still_in_force = live_policy(emulator, case, core_network_id).await;
     assert_eq!(

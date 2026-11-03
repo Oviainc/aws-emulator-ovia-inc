@@ -195,6 +195,8 @@ mod page_token_canonical_spelling;
 mod page_token_listing_scope;
 #[path = "all/policy_topology_derivation.rs"]
 mod policy_topology_derivation;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/register_transit_gateway_account_ownership.rs"]
 mod register_transit_gateway_account_ownership;
 #[path = "all/resource_not_found_message.rs"]

@@ -164,11 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // link." (`smithy_query query="doc" shape="DeleteSite"`) — so a site that still
         // holds either is refused, never deleted in a way that orphans them. The refusal
         // is the dependency ValidationException (400) every delete of this service raises
-        // through `crate::state::dependents_block_delete`.
+        // through `crate::state::object_dependents_block_delete`.
         let links = store.link_ids_of_site(&input.site_id);
         let devices = store.device_ids_of_site(&input.site_id);
-        if let Some(refusal) = crate::state::dependents_block_delete(
+        if let Some(refusal) = crate::state::object_dependents_block_delete(
             crate::state::SITE_KIND,
+            &input.site_id,
             &[
                 (crate::state::DEVICE_KIND, devices.len()),
                 (crate::state::LINK_KIND, links.len()),

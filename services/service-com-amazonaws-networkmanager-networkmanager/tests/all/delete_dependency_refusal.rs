@@ -12,9 +12,12 @@
 //! behaviour, not shape availability.
 //!
 //! The tables below span the dependency class: which child kinds are held, how many of
-//! each, and which parent is being deleted. The refusal must name every kind that blocks
-//! it and no kind that does not, must leave the resource tree untouched, and must stop
-//! blocking once the dependents are gone.
+//! each, and which parent is being deleted. A delete addressed at a CONTAINER (the global
+//! network itself) names every kind that blocks it and no kind that does not, as its
+//! recorded refusal does; a delete addressed at one of the global network's own OBJECTS (a
+//! site here) names that object by its kind and the id the request addressed it with, and no
+//! dependent kind at all. Either way the refusal must leave the resource tree untouched and
+//! must stop blocking once the dependents are gone.
 
 use serde_json::{json, Value};
 
@@ -22,17 +25,6 @@ use crate::core_network_lifecycle::create_core_network;
 use crate::device_lifecycle::create_device_ok;
 use crate::global_network_lifecycle::{error_code, ids_of, Emulator};
 use crate::link_lifecycle::{create_link_ok, plain_link};
-
-/// Every dependent kind a `DeleteGlobalNetwork` / `DeleteSite` refusal can name, as the
-/// refusal spells it (the ARN resource type read as words). Used to assert that a refusal
-/// names the kinds that block it and NONE of the others.
-pub(crate) const DEPENDENT_LABELS: [&str; 5] = [
-    "device",
-    "link",
-    "site",
-    "transit gateway registration",
-    "core network",
-];
 
 /// One row of the `DeleteGlobalNetwork` table: the children to put in a fresh global
 /// network, and the kinds the refusal must then name.
@@ -157,15 +149,20 @@ async fn build_network(emulator: &Emulator, case: &NetworkCase) -> (String, Vec<
     (network, sites)
 }
 
-/// Assert `body` is the dependency refusal: HTTP 400, `ValidationException`, naming every
-/// kind in `blocking` and no other dependent kind, with no field at fault.
-pub(crate) fn assert_dependency_refusal(
-    case: &str,
-    parent_label: &str,
-    status: u16,
-    body: &Value,
-    blocking: &[&str],
-) {
+/// Every dependent kind a `DeleteGlobalNetwork` refusal can name, as the refusal spells it
+/// (the ARN resource type read as words). Used to assert that a refusal names the kinds that
+/// block it and NONE of the others.
+pub(crate) const DEPENDENT_LABELS: [&str; 5] = [
+    "device",
+    "link",
+    "site",
+    "transit gateway registration",
+    "core network",
+];
+
+/// Assert `body` is the envelope every dependency refusal of this service carries: HTTP 400,
+/// `ValidationException`, the catch-all reason, no field at fault.
+fn assert_dependency_envelope(case: &str, status: u16, body: &Value) {
     assert_eq!(
         status, 400,
         "case {case:?}: a dependency refusal is HTTP 400, got {status} with {body}"
@@ -185,6 +182,18 @@ pub(crate) fn assert_dependency_refusal(
         Value::Null,
         "case {case:?}: a dependency refusal blames no field, got {body}"
     );
+}
+
+/// Assert `body` is the dependency refusal of a delete addressed at a CONTAINER: the
+/// envelope above, naming every kind in `blocking` and no other dependent kind.
+pub(crate) fn assert_dependency_refusal(
+    case: &str,
+    parent_label: &str,
+    status: u16,
+    body: &Value,
+    blocking: &[&str],
+) {
+    assert_dependency_envelope(case, status, body);
     let message = body["Message"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: no Message in {body}"));
@@ -206,6 +215,27 @@ pub(crate) fn assert_dependency_refusal(
             );
         }
     }
+}
+
+/// Assert `body` is the dependency refusal of a delete addressed at one of a global
+/// network's own OBJECTS: the envelope above, and the whole message, which names the object
+/// by its kind and the id the request addressed it with and no dependent kind.
+pub(crate) fn assert_object_dependency_refusal(
+    case: &str,
+    object_label: &str,
+    object_id: &str,
+    status: u16,
+    body: &Value,
+) {
+    assert_dependency_envelope(case, status, body);
+    let message = body["Message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no Message in {body}"));
+    let expected = crate::delete_live_reference_refusal::refusal_message(object_label, object_id);
+    assert_eq!(
+        message, expected,
+        "case {case:?}: expected the message {expected:?}, got {message:?}"
+    );
 }
 
 #[tokio::test]
@@ -353,7 +383,7 @@ async fn delete_site_blocked_by_its_devices_or_links_is_the_same_validation_fail
             continue;
         }
 
-        assert_dependency_refusal(name, "Site", status, &body, case.blocking);
+        assert_object_dependency_refusal(name, "Site", &site, status, &body);
 
         // A sibling site holding nothing still deletes, so the refusal is about the
         // dependents of the site named, not about the operation.

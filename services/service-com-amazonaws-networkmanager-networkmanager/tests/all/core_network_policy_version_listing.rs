@@ -284,7 +284,7 @@ async fn the_listing_reports_every_version_its_core_network_still_holds() {
         (
             "a restore appends the restored document as a new version",
             Some(first.as_str()),
-            vec![Step::Put("beta"), Step::Restore(1)],
+            vec![Step::Put("beta"), Step::Restore(2)],
             vec!["1/LIVE", "2/-", "3/LATEST"],
         ),
         (

@@ -13,7 +13,10 @@
 //! the document this one replaces, so each is superseded and reports `OUT_OF_DATE`. An
 //! unknown core network, and a policy version the core network does not hold, are both
 //! 404s; a change set that is not `READY_TO_EXECUTE` — one still being generated, one being
-//! executed or already executed, one superseded — is a 409 conflict and nothing is put in
+//! executed or already executed, one superseded — is a request invalid against the state of
+//! the policy it addresses that no retry can make valid, so it is the modelled
+//! `ValidationException` (HTTP 400) with the catch-all `Reason` and no `Fields` entry,
+//! never the retryable concurrent-state `ConflictException` (409), and nothing is put in
 //! force. This is the ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
@@ -187,26 +190,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // generated has no settled set of differences to apply yet, one already being
         // executed or executed has applied them, and one superseded by another version's
         // execution describes differences from a document no longer in force. Each is a
-        // request that conflicts with the state the addressed policy is in rather than a
-        // malformed one, so it is the modelled `ConflictException` (HTTP 409) naming that
-        // policy, and the LIVE policy does not move.
+        // request that is invalid against the state the addressed policy is in, and no
+        // retry of THIS call can make it valid — the caller has to submit a new version —
+        // so it is a terminal HTTP 400 `ValidationException` carrying `Other` and no
+        // member at fault, not this service's concurrent-state `ConflictException` (409)
+        // that a retry can clear. The prose is entirely fixed: it names neither the state
+        // the change set is in nor any id from the request. The LIVE policy does not move.
         if change_set_state != crate::state::CHANGE_SET_READY_TO_EXECUTE {
-            return Err(ExecuteCoreNetworkChangeSetErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "the change set of policy version {} of core network {} is in state {change_set_state}; only a change set in state {} can be executed",
-                        input.policy_version_id,
-                        input.core_network_id,
-                        crate::state::CHANGE_SET_READY_TO_EXECUTE
-                    ),
-                    resource_id: crate::state::policy_version_resource_id(
-                        &input.core_network_id,
-                        input.policy_version_id,
-                    ),
-                    resource_type: crate::state::CORE_NETWORK_POLICY_KIND.to_string(),
-                },
-            )
-            .into());
+            return Err(
+                ExecuteCoreNetworkChangeSetErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "Change set state for policy is invalid.".to_string(),
+                        reason: Some(crate::state::VALIDATION_REASON_OTHER.to_string()),
+                        fields: None,
+                    },
+                )
+                .into(),
+            );
         }
 
         // "Executes a change set on your core network. Deploys changes globally based on

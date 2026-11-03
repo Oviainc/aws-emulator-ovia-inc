@@ -365,23 +365,28 @@ async fn policy_version_history_round_trips_through_stored_state() {
     // The LIVE version cannot be deleted, and the refusal removes nothing.
     let (status, refused) = delete_version(&emulator, &core_network_id, 1).await;
     assert_eq!(
-        status, 409,
+        status, 400,
         "deleting the LIVE version must be refused, got {status} with {refused}"
     );
     assert_eq!(
         error_code(&refused),
-        "ConflictException",
-        "the LIVE refusal must be a conflict, got {refused}"
+        "ValidationException",
+        "the LIVE refusal is a terminal validation failure, not a retryable conflict, got {refused}"
     );
     assert_eq!(
-        refused["ResourceType"],
-        json!("core-network-policy"),
-        "the refusal must name the resource type it addresses, got {refused}"
+        refused["Reason"],
+        json!("Other"),
+        "no input member is at fault, so the reason is the modelled Other, got {refused}"
     );
+    assert!(
+        refused["Fields"].is_null(),
+        "the LIVE refusal blames no input member, got {refused}"
+    );
+    let expected = "Cannot delete the live version of the core network ID.";
     assert_eq!(
-        refused["ResourceId"],
-        json!(format!("{core_network_id}/1")),
-        "the refusal must name the core network and the version, got {refused}"
+        refused["Message"].as_str(),
+        Some(expected),
+        "expected the message {expected:?}, got {refused}"
     );
     let (status, still_live) = get_policy(&emulator, &core_network_id, "?alias=LIVE").await;
     assert_eq!(
