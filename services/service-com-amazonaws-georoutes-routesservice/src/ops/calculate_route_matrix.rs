@@ -410,7 +410,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             route_matrix.push(row);
             tokio::task::yield_now().await;
         }
-        let pricing_bucket = state_handle.lock().pricing_bucket.clone();
+        let pricing_bucket = state_handle.lock().pricing_bucket(Self::NAME);
 
         // "The count of error results in the route matrix": derived from the entries that
         // carry one, so the count and the matrix cannot disagree.

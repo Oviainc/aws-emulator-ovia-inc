@@ -27,5 +27,7 @@ mod response_detail;
 mod routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/success_response_synthesis.rs"]
+mod success_response_synthesis;
 #[path = "all/travel_steps.rs"]
 mod travel_steps;

@@ -2,14 +2,16 @@
 
 //! @op OptimizeWaypoints
 //!
-//! Orders the submitted waypoints by the cost the shared cost function in
-//! [`crate::state`] gives each hop — duration for `FastestRoute`, distance for
-//! `ShortestRoute` — taking the cheapest unvisited waypoint at each step, with the origin
-//! first and the destination, when one is given, last. The answer carries one connection
-//! per consecutive pair of the computed sequence, the clock walked forward across them
-//! (travel, then the rest a `Driver.RestCycles` schedule owes, then any wait for an
-//! `AppointmentTime`, then the waypoint's `ServiceDuration`), and the totals summed over
-//! those connections: the overall `Duration` is every phase `TimeBreakdown` splits the
+//! Orders the submitted waypoints so that the cost of the WHOLE journey — by the shared
+//! cost function in [`crate::state`]: duration for `FastestRoute`, distance for
+//! `ShortestRoute` — is the least any order of them takes, with the origin first and the
+//! destination, when one is given, last. The order is searched over orders rather than
+//! grown hop by hop ([`optimal_order`]), because the cheapest next hop can leave an
+//! expensive remainder and the journey is what the operation minimizes. The answer carries
+//! one connection per consecutive pair of the computed sequence, the clock walked forward
+//! across them (travel, then the rest a `Driver.RestCycles` schedule owes, then any wait
+//! for an `AppointmentTime`, then the waypoint's `ServiceDuration`), and the totals summed
+//! over those connections: the overall `Duration` is every phase `TimeBreakdown` splits the
 //! cycle into — travel, rest, wait and the service time spent at the waypoints.
 //!
 //! A request must say where the journey GOES, not only where it starts: `Origin` is the
@@ -17,17 +19,18 @@
 //! non-empty `Waypoints` is refused rather than answered with a route to nowhere.
 //!
 //! `Before` is HONOURED where it can be: a waypoint another unvisited waypoint requires
-//! to come after it is not eligible for the next step, so the computed sequence satisfies
-//! the constraint whenever the constraints are satisfiable at all. Constraints that name a
-//! cycle cannot all hold; the sequence then falls back to cost alone and every waypoint
-//! whose `Before` the order breaks comes back as an `ImpedingWaypoints` entry naming that
-//! failed constraint — the model's own channel for "waypoints that caused the optimization
-//! problem to fail, and the constraints that were unsatisfied".
+//! to come after it is not a candidate for the next place in the order, so the computed
+//! sequence satisfies the constraint whenever the constraints are satisfiable at all.
+//! Constraints that name a cycle cannot all hold; the sequence then falls back to cost
+//! alone and every waypoint whose `Before` the order breaks comes back as an
+//! `ImpedingWaypoints` entry naming that failed constraint — the model's own channel for
+//! "waypoints that caused the optimization problem to fail, and the constraints that were
+//! unsatisfied".
 //!
 //! `Clustering` is HONOURED: the clusters the requested algorithm forms are what the
-//! sequencer keeps together — while the traveller is in a cluster, that cluster's own
-//! waypoints are the candidates for the next step and cost decides between them — and
-//! every optimized waypoint reports the `ClusterIndex` of the cluster it was assigned to.
+//! sequencer keeps together — the traveller leaves a cluster only once that cluster's own
+//! waypoints are behind — and every optimized waypoint reports the `ClusterIndex` of the
+//! cluster it was assigned to.
 //! `DrivingDistance` clusters the stops that are within the configured driving distance of
 //! each other, costed by the same cost function as the connections; `TopologySegment`
 //! clusters the stops that snap onto one stretch of one road between two junctions of the
@@ -536,90 +539,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // Sequence: from the stop reached last, take the cheapest unvisited waypoint the
-        // `Before` constraints allow — a waypoint another unvisited one requires to be
-        // visited after it is not eligible yet. When no candidate is eligible the
-        // constraints cannot all hold (they name a cycle), so the step falls back to cost
-        // alone and the broken ones are reported under `ImpedingWaypoints` below.
+        // Every stop of the journey, in the order the request named them: the origin
+        // first, then the submitted waypoints, then the destination where the request
+        // named one. The sequencing below reorders the WAYPOINTS between those two fixed
+        // ends — the journey starts at the origin and, when there is one, ends at the
+        // destination.
+        let ends_at_destination = destination.is_some();
+        let stops: Vec<Stop> = std::iter::once(origin)
+            .chain(waypoints)
+            .chain(destination)
+            .collect();
+        let last_stop = stops.len() - 1;
+
+        // The cost of every hop the journey could take, from the one cost function in
+        // [`crate::state`]: `hops[from][to]` is the distance and the duration of
+        // travelling from one stop to another. The WHOLE table is costed before anything
+        // is sequenced, because the order with the least total cost cannot be read off one
+        // hop at a time. Nothing travels back to the origin and nothing travels on from
+        // the destination, so those hops are not costed.
         //
-        // The lock on the shared state is taken once per step — at most `Waypoints.len()`
-        // route computations, itself capped by the documented maximum above — and released
-        // between steps, where the handler yields, so a long sequence neither holds the
-        // lock for the whole request nor leaves a client's cancellation nowhere to land.
-        let mut sequence = vec![origin];
-        let mut remaining: Vec<Stop> = waypoints;
-        while !remaining.is_empty() {
-            let from = sequence
-                .last()
-                .ok_or_else(|| internal("the optimized sequence lost its origin"))?
-                .position;
-            let eligible: Vec<usize> = (0..remaining.len())
-                .filter(|&index| {
-                    let waypoint_index = remaining[index].waypoint_index;
-                    !remaining.iter().enumerate().any(|(other, stop)| {
-                        other != index && waypoint_index.is_some_and(|named| stop.before.contains(&named))
-                    })
-                })
-                .collect();
-            let pool: Vec<usize> = if eligible.is_empty() {
-                (0..remaining.len()).collect()
-            } else {
-                eligible
-            };
-            // Clustering "improves the optimized sequence": the waypoints of one cluster
-            // are visited together, so while the traveller is in a cluster the candidates
-            // of that cluster come first and only cost decides between them. With the
-            // cluster exhausted, or with no clustering asked for, the whole pool competes.
-            let pool: Vec<usize> = match sequence.last().and_then(|stop| clusters.get(&stop.id)) {
-                None => pool,
-                Some(cluster) => {
-                    let same: Vec<usize> = pool
-                        .iter()
-                        .copied()
-                        .filter(|index| clusters.get(&remaining[*index].id) == Some(cluster))
-                        .collect();
-                    if same.is_empty() {
-                        pool
-                    } else {
-                        same
-                    }
-                }
-            };
-            let chosen = {
+        // The lock on the shared state is taken once per stop — at most `Waypoints.len()`
+        // acquisitions, itself capped by the documented maximum above — and released
+        // between them, where the handler yields, so a long request neither holds the lock
+        // for the whole of it nor leaves a client's cancellation nowhere to land.
+        let mut hops: Vec<Vec<(i64, i64)>> = vec![vec![(0, 0); stops.len()]; stops.len()];
+        for from in 0..stops.len() {
+            if ends_at_destination && from == last_stop {
+                continue;
+            }
+            {
                 let mut state = state_handle.lock();
-                let mut best: Option<(usize, i64)> = None;
-                for index in pool {
-                    let candidate = &remaining[index];
-                    let route = state.compute_route(&[from, candidate.position], travel_mode, objective, 0);
-                    let cost = match objective {
-                        RoutingObjective::FastestRoute => route.duration_s,
-                        RoutingObjective::ShortestRoute => route.distance_m,
-                    };
-                    if best.is_none_or(|(_, best_cost)| cost < best_cost) {
-                        best = Some((index, cost));
+                for to in 1..stops.len() {
+                    if to == from {
+                        continue;
                     }
+                    let route =
+                        state.compute_route(&[stops[from].position, stops[to].position], travel_mode, objective, 0);
+                    hops[from][to] = (route.distance_m, route.duration_s);
                 }
-                best.map(|(index, _)| index)
-            };
-            let index = chosen.ok_or_else(|| internal("no next waypoint could be chosen"))?;
-            sequence.push(remaining.remove(index));
+            }
             tokio::task::yield_now().await;
         }
-        sequence.extend(destination);
 
-        // The cost of each hop of the computed sequence, from the same cost function.
-        let (routed, pricing_bucket) = {
-            let mut state = state_handle.lock();
-            let routed: Vec<(i64, i64)> = sequence
-                .windows(2)
-                .map(|pair| {
-                    let route =
-                        state.compute_route(&[pair[0].position, pair[1].position], travel_mode, objective, 0);
-                    (route.distance_m, route.duration_s)
-                })
-                .collect();
-            (routed, state.pricing_bucket.clone())
-        };
+        // What the objective minimises: the travel time for `FastestRoute`, the distance
+        // travelled for `ShortestRoute`.
+        let hop_costs: Vec<Vec<i64>> = hops
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|(distance_m, duration_s)| match objective {
+                        RoutingObjective::FastestRoute => *duration_s,
+                        RoutingObjective::ShortestRoute => *distance_m,
+                    })
+                    .collect()
+            })
+            .collect();
+        // `Before` names waypoints by their index in `Waypoints`, which is one less than
+        // their index among the stops.
+        let must_follow: Vec<Vec<usize>> = stops
+            .iter()
+            .map(|stop| stop.before.iter().map(|index| index + 1).collect())
+            .collect();
+        let cluster_of: Vec<Option<i32>> = stops
+            .iter()
+            .map(|stop| clusters.get(&stop.id).copied())
+            .collect();
+
+        // The stops in VISITING order, which is what every connection, optimized waypoint
+        // and total below is read off.
+        let visiting: Vec<usize> = std::iter::once(0)
+            .chain(optimal_order(
+                &hop_costs,
+                &must_follow,
+                &cluster_of,
+                ends_at_destination,
+            ))
+            .chain(ends_at_destination.then_some(last_stop))
+            .collect();
+        let sequence: Vec<Stop> = visiting.iter().map(|index| stops[*index].clone()).collect();
+        // The cost of each hop of the computed sequence, read off the same table the order
+        // was chosen from, so the answer's connections cannot disagree with the choice.
+        let routed: Vec<(i64, i64)> = visiting.windows(2).map(|pair| hops[pair[0]][pair[1]]).collect();
+        let pricing_bucket = state_handle.lock().pricing_bucket(Self::NAME);
 
         let treat_service_time_as_rest = input
             .driver
@@ -757,6 +758,279 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// applies when any waypoint uses a constraint.
 const MAX_WAYPOINTS: usize = 50;
 const MAX_CONSTRAINED_WAYPOINTS: usize = 20;
+
+/// Up to this many waypoints the visiting order is searched EXACTLY, over the subsets of
+/// the waypoints already visited ([`exact_order`]). Beyond it an exact search is more work
+/// than one request may ask for, so the order is grown and then improved
+/// ([`improved_order`]).
+const EXACT_SEQUENCING_MAX: usize = 12;
+
+/// How many improvement passes [`improved_order`] makes over a grown order. A pass that
+/// improves nothing stops the loop, so this only bounds the work of a request whose order
+/// keeps improving.
+const SEQUENCING_PASSES: usize = 8;
+
+/// The order the journey visits the waypoints in: the one whose TOTAL cost is least.
+///
+/// `costs[from][to]` is the cost of the hop between two stops, in whatever the objective
+/// minimises. Stop `0` is the origin, stops `1..` the submitted waypoints and, when
+/// `ends_at_destination`, the last stop is the destination. The answer is the waypoints in
+/// visiting order.
+///
+/// This operation "calculates the optimal order to travel between a set of waypoints to
+/// minimize either the travel time or the distance travelled during the journey", so what
+/// is minimised is the cost of the WHOLE journey — the origin, every waypoint and the
+/// destination where there is one — and not the cost of the next hop. Taking the cheapest
+/// hop at each step does not minimise the journey: a cheap first hop can leave an
+/// expensive remainder, and the sequence a client dispatches its stops in would then be
+/// one it could have beaten.
+///
+/// `must_follow[stop]` names the stops that have to be visited after that stop (`Before`)
+/// and `clusters[stop]` the cluster it was assigned to; an order breaking either is not
+/// considered. Constraints no order can satisfy at once — a `Before` cycle — are dropped a
+/// tier at a time rather than left to make the request unanswerable, and the constraints
+/// the resulting order leaves unmet are what the caller is told about through
+/// `ImpedingWaypoints`.
+fn optimal_order(
+    costs: &[Vec<i64>],
+    must_follow: &[Vec<usize>],
+    clusters: &[Option<i32>],
+    ends_at_destination: bool,
+) -> Vec<usize> {
+    let stops: Vec<usize> = (1..costs.len() - usize::from(ends_at_destination)).collect();
+    if stops.len() < 2 {
+        return stops;
+    }
+    for (honour_before, honour_clusters) in [(true, true), (false, true), (false, false)] {
+        let rules = Rules {
+            must_follow,
+            clusters,
+            stops: &stops,
+            honour_before,
+            honour_clusters,
+        };
+        let order = if stops.len() <= EXACT_SEQUENCING_MAX {
+            exact_order(costs, &rules, ends_at_destination)
+        } else {
+            improved_order(costs, &rules, ends_at_destination)
+        };
+        if let Some(order) = order {
+            return order.into_iter().map(|local| stops[local]).collect();
+        }
+    }
+    stops
+}
+
+/// Which waypoint may be visited next, over the constraints the request set.
+struct Rules<'a> {
+    /// By stop, the stops that must be visited after it.
+    must_follow: &'a [Vec<usize>],
+    /// By stop, the cluster it was assigned to.
+    clusters: &'a [Option<i32>],
+    /// The stops being sequenced, by the LOCAL index the search uses.
+    stops: &'a [usize],
+    honour_before: bool,
+    honour_clusters: bool,
+}
+
+impl Rules<'_> {
+    /// Whether the waypoint at local index `next` may be visited now: with `visited` (a
+    /// bit per local index) behind the traveller and `last` the waypoint reached last, or
+    /// `None` while the traveller is still at the origin.
+    fn allows(&self, visited: u64, last: Option<usize>, next: usize) -> bool {
+        let stop = self.stops[next];
+        if self.honour_before {
+            // A waypoint another unvisited waypoint requires to come after it cannot be
+            // visited yet.
+            let waiting_on = self.stops.iter().enumerate().any(|(local, earlier)| {
+                local != next
+                    && visited & bit(local) == 0
+                    && self.must_follow[*earlier].contains(&stop)
+            });
+            if waiting_on {
+                return false;
+            }
+        }
+        if self.honour_clusters {
+            // Clustering "improves the optimized sequence": the waypoints of one cluster
+            // are visited together, so the traveller leaves a cluster only once its own
+            // waypoints are all behind.
+            let current = match last {
+                // The origin is a stop of the journey and so of a cluster too.
+                None => self.clusters[0],
+                Some(last) => self.clusters[self.stops[last]],
+            };
+            if let Some(cluster) = current {
+                if self.clusters[stop] != Some(cluster) {
+                    let left_behind = self.stops.iter().enumerate().any(|(local, waypoint)| {
+                        local != next && visited & bit(local) == 0 && self.clusters[*waypoint] == Some(cluster)
+                    });
+                    if left_behind {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether a whole order of local indexes keeps to the rules, which is the same check
+    /// walked from the origin.
+    fn allows_order(&self, order: &[usize]) -> bool {
+        let mut visited = 0_u64;
+        let mut last = None;
+        for &local in order {
+            if !self.allows(visited, last, local) {
+                return false;
+            }
+            visited |= bit(local);
+            last = Some(local);
+        }
+        true
+    }
+}
+
+/// The bit a local index occupies in a visited set. A request carries at most
+/// [`MAX_WAYPOINTS`] waypoints, which is fewer than the bits of the set.
+fn bit(local: usize) -> u64 {
+    debug_assert!(local < u64::BITS as usize, "a visited set covers every waypoint");
+    1_u64 << (local % u64::BITS as usize)
+}
+
+/// The cost of a whole order: the hops from the origin through the waypoints and on to the
+/// destination where there is one.
+fn order_cost(costs: &[Vec<i64>], rules: &Rules<'_>, order: &[usize], ends_at_destination: bool) -> i64 {
+    let mut total: i64 = 0;
+    let mut from = 0;
+    for &local in order {
+        let to = rules.stops[local];
+        total = total.saturating_add(costs[from][to]);
+        from = to;
+    }
+    if ends_at_destination {
+        total = total.saturating_add(costs[from][costs.len() - 1]);
+    }
+    total
+}
+
+/// The cheapest way to have reached one waypoint: what that cost, and the waypoint visited
+/// before it — `None` for the first of the order, which was reached from the origin.
+type Reached = Option<(i64, Option<usize>)>;
+
+/// The cheapest order, searched exactly: for every SET of waypoints already visited and
+/// every waypoint the traveller could be at, the least cost of having visited that set and
+/// stopped there. A set is reached from the sets one waypoint smaller, so each is costed
+/// once however many orders lead to it, and the cheapest full set is the cheapest journey.
+///
+/// `None` when the rules admit no order at all.
+fn exact_order(costs: &[Vec<i64>], rules: &Rules<'_>, ends_at_destination: bool) -> Option<Vec<usize>> {
+    let count = rules.stops.len();
+    let sets = 1_usize.checked_shl(u32::try_from(count).ok()?)?;
+    // By visited set and waypoint reached last.
+    let mut best: Vec<Vec<Reached>> = vec![vec![None; count]; sets];
+    for first in 0..count {
+        if rules.allows(0, None, first) {
+            best[bit(first) as usize][first] = Some((costs[0][rules.stops[first]], None));
+        }
+    }
+    for visited in 1..sets {
+        for last in 0..count {
+            if visited & bit(last) as usize == 0 {
+                continue;
+            }
+            let Some((reached, _)) = best[visited][last] else {
+                continue;
+            };
+            for next in 0..count {
+                if visited & bit(next) as usize != 0 || !rules.allows(visited as u64, Some(last), next) {
+                    continue;
+                }
+                let cost = reached.saturating_add(costs[rules.stops[last]][rules.stops[next]]);
+                let entry = &mut best[visited | bit(next) as usize][next];
+                if entry.is_none_or(|(known, _)| cost < known) {
+                    *entry = Some((cost, Some(last)));
+                }
+            }
+        }
+    }
+
+    let full = sets - 1;
+    let mut end: Option<(i64, usize)> = None;
+    for last in 0..count {
+        let Some((reached, _)) = best[full][last] else {
+            continue;
+        };
+        let total = if ends_at_destination {
+            reached.saturating_add(costs[rules.stops[last]][costs.len() - 1])
+        } else {
+            reached
+        };
+        if end.is_none_or(|(known, _)| total < known) {
+            end = Some((total, last));
+        }
+    }
+
+    // Walk the choices back from the cheapest end to the first waypoint.
+    let (_, mut last) = end?;
+    let mut visited = full;
+    let mut order = Vec::with_capacity(count);
+    loop {
+        order.push(last);
+        let (_, previous) = best[visited][last]?;
+        visited ^= bit(last) as usize;
+        match previous {
+            Some(previous) => last = previous,
+            None => break,
+        }
+    }
+    order.reverse();
+    Some(order)
+}
+
+/// The cheapest order found by growing one and then improving it, for a request with more
+/// waypoints than an exact search may be asked for.
+///
+/// The order is grown by taking the cheapest hop the rules allow, which is a feasible
+/// order but not the cheapest one, and then improved: reversing a stretch of it is kept
+/// whenever that makes the whole journey cheaper and still keeps to the rules, until a
+/// pass finds no improvement. `None` when the rules admit no order at all.
+fn improved_order(costs: &[Vec<i64>], rules: &Rules<'_>, ends_at_destination: bool) -> Option<Vec<usize>> {
+    let count = rules.stops.len();
+    let mut order: Vec<usize> = Vec::with_capacity(count);
+    let mut visited = 0_u64;
+    while order.len() < count {
+        let last = order.last().copied();
+        let next = (0..count)
+            .filter(|local| visited & bit(*local) == 0 && rules.allows(visited, last, *local))
+            .min_by_key(|local| {
+                let from = last.map_or(0, |last| rules.stops[last]);
+                costs[from][rules.stops[*local]]
+            })?;
+        visited |= bit(next);
+        order.push(next);
+    }
+
+    let mut cost = order_cost(costs, rules, &order, ends_at_destination);
+    for _ in 0..SEQUENCING_PASSES {
+        let mut improved = false;
+        for from in 0..count {
+            for to in from + 1..count {
+                let mut candidate = order.clone();
+                candidate[from..=to].reverse();
+                let candidate_cost = order_cost(costs, rules, &candidate, ends_at_destination);
+                if candidate_cost < cost && rules.allows_order(&candidate) {
+                    order = candidate;
+                    cost = candidate_cost;
+                    improved = true;
+                }
+            }
+        }
+        if !improved {
+            break;
+        }
+    }
+    Some(order)
+}
 
 /// The upper bound of the model's `DurationSeconds` range, which `ServiceDuration`
 /// targets (`0..4294967295`).

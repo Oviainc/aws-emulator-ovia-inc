@@ -178,7 +178,7 @@ pub const MAX_SNAP_RADIUS_M: i64 = 10_000;
 /// The documented default of `LegGeometryFormat` / `SnappedGeometryFormat`.
 pub const DEFAULT_GEOMETRY_FORMAT: &str = "FlexiblePolyline";
 
-/// The pricing TIER a geo-routes query is charged in.
+/// The base pricing TIER a geo-routes query is charged in.
 ///
 /// `PricingBucket` is "the pricing bucket for which the query is charged at"
 /// (`CalculateRoutesResponse$PricingBucket`), `@required` and bound to the
@@ -186,12 +186,19 @@ pub const DEFAULT_GEOMETRY_FORMAT: &str = "FlexiblePolyline";
 /// enumerates no values, and recorded behavior is a tier token shared by the Location
 /// Service APIs — the sibling places service reports the same `Core` tier
 /// (`PRICING_BUCKET_CORE` in `service-com-amazonaws-geoplaces-placesservice`). So the
-/// bucket names the TIER the call is charged in and never the request or operation class:
-/// every query this service serves is a core routing query, because the features that
-/// would be charged differently (transit and intermodal modes, country exclusions,
-/// avoidance areas, span features and the leg features the road model holds no data for)
-/// are declined before any answer is computed.
+/// bucket names the TIER the call is charged in and never the request class: the route,
+/// matrix and isoline queries are charged in this base tier.
 pub const PRICING_BUCKET_CORE: &str = "Core";
+
+/// The higher pricing TIER a geo-routes query is charged in.
+///
+/// Which tier a query falls in is a property of the OPERATION that serves it and not of
+/// the request: recorded behavior answers every waypoint-optimization and every
+/// road-snapping query with this tier, however the request varies, and the route, matrix
+/// and isoline queries with [`PRICING_BUCKET_CORE`]. The two are the tokens recorded
+/// behavior carries; the model enumerates none, so nothing beyond the per-operation tier
+/// is read off a request.
+pub const PRICING_BUCKET_ADVANCED: &str = "Advanced";
 
 /// Precision of the Flexible Polyline encoding: 6 decimal digits, the default of the
 /// `aws-geospatial/polyline` library the model's `LegGeometryFormat` documentation points
@@ -740,12 +747,20 @@ pub struct CachedRoute {
 /// A position snapped onto the road network.
 #[derive(Debug, Clone)]
 pub struct SnappedPosition {
-    /// The point on the road nearest the submitted position.
+    /// The point on the road nearest the submitted position, at the coordinate precision
+    /// the network's geometry carries ([`round_to_network_precision`]).
     pub position: Position,
     /// Distance from the submitted position to [`SnappedPosition::position`], in metres.
     pub offset_m: f64,
     /// The road snapped to.
     pub road: TravelledRoad,
+    /// Distance from the submitted position to the nearest point of the nearest OTHER
+    /// road of the network, in metres, where there is one the same traveller may use.
+    ///
+    /// It is what makes a match CERTAIN or ambiguous: a position far nearer its matched
+    /// road than any other lies on that road, while one as near a second road could be on
+    /// either, and no offset alone tells the two cases apart.
+    pub runner_up_offset_m: Option<f64>,
 }
 
 /// Per-service state for com-amazonaws-georoutes-routesservice. A handler reaches it through [`service_state`].
@@ -767,8 +782,10 @@ pub struct ComAmazonawsGeoroutesRoutesserviceState {
     pub travel_mode_speeds: HashMap<TravelMode, f64>,
     /// Multipliers applied for `FastestRoute` versus `ShortestRoute`.
     pub routing_objective_factors: HashMap<RoutingObjective, ObjectiveFactors>,
-    /// The value returned in the `x-amz-geo-pricing-bucket` header.
-    pub pricing_bucket: String,
+    /// The value returned in the `x-amz-geo-pricing-bucket` header, by the operation that
+    /// answers the request: the tier is per-operation, so it is held per-operation and
+    /// read through [`Self::pricing_bucket`].
+    pub pricing_buckets: HashMap<&'static str, String>,
     /// Memo of computed routes, keyed by [`route_key`].
     pub calculated_routes: HashMap<String, CachedRoute>,
 }
@@ -807,13 +824,29 @@ impl Default for ComAmazonawsGeoroutesRoutesserviceState {
             road_cells: HashMap::new(),
             travel_mode_speeds,
             routing_objective_factors,
-            pricing_bucket: PRICING_BUCKET_CORE.to_string(),
+            pricing_buckets: HashMap::from([
+                ("CalculateIsolines", PRICING_BUCKET_CORE.to_string()),
+                ("CalculateRouteMatrix", PRICING_BUCKET_CORE.to_string()),
+                ("CalculateRoutes", PRICING_BUCKET_CORE.to_string()),
+                ("OptimizeWaypoints", PRICING_BUCKET_ADVANCED.to_string()),
+                ("SnapToRoads", PRICING_BUCKET_ADVANCED.to_string()),
+            ]),
             calculated_routes: HashMap::new(),
         }
     }
 }
 
 impl ComAmazonawsGeoroutesRoutesserviceState {
+    /// The pricing tier the queries `operation` serves are charged in, as its response
+    /// reports it in `PricingBucket`. An operation no tier is held for is charged in the
+    /// base tier rather than left without the `@required` member.
+    pub fn pricing_bucket(&self, operation: &str) -> String {
+        self.pricing_buckets
+            .get(operation)
+            .cloned()
+            .unwrap_or_else(|| PRICING_BUCKET_CORE.to_string())
+    }
+
     /// Travel speed of `mode`, in metres per second.
     pub fn speed_mps(&self, mode: TravelMode) -> f64 {
         self.travel_mode_speeds
@@ -924,13 +957,33 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
             let (position, offset_m) = nearest_point_on_polyline(pos, &segment.polyline);
             if best.as_ref().is_none_or(|current| offset_m < current.offset_m) {
                 best = Some(SnappedPosition {
-                    position,
+                    // The point is read off the network, so it is carried at the
+                    // network's own precision rather than with the artefacts of the
+                    // projection that located it.
+                    position: round_to_network_precision(position),
                     offset_m,
                     road: segment.travelled(),
+                    runner_up_offset_m: None,
                 });
             }
         }
-        best
+        let mut best = best?;
+        // The nearest road that is not the matched one, which is the candidate the match
+        // was chosen OVER. A second run of the very same road is not another candidate:
+        // one road carries one match however many cells of it were materialised.
+        for &index in self.road_cells.get(&cell).into_iter().flatten() {
+            let Some(segment) = self.road_network.get(index) else {
+                continue;
+            };
+            if !segment.allows(mode) || segment.travelled().is_same_road(&best.road) {
+                continue;
+            }
+            let (_, offset_m) = nearest_point_on_polyline(pos, &segment.polyline);
+            if best.runner_up_offset_m.is_none_or(|current| offset_m < current) {
+                best.runner_up_offset_m = Some(offset_m);
+            }
+        }
+        Some(best)
     }
 
     /// The route from `positions[0]` through every following position, costed by this
@@ -1150,17 +1203,46 @@ fn allows_of(class: RoadClass) -> Vec<TravelMode> {
 /// The route number designating a motorway of the network at grid index `index`: the
 /// network numbers its motorways, which is what [`TravelledRoad::route_number`] reports
 /// and what [`label_of`] names a motorway after.
+///
+/// A designation is what a client puts on a highway shield, so it is built the way a road
+/// designation is: a prefix, the road's own number, and the hemisphere letter that tells
+/// the two roads of one number apart. The grid index it is derived from is an internal
+/// coordinate of this network — its SIGN says which side of the equator the road is on and
+/// its multiple of [`MOTORWAY_EVERY`] counts the motorways from there — so neither the
+/// sign nor the spacing reaches the designation.
 fn motorway_number(index: i64) -> String {
-    format!("M{index}")
+    format!(
+        "M{}{}",
+        (index / MOTORWAY_EVERY).unsigned_abs(),
+        hemisphere(false, index)
+    )
 }
 
 /// The name of the road at grid index `index`.
+///
+/// Like [`motorway_number`], a name carries the road's number and the side of the origin
+/// it runs on, never the signed grid index itself: a negative numeral is an artefact of
+/// this network's coordinates and not something a client could render or match a road by.
 fn label_of(class: RoadClass, meridian: bool, index: i64) -> String {
+    let number = index.unsigned_abs();
+    let side = hemisphere(meridian, index);
     match (class, meridian) {
         (RoadClass::Motorway, _) => format!("Motorway {}", motorway_number(index)),
-        (RoadClass::Footpath, _) => format!("Footpath F{index}"),
-        (RoadClass::Street, true) => format!("Meridian Street {index}"),
-        (RoadClass::Street, false) => format!("Parallel Avenue {index}"),
+        (RoadClass::Footpath, _) => format!("Footpath F{number}{side}"),
+        (RoadClass::Street, true) => format!("Meridian Street {number}{side}"),
+        (RoadClass::Street, false) => format!("Parallel Avenue {number}{side}"),
+    }
+}
+
+/// Which side of the prime meridian a meridian road runs on, or which side of the equator
+/// a parallel road runs on: the letter a road designation carries instead of the sign of
+/// its grid index.
+fn hemisphere(meridian: bool, index: i64) -> &'static str {
+    match (meridian, index < 0) {
+        (true, true) => "W",
+        (true, false) => "E",
+        (false, true) => "S",
+        (false, false) => "N",
     }
 }
 
@@ -1255,6 +1337,74 @@ fn nearest_point_on_segment(pos: Position, a: Position, b: Position) -> Position
     }
     let t = (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0);
     [(ax + dx * t) / mx, (ay + dy * t) / my]
+}
+
+/// `position` at the coordinate precision the network's geometry carries
+/// ([`POLYLINE_PRECISION`] digits, ~0.1 m).
+///
+/// A position READ OFF the network is located by projecting into metres and back, so the
+/// arithmetic leaves digits far below that precision on it. They are not part of the
+/// network: the same road vertex reached two ways would otherwise be reported as two
+/// places. A position the CALLER supplied is never put through this — it is echoed as it
+/// was sent.
+pub fn round_to_network_precision(position: Position) -> Position {
+    let Ok(digits) = i32::try_from(POLYLINE_PRECISION) else {
+        return position;
+    };
+    let scale = 10_f64.powi(digits);
+    [
+        (position[0] * scale).round() / scale,
+        (position[1] * scale).round() / scale,
+    ]
+}
+
+/// The scale, in metres at `latitude`, on which a match onto this network is uncertain:
+/// half the spacing between neighbouring roads, which is the farthest a position inside
+/// the network's coverage can be from the nearest road along one axis.
+///
+/// A match whose offset is this much is as far from its road as a position can be, and a
+/// second road no further away than this is as good a candidate as the matched one.
+pub fn snap_ambiguity_m(latitude: f64) -> f64 {
+    let (metres_per_lon, metres_per_lat) = metres_per_degree(latitude);
+    (ROAD_SPACING_DEG * metres_per_lon.min(metres_per_lat) / 2.0).max(f64::MIN_POSITIVE)
+}
+
+/// The path ALONG THE ROADS from one matched position to another: the geometry a traveller
+/// following the network covers between the two points.
+///
+/// Both ends lie on a road of the network, so the path runs on roads the whole way and
+/// never cuts across the blocks between them:
+///
+/// * on one road, the stretch of that road between them;
+/// * on two roads that cross, along the first to the junction the two meet in
+///   ([`TravelledRoad::junction_with`]) and along the second from there;
+/// * on two roads of the same orientation, which never meet, along the first to the
+///   nearest road crossing both, along that one, and along the second — the corners are
+///   junctions of the network, not chosen points.
+pub fn road_path_between(from: &SnappedPosition, to: &SnappedPosition) -> Vec<Position> {
+    let (start, end) = (from.position, to.position);
+    let mut path = vec![start];
+    if !from.road.is_same_road(&to.road) {
+        match from.road.junction_with(&to.road) {
+            Some(junction) => path.push(round_to_network_precision(junction.position)),
+            None => {
+                // The two roads run parallel. The axis they both run along is where a
+                // crossing road sits at every multiple of the grid spacing, so the one
+                // nearest the far end connects them with no detour past it.
+                let axis = from.road.orientation.axis();
+                let crossing = (end[axis] / ROAD_SPACING_DEG).round() * ROAD_SPACING_DEG;
+                let mut leave = start;
+                leave[axis] = crossing;
+                let mut join = end;
+                join[axis] = crossing;
+                path.push(round_to_network_precision(leave));
+                path.push(round_to_network_precision(join));
+            }
+        }
+    }
+    path.push(end);
+    path.dedup_by(|a, b| positions_equal(*a, *b));
+    path
 }
 
 /// Whether two positions are the same at the 6-digit precision the geometry carries.

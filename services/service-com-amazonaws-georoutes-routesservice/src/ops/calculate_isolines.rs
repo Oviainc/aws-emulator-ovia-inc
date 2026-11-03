@@ -395,7 +395,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut state = state_handle.lock();
             (
                 state.snap(anchor.position, travel_mode).map(|snapped| snapped.position),
-                state.pricing_bucket.clone(),
+                state.pricing_bucket(Self::NAME),
             )
         };
 

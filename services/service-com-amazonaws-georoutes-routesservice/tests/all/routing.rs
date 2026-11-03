@@ -1475,16 +1475,18 @@ async fn snap_to_roads_answers_one_point_per_trace_point_within_the_radius() {
     }
 }
 
-/// Confidence is derived from the offset over the radius: the same trace point snapped
-/// with a larger radius is reported with a higher confidence.
+/// Confidence is a property of the MATCH and not of the request: the same trace point
+/// matched onto the same road is reported with the same confidence however much slack
+/// `SnapRadius` left around it, and a point the matcher had to move further, or that lies
+/// as near a second road, is reported with less of it.
 #[tokio::test]
-async fn a_wider_snap_radius_reports_a_higher_confidence_for_the_same_point() {
+async fn the_confidence_of_a_match_does_not_follow_the_snap_radius() {
     let router = routes_service();
     let trace_points = json!([
         { "Position": [-123.10025, 49.28025] },
         { "Position": [-123.10075, 49.28075] }
     ]);
-    let mut last: Option<(i64, f64)> = None;
+    let mut first: Option<(i64, f64)> = None;
     for radius in [50_i64, 100, 300, 1_000, 10_000] {
         let (status, answer, _) = post(
             &router,
@@ -1496,13 +1498,13 @@ async fn a_wider_snap_radius_reports_a_higher_confidence_for_the_same_point() {
         let confidence = answer["SnappedTracePoints"][0]["Confidence"]
             .as_f64()
             .unwrap_or_else(|| panic!("case {radius:?}: expected a confidence, got {answer:?}"));
-        if let Some((previous_radius, previous_confidence)) = last {
-            assert!(
-                confidence > previous_confidence,
-                "case {radius:?}: a wider radius than {previous_radius} must report more confidence, got {confidence} against {previous_confidence}"
+        if let Some((first_radius, first_confidence)) = first {
+            assert_eq!(
+                confidence, first_confidence,
+                "case {radius:?}: the same match as at {first_radius} m must score the same, got {confidence} against {first_confidence}"
             );
         }
-        last = Some((radius, confidence));
+        first = first.or(Some((radius, confidence)));
     }
 }
 
@@ -2386,45 +2388,48 @@ async fn contradictory_or_unknown_members_are_refused() {
     }
 }
 
-/// Every operation of this service reports the pricing bucket HELD IN STATE in the
+/// Every operation of this service reports the pricing bucket HELD IN STATE FOR IT in the
 /// required `PricingBucket` member, which the model binds to the
 /// `x-amz-geo-pricing-bucket` HTTP header (`@httpHeader` on
 /// `CalculateRoutesResponse$PricingBucket` and its four siblings), and reports the same
-/// value however the request varies — the bucket is a property of the service, not of the
-/// request, so nothing in the body carries it.
+/// value however the request varies — the tier is a property of the operation, not of the
+/// request, so nothing in the body carries it and nothing in the request moves it.
 #[tokio::test]
 async fn every_operation_reports_the_pricing_bucket_held_in_state() {
     let router = routes_service();
-    // The one value every handler reads, taken from the state struct itself rather than
+    // The mapping every handler reads, taken from the state struct itself rather than
     // restated here, so a change to it cannot leave this test asserting a stale literal.
-    let expected =
-        service_com_amazonaws_georoutes_routesservice::ComAmazonawsGeoroutesRoutesserviceState::default()
-            .pricing_bucket;
+    let state =
+        service_com_amazonaws_georoutes_routesservice::ComAmazonawsGeoroutesRoutesserviceState::default();
     let near = [-123.1, 49.28];
     let far = [-123.12, 49.26];
 
     // Rows span the five implemented operations and, within each, requests that differ in
     // the dimensions the response varies over (waypoints, size, radius, travel mode,
     // threshold).
-    let cases: [(&str, &str, Value); 10] = [
+    let cases: [(&str, &str, &str, Value); 10] = [
         (
             "a direct route",
             ROUTES,
+            "CalculateRoutes",
             json!({ "Origin": near, "Destination": far }),
         ),
         (
             "a time-based isoline",
             ISOLINES,
+            "CalculateIsolines",
             json!({ "Origin": near, "Thresholds": { "Time": [300] } }),
         ),
         (
             "a distance-based isoline around a destination",
             ISOLINES,
+            "CalculateIsolines",
             json!({ "Destination": far, "Thresholds": { "Distance": [2000] } }),
         ),
         (
             "a route through a waypoint, on foot",
             ROUTES,
+            "CalculateRoutes",
             json!({
                 "Origin": near,
                 "Destination": far,
@@ -2435,11 +2440,13 @@ async fn every_operation_reports_the_pricing_bucket_held_in_state() {
         (
             "a 1x1 matrix",
             MATRIX,
+            "CalculateRouteMatrix",
             json!({ "Origins": [{ "Position": near }], "Destinations": [{ "Position": far }] }),
         ),
         (
             "a 2x2 truck matrix",
             MATRIX,
+            "CalculateRouteMatrix",
             json!({
                 "Origins": [{ "Position": near }, { "Position": [-123.2, 49.3] }],
                 "Destinations": [{ "Position": far }, { "Position": [-123.05, 49.25] }],
@@ -2449,6 +2456,7 @@ async fn every_operation_reports_the_pricing_bucket_held_in_state() {
         (
             "a snap at the default radius",
             SNAP,
+            "SnapToRoads",
             json!({
                 "TracePoints": [{ "Position": [-123.10025, 49.28025] }, { "Position": [-123.10125, 49.28125] }],
                 "SnapRadius": 0,
@@ -2457,6 +2465,7 @@ async fn every_operation_reports_the_pricing_bucket_held_in_state() {
         (
             "a snap at 10 km, simple geometry",
             SNAP,
+            "SnapToRoads",
             json!({
                 "TracePoints": [{ "Position": [-123.10025, 49.28025] }, { "Position": [-123.10075, 49.28075] }],
                 "SnapRadius": 10_000,
@@ -2466,11 +2475,13 @@ async fn every_operation_reports_the_pricing_bucket_held_in_state() {
         (
             "an optimization with no waypoints",
             OPTIMIZE,
+            "OptimizeWaypoints",
             json!({ "Origin": near, "Destination": far }),
         ),
         (
             "an optimization over three waypoints",
             OPTIMIZE,
+            "OptimizeWaypoints",
             json!({
                 "Origin": near,
                 "Destination": far,
@@ -2483,13 +2494,14 @@ async fn every_operation_reports_the_pricing_bucket_held_in_state() {
         ),
     ];
 
-    for (case, path, body) in cases {
+    for (case, path, operation, body) in cases {
+        let expected = state.pricing_bucket(operation);
         let (status, answer, bucket) = post(&router, path, &body).await;
         assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
         assert_eq!(
             bucket.as_deref(),
             Some(expected.as_str()),
-            "case {case:?}: expected the x-amz-geo-pricing-bucket header to carry the bucket held in state ({expected:?}), got {bucket:?}"
+            "case {case:?}: expected the x-amz-geo-pricing-bucket header to carry the bucket held in state for {operation} ({expected:?}), got {bucket:?}"
         );
         assert!(
             answer["PricingBucket"].is_null(),

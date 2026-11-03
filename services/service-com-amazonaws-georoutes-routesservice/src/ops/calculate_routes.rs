@@ -904,7 +904,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let computed: Vec<state::CachedRoute> = (0..=u32::try_from(alternatives).unwrap_or(0))
                 .map(|variant| state.compute_route(&positions, travel_mode, objective, variant))
                 .collect();
-            (computed, state.pricing_bucket.clone())
+            (computed, state.pricing_bucket(Self::NAME))
         };
 
         let mut routes = Vec::new();

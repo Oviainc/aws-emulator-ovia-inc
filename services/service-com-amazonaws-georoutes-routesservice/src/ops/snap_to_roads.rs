@@ -5,18 +5,20 @@
 //! Each trace point is snapped onto the nearest road of the network in [`crate::state`]
 //! that the requested travel mode may use. The answer carries one snapped point per
 //! submitted trace point, at the same index, with the submitted position echoed as
-//! `OriginalPosition`, the point on the road as `SnappedPosition` and a `Confidence` that
-//! falls off with the snap offset over `SnapRadius`. A point whose nearest usable road is
-//! further away than `SnapRadius` is not matched: it keeps its submitted position, scores
-//! zero confidence, and its index is listed under a `TracePointsNotMatched` notice. So is
-//! a point the network holds no road anywhere near — one in the open sea, where
-//! [`crate::state`] materialises no road at all — which is the case the notice exists for:
-//! a client reading `SnappedTracePoints` alone could not tell that fix from a road fix.
+//! `OriginalPosition`, the point on the road as `SnappedPosition` and a `Confidence` read
+//! off the match itself ([`match_confidence`]): how far the point had to move to reach its
+//! road, and how much nearer that road is than the next candidate road. A point whose
+//! nearest usable road is further away than `SnapRadius` is not matched: it keeps its
+//! submitted position, scores zero confidence, and its index is listed under a
+//! `TracePointsNotMatched` notice. So is a point the network holds no road anywhere near —
+//! one in the open sea, where [`crate::state`] materialises no road at all — which is the
+//! case the notice exists for: a client reading `SnappedTracePoints` alone could not tell
+//! that fix from a road fix.
 //!
-//! `SnappedGeometry` is the line through the positions that DID match a road; a point
-//! reported unmatched is left out of it, so the geometry and the per-point confidence
-//! cannot disagree, and a trace with fewer than two matched points reports no geometry at
-//! all.
+//! `SnappedGeometry` is the line along the ROADS the matched points were matched onto,
+//! from the first of them to the last ([`matched_geometry`]); a point reported unmatched is
+//! left out of it, so the geometry and the per-point confidence cannot disagree, and a
+//! trace with fewer than two matched points reports no geometry at all.
 //!
 //! `TracePoints[].Timestamp`, `Speed` and `Heading` are read but have nothing to act on:
 //! the network carries no one-way or direction data for a heading to disambiguate and no
@@ -261,10 +263,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             tokio::task::yield_now().await;
         }
-        let pricing_bucket = state_handle.lock().pricing_bucket.clone();
+        let pricing_bucket = state_handle.lock().pricing_bucket(Self::NAME);
 
         let mut snapped_trace_points = Vec::with_capacity(positions.len());
-        let mut snapped_path: Vec<Position> = Vec::with_capacity(positions.len());
+        // The matched points in order, each with the road it matched onto: the snapped
+        // geometry is the stretch of ROAD between consecutive ones, so the road is needed
+        // beside the position.
+        let mut matched_path: Vec<state::SnappedPosition> = Vec::with_capacity(positions.len());
         // The unmatched points, kept apart by WHY no road matched them: one lies beyond
         // the radius of the roads around it, the other lies where the network holds no
         // road at any radius. The notice states the reason, so the two cannot be reported
@@ -277,15 +282,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let matched = candidate.filter(|candidate| candidate.offset_m <= snap_radius_m);
             match matched {
                 Some(candidate) => {
-                    snapped_path.push(candidate.position);
                     snapped_trace_points.push(RoadSnapSnappedTracePoint {
-                        // Confidence falls off linearly with how far the point had to
-                        // move, over the radius the caller allowed: on the road is 1, at
-                        // the edge of the radius is 0.
-                        confidence: (1.0 - candidate.offset_m / snap_radius_m).clamp(0.0, 1.0),
+                        confidence: match_confidence(*position, &candidate),
                         original_position: state::position_to_vec(*position),
                         snapped_position: state::position_to_vec(candidate.position),
                     });
+                    matched_path.push(candidate);
                 }
                 None => {
                     if let Ok(index) = i32::try_from(index) {
@@ -334,7 +336,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let snapped_geometry = snapped_geometry(&snapped_path, &geometry_format)?;
+        let snapped_geometry = snapped_geometry(&matched_geometry(&matched_path), &geometry_format)?;
         Ok(SnapToRoadsOutput {
             notices,
             pricing_bucket,
@@ -361,8 +363,65 @@ const SNAP_CHUNK: usize = 256;
 /// 1..1000).
 const MAX_NOTICE_INDEXES: usize = 1_000;
 
-/// The interpolated geometry of the snapped route, in the requested format. `None` when
-/// there is no line to draw — a `LineString` carries two positions at least.
+/// How certain the match of `position` onto the road `candidate` names is, as
+/// `Confidence` ("Confidence value for the correctness of this point match", a
+/// `@range 0..1` double) reports it.
+///
+/// It is read off the MATCH and nothing else. Two things make a map match uncertain, and
+/// the score is their product:
+///
+/// * how far the point had to move to reach the road, over the scale on which a position
+///   inside this network's coverage is ambiguous ([`state::snap_ambiguity_m`]) — a point
+///   sitting on the road was observed where the road is, one as far from it as a point
+///   can be was not;
+/// * how much nearer the matched road is than the nearest other road the traveller may
+///   use — a point as near a second road could be on either, so the match is a guess
+///   between them, while a point with no other road near it can only be on this one.
+///
+/// The radius the request allowed is deliberately NOT part of it: `SnapRadius` says which
+/// points may be matched at all, so scoring against it would report the same match as
+/// confident or not depending on how much slack the caller left, and would never signal a
+/// poor match at a generous radius.
+fn match_confidence(position: Position, candidate: &state::SnappedPosition) -> f64 {
+    let ambiguity = state::snap_ambiguity_m(position[1]);
+    // A Gaussian error model on the distance from the observed point to a road: the
+    // relative likelihood that the point was observed on it. Strictly positive, so a
+    // matched point always carries some confidence.
+    let likelihood = |offset_m: f64| (-(offset_m / ambiguity).powi(2)).exp();
+    let matched = likelihood(candidate.offset_m);
+    let runner_up = candidate.runner_up_offset_m.map_or(0.0, likelihood);
+    let share = if matched + runner_up > 0.0 {
+        matched / (matched + runner_up)
+    } else {
+        // Both likelihoods underflowed, which leaves no ground to prefer either road.
+        0.5
+    };
+    (matched * share).clamp(0.0, 1.0)
+}
+
+/// The geometry of the snapped route: the roads the trace was matched onto, from the first
+/// matched point to the last.
+///
+/// Between two consecutive matched points the line is the stretch of the NETWORK that
+/// joins them ([`state::road_path_between`]), not the chord between them: the trace was
+/// matched onto roads, so the geometry the answer carries runs along those roads and a
+/// client drawing it stays on the network. An unmatched point contributes nothing — the
+/// line would otherwise run through a position the same answer reports as matching no
+/// road.
+fn matched_geometry(matched: &[state::SnappedPosition]) -> Vec<Position> {
+    let mut path: Vec<Position> = matched.first().map(|first| vec![first.position]).unwrap_or_default();
+    for pair in matched.windows(2) {
+        for vertex in state::road_path_between(&pair[0], &pair[1]) {
+            if path.last() != Some(&vertex) {
+                path.push(vertex);
+            }
+        }
+    }
+    path
+}
+
+/// The snapped geometry in the requested format. `None` when there is no line to draw — a
+/// `LineString` carries two positions at least.
 fn snapped_geometry(path: &[Position], format: &str) -> Result<Option<RoadSnapSnappedGeometry>, SnapToRoadsError> {
     if path.len() < 2 {
         return Ok(None);
