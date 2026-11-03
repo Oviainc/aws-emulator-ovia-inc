@@ -1,0 +1,111 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudformation__ssm.cdk-deploy-import-existing-resources-adopts-a-named-parameter cloudformation__ssm.change-set-import-existing-resources-name-owned-by-another-stack-fails cloudformation__ssm.change-set-import-without-deletion-policy-rejected cloudformation__ssm.change-set-on-stack-failure-delete-removes-the-failed-new-stack cloudformation__ssm.change-set-on-stack-failure-do-nothing-keeps-the-created-resource cloudformation__ssm.change-set-on-stack-failure-rollback-removes-the-created-resource cloudformation__ssm.change-set-execute-retain-except-on-create-deletes-the-new-retained-resource cloudformation__ssm.change-set-bootstrap-version-param-missing-rejected cloudformation__ssm.change-set-express-mode-failed-update-is-not-rolled-back cloudformation__ssm.change-set-revert-drift-restores-an-out-of-band-parameter-change cloudformation__ssm.cdk-deploy-prepare-change-set-leaves-it-unexecuted-until-execute-change-set
+Issue-Key: cloudformation__ssm.cdk-deploy-import-existing-resources-adopts-a-named-parameter|run#16|AssertionError|assert failed["StackStatus"] == "REVIEW_IN_PROGRESS", (
+Issue-Key: cloudformation__ssm.change-set-import-existing-resources-name-owned-by-another-stack-fails|run#14|AssertionError|assert (cs["Status"], cs.get("StatusReason")) == (
+Issue-Key: cloudformation__ssm.change-set-import-without-deletion-policy-rejected|run#9|AssertionError|assert got == (
+Issue-Key: cloudformation__ssm.change-set-on-stack-failure-delete-removes-the-failed-new-stack|_wait_deleted#13|AssertionError|raise AssertionError(f"stack still {stack['StackStatus']!r} after {timeout_s}s")
+Issue-Key: cloudformation__ssm.change-set-on-stack-failure-do-nothing-keeps-the-created-resource|run#18|AssertionError|assert _reason(events, "B", "CREATE_FAILED") == f"{name} already exists in stack {stack_id}", (
+Issue-Key: cloudformation__ssm.change-set-on-stack-failure-rollback-removes-the-created-resource|run#19|AssertionError|assert _reason(events, "B", "CREATE_FAILED") == f"{name} already exists in stack {stack_id}", (
+Issue-Key: cloudformation__ssm.change-set-execute-retain-except-on-create-deletes-the-new-retained-resource|_failed_update#3|AssertionError|assert got == want, f"[{label}] failure reasons: expected {want!r}, got {got!r}"
+Issue-Key: cloudformation__ssm.change-set-bootstrap-version-param-missing-rejected|_err#8|AssertionError|raise AssertionError(f"expected the call to be refused, but it succeeded: {result!r}")
+Issue-Key: cloudformation__ssm.change-set-express-mode-failed-update-is-not-rolled-back|run#14|AssertionError|assert cs.get("DeploymentConfig") == {"Mode": "EXPRESS", "DisableRollback": True}, (
+Issue-Key: cloudformation__ssm.change-set-revert-drift-restores-an-out-of-band-parameter-change|run#15|AssertionError|assert cs["Status"] == "CREATE_COMPLETE", f"drift-aware change set: {cs.get('StatusReason')!r}"
+Issue-Key: cloudformation__ssm.cdk-deploy-prepare-change-set-leaves-it-unexecuted-until-execute-change-set|run#21|AssertionError|assert rc == 0, f"the execute deploy exited {rc}; output tail {out[-800:]!r}"
+Issue-Commit: 39390cfa3000e408bc0d1db242197466d1e66569
+
+# cloudformation__ssm: 8 net-new root causes in the change-set surface — auto-import/early validation, ChangeSetType=IMPORT, OnStackFailure=DELETE, collision reasons, SSM-typed parameter resolution, EXPRESS, REVERT_DRIFT, REVIEW_IN_PROGRESS templates
+
+> _Note: this issue was identified against the code base at commit `39390cfa3000e408bc0d1db242197466d1e66569`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateChangeSet
+
+## Description
+Eight distinct net-new root causes in the emulator's CloudFormation change-set surface, all exercised through AWS::SSM::Parameter resources. They are independent defects and must each be closed; the numbering below is the count a fixer must satisfy.
+
+=== Cause 1 of 8: CreateChangeSet ignores ImportExistingResources and runs no pre-flight resource-existence check ===
+AWS: Smithy: CreateChangeSet.ImportExistingResources (boolean), DescribeChangeSet.ImportExistingResources, Status=ChangeSetStatus, ExecutionStatus. With ImportExistingResources=true, a template naming a physical resource that ANOTHER stack already manages is not adopted: the change set settles Status FAILED with StatusReason `<physical-id> already exists in stack <stack-arn>` (fixed text ` already exists in stack `; the physical id comes from the template and the stack ARN from the owning stack's StackId), ExecutionStatus UNAVAILABLE, and the new stack stays REVIEW_IN_PROGRESS while the owner keeps the resource. An unmanaged resource of the same name IS adopted: the change set is CREATE_COMPLETE and its ResourceChange carries Action `Import` with PhysicalResourceId set to the adopted name. Without auto-import, a plain deploy over an existing name is stopped by early validation: the change set is FAILED with StatusReason `The following hook(s)/validation failed: [AWS::EarlyValidation::ResourceExistenceCheck]. To troubleshoot Early Validation errors, use the DescribeEvents API for detailed failure information.` and the stack stays REVIEW_IN_PROGRESS with nothing provisioned.
+Emulator: the auto-import change set reaches CREATE_COMPLETE (observed `('CREATE_COMPLETE', None)`) — the name already owned by another stack is neither detected nor imported; and the plain deploy provisions, fails and parks the stack at ROLLBACK_COMPLETE instead of REVIEW_IN_PROGRESS with a FAILED early-validation change set.
+Why: a client doing CDK/CloudFormation adoption of existing resources gets a change set it believes is safe to execute, and the executing stack then takes over or clobbers a resource another stack owns — the exact outcome the pre-flight exists to prevent.
+Fix: the CreateChangeSet handler's change-set planning/validation stage (auto-import classification and the resource-existence pre-flight), plus the change-set status/StatusReason serializer.
+Traces: cloudformation__ssm.cdk-deploy-import-existing-resources-adopts-a-named-parameter, cloudformation__ssm.change-set-import-existing-resources-name-owned-by-another-stack-fails
+
+=== Cause 2 of 8: CreateChangeSet with ChangeSetType=IMPORT answers NotImplemented instead of the modelled pre-flight refusal ===
+AWS: Smithy: CreateChangeSet.ChangeSetType (enum, includes IMPORT), CreateChangeSet.ResourcesToImport (list, max 200). An IMPORT change set whose template gives an imported resource no DeletionPolicy is refused with HTTP 400 ValidationError and message `The following resources to import [P] must have DeletionPolicy attribute specified in the template.` (fixed text around the bracketed list; the list holds the LogicalResourceIds from ResourcesToImport that lack the attribute), and no stack is created — DescribeStacks on the name answers ValidationError `Stack with id <name> does not exist`. With DeletionPolicy Retain the same call succeeds and classifies the resource as Action `Import`.
+Emulator: answers error code `NotImplemented` with message `operation CreateChangeSet with ChangeSetType IMPORT (importing existing resources) is scaffolded but not implemented in this emulator`.
+Why: resource import is completely unavailable, and because the refusal is NotImplemented rather than ValidationError, clients cannot distinguish a template defect from an unsupported API.
+Fix: the CreateChangeSet handler's ChangeSetType=IMPORT path and its ResourcesToImport/DeletionPolicy validation. Note: open issue 20261025T015306Z-cloudformation-cannot-deploy-large-parts-of-the-resource.md owns two sibling checks blocked on this same stub, but it does not carry this check's replay key — this cause is listed here so the DeletionPolicy pre-flight is not left unverified.
+Traces: cloudformation__ssm.change-set-import-without-deletion-policy-rejected
+
+=== Cause 3 of 8: OnStackFailure=DELETE is accepted and echoed but never acted on ===
+AWS: Smithy: OnStackFailure enum values DO_NOTHING | ROLLBACK | DELETE; DescribeChangeSet.OnStackFailure. Executing a CREATE change set created with OnStackFailure=DELETE whose provisioning fails ends the stack at DELETE_COMPLETE: resources created before the failure are deleted, the final stack event is (<stack name>, DELETE_COMPLETE), and the stack name no longer resolves — DescribeStacks answers ValidationError `Stack with id <name> does not exist`.
+Emulator: DescribeChangeSet echoes OnStackFailure=DELETE, but after ExecuteChangeSet the stack parks at ROLLBACK_COMPLETE and never transitions to DELETE_COMPLETE (polled to the check's deadline).
+Why: a client using the documented failure option to leave no wreckage behind is left with a ROLLBACK_COMPLETE stack occupying the name, so the retry that AWS would allow is refused as a duplicate name.
+Fix: the ExecuteChangeSet handler's failure-handling branch (OnStackFailure dispatch) in the stack state machine.
+Traces: cloudformation__ssm.change-set-on-stack-failure-delete-removes-the-failed-new-stack
+
+=== Cause 4 of 8: an intra-stack physical-name collision is reported with the resource handler's wording instead of CloudFormation's own reason ===
+AWS: recorded behavior and the stack-failure-options documentation. When two resources of the SAME stack resolve to one physical name, CloudFormation itself detects the collision and the failing resource's CREATE_FAILED event carries ResourceStatusReason `<physical-id> already exists in stack <stack-arn>` — no `Resource handler returned message:` wrapper, no RequestToken and no HandlerErrorCode. Fixed text is ` already exists in stack `; the physical id comes from the request's resolved Name property and the stack ARN from the stack's StackId.
+Emulator: the reason is the SSM handler's wrap — `Resource handler returned message: "Parameter <name> already exists; set Overwrite to update it" (RequestToken: <uuid>, HandlerErrorCode: AlreadyExists)`.
+Why: the message is both the wrong text and the wrong error class, so clients (and the CDK CLI) that match CloudFormation's collision reason to tell a template defect from a transient handler error misclassify every name collision.
+Fix: the provisioning stage's name-collision detection for resources inside one stack, and the stack-event ResourceStatusReason it records (not the AWS::SSM::Parameter handler).
+Traces: cloudformation__ssm.change-set-execute-retain-except-on-create-deletes-the-new-retained-resource, cloudformation__ssm.change-set-on-stack-failure-do-nothing-keeps-the-created-resource, cloudformation__ssm.change-set-on-stack-failure-rollback-removes-the-created-resource
+
+=== Cause 5 of 8: a template parameter of type AWS::SSM::Parameter::Value<String> naming a missing SSM parameter is accepted instead of refused ===
+AWS: Smithy: CreateChangeSet.Parameters, DescribeChangeSet.Parameters (Parameter carries ParameterValue and ResolvedValue). CreateChangeSet resolves SSM-typed parameters up front; when the named SSM parameter does not exist the call is refused with HTTP 400 ValidationError and message `Unable to fetch parameters [<name>] from parameter store for this account.` (fixed text around the bracketed list; the list holds the unresolvable parameter-store names taken from the request/template defaults), and NO stack is created — DescribeStacks answers ValidationError `Stack with id <name> does not exist`. Once the SSM parameter exists the same call succeeds and the change set's parameter entry carries ParameterValue = the parameter-store name and ResolvedValue = its value, with the stack REVIEW_IN_PROGRESS.
+Emulator: returns HTTP 200 with an Id/StackId and creates the stack, so the missing bootstrap-version parameter is never caught.
+Why: every CDK-synthesized template carries a BootstrapVersion parameter of this type; deploying into an unbootstrapped environment silently proceeds instead of telling the user to run `cdk bootstrap`, and leaves a stray REVIEW_IN_PROGRESS stack.
+Fix: the CreateChangeSet handler's parameter-resolution stage (SSM-typed parameter lookup) and its ValidationError path.
+Traces: cloudformation__ssm.change-set-bootstrap-version-param-missing-rejected
+
+=== Cause 6 of 8: DeploymentConfig Mode=EXPRESS does not imply DisableRollback=true ===
+AWS: Smithy: DeploymentConfig { Mode: DeploymentConfigMode (STANDARD|EXPRESS), DisableRollback: boolean }, echoed by DescribeChangeSet.DeploymentConfig. For a change set created with DeploymentConfig {Mode: EXPRESS}, DescribeChangeSet reports DeploymentConfig {Mode: EXPRESS, DisableRollback: true}, and a failing EXPRESS update stops at UPDATE_FAILED with StackStatusReason `The following resource(s) failed to create via Express Mode: [D]. ` (fixed text around the bracketed logical-id list, which names the resources that failed) and emits no UPDATE_ROLLBACK_* resource events, leaving already-applied updates in place.
+Emulator: DescribeChangeSet returns DeploymentConfig {'Mode': 'EXPRESS', 'DisableRollback': False}.
+Why: a client that reads DisableRollback to decide whether a failure will be reverted is told the opposite of what EXPRESS mode does, so it plans recovery for a rollback that will never happen.
+Fix: the CreateChangeSet handler's DeploymentConfig normalization and the DescribeChangeSet serializer. Related open issue 20261101T164248Z-cloudformation-5-net-new-behavioral-root-causes-express.md covers EXPRESS causes under the `cloudformation` heading but does not carry this check.
+Traces: cloudformation__ssm.change-set-express-mode-failed-update-is-not-rolled-back
+
+=== Cause 7 of 8: DeploymentMode=REVERT_DRIFT is ignored, so a drift-aware change set is refused as empty ===
+AWS: Smithy: DeploymentMode enum with the single value REVERT_DRIFT; CreateChangeSet.DeploymentMode, DescribeChangeSet.DeploymentMode. A REVERT_DRIFT change set compares the template against the resource's ACTUAL state rather than against the previous template: after an out-of-band write it is Status CREATE_COMPLETE, DeploymentMode REVERT_DRIFT, with one ResourceChange of Action `Modify`, Replacement `False`, ResourceDriftStatus `MODIFIED`, whose Details target reports BeforeValue = the live value with BeforeValueFrom `ACTUAL_STATE` and AfterValue = the template value with AfterValueFrom `TEMPLATE`; executing it brings the resource back to the template value and the stack to UPDATE_COMPLETE. The STANDARD change set over the same unchanged template is the one that is FAILED with `The submitted information didn't contain changes. Submit different information to create a change set.`
+Emulator: the REVERT_DRIFT change set is FAILED with StatusReason `The submitted information didn't contain changes. Submit different information to create a change set.` — the mode is dropped and the template-only comparison is used.
+Why: drift cannot be reverted at all through CloudFormation; a client's only documented remediation path answers as if there were nothing to fix.
+Fix: the CreateChangeSet handler's change computation (DeploymentMode dispatch and actual-state diffing) and the DescribeChangeSet Details serializer.
+Traces: cloudformation__ssm.change-set-revert-drift-restores-an-out-of-band-parameter-change
+
+=== Cause 8 of 8: a REVIEW_IN_PROGRESS stack's template cannot be fetched, so a prepared change set can never be executed ===
+AWS: Smithy: GetTemplate.ChangeSetName (ChangeSetNameOrId) and GetTemplate.TemplateStage. A stack created by a prepared change set sits in REVIEW_IN_PROGRESS with the change set Status CREATE_COMPLETE / ExecutionStatus AVAILABLE; its template is retrievable through that change set, so `cdk deploy --method=execute-change-set --change-set-name <name>` executes it and the stack reaches CREATE_COMPLETE with ChangeSetId equal to the prepared change set's ChangeSetId and the change set ExecutionStatus EXECUTE_COMPLETE.
+Emulator: the executing deploy exits 1 with `Template does not exist for stack [<stack-name>] in REVIEW_IN_PROGRESS state` — the emulator refuses to serve any template for a stack in REVIEW_IN_PROGRESS. Hypothesis: GetTemplate keys only on the stack's status and ignores the ChangeSetName member, so the change set's own template is never reachable.
+Why: the whole prepare-then-execute workflow (`cdk deploy --method=prepare-change-set`, review, execute) is dead: the prepared change set is created but can never be executed.
+Fix: the GetTemplate handler (honour ChangeSetName and return the named change set's template regardless of the stack being REVIEW_IN_PROGRESS).
+Traces: cloudformation__ssm.cdk-deploy-prepare-change-set-leaves-it-unexecuted-until-execute-change-set
+
+## Evidence
+Cause 1 — cloudformation__ssm.cdk-deploy-import-existing-resources-adopts-a-named-parameter: expected the plain deploy's stack to be 'REVIEW_IN_PROGRESS' with a FAILED change set whose StatusReason is 'The following hook(s)/validation failed: [AWS::EarlyValidation::ResourceExistenceCheck]. To troubleshoot Early Validation errors, use the DescribeEvents API for detailed failure information.'; got AssertionError: the plain deploy left its stack 'ROLLBACK_COMPLETE'. cloudformation__ssm.change-set-import-existing-resources-name-owned-by-another-stack-fails: expected (Status, StatusReason) == ('FAILED', '<name> already exists in stack <owner stack arn>'); got AssertionError: auto-import of a managed name: ('CREATE_COMPLETE', None).
+
+Cause 2 — cloudformation__ssm.change-set-import-without-deletion-policy-rejected: expected ('ValidationError', 'The following resources to import [P] must have DeletionPolicy attribute specified in the template.'); got AssertionError: IMPORT without DeletionPolicy answered ('NotImplemented', 'operation CreateChangeSet with ChangeSetType IMPORT (importing existing resources) is scaffolded but not implemented in this emulator').
+
+Cause 3 — cloudformation__ssm.change-set-on-stack-failure-delete-removes-the-failed-new-stack: expected DescribeStacks by StackId to reach DELETE_COMPLETE; got AssertionError: stack still 'ROLLBACK_COMPLETE' after 41.79s.
+
+Cause 4 — cloudformation__ssm.change-set-on-stack-failure-do-nothing-keeps-the-created-resource and ...-rollback-removes-the-created-resource: expected the B CREATE_FAILED ResourceStatusReason '<name> already exists in stack <stack arn>'; got AssertionError: Resource handler returned message: "Parameter /sim2real-xsvc-csosf-<id> already exists; set Overwrite to update it" (RequestToken: <uuid>, HandlerErrorCode: AlreadyExists). cloudformation__ssm.change-set-execute-retain-except-on-create-deletes-the-new-retained-resource: expected failure reasons ('/<name> already exists in stack <stack arn>', 'The following resource(s) failed to create: [Bad]. '); got ('Resource handler returned message: "Parameter /<name> already exists; set Overwrite to update it" (RequestToken: <uuid>, HandlerErrorCode: AlreadyExists)', 'The following resource(s) failed to create: [Bad]. ').
+
+Cause 5 — cloudformation__ssm.change-set-bootstrap-version-param-missing-rejected: expected ('ValidationError', 'Unable to fetch parameters [/cdk-bootstrap/<qualifier>/version] from parameter store for this account.'); got AssertionError: expected the call to be refused, but it succeeded: {'Id': 'arn:aws:cloudformation:...:changeSet/deploy/<id>', 'StackId': 'arn:aws:cloudformation:...:stack/<name>/<id>', HTTPStatusCode 200}.
+
+Cause 6 — cloudformation__ssm.change-set-express-mode-failed-update-is-not-rolled-back: expected DescribeChangeSet DeploymentConfig == {'Mode': 'EXPRESS', 'DisableRollback': True}; got {'Mode': 'EXPRESS', 'DisableRollback': False}.
+
+Cause 7 — cloudformation__ssm.change-set-revert-drift-restores-an-out-of-band-parameter-change: expected the DeploymentMode=REVERT_DRIFT change set to be CREATE_COMPLETE with a Modify change whose Details target is ('Value', '<live value>', 'ACTUAL_STATE', '<template value>', 'TEMPLATE'); got AssertionError: drift-aware change set: "The submitted information didn't contain changes. Submit different information to create a change set."
+
+Cause 8 — cloudformation__ssm.cdk-deploy-prepare-change-set-leaves-it-unexecuted-until-execute-change-set: expected `cdk deploy --method=execute-change-set --change-set-name <name>` to exit 0 and the stack to reach CREATE_COMPLETE with ChangeSetId == the prepared change set; got AssertionError: the execute deploy exited 1; output tail 'Template does not exist for stack [<stack-name>] in REVIEW_IN_PROGRESS state'.
+
+## Steps to Reproduce
+Replay the behavioral suite and re-run the listed checks against the emulator:
+
+1. Cause 1: CreateChangeSet(StackName=new, ChangeSetType=CREATE, ImportExistingResources=true) with a template naming an AWS::SSM::Parameter whose name another CREATE_COMPLETE stack manages; poll DescribeChangeSet. Also `cdk deploy` a template naming an existing parameter without --import-existing-resources and read DescribeStacks/ListChangeSets.
+2. Cause 2: CreateChangeSet(ChangeSetType=IMPORT, ResourcesToImport=[{ResourceType: AWS::SSM::Parameter, LogicalResourceId: P, ResourceIdentifier: {Name: <existing>}}]) with the template resource carrying no DeletionPolicy.
+3. Cause 3: CreateChangeSet(ChangeSetType=CREATE, OnStackFailure=DELETE) with a template whose second parameter takes the first's Name via Ref; ExecuteChangeSet; poll DescribeStacks by StackId.
+4. Cause 4: same colliding template with OnStackFailure=DO_NOTHING / ROLLBACK; read the CREATE_FAILED event's ResourceStatusReason for the second resource.
+5. Cause 5: CreateChangeSet with a template parameter of type AWS::SSM::Parameter::Value<String> defaulting to /cdk-bootstrap/<qualifier>/version before that SSM parameter exists.
+6. Cause 6: CreateChangeSet(ChangeSetType=UPDATE, DeploymentConfig={Mode: EXPRESS}); DescribeChangeSet and read DeploymentConfig.
+7. Cause 7: create a stack with an AWS::SSM::Parameter, PutParameter(..., Overwrite=true) out of band, then CreateChangeSet(ChangeSetType=UPDATE, UsePreviousTemplate=true, DeploymentMode=REVERT_DRIFT) and DescribeChangeSet(IncludePropertyValues=true).
+8. Cause 8: `cdk deploy --method=prepare-change-set --change-set-name X`, then `cdk deploy --method=execute-change-set --change-set-name X` over the same app.
