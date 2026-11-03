@@ -242,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(missing(&reference));
         };
         let (name, version) = (recipe.name.clone(), recipe.version.clone());
-        let platform = recipe.platform.clone();
+        let platform = Some(recipe.platform.clone());
         // "For an image recipe, this is always AMI": which kind of recipe the pipeline
         // builds decides what its images are.
         let image_type = if pipeline_builds_a_container {

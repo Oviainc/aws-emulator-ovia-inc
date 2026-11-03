@@ -1050,16 +1050,15 @@ async fn a_created_recipe_is_reported_back_member_for_member() {
         );
         assert_instant(case, &recipe, "dateCreated");
 
-        // The platform is the platform of the components the recipe includes; a recipe
-        // that includes none reports none.
-        let expected_platform = body
-            .get("components")
-            .and_then(Value::as_array)
-            .map(|_| json!("Linux"));
+        // Every recipe reports ONE platform: the platform of the components it includes,
+        // or — for a recipe that includes none — the platform of its parent image. Every
+        // row here names Linux components or a Linux parent image, so every row reports
+        // Linux; `a_recipe_reports_the_platform_of_what_it_builds` spans the rest.
         let actual_platform = recipe.get("platform").cloned();
         assert_eq!(
-            actual_platform, expected_platform,
-            "case {case:?}: expected platform {expected_platform:?}, got {actual_platform:?}"
+            actual_platform,
+            Some(json!("Linux")),
+            "case {case:?}: expected platform Linux, got {actual_platform:?}"
         );
     }
 }

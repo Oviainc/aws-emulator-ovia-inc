@@ -28,7 +28,9 @@
 //!   ORIGINAL response, and the same token carrying different creation parameters is
 //!   `IdempotentParameterMismatchException`;
 //! * `dryRun` validates the request and then answers `DryRunOperationException`, having
-//!   stored nothing.
+//!   stored nothing;
+//! * the response carries the wildcard version ARNs the created build version is reached
+//!   by ([`crate::state::latest_version_references`]).
 //!
 //! ## Shape of an operation
 //!
@@ -363,7 +365,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 request_id: Some(receipt.request_id.clone()),
                 client_token: Some(receipt.client_token.clone()),
                 component_build_version_arn: Some(receipt.arn.clone()),
-                latest_version_references: None,
+                // The ORIGINAL response, down to the wildcard references the resource
+                // that request created is reached by.
+                latest_version_references: crate::state::latest_version_references(
+                    &receipt.arn,
+                    crate::state::COMPONENT_ARN_PREFIX,
+                ),
             });
         }
 
@@ -455,8 +462,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(CreateComponentOutput {
             request_id: Some(request_id),
             client_token: Some(client_token),
-            component_build_version_arn: Some(arn),
-            latest_version_references: None,
+            component_build_version_arn: Some(arn.clone()),
+            // "A set of wildcard version ARNs that always reference the latest version of
+            // the resource", derived from the ARN this create minted.
+            latest_version_references: crate::state::latest_version_references(
+                &arn,
+                crate::state::COMPONENT_ARN_PREFIX,
+            ),
         })
     }
 }

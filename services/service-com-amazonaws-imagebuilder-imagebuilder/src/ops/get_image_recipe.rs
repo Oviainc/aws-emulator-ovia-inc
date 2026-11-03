@@ -3,7 +3,10 @@
 //! @op GetImageRecipe
 //!
 //! Reports the image recipe this service's state holds, as `CreateImageRecipe` stored
-//! it — including its component list, in the order the create submitted it. An ARN
+//! it — including its component list, in the order the create submitted it, the ONE
+//! platform it builds for and its own tags, both of which every read reports. Beside the
+//! recipe it answers the wildcard version ARNs that recipe is reached by
+//! ([`crate::state::latest_version_references`]). An ARN
 //! nothing is stored under, and one of another Region, resolve to nothing — which is
 //! reported MISSING, as the not-found error this service models for a resource its
 //! request references and it does not hold.
@@ -203,8 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetImageRecipeOutput {
             request_id: Some(crate::state::new_request_id()),
+            // "A set of wildcard version ARNs that always reference the latest version of
+            // the resource", derived from the stored recipe's own ARN.
+            latest_version_references: image_recipe.arn.as_deref().and_then(|arn| {
+                crate::state::latest_version_references(arn, crate::state::IMAGE_RECIPE_ARN_PREFIX)
+            }),
             image_recipe: Some(image_recipe),
-            latest_version_references: None,
         })
     }
 }

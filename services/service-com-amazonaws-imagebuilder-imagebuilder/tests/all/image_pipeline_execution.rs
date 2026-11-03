@@ -905,7 +905,15 @@ async fn a_created_pipeline_reads_back_with_its_defaults() {
             Some(&json!({ "imageTestsEnabled": tests_enabled, "timeoutMinutes": timeout })),
             "case {case:?}: expected the stored test configuration in {stored}"
         );
-        for member in ["description", "tags", "imageTags", "schedule"] {
+        // A resource reports its own tags as a map on every read — an empty one when it
+        // carries none — so a create that named none reads back an empty map.
+        let expected_tags = extra.get("tags").cloned().unwrap_or_else(|| json!({}));
+        assert_eq!(
+            stored.get("tags"),
+            Some(&expected_tags),
+            "case {case:?}: expected tags {expected_tags} in {stored}"
+        );
+        for member in ["description", "imageTags", "schedule"] {
             assert_eq!(
                 stored.get(member),
                 extra.get(member),

@@ -14,7 +14,13 @@
 //! * every `componentArn` must name a stored component, resolved the way every other
 //!   component reference is, each component named only once "regardless of version", at
 //!   most the documented 20 per recipe, and the components of one recipe all target one
-//!   platform — which is the platform the recipe reports;
+//!   platform;
+//! * the recipe is stored carrying the ONE platform it builds for, so every later read
+//!   reports it: the platform its components target, or — for a recipe that includes none
+//!   — the platform of the parent image it builds from
+//!   ([`crate::state::image_recipe_platform`]);
+//! * the response carries the wildcard version ARNs the created recipe is reached by
+//!   ([`crate::state::latest_version_references`]);
 //! * the ARN is derived from a NORMALIZED form of the name plus the version, so a second
 //!   create of one name+version pair is `ResourceAlreadyExistsException`;
 //! * `clientToken` is an idempotency token: a retry carrying it answers with the
@@ -338,7 +344,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 request_id: Some(receipt.request_id.clone()),
                 client_token: Some(receipt.client_token.clone()),
                 image_recipe_arn: Some(receipt.arn.clone()),
-                latest_version_references: None,
+                // The ORIGINAL response, down to the wildcard references the resource
+                // that request created is reached by.
+                latest_version_references: crate::state::latest_version_references(
+                    &receipt.arn,
+                    crate::state::IMAGE_RECIPE_ARN_PREFIX,
+                ),
             });
         }
 
@@ -360,10 +371,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // way every other component reference is — so a reference naming nothing, or a
         // component of another Region, is reported MISSING rather than stored. "You can
         // specify each component only once in a recipe, regardless of version", so a name
-        // named twice is refused too. The platform the recipe reports is the platform those
-        // components target, so a list spanning two platforms names no platform the recipe
-        // could have.
-        let mut platform: Option<String> = None;
+        // named twice is refused too. The components a recipe includes "must all target one
+        // platform", so a list spanning two of them names no platform the recipe could
+        // report.
+        let mut components_target: Option<String> = None;
         let mut included: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
         for configuration in input.components.iter().flatten() {
             let Some(component) =
@@ -388,8 +399,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            match platform.as_deref() {
-                None => platform = Some(component.platform.clone()),
+            match components_target.as_deref() {
+                None => components_target = Some(component.platform.clone()),
                 Some(named) if named == component.platform => {}
                 Some(named) => {
                     return Err(CreateImageRecipeErrorModeled::InvalidRequestException(
@@ -435,6 +446,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let request_id = crate::state::new_request_id();
         let client_token = input.client_token.clone();
+        // Every recipe builds for ONE platform, and every read of one reports it.
+        let platform = crate::state::image_recipe_platform(
+            components_target.as_deref(),
+            &input.parent_image,
+        );
 
         store.insert_image_recipe(
             crate::state::ImageRecipeRecord {
@@ -445,7 +461,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 description: input.description,
                 platform,
                 owner: ::engine::EMULATOR_ACCOUNT_ID.to_string(),
-                components: input.components,
+                components: input.components.unwrap_or_default(),
                 parent_image: input.parent_image,
                 block_device_mappings: input.block_device_mappings,
                 working_directory: input.working_directory,
@@ -463,8 +479,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(CreateImageRecipeOutput {
             request_id: Some(request_id),
             client_token: Some(client_token),
-            image_recipe_arn: Some(arn),
-            latest_version_references: None,
+            image_recipe_arn: Some(arn.clone()),
+            // "A set of wildcard version ARNs that always reference the latest version of
+            // the resource", derived from the ARN this create minted.
+            latest_version_references: crate::state::latest_version_references(
+                &arn,
+                crate::state::IMAGE_RECIPE_ARN_PREFIX,
+            ),
         })
     }
 }

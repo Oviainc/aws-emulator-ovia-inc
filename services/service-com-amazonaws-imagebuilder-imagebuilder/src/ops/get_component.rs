@@ -12,6 +12,10 @@
 //! the not-found error this service models for a resource its request references and it
 //! does not hold.
 //!
+//! Beside the component it answers the wildcard version ARNs that build version is
+//! reached by ([`crate::state::latest_version_references`]), derived from the ARN of the
+//! record this read RESOLVED to rather than from the reference the request carried.
+//!
 //! A pure read: it answers from the store and writes nothing a later caller sees.
 //!
 //! ## Shape of an operation
@@ -209,8 +213,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetComponentOutput {
             request_id: Some(crate::state::new_request_id()),
+            // "A set of wildcard version ARNs that always reference the latest version of
+            // the resource", derived from the ARN of the build version this read
+            // RESOLVED to rather than from the reference the request carried, which may
+            // name a wildcard version.
+            latest_version_references: component.arn.as_deref().and_then(|arn| {
+                crate::state::latest_version_references(arn, crate::state::COMPONENT_ARN_PREFIX)
+            }),
             component: Some(component),
-            latest_version_references: None,
         })
     }
 }

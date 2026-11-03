@@ -86,9 +86,9 @@ use crate::ops::types::{
     ComponentState, CreateComponentInput, CreateImagePipelineInput, CreateImageRecipeInput,
     CreateInfrastructureConfigurationInput, Filter, ImagePipeline, ImageRecipe, ImageRecipeSummary,
     ImageScanningConfiguration, ImageState, ImageSummary, ImageTestsConfiguration,
-    InfrastructureConfiguration, InstanceBlockDeviceMapping, InstanceMetadataOptions, Logging,
-    ParentInstanceConfiguration, PipelineLoggingConfiguration, Placement, Schedule,
-    StartImagePipelineExecutionInput, WorkflowConfiguration,
+    InfrastructureConfiguration, InstanceBlockDeviceMapping, InstanceMetadataOptions,
+    LatestVersionReferences, Logging, ParentInstanceConfiguration, PipelineLoggingConfiguration,
+    Placement, Schedule, StartImagePipelineExecutionInput, WorkflowConfiguration,
 };
 
 /// This service's ARN namespace and SigV4 signing name (`arnNamespace` / `sigv4Name`
@@ -194,6 +194,23 @@ pub const COMPONENT_DATA_ENCRYPTED: bool = true;
 /// The scheme a component document URI must carry, from `CreateComponent`'s `uri`: "This
 /// must be an S3 URL (s3://bucket/key)".
 pub const COMPONENT_URI_SCHEME: &str = "s3://";
+
+/// The platform of a parent image whose reference names Windows, from the modelled
+/// `Platform` enum (`Windows | Linux | macOS`).
+pub const PLATFORM_WINDOWS: &str = "Windows";
+
+/// The platform of a parent image whose reference names macOS, from the modelled
+/// `Platform` enum (`Windows | Linux | macOS`).
+pub const PLATFORM_MACOS: &str = "macOS";
+
+/// The platform of every other parent image: the remaining value of the modelled
+/// `Platform` enum (`Windows | Linux | macOS`).
+pub const PLATFORM_LINUX: &str = "Linux";
+
+/// The version node that matches any assigned value, from `GetComponent`'s
+/// `componentBuildVersionArn`: "The version can use the `x` wildcard in trailing
+/// positions".
+pub const WILDCARD_VERSION_NODE: &str = "x";
 
 /// The ownership a caller's own resources carry, from the modelled `Ownership` enum.
 /// `ListImageRecipes`' `owner` documents "By default, this request will only show image
@@ -468,7 +485,7 @@ impl InfrastructureConfigurationRecord {
             date_updated: Some(self.date_updated.clone()),
             resource_tags: self.resource_tags.clone().map(into_tag_map),
             instance_metadata_options: self.instance_metadata_options.clone(),
-            tags: self.tags.clone().map(into_tag_map),
+            tags: Some(reported_tags(self.tags.as_ref())),
             placement: self.placement.clone(),
             terminate_instance_on_completion: Some(self.terminate_instance_on_completion),
             parent_instance: self.parent_instance.clone(),
@@ -537,7 +554,7 @@ impl ComponentRecord {
             kms_key_id: self.kms_key_id.clone(),
             encrypted: Some(COMPONENT_DATA_ENCRYPTED),
             date_created: Some(self.date_created.clone()),
-            tags: self.tags.clone().map(into_tag_map),
+            tags: Some(reported_tags(self.tags.as_ref())),
             // "Contains the name of the publisher if this is a third-party component.
             // Otherwise, this property is empty" — a component this account created is
             // not third-party.
@@ -573,12 +590,13 @@ pub struct ImageRecipeRecord {
     pub name: String,
     pub version: String,
     pub description: Option<String>,
-    /// The platform the recipe builds for, taken from the components it includes — a
-    /// recipe that includes none has no platform to report.
-    pub platform: Option<String>,
+    /// The ONE platform the recipe builds for. Every recipe has one, so every read
+    /// reports it: see [`image_recipe_platform`] for where a create reads it from.
+    pub platform: String,
     pub owner: String,
-    /// The component configurations, in the order the create submitted them.
-    pub components: Option<Vec<ComponentConfiguration>>,
+    /// The component configurations, in the order the create submitted them — empty for a
+    /// recipe created without any.
+    pub components: Vec<ComponentConfiguration>,
     pub parent_image: String,
     pub block_device_mappings: Option<Vec<InstanceBlockDeviceMapping>>,
     pub working_directory: Option<String>,
@@ -600,14 +618,14 @@ impl ImageRecipeRecord {
             r#type: None,
             name: Some(self.name.clone()),
             description: self.description.clone(),
-            platform: self.platform.clone(),
+            platform: Some(self.platform.clone()),
             owner: Some(self.owner.clone()),
             version: Some(self.version.clone()),
-            components: self.components.clone(),
+            components: Some(self.components.clone()),
             parent_image: Some(self.parent_image.clone()),
             block_device_mappings: self.block_device_mappings.clone(),
             date_created: Some(self.date_created.clone()),
-            tags: self.tags.clone().map(into_tag_map),
+            tags: Some(reported_tags(self.tags.as_ref())),
             working_directory: self.working_directory.clone(),
             additional_instance_configuration: self.additional_instance_configuration.clone(),
             ami_tags: self.ami_tags.clone().map(into_tag_map),
@@ -621,11 +639,11 @@ impl ImageRecipeRecord {
         ImageRecipeSummary {
             arn: Some(self.arn.clone()),
             name: Some(self.name.clone()),
-            platform: self.platform.clone(),
+            platform: Some(self.platform.clone()),
             owner: Some(self.owner.clone()),
             parent_image: Some(self.parent_image.clone()),
             date_created: Some(self.date_created.clone()),
-            tags: self.tags.clone().map(into_tag_map),
+            tags: Some(reported_tags(self.tags.as_ref())),
         }
     }
 
@@ -636,7 +654,7 @@ impl ImageRecipeRecord {
         match filter_name {
             "name" => Some(self.name.as_str()),
             "parentImage" => Some(self.parent_image.as_str()),
-            "platform" => self.platform.as_deref(),
+            "platform" => Some(self.platform.as_str()),
             _ => None,
         }
     }
@@ -742,7 +760,7 @@ impl ImageBuildVersionRecord {
             // reports no output AMI or container image rather than naming one that exists
             // nowhere.
             output_resources: None,
-            tags: self.tags.clone().map(into_tag_map),
+            tags: Some(reported_tags(self.tags.as_ref())),
             build_type: self.build_type.clone(),
             // "The origin of the base image that Image Builder used to build this image":
             // a recipe's `parentImage` is caller-supplied text that nothing here can place
@@ -1133,7 +1151,6 @@ impl ComAmazonawsImagebuilderImagebuilderState {
             recipe
                 .components
                 .iter()
-                .flatten()
                 .filter_map(|configuration| {
                     ComponentReference::parse(&configuration.component_arn)
                 })
@@ -1337,7 +1354,7 @@ impl ComAmazonawsImagebuilderImagebuilderState {
             // emulator runs a pipeline on its schedule, so no run is due at any date and
             // a read reports none rather than naming a date nothing will act on.
             date_next_run: None,
-            tags: record.tags.clone().map(into_tag_map),
+            tags: Some(reported_tags(record.tags.as_ref())),
             image_scanning_configuration: record.image_scanning_configuration.clone(),
             image_tags: record.image_tags.clone().map(into_tag_map),
             execution_role: record.execution_role.clone(),
@@ -1638,6 +1655,91 @@ pub fn image_pipeline_arn(region: &str, name: &str) -> String {
         region,
         &format!("{IMAGE_PIPELINE_ARN_PREFIX}{}", normalized_name(name)),
     )
+}
+
+/// The four wildcard-version ARNs a response reports beside the versioned resource `arn`
+/// names, or `None` when `arn` is not an ARN of a resource stored under
+/// `resource_prefix`.
+///
+/// `LatestVersionReferences` is "a set of wildcard version ARNs that always reference the
+/// latest version of the resource. ARNs are included for the latest version overall, and
+/// for the latest versions within the same major, minor, and patch levels", and a wildcard
+/// is admitted only in a TRAILING position (`GetComponent`'s
+/// `componentBuildVersionArn`: "The version can use the `x` wildcard in trailing
+/// positions"). So the four of them are this resource's own ARN with its version replaced
+/// by `x.x.x`, `<major>.x.x`, `<major>.<minor>.x` and its exact `<major>.<minor>.<patch>`
+/// — each a reference this service RESOLVES
+/// ([`ComAmazonawsImagebuilderImagebuilderState::resolve_component`],
+/// [`ComAmazonawsImagebuilderImagebuilderState::resolve_image_recipe`]), so what a client
+/// reads here reaches the latest matching version at the time it is used. A build number
+/// is deliberately not carried: a reference pinned to one build is not a reference to the
+/// latest.
+#[must_use]
+pub fn latest_version_references(
+    arn: &str,
+    resource_prefix: &str,
+) -> Option<LatestVersionReferences> {
+    let reference = VersionedReference::parse(arn, resource_prefix)?;
+    let assigned = |node: &VersionNode| match node {
+        VersionNode::Exact(value) => Some(value.to_string()),
+        VersionNode::Any => None,
+    };
+    let [major, minor, patch] = [
+        assigned(&reference.version[0])?,
+        assigned(&reference.version[1])?,
+        assigned(&reference.version[2])?,
+    ];
+    let wildcard = WILDCARD_VERSION_NODE;
+    let at = |version: String| {
+        Some(::engine::emulator_arn(
+            ARN_SERVICE,
+            &reference.region,
+            &format!("{resource_prefix}{}/{version}", reference.name),
+        ))
+    };
+    Some(LatestVersionReferences {
+        latest_version_arn: at(format!("{wildcard}.{wildcard}.{wildcard}")),
+        latest_major_version_arn: at(format!("{major}.{wildcard}.{wildcard}")),
+        latest_minor_version_arn: at(format!("{major}.{minor}.{wildcard}")),
+        latest_patch_version_arn: at(format!("{major}.{minor}.{patch}")),
+    })
+}
+
+/// The ONE platform the image recipe a create describes builds for.
+///
+/// Every recipe has one, so every read of one reports it. Where it comes from:
+///
+/// * the components the recipe includes, when it includes any. They are resources this
+///   store holds, each carrying the platform its own create named, and a recipe's
+///   components "must all target one platform" ([`mixed_component_platforms_message`]),
+///   so that one platform is the recipe's.
+/// * otherwise the parent image the recipe builds from, read by
+///   [`parent_image_platform`].
+#[must_use]
+pub fn image_recipe_platform(components_target: Option<&str>, parent_image: &str) -> String {
+    components_target.map_or_else(|| parent_image_platform(parent_image), str::to_string)
+}
+
+/// The platform of the parent image `reference` names.
+///
+/// `parentImage` is "AMI ID", an "Image Builder image Amazon Resource Name (ARN)", an
+/// "Amazon Web Services Systems Manager (SSM) Parameter Store Parameter" or a
+/// "Marketplace product ID" (the modelled member's own list). None of those is resolved
+/// against EC2 by anything in this emulator, so what is read is the reference itself: the
+/// Windows and macOS images a recipe builds from name their operating system in the image
+/// or parameter name, and the remaining value of the modelled `Platform` enum is the one
+/// every other base image carries.
+#[must_use]
+pub fn parent_image_platform(reference: &str) -> String {
+    let named = reference.to_ascii_lowercase();
+    if named.contains("windows") {
+        PLATFORM_WINDOWS
+    } else if named.contains("macos") {
+        PLATFORM_MACOS
+    } else {
+        PLATFORM_LINUX
+    }
+    .to_string()
 }
 
 /// The three assigned nodes `version` carries, or `None` when it is not three integers
@@ -2339,6 +2441,19 @@ pub fn into_ordered_tags(tags: HashMap<String, String>) -> BTreeMap<String, Stri
 /// An ordered tag map as the modelled map member carries it.
 fn into_tag_map(tags: BTreeMap<String, String>) -> HashMap<String, String> {
     tags.into_iter().collect()
+}
+
+/// The tags a read of a stored resource reports: the ones it carries, which is an EMPTY
+/// map for a resource that carries none.
+///
+/// A resource and its tags are not the same question: this service's own tag read already
+/// tells an untagged resource ("an empty tag map") apart from an ARN naming no resource at
+/// all ([`ComAmazonawsImagebuilderImagebuilderState::tags_of_resource`]), and a resource
+/// view answers the same way, so a client that iterates `tags` finds a map on every
+/// resource rather than one it has to null-check.
+#[must_use]
+pub fn reported_tags(tags: Option<&BTreeMap<String, String>>) -> HashMap<String, String> {
+    tags.cloned().map(into_tag_map).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

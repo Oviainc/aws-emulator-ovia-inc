@@ -87,3 +87,19 @@ All six steps returned HTTP 200 where 200 was expected, so only the body diverge
 2. Replay imagebuilder-create-component-supported-os-versions-roundtrip step task#2 (GetComponent on the created build-version ARN) and inspect component.tags, component.billable and latestVersionReferences.
 3. Replay imagebuilder-image-recipe-component-list-roundtrip step task#3 (GetImageRecipe) and inspect imageRecipe.tags and latestVersionReferences.
 4. Replay imagebuilder-image-recipe-lifecycle-with-policy steps setup#1 (CreateImageRecipe), task#2 (GetImageRecipe) and task#3 (ListImageRecipes) and inspect latestVersionReferences, imageRecipe.platform, imageRecipe.components and the summary's platform.
+
+## Resolution
+
+Fixed: `latestVersionReferences` on CreateComponent, GetComponent, CreateImageRecipe and
+GetImageRecipe (causes 1, 2, 3 and 4), the resource `tags` map on every resource view
+(causes 2 and 3), and the image recipe's `platform` and `components` on the read and in
+the listed summary (causes 5 and 6).
+
+Still outstanding, declined as outside the modelled contract: `$.component.billable`.
+This service's `Component` shape declares no `billable` member
+(`smithy_query(query="shape", shape="Component")`), and every response of this emulator is
+serialized from the shape the model declares, so there is no member to populate. Beside it,
+the replay of `imagebuilder-image-recipe-lifecycle-with-policy` now reaches its teardown and
+diverges there on `$.requestId` of a 404 body — a cause this issue does not name, and the
+same kind of gap: the modelled `ResourceNotFoundException` declares only `message`, and the
+restJson1 error envelope is written by the framework.

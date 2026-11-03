@@ -342,7 +342,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing — the answer any reference to a resource that was never created gets.
         let platform = match (&input.image_recipe_arn, &input.container_recipe_arn) {
             (Some(reference), _) => match store.resolve_image_recipe(reference, &region) {
-                Some(recipe) => recipe.platform.clone(),
+                Some(recipe) => Some(recipe.platform.clone()),
                 None => return Err(missing(reference)),
             },
             (None, Some(reference)) => return Err(missing(reference)),
