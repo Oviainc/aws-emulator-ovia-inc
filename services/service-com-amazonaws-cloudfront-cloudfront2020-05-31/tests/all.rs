@@ -115,6 +115,8 @@ mod domain_conflicts;
 mod duplicate_name_conflict_wording;
 #[path = "all/edge_data_plane.rs"]
 mod edge_data_plane;
+#[path = "all/edge_geo_restriction.rs"]
+mod edge_geo_restriction;
 #[path = "all/enum_value_set_message.rs"]
 mod enum_value_set_message;
 #[path = "all/error_envelope.rs"]

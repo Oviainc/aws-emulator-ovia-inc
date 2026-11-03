@@ -806,6 +806,15 @@ pub const DEFAULT_HTTP_VERSION: &str = "http2";
 /// reported for a stored configuration that carries no `Restrictions`.
 pub const GEO_RESTRICTION_NONE: &str = "none";
 
+/// `GeoRestriction$RestrictionType`'s value whose `Location` items "specify the countries
+/// in which you don't want CloudFront to distribute your content" — so every country but
+/// those is served.
+pub const GEO_RESTRICTION_BLACKLIST: &str = "blacklist";
+
+/// `GeoRestriction$RestrictionType`'s value whose `Location` items "specify the countries
+/// in which you want CloudFront to distribute your content" — so only those are served.
+pub const GEO_RESTRICTION_WHITELIST: &str = "whitelist";
+
 /// The `ConnectionMode` value that makes a distribution MULTI-TENANT.
 ///
 /// `DistributionConfig$ConnectionMode`: "This field specifies whether the connection mode

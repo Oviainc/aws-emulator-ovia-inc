@@ -21,18 +21,22 @@
 //!
 //! 1. the host (or the path, see below) names a distribution this service HOLDS, whose
 //!    configuration is `Enabled`; a disabled distribution serves nothing;
-//! 2. the CACHE BEHAVIOUR is selected by path pattern: `CacheBehaviors$Items` in the
+//! 2. the distribution's `Restrictions.GeoRestriction` decides whether the viewer's
+//!    COUNTRY is served at all. A viewer a `blacklist` names, or one a `whitelist` leaves
+//!    out, is refused BY CLOUDFRONT with `403`, before the cache is read and before any
+//!    origin request exists ([`geo_restricts`]);
+//! 3. the CACHE BEHAVIOUR is selected by path pattern: `CacheBehaviors$Items` in the
 //!    order the configuration lists them, first match wins, and the
 //!    `DefaultCacheBehavior` when none matches — "If none of the path patterns match,
 //!    CloudFront applies the default cache behavior";
-//! 3. that behaviour's `AllowedMethods` decide whether the viewer's METHOD is served at
+//! 4. that behaviour's `AllowedMethods` decide whether the viewer's METHOD is served at
 //!    all. A method the behaviour does not allow is refused BY CLOUDFRONT with `403` and
 //!    `X-Cache: Error from cloudfront`, and no origin request is made;
-//! 4. that behaviour's `CachedMethods` and cache policy decide whether the answer may
+//! 5. that behaviour's `CachedMethods` and cache policy decide whether the answer may
 //!    come from the edge cache: a cacheable method whose TTL has not run out is answered
 //!    `X-Cache: Hit from cloudfront` without touching the origin, and everything else
 //!    goes to the origin and is answered `X-Cache: Miss from cloudfront`;
-//! 5. only then is the ORIGIN the behaviour's `TargetOriginId` names fetched, in process,
+//! 6. only then is the ORIGIN the behaviour's `TargetOriginId` names fetched, in process,
 //!    through the emulator this service is running within.
 //!
 //! # What the origin fetch is, and what it is not
@@ -102,7 +106,8 @@ use crate::ops::types::{AllowedMethods, CacheBehavior, DefaultCacheBehavior, Ori
 use crate::state::{
     managed_cache_policy, managed_origin_request_policy, matches_path_pattern, same_domain,
     CachedEdgeResponse, ComAmazonawsCloudfrontCloudfront20200531State, StoredDistribution,
-    DEFAULT_ALLOWED_METHODS, DEFAULT_ORIGIN_READ_TIMEOUT,
+    DEFAULT_ALLOWED_METHODS, DEFAULT_ORIGIN_READ_TIMEOUT, GEO_RESTRICTION_BLACKLIST,
+    GEO_RESTRICTION_WHITELIST,
 };
 
 /// The reserved path segment that names a DATA plane on the one endpoint this emulator
@@ -158,6 +163,24 @@ const BAD_REQUEST_DETAIL: &str = "Bad request.";
 /// The detail line CloudFront's generated page carries when it could not reach the
 /// origin, from CloudFront's own troubleshooting of a 502.
 const NO_ORIGIN_DETAIL: &str = "CloudFront wasn't able to connect to the origin.";
+
+/// The detail line CloudFront's generated page carries for a viewer its geographic
+/// restriction refuses.
+const GEO_RESTRICTED_DETAIL: &str =
+    "The Amazon CloudFront distribution is configured to block access from your country.";
+
+/// The header a viewer states the country it is in with, as CloudFront spells the one it
+/// adds to an origin request from the viewer's location: a `Location` of
+/// `GeoRestriction$Items` is "a two-letter, uppercase country code" (`ISO 3166-1
+/// alpha-2`), and this header carries exactly that.
+///
+/// CloudFront itself resolves the country from the VIEWER'S ADDRESS, through the MaxMind
+/// GeoIP databases `GeoRestriction` names. Nothing of that is reachable here: every viewer
+/// of this emulator dials a loopback address, which is in no country any database places,
+/// and no database is consulted off this machine. So the country travels on the request,
+/// in the one header CloudFront states it in — the same addressing choice [`resolve`]
+/// makes for the host a viewer cannot resolve either.
+const VIEWER_COUNTRY_HEADER: &str = "cloudfront-viewer-country";
 
 /// The headers that belong to ONE hop of an HTTP connection and are never forwarded to an
 /// origin, as RFC 9110 lists them, plus the viewer's own `Authorization`.
@@ -560,6 +583,49 @@ fn select_behavior(distribution: &StoredDistribution, viewer_path: &str) -> Beha
     }
 }
 
+/// The country a viewer request states it comes from, or `None` when it states none.
+///
+/// Read from [`VIEWER_COUNTRY_HEADER`], which is where CloudFront itself states a viewer's
+/// country; the value travels as the two-letter code a `Location` is spelled with.
+fn viewer_country(req: &RtRequest) -> Option<&str> {
+    req.headers().get(VIEWER_COUNTRY_HEADER)
+}
+
+/// Whether this distribution's GEOGRAPHIC RESTRICTION refuses a viewer in `country`,
+/// computed from `Restrictions.GeoRestriction` alone.
+///
+/// `RestrictionType` decides how the `Items` are read. `blacklist`: the locations "specify
+/// the countries in which you don't want CloudFront to distribute your content", so a
+/// viewer in one of them is refused and every other viewer is served. `whitelist`: they
+/// "specify the countries in which you want CloudFront to distribute your content", so a
+/// viewer anywhere else is refused. `none`: "No geo restriction is enabled, meaning access
+/// to content is not restricted by client geo location", so nobody is refused — which is
+/// also what a configuration carrying no `Restrictions` at all means
+/// ([`crate::state::GEO_RESTRICTION_NONE`]).
+///
+/// A `Location` is "a two-letter, uppercase country code", so what the VIEWER stated is
+/// matched without regard to its case; a viewer that stated no country at all is in none
+/// of the listed locations, which a blocklist does not reach and a whitelist cannot admit.
+fn geo_restricts(distribution: &StoredDistribution, country: Option<&str>) -> bool {
+    let Some(restrictions) = distribution.config.restrictions.as_ref() else {
+        return false;
+    };
+    let geo = &restrictions.geo_restriction;
+    let listed = geo
+        .items
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|location| country.is_some_and(|country| location.eq_ignore_ascii_case(country)));
+    match geo.restriction_type.as_str() {
+        GEO_RESTRICTION_BLACKLIST => listed,
+        GEO_RESTRICTION_WHITELIST => !listed,
+        // `none`, and a restriction type this emulator does not know: nothing is
+        // restricted, which is what an absent `Restrictions` member means too.
+        _ => false,
+    }
+}
+
 /// The longest an object is held in the edge cache, whatever the configuration asks for:
 /// a year in seconds, the `MaxTTL` every AWS-managed cache policy that caches at all
 /// publishes ([`crate::state::MANAGED_CACHE_POLICIES`]). A stored TTL is an `i64` taken
@@ -745,6 +811,23 @@ fn plan_request(
         return Plan::Generated {
             status: FORBIDDEN,
             detail: BAD_REQUEST_DETAIL,
+        };
+    }
+    // Enforced HERE, by CloudFront, before the edge cache is read and before any origin
+    // request exists: a viewer the distribution's geographic restriction refuses sees
+    // CloudFront's own page and nothing of the origin — and nothing of a cached answer
+    // either, so a restriction cannot be stepped around by asking for an object another
+    // viewer already fetched.
+    let country = viewer_country(req);
+    if geo_restricts(resolved.distribution, country) {
+        ::tracing::debug!(
+            distribution = %distribution_id,
+            "this distribution's geographic restriction refuses this viewer's country; the \
+             edge refuses the request and makes no origin request"
+        );
+        return Plan::Generated {
+            status: FORBIDDEN,
+            detail: GEO_RESTRICTED_DETAIL,
         };
     }
     let behavior = select_behavior(resolved.distribution, &viewer_path);

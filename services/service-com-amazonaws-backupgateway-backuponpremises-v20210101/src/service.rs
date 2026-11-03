@@ -139,11 +139,6 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
         // An absent member is reported as the null it was: a fact of the request's
         // shape, not a rendering of a value the caller sent.
         (ViolationKind::MissingRequiredMember, _) => "Value null".to_string(),
-        // A `@sensitive` member names itself and nothing of what it held. Its value is
-        // DROPPED from the violation by the framework's own walk, which reports the trait
-        // there, so the two valueless cases are told apart by that flag rather than by the
-        // missing value.
-        _ if violation.sensitive => "Value".to_string(),
         (_, None) => "Value null".to_string(),
         (_, Some(_)) if names_a_sensitive_member(&violation.path) => "Value".to_string(),
         (_, Some(shown)) => format!("Value '{shown}'"),

@@ -1172,8 +1172,9 @@ fn echo_of(
     let rendered = match violation.kind {
         // A `@uniqueItems` clause is reported at the LIST's path but states the ELEMENT
         // that repeated, where the rendering recorded is the whole list. The framework's
-        // own echo IS that element, already bounded, so it stands.
-        ViolationKind::UniqueItems => violation.value.as_deref(),
+        // own echo IS that element, already bounded, so it stands — unless it was
+        // withheld, where the list's rendering at this path is all there is.
+        ViolationKind::UniqueItems if !violation.sensitive => violation.value.as_deref(),
         _ => match by_path.get(violation.path.as_str()) {
             Some(Some(rendering)) => Some(*rendering),
             // A value with no text rendering, or a position this walk recorded nothing

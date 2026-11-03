@@ -608,6 +608,10 @@ struct Clause {
     /// once, from where the service read it ([`quotes_the_value`]), so every violation that
     /// folds into the clause states it the same way.
     quotes_value: bool,
+    /// Whether the value this clause is about was WITHHELD rather than absent: the
+    /// framework hands a `@sensitive` member's violation over with no value and says so,
+    /// which is what separates `Value` from the `Value null` an omitted member earns.
+    withheld: bool,
 }
 
 impl Clause {
@@ -637,7 +641,11 @@ impl Clause {
         // reported as the `null` it was. Read off what the clause COLLECTED rather than off
         // the violation that opened it, so a clause that did collect a value is never
         // reported as an absence.
-        let subject = if self.values.is_empty() {
+        let subject = if self.withheld {
+            // The member carried a value; it is `@sensitive`, so the clause names the
+            // member and the requirement and nothing of what it held.
+            "Value".to_string()
+        } else if self.values.is_empty() {
             "Value null".to_string()
         } else if !self.quotes_value {
             // A member the service read anywhere but the request URI: the position and the
@@ -748,9 +756,11 @@ pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
                     // A property of the MEMBER the clause is reported at, so it is the same
                     // for every violation that folds into this clause.
                     quotes_value: quotes_the_value(path),
+                    withheld: false,
                 })
             }
         };
+        clause.withheld |= violation.sensitive;
         if let Some(value) = violation.value.as_deref() {
             // One rendered value per violation PATH: the same element breaking two of its
             // shape's constraints is one value, two elements are two.
