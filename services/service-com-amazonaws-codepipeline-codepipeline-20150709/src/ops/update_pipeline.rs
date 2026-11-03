@@ -180,7 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.pipelines.contains_key(&name) {
             return Err(UpdatePipelineErrorModeled::PipelineNotFoundException(
                 PipelineNotFoundException {
-                    message: Some(crate::state::pipeline_not_found_message(&name)),
+                    message: Some(crate::state::pipeline_not_found_message(
+                        crate::state::PipelineNotFoundWording::Definition,
+                        &name,
+                    )),
                 },
             )
             .into());
@@ -239,7 +242,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pipeline = state.pipelines.get_mut(&name).ok_or_else(|| {
             UpdatePipelineError::from(UpdatePipelineErrorModeled::PipelineNotFoundException(
                 PipelineNotFoundException {
-                    message: Some(crate::state::pipeline_not_found_message(&name)),
+                    message: Some(crate::state::pipeline_not_found_message(
+                        crate::state::PipelineNotFoundWording::Definition,
+                        &name,
+                    )),
                 },
             ))
         })?;

@@ -168,6 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(RollbackStageErrorModeled::PipelineNotFoundException(
                     PipelineNotFoundException {
                         message: Some(crate::state::pipeline_not_found_message(
+                            crate::state::PipelineNotFoundWording::StageRollback,
                             &input.pipeline_name,
                         )),
                     },

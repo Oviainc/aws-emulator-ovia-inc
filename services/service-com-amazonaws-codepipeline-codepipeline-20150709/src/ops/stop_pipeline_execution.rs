@@ -169,6 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 StopPipelineExecutionErrorModeled::PipelineNotFoundException(
                     PipelineNotFoundException {
                         message: Some(crate::state::pipeline_not_found_message(
+                            crate::state::PipelineNotFoundWording::ExecutionControl,
                             &input.pipeline_name,
                         )),
                     },

@@ -21,8 +21,9 @@
 //! * a `@pattern` is not evaluated against an EMPTY value that already violated a
 //!   `@length` minimum the model declares: the floor is the one violation such a value
 //!   has;
-//! * a `resourceArn` is held to a length floor the model leaves unstated, reported after
-//!   the clause for the constraint the model does declare.
+//! * a `resourceArn` and an approval `token` are held to the length floor their own
+//!   `@pattern` implies and the model leaves unstated, reported after the clause for the
+//!   constraint the model does declare.
 //!
 //! The harness comes from `tests/all/pipeline_lifecycle.rs`, so every assertion goes
 //! through the same router the production emulator builds.
@@ -30,8 +31,9 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_codepipeline_codepipeline_20150709::state::{
-    duplicate_action_name_message, too_few_stages_message, MIN_STAGES_PER_PIPELINE,
-    MISSING_ARTIFACT_STORE_MESSAGE, NO_NON_SOURCE_ACTION_MESSAGE, RESOURCE_ARN_MIN_LENGTH,
+    duplicate_action_name_message, too_few_stages_message, APPROVAL_TOKEN_MIN_LENGTH,
+    MIN_STAGES_PER_PIPELINE, MISSING_ARTIFACT_STORE_MESSAGE, NO_NON_SOURCE_ACTION_MESSAGE,
+    RESOURCE_ARN_MIN_LENGTH,
 };
 
 use crate::pipeline_lifecycle::{build_stage, source_stage, Emulator, ROLE_ARN};
@@ -56,6 +58,11 @@ const REASON_PATTERN: &str = r"[a-zA-Z0-9!@ \(\)\.\*\?\-]+";
 /// `^`/`$` anchors the model spells it with
 /// (`smithy_query(query="shape", shape="ResourceArn")`).
 const RESOURCE_ARN_PATTERN: &str = r"arn:aws(-[\w]+)*:codepipeline:.+:[0-9]{12}:.+";
+
+/// `ApprovalToken`'s modelled pattern, quoted the same way
+/// (`smithy_query(query="shape", shape="ApprovalToken")`).
+const APPROVAL_TOKEN_PATTERN: &str =
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 
 /// How a row builds the request one ARN-addressed operation carries.
 type ArnRequest = fn(&str) -> Value;
@@ -833,5 +840,81 @@ async fn a_resource_arn_states_the_length_floor_the_model_leaves_unstated() {
     assert!(
         listed["tags"].is_null() || listed["tags"].is_array(),
         "a well-formed ARN is served from state, got {listed}"
+    );
+}
+
+/// RULE: the same floor rule on the other member whose pattern implies one — an approval
+/// `token` below the length its pattern admits states the floor clause AFTER the pattern
+/// clause the model declares, and a value at or above that length states only the
+/// pattern's.
+#[tokio::test]
+async fn an_approval_token_states_the_length_floor_the_model_leaves_unstated() {
+    let emulator = emulator_with_fixture().await;
+
+    let approval = |token: &str| {
+        json!({
+            "pipelineName": FIXTURE,
+            "stageName": "Build",
+            "actionName": "Build0",
+            "result": {"summary": "looks good", "status": "Approved"},
+            "token": token,
+        })
+    };
+
+    // The rows differ along the LENGTH and the shape of the malformed token: empty, well
+    // under the floor, one character under it, exactly at it, and above it.
+    let rows: Vec<(&str, String)> = vec![
+        ("an empty token", String::new()),
+        ("not a token at all", "nope".to_string()),
+        (
+            "one character under the floor",
+            "1".repeat(usize::try_from(APPROVAL_TOKEN_MIN_LENGTH - 1).expect("a small floor")),
+        ),
+        (
+            "exactly at the floor, and malformed",
+            "z".repeat(usize::try_from(APPROVAL_TOKEN_MIN_LENGTH).expect("a small floor")),
+        ),
+        (
+            "well above the floor, and malformed",
+            "0123456789".repeat(8),
+        ),
+    ];
+
+    for (case, token) in &rows {
+        let pattern_clause = format!(
+            "Value at 'token' failed to satisfy constraint: Member must satisfy regular \
+             expression pattern: {APPROVAL_TOKEN_PATTERN}"
+        );
+        let length_clause = format!(
+            "Value at 'token' failed to satisfy constraint: Member must have length greater \
+             than or equal to {APPROVAL_TOKEN_MIN_LENGTH}"
+        );
+        let expected = if i64::try_from(token.chars().count()).expect("a short value")
+            < APPROVAL_TOKEN_MIN_LENGTH
+        {
+            format!("2 validation errors detected: {pattern_clause}; {length_clause}")
+        } else {
+            format!("1 validation error detected: {pattern_clause}")
+        };
+        let (status, code, message) = refusal(&emulator, "PutApprovalResult", &approval(token)).await;
+        assert_eq!(
+            (status, code.as_str(), message.as_str()),
+            (400, "ValidationException", expected.as_str()),
+            "case {case:?}: unexpected refusal, got {status} {code} {message:?}"
+        );
+    }
+
+    // The control: a token the pattern admits is past validation entirely, so the refusal
+    // comes from the handler resolving it against state instead.
+    let (status, code, message) = refusal(
+        &emulator,
+        "PutApprovalResult",
+        &approval("11111111-2222-4333-8444-555555555555"),
+    )
+    .await;
+    assert_ne!(
+        code.as_str(),
+        "ValidationException",
+        "case \"a well-formed token\": the constraints admit it, got {status} {code} {message:?}"
     );
 }

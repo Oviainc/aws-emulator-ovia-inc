@@ -4292,20 +4292,84 @@ pub fn duplicate_action_name_message(action_name: &str, stage_name: &str) -> Str
 /// falls below it, and a value below it is one the pattern already refused.
 pub const RESOURCE_ARN_MIN_LENGTH: i64 = 37;
 
-/// The message `PipelineNotFoundException` carries, for every operation that raises it.
+/// The fewest characters an approval token carries.
 ///
-/// The text is built from the request and the caller's account — the lookup is scoped
-/// to one account, so the refusal names the account it did not find the pipeline in.
-pub fn pipeline_not_found_message(name: &str) -> String {
-    format!(
-        "Account '{}' does not have a pipeline with name '{name}'",
-        ::engine::emulator_account_id()
-    )
+/// The same rule one member over: `ApprovalToken` declares a `@pattern` and no `@length`
+/// (`smithy_query query="shape" shape="ApprovalToken"`), and CodePipeline holds the
+/// member to the floor that pattern implies as well. The pattern admits only one length —
+/// eight hex digits, four groups of four and twelve, with the four hyphens between them —
+/// so this is it, and a value below it is one the pattern already refused.
+pub const APPROVAL_TOKEN_MIN_LENGTH: i64 = 36;
+
+/// Which of CodePipeline's `PipelineNotFoundException` sentences a refusal carries.
+///
+/// Every operation that resolves a pipeline NAME raises the same modelled error — 400,
+/// `PipelineNotFoundException`, `errorKind=client` (`smithy_query(query="shape",
+/// shape="PipelineNotFoundException")`) — but CodePipeline does not word it the same way
+/// everywhere: the sentence belongs to the PLANE of the API the call came in on. So the
+/// status and the code are shared across the service and the text is per plane, with the
+/// caller's pipeline name and the caller's account the only parts that vary within one
+/// plane.
+///
+/// One variant per plane, so the operations of a plane cannot word one refusal two ways
+/// and no operation has a sentence of its own invention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineNotFoundWording {
+    /// The pipeline-DECLARATION plane: the calls that read or write the declaration and
+    /// the things recorded against it — its stage transitions and its action revisions
+    /// (`GetPipeline`, `GetPipelineState`, `UpdatePipeline`, `EnableStageTransition`,
+    /// `DisableStageTransition`, `PutActionRevision`).
+    Definition,
+    /// The APPROVAL plane: `PutApprovalResult`, which answers a manual approval action.
+    /// The only sentence of the six that closes with guidance for the caller, because the
+    /// caller here is a person (or their client) answering a gate rather than a pipeline
+    /// maintainer.
+    Approval,
+    /// A single execution READ: `GetPipelineExecution`.
+    ExecutionRead,
+    /// The execution LISTINGS (`ListActionExecutions`, `ListPipelineExecutions`,
+    /// `ListRuleExecutions`).
+    ExecutionListing,
+    /// The execution-CONTROL plane: the calls that start, stop or retry work
+    /// (`StartPipelineExecution`, `StopPipelineExecution`, `RetryStageExecution`).
+    ExecutionControl,
+    /// Stage ROLLBACK: `RollbackStage`, whose sentence names no account at all.
+    StageRollback,
+}
+
+/// The message `PipelineNotFoundException` carries, for the plane `wording` names.
+///
+/// The variable parts are the pipeline name the request asked for and — for every plane
+/// but [`PipelineNotFoundWording::StageRollback`] — the caller's account, because the
+/// lookup is scoped to one account. Everything else is the plane's fixed text.
+pub fn pipeline_not_found_message(wording: PipelineNotFoundWording, name: &str) -> String {
+    let account = ::engine::emulator_account_id();
+    match wording {
+        PipelineNotFoundWording::Definition => {
+            format!("Account '{account}' does not have a pipeline with name '{name}'")
+        }
+        PipelineNotFoundWording::Approval => format!(
+            "{name} was not found in account {account}. Make sure you are using the correct \
+             name for the pipeline, and then try again."
+        ),
+        PipelineNotFoundWording::ExecutionRead => format!(
+            "The account with id '{account}' does not include a pipeline with the name '{name}'"
+        ),
+        PipelineNotFoundWording::ExecutionListing => format!(
+            "The account with AWS account ID '{account}' does not include a pipeline named \
+             '{name}'"
+        ),
+        PipelineNotFoundWording::ExecutionControl => {
+            format!("Pipeline with name {name} does not exist in account {account}.")
+        }
+        PipelineNotFoundWording::StageRollback => format!("Pipeline '{name}' does not exist."),
+    }
 }
 
 /// The message a pipeline-VERSION lookup that found no such version carries.
 ///
-/// The same rule as [`pipeline_not_found_message`] with the version the request asked
+/// The definition plane's [`PipelineNotFoundWording::Definition`] sentence with the
+/// version the request asked
 /// for appended, so a caller reading version history can tell an absent version from an
 /// absent pipeline from the text alone: the lookup is scoped to one account AND one
 /// version, and the refusal names both.

@@ -20,9 +20,10 @@
 //! * a tag-limit refusal names the RESOURCE the limit was exceeded for and not the
 //!   count.
 //!
-//! The sibling suite `validation_and_messages.rs` pins the two rules not here: the
-//! `PipelineNotFoundException` / `PipelineNameInUseException` text, and the
-//! constraint-violation envelope.
+//! The sibling suite `validation_and_messages.rs` pins the `PipelineNameInUseException`
+//! text and the constraint-violation envelope, and `pipeline_not_found_wording.rs` pins
+//! the `PipelineNotFoundException` text, which is NOT one formatter: CodePipeline words
+//! it per API plane.
 
 use serde_json::{json, Value};
 
@@ -430,116 +431,6 @@ async fn every_paginated_listing_words_an_invalid_next_token_the_same_way() {
                 message, expected,
                 "case {token_case:?} via {operation}: every listing words the rule the same \
                  way and quotes the rejected token, got {message:?}"
-            );
-        }
-    }
-}
-
-/// RULE: every operation that resolves a pipeline by name words a lookup that found
-/// nothing with the ONE account-scoped formatter — so the account the name was looked up
-/// in is reported, identically whichever operation refused.
-///
-/// The sibling suite pins the five readers; these are the remaining raisers, each with
-/// whatever else its input requires, over absent names differing in alphabet and length.
-/// `PutWebhook` is NOT one of them: it stores a definition over a pipeline NAME and
-/// resolves nothing, so it has no lookup to word (see `webhooks.rs`).
-#[tokio::test]
-async fn every_operation_that_cannot_find_a_pipeline_words_it_the_same_way() {
-    let emulator = Emulator::new();
-    // One stored pipeline, so a refusal below is the NAME's lookup failing and not an
-    // empty store.
-    emulator
-        .ok("CreatePipeline", &json!({"pipeline": two_stage_declaration("stored")}))
-        .await;
-
-    let absent_names: Vec<(&str, String)> = vec![
-        ("a plain absent name", "absent-pipeline".to_string()),
-        ("a punctuated absent name", "a.b@c-d_e".to_string()),
-        ("the longest absent name", "q".repeat(100)),
-    ];
-
-    // (the operation, the request naming the absent pipeline)
-    let operations: Vec<(&str, StageRequest)> = vec![
-        ("UpdatePipeline", |name| {
-            json!({"pipeline": {
-                "name": name,
-                "roleArn": ROLE_ARN,
-                "artifactStore": {"type": "S3", "location": "my-bucket"},
-                "stages": [source_stage("Source")],
-            }})
-        }),
-        ("ListActionExecutions", |name| {
-            json!({"pipelineName": name})
-        }),
-        ("ListRuleExecutions", |name| json!({"pipelineName": name})),
-        ("DisableStageTransition", |name| {
-            json!({
-                "pipelineName": name,
-                "stageName": "Source",
-                "transitionType": "Inbound",
-                "reason": "maintenance window",
-            })
-        }),
-        ("EnableStageTransition", |name| {
-            json!({
-                "pipelineName": name,
-                "stageName": "Source",
-                "transitionType": "Inbound",
-            })
-        }),
-        ("PutActionRevision", |name| {
-            json!({
-                "pipelineName": name,
-                "stageName": "Source",
-                "actionName": "Src",
-                "actionRevision": {
-                    "revisionId": "rev-1",
-                    "revisionChangeId": "change-1",
-                    "created": 1_700_000_000,
-                },
-            })
-        }),
-        ("PutApprovalResult", |name| {
-            json!({
-                "pipelineName": name,
-                "stageName": "Source",
-                "actionName": "Src",
-                "result": {"summary": "looks good", "status": "Approved"},
-                "token": "11111111-2222-4333-8444-555555555555",
-            })
-        }),
-        ("RetryStageExecution", |name| {
-            json!({
-                "pipelineName": name,
-                "stageName": "Source",
-                "pipelineExecutionId": "11111111-2222-4333-8444-555555555555",
-                "retryMode": "FAILED_ACTIONS",
-            })
-        }),
-        ("StopPipelineExecution", |name| {
-            json!({
-                "pipelineName": name,
-                "pipelineExecutionId": "11111111-2222-4333-8444-555555555555",
-            })
-        }),
-    ];
-
-    for (name_case, name) in &absent_names {
-        for (operation, build) in &operations {
-            let (status, code, message) = refusal(&emulator, operation, &build(name)).await;
-            assert_eq!(
-                (status, code.as_str()),
-                (400, "PipelineNotFoundException"),
-                "case {name_case:?} via {operation}: expected the modelled not-found refusal, \
-                 got {status} {code} {message:?}"
-            );
-            assert_eq!(
-                message,
-                format!(
-                    "Account '{ACCOUNT_ID}' does not have a pipeline with name '{name}'"
-                ),
-                "case {name_case:?} via {operation}: the message is built from the request and \
-                 the account, got {message:?}"
             );
         }
     }

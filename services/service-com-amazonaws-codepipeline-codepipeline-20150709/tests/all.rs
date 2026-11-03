@@ -53,6 +53,8 @@ mod job_worker_refusals_and_poll_results;
 mod management_event_recording;
 #[path = "all/pipeline_lifecycle.rs"]
 mod pipeline_lifecycle;
+#[path = "all/pipeline_not_found_wording.rs"]
+mod pipeline_not_found_wording;
 #[path = "all/pipeline_state.rs"]
 mod pipeline_state;
 #[path = "all/probe.rs"]

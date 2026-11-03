@@ -191,6 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     DisableStageTransitionErrorModeled::PipelineNotFoundException(
                         PipelineNotFoundException {
                             message: Some(crate::state::pipeline_not_found_message(
+                                crate::state::PipelineNotFoundWording::Definition,
                                 &input.pipeline_name,
                             )),
                         },

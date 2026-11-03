@@ -245,6 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListActionExecutionsErrorModeled::PipelineNotFoundException(
                 PipelineNotFoundException {
                     message: Some(crate::state::pipeline_not_found_message(
+                        crate::state::PipelineNotFoundWording::ExecutionListing,
                         &input.pipeline_name,
                     )),
                 },

@@ -9,9 +9,10 @@
 //!   source stage, a `Source` action outside it, a `roleArn` IAM holds no role for, and
 //!   the V2-only members on a declaration that states `pipelineType` `V1` — with the
 //!   error shape the model declares for a malformed structure;
-//! * `PipelineNameInUseException` and `PipelineNotFoundException` carry the text their
-//!   rule builds from the REQUEST and the caller's account, so the account the name was
-//!   looked up in is reported;
+//! * `PipelineNameInUseException` carries the text its rule builds from the REQUEST and
+//!   the caller's account, so the account the name collided in is reported, and so does
+//!   the pipeline-definition plane's `PipelineNotFoundException` (the OTHER planes word
+//!   that error their own way — `pipeline_not_found_wording.rs` pins all six);
 //! * a declaration whose first stage is not made up exclusively of `Source` actions is
 //!   refused with the FIXED sentence that defect class carries, with nothing of the
 //!   request interpolated into it, by every operation that takes a declaration;
@@ -595,24 +596,18 @@ async fn the_pipeline_name_refusals_carry_the_text_their_rule_builds() {
         );
     }
 
-    // Every operation that cannot find a pipeline words it the same way.
+    // The pipeline-DEFINITION plane: the calls that read or write the declaration itself
+    // all word a lookup that found nothing the same way. The planes that word it
+    // otherwise are `pipeline_not_found_wording.rs`.
     for (operation, body) in [
         ("GetPipeline", json!({"name": "absent-pipeline"})),
         ("GetPipelineState", json!({"name": "absent-pipeline"})),
         (
-            "StartPipelineExecution",
-            json!({"name": "absent-pipeline"}),
-        ),
-        (
-            "ListPipelineExecutions",
-            json!({"pipelineName": "absent-pipeline"}),
-        ),
-        (
-            "GetPipelineExecution",
-            json!({
-                "pipelineName": "absent-pipeline",
-                "pipelineExecutionId": "11111111-2222-4333-8444-555555555555",
-            }),
+            "UpdatePipeline",
+            declaration(
+                "absent-pipeline",
+                json!([source_stage("SourceArtifact"), acting_stage("Build")]),
+            ),
         ),
     ] {
         let (status, code, message) = emulator.refusal(operation, &body).await;

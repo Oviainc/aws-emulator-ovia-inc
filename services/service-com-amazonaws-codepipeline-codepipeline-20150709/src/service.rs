@@ -212,13 +212,14 @@ pub(crate) fn constraint_clause(violation: &Violation) -> Option<String> {
 /// One member of this service's input surface whose value is held to a `@length` floor
 /// the MODEL does not declare.
 ///
-/// `smithy_query query="shape" shape="ResourceArn"` reports a `@pattern` and no
-/// `@length`, while CodePipeline states both a pattern clause and a length clause for a
-/// malformed ARN. The floor ([`crate::state::RESOURCE_ARN_MIN_LENGTH`]) is the shortest
-/// string that pattern can match, so no value the pattern ADMITS falls below it: the
-/// floor only ever adds a clause to a value the pattern already refused, which is why
-/// stating it here — where the violations of one request are worded — is the whole rule
-/// rather than half of it.
+/// `smithy_query query="shape" shape="ResourceArn,ApprovalToken"` reports a `@pattern`
+/// and no `@length` for either, while CodePipeline states both a pattern clause and a
+/// length clause for a malformed value. Each floor ([`crate::state::RESOURCE_ARN_MIN_LENGTH`],
+/// [`crate::state::APPROVAL_TOKEN_MIN_LENGTH`]) is the shortest string its member's
+/// pattern can match, so no value the pattern ADMITS falls below it: the floor only ever
+/// adds a clause to a value the pattern already refused, which is why stating it here —
+/// where the violations of one request are worded — is the whole rule rather than half of
+/// it.
 struct LengthFloor {
     /// The member name the value is bound to, at any depth in the input.
     member: &'static str,
@@ -227,10 +228,16 @@ struct LengthFloor {
 }
 
 /// Every member of this service's inputs whose length floor the model leaves unstated.
-const LENGTH_FLOORS: &[LengthFloor] = &[LengthFloor {
-    member: "resourceArn",
-    min: crate::state::RESOURCE_ARN_MIN_LENGTH,
-}];
+const LENGTH_FLOORS: &[LengthFloor] = &[
+    LengthFloor {
+        member: "resourceArn",
+        min: crate::state::RESOURCE_ARN_MIN_LENGTH,
+    },
+    LengthFloor {
+        member: "token",
+        min: crate::state::APPROVAL_TOKEN_MIN_LENGTH,
+    },
+];
 
 /// The undeclared length floor the member a violation path names is held to, if any.
 ///
