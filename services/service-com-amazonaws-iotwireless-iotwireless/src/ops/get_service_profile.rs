@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetServiceProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetServiceProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetServiceProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored service profile an `Id` names. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +139,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetServiceProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetServiceProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetServiceProfile"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetServiceProfileError::from(GetServiceProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iotwireless store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let store = state.lock();
+        let profile = store.service_profiles.get(&input.id).ok_or_else(|| {
+            GetServiceProfileError::from(GetServiceProfileErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("ServiceProfile {} not found", input.id)),
+                    resource_id: Some(input.id.clone()),
+                    resource_type: Some("ServiceProfile".to_string()),
+                },
+            ))
+        })?;
+
+        Ok(GetServiceProfileOutput {
+            arn: Some(profile.arn.clone()),
+            name: profile.name.clone(),
+            id: Some(profile.id.clone()),
+            lo_ra_wan: profile.lorawan.as_ref().map(reported_settings),
+        })
+    }
+}
+
+/// The stored service-profile settings as this operation's own view of them.
+///
+/// `LoRaWANGetServiceProfileInfo` carries every member `LoRaWANServiceProfile` does plus
+/// the network-server counters and policies no operation this service models can set, so
+/// the shared members are projected from the stored record and the rest are left at the
+/// value the model declares for a member nothing has set.
+fn reported_settings(stored: &LoRaWANServiceProfile) -> LoRaWANGetServiceProfileInfo {
+    LoRaWANGetServiceProfileInfo {
+        add_gw_metadata: stored.add_gw_metadata,
+        // `DrMin`/`DrMax` are boxed on the create and unboxed with a modelled default
+        // here, so a profile created without them reports that default.
+        dr_min: stored.dr_min.unwrap_or_default(),
+        dr_max: stored.dr_max.unwrap_or_default(),
+        pr_allowed: stored.pr_allowed,
+        ra_allowed: stored.ra_allowed,
+        tx_power_index_min: stored.tx_power_index_min,
+        tx_power_index_max: stored.tx_power_index_max,
+        nb_trans_min: stored.nb_trans_min,
+        nb_trans_max: stored.nb_trans_max,
+        ..LoRaWANGetServiceProfileInfo::default()
     }
 }

@@ -58,9 +58,10 @@ const NAME_MAX_LEN: usize = 256;
 
 /// Dispatch one call signed for `scope_region` — `None` leaves it unsigned, so a minted
 /// ARN falls back to [`DEFAULT_REGION`] — and return its status plus its parsed JSON
-/// body. Only the region table needs a scope other than [`REGION`]; every other case
-/// goes through the shared `call`.
-async fn call_signed_for(
+/// body. Only a region table needs a scope other than [`REGION`]; every other case
+/// goes through the shared `call`. Shared with the sibling suites that assert the same
+/// region rule, so the dispatch exists once.
+pub(crate) async fn call_signed_for(
     router: &MultiServiceRouter,
     scope_region: Option<&str>,
     method: Method,

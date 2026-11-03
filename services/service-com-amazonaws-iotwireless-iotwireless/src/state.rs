@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    LoRaWANDevice, LoRaWANDeviceProfile, LoRaWANGateway, LoRaWANMulticast,
+    LoRaWANDevice, LoRaWANDeviceProfile, LoRaWANGateway, LoRaWANMulticast, LoRaWANServiceProfile,
     ResourceNotFoundException, SidewalkDevice, Tag,
 };
 
@@ -43,6 +43,11 @@ pub fn wireless_device_arn(region: &str, id: &str) -> String {
 /// `arn:aws:iotwireless:<region>:<account>:DeviceProfile/<id>`.
 pub fn device_profile_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("DeviceProfile/{id}"))
+}
+
+/// `arn:aws:iotwireless:<region>:<account>:ServiceProfile/<id>`.
+pub fn service_profile_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("ServiceProfile/{id}"))
 }
 
 /// `arn:aws:iotwireless:<region>:<account>:MulticastGroup/<id>`.
@@ -161,6 +166,60 @@ pub struct DeviceProfile {
     pub profile_type: String,
     pub lorawan: Option<LoRaWANDeviceProfile>,
     pub tags: Vec<Tag>,
+}
+
+/// A service profile: the LoRaWAN network-server settings a set of wireless devices
+/// shares.
+///
+/// `lorawan` holds the settings as the resource carries them — the create's own members
+/// with the defaults its model docs publish filled in for the ones it omitted — so every
+/// reader projects one stored record rather than re-deriving a default of its own.
+#[derive(Debug, Clone)]
+pub struct ServiceProfile {
+    pub id: String,
+    pub arn: String,
+    pub name: Option<String>,
+    pub lorawan: Option<LoRaWANServiceProfile>,
+    pub tags: Vec<Tag>,
+}
+
+/// The `TxPowerIndexMin` a service profile carries when its create named none.
+/// Source: `LoRaWANServiceProfile.TxPowerIndexMin`'s model doc ("Default: 0").
+pub const DEFAULT_TX_POWER_INDEX_MIN: i32 = 0;
+
+/// The `TxPowerIndexMax` a service profile carries when its create named none.
+/// Source: `LoRaWANServiceProfile.TxPowerIndexMax`'s model doc ("Default: 15").
+pub const DEFAULT_TX_POWER_INDEX_MAX: i32 = 15;
+
+/// The `NbTransMin` a service profile carries when its create named none.
+/// Source: `LoRaWANServiceProfile.NbTransMin`'s model doc ("Default: 0").
+pub const DEFAULT_NB_TRANS_MIN: i32 = 0;
+
+/// The `NbTransMax` a service profile carries when its create named none.
+/// Source: `LoRaWANServiceProfile.NbTransMax`'s model doc ("Default: 3").
+pub const DEFAULT_NB_TRANS_MAX: i32 = 3;
+
+/// The settings a created service profile carries: the ones the request named, and the
+/// default its model doc publishes for each one it left out.
+///
+/// One function, so the stored resource — and therefore every reader of it — carries
+/// the same settings whether or not the create spelled them out.
+pub fn service_profile_settings(requested: &LoRaWANServiceProfile) -> LoRaWANServiceProfile {
+    LoRaWANServiceProfile {
+        tx_power_index_min: Some(
+            requested
+                .tx_power_index_min
+                .unwrap_or(DEFAULT_TX_POWER_INDEX_MIN),
+        ),
+        tx_power_index_max: Some(
+            requested
+                .tx_power_index_max
+                .unwrap_or(DEFAULT_TX_POWER_INDEX_MAX),
+        ),
+        nb_trans_min: Some(requested.nb_trans_min.unwrap_or(DEFAULT_NB_TRANS_MIN)),
+        nb_trans_max: Some(requested.nb_trans_max.unwrap_or(DEFAULT_NB_TRANS_MAX)),
+        ..requested.clone()
+    }
 }
 
 /// A wireless device registered against a destination.
@@ -284,6 +343,13 @@ pub const MAX_WIRELESS_DEVICES: usize = 250;
 /// refuses with `ValidationException`.
 pub const MAX_DEVICE_PROFILES: usize = 100;
 
+/// The most service profiles this emulator stores. A ceiling, for the same reason as
+/// [`MAX_DESTINATIONS`]; `CreateServiceProfile` models no quota error either
+/// (`smithy_query(query="operation", operation="CreateServiceProfile")` lists
+/// AccessDenied / Conflict / InternalServer / Throttling / Validation), so a full store
+/// refuses with `ValidationException`.
+pub const MAX_SERVICE_PROFILES: usize = 100;
+
 /// The most multicast groups this emulator stores. A ceiling, for the same reason as
 /// [`MAX_DESTINATIONS`]; `CreateMulticastGroup` models no quota error either
 /// (`smithy_query(query="operation", operation="CreateMulticastGroup")` lists
@@ -314,6 +380,10 @@ pub const MAX_WIRELESS_DEVICE_TOKENS: usize = MAX_WIRELESS_DEVICES;
 /// Bounded for the same reason as [`MAX_DESTINATION_TOKENS`].
 pub const MAX_DEVICE_PROFILE_TOKENS: usize = MAX_DEVICE_PROFILES;
 
+/// The most `ClientRequestToken` entries kept for `CreateServiceProfile` idempotency.
+/// Bounded for the same reason as [`MAX_DESTINATION_TOKENS`].
+pub const MAX_SERVICE_PROFILE_TOKENS: usize = MAX_SERVICE_PROFILES;
+
 /// The most `ClientRequestToken` entries kept for `CreateMulticastGroup` idempotency.
 /// Bounded for the same reason as [`MAX_DESTINATION_TOKENS`].
 pub const MAX_MULTICAST_GROUP_TOKENS: usize = MAX_MULTICAST_GROUPS;
@@ -329,16 +399,19 @@ pub const MAX_WIRELESS_GATEWAY_TOKENS: usize = MAX_WIRELESS_GATEWAYS;
 /// resume exactly where the previous page stopped.
 ///
 /// Every store here is BOUNDED: the resource maps by [`MAX_DESTINATIONS`] /
-/// [`MAX_WIRELESS_DEVICES`] / [`MAX_DEVICE_PROFILES`] / [`MAX_MULTICAST_GROUPS`] /
+/// [`MAX_WIRELESS_DEVICES`] / [`MAX_DEVICE_PROFILES`] / [`MAX_SERVICE_PROFILES`] /
+/// [`MAX_MULTICAST_GROUPS`] /
 /// [`MAX_WIRELESS_GATEWAYS`] (the
 /// creates refuse once full), `dev_eui_index` by one entry per stored device,
 /// `gateway_eui_index` by one entry per stored gateway, and the
 /// token maps by [`MAX_DESTINATION_TOKENS`] / [`MAX_WIRELESS_DEVICE_TOKENS`] /
-/// [`MAX_DEVICE_PROFILE_TOKENS`] / [`MAX_MULTICAST_GROUP_TOKENS`] /
+/// [`MAX_DEVICE_PROFILE_TOKENS`] / [`MAX_SERVICE_PROFILE_TOKENS`] /
+/// [`MAX_MULTICAST_GROUP_TOKENS`] /
 /// [`MAX_WIRELESS_GATEWAY_TOKENS`] with oldest-entry
 /// eviction. The token maps are private so every write goes through
 /// [`Self::record_destination_token`] / [`Self::record_wireless_device_token`] /
-/// [`Self::record_device_profile_token`] / [`Self::record_multicast_group_token`] /
+/// [`Self::record_device_profile_token`] / [`Self::record_service_profile_token`] /
+/// [`Self::record_multicast_group_token`] /
 /// [`Self::record_wireless_gateway_token`] and
 /// cannot bypass the cap.
 #[derive(Debug, Default)]
@@ -349,6 +422,8 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
     pub wireless_devices: BTreeMap<String, WirelessDevice>,
     /// Device profiles by `Id`. Bounded by [`MAX_DEVICE_PROFILES`].
     pub device_profiles: BTreeMap<String, DeviceProfile>,
+    /// Service profiles by `Id`. Bounded by [`MAX_SERVICE_PROFILES`].
+    pub service_profiles: BTreeMap<String, ServiceProfile>,
     /// Multicast groups by `Id`. Bounded by [`MAX_MULTICAST_GROUPS`].
     pub multicast_groups: BTreeMap<String, MulticastGroup>,
     /// Wireless gateways by `Id`. Bounded by [`MAX_WIRELESS_GATEWAYS`].
@@ -378,6 +453,11 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
     device_profile_tokens: HashMap<String, IdempotentCreate>,
     /// Write order for [`Self::device_profile_tokens`].
     device_profile_token_order: VecDeque<String>,
+    /// `CreateServiceProfile` client request tokens, bounded by
+    /// [`MAX_SERVICE_PROFILE_TOKENS`]. Private, like the destination tokens.
+    service_profile_tokens: HashMap<String, IdempotentCreate>,
+    /// Write order for [`Self::service_profile_tokens`].
+    service_profile_token_order: VecDeque<String>,
     /// `CreateMulticastGroup` client request tokens, bounded by
     /// [`MAX_MULTICAST_GROUP_TOKENS`]. Private, like the destination tokens.
     multicast_group_tokens: HashMap<String, IdempotentCreate>,
@@ -463,6 +543,29 @@ impl ComAmazonawsIotwirelessIotwirelessState {
     /// Mint a fresh, unused `DeviceProfileId`.
     pub fn mint_device_profile_id(&mut self) -> String {
         mint_unused_uuid(&self.device_profiles)
+    }
+
+    /// Mint a fresh, unused `ServiceProfileId`.
+    pub fn mint_service_profile_id(&mut self) -> String {
+        mint_unused_uuid(&self.service_profiles)
+    }
+
+    /// What a `CreateServiceProfile` `ClientRequestToken` already minted, if anything.
+    pub fn service_profile_token(&self, token: &str) -> Option<&IdempotentCreate> {
+        self.service_profile_tokens.get(token)
+    }
+
+    /// Record `token` as having minted the service profile named by `record`, evicting
+    /// the oldest token first if that would push the map past
+    /// [`MAX_SERVICE_PROFILE_TOKENS`].
+    pub fn record_service_profile_token(&mut self, token: String, record: IdempotentCreate) {
+        record_token(
+            &mut self.service_profile_tokens,
+            &mut self.service_profile_token_order,
+            MAX_SERVICE_PROFILE_TOKENS,
+            token,
+            record,
+        );
     }
 
     /// Mint a fresh, unused `MulticastGroupId`.

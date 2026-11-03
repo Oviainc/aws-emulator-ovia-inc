@@ -19,6 +19,8 @@ mod destination_update_and_not_found;
 mod device_profile_lifecycle;
 #[path = "all/multicast_group_lifecycle.rs"]
 mod multicast_group_lifecycle;
+#[path = "all/service_profile_lifecycle.rs"]
+mod service_profile_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/wireless_gateway_lifecycle.rs"]
