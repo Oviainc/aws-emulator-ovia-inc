@@ -1309,3 +1309,10 @@ mod delete_verified_access_instance;
 // it refuses for an address nothing has on offer, and where the tags it carries land.
 #[path = "all/accept_address_transfer.rs"]
 mod accept_address_transfer;
+// Appended at the END of this file, for the reason the header gives: the sorted region of this
+// file is where every new ec2 suite inserts its lines. What `UnmonitorInstances` turns off: the
+// `disabling` -> `disabled` move it starts for every distinct instance it names, read back
+// through `DescribeInstances`, the instance it leaves where it was, and the states, ids, batch
+// sizes and dry run it refuses without changing any instance's monitoring.
+#[path = "all/unmonitor_instances.rs"]
+mod unmonitor_instances;
