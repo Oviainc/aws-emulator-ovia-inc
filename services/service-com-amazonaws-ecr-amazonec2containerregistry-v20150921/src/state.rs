@@ -281,6 +281,10 @@ pub const TRANSITION_ACTION_TYPE: &str = "TRANSITION";
 /// The `TagStatus` a selection with no tag list asks for.
 pub const ANY_TAG_STATUS: &str = "ANY";
 
+/// The `TagStatus` a selection that names tags asks for — the one status the format's
+/// tag-filter rules are stated about.
+pub const TAGGED_TAG_STATUS: &str = "TAGGED";
+
 /// The only `selection.countUnit` a lifecycle policy rule carries: a `sinceImagePushed`
 /// count is a number of days.
 pub const COUNT_UNIT_DAYS: &str = "days";
@@ -1982,6 +1986,40 @@ fn array_too_short(minimum: usize, found: usize) -> String {
     ))
 }
 
+/// How many alternative forms the lifecycle policy schema admits a RULE in — the forms it
+/// CHOOSES between, so a rule has to be in exactly one of them.
+///
+/// A rule's form is fixed by the two values the choice is made on, its count type and its
+/// action type, because each pair also fixes which of the rule's conditional members it
+/// carries: a `countUnit` with an age count and none with a count of images, a
+/// `targetStorageClass` with a transition and none with an expiry. Neither of the two
+/// alone admits as many forms as the count ECR reports, and their cross does, so the
+/// alternatives are the cross and the number is derived from the two value sets rather
+/// than written out.
+fn rule_alternatives() -> usize {
+    LIFECYCLE_COUNT_TYPES.len() * IMAGE_ACTION_TYPE_VALUES.len()
+}
+
+/// The report the schema produces for a rule that is in NONE of those forms: a choice
+/// states its OWN outcome — how many of the alternatives the instance matched — and never
+/// the sub-constraint one alternative failed, so this report carries neither the value the
+/// rule gave nor the set an alternative admits.
+///
+/// Only the members the choice is MADE on reach it: the two values it is made on
+/// (`selection.countType`, `action.type`) and the conditional members each pair fixes
+/// (`selection.countUnit`, `action.targetStorageClass`). Every member the alternatives
+/// SHARE — a rule's `rulePriority`, a selection's `tagStatus` and `countNumber`, and the
+/// presence of each of them — is checked by the schema common to all the alternatives,
+/// which states its own constraint ([`missing_required`], [`below_minimum`],
+/// [`not_in_enum`]), and the format's rules ACROSS members are checked after the schema
+/// and worded by ECR itself.
+fn outside_every_rule_alternative() -> Fault {
+    lifecycle_invalid(validator_report(format!(
+        "instance failed to match exactly one schema (matched 0 out of {})",
+        rule_alternatives()
+    )))
+}
+
 /// `values` as a lifecycle policy DOCUMENT spells them: the modelled enums
 /// (`TagStatus`, `ImageActionType`) are upper case, and a policy document writes them in
 /// the lower case ECR's published lifecycle policy examples use — so a refusal that
@@ -2048,6 +2086,164 @@ fn lifecycle_required<T>(member: Option<T>, name: &str) -> Result<T, Fault> {
     member.ok_or_else(|| lifecycle_invalid(missing_required(name)))
 }
 
+/// One rule of a lifecycle policy document, checked against the lifecycle policy SCHEMA.
+///
+/// The schema states a rule in two parts, and which part a value belongs to is what
+/// decides how its refusal is worded:
+///
+/// * the members every alternative form of a rule SHARES — `rulePriority`, and a
+///   `selection`'s `tagStatus`, `countType`, `countNumber` — are checked against the
+///   schema common to the alternatives, which states the constraint that failed
+///   ([`missing_required`], [`below_minimum`], [`not_in_enum`]);
+/// * the rule's FORM is then chosen among the alternatives
+///   ([`rule_alternatives`]), and a rule in none of them is refused with the choice's own
+///   outcome ([`outside_every_rule_alternative`]) — so the value it gave for a member the
+///   choice is made on is not stated back to the caller.
+///
+/// A policy document writes `tagStatus`, `countType` and `action.type` in lower camel
+/// case; the modelled enums are what they mean, so each is matched case-insensitively and
+/// stored in the modelled spelling.
+fn parse_lifecycle_rule(rule: &serde_json::Value) -> Result<LifecycleRule, Fault> {
+    if !rule.is_object() {
+        return Err(lifecycle_unmappable());
+    }
+
+    // --- the members the alternatives share ---
+    let priority_number = lifecycle_required(lifecycle_i64(rule, "rulePriority")?, "rulePriority")?;
+    let priority = match i32::try_from(priority_number) {
+        // "rulePriority … The priority must be a positive value".
+        Ok(priority) if priority >= 1 => priority,
+        Ok(priority) => return Err(lifecycle_invalid(below_minimum(1, i64::from(priority)))),
+        // Outside the range the shape's integer member holds at all, so the document
+        // does not map onto it.
+        Err(_) => return Err(lifecycle_unmappable()),
+    };
+
+    let selection = lifecycle_required(lifecycle_object(rule, "selection")?, "selection")?;
+    let tag_status_text = lifecycle_required(lifecycle_str(selection, "tagStatus")?, "tagStatus")?;
+    let tag_status = TAG_STATUS_VALUES
+        .iter()
+        .find(|value| value.eq_ignore_ascii_case(tag_status_text))
+        .ok_or_else(|| {
+            lifecycle_invalid(not_in_enum(
+                tag_status_text,
+                &document_spellings(TAG_STATUS_VALUES),
+            ))
+        })?;
+
+    let string_list = |member: &str| -> Result<Vec<String>, Fault> {
+        match lifecycle_array(selection, member)? {
+            None => Ok(Vec::new()),
+            Some(entries) => entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .as_str()
+                        .map(ToString::to_string)
+                        .ok_or_else(lifecycle_unmappable)
+                })
+                .collect(),
+        }
+    };
+    let tag_prefixes = string_list("tagPrefixList")?;
+    let tag_patterns = string_list("tagPatternList")?;
+
+    let count_type_text = lifecycle_required(lifecycle_str(selection, "countType")?, "countType")?;
+    let count_number = lifecycle_required(lifecycle_i64(selection, "countNumber")?, "countNumber")?;
+    // The format's own minimum: an `imageCountMoreThan` keeps at least one image, and a
+    // `sinceImagePushed` counts at least one day.
+    if count_number < 1 {
+        return Err(lifecycle_invalid(below_minimum(1, count_number)));
+    }
+    let count_unit = lifecycle_str(selection, "countUnit")?;
+
+    let action = lifecycle_required(lifecycle_object(rule, "action")?, "action")?;
+    let action_text = lifecycle_required(lifecycle_str(action, "type")?, "type")?;
+    let target_text = lifecycle_str(action, "targetStorageClass")?;
+
+    // --- the choice among the rule's alternative forms ---
+    let count_type = LIFECYCLE_COUNT_TYPES
+        .iter()
+        .find(|value| value.eq_ignore_ascii_case(count_type_text))
+        .ok_or_else(outside_every_rule_alternative)?;
+    // Each count type fixes whether the rule carries a `countUnit`, and an age count
+    // counts in the one unit the format defines for it.
+    let count = if *count_type == IMAGE_COUNT_MORE_THAN_COUNT_TYPE {
+        if count_unit.is_some() {
+            return Err(outside_every_rule_alternative());
+        }
+        LifecycleCount::ImageCountMoreThan {
+            keep: usize::try_from(count_number).unwrap_or(usize::MAX),
+        }
+    } else {
+        let unit = count_unit.ok_or_else(outside_every_rule_alternative)?;
+        if !unit.eq_ignore_ascii_case(COUNT_UNIT_DAYS) {
+            return Err(outside_every_rule_alternative());
+        }
+        LifecycleCount::SinceImagePushed {
+            days: u64::try_from(count_number).unwrap_or(u64::MAX),
+        }
+    };
+
+    let action_type: &str = IMAGE_ACTION_TYPE_VALUES
+        .iter()
+        .find(|value| value.eq_ignore_ascii_case(action_text))
+        .ok_or_else(outside_every_rule_alternative)?;
+    // And each action type fixes whether the rule carries a target storage class.
+    let target_storage_class = match (action_type, target_text) {
+        (TRANSITION_ACTION_TYPE, Some(target)) => Some(
+            LIFECYCLE_POLICY_TARGET_STORAGE_CLASS_VALUES
+                .iter()
+                .find(|value| value.eq_ignore_ascii_case(target))
+                .ok_or_else(outside_every_rule_alternative)?
+                .to_string(),
+        ),
+        (TRANSITION_ACTION_TYPE, None) | (_, Some(_)) => {
+            return Err(outside_every_rule_alternative())
+        }
+        (_, None) => None,
+    };
+
+    Ok(LifecycleRule {
+        priority,
+        tag_status: (*tag_status).to_string(),
+        tag_prefixes,
+        tag_patterns,
+        count,
+        action_type: action_type.to_string(),
+        target_storage_class,
+    })
+}
+
+/// The format's rule ACROSS one rule's members about its tag filters: a rule selecting
+/// TAGGED images names exactly one of the two tag lists, and a rule selecting anything
+/// else names neither.
+///
+/// Checked once `rule` is through the schema and worded by ECR itself, so the sentence
+/// names the `tagStatus` the rule asked for and carries no validator terminator.
+fn tag_filters_stated(rule: &LifecycleRule) -> Result<(), Fault> {
+    let tag_status = &rule.tag_status;
+    let tagged = tag_status == TAGGED_TAG_STATUS;
+    let names_tags = !rule.tag_prefixes.is_empty() || !rule.tag_patterns.is_empty();
+    if tagged && !names_tags {
+        return Err(lifecycle_invalid(format!(
+            "Must specify tagPrefixList or tagPatternList when tagStatus={tag_status}."
+        )));
+    }
+    if !rule.tag_prefixes.is_empty() && !rule.tag_patterns.is_empty() {
+        return Err(lifecycle_invalid(format!(
+            "Must specify only one of tagPrefixList or tagPatternList when \
+             tagStatus={tag_status}."
+        )));
+    }
+    if !tagged && names_tags {
+        return Err(lifecycle_invalid(format!(
+            "Must not specify tagPrefixList or tagPatternList when tagStatus={tag_status}."
+        )));
+    }
+    Ok(())
+}
+
 /// The rules a lifecycle policy document declares, in the order they are applied, or
 /// [`Fault::InvalidParameter`] stating the constraint the document failed.
 ///
@@ -2059,6 +2255,13 @@ fn lifecycle_required<T>(member: Option<T>, name: &str) -> Result<T, Fault> {
 /// and neither anywhere else; `countUnit` on `sinceImagePushed` and only there; and an
 /// `action` naming an `ImageActionType`, with a target storage class on a transition and
 /// only there.
+///
+/// Those checks run in the order the SERVICE makes them, which is what decides which
+/// constraint a document breaking several of them is refused with: the document's own
+/// schema first (each rule against the alternatives the schema chooses between, see
+/// [`parse_lifecycle_rule`]), then the format's rules ACROSS one rule's members
+/// ([`tag_filters_stated`]), then the rules across the whole policy — a unique rule
+/// priority and the evaluation order of a catch-all rule.
 ///
 /// A refusal is worded by [`lifecycle_unmappable`] when the document cannot be mapped
 /// onto the policy shape at all, and by [`lifecycle_invalid`] when it maps but breaks
@@ -2077,162 +2280,26 @@ pub fn parse_lifecycle_policy(text: &str) -> Result<Vec<LifecycleRule>, Fault> {
         return Err(lifecycle_invalid(array_too_short(1, rules.len())));
     }
 
+    // The schema check, rule by rule.
     let mut parsed: Vec<LifecycleRule> = Vec::new();
+    for rule in rules {
+        parsed.push(parse_lifecycle_rule(rule)?);
+    }
+
+    // Then the format's own rules across one rule's members.
+    for rule in &parsed {
+        tag_filters_stated(rule)?;
+    }
+
     // A rule priority is unique within a policy, so each one is recorded as it is read.
     let mut seen_priorities: BTreeSet<i32> = BTreeSet::new();
-    for rule in rules {
-        if !rule.is_object() {
-            return Err(lifecycle_unmappable());
-        }
-        let priority_number =
-            lifecycle_required(lifecycle_i64(rule, "rulePriority")?, "rulePriority")?;
-        let priority = match i32::try_from(priority_number) {
-            // "rulePriority … The priority must be a positive value".
-            Ok(priority) if priority >= 1 => priority,
-            Ok(priority) => return Err(lifecycle_invalid(below_minimum(1, i64::from(priority)))),
-            // Outside the range the shape's integer member holds at all, so the document
-            // does not map onto it.
-            Err(_) => return Err(lifecycle_unmappable()),
-        };
-        if !seen_priorities.insert(priority) {
+    for rule in &parsed {
+        if !seen_priorities.insert(rule.priority) {
             return Err(lifecycle_invalid(format!(
-                "Duplicate rulePriority {priority}; a rulePriority is unique within a \
-                 policy."
+                "Duplicate rulePriority {}; a rulePriority is unique within a policy.",
+                rule.priority
             )));
         }
-
-        let selection = lifecycle_required(lifecycle_object(rule, "selection")?, "selection")?;
-        let tag_status_text =
-            lifecycle_required(lifecycle_str(selection, "tagStatus")?, "tagStatus")?;
-        // A policy document writes `tagStatus`, `countType` and `action.type` in lower
-        // camel case; the modelled enums are what they mean, so they are matched against
-        // those case-insensitively and stored in the modelled spelling.
-        let tag_status = TAG_STATUS_VALUES
-            .iter()
-            .find(|value| value.eq_ignore_ascii_case(tag_status_text))
-            .ok_or_else(|| {
-                lifecycle_invalid(not_in_enum(
-                    tag_status_text,
-                    &document_spellings(TAG_STATUS_VALUES),
-                ))
-            })?;
-
-        let string_list = |member: &str| -> Result<Vec<String>, Fault> {
-            match lifecycle_array(selection, member)? {
-                None => Ok(Vec::new()),
-                Some(entries) => entries
-                    .iter()
-                    .map(|entry| {
-                        entry
-                            .as_str()
-                            .map(ToString::to_string)
-                            .ok_or_else(lifecycle_unmappable)
-                    })
-                    .collect(),
-            }
-        };
-        let tag_prefixes = string_list("tagPrefixList")?;
-        let tag_patterns = string_list("tagPatternList")?;
-        let tagged = *tag_status == "TAGGED";
-        let names_tags = !tag_prefixes.is_empty() || !tag_patterns.is_empty();
-        if tagged && !names_tags {
-            return Err(lifecycle_invalid(format!(
-                "Must specify tagPrefixList or tagPatternList when tagStatus={tag_status}."
-            )));
-        }
-        if !tag_prefixes.is_empty() && !tag_patterns.is_empty() {
-            return Err(lifecycle_invalid(format!(
-                "Must specify only one of tagPrefixList or tagPatternList when \
-                 tagStatus={tag_status}."
-            )));
-        }
-        if !tagged && names_tags {
-            return Err(lifecycle_invalid(format!(
-                "Must not specify tagPrefixList or tagPatternList when \
-                 tagStatus={tag_status}."
-            )));
-        }
-
-        let count_type_text =
-            lifecycle_required(lifecycle_str(selection, "countType")?, "countType")?;
-        let count_type = LIFECYCLE_COUNT_TYPES
-            .iter()
-            .find(|value| value.eq_ignore_ascii_case(count_type_text))
-            .ok_or_else(|| {
-                lifecycle_invalid(not_in_enum(count_type_text, &LIFECYCLE_COUNT_TYPES))
-            })?;
-        let count_number =
-            lifecycle_required(lifecycle_i64(selection, "countNumber")?, "countNumber")?;
-        // The format's own minimum: an `imageCountMoreThan` keeps at least one image,
-        // and a `sinceImagePushed` counts at least one day.
-        if count_number < 1 {
-            return Err(lifecycle_invalid(below_minimum(1, count_number)));
-        }
-        let count_unit = lifecycle_str(selection, "countUnit")?;
-        let count = if *count_type == IMAGE_COUNT_MORE_THAN_COUNT_TYPE {
-            if count_unit.is_some() {
-                return Err(lifecycle_invalid(format!(
-                    "Must not specify countUnit when countType={count_type}."
-                )));
-            }
-            LifecycleCount::ImageCountMoreThan {
-                keep: usize::try_from(count_number).unwrap_or(usize::MAX),
-            }
-        } else {
-            let unit = lifecycle_required(count_unit, "countUnit")?;
-            if !unit.eq_ignore_ascii_case(COUNT_UNIT_DAYS) {
-                return Err(lifecycle_invalid(not_in_enum(unit, &[COUNT_UNIT_DAYS])));
-            }
-            LifecycleCount::SinceImagePushed {
-                days: u64::try_from(count_number).unwrap_or(u64::MAX),
-            }
-        };
-
-        let action = lifecycle_required(lifecycle_object(rule, "action")?, "action")?;
-        let action_text = lifecycle_required(lifecycle_str(action, "type")?, "type")?;
-        let action_type: &str = IMAGE_ACTION_TYPE_VALUES
-            .iter()
-            .find(|value| value.eq_ignore_ascii_case(action_text))
-            .ok_or_else(|| {
-                lifecycle_invalid(not_in_enum(
-                    action_text,
-                    &document_spellings(IMAGE_ACTION_TYPE_VALUES),
-                ))
-            })?;
-        let target_text = lifecycle_str(action, "targetStorageClass")?;
-        let target_storage_class = match (action_type, target_text) {
-            (TRANSITION_ACTION_TYPE, Some(target)) => Some(
-                LIFECYCLE_POLICY_TARGET_STORAGE_CLASS_VALUES
-                    .iter()
-                    .find(|value| value.eq_ignore_ascii_case(target))
-                    .ok_or_else(|| {
-                        lifecycle_invalid(not_in_enum(
-                            target,
-                            LIFECYCLE_POLICY_TARGET_STORAGE_CLASS_VALUES,
-                        ))
-                    })?
-                    .to_string(),
-            ),
-            (TRANSITION_ACTION_TYPE, None) => {
-                return Err(lifecycle_invalid(missing_required("targetStorageClass")))
-            }
-            (_, Some(_)) => {
-                return Err(lifecycle_invalid(format!(
-                    "Must not specify targetStorageClass when action type={action_type}."
-                )))
-            }
-            (_, None) => None,
-        };
-
-        parsed.push(LifecycleRule {
-            priority,
-            tag_status: (*tag_status).to_string(),
-            tag_prefixes,
-            tag_patterns,
-            count,
-            action_type: action_type.to_string(),
-            target_storage_class,
-        });
     }
 
     // Rules are applied in ascending rule priority, whatever order the document lists
@@ -3305,9 +3372,26 @@ pub fn replication_rule_covers(rule: &ReplicationRule, repository_name: &str) ->
 /// not the sentence the API answers with — see
 /// [`pull_through_cache_rule_not_found_message`].
 pub fn template_not_found_message(prefix: &str) -> String {
+    template_message(prefix, "is not found in the registry with id")
+}
+
+/// The wording ECR uses when the registry ALREADY holds a repository creation template
+/// for a prefix — `TemplateAlreadyExistsException`. The same construction as
+/// [`template_not_found_message`], with this verdict: the runtime message names the KIND
+/// of record with the prefix the request gave and the registry holding it, which the
+/// error shape's own documentation ("The repository creation template already exists.
+/// Specify a unique prefix and try again.") describes but is not.
+pub fn template_already_exists_message(prefix: &str) -> String {
+    template_message(prefix, "already exists in the registry with id")
+}
+
+/// The frame ECR states a refusal ABOUT ONE repository creation template in: the kind of
+/// record, the prefix the request addressed it by, then the verdict and the registry. The
+/// one place that frame is written, so both halves of a template's lifecycle are worded
+/// the same way and only the verdict differs.
+fn template_message(prefix: &str, verdict: &str) -> String {
     format!(
-        "A repository creation template with prefix '{prefix}' is not found in the \
-         registry with id '{}'",
+        "A repository creation template with prefix '{prefix}' {verdict} '{}'",
         registry_id()
     )
 }
@@ -3639,6 +3723,24 @@ fn upload_message(upload_id: &str, repository_name: &str, verdict: &str) -> Stri
     format!(
         "The upload with id '{upload_id}' in the repository with name \
          '{repository_name}' in registry with id '{}' {verdict}",
+        registry_id()
+    )
+}
+
+/// The wording ECR uses when the repository already holds the layer the upload a request
+/// asks to close carries — `LayerAlreadyExistsException`, whose own documentation ("The
+/// image layer already exists in the associated repository.") describes the state rather
+/// than the sentence.
+///
+/// A refusal names the resource by the identifier the REQUEST addressed it by, and a
+/// completion addresses an upload by its id: the digest the registry computed over the
+/// bytes it received is its own value, not something the caller asked by, so the message
+/// states the upload id — in the clause every refusal about one upload states it in
+/// ([`upload_message`]).
+pub fn layer_already_exists_message(upload_id: &str, repository_name: &str) -> String {
+    format!(
+        "Layer with upload id '{upload_id}' already exists in the repository with name \
+         '{repository_name}' in registry with id '{}'",
         registry_id()
     )
 }

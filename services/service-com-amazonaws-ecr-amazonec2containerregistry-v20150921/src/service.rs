@@ -124,13 +124,17 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 ///   'signingProfileArn' … 'The signing profile ARN '<value>' must be well formed''`).
 ///   That is every parameter the request CARRIES — a top-level member, or an element of
 ///   one of its collections, which is one VALUE of that same parameter and is named by it
-///   in the singular — plus an ARN wherever the request carries it, because ECR checks an
-///   ARN's form itself.
-/// * a value the MODEL-DRIVEN walk caught inside a NESTED structure keeps that walk's own
-///   rendering: the dotted path it descended, collection steps included, and the
-///   `@pattern` exactly as the model declares it, anchors and all — `… at
+///   in the singular — plus, wherever the request carries one, an ARN ECR has to RESOLVE
+///   to a resource before the call can do its work, because ECR checks such an ARN's form
+///   itself.
+/// * a value the MODEL-DRIVEN walk caught keeps that walk's own rendering: the dotted
+///   path it descended, collection steps included, and the `@pattern` exactly as the
+///   model declares it, anchors and all — `… at
 ///   'signingConfiguration.rules.1.member.repositoryFilters.1.member.filter' failed to
 ///   satisfy constraint: 'Member must satisfy regular expression pattern: ^(?:[a-z0-9*]+…$'`.
+///   That is every member of a structure NESTED in the request, and also a parameter the
+///   request carries whose value ECR only RECORDS, with nothing of its own to check it
+///   against ([`names_an_iam_principal`]).
 ///
 /// Only a `@pattern` is worded differently by the two: every other constraint is "Member
 /// must …" either way, so only the parameter label can differ for it.
@@ -139,7 +143,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// framework's own clause, which states the same two facts in its own words.
 fn clause(violation: &Violation) -> String {
     let member = member_at_fault(&violation.path);
-    // ECR checks an ARN's form in its own code, wherever the request carries it, and
+    // ECR checks such an ARN's form in its own code, wherever the request carries it, and
     // states the kind of ARN and the value that is not one — so this branch is taken
     // before the position of the member is even looked at.
     if let ViolationKind::Pattern(pattern) = &violation.kind {
@@ -147,7 +151,7 @@ fn clause(violation: &Violation) -> String {
             return stated(&member, &prose);
         }
     }
-    let by_ecr = carried_parameter(&violation.path);
+    let by_ecr = caught_by_ecr(violation);
     let Some(requirement) = requirement(&violation.kind, by_ecr) else {
         return violation.message();
     };
@@ -157,6 +161,22 @@ fn clause(violation: &Violation) -> String {
         ::std::borrow::Cow::Borrowed(violation.path.as_str())
     };
     stated(&parameter, &requirement)
+}
+
+/// Whether ECR'S OWN validation is what caught this value, which is what decides how both
+/// halves of the clause are spelled.
+///
+/// A parameter the request CARRIES ([`carried_parameter`]) is ECR's own to validate —
+/// except when nothing of ECR's checks it: the value of a member the registry only
+/// RECORDS is left to the model's constraint, and that is what the model-driven walk
+/// states.
+fn caught_by_ecr(violation: &Violation) -> bool {
+    if let ViolationKind::Pattern(pattern) = &violation.kind {
+        if names_an_iam_principal(pattern) {
+            return false;
+        }
+    }
+    carried_parameter(&violation.path)
 }
 
 /// The clause itself, the one place its template is written.
@@ -356,26 +376,26 @@ const ARN_MEMBER_SUFFIX: &str = "Arn";
 /// The anchorless opening of a `@pattern` that describes an ARN.
 const ARN_PREFIX: &str = "arn:";
 
-/// The constraint ECR states for an ARN-valued member refused against its `@pattern`:
-/// prose naming the kind of ARN and the value that is not one, rather than the
+/// The constraint ECR states for a member holding an ARN IT RESOLVES, refused against its
+/// `@pattern`: prose naming the kind of ARN and the value that is not one, rather than the
 /// expression.
 ///
-/// ECR does not quote an ARN member's expression back at the caller — it says the ARN is
-/// not well formed: `The signing profile ARN '<value>' must be well formed`. The kind of
-/// ARN comes from the member's own name with its [`ARN_MEMBER_SUFFIX`] removed and its
-/// lowerCamel words separated (`signingProfileArn` -> `signing profile`), so every
-/// ARN-valued member this service models is worded by the one rule and none is written
-/// out here.
+/// For such an ARN ECR does not quote the member's expression back at the caller — it says
+/// the ARN is not well formed: `The signing profile ARN '<value>' must be well formed`.
+/// The kind of ARN comes from the member's own name with its [`ARN_MEMBER_SUFFIX`] removed
+/// and its lowerCamel words separated (`signingProfileArn` -> `signing profile`), so every
+/// such member this service models is worded by the one rule and none is written out here.
 ///
 /// `None` — so the expression itself is stated — when the member is not ARN-valued: its
 /// name does not end in `Arn`, or the expression it failed does not describe an ARN. Also
-/// `None` when the violation carries no value, which a `@pattern` failure always does
-/// (only an absent member has none) but which is not this function's to assume.
+/// `None` for an ARN this registry does not resolve ([`names_an_iam_principal`]), and
+/// when the violation carries no value, which a `@pattern` failure always does (only an
+/// absent member has none) but which is not this function's to assume.
 fn arn_constraint(member: &str, pattern: &str, value: Option<&str>) -> Option<String> {
     let kind = member
         .strip_suffix(ARN_MEMBER_SUFFIX)
         .filter(|kind| !kind.is_empty())?;
-    if !unanchored(pattern).starts_with(ARN_PREFIX) {
+    if !unanchored(pattern).starts_with(ARN_PREFIX) || names_an_iam_principal(pattern) {
         return None;
     }
     let value = value?;
@@ -383,6 +403,40 @@ fn arn_constraint(member: &str, pattern: &str, value: Option<&str>) -> Option<St
         "The {} ARN '{value}' must be well formed",
         in_words(kind)
     ))
+}
+
+/// The namespace an ARN of the identity service carries, as a `@pattern` describing one
+/// spells its service segment.
+const IAM_SERVICE_NAMESPACE: &str = "iam";
+
+/// The resources of that namespace that are PRINCIPALS — the two kinds of identity a
+/// request is made by (`smithy_query(query="shape", shape="PrincipalArn")`, whose
+/// expression admits exactly these). An expression names one as the ALTERNATION the two of
+/// them form, ahead of the resource's own name.
+const IAM_PRINCIPAL_RESOURCE_ALTERNATION: &str = "(role|user)/";
+
+/// Whether `pattern` is the expression of an ARN naming an IAM PRINCIPAL: the identity
+/// service's namespace with a role or a user as the resource.
+///
+/// Such a value is one this registry RECORDS — the pull time update exclusion list is
+/// keyed by it — rather than one an operation has to resolve to a resource before it can
+/// do its work, the way a signing profile is signed with and a secret is read from. ECR
+/// has nothing of its own to check it against, so the model's constraint is what refuses
+/// it and the model-driven walk's wording is what states it.
+///
+/// Keyed on the expression, so it holds for every member targeting that value class
+/// rather than for one operation's member — and on the alternation the expression OPENS
+/// its resource segment with, so a resource whose NAME happens to spell one of the two
+/// kinds is not mistaken for the kind itself. An expression that is not an ARN's, or whose
+/// segments an ARN's six do not account for, is not one of these.
+fn names_an_iam_principal(pattern: &str) -> bool {
+    let segments: Vec<&str> = unanchored(pattern).split(':').collect();
+    // arn : <partition> : <service> : <region> : <account> : <resource>
+    let ["arn", _partition, service, _region, _account, resource] = segments[..] else {
+        return false;
+    };
+    service == IAM_SERVICE_NAMESPACE
+        && resource.starts_with(IAM_PRINCIPAL_RESOURCE_ALTERNATION)
 }
 
 /// A lowerCamel member name as the words it is made of: `signingProfile` -> `signing

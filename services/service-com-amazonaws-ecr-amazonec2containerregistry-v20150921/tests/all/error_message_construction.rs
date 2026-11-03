@@ -11,12 +11,13 @@
 //! 2. a layer-upload diagnostic states what a client needs to recover — the byte the
 //!    upload expects next on a non-contiguous part, and nothing but the verdict on a
 //!    digest that does not match;
-//! 3. a parameter ECR validates ITSELF — one the request carries, and an ARN wherever it
-//!    carries one — is named by its API label (not the validating walk's path to it) and
-//!    its constraint stated in ECR's own words: an expression with no escape a regular
-//!    expression does not need, and prose for an ARN-valued member. (A member the
-//!    model-driven walk caught inside a NESTED structure keeps that walk's path and
-//!    wording; that half of the rule is pinned in `parameter_constraint_clauses.rs`.)
+//! 3. a parameter ECR validates ITSELF — one the request carries, and an ARN it must
+//!    RESOLVE wherever it carries one — is named by its API label (not the validating
+//!    walk's path to it) and its constraint stated in ECR's own words: an expression with
+//!    no escape a regular expression does not need, and prose for such an ARN. (A value
+//!    the model-driven walk caught — a member inside a NESTED structure, or a parameter
+//!    whose value the registry only RECORDS — keeps that walk's path and wording; that
+//!    half of the rule is pinned in `parameter_constraint_clauses.rs`.)
 //! 4. a refusal caused by a per-resource state names the resource that refused.
 //!
 //! Each suite is a TABLE whose rows differ along what its rule generalises over — the
@@ -499,14 +500,15 @@ const WRONG_NAMESPACE_SECRET: &str =
     "arn:aws:secretsmanager:eu-west-1:000000000000:secret:not-the-pull-through-namespace";
 
 /// A parameter ECR validates itself is stated as the MEMBER at fault — never the
-/// validating walk's path to the value — with the constraint in ECR's own words: an
-/// ARN-valued member in prose naming the value, every other `@pattern` as the expression
+/// validating walk's path to the value — with the constraint in ECR's own words: an ARN it
+/// must RESOLVE in prose naming the value, every other `@pattern` as the expression
 /// with no escape a regular expression does not need, and every other constraint
 /// unchanged.
 ///
 /// Every row is such a parameter: one the request CARRIES (a top-level member, or an
-/// element of one of its lists, which is a value of that same parameter) or an ARN-valued
-/// member, which ECR checks the form of wherever the request carries it.
+/// element of one of its lists, which is a value of that same parameter) or an ARN naming
+/// a resource the operation has to reach, which ECR checks the form of wherever the
+/// request carries it.
 ///
 /// The rows differ along what the rule generalises over: which constraint failed
 /// (`@pattern` on a plain string, on an ARN, `@length`, `@required`), where the member
@@ -583,21 +585,6 @@ async fn a_parameter_ecr_validates_itself_is_stated_as_aws_states_it() {
             "signingProfileArn",
             "The signing profile ARN 'arn:aws:iam::000000000000:role/NotASigningProfile' must \
              be well formed"
-                .to_string(),
-        ),
-        (
-            "a principal that is no ARN at all",
-            "RegisterPullTimeUpdateExclusion",
-            json!({"principalArn": "not-an-arn"}),
-            "principalArn",
-            "The principal ARN 'not-an-arn' must be well formed".to_string(),
-        ),
-        (
-            "a principal ARN of a kind the member does not admit",
-            "DeregisterPullTimeUpdateExclusion",
-            json!({"principalArn": "arn:aws:iam::000000000000:group/admins"}),
-            "principalArn",
-            "The principal ARN 'arn:aws:iam::000000000000:group/admins' must be well formed"
                 .to_string(),
         ),
         (

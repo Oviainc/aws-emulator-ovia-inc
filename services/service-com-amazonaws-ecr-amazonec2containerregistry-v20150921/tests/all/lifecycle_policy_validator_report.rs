@@ -9,12 +9,19 @@
 //! newline. The policy format's rules ACROSS members are checked after the schema and
 //! worded by ECR itself, so those refusals quote a plain sentence with no terminator.
 //!
+//! The schema states a RULE as a CHOICE among the alternative forms the format admits one
+//! in, so which part of the schema a value belongs to decides which report it earns: a
+//! member every alternative shares earns the validator's report for the constraint that
+//! failed, and a value that puts the rule outside every alternative earns the choice's own
+//! outcome, which states neither the value nor the set an alternative admits.
+//!
 //! So the tables below span the CLASSES of schema failure — a required member absent, a
 //! number under its minimum, a value outside an enum, an array under its minimum entry
-//! count — over several members, values, JSON types and entry counts, rather than the one
-//! recorded document; and the second table spans the cross-member rules, which must NOT
-//! grow a terminator. A refused document also changes nothing, so the last suite reads
-//! the previously stored policy back after every row.
+//! count, and a rule in none of the alternative forms — over several members, values, JSON
+//! types and entry counts, rather than the one recorded document; and the second table
+//! spans the cross-member rules, which must NOT grow a terminator. A refused document also
+//! changes nothing, so the last suite reads the previously stored policy back after every
+//! row.
 //!
 //! Every case goes through the shared `wire` harness, so it exercises routing,
 //! deserialization, the handler and serialization — the same path a client takes.
@@ -34,6 +41,14 @@ const PARAMETER: &str = "LifecyclePolicyText";
 
 /// What a refusal of the document's validation opens the quoted span with.
 const VALIDATION_PREFIX: &str = "Lifecycle policy validation failure: ";
+
+/// The report the schema produces for a rule in NONE of the alternative forms it admits
+/// one in: the choice's own outcome, which the recorded refusal of an unrecognised
+/// `countType` carries. The count is the number of those forms — one per count type
+/// crossed with one per action type — and the matched count is zero, because the rule is
+/// in none of them.
+const OUTSIDE_EVERY_ALTERNATIVE: &str =
+    "instance failed to match exactly one schema (matched 0 out of 4)";
 
 /// The modelled minimum length of `lifecyclePolicyText` (`@length(min: 100, max: 30720)`
 /// on `LifecyclePolicyText`, per `smithy_query(query="operation",
@@ -189,6 +204,16 @@ fn schema_failures() -> Vec<(&'static str, String, String)> {
                 .to_string(),
         ),
         (
+            // The recorded instance: a count type the format does not define, so the rule
+            // is in none of the alternative forms.
+            "a countType outside the values the format defines",
+            document(json!([rule_with(
+                count_selection("notARealCountType", 5),
+                expire()
+            )])),
+            OUTSIDE_EVERY_ALTERNATIVE.to_string(),
+        ),
+        (
             "a countUnit outside the values the format defines",
             document(json!([rule_with(
                 json!({
@@ -199,7 +224,31 @@ fn schema_failures() -> Vec<(&'static str, String, String)> {
                 }),
                 expire()
             )])),
-            r#"instance value ("hours") not found in enum (possible values: ["days"])"#.to_string(),
+            OUTSIDE_EVERY_ALTERNATIVE.to_string(),
+        ),
+        (
+            "an age count carrying no countUnit at all",
+            document(json!([rule_with(
+                count_selection("sinceImagePushed", 5),
+                expire()
+            )])),
+            OUTSIDE_EVERY_ALTERNATIVE.to_string(),
+        ),
+        (
+            "an action type outside the values the format defines",
+            document(json!([rule_with(
+                count_selection("imageCountMoreThan", 5),
+                json!({ "type": "delete" })
+            )])),
+            OUTSIDE_EVERY_ALTERNATIVE.to_string(),
+        ),
+        (
+            "a transition carrying no targetStorageClass",
+            document(json!([rule_with(
+                count_selection("imageCountMoreThan", 5),
+                json!({ "type": "transition" })
+            )])),
+            OUTSIDE_EVERY_ALTERNATIVE.to_string(),
         ),
         (
             "a rulePriority under the minimum the format declares",
@@ -276,29 +325,6 @@ fn cross_member_failures() -> Vec<(&'static str, String)> {
                     "countNumber": 5,
                 }),
                 expire()
-            )])),
-        ),
-        (
-            "a count of images carrying a countUnit",
-            document(json!([rule_with(
-                json!({
-                    "tagStatus": "any",
-                    "countType": "imageCountMoreThan",
-                    "countUnit": "days",
-                    "countNumber": 5,
-                }),
-                expire()
-            )])),
-        ),
-        (
-            "an expiry naming a targetStorageClass",
-            document(json!([rule_with(
-                json!({
-                    "tagStatus": "any",
-                    "countType": "imageCountMoreThan",
-                    "countNumber": 5,
-                }),
-                json!({ "type": "expire", "targetStorageClass": "ARCHIVE" })
             )])),
         ),
         (

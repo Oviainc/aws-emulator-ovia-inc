@@ -330,7 +330,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // The repository already holds this blob, so there is nothing to register: the
-        // upload is closed either way, because its bytes have been accounted for.
+        // upload is closed either way, because its bytes have been accounted for. The
+        // refusal names the upload by the id the REQUEST addressed it by — see
+        // `crate::state::layer_already_exists_message`.
         if repo.layer_blobs.contains_key(&digest) {
             store.uploads.remove(&input.upload_id);
             return Err(refusal(
@@ -338,11 +340,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &caller_akid,
                 CompleteLayerUploadErrorModeled::LayerAlreadyExistsException(
                     LayerAlreadyExistsException {
-                        message: Some(format!(
-                            "The layer with digest '{digest}' already exists in the \
-                             repository with name '{repository_name}' in the registry with \
-                             id '{}'",
-                            crate::state::registry_id()
+                        message: Some(crate::state::layer_already_exists_message(
+                            &input.upload_id,
+                            &repository_name,
                         )),
                     },
                 ),

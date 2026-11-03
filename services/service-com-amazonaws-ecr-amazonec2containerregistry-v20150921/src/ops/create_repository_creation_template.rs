@@ -255,17 +255,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // "The repository creation template already exists. Specify a unique prefix and
-        // try again." — one template per namespace prefix.
+        // One template per namespace prefix: a create naming a prefix the registry
+        // already holds a template for is refused, worded from the request and the
+        // registry the way the other half of a template's lifecycle is — see
+        // `crate::state::template_already_exists_message`.
         if store.creation_templates.contains_key(&prefix) {
             return Err(
                 CreateRepositoryCreationTemplateErrorModeled::TemplateAlreadyExistsException(
                     TemplateAlreadyExistsException {
-                        message: Some(format!(
-                            "The repository creation template with prefix '{prefix}' already \
-                             exists in the registry with id '{}'",
-                            crate::state::registry_id()
-                        )),
+                        message: Some(crate::state::template_already_exists_message(&prefix)),
                     },
                 )
                 .into(),

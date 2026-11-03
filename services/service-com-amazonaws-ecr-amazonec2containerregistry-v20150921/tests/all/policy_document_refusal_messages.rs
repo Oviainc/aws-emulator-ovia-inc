@@ -66,6 +66,13 @@ fn lifecycle_schema(report: &str) -> String {
     lifecycle_validation(&format!("{report}\n"))
 }
 
+/// The schema's report for a rule in NONE of the alternative forms it admits one in: the
+/// choice's own outcome, which states neither the value the rule gave nor the set an
+/// alternative admits. The count is the number of those forms — one per count type
+/// crossed with one per action type.
+const OUTSIDE_EVERY_ALTERNATIVE: &str =
+    "instance failed to match exactly one schema (matched 0 out of 4)";
+
 /// The modelled minimum length of `lifecyclePolicyText` (`@length(min: 100, max: 30720)`
 /// on `LifecyclePolicyText`, per `smithy_query(query="operation",
 /// operation="PutLifecyclePolicy")`). A shorter document is refused at the BOUNDARY,
@@ -456,7 +463,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 count_selection("sinceImagePushed", 5),
                 expire()
             )])),
-            lifecycle_schema(r#"object has missing required properties (["countUnit"])"#),
+            lifecycle_schema(OUTSIDE_EVERY_ALTERNATIVE),
         ),
         (
             "a rule with no action",
@@ -480,7 +487,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 count_selection("imageCountMoreThan", 5),
                 json!({ "type": "transition" })
             )])),
-            lifecycle_schema(r#"object has missing required properties (["targetStorageClass"])"#),
+            lifecycle_schema(OUTSIDE_EVERY_ALTERNATIVE),
         ),
         // Documents whose member is present and mappable but outside its bound.
         (
@@ -528,14 +535,14 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
             ),
         ),
         (
+            // The recorded instance: a count type the format does not define, so the rule
+            // is in none of the alternative forms the schema admits one in.
             "a countType the format does not define",
             lifecycle_document(json!([rule_with(
                 count_selection("sinceImagePulled", 5),
                 expire()
             )])),
-            lifecycle_schema(
-                r#"instance value ("sinceImagePulled") not found in enum (possible values: ["imageCountMoreThan","sinceImagePushed"])"#,
-            ),
+            lifecycle_schema(OUTSIDE_EVERY_ALTERNATIVE),
         ),
         (
             "a countUnit the format does not define",
@@ -548,9 +555,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 }),
                 expire()
             )])),
-            lifecycle_schema(
-                r#"instance value ("hours") not found in enum (possible values: ["days"])"#,
-            ),
+            lifecycle_schema(OUTSIDE_EVERY_ALTERNATIVE),
         ),
         (
             "an action type the format does not define",
@@ -558,9 +563,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 count_selection("imageCountMoreThan", 5),
                 json!({ "type": "delete" })
             )])),
-            lifecycle_schema(
-                r#"instance value ("delete") not found in enum (possible values: ["expire","transition"])"#,
-            ),
+            lifecycle_schema(OUTSIDE_EVERY_ALTERNATIVE),
         ),
         (
             "a targetStorageClass the format does not define",
@@ -568,9 +571,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 count_selection("imageCountMoreThan", 5),
                 json!({ "type": "transition", "targetStorageClass": "GLACIER" })
             )])),
-            lifecycle_schema(
-                r#"instance value ("GLACIER") not found in enum (possible values: ["ARCHIVE"])"#,
-            ),
+            lifecycle_schema(OUTSIDE_EVERY_ALTERNATIVE),
         ),
         // Documents breaking one of the format's rules ACROSS members.
         (
@@ -631,7 +632,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 }),
                 expire()
             )])),
-            lifecycle_validation("Must not specify countUnit when countType=imageCountMoreThan."),
+            lifecycle_schema(OUTSIDE_EVERY_ALTERNATIVE),
         ),
         (
             "an expiry naming a targetStorageClass",
@@ -639,7 +640,7 @@ fn refused_lifecycle_documents() -> Vec<(&'static str, String, String)> {
                 count_selection("imageCountMoreThan", 5),
                 json!({ "type": "expire", "targetStorageClass": "ARCHIVE" })
             )])),
-            lifecycle_validation("Must not specify targetStorageClass when action type=EXPIRE."),
+            lifecycle_schema(OUTSIDE_EVERY_ALTERNATIVE),
         ),
         (
             "two rules sharing one rulePriority",
