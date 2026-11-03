@@ -397,6 +397,60 @@ pub enum PolicyKind {
     },
 }
 
+impl PolicyKind {
+    /// The `PolicyTypeName` a policy of this kind is of — the base policy type a describe
+    /// reports it under.
+    ///
+    /// A stickiness policy's base type is the service's own (the two stickiness operations
+    /// each create a policy of one predefined type), while a policy created by
+    /// `CreateLoadBalancerPolicy` carries "the name of the base policy type" that create
+    /// named. The `match` is exhaustive, so a new policy kind has to say which type it is
+    /// of rather than being reported under none.
+    pub fn policy_type_name(&self) -> &str {
+        match self {
+            PolicyKind::LbCookieStickiness { .. } => LB_COOKIE_STICKINESS_POLICY_TYPE,
+            PolicyKind::AppCookieStickiness { .. } => APP_COOKIE_STICKINESS_POLICY_TYPE,
+            PolicyKind::Other {
+                policy_type_name, ..
+            } => policy_type_name,
+        }
+    }
+
+    /// The attributes this policy is configured by, as a describe reports them.
+    ///
+    /// A policy is configured by the attributes of its base policy type, so each
+    /// stickiness kind reports the one attribute its create operation takes — named by
+    /// that operation's own input member ([`COOKIE_EXPIRATION_PERIOD_ATTRIBUTE`],
+    /// [`COOKIE_NAME_ATTRIBUTE`]) and carrying the value it was created with — and a
+    /// policy created by `CreateLoadBalancerPolicy` reports the attributes it was created
+    /// with, whole.
+    pub fn attribute_entries(&self) -> Vec<PolicyAttributeEntry> {
+        match self {
+            PolicyKind::LbCookieStickiness {
+                cookie_expiration_period,
+            } => vec![PolicyAttributeEntry {
+                name: COOKIE_EXPIRATION_PERIOD_ATTRIBUTE.to_string(),
+                value: Some(cookie_expiration_period.to_string()),
+            }],
+            PolicyKind::AppCookieStickiness { cookie_name } => vec![PolicyAttributeEntry {
+                name: COOKIE_NAME_ATTRIBUTE.to_string(),
+                value: Some(cookie_name.clone()),
+            }],
+            PolicyKind::Other { attributes, .. } => attributes.clone(),
+        }
+    }
+}
+
+/// The attribute a duration-based stickiness policy is configured by: the period after
+/// which its cookie goes stale, in seconds, named as `CreateLBCookieStickinessPolicy`'s
+/// own input member names it.
+pub const COOKIE_EXPIRATION_PERIOD_ATTRIBUTE: &str = "CookieExpirationPeriod";
+
+/// The attribute an application-controlled stickiness policy is configured by: the
+/// application cookie the sticky session follows, named as
+/// `CreateAppCookieStickinessPolicy`'s own input member names it.
+pub const COOKIE_NAME_ATTRIBUTE: &str = "CookieName";
+
 /// One attribute of a stored policy, as `PolicyAttribute` carries it: "The name of the
 /// attribute" and "The value of the attribute", the value left unreported where the
 /// request named none.
@@ -420,13 +474,91 @@ pub struct PolicyAttributeEntry {
 /// `PolicyTypeName` a plain string with no enum, so nothing has refused a name no policy
 /// type carries by the time a handler runs; [`is_known_policy_type`] is that rule.
 pub const POLICY_TYPE_NAMES: &[&str] = &[
-    "AppCookieStickinessPolicyType",
+    APP_COOKIE_STICKINESS_POLICY_TYPE,
     "BackendServerAuthenticationPolicyType",
-    "LBCookieStickinessPolicyType",
+    LB_COOKIE_STICKINESS_POLICY_TYPE,
     "ProxyProtocolPolicyType",
     "PublicKeyPolicyType",
-    "SSLNegotiationPolicyType",
+    SSL_NEGOTIATION_POLICY_TYPE,
 ];
+
+/// The policy type of the policies `CreateAppCookieStickinessPolicy` creates:
+/// application-controlled session stickiness.
+pub const APP_COOKIE_STICKINESS_POLICY_TYPE: &str = "AppCookieStickinessPolicyType";
+
+/// The policy type of the policies `CreateLBCookieStickinessPolicy` creates:
+/// duration-based session stickiness.
+pub const LB_COOKIE_STICKINESS_POLICY_TYPE: &str = "LBCookieStickinessPolicyType";
+
+/// The policy type of an SSL negotiation configuration — the type the sample policies
+/// ([`SAMPLE_POLICIES`]) are of.
+pub const SSL_NEGOTIATION_POLICY_TYPE: &str = "SSLNegotiationPolicyType";
+
+/// The prefix the name of every sample policy carries, from
+/// `DescribeLoadBalancerPolicies`' own documentation: "The names of the sample policies
+/// have the ELBSample- prefix."
+pub const SAMPLE_POLICY_NAME_PREFIX: &str = "ELBSample-";
+
+/// One sample policy: a policy the SERVICE predefines rather than one a caller created,
+/// which is why it carries no load balancer and lives in a constant rather than in the
+/// store.
+#[derive(Debug)]
+pub struct SamplePolicy {
+    pub name: &'static str,
+    pub policy_type_name: &'static str,
+    /// The attributes the sample's published configuration sets, each as the name and the
+    /// value a describe reports.
+    pub attributes: &'static [(&'static str, &'static str)],
+}
+
+/// The sample policies this service predefines — what `DescribeLoadBalancerPolicies`
+/// describes when the request names no load balancer: "descriptions of the specified
+/// sample policies, or descriptions of all sample policies".
+///
+/// Source: the two SAMPLE SSL negotiation configurations the Classic Load Balancer
+/// documentation publishes beside the predefined security policies — the load balancer's
+/// own default cipher policy and OpenSSL's — both of the SSL negotiation policy type and
+/// both named with the documented [`SAMPLE_POLICY_NAME_PREFIX`].
+///
+/// Each entry carries the SSL PROTOCOL attributes of that policy type, whose values are
+/// what its published configuration enables: the load balancer's default negotiates TLS
+/// only, OpenSSL's default negotiates SSLv3 as well, and neither negotiates SSLv2. The
+/// cipher attributes of those configurations — one per cipher suite the configuration
+/// enables — are deliberately NOT carried here: this set is the protocol half of the
+/// published samples, not the whole of either one, so a reader must not take it for the
+/// complete attribute list AWS reports.
+pub const SAMPLE_POLICIES: &[SamplePolicy] = &[
+    SamplePolicy {
+        name: "ELBSample-ELBDefaultCipherPolicy",
+        policy_type_name: SSL_NEGOTIATION_POLICY_TYPE,
+        attributes: &[
+            ("Protocol-SSLv2", "false"),
+            ("Protocol-SSLv3", "false"),
+            ("Protocol-TLSv1", "true"),
+            ("Protocol-TLSv1.1", "true"),
+            ("Protocol-TLSv1.2", "true"),
+        ],
+    },
+    SamplePolicy {
+        name: "ELBSample-OpenSSLDefaultCipherPolicy",
+        policy_type_name: SSL_NEGOTIATION_POLICY_TYPE,
+        attributes: &[
+            ("Protocol-SSLv2", "false"),
+            ("Protocol-SSLv3", "true"),
+            ("Protocol-TLSv1", "true"),
+            ("Protocol-TLSv1.1", "true"),
+            ("Protocol-TLSv1.2", "true"),
+        ],
+    },
+];
+
+/// The sample policy named `policy_name`, or `None` when no sample policy carries that
+/// name.
+pub fn sample_policy(policy_name: &str) -> Option<&'static SamplePolicy> {
+    SAMPLE_POLICIES
+        .iter()
+        .find(|sample| sample.name == policy_name)
+}
 
 /// Whether `policy_type_name` names one of the policy types this service predefines.
 ///
@@ -489,6 +621,23 @@ pub fn policy_name_rejection(name: &str) -> Result<(), String> {
 /// that refusal the same way.
 pub fn duplicate_policy_name_message(policy_name: &str) -> String {
     format!("Policy Name [{policy_name}] already exists.")
+}
+
+/// How this service states `PolicyNotFoundException` — "One or more of the specified
+/// policies do not exist" — naming the policy the request asked for and, where the
+/// request named a load balancer, the load balancer whose policy set does not hold it.
+///
+/// A policy is a policy OF a load balancer, so which policies exist depends on which load
+/// balancer was asked about: a request naming none asks about the sample policies the
+/// service predefines, and its refusal names the policy alone.
+pub fn policy_not_found_message(policy_name: &str, load_balancer_name: Option<&str>) -> String {
+    match load_balancer_name {
+        Some(load_balancer_name) => format!(
+            "There is no policy with name {policy_name} for load balancer \
+             {load_balancer_name}."
+        ),
+        None => format!("There is no policy with name {policy_name}."),
+    }
 }
 
 /// A load balancer's health-check configuration.

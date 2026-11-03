@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLoadBalancerPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLoadBalancerPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the policies the request asks about — the policies the load
+//! balancer it names HOLDS, or the sample policies this service predefines when it names
+//! none — each projected from what created it. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLoadBalancerPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reporting operation: it answers from the store and from this service's own
+//! predefined sample policies and writes nothing, so a policy reported here is one a
+//! create persisted, and one a delete removed is reported by neither this operation nor
+//! `DescribeLoadBalancers`.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +143,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLoadBalancerPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLoadBalancerPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLoadBalancerPolicies"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation's model declares no server-fault error, and a 501 would
+            // claim "not implemented", so an unreachable store is refused instead.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the Elastic Load Balancing store is unavailable",
+            ));
+        };
+
+        // "The names of the policies": caller-sized, so the list is walked ONCE into a
+        // set, deduplicated. An EMPTY set is what "the request named no policy" means —
+        // the whole set being asked about is described then. Repeating a name is not an
+        // error, so no valid request is refused for it.
+        let requested = input.policy_names.as_deref().unwrap_or_default();
+        let wanted: ::std::collections::BTreeSet<&str> =
+            requested.iter().map(String::as_str).collect();
+
+        // "If you specify a load balancer name, the action returns the descriptions of
+        // all policies created for the load balancer. If you specify a policy name
+        // associated with your load balancer, the action returns the description of that
+        // policy. If you don't specify a load balancer name, the action returns
+        // descriptions of the specified sample policies, or descriptions of all sample
+        // policies."
+        let Some(load_balancer_name) = input.load_balancer_name.as_deref() else {
+            // Every named policy has to BE a sample policy: a sample describe asks about
+            // the set this service predefines, so a name outside it names no policy. The
+            // names are checked in the order the REQUEST carried them, so the refusal
+            // names the first policy the caller asked for that does not exist.
+            for policy_name in requested {
+                if crate::state::sample_policy(policy_name).is_none() {
+                    return Err(
+                        DescribeLoadBalancerPoliciesErrorModeled::PolicyNotFoundException(
+                            PolicyNotFoundException {
+                                message: Some(crate::state::policy_not_found_message(
+                                    policy_name,
+                                    None,
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            return Ok(DescribeLoadBalancerPoliciesOutput {
+                policy_descriptions: Some(
+                    crate::state::SAMPLE_POLICIES
+                        .iter()
+                        .filter(|sample| wanted.is_empty() || wanted.contains(sample.name))
+                        .map(describe_sample)
+                        .collect(),
+                ),
+            });
+        };
+
+        let region = crate::state::region_from_request(ctx.parts());
+        let guard = state.lock();
+        // A load balancer is a regional resource, so the name is resolved in the region
+        // this request is signed for; a name no record holds there is not found.
+        let Some(record) = guard
+            .load_balancers_in(&region)
+            .and_then(|records| records.get(load_balancer_name))
+        else {
+            return Err(
+                DescribeLoadBalancerPoliciesErrorModeled::AccessPointNotFoundException(
+                    AccessPointNotFoundException {
+                        message: Some(format!(
+                            "There is no ACTIVE Load Balancer named '{load_balancer_name}'"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A policy is a policy OF this load balancer, so a named one it does not hold is
+        // not found — which is what "one or more of the specified policies do not exist"
+        // refuses, stated over the first name the REQUEST carried that the load balancer
+        // does not hold.
+        for policy_name in requested {
+            if !record.policies.contains_key(policy_name) {
+                return Err(
+                    DescribeLoadBalancerPoliciesErrorModeled::PolicyNotFoundException(
+                        PolicyNotFoundException {
+                            message: Some(crate::state::policy_not_found_message(
+                                policy_name,
+                                Some(load_balancer_name),
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        Ok(DescribeLoadBalancerPoliciesOutput {
+            policy_descriptions: Some(
+                record
+                    .policies
+                    .values()
+                    .filter(|policy| wanted.is_empty() || wanted.contains(policy.name.as_str()))
+                    .map(describe)
+                    .collect(),
+            ),
+        })
+    }
+}
+
+/// Project one stored policy into the modelled `PolicyDescription`.
+///
+/// The base policy type and the attributes both FOLLOW the stored policy
+/// ([`crate::state::PolicyKind`]), so a policy is reported as whatever created it
+/// configured it: a stickiness policy under the policy type its create operation creates,
+/// carrying that operation's one attribute, and a policy created by
+/// `CreateLoadBalancerPolicy` under the base policy type that request named, carrying the
+/// attributes it was created with. An attribute the create carried no value for is
+/// reported with its name alone rather than an invented value.
+fn describe(policy: &crate::state::PolicyRecord) -> PolicyDescription {
+    PolicyDescription {
+        policy_name: Some(policy.name.clone()),
+        policy_type_name: Some(policy.kind.policy_type_name().to_string()),
+        policy_attribute_descriptions: Some(
+            policy
+                .kind
+                .attribute_entries()
+                .into_iter()
+                .map(|attribute| PolicyAttributeDescription {
+                    attribute_name: Some(attribute.name),
+                    attribute_value: attribute.value,
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// Project one predefined sample policy into the modelled `PolicyDescription`.
+///
+/// A sample policy belongs to no load balancer and nothing a caller does changes it, so
+/// it is reported from this service's own set of them
+/// ([`crate::state::SAMPLE_POLICIES`]) rather than from the store.
+fn describe_sample(sample: &crate::state::SamplePolicy) -> PolicyDescription {
+    PolicyDescription {
+        policy_name: Some(sample.name.to_string()),
+        policy_type_name: Some(sample.policy_type_name.to_string()),
+        policy_attribute_descriptions: Some(
+            sample
+                .attributes
+                .iter()
+                .map(|(name, value)| PolicyAttributeDescription {
+                    attribute_name: Some((*name).to_string()),
+                    attribute_value: Some((*value).to_string()),
+                })
+                .collect(),
+        ),
     }
 }
