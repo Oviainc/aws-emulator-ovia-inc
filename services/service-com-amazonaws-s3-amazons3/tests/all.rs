@@ -107,6 +107,8 @@ mod bucket_website;
 mod bucket_website_delete;
 #[path = "all/checksum_mode_header_case.rs"]
 mod checksum_mode_header_case;
+#[path = "all/cli_download_legs.rs"]
+mod cli_download_legs;
 #[path = "all/directory_bucket_conditional_deletes.rs"]
 mod directory_bucket_conditional_deletes;
 #[path = "all/directory_bucket_sessions_and_appends.rs"]
