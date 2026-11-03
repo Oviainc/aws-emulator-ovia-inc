@@ -97,6 +97,18 @@ pub(crate) fn error_code(body: &Value) -> String {
         .unwrap_or_else(|| format!("<no __type in {body}>"))
 }
 
+/// The error message of a failure body, whichever case the wire member carries.
+///
+/// The one reader every suite in this crate asserts a refusal's wording through, so a
+/// suite does not carry a second copy of it.
+pub(crate) fn message(body: &Value) -> String {
+    body["message"]
+        .as_str()
+        .or(body["Message"].as_str())
+        .unwrap_or_else(|| panic!("no message in {body}"))
+        .to_string()
+}
+
 /// A `Tags` list from a response, as a key -> value map.
 pub(crate) fn tag_map(case: &str, tags: &Value) -> BTreeMap<String, String> {
     let list = tags

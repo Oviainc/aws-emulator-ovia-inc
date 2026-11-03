@@ -159,10 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(product) = state.products.get_mut(&input.id) else {
             return Err(UpdateProductErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "{} does not exist or access was denied",
-                        input.id
-                    )),
+                    message: Some(format!("Product {} not found.", input.id)),
                 },
             )
             .into());

@@ -247,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
                 match found {
                     Some((id, _)) => id.clone(),
-                    None => return Err(not_found(addressed_path.identifier())),
+                    None => return Err(not_found(KIND_LAUNCH_PATH, addressed_path.identifier())),
                 }
             }
             None => match paths.as_slice() {
@@ -285,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .values()
                 .find(|artifact| artifact.name.as_deref() == Some(name)),
         }
-        .ok_or_else(|| not_found(artifact.identifier()))?
+        .ok_or_else(|| not_found(KIND_PROVISIONING_ARTIFACT, artifact.identifier()))?
         .id
         .clone();
 
@@ -462,12 +462,18 @@ fn no_launch_paths(identifier: &str) -> ProvisionProductError {
     .into()
 }
 
-/// This operation's not-found error for an identifier that resolves to nothing this
-/// account holds — the wording every read in this service answers such an identifier
-/// with.
-fn not_found(identifier: &str) -> ProvisionProductError {
+/// This operation's not-found error for an identifier that resolves to nothing: the
+/// message names the KIND of resource the request addressed and the identifier it used,
+/// the shape every not-found in this service reports.
+fn not_found(kind: &str, identifier: &str) -> ProvisionProductError {
     ProvisionProductErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("{identifier} does not exist or access was denied")),
+        message: Some(format!("{kind} not found: {identifier}")),
     })
     .into()
 }
+
+/// The resource kind a launch path is, as its not-found names it.
+const KIND_LAUNCH_PATH: &str = "Launch path";
+
+/// The resource kind a product version is, as its not-found names it.
+const KIND_PROVISIONING_ARTIFACT: &str = "Provisioning artifact";

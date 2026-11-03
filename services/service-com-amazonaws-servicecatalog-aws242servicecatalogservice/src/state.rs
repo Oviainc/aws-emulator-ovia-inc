@@ -361,7 +361,37 @@ pub struct ProvisioningArtifact {
     pub created_time: SystemTime,
     /// The artifact's `Info` template source, as the request gave it.
     pub info: BTreeMap<String, String>,
+    /// The version this one was copied from, for an artifact `CopyProduct` created;
+    /// `None` for one a create minted, which was copied from nothing.
+    pub copied_from: Option<ArtifactCopyLineage>,
 }
+
+/// Where a copied provisioning artifact came from: the product that was copied and the
+/// version of it this one is a copy of.
+///
+/// A copy records its IMMEDIATE source, so copying a copy reports the product it was
+/// copied from rather than the one at the head of the chain.
+#[derive(Debug, Clone)]
+pub struct ArtifactCopyLineage {
+    /// The id of the product this version was copied from.
+    pub source_product_id: String,
+    /// The id that version carries in the product it was copied from.
+    pub source_provisioning_artifact_id: String,
+}
+
+/// The `ProvisioningArtifactMetadata` key carrying the product a copied version was
+/// copied from.
+///
+/// The metadata map is open (`ProvisioningArtifactInfo`, a string -> string map
+/// `smithy_query query="shape" shape="ProvisioningArtifactInfo"`), so the keys a
+/// version carries are the ones the service that created it recorded: a copied version
+/// reports its source product and source version under these two.
+pub const ARTIFACT_METADATA_SOURCE_PRODUCT_ID: &str = "SourceProductId";
+
+/// The `ProvisioningArtifactMetadata` key carrying the version a copied version was
+/// copied from; see [`ARTIFACT_METADATA_SOURCE_PRODUCT_ID`].
+pub const ARTIFACT_METADATA_SOURCE_PROVISIONING_ARTIFACT_ID: &str =
+    "SourceProvisioningArtifactId";
 
 /// The `Guidance` a newly created provisioning artifact carries.
 ///
@@ -395,13 +425,33 @@ impl ProvisioningArtifact {
             name: self.name.clone(),
             description: self.description.clone(),
             created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
-            provisioning_artifact_metadata: Some(
-                self.info
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
-            ),
+            provisioning_artifact_metadata: self.metadata(),
         }
+    }
+
+    /// This version's `ProvisioningArtifactMetadata`: the `Info` template source it was
+    /// created with, plus — for a version a copy created — the source product and source
+    /// version it was copied from, so a reader of a copy can tell what it is a copy of.
+    ///
+    /// `ProvisioningArtifactInfo` holds between 1 and 100 entries, so a version with
+    /// nothing to report carries no map rather than an empty one.
+    fn metadata(&self) -> Option<std::collections::HashMap<String, String>> {
+        let mut metadata: std::collections::HashMap<String, String> = self
+            .info
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        if let Some(lineage) = &self.copied_from {
+            metadata.insert(
+                ARTIFACT_METADATA_SOURCE_PRODUCT_ID.to_string(),
+                lineage.source_product_id.clone(),
+            );
+            metadata.insert(
+                ARTIFACT_METADATA_SOURCE_PROVISIONING_ARTIFACT_ID.to_string(),
+                lineage.source_provisioning_artifact_id.clone(),
+            );
+        }
+        Some(metadata).filter(|metadata| !metadata.is_empty())
     }
 
     /// This record as the modelled `ProvisioningArtifact`, the shorter shape

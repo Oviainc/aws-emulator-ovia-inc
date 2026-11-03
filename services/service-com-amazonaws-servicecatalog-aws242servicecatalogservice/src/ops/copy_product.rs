@@ -281,7 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `Info` names — comes from the source version. Minting the ids only
                 // advances this service's id counter, so the refusals below still leave
                 // both products exactly as they were.
-                let copied = copied_artifacts(&mut state, &selected, now);
+                let copied = copied_artifacts(&mut state, &source.id, &selected, now);
                 // The target is resolved ONCE, mutably: a `TargetProductId` naming no
                 // product this account holds is refused here, and the checks that follow
                 // all run before the first write.
@@ -358,7 +358,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &crate::state::request_region(ctx),
                     &format!("product/{id}"),
                 );
-                let provisioning_artifacts = copied_artifacts(&mut state, &selected, now);
+                let provisioning_artifacts =
+                    copied_artifacts(&mut state, &source.id, &selected, now);
                 let product = crate::state::Product {
                     id: id.clone(),
                     view_id,
@@ -424,12 +425,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The refusal for a product this account cannot read: the one `SourceProductArn`
-/// names, or the one `TargetProductId` does. The message does not tell a product that
-/// does not exist from one the caller has no access to, so a refusal cannot be read as
+/// names, or the one `TargetProductId` does. The message names the kind of resource
+/// that did not resolve and the identifier the request addressed it by, the way this
+/// service reports every product it cannot find; it does not tell a product that does
+/// not exist from one the caller has no access to, so a refusal cannot be read as
 /// "this product exists".
 fn product_not_found(identifier: &str) -> CopyProductError {
     CopyProductErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("{identifier} does not exist or access was denied")),
+        message: Some(format!("Product {identifier} not found.")),
     })
     .into()
 }
@@ -462,8 +465,14 @@ const ARTIFACT_IDENTIFIER_ID: &str = "Id";
 /// `selected` as versions of the product being copied into: each one keeps what the
 /// source version IS and gets a freshly minted artifact id of the target's own and
 /// `created_time` the copy's instant, keyed by that new id.
+///
+/// Each copied version also records WHAT IT IS A COPY OF — `source_product_id` and the
+/// id the version carries in that product — so a reader of the copy can tell its
+/// origin. The lineage recorded is THIS copy's, so copying a copy names the product
+/// this request read rather than the one further back.
 fn copied_artifacts(
     state: &mut crate::state::ComAmazonawsServicecatalogAws242servicecatalogserviceState,
+    source_product_id: &str,
     selected: &[crate::state::ProvisioningArtifact],
     created_time: std::time::SystemTime,
 ) -> std::collections::BTreeMap<String, crate::state::ProvisioningArtifact> {
@@ -475,6 +484,10 @@ fn copied_artifacts(
             crate::state::ProvisioningArtifact {
                 id,
                 created_time,
+                copied_from: Some(crate::state::ArtifactCopyLineage {
+                    source_product_id: source_product_id.to_string(),
+                    source_provisioning_artifact_id: artifact.id.clone(),
+                }),
                 ..artifact.clone()
             },
         );

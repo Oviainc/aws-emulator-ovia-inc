@@ -194,12 +194,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let provisioned = match provisioned {
             Ok(provisioned) => provisioned,
             Err(identifier) => {
+                // The refusal names the KIND of resource that did not resolve and
+                // echoes the identifier the request addressed it by — the one variable
+                // part — rather than a sentence that also asserts an access failure.
                 return Err(
                     DescribeProvisionedProductErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(format!(
-                                "{identifier} does not exist or access was denied"
-                            )),
+                            message: Some(format!("Provisioned product not found: {identifier}")),
                         },
                     )
                     .into(),

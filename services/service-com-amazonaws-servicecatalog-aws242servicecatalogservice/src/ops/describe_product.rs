@@ -188,11 +188,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let product = match product {
             Ok(product) => product,
             Err(identifier) => {
+                // The refusal names the kind of resource that did not resolve and the
+                // identifier the request addressed it by, the way every product lookup
+                // in this service reports one it cannot find. It still does not tell a
+                // product that does not exist from one this view cannot reach.
                 return Err(DescribeProductErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "{identifier} does not exist or access was denied"
-                        )),
+                        message: Some(format!("Product {identifier} not found.")),
                     },
                 )
                 .into())

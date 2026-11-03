@@ -15,6 +15,8 @@
 mod catalog_error_paths;
 #[path = "all/catalog_resource_lifecycle.rs"]
 mod catalog_resource_lifecycle;
+#[path = "all/copy_lineage_and_lookup_messages.rs"]
+mod copy_lineage_and_lookup_messages;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/launch_paths.rs"]

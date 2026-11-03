@@ -312,6 +312,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .unwrap_or_default()
                         .into_iter()
                         .collect(),
+                    // A created version is a copy of nothing, so it carries no copy
+                    // lineage; only `CopyProduct` records one.
+                    copied_from: None,
                 },
             );
         }

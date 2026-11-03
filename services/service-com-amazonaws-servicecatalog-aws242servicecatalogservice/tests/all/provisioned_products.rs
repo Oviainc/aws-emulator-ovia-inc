@@ -27,17 +27,8 @@ use serde_json::{json, Value};
 use crate::harness::{
     associate_product_with_portfolio, call, create_portfolio, create_product,
     create_product_of_type, emulator, error_code, first_provisioning_artifact_id, is_catalog_id,
-    tag_list, tag_map, ACCOUNT_ID, DEFAULT_REGION,
+    message, tag_list, tag_map, ACCOUNT_ID, DEFAULT_REGION,
 };
-
-/// The error message of a failure body, whichever case the wire member carries.
-fn message(body: &Value) -> String {
-    body["message"]
-        .as_str()
-        .or(body["Message"].as_str())
-        .unwrap_or_else(|| panic!("no message in {body}"))
-        .to_string()
-}
 
 /// How a request addresses a resource that takes either an id or a name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

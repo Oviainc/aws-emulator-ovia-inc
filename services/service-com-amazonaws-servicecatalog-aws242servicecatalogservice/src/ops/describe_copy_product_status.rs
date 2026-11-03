@@ -142,12 +142,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The token for the copy product operation. This token is returned by
         // CopyProduct" — so a token this service never minted, or one whose copy record
         // it no longer keeps, names no copy operation to report on.
+        // The refusal names the PARAMETER that did not resolve and echoes the token the
+        // request addressed the copy by, which is the only thing about it that varies.
         let Some(copy) = state.product_copies.get(&input.copy_product_token) else {
             return Err(
                 DescribeCopyProductStatusErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(format!(
-                            "{} does not exist or access was denied",
+                            "Invalid CopyProductToken {}",
                             input.copy_product_token
                         )),
                     },
