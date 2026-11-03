@@ -25,6 +25,8 @@ mod address_member_jurisdictions;
 mod batch_get_tax_exemptions_failed_accounts;
 #[path = "all/batch_put_mixed_row_codes.rs"]
 mod batch_put_mixed_row_codes;
+#[path = "all/batch_refusal_rows.rs"]
+mod batch_refusal_rows;
 #[path = "all/batch_row_error_codes.rs"]
 mod batch_row_error_codes;
 #[path = "all/batch_tax_registration.rs"]
@@ -45,6 +47,8 @@ mod document_destination_location;
 mod document_token_validity;
 #[path = "all/exemption_access_record.rs"]
 mod exemption_access_record;
+#[path = "all/exemption_authority_support.rs"]
+mod exemption_authority_support;
 #[path = "all/exemption_identity_padding.rs"]
 mod exemption_identity_padding;
 #[path = "all/exemption_type_admission.rs"]
@@ -83,6 +87,8 @@ mod shared_trn_settle;
 mod state_roundtrip;
 #[path = "all/supplemental_tax_registrations.rs"]
 mod supplemental_tax_registrations;
+#[path = "all/supplemental_trn_conflict.rs"]
+mod supplemental_trn_conflict;
 #[path = "all/supplemental_trn_spelling_identity.rs"]
 mod supplemental_trn_spelling_identity;
 #[path = "all/tax_exemption_types.rs"]

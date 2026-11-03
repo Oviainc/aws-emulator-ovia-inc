@@ -94,7 +94,10 @@ fn address(country_code: &str, state_or_region: Option<&str>) -> Value {
 /// `country_code`.
 fn entry(registration_type: &str, country_code: &str, state_or_region: Option<&str>) -> Value {
     json!({
-        "registrationId": format!("{registration_type}-0000000001"),
+        "registrationId": crate::fidelity_rules::number_of_type(
+            registration_type,
+            Some(country_code),
+        ),
         "registrationType": registration_type,
         "legalName": "Example Holdings",
         "legalAddress": address(country_code, state_or_region),

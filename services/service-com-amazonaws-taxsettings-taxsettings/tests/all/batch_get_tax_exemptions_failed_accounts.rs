@@ -104,7 +104,7 @@ async fn seeded_emulator() -> MultiServiceRouter {
         &json!({
             "accountId": WITH_REGISTRATION,
             "taxRegistrationEntry": {
-                "registrationId": "DE123456789",
+                "registrationId": "DE136695976",
                 "registrationType": "VAT",
                 "legalName": "Acme GmbH",
                 "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
@@ -132,7 +132,7 @@ async fn an_unreportable_account_fails_on_its_own_row_not_the_whole_call() {
         Row {
             case: "no unreportable account at all",
             named: vec![id(first_exempt), id(second_exempt), id(WITH_REGISTRATION)],
-            reported: vec![id(first_exempt), id(second_exempt)],
+            reported: vec![id(first_exempt), id(second_exempt), id(WITH_REGISTRATION)],
             failed: vec![],
         },
         Row {
@@ -169,7 +169,7 @@ async fn an_unreportable_account_fails_on_its_own_row_not_the_whole_call() {
                 id(u4),
                 id(second_exempt),
             ],
-            reported: vec![id(first_exempt), id(second_exempt)],
+            reported: vec![id(first_exempt), id(second_exempt), id(WITH_REGISTRATION)],
             failed: vec![id(u1), id(u4)],
         },
         Row {
@@ -189,13 +189,13 @@ async fn an_unreportable_account_fails_on_its_own_row_not_the_whole_call() {
         Row {
             case: "an unreportable account beside the caller's own, which holds no exemption",
             named: vec![own_account(), id(u2)],
-            reported: vec![],
+            reported: vec![own_account()],
             failed: vec![id(u2)],
         },
         Row {
             case: "an unreportable account beside one holding only a registration",
             named: vec![id(WITH_REGISTRATION), id(u3)],
-            reported: vec![],
+            reported: vec![id(WITH_REGISTRATION)],
             failed: vec![id(u3)],
         },
     ];
@@ -230,20 +230,31 @@ async fn an_unreportable_account_fails_on_its_own_row_not_the_whole_call() {
             answer.body
         );
 
-        // Each account the map carries carries its own records, so a partial
-        // answer is a real one rather than an empty placeholder.
+        // Each account the map carries carries its own details — the inheritance
+        // indicator every reported account has, and the exemptions of the
+        // accounts that hold some — so a partial answer is a real one rather than
+        // an empty placeholder.
         for account_id in &expected {
-            let exemptions = answer
+            let details = answer
                 .get("taxExemptionDetailsMap")
                 .get(account_id)
-                .and_then(|details| details.get("taxExemptions"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            assert_eq!(
+                details.get("heritageObtainedDetails"),
+                Some(&json!(false)),
+                "case {case:?} ({account_id}): expected the inheritance indicator, got {details}"
+            );
+            let exemptions = details
+                .get("taxExemptions")
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            assert!(
+            assert_eq!(
                 !exemptions.is_empty(),
-                "case {case:?} ({account_id}): expected the account's exemptions, got {:?}",
-                answer.body
+                WITH_EXEMPTION.contains(&account_id.as_str()),
+                "case {case:?} ({account_id}): expected the exemptions this service holds for it, \
+                 got {details}"
             );
         }
     }
@@ -283,12 +294,18 @@ async fn a_failed_account_is_not_recorded_by_being_read() {
         .map(|map| map.keys().cloned().collect())
         .unwrap_or_default();
     listed_accounts.sort();
-    let mut expected: Vec<String> = WITH_EXEMPTION.iter().map(|account| id(account)).collect();
+    let mut expected: Vec<String> = WITH_EXEMPTION
+        .iter()
+        .map(|account| id(account))
+        .chain(std::iter::once(id(WITH_REGISTRATION)))
+        .chain(std::iter::once(own_account()))
+        .collect();
     expected.sort();
+    expected.dedup();
     assert_eq!(
         listed_accounts, expected,
-        "case \"the listing after the reads\": expected only the written accounts {expected:?}, \
-         got {:?}",
+        "case \"the listing after the reads\": expected the accounts this service answers for \
+         {expected:?}, got {:?}",
         listed.body
     );
 }

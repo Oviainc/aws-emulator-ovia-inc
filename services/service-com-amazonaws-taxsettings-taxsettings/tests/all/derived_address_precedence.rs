@@ -91,8 +91,11 @@ fn address_forms(country_code: &str) -> Vec<(&'static str, Value)> {
 
 /// An entry of `registration_type`, carrying `legal_address` when there is one.
 fn entry_of(registration_type: &str, legal_address: Option<&Value>) -> Value {
+    let country_code = legal_address
+        .and_then(|address| address.get("countryCode"))
+        .and_then(Value::as_str);
     let mut entry = json!({
-        "registrationId": format!("{registration_type}-0000000001"),
+        "registrationId": crate::fidelity_rules::number_of_type(registration_type, country_code),
         "registrationType": registration_type,
         "legalName": "Example Holdings",
     });

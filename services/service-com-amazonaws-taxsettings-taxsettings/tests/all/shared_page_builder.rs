@@ -106,6 +106,9 @@ impl Listing {
                 seed_exemptions(engine, count);
             }
             Self::SupplementalTaxRegistrations => {
+                // A supplemental registration supplements the account's own, so
+                // the account holds a settled registration before these writes.
+                crate::supplemental_tax_registrations::hold_a_settled_own_registration(engine);
                 for index in 1..=count {
                     // A distinct TRN per record, so each is stored under its own
                     // minted `authorityId` instead of updating one record.

@@ -33,15 +33,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_taxsettings_taxsettings::ops::types::{Address, TaxRegistrationEntry};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    ComAmazonawsTaxsettingsTaxsettingsState, ERROR_CODE_FIELD_VALIDATION_FAILED,
-    ERROR_CODE_INVALID_TOKEN, ERROR_CODE_MALFORMED_TOKEN, STATUS_PENDING, STATUS_VERIFIED,
-    SUPPLEMENTAL_COUNTRY_NOT_SUPPORTED,
-    SUPPLEMENTAL_TAX_REGISTRATIONS_PAGE_BOUNDS, SUPPLEMENTAL_TRN_COUNTRIES,
+    ComAmazonawsTaxsettingsTaxsettingsState, StoredTaxRegistration,
+    ERROR_CODE_FIELD_VALIDATION_FAILED, ERROR_CODE_INVALID_TOKEN, ERROR_CODE_MALFORMED_TOKEN,
+    STATUS_PENDING, STATUS_VERIFIED, SUPPLEMENTAL_COUNTRY_NOT_SUPPORTED,
+    SUPPLEMENTAL_TAX_REGISTRATIONS_PAGE_BOUNDS, SUPPLEMENTAL_TRN_COUNTRIES, TRN_VALIDATION_DELAY,
 };
 
 use crate::declared_member_defaults::address_as_stored;
-use crate::tax_registration_lifecycle::{call, emulator, emulator_with_engine, Answer};
+use crate::tax_registration_lifecycle::{call, emulator_with_engine, Answer};
 
 /// Hold every stored supplemental TRN's validation open, so a listing reports
 /// the status the write reported however long the test takes to get there.
@@ -62,6 +63,49 @@ pub(crate) fn make_supplemental_validations_due(engine: &Arc<engine::InMemoryEng
     for stored in store.supplemental_registrations.values_mut() {
         stored.validation_due_at = Some(Instant::now());
     }
+}
+
+/// Make the presented account hold a tax registration of its own whose
+/// validation has already run — the account state a supplemental registration
+/// SUPPLEMENTS
+/// (`state::ComAmazonawsTaxsettingsTaxsettingsState::store_supplemental_registration`).
+///
+/// Seeded through the same store the handlers read rather than over the wire,
+/// because what every case below is about is the supplemental write, not the
+/// primary one; the account-state conflict itself is pinned in
+/// `tests/all/supplemental_trn_conflict.rs`.
+pub(crate) fn hold_a_settled_own_registration(engine: &Arc<engine::InMemoryEngine>) {
+    let state = engine.state::<ComAmazonawsTaxsettingsTaxsettingsState>();
+    let mut store = state.lock();
+    let account_id = engine::emulator_account_id();
+    let entry = TaxRegistrationEntry {
+        registration_id: "DE136695976".to_string(),
+        registration_type: "VAT".to_string(),
+        legal_name: Some("Acme GmbH".to_string()),
+        legal_address: Some(Address {
+            postal_code: "10117".to_string(),
+            country_code: "DE".to_string(),
+            ..Address::default()
+        }),
+        ..TaxRegistrationEntry::default()
+    };
+    store.registrations.insert(
+        account_id.to_string(),
+        StoredTaxRegistration::from_entry(&entry, account_id, 1, Instant::now()),
+    );
+    // What the clock owed on that write is settled, so the account's own TRN is
+    // not an outstanding one.
+    store.settle_due(Instant::now() + TRN_VALIDATION_DELAY);
+}
+
+/// An emulator whose presented account already holds that settled registration.
+pub(crate) fn emulator_supplementing() -> (
+    smithy_server_runtime::MultiServiceRouter,
+    Arc<engine::InMemoryEngine>,
+) {
+    let (router, engine) = emulator_with_engine();
+    hold_a_settled_own_registration(&engine);
+    (router, engine)
 }
 
 /// A supplemental entry for `country_code` registering `registration_id`.
@@ -206,7 +250,7 @@ async fn only_a_supported_jurisdiction_can_hold_a_supplemental_registration() {
     for (country_code, country) in SUPPLEMENTAL_TRN_COUNTRIES {
         for spelling in [country_code.to_uppercase(), country_code.to_lowercase()] {
             let case = format!("{country} as {spelling:?}");
-            let (router, _engine) = emulator_with_engine();
+            let (router, _engine) = emulator_supplementing();
             let answer = put(&router, &entry_for(&spelling, "CHE123456789", "Acme AG")).await;
             assert_eq!(
                 answer.status, 200,
@@ -270,7 +314,7 @@ async fn only_a_supported_jurisdiction_can_hold_a_supplemental_registration() {
         {
             continue;
         }
-        let (router, _engine) = emulator_with_engine();
+        let (router, _engine) = emulator_supplementing();
         let answer = put(
             &router,
             &entry_for(country_code, "XX12345678901", "Acme Overseas"),
@@ -340,7 +384,7 @@ async fn a_country_code_outside_its_modelled_constraint_is_refused_too() {
         ("the required member omitted", None),
     ];
     for (case, country_code) in &cases {
-        let router = emulator();
+        let (router, _engine) = emulator_supplementing();
         let mut entry = entry_for("CH", "CHE123456789", "Acme AG");
         let address = entry
             .get_mut("address")
@@ -423,7 +467,7 @@ pub(crate) async fn list_all(
 /// reports exactly the stored set.
 #[tokio::test]
 async fn a_stored_supplemental_trn_reads_back_through_the_listing() {
-    let (router, engine) = emulator_with_engine();
+    let (router, engine) = emulator_supplementing();
     let cases = round_trip_cases();
     let mut authority_ids: Vec<String> = Vec::new();
 
@@ -565,7 +609,7 @@ async fn rewriting_a_supplemental_trn_updates_it_under_the_same_authority_id() {
     ];
 
     for (case, second, same_record) in rewrites {
-        let (router, engine) = emulator_with_engine();
+        let (router, engine) = emulator_supplementing();
         let stored = put(&router, &first).await;
         assert_eq!(
             stored.status, 200,
@@ -577,6 +621,13 @@ async fn rewriting_a_supplemental_trn_updates_it_under_the_same_authority_id() {
             .as_str()
             .unwrap_or_default()
             .to_string();
+
+        // A write aimed at a record whose own validation is still outstanding
+        // conflicts with the current state of that record (pinned in
+        // `tests/all/supplemental_trn_conflict.rs`), so let the clock settle what
+        // it owed before the second write: what this table is about is which
+        // record the second write addresses.
+        make_supplemental_validations_due(&engine);
 
         let rewritten = put(&router, second).await;
         assert_eq!(
@@ -700,7 +751,7 @@ async fn paging_emits_every_supplemental_registration_exactly_once_in_order() {
     ];
     for (count, page_size) in shapes.iter().copied() {
         let case = format!("{count} supplemental registrations, page size {page_size:?}");
-        let router = emulator();
+        let (router, _engine) = emulator_supplementing();
         let expected = seed(&router, count).await;
 
         let mut seen: Vec<String> = Vec::new();
@@ -782,7 +833,7 @@ async fn paging_emits_every_supplemental_registration_exactly_once_in_order() {
 /// clock had already made due, which was owed whether or not anybody called.
 #[tokio::test]
 async fn listing_does_not_change_what_a_later_caller_sees() {
-    let (router, engine) = emulator_with_engine();
+    let (router, engine) = emulator_supplementing();
     seed(&router, 3).await;
     hold_supplemental_validations_open(&engine);
 
@@ -872,7 +923,7 @@ async fn requests_outside_the_model_are_refused() {
     ];
 
     for (case, body, status, error_code) in listings {
-        let router = emulator();
+        let (router, _engine) = emulator_supplementing();
         seed(&router, 2).await;
         let answer = call(&router, "ListSupplementalTaxRegistrations", body).await;
         assert_eq!(
@@ -961,7 +1012,7 @@ async fn requests_outside_the_model_are_refused() {
     ];
 
     for (case, member, value, status, error_code) in writes {
-        let router = emulator();
+        let (router, _engine) = emulator_supplementing();
         let mut entry = valid.clone();
         entry
             .as_object_mut()
@@ -1020,7 +1071,7 @@ async fn deleting_by_an_authority_that_names_nothing_is_refused() {
         ("punctuation", "../../etc/passwd".to_string()),
     ];
     for (case, authority_id) in &unknown {
-        let (router, _engine) = emulator_with_engine();
+        let (router, _engine) = emulator_supplementing();
         // An account holding a registration still refuses an authority that is
         // not that registration's.
         let stored = put(&router, &entry_for(supported, "CHE400000001", "Acme AG")).await;
@@ -1053,7 +1104,7 @@ async fn deleting_by_an_authority_that_names_nothing_is_refused() {
     }
 
     // The live authority deletes, and deleting it again is refused the same way.
-    let (router, _engine) = emulator_with_engine();
+    let (router, _engine) = emulator_supplementing();
     let stored = put(&router, &entry_for(supported, "CHE400000002", "Acme AG")).await;
     let authority_id = stored
         .get("authorityId")
@@ -1095,7 +1146,7 @@ async fn concurrent_deletes_of_one_authority_agree() {
     let supported = SUPPLEMENTAL_TRN_COUNTRIES[0].0;
 
     // An authority that names nothing: every caller is refused.
-    let (router, _engine) = emulator_with_engine();
+    let (router, _engine) = emulator_supplementing();
     let body = json!({ "authorityId": "no-such-authority-concurrent" });
     let mut codes = Vec::new();
     for answer in eight_deletes(&router, &body).await {
@@ -1110,7 +1161,7 @@ async fn concurrent_deletes_of_one_authority_agree() {
 
     // A live authority: exactly one caller deletes it, the rest are refused, and
     // the registration is gone.
-    let (router, _engine) = emulator_with_engine();
+    let (router, _engine) = emulator_supplementing();
     let stored = put(&router, &entry_for(supported, "CHE500000001", "Acme AG")).await;
     let authority_id = stored
         .get("authorityId")
@@ -1159,7 +1210,7 @@ async fn an_entry_missing_a_required_member_is_refused() {
     // (`smithy_query(query="shape", shape="SupplementalTaxRegistrationEntry")`),
     // plus each @required member of the `Address` it carries.
     for member in ["registrationId", "registrationType", "legalName", "address"] {
-        let router = emulator();
+        let (router, _engine) = emulator_supplementing();
         let mut entry = valid.clone();
         entry
             .as_object_mut()
@@ -1180,7 +1231,7 @@ async fn an_entry_missing_a_required_member_is_refused() {
     }
 
     for member in ["postalCode", "countryCode"] {
-        let router = emulator();
+        let (router, _engine) = emulator_supplementing();
         let mut entry = valid.clone();
         entry["address"]
             .as_object_mut()

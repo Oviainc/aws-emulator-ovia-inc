@@ -161,7 +161,7 @@ fn address_rows() -> Vec<(&'static str, Value)> {
 /// A `TaxRegistrationEntry` carrying `address` as its legal address.
 fn entry_with(address: &Value) -> Value {
     json!({
-        "registrationId": "VAT-0000000001",
+        "registrationId": "DE136695976",
         "registrationType": "VAT",
         "legalName": "Acme Holdings",
         "legalAddress": address,
@@ -309,7 +309,7 @@ async fn every_write_path_that_takes_an_address_materialises_the_same_defaults()
     // that country code: what varies is still which defaulted member the address
     // carries.
     for (case, address) in address_rows() {
-        let router = emulator();
+        let (router, _engine) = crate::supplemental_tax_registrations::emulator_supplementing();
         let mut address = address;
         address
             .as_object_mut()

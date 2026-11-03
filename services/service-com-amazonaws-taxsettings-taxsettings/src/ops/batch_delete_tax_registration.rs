@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let code = refusal.row_error_code();
                 errors.push(BatchDeleteTaxRegistrationError2 {
                     account_id: account_id.to_string(),
-                    message: refusal.into_message(),
+                    message: refusal.into_row_message(),
                     code,
                 });
             }

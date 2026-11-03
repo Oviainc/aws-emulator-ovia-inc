@@ -203,6 +203,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_address("taxRegistrationEntry.address", &entry.address)
             .map_err(PutSupplementalTaxRegistrationErrorModeled::ValidationException)?;
 
+        // The submitted NUMBER, judged by the same one judgement every write of a
+        // tax registration of this service makes: a number its jurisdiction's
+        // authority does not issue is refused rather than stored.
+        crate::state::check_supplemental_registration_number(entry).map_err(|refusal| {
+            PutSupplementalTaxRegistrationErrorModeled::ValidationException(
+                refusal.into_validation(),
+            )
+        })?;
+
         // The record itself is written by the one state method that stores a
         // supplemental TRN, which owns the whole write decision — the TRN the
         // entry names is the record's identity, so a write of one the account

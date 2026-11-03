@@ -380,7 +380,8 @@ async fn an_address_that_carries_no_restricted_member_is_stored_in_every_jurisdi
 async fn the_supplemental_write_path_judges_an_address_by_the_same_rule() {
     for (country_code, _) in SUPPLEMENTAL_TRN_COUNTRIES {
         for rule in ADDRESS_MEMBER_JURISDICTIONS {
-            let router = emulator();
+            let (router, _engine) =
+                crate::supplemental_tax_registrations::emulator_supplementing();
             let supplemental = |member: Option<(&str, &str)>| {
                 json!({
                     "registrationId": "CHE-123.456.789",

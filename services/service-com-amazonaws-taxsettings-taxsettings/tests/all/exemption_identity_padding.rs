@@ -210,7 +210,7 @@ fn first_tokens() -> Vec<(String, String)> {
 #[tokio::test]
 async fn padding_and_case_in_the_type_make_no_second_exemption() {
     let account = "000000000031";
-    let jurisdiction = json!({ "country": "US", "state": "Ohio" });
+    let jurisdiction = json!({ "country": "US", "state": "OH" });
     for (token_case, token) in first_tokens() {
         for (spelling, resubmitted) in restatements(&token) {
             let case = format!("{token_case}, resubmitted {spelling}");
@@ -283,7 +283,7 @@ async fn a_difference_the_identity_keeps_adds_a_record() {
     let account = "000000000032";
     let token = "Exemption certificate on file";
     let country_only = json!({ "country": "US" });
-    let with_state = json!({ "country": "US", "state": "Ohio" });
+    let with_state = json!({ "country": "US", "state": "OH" });
     let rows = vec![
         Distinct {
             case: "an extra space inside the token",

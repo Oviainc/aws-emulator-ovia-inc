@@ -1007,7 +1007,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "Germany, a country with no documented requirement",
             entry: json!({
-                "registrationId": "DE123456789",
+                "registrationId": "DE136695976",
                 "registrationType": "VAT",
                 "legalName": "Acme GmbH",
                 "legalAddress": { "postalCode": "10115", "countryCode": "DE" },

@@ -57,7 +57,7 @@ use service_com_amazonaws_taxsettings_taxsettings::state::{
     ERROR_CODE_FIELD_VALIDATION_FAILED, SUPPLEMENTAL_TRN_COUNTRIES,
 };
 
-use crate::supplemental_tax_registrations::{entry_for, list_all, put};
+use crate::supplemental_tax_registrations::{emulator_supplementing, entry_for, list_all, put};
 use crate::tax_registration_lifecycle::{call, emulator, Answer};
 
 /// Assert one answer is the refusal an `authorityId` that names no live
@@ -139,7 +139,7 @@ async fn an_authority_that_names_nothing_is_refused_the_same_way() {
         // live registration under a DIFFERENT authority.
         for stored_registrations in [0_usize, 1] {
             let case = format!("{shape} against {stored_registrations} stored");
-            let router = emulator();
+            let (router, _engine) = emulator_supplementing();
             if stored_registrations == 1 {
                 let stored = put(&router, &entry_for(supported, "CHE400000001", "Acme AG")).await;
                 assert_eq!(
@@ -224,7 +224,7 @@ async fn an_authority_stops_naming_a_registration_once_it_is_deleted() {
     // One registration per supported jurisdiction, each deleted and then
     // deleted twice more: the rule is about the id's lifetime, not about one
     // recorded id.
-    let router = emulator();
+    let (router, _engine) = emulator_supplementing();
     let mut authority_ids = Vec::new();
     for (index, (country_code, _)) in SUPPLEMENTAL_TRN_COUNTRIES.iter().enumerate() {
         let stored = put(

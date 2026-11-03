@@ -280,11 +280,17 @@ async fn a_submission_is_persisted_for_every_published_type_and_read_by_another_
         (200, ""),
         "case \"listing through another mount\": expected 200, got {listed:?}"
     );
+    // Every account this service reports exemptions for is in the listing, which
+    // is every account a submission named plus the caller's own — the account the
+    // emulator presents, which is in the family whether or not it holds an
+    // exemption.
     let mut expected_accounts: Vec<String> = expectations
         .iter()
         .map(|expectation| expectation.account.clone())
+        .chain(std::iter::once(engine::emulator_account_id().to_string()))
         .collect();
     expected_accounts.sort();
+    expected_accounts.dedup();
     assert_eq!(
         reported_accounts(&listed),
         expected_accounts,

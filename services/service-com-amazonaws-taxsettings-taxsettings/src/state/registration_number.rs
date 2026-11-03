@@ -1,21 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Whether a submitted tax registration number satisfies the structure its
-//! jurisdiction publishes for it.
+//! Whether a submitted tax registration number is one its jurisdiction's
+//! authority issues, in the two senses the API answers separately.
 //!
-//! This is what validating a TRN can establish without the tax authority's
-//! register: the authority publishes how a number of that kind is built — its
-//! length, its character layout and, for many of them, a check digit computed
-//! from the rest of the number — and a submitted number that does not satisfy
-//! that published structure is not a number the authority ever issued. It is the
-//! one question about the number itself that has an answer here, so it is the
-//! question [`super::trn_validation_status`] asks when the validation a write
-//! started falls due.
+//! The authority publishes how a number of that kind is WRITTEN — its length and
+//! its character layout, the prefix it is printed with — and, for many of them,
+//! how a number of that kind is CONFIRMED: a check digit computed from the rest
+//! of it. The two are different questions for a caller:
+//!
+//! * a value that is not even written the way such a number is written is not a
+//!   registration number of that type at all, which the API can say as it reads
+//!   the request — so the write refuses it ([`satisfies_published_layout`],
+//!   `super::check_registration_number`);
+//! * a value written the right way whose check digit the authority's rule does
+//!   not confirm is a well-formed number the register does not know, which is
+//!   what validating the submitted TRN establishes — so the write stores it and
+//!   the validation that follows reaches its own outcome
+//!   ([`confirmed_by_its_authority`], [`super::trn_validation_status`]).
 //!
 //! A jurisdiction and registration type this module publishes NO structure for
-//! is not judged: there is nothing to contradict the submitted number with, so
-//! the validation finds no fault. Adding a jurisdiction is adding a row to
-//! [`PUBLISHED_STRUCTURES`]; nothing else changes.
+//! is not judged at all: there is nothing to contradict the submitted number
+//! with, so the write admits it and its validation finds no fault. Adding a
+//! jurisdiction is adding a row to [`PUBLISHED_STRUCTURES`]; nothing else
+//! changes.
 
 /// The structure one jurisdiction publishes for one registration type.
 ///
@@ -34,8 +41,15 @@ struct PublishedStructure {
     /// none.
     prefix: &'static str,
     /// Whether `number` — normalised by [`normalised`] and with [`Self::prefix`]
-    /// removed — satisfies the structure.
-    satisfied: fn(&str) -> bool,
+    /// removed — is WRITTEN the way the authority writes such a number: its
+    /// length and its character layout, which is what a request can be judged on
+    /// as it is read.
+    layout: fn(&str) -> bool,
+    /// Whether the same number is CONFIRMED by the rule the authority publishes
+    /// for it — its check digit, computed from the rest of the number. `None`
+    /// where the authority publishes no such rule, which leaves a number of the
+    /// published layout contradicted by nothing this service holds.
+    confirmed: Option<fn(&str) -> bool>,
 }
 
 /// Every tax registration number structure this service holds, one row per
@@ -52,7 +66,8 @@ const PUBLISHED_STRUCTURES: &[PublishedStructure] = &[
         country_code: "DE",
         registration_type: "VAT",
         prefix: "DE",
-        satisfied: german_vat_number,
+        layout: nine_digits,
+        confirmed: Some(german_vat_number),
     },
     // France, numéro de TVA intracommunautaire (Direction générale des Finances
     // publiques): the country prefix `FR`, a two-digit key and the nine-digit
@@ -61,7 +76,8 @@ const PUBLISHED_STRUCTURES: &[PublishedStructure] = &[
         country_code: "FR",
         registration_type: "VAT",
         prefix: "FR",
-        satisfied: french_vat_number,
+        layout: eleven_digits,
+        confirmed: Some(french_vat_number),
     },
     // Brazil, Cadastro Nacional da Pessoa Jurídica (Receita Federal): fourteen
     // digits, the last two check digits over the twelve before them.
@@ -69,7 +85,8 @@ const PUBLISHED_STRUCTURES: &[PublishedStructure] = &[
         country_code: "BR",
         registration_type: "CNPJ",
         prefix: "",
-        satisfied: brazilian_cnpj_number,
+        layout: fourteen_digits,
+        confirmed: Some(brazilian_cnpj_number),
     },
     // Brazil, Cadastro de Pessoas Físicas (Receita Federal): eleven digits, the
     // last two check digits over the nine before them.
@@ -77,7 +94,8 @@ const PUBLISHED_STRUCTURES: &[PublishedStructure] = &[
         country_code: "BR",
         registration_type: "CPF",
         prefix: "",
-        satisfied: brazilian_cpf_number,
+        layout: eleven_digits,
+        confirmed: Some(brazilian_cpf_number),
     },
     // India, Permanent Account Number (Income Tax Department): ten characters —
     // five letters, four digits and a letter — and no published check digit.
@@ -85,7 +103,8 @@ const PUBLISHED_STRUCTURES: &[PublishedStructure] = &[
         country_code: "IN",
         registration_type: "PAN",
         prefix: "",
-        satisfied: indian_permanent_account_number,
+        layout: indian_permanent_account_number,
+        confirmed: None,
     },
     // India, Goods and Services Tax Identification Number (Goods and Services
     // Tax Network): fifteen characters — a two-digit state code, the holder's
@@ -95,7 +114,8 @@ const PUBLISHED_STRUCTURES: &[PublishedStructure] = &[
         country_code: "IN",
         registration_type: "GST",
         prefix: "",
-        satisfied: indian_gst_number,
+        layout: indian_gst_number,
+        confirmed: None,
     },
     // Kenya, Personal Identification Number (Kenya Revenue Authority): eleven
     // characters — the taxpayer-class letter `A` or `P`, nine digits and a
@@ -104,19 +124,56 @@ const PUBLISHED_STRUCTURES: &[PublishedStructure] = &[
         country_code: "KE",
         registration_type: "TIN",
         prefix: "",
-        satisfied: kenyan_pin_number,
+        layout: kenyan_pin_number,
+        confirmed: None,
     },
 ];
 
-/// Whether the number of a registration of this type, held in this jurisdiction,
-/// satisfies the structure that jurisdiction publishes for it.
+/// Whether the number of a registration of this type, held in this
+/// jurisdiction, is WRITTEN the way that jurisdiction's authority writes one.
 ///
 /// True for a jurisdiction and type [`PUBLISHED_STRUCTURES`] holds no row for:
-/// the submitted number is then contradicted by nothing this service holds.
-pub fn satisfies_published_structure(
+/// the submitted number is then judged by no published layout. This is the
+/// question the WRITE answers — see the module header.
+pub fn satisfies_published_layout(
     country_code: &str,
     registration_type: &str,
     registration_id: &str,
+) -> bool {
+    judge(country_code, registration_type, registration_id, |structure, number| {
+        (structure.layout)(number)
+    })
+}
+
+/// Whether the same number is CONFIRMED by the rule its jurisdiction's
+/// authority publishes for it — the question the VALIDATION a write starts
+/// answers, see the module header.
+///
+/// True where the authority publishes no such rule, and true for a jurisdiction
+/// and type [`PUBLISHED_STRUCTURES`] holds no row for: in neither case does this
+/// service hold anything that contradicts the number. A number the write
+/// admitted satisfies the published layout, so this is the only question the
+/// validation has left.
+pub fn confirmed_by_its_authority(
+    country_code: &str,
+    registration_type: &str,
+    registration_id: &str,
+) -> bool {
+    judge(country_code, registration_type, registration_id, |structure, number| {
+        structure
+            .confirmed
+            .is_none_or(|confirmed| confirmed(number))
+    })
+}
+
+/// Apply `question` to the structure this jurisdiction and type publish, with
+/// the submitted number normalised and its published prefix removed — the form
+/// every row above is stated in.
+fn judge(
+    country_code: &str,
+    registration_type: &str,
+    registration_id: &str,
+    question: impl Fn(&PublishedStructure, &str) -> bool,
 ) -> bool {
     let Some(structure) = PUBLISHED_STRUCTURES.iter().find(|structure| {
         structure.country_code.eq_ignore_ascii_case(country_code)
@@ -128,7 +185,7 @@ pub fn satisfies_published_structure(
     let number = normalised
         .strip_prefix(structure.prefix)
         .unwrap_or(&normalised);
-    (structure.satisfied)(number)
+    question(structure, number)
 }
 
 /// The submitted number with the separators a holder writes it with removed and
@@ -172,6 +229,21 @@ fn matches_layout(number: &str, layout: &str) -> bool {
             '*' => character.is_ascii_uppercase() || character.is_ascii_digit(),
             literal => character == literal,
         })
+}
+
+/// Germany's VAT identification number as it is written: nine digits.
+fn nine_digits(number: &str) -> bool {
+    matches_layout(number, "999999999")
+}
+
+/// France's VAT number and Brazil's CPF as they are written: eleven digits.
+fn eleven_digits(number: &str) -> bool {
+    matches_layout(number, "99999999999")
+}
+
+/// Brazil's CNPJ as it is written: fourteen digits.
+fn fourteen_digits(number: &str) -> bool {
+    matches_layout(number, "99999999999999")
 }
 
 /// The check digit ISO 7064 MOD 11,10 publishes for `body`, the digits before
@@ -234,8 +306,8 @@ fn all_one_digit(body: &[u32]) -> bool {
         .is_some_and(|first| body.iter().all(|digit| digit == first))
 }
 
-/// Germany's VAT identification number: nine digits closed by an ISO 7064 MOD
-/// 11,10 check digit.
+/// Germany's VAT identification number, confirmed: nine digits closed by an ISO
+/// 7064 MOD 11,10 check digit.
 fn german_vat_number(number: &str) -> bool {
     let Some(digits) = digits(number) else {
         return false;
@@ -246,10 +318,11 @@ fn german_vat_number(number: &str) -> bool {
     body.len() == 8 && iso_7064_mod_11_10_check_digit(body) == *check
 }
 
-/// France's VAT number: a two-digit key over the nine-digit SIREN that follows
-/// it, where the published key of a SIREN `s` is `(12 + 3 * (s mod 97)) mod 97`.
+/// France's VAT number, confirmed: a two-digit key over the nine-digit SIREN
+/// that follows it, where the published key of a SIREN `s` is
+/// `(12 + 3 * (s mod 97)) mod 97`.
 fn french_vat_number(number: &str) -> bool {
-    if !matches_layout(number, "99999999999") {
+    if !eleven_digits(number) {
         return false;
     }
     let (key, siren) = number.split_at(2);
@@ -259,14 +332,14 @@ fn french_vat_number(number: &str) -> bool {
     key == (12 + 3 * (siren % 97)) % 97
 }
 
-/// Brazil's CNPJ: twelve digits closed by two check digits, the first over the
-/// twelve and the second over the thirteen before it.
+/// Brazil's CNPJ, confirmed: twelve digits closed by two check digits, the first
+/// over the twelve and the second over the thirteen before it.
 fn brazilian_cnpj_number(number: &str) -> bool {
     brazilian_number(number, 12, cnpj_check_digit)
 }
 
-/// Brazil's CPF: nine digits closed by two check digits, read the same way as
-/// [`brazilian_cnpj_number`] but with that register's own weights.
+/// Brazil's CPF, confirmed: nine digits closed by two check digits, read the
+/// same way as [`brazilian_cnpj_number`] but with that register's own weights.
 fn brazilian_cpf_number(number: &str) -> bool {
     brazilian_number(number, 9, cpf_check_digit)
 }
@@ -310,40 +383,88 @@ fn kenyan_pin_number(number: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Each published structure, with a number the authority's own rule admits
-    /// and one it does not, so no row can pass by admitting everything.
+    /// Each published structure, with a number written the way its authority
+    /// writes one and a value that is not, so no row can pass by admitting
+    /// everything.
     #[test]
-    fn each_published_structure_admits_its_own_numbers_and_refuses_others() {
-        // (country, type, admitted, refused). The admitted numbers carry the
-        // check digits their authority's rule computes; the refused ones differ
-        // from an admitted one only in that digit, or in the layout.
+    fn each_published_layout_admits_its_own_numbers_and_refuses_others() {
+        // (country, type, written as the authority writes one, not written that
+        // way at all). The refused values differ from an admitted one in their
+        // length or in their character layout.
         let rows: &[(&str, &str, &str, &str)] = &[
-            ("DE", "VAT", "DE136695976", "DE123456789"),
-            ("DE", "VAT", "136695976", "13669597"),
-            ("FR", "VAT", "FR15345678901", "FR12345678901"),
-            ("BR", "CNPJ", "12.345.678/0001-95", "12.345.678/0001-96"),
-            ("BR", "CNPJ", "11222333000181", "11111111111111"),
-            ("BR", "CPF", "11144477735", "11144477736"),
+            ("DE", "VAT", "DE136695976", "DE13669597"),
+            ("DE", "VAT", "136695976", "DE1366959761"),
+            ("FR", "VAT", "FR15345678901", "FR1534567890"),
+            ("BR", "CNPJ", "12.345.678/0001-95", "12.345.678/0001-9"),
+            ("BR", "CPF", "11144477735", "111444777350"),
             ("IN", "PAN", "ABCDE1234F", "ABCD12345F"),
             ("IN", "GST", "29ABCDE1234F1Z5", "29ABCDE1234F1X5"),
             ("KE", "TIN", "P051234567M", "X051234567M"),
         ];
         for (country, registration_type, admitted, refused) in rows.iter().copied() {
             assert!(
-                satisfies_published_structure(country, registration_type, admitted),
-                "case {country}/{registration_type}: {admitted:?} satisfies the published \
-                 structure, got false"
+                satisfies_published_layout(country, registration_type, admitted),
+                "case {country}/{registration_type}: {admitted:?} is written the published way, \
+                 got false"
             );
             assert!(
-                !satisfies_published_structure(country, registration_type, refused),
-                "case {country}/{registration_type}: {refused:?} does not satisfy the published \
-                 structure, got true"
+                !satisfies_published_layout(country, registration_type, refused),
+                "case {country}/{registration_type}: {refused:?} is not written that way, got true"
             );
         }
     }
 
-    /// A jurisdiction and type no row covers is not judged, whatever the number
-    /// looks like.
+    /// A number of the published layout whose check digit the authority's rule
+    /// does not confirm: written the right way, and not confirmed.
+    #[test]
+    fn a_published_layout_is_confirmed_only_by_its_authoritys_own_rule() {
+        // (country, type, confirmed, of the layout but not confirmed).
+        let rows: &[(&str, &str, &str, &str)] = &[
+            ("DE", "VAT", "DE136695976", "DE123456789"),
+            ("FR", "VAT", "FR15345678901", "FR12345678901"),
+            ("BR", "CNPJ", "12345678000195", "12345678000196"),
+            ("BR", "CPF", "11144477735", "11144477736"),
+        ];
+        for (country, registration_type, confirmed, unconfirmed) in rows.iter().copied() {
+            for number in [confirmed, unconfirmed] {
+                assert!(
+                    satisfies_published_layout(country, registration_type, number),
+                    "case {country}/{registration_type}: {number:?} is written the published way, \
+                     got false"
+                );
+            }
+            assert!(
+                confirmed_by_its_authority(country, registration_type, confirmed),
+                "case {country}/{registration_type}: {confirmed:?} is confirmed by its \
+                 authority's rule, got false"
+            );
+            assert!(
+                !confirmed_by_its_authority(country, registration_type, unconfirmed),
+                "case {country}/{registration_type}: {unconfirmed:?} is not confirmed by it, got \
+                 true"
+            );
+        }
+    }
+
+    /// A jurisdiction whose authority publishes no confirming rule: a number of
+    /// the published layout is contradicted by nothing.
+    #[test]
+    fn a_layout_with_no_published_confirming_rule_confirms_every_number_of_it() {
+        for (country, registration_type, number) in [
+            ("IN", "PAN", "ABCDE1234F"),
+            ("IN", "GST", "29ABCDE1234F1Z5"),
+            ("KE", "TIN", "P051234567M"),
+        ] {
+            assert!(
+                confirmed_by_its_authority(country, registration_type, number),
+                "case {country}/{registration_type}: {number:?} is contradicted by no published \
+                 rule, got false"
+            );
+        }
+    }
+
+    /// A jurisdiction and type no row covers is not judged either way, whatever
+    /// the number looks like.
     #[test]
     fn a_structure_this_service_does_not_hold_judges_nothing() {
         for (country, registration_type, number) in [
@@ -353,9 +474,14 @@ mod tests {
             ("MY", "NRIC", "800101011234"),
         ] {
             assert!(
-                satisfies_published_structure(country, registration_type, number),
-                "case {country}/{registration_type}: {number:?} is judged by no structure this \
+                satisfies_published_layout(country, registration_type, number),
+                "case {country}/{registration_type}: {number:?} is judged by no layout this \
                  service holds, got false"
+            );
+            assert!(
+                confirmed_by_its_authority(country, registration_type, number),
+                "case {country}/{registration_type}: {number:?} is judged by no confirming rule \
+                 this service holds, got false"
             );
         }
     }

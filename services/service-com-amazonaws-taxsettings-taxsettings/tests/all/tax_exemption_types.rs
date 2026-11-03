@@ -66,77 +66,96 @@ pub(crate) fn wire_form(entry: &TaxExemptionType) -> Value {
     })
 }
 
-/// One jurisdiction of a pinned entry: `(country, state)`.
-type PinnedJurisdiction = (&'static str, Option<&'static str>);
+/// The states a pinned entry applies in, by their two-letter postal codes: the
+/// charitable entry's own list, as a recorded `GetTaxExemptionTypes` response
+/// publishes it.
+const CHARITABLE_ORGANIZATION_STATES: &[&str] = &[
+    "AZ", "CO", "CT", "DC", "FL", "GA", "ID", "IL", "IN", "KS", "KY", "LA", "MA", "MD", "MI", "MN",
+    "MO", "MS", "ND", "NE", "NJ", "NV", "NY", "OH", "OK", "PA", "RI", "SC", "SD", "TN", "TX", "UT",
+    "VA", "VT", "WI", "WV", "WY",
+];
+
+/// The states every other pinned entry applies in: the US jurisdictions that
+/// levy a general sales tax, which is the widest list a category can carry.
+const SALES_TAX_STATES: &[&str] = &[
+    "AL", "AR", "AZ", "CA", "CO", "CT", "DC", "FL", "GA", "HI", "IA", "ID", "IL", "IN", "KS", "KY",
+    "LA", "MA", "MD", "ME", "MI", "MN", "MO", "MS", "NC", "ND", "NE", "NJ", "NM", "NV", "NY", "OH",
+    "OK", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VA", "VT", "WA", "WI", "WV", "WY",
+];
 
 /// The catalog this service publishes, pinned LITERALLY:
-/// `(displayName, description, applicableJurisdictions)`.
+/// `(displayName, description, the states it applies in)`.
 ///
 /// Written out here rather than read from `state::TAX_EXEMPTION_TYPE_CATALOG`, so a
 /// regression in the published collection — an emptied catalog, a dropped entry, a
 /// reworded or duplicated description, a jurisdiction that moved — fails this test
-/// instead of being restated by it. What AWS pins is the categories and their US
-/// jurisdiction (AWS Billing and Cost Management User Guide, "Tax exemption"); the
-/// wording and the order are this emulator's own, as `state::TAX_EXEMPTION_TYPE_CATALOG`
-/// documents, and this table is what holds both stable.
-const PINNED_CATALOG: &[(&str, &str, &[PinnedJurisdiction])] = &[
-    (
-        "501(c)(3)",
-        "Charitable organization exempt under section 501(c)(3) of the US Internal Revenue Code",
-        &[("US", None)],
-    ),
+/// instead of being restated by it. What AWS pins is the first entry outright (its
+/// token and its per-state list) and the per-state SHAPE of every entry's
+/// `applicableJurisdictions`; the wording of the remaining entries and the order
+/// are this emulator's own, as `state::TAX_EXEMPTION_TYPE_CATALOG` documents, and
+/// this table is what holds both stable.
+const PINNED_CATALOG: &[(&str, &str, &[&str])] = &[
+    ("501C", "501C", CHARITABLE_ORGANIZATION_STATES),
     (
         "Direct Pay Permit",
         "Holder of a direct pay permit that remits sales and use tax directly to the taxing \
          authority",
-        &[("US", None)],
+        SALES_TAX_STATES,
     ),
     (
         "Educational Institution",
         "Accredited school, college or university exempt from sales and use tax",
-        &[("US", None)],
+        SALES_TAX_STATES,
     ),
     (
         "Federal Government",
         "US federal government body exempt from sales and use tax",
-        &[("US", None)],
+        SALES_TAX_STATES,
     ),
     (
         "Reseller",
         "Purchases for resale, held under a resale certificate",
-        &[("US", None)],
+        SALES_TAX_STATES,
     ),
     (
         "State or Local Government",
         "US state, county or municipal government body exempt from sales and use tax",
-        &[("US", None)],
+        SALES_TAX_STATES,
     ),
     (
         "Tribal Government",
         "Federally recognized tribal government body exempt from sales and use tax",
-        &[("US", None)],
+        SALES_TAX_STATES,
     ),
 ];
 
 /// One pinned entry as the restJson1 wire must carry it.
 fn pinned_wire_form(
-    (display_name, description, jurisdictions): &(&str, &str, &[PinnedJurisdiction]),
+    (display_name, description, states): &(&str, &str, &[&str]),
 ) -> Value {
-    let authorities: Vec<Value> = jurisdictions
+    let authorities: Vec<Value> = states
         .iter()
-        .map(|(country, state)| {
-            let mut rendered = json!({ "country": country });
-            if let Some(state) = state {
-                rendered["state"] = json!(state);
-            }
-            rendered
-        })
+        .map(|state| json!({ "country": "US", "state": state }))
         .collect();
     json!({
         "displayName": display_name,
         "description": description,
         "applicableJurisdictions": authorities,
     })
+}
+
+/// The entry the pinned catalog publishes under `display_name`, as the restJson1
+/// wire carries it.
+///
+/// `pub(crate)` so a suite asserting what a read reports for a PUBLISHED type
+/// compares against the literally pinned collection above rather than against
+/// the table the handler projects.
+pub(crate) fn pinned_entry(display_name: &str) -> Value {
+    let entry = PINNED_CATALOG
+        .iter()
+        .find(|(pinned, _, _)| *pinned == display_name)
+        .unwrap_or_else(|| panic!("the pinned catalog publishes {display_name:?}"));
+    pinned_wire_form(entry)
 }
 
 /// Read the catalog over the wire from a fresh emulator.
@@ -275,15 +294,15 @@ async fn every_entry_satisfies_the_modelled_constraints() {
 }
 
 /// The exemption categories AWS documents a certificate for, each as the phrase
-/// that NAMES the category ("resale", "federal government", "501(c)(3)"), looked
+/// that NAMES the category ("resale", "federal government", "501C"), looked
 /// up in the `description` — the member `PutTaxExemptionRequest$exemptionType`
 /// identifies a type by ("Use the supported tax exemption type description") — so
 /// the check is about the category being published rather than about this
 /// emulator's display prose. Source: AWS Billing and Cost Management User Guide,
 /// "Tax exemption" / "Managing your tax exemptions": US sales-tax exemptions held
-/// by a reseller, a federal government body or a section 501(c)(3) charitable
-/// organization among others.
-const DOCUMENTED_CATEGORIES: &[&str] = &["resale", "federal government", "501(c)(3)"];
+/// by a reseller, a federal government body or a charitable organization among
+/// others, the last of which the service's own catalog tokens name `501C`.
+const DOCUMENTED_CATEGORIES: &[&str] = &["resale", "federal government", "501C"];
 
 /// RULE: the published catalog covers the documented exemption categories, each
 /// one applicable in the jurisdiction AWS offers it in.
@@ -364,7 +383,7 @@ async fn the_same_catalog_is_reported_for_every_request_and_every_account() {
             &json!({
                 "accountId": account,
                 "taxRegistrationEntry": {
-                    "registrationId": "DE123456789",
+                    "registrationId": "DE136695976",
                     "registrationType": "VAT",
                     "legalName": "Acme GmbH",
                     "legalAddress": { "postalCode": "10115", "countryCode": "DE" },

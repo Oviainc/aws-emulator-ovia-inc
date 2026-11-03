@@ -26,8 +26,8 @@ use service_com_amazonaws_taxsettings_taxsettings::state::{
 
 use crate::fidelity_rules::read_status;
 use crate::supplemental_tax_registrations::{
-    entry_for, hold_supplemental_validations_open, list_all, make_supplemental_validations_due,
-    put as put_supplemental,
+    emulator_supplementing, entry_for, hold_supplemental_validations_open, list_all,
+    make_supplemental_validations_due, put as put_supplemental,
 };
 use crate::tax_registration_lifecycle::{
     call, emulator_with_engine, hold_validations_open, make_validations_due,
@@ -229,7 +229,9 @@ async fn an_accepted_supplemental_registration_settles_verified_in_the_listing()
     ];
 
     for (case, registration_id, legal_name) in rows.iter().copied() {
-        let (router, engine) = emulator_with_engine();
+        // A supplemental registration supplements the account's own, so the
+        // account holds a settled registration before the write under test.
+        let (router, engine) = emulator_supplementing();
         let written = put_supplemental(&router, &entry_for("CH", registration_id, legal_name)).await;
         assert_eq!(
             written.status, 200,

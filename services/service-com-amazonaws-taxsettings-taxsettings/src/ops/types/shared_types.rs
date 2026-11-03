@@ -11,27 +11,24 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-taxsettings-taxsettings.json");
 
-// `ConflictException`, `InternalServerException` and `ResourceNotFoundException` are
-// rendered with their `message` only.
+// `errorCode` on this service's exceptions targets `ErrorCode` — a free-form string
+// (length 0..50), NOT the `ValidationExceptionErrorCode` enum — and carries a
+// SERVICE-DEFINED code, never the exception's own shape name, which the wire already
+// carries in `x-amzn-errortype` / `__type`: a client reading `errorCode` to classify a
+// failure would take a shape name for a service code.
 //
-// The model marks each one's `errorCode` `@required`, but it targets `ErrorCode` — a
-// free-form string (length 0..50), NOT the `ValidationExceptionErrorCode` enum — and it
-// carries a SERVICE-DEFINED code, never the exception's own shape name, which the wire
-// already carries in `x-amzn-errortype` / `__type`. This service publishes no code for a
-// missing resource, a state conflict or an internal fault, and the real service omits the
-// member on those paths rather than inventing one (recorded: a taxsettings 404 answers
-// `{"message": ...}` with no `errorCode`), so the three are declared unsupported and left
-// off the wire instead of being filled with the shape name — which a client reading
-// `errorCode` to classify a failure would take for a service code. `ValidationException`
-// below keeps its `errorCode`: that one targets the model's enum and this service has a
-// token to report.
-#[smithy_macros::smithy(
-    shape = "com.amazonaws.taxsettings#ConflictException",
-    unsupported = ["errorCode"]
-)]
+// `InternalServerException` and `ResourceNotFoundException` are therefore rendered with
+// their `message` only — this service publishes no code for a missing resource or an
+// internal fault, and the real service omits the member on those paths rather than
+// inventing one (recorded: a taxsettings 404 answers `{"message": ...}` with no
+// `errorCode`). `ConflictException` and `ValidationException` keep theirs: this service
+// publishes a token for a state conflict and one for each class of field violation, and a
+// recorded 409 of this service carries it.
+#[smithy_macros::smithy(shape = "com.amazonaws.taxsettings#ConflictException")]
 #[derive(Debug, Clone, Default)]
 pub struct ConflictException {
     pub message: String,
+    pub error_code: String,
 }
 
 #[smithy_macros::smithy(

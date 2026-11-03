@@ -198,11 +198,24 @@ fn own_account() -> &'static str {
     engine::emulator_account_id()
 }
 
+/// The accounts a listing reports once this service holds exemptions for
+/// `accounts`: those accounts and the caller's own, which the exemption reads
+/// answer for whether or not it holds an exemption, in account-id order.
+fn listed_family<I: IntoIterator<Item = String>>(accounts: I) -> Vec<String> {
+    let mut family: Vec<String> = accounts
+        .into_iter()
+        .chain(std::iter::once(own_account().to_string()))
+        .collect();
+    family.sort();
+    family.dedup();
+    family
+}
+
 /// A `TaxRegistrationEntry` to make an account one this service holds tax
 /// settings for.
 fn a_registration() -> Value {
     json!({
-        "registrationId": "DE123456789",
+        "registrationId": "DE136695976",
         "registrationType": "VAT",
         "legalName": "Acme GmbH",
         "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
@@ -223,12 +236,13 @@ struct Visibility {
     failed: Vec<&'static str>,
 }
 
-/// RULE: the call reports the exemptions this service holds for each account it
-/// names, and an account it holds no tax settings for and that is not the
-/// caller's own — an account outside the caller's consolidated billing family —
-/// is reported on the response's own per-account failure channel
-/// (`failedAccounts`) on a 200, the accounts named beside it still being
-/// reported in the map.
+/// RULE: the call reports a `TaxExemptionDetails` for each account it names that
+/// this service can answer for — the exemptions it holds for that account where
+/// there are any, and the inheritance indicator either way — and an account it
+/// holds no tax settings for and that is not the caller's own — an account
+/// outside the caller's consolidated billing family — is reported on the
+/// response's own per-account failure channel (`failedAccounts`) on a 200, the
+/// accounts named beside it still being reported in the map.
 #[tokio::test]
 async fn only_accounts_this_service_holds_tax_settings_for_are_reported() {
     let (router, engine) = emulator_with_engine();
@@ -262,7 +276,7 @@ async fn only_accounts_this_service_holds_tax_settings_for_are_reported() {
             accounts: vec![own_account()],
             status: 200,
             error_code: "",
-            reported: vec![],
+            reported: vec![own_account()],
             failed: vec![],
         },
         Visibility {
@@ -270,7 +284,7 @@ async fn only_accounts_this_service_holds_tax_settings_for_are_reported() {
             accounts: vec![with_registration],
             status: 200,
             error_code: "",
-            reported: vec![],
+            reported: vec![with_registration],
             failed: vec![],
         },
         Visibility {
@@ -286,7 +300,7 @@ async fn only_accounts_this_service_holds_tax_settings_for_are_reported() {
             accounts: vec![with_empty_record],
             status: 200,
             error_code: "",
-            reported: vec![],
+            reported: vec![with_empty_record],
             failed: vec![],
         },
         Visibility {
@@ -294,7 +308,7 @@ async fn only_accounts_this_service_holds_tax_settings_for_are_reported() {
             accounts: vec![own_account(), with_registration, with_exemption],
             status: 200,
             error_code: "",
-            reported: vec![with_exemption],
+            reported: vec![own_account(), with_registration, with_exemption],
             failed: vec![],
         },
         Visibility {
@@ -310,7 +324,7 @@ async fn only_accounts_this_service_holds_tax_settings_for_are_reported() {
             ],
             status: 200,
             error_code: "",
-            reported: vec![with_exemption],
+            reported: vec![own_account(), with_registration, with_exemption],
             failed: vec![],
         },
         Visibility {
@@ -839,13 +853,9 @@ impl Submission {
     }
 
     /// The `taxExemptionType` the listing must report for it: the catalog's
-    /// entry, pinned literally here rather than read back from the service.
+    /// entry, as `tax_exemption_types.rs` pins that collection literally.
     fn expected_type(&self) -> Value {
-        json!({
-            "displayName": self.expected_display_name,
-            "description": self.expected_description,
-            "applicableJurisdictions": [{ "country": "US" }],
-        })
+        crate::tax_exemption_types::pinned_entry(self.expected_display_name)
     }
 
     /// The `authority` the listing must report for it.
@@ -881,28 +891,27 @@ const SUBMISSIONS: &[Submission] = &[
     Submission {
         case: "three accounts, the type named by its display name, with a state",
         accounts: &["000000000002", "000000000003", "000000000004"],
-        exemption_type: "501(c)(3)",
+        exemption_type: "501C",
         country: "US",
-        state: Some("New York"),
+        state: Some("NY"),
         document_name: "charity.JPG",
-        expected_display_name: "501(c)(3)",
-        expected_description: "Charitable organization exempt under section 501(c)(3) of the US \
-                               Internal Revenue Code",
+        expected_display_name: "501C",
+        expected_description: "501C",
         expected_country: "US",
-        expected_state: Some("New York"),
+        expected_state: Some("NY"),
     },
     Submission {
         case: "a lower-cased country code and a padded state",
         accounts: &["000000000005"],
         exemption_type: "educational institution",
         country: "us",
-        state: Some("  Texas  "),
+        state: Some("  TX  "),
         document_name: "school.png",
         expected_display_name: "Educational Institution",
         expected_description: "Accredited school, college or university exempt from sales and use \
                                tax",
         expected_country: "US",
-        expected_state: Some("Texas"),
+        expected_state: Some("TX"),
     },
     Submission {
         case: "a tribal government exemption for two accounts",
@@ -910,13 +919,13 @@ const SUBMISSIONS: &[Submission] = &[
         exemption_type: "Federally recognized tribal government body exempt from sales and use \
                          tax",
         country: "US",
-        state: Some("Arizona"),
+        state: Some("AZ"),
         document_name: "tribal.pdf",
         expected_display_name: "Tribal Government",
         expected_description: "Federally recognized tribal government body exempt from sales and \
                                use tax",
         expected_country: "US",
-        expected_state: Some("Arizona"),
+        expected_state: Some("AZ"),
     },
 ];
 
@@ -955,15 +964,13 @@ async fn every_submitted_exemption_is_reported_for_every_account_it_names() {
             (200, ""),
             "case {case:?}: expected 200, got {listed:?}"
         );
-        let expected_accounts: Vec<String> = submission
-            .accounts
-            .iter()
-            .map(|id| (*id).to_string())
-            .collect();
+        let expected_accounts: Vec<String> =
+            listed_family(submission.accounts.iter().map(|id| (*id).to_string()));
         assert_eq!(
             reported_accounts(&listed),
             expected_accounts,
-            "case {case:?}: expected exactly the accounts the submission named, got {:?}",
+            "case {case:?}: expected the accounts the submission named, beside the caller's own, \
+             got {:?}",
             details_map(&listed)
         );
 
@@ -974,10 +981,14 @@ async fn every_submitted_exemption_is_reported_for_every_account_it_names() {
                 .cloned()
                 .unwrap_or_else(|| panic!("case {case:?}: expected {account}, got {listed:?}"));
             // Nothing this service records is inherited from a consolidated
-            // billing family's management account, so no `heritageObtained*`
-            // member is reported.
+            // billing family's management account, so the indicator is reported
+            // false and the members describing an inheritance stay absent.
+            assert_eq!(
+                details.get("heritageObtainedDetails"),
+                Some(&json!(false)),
+                "case {case:?}: the inheritance indicator is always reported, got {details}"
+            );
             for member in [
-                "heritageObtainedDetails",
                 "heritageObtainedParentEntity",
                 "heritageObtainedReason",
             ] {
@@ -1006,6 +1017,17 @@ async fn every_submitted_exemption_is_reported_for_every_account_it_names() {
                 Some(&submission.expected_type()),
                 "case {case:?}: expected {}, got {exemption}",
                 submission.expected_type()
+            );
+            // The type's own identifying member, stated by this row rather than
+            // read from the collection: the token a later submission names this
+            // type by.
+            assert_eq!(
+                exemption
+                    .get("taxExemptionType")
+                    .and_then(|entry| entry.get("description"))
+                    .and_then(Value::as_str),
+                Some(submission.expected_description),
+                "case {case:?}: expected the type's published description, got {exemption}"
             );
             assert_eq!(
                 exemption.get("status").and_then(Value::as_str),
@@ -1060,7 +1082,7 @@ async fn an_exemption_is_identified_by_its_type_and_its_jurisdiction() {
             "the first type in another state",
             json!({
                 "exemptionType": "Reseller",
-                "authority": { "country": "US", "state": "Ohio" },
+                "authority": { "country": "US", "state": "OH" },
             }),
             3,
         ),
@@ -1068,7 +1090,7 @@ async fn an_exemption_is_identified_by_its_type_and_its_jurisdiction() {
             "the same type in the same state again",
             json!({
                 "exemptionType": "Reseller",
-                "authority": { "country": "US", "state": "Ohio" },
+                "authority": { "country": "US", "state": "OH" },
             }),
             3,
         ),
@@ -1076,7 +1098,7 @@ async fn an_exemption_is_identified_by_its_type_and_its_jurisdiction() {
             "the same state spelled in another case",
             json!({
                 "exemptionType": "Reseller",
-                "authority": { "country": "us", "state": "OHIO" },
+                "authority": { "country": "us", "state": "oh" },
             }),
             3,
         ),
@@ -1084,7 +1106,7 @@ async fn an_exemption_is_identified_by_its_type_and_its_jurisdiction() {
             "the same type named by its description instead",
             json!({
                 "exemptionType": "Purchases for resale, held under a resale certificate",
-                "authority": { "country": "US", "state": " Ohio " },
+                "authority": { "country": "US", "state": " OH " },
             }),
             3,
         ),
@@ -1313,9 +1335,10 @@ async fn a_submission_records_the_exemption_for_every_account_it_names() {
         expected.dedup();
         let recorded = all_listed_accounts(&router).await;
         assert_eq!(
-            recorded, expected,
-            "case {case:?}: expected the exemption recorded for every account named, got \
-             {recorded:?}"
+            recorded,
+            listed_family(expected.clone()),
+            "case {case:?}: expected the exemption recorded for every account named, beside the \
+             caller's own, got {recorded:?}"
         );
 
         // Read the records back through `BatchGetTaxExemptions` — the first, a
@@ -1379,8 +1402,16 @@ async fn a_submission_records_the_exemption_for_every_account_it_names() {
 
 /// Seed one exemption for each of `count` accounts, answering the account ids in
 /// store order.
+///
+/// The caller's own account is the first of them: the exemption reads answer for
+/// that account whether or not it holds an exemption, so seeding it keeps the
+/// accounts the store holds and the accounts a listing reports one and the same
+/// set.
 pub(crate) fn seed_many(engine: &Arc<engine::InMemoryEngine>, count: usize) -> Vec<String> {
-    let accounts: Vec<String> = (1..=count).map(|index| format!("{index:012}")).collect();
+    let accounts: Vec<String> = std::iter::once(own_account().to_string())
+        .chain((1..count).map(|index| format!("{index:012}")))
+        .take(count)
+        .collect();
     for account in &accounts {
         seed_exemptions(engine, account, vec![a_valid_exemption()]);
     }
@@ -1400,7 +1431,7 @@ async fn the_listing_pages_over_every_account() {
     for page_size in page_sizes {
         let case = format!("maxResults {page_size:?} over {store_size} accounts");
         let (router, engine) = emulator_with_engine();
-        let expected = seed_many(&engine, store_size);
+        let expected = listed_family(seed_many(&engine, store_size));
 
         let mut seen: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
@@ -1456,7 +1487,7 @@ async fn the_listing_pages_over_every_account() {
 async fn a_request_naming_no_page_size_gets_the_servers_default() {
     let (router, engine) = emulator_with_engine();
     let store_size = TAX_EXEMPTIONS_PAGE_BOUNDS.default_size + 5;
-    let expected = seed_many(&engine, store_size);
+    let expected = listed_family(seed_many(&engine, store_size));
 
     let first = call(&router, "ListTaxExemptions", &json!({})).await;
     let page = reported_accounts(&first);
@@ -1476,7 +1507,7 @@ async fn a_request_naming_no_page_size_gets_the_servers_default() {
     let rest = reported_accounts(&second);
     assert_eq!(
         rest.len(),
-        store_size - TAX_EXEMPTIONS_PAGE_BOUNDS.default_size,
+        expected.len() - TAX_EXEMPTIONS_PAGE_BOUNDS.default_size,
         "case \"the cursor's page\": expected the remainder, got {rest:?}"
     );
     assert!(
@@ -1553,7 +1584,7 @@ async fn a_cursor_this_service_did_not_issue_is_refused() {
     ];
 
     let (router, engine) = emulator_with_engine();
-    seed_many(&engine, 2);
+    let family = listed_family(seed_many(&engine, 2));
 
     for (case, token, expected_code) in cases {
         let answer = call(
@@ -1587,8 +1618,8 @@ async fn a_cursor_this_service_did_not_issue_is_refused() {
     let second = call(&router, "ListTaxExemptions", &json!({ "nextToken": token })).await;
     assert_eq!(
         (second.status, reported_accounts(&second)),
-        (200, vec!["000000000002".to_string()]),
-        "case \"an issued cursor\": expected the next account, got {second:?}"
+        (200, family[1..].to_vec()),
+        "case \"an issued cursor\": expected the accounts after the first, got {second:?}"
     );
 }
 
@@ -1744,14 +1775,19 @@ async fn every_exemption_type_the_model_admits_is_recorded() {
     }
 }
 
-/// RULE: an `authority` is admitted on the constraints the model states for
-/// `Authority` — a two-letter country code, and a non-blank state where one is
-/// submitted — rather than against the jurisdictions the published collection
-/// carries, so every jurisdiction the model admits is recorded and reported as
-/// the store holds it; a blank state is refused, naming that parameter, and
-/// stores nothing.
+/// RULE: for a type the published collection does NOT carry, an `authority` is
+/// admitted on the constraints the model states for `Authority` — a two-letter
+/// country code, and a non-blank state where one is submitted — because the
+/// collection says nothing about where such a type applies, so every
+/// jurisdiction the model admits is recorded and reported as the store holds it;
+/// a blank state is refused, naming that parameter, and stores nothing. Where
+/// the type IS one the collection publishes, its own `applicableJurisdictions`
+/// decide instead (`tests/all/exemption_authority_support.rs`).
 #[tokio::test]
 async fn an_authority_the_model_admits_is_recorded() {
+    // The token names no entry of the published collection, so what each row is
+    // judged on is the jurisdiction's own form.
+    let unpublished_type = "Exemption certificate this collection does not publish";
     // The rows differ along the jurisdiction: a country with and without a
     // state, the country re-cased, a state nothing enumerates, countries outside
     // the published collection's own, and a state that is all whitespace (the
@@ -1772,9 +1808,9 @@ async fn an_authority_the_model_admits_is_recorded() {
             "",
         ),
         (
-            // The jurisdictions the published collection carries are this
-            // emulator's own, so they decide no submission: a country the model
-            // admits is recorded.
+            // The jurisdictions the published collection carries speak only for
+            // the types it publishes, so they decide no submission of another
+            // type: a country the model admits is recorded.
             "another country",
             json!({ "country": "DE" }),
             200,
@@ -1802,7 +1838,7 @@ async fn an_authority_the_model_admits_is_recorded() {
             &json!({
                 "accountIds": [own_account()],
                 "authority": authority,
-                "exemptionType": "Reseller",
+                "exemptionType": unpublished_type,
                 "exemptionCertificate": certificate("resale.pdf"),
             }),
         )
@@ -1847,7 +1883,7 @@ async fn an_authority_the_model_admits_is_recorded() {
                 "case {case:?}: expected the refused parameter to be named, got {answer:?}"
             );
             assert!(
-                reported_accounts(&listed).is_empty(),
+                reported_exemptions(&listed, own_account()).is_empty(),
                 "case {case:?}: a refused submission stores nothing, got {listed:?}"
             );
         }

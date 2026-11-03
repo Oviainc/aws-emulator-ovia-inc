@@ -42,8 +42,10 @@ use service_com_amazonaws_taxsettings_taxsettings::state::ComAmazonawsTaxsetting
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::shared_supplemental_lifecycle::{reported_authority, supported_country};
-use crate::supplemental_tax_registrations::{entry_for, list_all, put};
-use crate::tax_registration_lifecycle::{call, emulator_with_engine, mount_on};
+use crate::supplemental_tax_registrations::{
+    emulator_supplementing, entry_for, list_all, make_supplemental_validations_due, put,
+};
+use crate::tax_registration_lifecycle::{call, mount_on};
 
 /// The published length of `SupplementalTaxRegistrationEntry$registrationId`:
 /// `@length` 1..200 (`smithy_query(query="shape",
@@ -231,9 +233,14 @@ async fn re_spelling_a_supplemental_number_updates_the_one_record_it_names() {
     for (number_case, number) in first_numbers() {
         for (spelling, respelled) in respellings(&number) {
             let case = format!("{number_case}, re-spelled {spelling}");
-            let (router, engine) = emulator_with_engine();
+            let (router, engine) = emulator_supplementing();
 
             let first_id = write(&router, &number, "Acme AG", &case).await;
+            // A write aimed at a record whose own validation is still
+            // outstanding conflicts with the current state of that record, so the
+            // clock settles what it owed before the second write: what this table
+            // is about is which record a re-spelled number names.
+            make_supplemental_validations_due(&engine);
             let second_id = write(&router, &respelled, "Acme Holding AG", &case).await;
             assert_eq!(
                 second_id, first_id,
@@ -354,8 +361,11 @@ async fn a_number_that_differs_in_its_characters_is_another_supplemental_trn() {
     for row in rows {
         let case = row.case;
         let expected = row.expected;
-        let (router, engine) = emulator_with_engine();
+        let (router, engine) = emulator_supplementing();
         let first_id = write(&router, &row.first, "Acme AG", case).await;
+        // See the sibling suite above: the first record's outstanding validation
+        // is settled so that what the second write meets is the identity rule.
+        make_supplemental_validations_due(&engine);
         let second_id = write(&router, &row.second, "Acme Holding AG", case).await;
         if expected == 1 {
             assert_eq!(

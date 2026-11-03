@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    ComAmazonawsTaxsettingsTaxsettingsState, MAX_STORED_REGISTRATIONS, STATUS_PENDING,
-    TAX_REGISTRATIONS_PAGE_BOUNDS,
+    ComAmazonawsTaxsettingsTaxsettingsState, ERROR_CODE_GENERAL_CONFLICT, MAX_STORED_REGISTRATIONS,
+    STATE_CONFLICT_MESSAGE, STATUS_PENDING, TAX_REGISTRATIONS_PAGE_BOUNDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -183,7 +183,7 @@ fn round_trip_cases() -> Vec<Case> {
             name: "minimal VAT registration",
             account_id: "000000000001",
             entry: json!({
-                "registrationId": "DE123456789",
+                "registrationId": "DE136695976",
                 "registrationType": "VAT",
                 "legalName": "Acme GmbH",
                 "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
@@ -562,6 +562,12 @@ async fn list_reports_the_same_registration_reduced_to_its_jurisdiction() {
 }
 
 /// Store `count` registrations and return their account ids in order.
+///
+/// Each record is held in a jurisdiction this service publishes no tax
+/// registration number structure for, so the synthetic per-account number below
+/// is one no published structure judges and the write admits it
+/// (`state::check_registration_number`); what this seeding is about is how many
+/// records the store holds, not what any one number is.
 async fn seed(router: &MultiServiceRouter, count: usize) -> Vec<String> {
     let mut ids = Vec::new();
     for index in 1..=count {
@@ -575,7 +581,7 @@ async fn seed(router: &MultiServiceRouter, count: usize) -> Vec<String> {
                     "registrationId": format!("VAT-{index}"),
                     "registrationType": "VAT",
                     "legalName": format!("Account {index} Ltd"),
-                    "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
+                    "legalAddress": { "postalCode": "1011AB", "countryCode": "NL" },
                 },
             }),
         )
@@ -776,7 +782,7 @@ async fn reads_are_repeatable_and_a_rewrite_replaces_the_record() {
     let (router, engine) = emulator_with_engine();
     let account_id = "000000000042";
     let first = json!({
-        "registrationId": "DE111111111",
+        "registrationId": "DE111111117",
         "registrationType": "VAT",
         "legalName": "Acme GmbH",
         "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
@@ -873,7 +879,7 @@ async fn an_omitted_account_id_is_the_callers_own_account() {
         "PutTaxRegistration",
         &json!({
             "taxRegistrationEntry": {
-                "registrationId": "DE999999999",
+                "registrationId": "DE999999995",
                 "registrationType": "VAT",
                 "legalName": "Caller GmbH",
                 "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
@@ -953,10 +959,22 @@ struct Refusal {
 /// exactly one member away from valid.
 fn valid_entry() -> Value {
     json!({
-        "registrationId": "DE123456789",
+        "registrationId": "DE136695976",
         "registrationType": "VAT",
         "legalName": "Acme GmbH",
         "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
+    })
+}
+
+/// The same, held in a jurisdiction this service publishes no tax registration
+/// number structure for, so no value this table puts in `registrationId` is
+/// judged as a number of a published kind.
+fn entry_in_an_unjudged_jurisdiction() -> Value {
+    json!({
+        "registrationId": "VAT-0000000001",
+        "registrationType": "VAT",
+        "legalName": "Voorbeeld BV",
+        "legalAddress": { "postalCode": "1011AB", "countryCode": "NL" },
     })
 }
 
@@ -1029,7 +1047,7 @@ async fn values_outside_the_model_are_refused_and_values_inside_it_are_served() 
             body: json!({
                 "accountId": "000000000001",
                 "taxRegistrationEntry": {
-                    "registrationId": "DE123456789",
+                    "registrationId": "DE136695976",
                     "legalName": "Acme GmbH",
                     "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
                 },
@@ -1050,7 +1068,7 @@ async fn values_outside_the_model_are_refused_and_values_inside_it_are_served() 
             body: json!({
                 "accountId": "000000000001",
                 "taxRegistrationEntry": {
-                    "registrationId": "DE123456789",
+                    "registrationId": "DE136695976",
                     "registrationType": "VAT",
                     "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
                 },
@@ -1065,7 +1083,7 @@ async fn values_outside_the_model_are_refused_and_values_inside_it_are_served() 
             body: json!({
                 "accountId": "000000000001",
                 "taxRegistrationEntry": {
-                    "registrationId": "DE123456789",
+                    "registrationId": "DE136695976",
                     "registrationType": "VAT",
                     "legalName": "Acme GmbH",
                 },
@@ -1274,7 +1292,17 @@ async fn values_outside_the_model_are_refused_and_values_inside_it_are_served() 
             "",
         ),
     ] {
-        let mut entry = valid_entry();
+        // A case that varies the `registrationId` is judged by the model's own
+        // constraints on that member and by nothing else, so it is submitted in a
+        // jurisdiction this service publishes no number structure for: a
+        // 200-character value is inside the member's 1..200 bound and is no
+        // German VAT number (`state::check_registration_number`, pinned in
+        // `tests/all/trn_validation_outcome.rs`).
+        let mut entry = if member == "registrationId" {
+            entry_in_an_unjudged_jurisdiction()
+        } else {
+            valid_entry()
+        };
         entry
             .as_object_mut()
             .expect("an object")
@@ -1371,7 +1399,7 @@ async fn the_resident_registration_store_is_bounded() {
     let seeded = seed(&router, MAX_STORED_REGISTRATIONS).await;
 
     let entry = json!({
-        "registrationId": "DE123456789",
+        "registrationId": "DE136695976",
         "registrationType": "VAT",
         "legalName": "One Too Many GmbH",
         "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
@@ -1389,12 +1417,18 @@ async fn the_resident_registration_store_is_bounded() {
         "case {overflow_account:?}: expected 409 ConflictException past the \
          {MAX_STORED_REGISTRATIONS}-record bound, got {refused:?}"
     );
-    // The refusal body carries the members this service populates and no more:
-    // `errorCode` is a service-defined code, not the exception's shape name,
-    // which the wire already carries in `__type`.
-    assert!(
-        refused.body.get("errorCode").is_none(),
-        "case {overflow_account:?}: the conflict body must not carry an errorCode, got {:?}",
+    // The refusal body carries the envelope the conflict class publishes: the
+    // service's own code for a state conflict and that class's fixed message.
+    assert_eq!(
+        (
+            refused.get("errorCode").as_str(),
+            refused.get("message").as_str(),
+        ),
+        (
+            Some(ERROR_CODE_GENERAL_CONFLICT),
+            Some(STATE_CONFLICT_MESSAGE),
+        ),
+        "case {overflow_account:?}: expected the conflict class's own envelope, got {:?}",
         refused.body
     );
     let not_stored = call(

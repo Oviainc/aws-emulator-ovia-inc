@@ -36,8 +36,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    non_api_delete_country, COUNTRIES_WITH_NON_API_REGISTRATION_DELETE,
-    ERROR_CODE_FIELD_VALIDATION_FAILED,
+    no_tax_registration, non_api_delete_country, COUNTRIES_WITH_NON_API_REGISTRATION_DELETE,
+    ERROR_CODE_FIELD_VALIDATION_FAILED, TAX_REGISTRATION_NOT_FOUND,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -94,6 +94,29 @@ impl Decision {
             Self::Removed => 200,
             Self::MissingResource => 404,
             Self::NotDeletable => 400,
+        }
+    }
+
+    /// The wording the channel `path` reports this decision on carries.
+    ///
+    /// One decision, two channels, and each is worded as a recording of THAT
+    /// channel words it: the missing-resource class is the exception's own
+    /// sentence on the single-account path and the class's token in a batch row
+    /// (`state::no_tax_registration`,
+    /// `state::RegistrationDeleteRefusal::into_row_message`), while the
+    /// jurisdiction carve-out has only its exception's sentence, so both
+    /// channels carry that. Empty where the decision refuses nothing.
+    fn message_on(self, path: &str) -> String {
+        match self {
+            Self::Removed => String::new(),
+            Self::MissingResource => {
+                if path == "BatchDeleteTaxRegistration" {
+                    TAX_REGISTRATION_NOT_FOUND.to_string()
+                } else {
+                    no_tax_registration().message
+                }
+            }
+            Self::NotDeletable => String::new(),
         }
     }
 
@@ -175,7 +198,10 @@ impl Row {
 /// `tests/all/country_requirements.rs` covers).
 fn entry(holding: &Holding) -> Value {
     json!({
-        "registrationId": format!("{}-0000000001", holding.registration_type),
+        "registrationId": crate::fidelity_rules::number_of_type(
+            holding.registration_type,
+            Some(&holding.country_code),
+        ),
         "registrationType": holding.registration_type,
         "legalName": "Example Holdings",
         "legalAddress": {
@@ -332,9 +358,9 @@ async fn delete_through(router: &MultiServiceRouter, path: &str, case: &str) -> 
 }
 
 /// RULE: both delete paths take the one single-account delete decision — the same
-/// code, the same message and the same post-state for one record, whichever path
-/// asked, and the same again once that decision has already answered for the
-/// account once.
+/// code class and the same post-state for one record, whichever path asked, each
+/// channel wording that decision the way a recording of it words it, and the
+/// same again once that decision has already answered for the account once.
 #[tokio::test]
 async fn both_delete_paths_take_the_one_delete_decision() {
     for row in rows() {
@@ -374,6 +400,16 @@ async fn both_delete_paths_take_the_one_delete_decision() {
                      so the account must report {expected_held:?}, got {:?}",
                     outcome.still_held
                 );
+                // The message each channel words this decision with.
+                let expected_message = decision.message_on(path);
+                if !expected_message.is_empty() {
+                    assert_eq!(
+                        outcome.message, expected_message,
+                        "case {case:?}: expected the wording this channel words the \
+                         {decision:?} class with, got {:?}",
+                        outcome.message
+                    );
+                }
                 if let Some(country) = row
                     .holds
                     .as_ref()
@@ -390,13 +426,13 @@ async fn both_delete_paths_take_the_one_delete_decision() {
             }
             per_path.push(outcomes);
         }
-        // The message and the post-state are the decision itself, so they must
-        // match across the paths; the code member each path reports them on is
-        // asserted per path above.
-        let shared = |outcomes: &Vec<Outcome>| -> Vec<(String, Option<String>)> {
+        // The post-state is the decision itself, so it must match across the
+        // paths; the code and the message each path reports it on are asserted
+        // per path above, because each channel words a refusal its own way.
+        let shared = |outcomes: &Vec<Outcome>| -> Vec<Option<String>> {
             outcomes
                 .iter()
-                .map(|outcome| (outcome.message.clone(), outcome.still_held.clone()))
+                .map(|outcome| outcome.still_held.clone())
                 .collect()
         };
         assert_eq!(

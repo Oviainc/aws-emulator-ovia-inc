@@ -42,7 +42,7 @@ fn meta_cases() -> Vec<MetaCase> {
             name: "minimal address, no state or region",
             account_id: "000000000011",
             entry: json!({
-                "registrationId": "DE123456789",
+                "registrationId": "DE136695976",
                 "registrationType": "VAT",
                 "legalName": "Acme GmbH",
                 "legalAddress": { "postalCode": "10115", "countryCode": "DE" },

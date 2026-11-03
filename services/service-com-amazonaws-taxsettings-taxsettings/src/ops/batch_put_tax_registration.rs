@@ -10,13 +10,15 @@
 //!
 //! Two refusal channels, which are not interchangeable:
 //!
-//! * the ENTRY, and the request's shape, are judged before anything is stored —
-//!   an entry no account may be registered with is refused with the modelled
-//!   `ValidationException` and the store is left untouched, and an `accountIds`
-//!   outside the 1..=550 the model sets on it never reaches this handler: the
-//!   boundary validator refuses it, naming the member and the bound.
-//! * an account the service could not write while the entry itself was fine is
-//!   reported in the response's `errors` list, which names that account and why,
+//! * the ENTRY's MEMBERS, and the request's shape, are judged before anything is
+//!   stored — an entry whose members no account may be registered with is
+//!   refused with the modelled `ValidationException` and the store is left
+//!   untouched, and an `accountIds` outside the 1..=550 the model sets on it
+//!   never reaches this handler: the boundary validator refuses it, naming the
+//!   member and the bound.
+//! * an account the service could not write while the entry's members were fine
+//!   is reported in the response's `errors` list, which names that account and
+//!   why,
 //!   while every other account the request named is still stored; reporting a
 //!   per-account failure there is what the `errors` member is for. The reasons
 //!   are the ones the shared write refuses on, each a `ConflictException` the
@@ -24,11 +26,14 @@
 //!   `Pending` ("You can't set a TRN if there's a pending TRN. You'll need to
 //!   delete the pending TRN first" — that account's record is left exactly as it
 //!   was), and the resident bound [`crate::state::MAX_STORED_REGISTRATIONS`] —
-//!   plus the one refusal that is about the account's stored record rather than
-//!   about the entry: a registration type that record BLOCKS
+//!   plus the two refusals that are not about the entry's members: a
+//!   registration type the account's stored record BLOCKS
 //!   ([`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::check_registration_type_against_stored`]),
 //!   which the single-account write answers 400 `ValidationException` with and
-//!   whose row carries that refusal's own `errorCode`.
+//!   whose row carries that refusal's own `errorCode`, and a submitted number
+//!   its jurisdiction's authority does not issue
+//!   ([`crate::state::check_registration_number`]), whose row carries that
+//!   class's token as its `message` and no `code`.
 //!
 //! `status` is the status the registrations were stored with — `Pending`, while
 //! the validation each write started is outstanding (see
@@ -219,11 +224,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // validator refuses outside of before this handler runs — reaching here
         // means the request named between 1 and 550 accounts.
         //
-        // The entry is judged once, for the whole call: it is the same entry for
-        // every account, so an entry no account may be registered with refuses
-        // the call rather than failing account by account, and nothing is stored.
+        // The entry's MEMBERS are judged once, for the whole call: they are the
+        // same members for every account, so an entry whose members no account
+        // may be registered with refuses the call rather than failing account by
+        // account, and nothing is stored.
         crate::state::check_tax_registration_entry(entry)
             .map_err(BatchPutTaxRegistrationErrorModeled::ValidationException)?;
+
+        // The submitted NUMBER, by contrast, is reported on the per-account
+        // channel: `errors` names the accounts "the TRN information could not be
+        // added or updated to", and a number its jurisdiction's authority does
+        // not issue is exactly such a failure — so a batch whose entry carries
+        // one is answered 200 with a row per addressed account and nothing
+        // stored for any of them, rather than refused whole. The judgement is
+        // the one both writers make ([`crate::state::check_registration_number`]),
+        // so the single-account write cannot store a number this one refuses.
+        let invalid_number = crate::state::check_registration_number(entry).err();
 
         let mut errors: Vec<BatchPutTaxRegistrationError2> = Vec::new();
         let mut stored_status: Option<String> = None;
@@ -234,6 +250,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in request order — see [`crate::state::distinct_account_ids`], which is
         // where what a repeated id means is stated for this whole service.
         for account_id in crate::state::distinct_account_ids(&input.account_ids) {
+            // The number is a fact about the entry rather than about this
+            // account's record, so it is reported first and the account's own
+            // record is left untouched.
+            if let Some(refusal) = invalid_number {
+                errors.push(BatchPutTaxRegistrationError2 {
+                    account_id: account_id.to_string(),
+                    code: refusal.row_error_code(),
+                    message: refusal.message(),
+                });
+                continue;
+            }
             // The same write `PutTaxRegistration` performs, so one entry cannot
             // be stored two different ways, and neither can one account's state
             // be judged two different ways. An account the write refuses — one

@@ -198,18 +198,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let page = {
             let store = state.lock();
+            let accounts = store.exemption_report_accounts();
             crate::state::build_page(
-                &store.exemptions,
+                &accounts,
                 resume_after.as_deref(),
                 page_size,
-                // An account's entry is created by the write that records its
-                // first exemption, so every entry holds at least one record; the
-                // projection answers `None` for an empty one, which the builder
-                // skips rather than reporting an account with nothing to report.
-                |account_id, _| {
-                    store
-                        .exemption_details(account_id, now)
-                        .map(|details| (account_id.to_string(), details))
+                // Every account this read answers for is reported, whether or not
+                // this service holds an exemption for it: the entry carries the
+                // inheritance indicator either way, and the exemptions only where
+                // there are some — the one projection the batch read uses too.
+                |account_id, ()| {
+                    Some((
+                        account_id.to_string(),
+                        store.exemption_details(account_id, now),
+                    ))
                 },
             )
         };

@@ -141,7 +141,10 @@ fn addressed(row: &Row) -> String {
 /// covers for the ones that do.
 fn entry(registration_type: &str, country_code: &str) -> Value {
     json!({
-        "registrationId": format!("{registration_type}-0000000001"),
+        "registrationId": crate::fidelity_rules::number_of_type(
+            registration_type,
+            Some(country_code),
+        ),
         "registrationType": registration_type,
         "legalName": "Example Holdings",
         "legalAddress": {
@@ -662,7 +665,10 @@ fn holding_entry(holding: &Holding) -> Value {
     match holding.submitted_country_code {
         Some(country_code) => entry(holding.registration_type, country_code),
         None => json!({
-            "registrationId": format!("{}-0000000001", holding.registration_type),
+            "registrationId": crate::fidelity_rules::number_of_type(
+                holding.registration_type,
+                None,
+            ),
             "registrationType": holding.registration_type,
             "legalName": "Example Holdings",
         }),

@@ -310,6 +310,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_tax_registration_entry(entry)
             .map_err(PutTaxRegistrationErrorModeled::ValidationException)?;
 
+        // And the submitted NUMBER, judged last of the entry's facts by the same
+        // one judgement the batch write makes: a number its jurisdiction's
+        // authority does not issue is refused here with the modelled
+        // `ValidationException` naming the member that carried it, rather than
+        // stored and failed afterwards.
+        crate::state::check_registration_number(entry)
+            .map_err(|refusal| {
+                PutTaxRegistrationErrorModeled::ValidationException(refusal.into_validation())
+            })?;
+
         // A write replaces the account's record and bumps its revision, which the
         // document access tokens derived from it carry — unless the record it
         // would replace is a TRN whose validation is still outstanding, which the

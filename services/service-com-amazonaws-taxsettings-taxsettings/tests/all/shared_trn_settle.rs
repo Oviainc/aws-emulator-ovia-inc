@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    ComAmazonawsTaxsettingsTaxsettingsState, STATUS_PENDING, STATUS_REJECTED, STATUS_VERIFIED,
+    ComAmazonawsTaxsettingsTaxsettingsState, STATUS_PENDING, STATUS_VERIFIED,
     TRN_VALIDATION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -158,6 +158,15 @@ impl Kind {
         }
     }
 
+    /// Put the store in the state this kind of write needs: a supplemental
+    /// registration supplements the account's own, so the account must already
+    /// hold a settled registration of its own for such a write to be reached.
+    fn prepare(self, engine: &Arc<engine::InMemoryEngine>) {
+        if matches!(self, Self::Supplemental) {
+            crate::supplemental_tax_registrations::hold_a_settled_own_registration(engine);
+        }
+    }
+
     /// Point the validation of every stored registration of this kind at `due`,
     /// the way the clock would have.
     ///
@@ -215,32 +224,30 @@ struct Row {
     settles_to: &'static str,
 }
 
-/// One registration of each kind that passes its validation and one of each kind
-/// whose outcome is whatever its jurisdiction's published structure makes it, so
-/// the settle rule is driven with both terminal statuses it can write.
+/// One registration of each kind, driven through the settle rule the clock owes.
 ///
-/// The German numbers differ only in the check digit the issuing authority
-/// publishes for the eight digits before it, so the `Rejected` row fails for the
-/// number alone. Supplemental registration is held only for jurisdictions
+/// Every number below is one its jurisdiction's authority issues, because the
+/// write refuses any other (`state::check_registration_number`, pinned in
+/// `tests/all/trn_validation_outcome.rs`): what this table varies is the KIND of
+/// record the shared rule has to move and the spelling its number was stored in.
+/// Supplemental registration is held only for jurisdictions
 /// `crate::state::SUPPLEMENTAL_TRN_COUNTRIES` names, and this service holds no
 /// published structure for that jurisdiction's numbers
 /// (`crate::state::registration_number`), so nothing contradicts either
-/// supplemental number and both pass — the outcome is a separate rule, with its
-/// own suite in `tests/all/trn_validation_outcome.rs`; what this table varies is
-/// the status the shared rule has to write.
+/// supplemental number.
 fn rows() -> Vec<Row> {
     vec![
         Row {
-            case: "an own TRN whose check digit is the published one",
+            case: "an own TRN carrying its country prefix",
             kind: Kind::OwnTrn,
             registration_id: "DE136695976",
             settles_to: STATUS_VERIFIED,
         },
         Row {
-            case: "an own TRN whose check digit is not the published one",
+            case: "the same own TRN written without that prefix",
             kind: Kind::OwnTrn,
-            registration_id: "DE123456789",
-            settles_to: STATUS_REJECTED,
+            registration_id: "136695976",
+            settles_to: STATUS_VERIFIED,
         },
         Row {
             case: "a supplemental TRN written with the separators the register prints",
@@ -272,6 +279,7 @@ async fn every_kind_of_registration_settles_by_the_shared_rule() {
                 row.kind.operation()
             );
             let (router, engine) = emulator_with_engine();
+            row.kind.prepare(&engine);
             let written = row.kind.store(&router, row.registration_id).await;
             assert_eq!(
                 written.status, 200,
@@ -326,6 +334,7 @@ async fn a_write_of_either_kind_stores_one_outstanding_validation() {
     for row in rows() {
         let case = format!("{} ({:?})", row.case, row.registration_id);
         let (router, engine) = emulator_with_engine();
+        row.kind.prepare(&engine);
         let before = Instant::now();
         let written = row.kind.store(&router, row.registration_id).await;
         let after = Instant::now();

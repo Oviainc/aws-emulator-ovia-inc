@@ -36,7 +36,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    STATUS_PENDING, STATUS_VERIFIED, TYPES_BLOCKED_BY_A_STORED_TYPE,
+    ERROR_CODE_GENERAL_CONFLICT, STATUS_PENDING, STATUS_VERIFIED, TYPES_BLOCKED_BY_A_STORED_TYPE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -162,7 +162,7 @@ const CASES: &[Case] = &[
             Account {
                 id: SECOND_ACCOUNT,
                 world: World::Outstanding(UNBLOCKED_TYPE),
-                expected: Expected::Refused(None),
+                expected: Expected::Refused(Some(ERROR_CODE_GENERAL_CONFLICT)),
             },
             Account {
                 id: THIRD_ACCOUNT,
@@ -184,7 +184,7 @@ const CASES: &[Case] = &[
             Account {
                 id: SECOND_ACCOUNT,
                 world: World::Outstanding(OTHER_TYPE),
-                expected: Expected::Refused(None),
+                expected: Expected::Refused(Some(ERROR_CODE_GENERAL_CONFLICT)),
             },
             Account {
                 id: FIRST_ACCOUNT,
@@ -201,12 +201,12 @@ const CASES: &[Case] = &[
             Account {
                 id: FIRST_ACCOUNT,
                 world: World::Outstanding(OTHER_TYPE),
-                expected: Expected::Refused(None),
+                expected: Expected::Refused(Some(ERROR_CODE_GENERAL_CONFLICT)),
             },
             Account {
                 id: SECOND_ACCOUNT,
                 world: World::Outstanding(UNBLOCKED_TYPE),
-                expected: Expected::Refused(None),
+                expected: Expected::Refused(Some(ERROR_CODE_GENERAL_CONFLICT)),
             },
             Account {
                 id: THIRD_ACCOUNT,
@@ -228,7 +228,7 @@ const CASES: &[Case] = &[
             Account {
                 id: SECOND_ACCOUNT,
                 world: World::Outstanding(UNBLOCKED_TYPE),
-                expected: Expected::Refused(None),
+                expected: Expected::Refused(Some(ERROR_CODE_GENERAL_CONFLICT)),
             },
         ],
     },
@@ -268,7 +268,7 @@ const CASES: &[Case] = &[
             Account {
                 id: NEWCOMER_ACCOUNT,
                 world: World::HoldsNothing,
-                expected: Expected::Refused(None),
+                expected: Expected::Refused(Some(ERROR_CODE_GENERAL_CONFLICT)),
             },
         ],
     },
@@ -290,7 +290,7 @@ const CASES: &[Case] = &[
             Account {
                 id: NEWCOMER_ACCOUNT,
                 world: World::HoldsNothing,
-                expected: Expected::Refused(None),
+                expected: Expected::Refused(Some(ERROR_CODE_GENERAL_CONFLICT)),
             },
         ],
     },
@@ -307,7 +307,7 @@ const CASES: &[Case] = &[
             Account {
                 id: SECOND_ACCOUNT,
                 world: World::Outstanding(OTHER_TYPE),
-                expected: Expected::Refused(None),
+                expected: Expected::Refused(Some(ERROR_CODE_GENERAL_CONFLICT)),
             },
             Account {
                 id: THIRD_ACCOUNT,
@@ -439,10 +439,13 @@ async fn one_call_reports_each_refusal_with_the_code_that_refusal_publishes() {
                 "case {case_name:?}: the row for {account_id} must say why, got {rows:?}"
             );
             // A code a row does carry is one of the codes this service
-            // publishes, so it can never be read as an exception shape name.
+            // publishes — a value of the model's `ValidationExceptionErrorCode`
+            // enum, or the one code the conflict class publishes — so it can
+            // never be read as an exception shape name.
             if let Some(code) = code {
                 assert!(
-                    VALIDATION_EXCEPTION_ERROR_CODES.contains(&code.as_str()),
+                    VALIDATION_EXCEPTION_ERROR_CODES.contains(&code.as_str())
+                        || code == ERROR_CODE_GENERAL_CONFLICT,
                     "case {case_name:?}: {code:?} is not a code this service publishes, \
                      got {rows:?}"
                 );

@@ -54,10 +54,43 @@ fn legal_address() -> Value {
     })
 }
 
+/// The `registrationId` an entry of `registration_type`, held in
+/// `country_code`, carries.
+///
+/// A write refuses a number its jurisdiction's authority does not issue
+/// (`state::check_registration_number`), so a jurisdiction and type this service
+/// publishes a structure for carries a number that satisfies it — the layout and
+/// check digits that authority publishes — and every other pair a plain
+/// synthetic id, which no published structure judges. `None` is a jurisdiction
+/// the entry does not name, which the service reads off the type itself.
+pub(crate) fn number_of_type(registration_type: &str, country_code: Option<&str>) -> String {
+    match (registration_type, country_code.unwrap_or_default()) {
+        // Nine digits closed by the check digit Germany's rule computes for the
+        // eight before it, and France's two-digit key over its SIREN.
+        ("VAT", "DE") => "DE136695976".to_string(),
+        ("VAT", "FR") => "FR15345678901".to_string(),
+        // Kenya's published PIN layout, India's GSTIN and PAN layouts.
+        ("TIN", "KE") => "P051234567M".to_string(),
+        ("GST", _) => "29ABCDE1234F1Z5".to_string(),
+        ("PAN", _) => "ABCDE1234F".to_string(),
+        // The check digits Brazil's two registers publish for these bodies.
+        ("CNPJ", _) => "11222333000181".to_string(),
+        ("CPF", _) => "11144477735".to_string(),
+        _ => format!("{registration_type}-0000000001"),
+    }
+}
+
 /// An entry of `registration_type`, with a legal address or without one.
 fn entry_of_type(registration_type: &str, with_address: bool) -> Value {
+    let country_code = with_address.then(|| {
+        legal_address()
+            .get("countryCode")
+            .and_then(Value::as_str)
+            .expect("the legal address names its country")
+            .to_string()
+    });
     let mut entry = json!({
-        "registrationId": format!("{registration_type}-0000000001"),
+        "registrationId": number_of_type(registration_type, country_code.as_deref()),
         "registrationType": registration_type,
         "legalName": "Example Holdings",
     });
@@ -252,29 +285,31 @@ async fn a_type_whose_address_is_derived_refuses_a_submitted_legal_address() {
 #[tokio::test]
 async fn a_submitted_trn_is_pending_until_its_validation_is_due_then_settles() {
     // The span the clock owes is the project's 250-750 ms band: never zero, so a
-    // caller reading straight after the write still sees `Pending`.
+    // caller reading straight after the write still sees `Pending` — and still
+    // meets the refusals that status carries.
     assert!(
         (Duration::from_millis(250)..=Duration::from_millis(750)).contains(&TRN_VALIDATION_DELAY),
         "the owed validation must fall due 250-750 ms out, got {TRN_VALIDATION_DELAY:?}"
     );
 
-    // Rows differ in the type, the sector, whether documents were submitted and
-    // whether the submitted number satisfies the structure its jurisdiction
-    // publishes for it: the TIMING is not a function of any of them, and the
-    // outcome is a function of the last. What each outcome follows from is pinned
-    // in `tests/all/trn_validation_outcome.rs`.
+    // Rows differ in the type, the sector and whether documents were submitted:
+    // neither the TIMING nor the outcome is a function of any of them — every
+    // number a write ADMITTED is one the validation finds no fault in, and a
+    // number its jurisdiction's authority does not issue is refused by the write
+    // instead of stored, which is pinned in
+    // `tests/all/trn_validation_outcome.rs`.
     let rows: &[(&str, Value, &str)] = &[
         (
             "VAT entry",
             json!({
-                "registrationId": "DE123456789",
+                // Nine digits closed by the check digit Germany's rule computes
+                // for the eight before it.
+                "registrationId": "DE136695976",
                 "registrationType": "VAT",
                 "legalName": "Acme GmbH",
                 "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
             }),
-            // Nine digits, but not the check digit Germany's rule computes for
-            // the eight before it, so the validation of this number fails.
-            STATUS_REJECTED,
+            STATUS_VERIFIED,
         ),
         (
             "GST entry with a sector",
@@ -539,7 +574,7 @@ fn one(clause: &str) -> Stated {
 /// exactly one member away from valid.
 fn valid_entry() -> Value {
     json!({
-        "registrationId": "DE123456789",
+        "registrationId": "DE136695976",
         "registrationType": "VAT",
         "legalName": "Acme GmbH",
         "legalAddress": { "postalCode": "10115", "countryCode": "DE" },

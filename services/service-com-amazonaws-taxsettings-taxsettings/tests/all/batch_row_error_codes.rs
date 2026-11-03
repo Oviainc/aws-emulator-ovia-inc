@@ -35,7 +35,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
     type_jurisdiction, type_with_derived_legal_address, ComAmazonawsTaxsettingsTaxsettingsState,
     StoredTaxRegistration, COUNTRIES_WITH_NON_API_REGISTRATION_DELETE,
-    ERROR_CODE_FIELD_VALIDATION_FAILED, MAX_STORED_REGISTRATIONS, TYPES_BLOCKED_BY_A_STORED_TYPE,
+    ERROR_CODE_FIELD_VALIDATION_FAILED, ERROR_CODE_GENERAL_CONFLICT, MAX_STORED_REGISTRATIONS,
+    TYPES_BLOCKED_BY_A_STORED_TYPE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -89,14 +90,17 @@ enum Refusal {
 
 impl Refusal {
     /// The service-defined code the row must carry, or `None` for a class this
-    /// service publishes no code for: it publishes none for a missing resource
-    /// or a state conflict, which is why the exceptions for those classes carry
-    /// no `errorCode` on the wire either.
+    /// service publishes no code for: it publishes none for a missing resource,
+    /// which is why that class's exception carries no `errorCode` on the wire
+    /// either, and one code for the whole conflict class.
     const fn code(self) -> Option<&'static str> {
         match self {
             Self::CarvedOutJurisdiction(_) => Some(ERROR_CODE_FIELD_VALIDATION_FAILED),
             Self::BlockedRegistrationType { code, .. } => Some(code),
-            Self::HoldsNothing | Self::OutstandingTrn | Self::NoRoomForANewRecord => None,
+            Self::OutstandingTrn | Self::NoRoomForANewRecord => {
+                Some(ERROR_CODE_GENERAL_CONFLICT)
+            }
+            Self::HoldsNothing => None,
         }
     }
 
@@ -362,10 +366,13 @@ async fn a_batch_row_carries_the_service_code_of_the_refusal_it_reports() {
             "case {case:?}: the row must say why, got {rows:?}"
         );
         // Whatever the class, a code the row does carry is one of the codes this
-        // service publishes, so it can never be read as a shape name.
+        // service publishes — a value of the model's `ValidationExceptionErrorCode`
+        // enum, or the one code the conflict class publishes — so it can never be
+        // read as a shape name.
         if let Some(code) = code {
             assert!(
-                VALIDATION_EXCEPTION_ERROR_CODES.contains(&code.as_str()),
+                VALIDATION_EXCEPTION_ERROR_CODES.contains(&code.as_str())
+                    || code == ERROR_CODE_GENERAL_CONFLICT,
                 "case {case:?}: {code:?} is not a code this service publishes, got {rows:?}"
             );
             assert!(

@@ -195,10 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `exemptionType` is a free-form string the model constrains only in
         // length (1..=200) and by a pattern admitting every character, and it
-        // enumerates no legal values for it: the token is admitted on those
-        // constraints and recorded as submitted, so a type the real service
-        // supports is never refused against a collection whose wording is this
-        // emulator's own (see `crate::state::submitted_exemption_type`).
+        // enumerates no legal values for it: a token that names no entry of the
+        // published collection is admitted on those constraints and recorded as
+        // submitted (see `crate::state::submitted_exemption_type`), so a type the
+        // real service supports is never refused against a collection whose
+        // wording is this emulator's own.
         //
         // `Authority$state` carries the model's non-blank pattern
         // `^(?!\s*$)[\s\S]+$`, a negative lookahead the boundary validator's
@@ -211,6 +212,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_not_blank("authority.state", submitted_state)
                 .map_err(PutTaxExemptionErrorModeled::ValidationException)?;
         }
+
+        // A type the published collection DOES carry says where it applies, and a
+        // submission that claims it somewhere else has nothing to be granted
+        // under: it is refused before anything is recorded, naming the member at
+        // fault ([`crate::state::check_exemption_authority`]).
+        crate::state::check_exemption_authority(&input.exemption_type, &input.authority)
+            .map_err(PutTaxExemptionErrorModeled::ValidationException)?;
 
         let mut store = state.lock();
         // Every account id the request names is written for: the boundary already

@@ -250,7 +250,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "German VAT entry carrying no legal name",
             entry: json!({
-                "registrationId": "DE123456789",
+                "registrationId": "DE136695976",
                 "registrationType": "VAT",
                 "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
             }),
@@ -548,7 +548,10 @@ async fn a_filled_in_address_is_reported_as_the_registration_s_jurisdiction() {
             &json!({
                 "accountId": ACCOUNT_ID,
                 "taxRegistrationEntry": {
-                    "registrationId": format!("{registration_type}-0000000001"),
+                    "registrationId": crate::fidelity_rules::number_of_type(
+                        registration_type,
+                        Some(country_code),
+                    ),
                     "registrationType": registration_type,
                     "legalName": "Example Holdings",
                 },

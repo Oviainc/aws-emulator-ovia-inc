@@ -38,17 +38,19 @@ use crate::ops::types::{
 /// validation occurring on the TRN, the status can be Verified, Pending or
 /// Rejected."
 pub const STATUS_PENDING: &str = "Pending";
-/// See [`STATUS_PENDING`]: the validation of the submitted TRN succeeded, which
-/// is what a stored registration whose number satisfies its jurisdiction's
-/// published structure reaches once that validation falls due — see
+/// See [`STATUS_PENDING`]: the validation of the submitted TRN found no fault,
+/// which is what a stored registration whose number its jurisdiction's authority
+/// CONFIRMS reaches once that validation falls due — see
 /// [`trn_validation_status`].
 pub const STATUS_VERIFIED: &str = "Verified";
 /// See [`STATUS_PENDING`]: the validation of the submitted TRN failed, which is
-/// what a stored registration whose number does NOT satisfy that structure
-/// reaches — see [`trn_validation_status`]. Accepting the entry and failing its
-/// validation are separate facts: the write admits an entry its structural and
-/// per-country rules do not refuse ([`check_tax_registration_entry`]), and the
-/// validation that follows judges the submitted NUMBER.
+/// what a stored registration whose number that authority's own rule does NOT
+/// confirm reaches — see [`trn_validation_status`]. Being WRITTEN the way such a
+/// number is written and being CONFIRMED by the authority's rule are separate
+/// facts, answered at separate times: the write refuses a value that is not
+/// written that way at all ([`check_registration_number`]) and the validation
+/// that follows judges whether the number it stored is one the register
+/// confirms.
 pub const STATUS_REJECTED: &str = "Rejected";
 /// See [`STATUS_PENDING`]. Never reached: `DeleteTaxRegistration` REMOVES the
 /// account's record, which is what the real service does too — a read of a
@@ -60,14 +62,16 @@ pub const STATUS_DELETED: &str = "Deleted";
 /// is judged to be once the validation the write started falls due.
 ///
 /// The model documents the status as the outcome of "the validation occurring on
-/// the TRN", and that validation is about the NUMBER: the jurisdiction's
-/// authority publishes how a number of that kind is built, so a submitted number
-/// that does not satisfy the published structure is one the authority never
-/// issued and its validation fails ([`STATUS_REJECTED`]), while one that does
-/// satisfy it is contradicted by nothing this service holds and its validation
-/// succeeds ([`STATUS_VERIFIED`]). See
-/// [`registration_number::satisfies_published_structure`] for the structures and
-/// where each comes from.
+/// the TRN", and what is left for that validation to establish is whether the
+/// number the write stored is one its jurisdiction's authority confirms
+/// ([`registration_number::confirmed_by_its_authority`]): a number of the
+/// published layout whose check digit that authority's own rule does not
+/// compute is a well-formed number the register does not know, so its validation
+/// fails ([`STATUS_REJECTED`]), while one the rule confirms — or one no published
+/// rule judges — is contradicted by nothing this service holds and its
+/// validation succeeds ([`STATUS_VERIFIED`]). How the number is WRITTEN is not
+/// this question: the write already refused a value that is not written the way
+/// such a number is ([`check_registration_number`]).
 ///
 /// A function of what the write STORED — the number, its registration type and
 /// the jurisdiction the registration is held in — and of nothing else, so every
@@ -78,7 +82,7 @@ pub fn trn_validation_status(
     registration_type: &str,
     registration_id: &str,
 ) -> &'static str {
-    if registration_number::satisfies_published_structure(
+    if registration_number::confirmed_by_its_authority(
         country_code,
         registration_type,
         registration_id,
@@ -89,13 +93,15 @@ pub fn trn_validation_status(
     }
 }
 
+
 /// How long after a write the TRN's validation is due.
 ///
 /// AWS documents no span for it, so this is the emulator's own, inside the
 /// project's 250-750 ms band for a transition the clock owes: it is never zero, so
 /// a caller that reads the registration straight after writing it still sees the
-/// `Pending` the write reported, and it is short enough that a caller polling for
-/// a terminal status gets one.
+/// `Pending` the write reported — and still meets the refusals that status
+/// carries — and it is short enough that a caller polling for a terminal status
+/// gets one.
 pub const TRN_VALIDATION_DELAY: Duration = Duration::from_millis(500);
 
 /// The status and due instant a write stores a registration with.
@@ -416,6 +422,44 @@ pub const ERROR_CODE_NON_INDIA_CUSTOMER_CAN_NOT_SET_PAN: &str = "NonIndiaCustome
 /// see [`TYPES_BLOCKED_BY_A_STORED_TYPE`].
 pub const ERROR_CODE_GST_EXISTENCE_BLOCK_SET_PAN: &str = "GSTExistenceBlockSetPAN";
 
+/// The `ConflictException$errorCode` this service publishes: the code every
+/// refusal of the conflict class carries.
+///
+/// `ConflictException` is the one refusal this service answers when "the input is
+/// creating conflict with the given state"
+/// (`smithy_query(query="shape", shape="ConflictException")`), and that class has
+/// one published code and one published message
+/// ([`STATE_CONFLICT_MESSAGE`]) — neither interpolates anything from the request
+/// or from state, so every conflict of this service renders the same envelope
+/// ([`state_conflict`]).
+pub const ERROR_CODE_GENERAL_CONFLICT: &str = "GeneralConflict";
+
+/// The `message` every `ConflictException` of this service carries — the fixed
+/// text of the conflict class, as a recorded 409 of this service words it. See
+/// [`ERROR_CODE_GENERAL_CONFLICT`].
+pub const STATE_CONFLICT_MESSAGE: &str = "Operation cannot be performed due to conflict in current state.";
+
+/// The `message` the per-account row of `BatchDeleteTaxRegistration` carries for
+/// an account that holds no tax registration: the token naming the class of the
+/// refusal, as a recorded row of that class words it.
+///
+/// The single-account 404 carries that exception's own sentence instead
+/// ([`no_tax_registration`]): the two channels word this class differently, and
+/// each is recorded.
+pub const TAX_REGISTRATION_NOT_FOUND: &str = "TaxRegistrationNotFound";
+
+/// The `message` this service answers with for a submitted tax registration
+/// number that is not one its jurisdiction's authority issues: the token naming
+/// the class of the refusal, as a recorded per-account row of
+/// `BatchPutTaxRegistration` words it. See [`check_registration_number`].
+pub const INVALID_TAX_REGISTRATION_NUMBER: &str = "TCS_INVALID_TAX_REGISTRATION_NUMBER";
+
+/// The `message` `PutTaxExemption` refuses a submission with when the
+/// jurisdiction it names is not one the exemption type it names applies in — the
+/// fixed text of that refusal class. See [`check_exemption_authority`].
+pub const EXEMPTION_AUTHORITY_NOT_SUPPORTED: &str =
+    "Provided tax exemption authority is not supported for the tax exemption type.";
+
 /// The `ValidationException$errorCode` this service answers with when a request
 /// sets a `TaxRegistrationType` that belongs to ONE country
 /// ([`TYPE_JURISDICTIONS`]) for a registration held in a different country, per
@@ -720,7 +764,7 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     ///   "You can't set a TRN if there's a pending TRN. You'll need to delete the
     ///   pending TRN first", so a record in [`STATUS_PENDING`] is NOT replaced —
     ///   it is left exactly as it was and the write is refused
-    ///   ([`pending_registration_conflict`]). The validation the clock had
+    ///   ([`state_conflict`]). The validation the clock had
     ///   already made due at `written_at` is materialised first, because it was
     ///   owed at that instant whether or not anybody wrote: a TRN whose
     ///   validation has run is not an outstanding one, so it may be rewritten.
@@ -742,14 +786,14 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
                 // since it fell due.
                 stored.settle(written_at);
                 if stored.status == STATUS_PENDING {
-                    return Err(pending_registration_conflict());
+                    return Err(state_conflict());
                 }
                 Some(stored.revision)
             }
             None => None,
         };
         if previous_revision.is_none() && self.registrations.len() >= MAX_STORED_REGISTRATIONS {
-            return Err(registration_store_full());
+            return Err(state_conflict());
         }
         // Every write gets a revision past every one this account's documents
         // have already been minted under — the record's own while the store
@@ -921,44 +965,80 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     /// A read that names such an account reports it on its own per-account
     /// channel — the batch read's `failedAccounts` — so the accounts named
     /// beside it are still reported.
+    ///
+    /// Decided by MEMBERSHIP of the one set those accounts are enumerated as
+    /// ([`Self::exemption_report_accounts`]), so the listing that reports the
+    /// family and the batch read that screens a named account against it cannot
+    /// disagree about who is in it.
     pub fn reports_exemptions_for(&self, account_id: &str) -> bool {
-        account_id == ::engine::emulator_account_id()
-            || self.registrations.contains_key(account_id)
-            || self.exemptions.contains_key(account_id)
+        self.exemption_report_accounts().contains_key(account_id)
     }
 
     /// The `TaxExemptionDetails` the exemption reads report for `account_id` at
-    /// `now`, or `None` when this service holds no exemption for it.
+    /// `now`.
     ///
-    /// An account the service knows but holds no exemption for therefore gets no
-    /// entry in the reported map: the reads report the exemptions an account
-    /// has, and an account with none has nothing to report.
+    /// The ONE projection both read paths use, so `ListTaxExemptions` and
+    /// `BatchGetTaxExemptions` cannot describe one account two different ways.
+    /// Every account these reads answer for ([`Self::reports_exemptions_for`])
+    /// gets one, whether or not this service holds an exemption for it: the
+    /// details say what is known about the account's exemptions, and "it holds
+    /// none, and none is inherited" is such an answer.
     ///
-    /// The `heritageObtained*` members describe an exemption INHERITED from the
-    /// consolidated billing family's management account. No operation this
-    /// service models records such an inheritance — the same reason
-    /// `ListTaxRegistrations` reports no `taxInheritanceDetails` — so there is
-    /// nothing stored to report and they stay absent.
-    pub fn exemption_details(
-        &self,
-        account_id: &str,
-        now: SystemTime,
-    ) -> Option<TaxExemptionDetails> {
-        let stored = self.exemptions.get(account_id)?;
-        if stored.is_empty() {
-            return None;
-        }
-        Some(TaxExemptionDetails {
+    /// `taxExemptions` therefore carries the records this service holds and is
+    /// EMPTY for an account holding none — the member is this read's payload, so
+    /// an empty list says "it holds none" where an absent one would leave a
+    /// client unable to tell that from a response that did not answer. The same
+    /// reason reports `heritageObtainedDetails` ALWAYS: the model declares a
+    /// boolean, documented as "the indicator if the tax exemption is inherited
+    /// from the consolidated billing family management account", and a client
+    /// branching on inheritance must be able to tell "not inherited" from "the
+    /// service did not say". It is false for every account: no operation this
+    /// service models records an exemption inherited from a family management
+    /// account — the same reason `ListTaxRegistrations` reports no
+    /// `taxInheritanceDetails` — so nothing is inherited, and the parent entity
+    /// and the reason such an inheritance would be described by stay absent
+    /// because there is no inheritance to describe.
+    pub fn exemption_details(&self, account_id: &str, now: SystemTime) -> TaxExemptionDetails {
+        TaxExemptionDetails {
             tax_exemptions: Some(
-                stored
-                    .iter()
-                    .map(|exemption| exemption.to_tax_exemption(now))
-                    .collect(),
+                self.exemptions
+                    .get(account_id)
+                    .map(|stored| {
+                        stored
+                            .iter()
+                            .map(|exemption| exemption.to_tax_exemption(now))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             ),
-            heritage_obtained_details: None,
+            heritage_obtained_details: Some(false),
             heritage_obtained_parent_entity: None,
             heritage_obtained_reason: None,
-        })
+        }
+    }
+
+    /// The accounts the exemption reads answer for, in account-id order: the
+    /// caller's own account — which is in its own consolidated billing family
+    /// whatever it holds — and every account whose tax settings this service
+    /// holds, which are the only accounts it is ever told about.
+    ///
+    /// The ONE statement of that membership rule: `ListTaxExemptions`
+    /// enumerates this set and [`Self::reports_exemptions_for`] asks it whether
+    /// one account is in it, so the listing and the batch read cannot describe
+    /// two different families.
+    ///
+    /// A map rather than a set so the listing pages over it through the one
+    /// shared page builder ([`build_page`]), whose cursor names the account the
+    /// previous page stopped after; the entries carry no value of their own
+    /// because the details are projected from the store by
+    /// [`Self::exemption_details`].
+    pub fn exemption_report_accounts(&self) -> BTreeMap<String, ()> {
+        let mut accounts: BTreeMap<String, ()> = BTreeMap::new();
+        accounts.insert(::engine::emulator_account_id().to_string(), ());
+        for account_id in self.registrations.keys().chain(self.exemptions.keys()) {
+            accounts.insert(account_id.clone(), ());
+        }
+        accounts
     }
 
     /// The `authorityId` of the stored supplemental TRN with this type and
@@ -1032,27 +1112,67 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     /// then carries the members the LAST write submitted, that number included,
     /// as submitted.
     ///
-    /// One refusal, the modelled `ConflictException`: `registrationId` is
-    /// caller-supplied, so a write that would ADD a record is refused once the
-    /// store holds as many supplemental registrations as this emulator keeps
-    /// resident ([`MAX_STORED_SUPPLEMENTAL_REGISTRATIONS`],
-    /// [`supplemental_store_full`]) while rewriting a TRN the store already holds
-    /// adds nothing and is always allowed. A refused write stores nothing and
-    /// mints no id.
+    /// Three refusals, each the modelled `ConflictException` ([`state_conflict`]),
+    /// and a refused write stores nothing and mints no id:
+    ///
+    /// * a supplemental tax registration SUPPLEMENTS the account's own: the
+    ///   account must therefore hold a tax registration whose validation has
+    ///   already run, and a write for an account that holds none — or whose own
+    ///   TRN is still outstanding — conflicts with the account's current state.
+    ///   The validation the clock had already made due at `written_at` is
+    ///   materialised first, because it was owed at that instant whether or not
+    ///   anybody wrote.
+    /// * the supplemental record the write addresses has a validation still
+    ///   outstanding: the service documents the rule for an account's TRN — "You
+    ///   can't set a TRN if there's a pending TRN. You'll need to delete the
+    ///   pending TRN first"
+    ///   (`smithy_query(query="doc",shape="com.amazonaws.taxsettings#PutTaxRegistration")`)
+    ///   — and a supplemental TRN is a tax registration of the same account, held
+    ///   in the same store and validated by the same clock-owed rule
+    ///   ([`TrnValidation`]), so a record in [`STATUS_PENDING`] is NOT replaced:
+    ///   it is left exactly as it was.
+    /// * `registrationId` is caller-supplied, so a write that would ADD a record
+    ///   is refused once the store holds as many supplemental registrations as
+    ///   this emulator keeps resident ([`MAX_STORED_SUPPLEMENTAL_REGISTRATIONS`])
+    ///   while rewriting a TRN the store already holds adds nothing.
     pub fn store_supplemental_registration(
         &mut self,
         entry: &SupplementalTaxRegistrationEntry,
         written_at: Instant,
     ) -> Result<(String, String), ConflictException> {
+        // A supplemental registration supplements the account's own, so the
+        // account's state must carry one whose validation has already run.
+        let own_account = ::engine::emulator_account_id().to_string();
+        match self.registrations.get_mut(&own_account) {
+            Some(stored) => {
+                stored.settle(written_at);
+                if stored.status != STATUS_VERIFIED {
+                    return Err(state_conflict());
+                }
+            }
+            None => return Err(state_conflict()),
+        }
         let authority_id = match self
             .find_supplemental_authority(&entry.registration_type, &entry.registration_id)
         {
-            Some(authority_id) => authority_id,
+            Some(authority_id) => {
+                if let Some(held) = self.supplemental_registrations.get_mut(&authority_id) {
+                    // Settle what the clock owed at this instant before judging
+                    // the record's status, so "outstanding" means a validation
+                    // that is genuinely still running rather than one nobody has
+                    // read since it fell due.
+                    held.settle(written_at);
+                    if held.status == STATUS_PENDING {
+                        return Err(state_conflict());
+                    }
+                }
+                authority_id
+            }
             None => {
                 if self.supplemental_registrations.len()
                     >= MAX_STORED_SUPPLEMENTAL_REGISTRATIONS
                 {
-                    return Err(supplemental_store_full());
+                    return Err(state_conflict());
                 }
                 self.mint_supplemental_authority_id()
             }
@@ -1264,8 +1384,8 @@ impl StoredSupplementalRegistration {
 
 impl TrnValidation for StoredSupplementalRegistration {
     /// What the validation of this supplemental TRN reaches: the number it was
-    /// stored with, judged against the structure the jurisdiction it is held in
-    /// publishes — see [`trn_validation_status`].
+    /// stored with, judged against the rule the jurisdiction it is held in
+    /// publishes for confirming one — see [`trn_validation_status`].
     fn validation_outcome(&self) -> &'static str {
         trn_validation_status(
             &self.address.country_code,
@@ -1518,8 +1638,8 @@ impl StoredTaxRegistration {
 
 impl TrnValidation for StoredTaxRegistration {
     /// What the validation of this TRN reaches: the number it was stored with,
-    /// judged against the structure the jurisdiction it is held in publishes for
-    /// its registration type — see [`trn_validation_status`].
+    /// judged against the rule the jurisdiction it is held in publishes for
+    /// confirming one — see [`trn_validation_status`].
     ///
     /// Read from the stored record, so the outcome was fixed by the write and
     /// every reader of this record settles it identically.
@@ -3399,8 +3519,10 @@ pub fn check_country_requirements(
 /// left to the boundary validator is spelled out on the helpers this calls and in
 /// `ops/put_tax_registration.rs`.
 ///
-/// Everything judged here is a fact about the ENTRY alone. The refusals that
-/// depend on what the account already holds are
+/// Everything judged here is a fact about the ENTRY alone, bar the submitted
+/// NUMBER, which [`check_registration_number`] judges on its own because the two
+/// writers report that refusal on different channels. The refusals that depend
+/// on what the account already holds are
 /// [`ComAmazonawsTaxsettingsTaxsettingsState::check_registration_type_against_stored`],
 /// which each writer applies per account.
 pub fn check_tax_registration_entry(
@@ -3478,6 +3600,101 @@ pub fn check_tax_registration_entry(
     // `TaxRegistrationEntry`, keyed off the jurisdiction it identifies. They run
     // last because they are about an entry that is otherwise storable.
     check_country_requirements(entry)
+}
+
+/// Refuse a submitted tax registration NUMBER that is not WRITTEN the way its
+/// jurisdiction's authority writes one.
+///
+/// The authority publishes how a number of that kind is written — its length and
+/// its character layout
+/// ([`registration_number::satisfies_published_layout`]) — so a value that is
+/// not written that way is not a registration number of that type at all, and
+/// the write refuses it as it reads the request rather than storing it. Whether
+/// a number of that layout is CONFIRMED by the authority's own rule (its check
+/// digit) is the separate question the validation a write starts answers
+/// ([`trn_validation_status`]): such a number is stored, and its validation
+/// reaches its own outcome. A jurisdiction and type this service publishes no
+/// layout for is not judged, so such an entry is admitted.
+///
+/// Its own step, beside [`check_tax_registration_entry`], because the two
+/// writers report it on DIFFERENT channels: `PutTaxRegistration` answers the
+/// modelled `ValidationException` ([`invalid_registration_number`]), while
+/// `BatchPutTaxRegistration` reports it per account in its `errors` list — the
+/// channel that names the accounts the TRN information could not be added to —
+/// and still answers 200. Judged LAST of the entry's facts, after
+/// [`check_tax_registration_entry`], so a request that also breaks a rule about
+/// the entry's members is told about that member rather than about the number.
+pub fn check_registration_number(
+    entry: &TaxRegistrationEntry,
+) -> Result<(), InvalidRegistrationNumber> {
+    let Some(country_code) = entry_country_code(entry) else {
+        return Ok(());
+    };
+    check_number(country_code, &entry.registration_type, &entry.registration_id)
+}
+
+/// The same refusal as [`check_registration_number`] for a SUPPLEMENTAL TRN:
+/// one number is judged one way whichever kind of registration holds it, the
+/// jurisdiction being the country of the address the entry carries.
+pub fn check_supplemental_registration_number(
+    entry: &SupplementalTaxRegistrationEntry,
+) -> Result<(), InvalidRegistrationNumber> {
+    check_number(
+        &entry.address.country_code,
+        &entry.registration_type,
+        &entry.registration_id,
+    )
+}
+
+/// The one judgement both number checks make.
+fn check_number(
+    country_code: &str,
+    registration_type: &str,
+    registration_id: &str,
+) -> Result<(), InvalidRegistrationNumber> {
+    if registration_number::satisfies_published_layout(
+        country_code,
+        registration_type,
+        registration_id,
+    ) {
+        Ok(())
+    } else {
+        Err(InvalidRegistrationNumber)
+    }
+}
+
+/// Why a write of a tax registration was refused: the submitted number is not
+/// one its jurisdiction's authority issues — see [`check_registration_number`].
+///
+/// Its own refusal class, rather than a bare `ValidationException`, because what
+/// each writer reports for it differs: the message is the class's own token
+/// ([`INVALID_TAX_REGISTRATION_NUMBER`]) whichever path renders it, and a
+/// per-account row of this class carries NO `code` (see [`BatchRowErrorCode`]).
+#[derive(Debug, Clone, Copy)]
+pub struct InvalidRegistrationNumber;
+
+impl InvalidRegistrationNumber {
+    /// The refusal's message: the token this service words the class with, one
+    /// wording whichever path renders it.
+    pub fn message(self) -> String {
+        INVALID_TAX_REGISTRATION_NUMBER.to_string()
+    }
+
+    /// The modelled `ValidationException` (HTTP 400) a single-record write
+    /// answers this refusal with.
+    pub fn into_validation(self) -> ValidationException {
+        invalid_registration_number()
+    }
+}
+
+/// This service publishes no code for an invalid tax registration number: the
+/// class's token is the row's `message`, and a recorded row of this class
+/// carries no `code` at all — so the member is left off the wire rather than
+/// filled with the `errorCode` of the exception the single-record write renders.
+impl BatchRowErrorCode for InvalidRegistrationNumber {
+    fn row_error_code(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Whether this emulator stores a supplemental TRN for `country_code`, with the
@@ -3589,11 +3806,17 @@ pub enum RegistrationDeleteRefusal {
 }
 
 impl RegistrationDeleteRefusal {
-    /// The refusal's message, as the modelled exception carries it: one wording
-    /// per refusal, whichever path renders it.
-    pub fn into_message(self) -> String {
+    /// The message the refusal is reported with on the channel that renders it.
+    ///
+    /// A refusal the API answers as an EXCEPTION carries that exception's own
+    /// sentence; the per-account row of the batch delete carries the token this
+    /// service words the class with ([`TAX_REGISTRATION_NOT_FOUND`]), which is
+    /// what a recorded row of the missing-registration class carries. The
+    /// jurisdiction carve-out has no such token, so its row carries the
+    /// exception's sentence.
+    pub fn into_row_message(self) -> String {
         match self {
-            Self::NotFound(error) => error.message,
+            Self::NotFound(_) => TAX_REGISTRATION_NOT_FOUND.to_string(),
             Self::NotDeletable(error) => error.message,
         }
     }
@@ -3625,11 +3848,12 @@ impl BatchRowErrorCode for ValidationException {
     }
 }
 
-/// This service publishes no code for a state conflict — the member is
-/// unsupported on the exception for that reason.
+/// A state conflict publishes one code for the whole class
+/// ([`ERROR_CODE_GENERAL_CONFLICT`]), so a row rendering one reports it, exactly
+/// as the 409 response does.
 impl BatchRowErrorCode for ConflictException {
     fn row_error_code(&self) -> Option<String> {
-        None
+        (!self.error_code.is_empty()).then(|| self.error_code.clone())
     }
 }
 
@@ -3661,53 +3885,50 @@ impl BatchRowErrorCode for RegistrationDeleteRefusal {
 /// publishes no code for a missing resource (`ErrorCode` is a free-form string,
 /// unlike the `ValidationExceptionErrorCode` enum), so the member is left off the
 /// wire rather than filled with the shape name; see `ops/types/shared_types.rs`.
-/// The message names no account: the request that asked already names it.
+/// The message names no account: the request that asked already names it. It is
+/// the sentence the EXCEPTION carries; the per-account row of the batch delete
+/// carries the class's own token instead
+/// ([`RegistrationDeleteRefusal::into_row_message`]), which is how a recording
+/// of each channel words this class.
 pub fn no_tax_registration() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: "No tax registration found".to_string(),
     }
 }
 
-/// This service's modelled `ConflictException` (HTTP 409) for a write that would
-/// take the store past [`MAX_STORED_REGISTRATIONS`]. It carries its `message`
-/// only, for the reason [`no_tax_registration`] gives.
-pub fn registration_store_full() -> ConflictException {
-    ConflictException {
-        message: format!(
-            "This emulator keeps at most {MAX_STORED_REGISTRATIONS} tax registrations resident. \
-             Delete one before adding another."
-        ),
-    }
-}
-
-/// This service's modelled `ConflictException` (HTTP 409) for a write aimed at
-/// an account whose stored TRN is still [`STATUS_PENDING`].
+/// This service's modelled `ConflictException` (HTTP 409): the envelope EVERY
+/// refusal of the conflict class carries.
 ///
-/// Both writers of a tax registration document the rule: "You can't set a TRN if
-/// there's a pending TRN. You'll need to delete the pending TRN first"
-/// (`smithy_query(query="doc",shape="com.amazonaws.taxsettings#PutTaxRegistration")`,
-/// and the same sentence on `BatchPutTaxRegistration`). The 409 class and the
-/// `ConflictException` shape are the contract; the wording below is this
-/// emulator's own statement of the rule — AWS publishes no message for it — and
-/// names no account, for the reason [`no_tax_registration`] gives.
-pub fn pending_registration_conflict() -> ConflictException {
+/// The class has one published code and one published message
+/// ([`ERROR_CODE_GENERAL_CONFLICT`], [`STATE_CONFLICT_MESSAGE`]), neither of
+/// which interpolates anything from the request or from state, so there is one
+/// envelope rather than one per site and no caller can be told a conflict two
+/// different ways. WHICH state conflicts is the business of the call sites —
+/// a stored TRN whose validation is still outstanding, and the resident bounds
+/// [`MAX_STORED_REGISTRATIONS`] / [`MAX_STORED_SUPPLEMENTAL_REGISTRATIONS`] —
+/// each of which documents its own rule where it applies it.
+pub fn state_conflict() -> ConflictException {
     ConflictException {
-        message: "You can't set a TRN while there's a pending TRN for this account. Delete the \
-                  pending TRN first."
-            .to_string(),
+        message: STATE_CONFLICT_MESSAGE.to_string(),
+        error_code: ERROR_CODE_GENERAL_CONFLICT.to_string(),
     }
 }
 
-/// This service's modelled `ConflictException` (HTTP 409) for a write that would
-/// take the supplemental store past [`MAX_STORED_SUPPLEMENTAL_REGISTRATIONS`].
-/// It carries its `message` only, for the reason [`no_tax_registration`] gives.
-pub fn supplemental_store_full() -> ConflictException {
-    ConflictException {
-        message: format!(
-            "This emulator keeps at most {MAX_STORED_SUPPLEMENTAL_REGISTRATIONS} supplemental tax \
-             registrations resident. Delete one before adding another."
-        ),
-    }
+/// This service's modelled `ValidationException` (HTTP 400) for a submitted tax
+/// registration number that is not written the way its jurisdiction's authority
+/// writes one — see [`check_registration_number`], which is where the judgement
+/// is made.
+///
+/// The message is the class's own token, which a recorded per-account row of
+/// this class carries; what AWS words the SINGLE-account 400 with is not
+/// recorded, so carrying the same token here is this emulator's inference from
+/// the row — a later fixer holding a recording of this path should follow it.
+pub fn invalid_registration_number() -> ValidationException {
+    validation(
+        ERROR_CODE_FIELD_VALIDATION_FAILED,
+        "taxRegistrationEntry.registrationId",
+        INVALID_TAX_REGISTRATION_NUMBER,
+    )
 }
 
 /// This service's modelled `InternalServerException` (HTTP 500) for a handler
@@ -3845,7 +4066,8 @@ pub type JurisdictionRow = (&'static str, Option<&'static str>);
 /// the model's `TaxExemptionType` shape.
 pub type TaxExemptionTypeRow = (&'static str, &'static str, &'static [JurisdictionRow]);
 
-/// The tax exemption types this service supports.
+/// The tax exemption types this service supports, each with the jurisdictions it
+/// applies in.
 ///
 /// Hand-written because the model declares no shape enumerating them: `TaxExemptionType`
 /// is a free-form structure, and the only thing the model says about which values are
@@ -3855,69 +4077,168 @@ pub type TaxExemptionTypeRow = (&'static str, &'static str, &'static [Jurisdicti
 /// token a caller names an exemption type by, so the descriptions below are the catalog's
 /// identifying values and are kept distinct from one another.
 ///
-/// What is claimed to match AWS: the categories of US sales-and-use-tax exemption AWS
-/// accepts a certificate for (AWS Billing and Cost Management User Guide, "Tax exemption"
-/// / "Managing your tax exemptions": tax exemptions are offered for United States sales
-/// tax, under the certificate categories a reseller, a direct-pay permit holder, a
-/// federal, state, local or tribal government body, an educational institution or a
-/// section 501(c)(3) charitable organization holds), and the single country-level
-/// jurisdiction each of them carries — `US`, with no `state`, because the exemption
-/// category is published for the country and a certificate's state is a fact about the
-/// certificate rather than about the type.
+/// What is claimed to match AWS:
 ///
-/// What is NOT claimed: the `displayName` and `description` WORDING, and the order of the
-/// entries. The model states no sentence for either member, so each is this emulator's own
-/// phrasing of a documented category, sorted by `displayName` so the collection is
-/// enumerated one stable way; a client that keys off the prose rather than off a type it
-/// already read from this catalog is reading wording the real service words differently.
+/// * the FIRST entry outright. The service's own catalog token for the charitable
+///   category is `501C`, carried by both `displayName` and `description`, and it applies
+///   in the states [`CHARITABLE_ORGANIZATION_JURISDICTIONS`] names — one `Authority` per
+///   state, as a recorded `GetTaxExemptionTypes` response publishes it.
+/// * the SHAPE of every entry: `applicableJurisdictions` enumerates one `Authority` per
+///   STATE the type applies in, because a US sales-and-use-tax exemption is granted by a
+///   state's own taxing authority and the category is not offered in every state — which
+///   is what the authority check of a submission reads
+///   ([`check_exemption_authority`]).
+/// * the categories themselves: those AWS accepts a certificate for (AWS Billing and Cost
+///   Management User Guide, "Tax exemption" / "Managing your tax exemptions": tax
+///   exemptions are offered for United States sales tax, under the certificate categories
+///   a reseller, a direct-pay permit holder, a federal, state, local or tribal government
+///   body, an educational institution or a charitable organization holds).
 ///
-/// Because that wording is not AWS's, this table only REPORTS: it is what the read
-/// publishes, and it decides nothing about a write. A submission names its type with a
-/// free-form string the model constrains only in length and pattern, so it is admitted on
-/// those constraints whether or not this table happens to spell it the same way — see
-/// [`submitted_exemption_type`].
+/// What is NOT claimed: the `displayName` and `description` WORDING of every entry but the
+/// first, the per-state list of those entries, and the number and order of the entries.
+/// The model states no sentence for either member, so each is this emulator's own phrasing
+/// of a documented category, sorted by `displayName` so the collection is enumerated one
+/// stable way; the states those categories carry are the jurisdictions that levy the tax
+/// at all ([`US_SALES_TAX_JURISDICTIONS`]), which is the widest list a category can have
+/// and the only one that follows from a published fact. A client that keys off the prose
+/// rather than off a type it already read from this catalog is reading wording the real
+/// service words differently.
+///
+/// A submission is still admitted on the constraints the model states for `exemptionType`
+/// whether or not this table spells its token the same way (see
+/// [`submitted_exemption_type`]); what the table decides about a write is where a type it
+/// DOES publish applies ([`check_exemption_authority`]).
 pub const TAX_EXEMPTION_TYPE_CATALOG: &[TaxExemptionTypeRow] = &[
-    (
-        "501(c)(3)",
-        "Charitable organization exempt under section 501(c)(3) of the US Internal Revenue Code",
-        UNITED_STATES,
-    ),
+    ("501C", "501C", CHARITABLE_ORGANIZATION_JURISDICTIONS),
     (
         "Direct Pay Permit",
         "Holder of a direct pay permit that remits sales and use tax directly to the taxing \
          authority",
-        UNITED_STATES,
+        US_SALES_TAX_JURISDICTIONS,
     ),
     (
         "Educational Institution",
         "Accredited school, college or university exempt from sales and use tax",
-        UNITED_STATES,
+        US_SALES_TAX_JURISDICTIONS,
     ),
     (
         "Federal Government",
         "US federal government body exempt from sales and use tax",
-        UNITED_STATES,
+        US_SALES_TAX_JURISDICTIONS,
     ),
     (
         "Reseller",
         "Purchases for resale, held under a resale certificate",
-        UNITED_STATES,
+        US_SALES_TAX_JURISDICTIONS,
     ),
     (
         "State or Local Government",
         "US state, county or municipal government body exempt from sales and use tax",
-        UNITED_STATES,
+        US_SALES_TAX_JURISDICTIONS,
     ),
     (
         "Tribal Government",
         "Federally recognized tribal government body exempt from sales and use tax",
-        UNITED_STATES,
+        US_SALES_TAX_JURISDICTIONS,
     ),
 ];
 
-/// The jurisdiction every entry of [`TAX_EXEMPTION_TYPE_CATALOG`] applies in: the
-/// United States as a whole. See that constant for why it carries no `state`.
-const UNITED_STATES: &[JurisdictionRow] = &[("US", None)];
+/// The jurisdictions the charitable-organization entry of
+/// [`TAX_EXEMPTION_TYPE_CATALOG`] applies in — one `Authority` per state, as a
+/// recorded `GetTaxExemptionTypes` response publishes them for that type.
+pub const CHARITABLE_ORGANIZATION_JURISDICTIONS: &[JurisdictionRow] = &[
+    ("US", Some("AZ")),
+    ("US", Some("CO")),
+    ("US", Some("CT")),
+    ("US", Some("DC")),
+    ("US", Some("FL")),
+    ("US", Some("GA")),
+    ("US", Some("ID")),
+    ("US", Some("IL")),
+    ("US", Some("IN")),
+    ("US", Some("KS")),
+    ("US", Some("KY")),
+    ("US", Some("LA")),
+    ("US", Some("MA")),
+    ("US", Some("MD")),
+    ("US", Some("MI")),
+    ("US", Some("MN")),
+    ("US", Some("MO")),
+    ("US", Some("MS")),
+    ("US", Some("ND")),
+    ("US", Some("NE")),
+    ("US", Some("NJ")),
+    ("US", Some("NV")),
+    ("US", Some("NY")),
+    ("US", Some("OH")),
+    ("US", Some("OK")),
+    ("US", Some("PA")),
+    ("US", Some("RI")),
+    ("US", Some("SC")),
+    ("US", Some("SD")),
+    ("US", Some("TN")),
+    ("US", Some("TX")),
+    ("US", Some("UT")),
+    ("US", Some("VA")),
+    ("US", Some("VT")),
+    ("US", Some("WI")),
+    ("US", Some("WV")),
+    ("US", Some("WY")),
+];
+
+/// The jurisdictions every other entry of [`TAX_EXEMPTION_TYPE_CATALOG`] applies
+/// in: the US jurisdictions that levy a general sales tax at all, by their
+/// two-letter postal codes — the fifty states and the District of Columbia less
+/// Alaska, Delaware, Montana, New Hampshire and Oregon, which impose no general
+/// sales tax, so no exemption from one is granted there.
+pub const US_SALES_TAX_JURISDICTIONS: &[JurisdictionRow] = &[
+    ("US", Some("AL")),
+    ("US", Some("AR")),
+    ("US", Some("AZ")),
+    ("US", Some("CA")),
+    ("US", Some("CO")),
+    ("US", Some("CT")),
+    ("US", Some("DC")),
+    ("US", Some("FL")),
+    ("US", Some("GA")),
+    ("US", Some("HI")),
+    ("US", Some("IA")),
+    ("US", Some("ID")),
+    ("US", Some("IL")),
+    ("US", Some("IN")),
+    ("US", Some("KS")),
+    ("US", Some("KY")),
+    ("US", Some("LA")),
+    ("US", Some("MA")),
+    ("US", Some("MD")),
+    ("US", Some("ME")),
+    ("US", Some("MI")),
+    ("US", Some("MN")),
+    ("US", Some("MO")),
+    ("US", Some("MS")),
+    ("US", Some("NC")),
+    ("US", Some("ND")),
+    ("US", Some("NE")),
+    ("US", Some("NJ")),
+    ("US", Some("NM")),
+    ("US", Some("NV")),
+    ("US", Some("NY")),
+    ("US", Some("OH")),
+    ("US", Some("OK")),
+    ("US", Some("PA")),
+    ("US", Some("RI")),
+    ("US", Some("SC")),
+    ("US", Some("SD")),
+    ("US", Some("TN")),
+    ("US", Some("TX")),
+    ("US", Some("UT")),
+    ("US", Some("VA")),
+    ("US", Some("VT")),
+    ("US", Some("WA")),
+    ("US", Some("WI")),
+    ("US", Some("WV")),
+    ("US", Some("WY")),
+];
 
 /// The catalog as the modelled `TaxExemptionType` list `GetTaxExemptionTypes`
 /// reports, in [`TAX_EXEMPTION_TYPE_CATALOG`]'s order.
@@ -4009,6 +4330,64 @@ pub fn submitted_exemption_type(exemption_type: &str, authority: &Authority) -> 
 /// (`smithy_query(query="shape", shape="TaxExemptionType")`), against the
 /// 1..=200 of the `exemptionType` a submission names a type by.
 const MAX_TYPE_DISPLAY_NAME: usize = 50;
+
+/// Refuse a submission whose `authority` is not a jurisdiction the exemption
+/// type it names applies in.
+///
+/// A US sales-and-use-tax exemption is granted by the taxing authority of the
+/// jurisdiction it is claimed in, and the published catalog says for each type
+/// which jurisdictions those are
+/// ([`TAX_EXEMPTION_TYPE_CATALOG`]`$applicableJurisdictions`), so a submission
+/// that claims a type in a jurisdiction the type does not apply in has nothing
+/// to be granted under: it is refused with the modelled `ValidationException`
+/// (HTTP 400), the `errorCode` for a field that failed validation, the fixed
+/// text of that refusal class ([`EXEMPTION_AUTHORITY_NOT_SUPPORTED`]) and
+/// `fieldList` naming the offending member — the `authority`.
+///
+/// A jurisdiction is one the type applies in when the catalog lists it for the
+/// type's country: the whole country where the entry names no state, that state
+/// where the submission names one, and the country where the submission names no
+/// state at all — such a submission claims the exemption for the country, which
+/// the type does apply in. Case and padding distinguish no jurisdiction, so they
+/// are ignored, exactly as they are where a stored exemption's jurisdiction is
+/// compared ([`is_same_exemption`]).
+///
+/// The catalog publishes a state as the two-letter postal code its taxing
+/// authority is named by, and a recorded refusal of this class names the state
+/// the same way, so that is the form a submission is compared in: a value
+/// naming the state some other way names no jurisdiction the published list
+/// carries. A recording showing a state NAME admitted would widen this
+/// comparison, and nothing else.
+///
+/// A token that names no published entry is not judged here: the collection says
+/// nothing about where a type it does not publish applies, and the submission
+/// itself is the only thing that does ([`submitted_exemption_type`]).
+pub fn check_exemption_authority(
+    exemption_type: &str,
+    authority: &Authority,
+) -> Result<(), ValidationException> {
+    let Some((_, _, jurisdictions)) = find_exemption_type(exemption_type) else {
+        return Ok(());
+    };
+    let country = authority.country.trim();
+    let claimed_state = authority.state.as_deref().map(str::trim);
+    let applies = jurisdictions.iter().any(|(published_country, published_state)| {
+        published_country.eq_ignore_ascii_case(country)
+            && match (published_state, claimed_state) {
+                (None, _) | (Some(_), None) => true,
+                (Some(published), Some(claimed)) => published.eq_ignore_ascii_case(claimed),
+            }
+    });
+    if applies {
+        Ok(())
+    } else {
+        Err(validation(
+            ERROR_CODE_FIELD_VALIDATION_FAILED,
+            "authority",
+            EXEMPTION_AUTHORITY_NOT_SUPPORTED,
+        ))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Writing a tax exemption

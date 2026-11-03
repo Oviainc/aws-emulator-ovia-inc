@@ -30,8 +30,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    ComAmazonawsTaxsettingsTaxsettingsState, StoredTaxRegistration, STATUS_PENDING,
-    STATUS_VERIFIED,
+    ComAmazonawsTaxsettingsTaxsettingsState, StoredTaxRegistration, ERROR_CODE_GENERAL_CONFLICT,
+    STATE_CONFLICT_MESSAGE, STATUS_PENDING, STATUS_VERIFIED,
 };
 
 use crate::country_rules::{document, write, WRITERS};
@@ -51,7 +51,7 @@ const BATCH_WRITER: &str = "BatchPutTaxRegistration";
 /// the STATE of the account's record, not about what the new entry says.
 fn entry_pairs() -> Vec<(&'static str, Value, Value)> {
     let vat = json!({
-        "registrationId": "DE123456789",
+        "registrationId": "DE136695976",
         "registrationType": "VAT",
         "legalName": "Acme GmbH",
         "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
@@ -237,13 +237,10 @@ fn assert_refused(case: &str, writer: &str, answer: &Answer, account_id: &str) {
             "case {case:?}: the batch must report exactly the conflicting account, got {rows:?}"
         );
         assert_eq!(
-            rows[0].1, "",
-            "case {case:?}: this service publishes no code for a conflict, so the row must carry \
-             none, got {rows:?}"
-        );
-        assert!(
-            !rows[0].2.is_empty(),
-            "case {case:?}: the row must say why, got {rows:?}"
+            (rows[0].1.as_str(), rows[0].2.as_str()),
+            (ERROR_CODE_GENERAL_CONFLICT, STATE_CONFLICT_MESSAGE),
+            "case {case:?}: the row must carry the envelope the conflict class publishes, got \
+             {rows:?}"
         );
         assert!(
             answer.body.get("status").is_none(),
@@ -257,20 +254,18 @@ fn assert_refused(case: &str, writer: &str, answer: &Answer, account_id: &str) {
         (409, "ConflictException"),
         "case {case:?}: the write must be refused with a conflict, got {answer:?}"
     );
-    assert!(
-        answer
-            .get("message")
-            .as_str()
-            .is_some_and(|message| !message.is_empty()),
-        "case {case:?}: the conflict must say why, got {:?}",
-        answer.body
-    );
-    // `errorCode` on this service's exceptions is a service-defined code, never
-    // the exception's shape name, and this service publishes none for a
-    // conflict — the same body the resident-bound conflict carries.
-    assert!(
-        answer.body.get("errorCode").is_none(),
-        "case {case:?}: the conflict body must not carry an errorCode, got {:?}",
+    // The conflict class publishes one code and one message, so the single-account
+    // refusal carries the same envelope the batch row above does.
+    assert_eq!(
+        (
+            answer.get("errorCode").as_str(),
+            answer.get("message").as_str(),
+        ),
+        (
+            Some(ERROR_CODE_GENERAL_CONFLICT),
+            Some(STATE_CONFLICT_MESSAGE),
+        ),
+        "case {case:?}: expected the conflict class's own envelope, got {:?}",
         answer.body
     );
 }
@@ -564,13 +559,10 @@ async fn a_batch_reports_each_outstanding_account_and_stores_the_rest() {
         );
         for (account_id, code, message) in &error_list {
             assert_eq!(
-                code, "",
-                "case {case:?}: this service publishes no code for a conflict, so {account_id}'s \
-                 row must carry none, got {error_list:?}"
-            );
-            assert!(
-                !message.is_empty(),
-                "case {case:?}: {account_id}'s row must say why, got {error_list:?}"
+                (code.as_str(), message.as_str()),
+                (ERROR_CODE_GENERAL_CONFLICT, STATE_CONFLICT_MESSAGE),
+                "case {case:?}: {account_id}'s row must carry the envelope the conflict class \
+                 publishes, got {error_list:?}"
             );
         }
 

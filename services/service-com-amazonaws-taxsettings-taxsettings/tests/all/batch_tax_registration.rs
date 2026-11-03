@@ -13,8 +13,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    ComAmazonawsTaxsettingsTaxsettingsState, StoredTaxRegistration, MAX_STORED_REGISTRATIONS,
-    STATUS_PENDING,
+    ComAmazonawsTaxsettingsTaxsettingsState, StoredTaxRegistration, ERROR_CODE_GENERAL_CONFLICT,
+    MAX_STORED_REGISTRATIONS, STATE_CONFLICT_MESSAGE, STATUS_PENDING,
 };
 
 use crate::declared_member_defaults::address_as_stored;
@@ -35,7 +35,7 @@ pub(crate) fn entries() -> Vec<(&'static str, Value)> {
         (
             "minimal VAT entry",
             json!({
-                "registrationId": "DE123456789",
+                "registrationId": "DE136695976",
                 "registrationType": "VAT",
                 "legalName": "Acme GmbH",
                 "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
@@ -401,7 +401,7 @@ async fn an_entry_the_service_will_not_store_refuses_the_whole_batch() {
         (
             "entry with no legal name",
             json!({
-                "registrationId": "DE123456789",
+                "registrationId": "DE136695976",
                 "registrationType": "VAT",
                 "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
             }),
@@ -410,7 +410,7 @@ async fn an_entry_the_service_will_not_store_refuses_the_whole_batch() {
         (
             "entry with no legal address",
             json!({
-                "registrationId": "DE123456789",
+                "registrationId": "DE136695976",
                 "registrationType": "VAT",
                 "legalName": "Acme GmbH",
             }),
@@ -728,17 +728,16 @@ async fn an_account_the_batch_could_not_write_is_reported_against_that_account()
         "case \"store at its bound\": the error must name the account, got {errors:?}"
     );
     assert_eq!(
-        errors[0].get("code").and_then(Value::as_str),
-        None,
-        "case \"store at its bound\": this service publishes no code for a state conflict, so the \
-         row must carry none, got {errors:?}"
-    );
-    assert!(
-        errors[0]
-            .get("message")
-            .and_then(Value::as_str)
-            .is_some_and(|message| !message.is_empty()),
-        "case \"store at its bound\": the error must say why, got {errors:?}"
+        (
+            errors[0].get("code").and_then(Value::as_str),
+            errors[0].get("message").and_then(Value::as_str),
+        ),
+        (
+            Some(ERROR_CODE_GENERAL_CONFLICT),
+            Some(STATE_CONFLICT_MESSAGE),
+        ),
+        "case \"store at its bound\": the row must carry the envelope the conflict class \
+         publishes, got {errors:?}"
     );
 
     // The account that was already resident was still written.

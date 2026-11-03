@@ -77,7 +77,7 @@ pub(crate) async fn store_documents(
         &json!({
             "accountId": account_id,
             "taxRegistrationEntry": {
-                "registrationId": "DE123456789",
+                "registrationId": "DE136695976",
                 "registrationType": "VAT",
                 "legalName": "Acme GmbH",
                 "legalAddress": { "postalCode": "10115", "countryCode": "DE" },

@@ -46,9 +46,9 @@ use service_com_amazonaws_taxsettings_taxsettings::ops::types::{
     Address, SupplementalTaxRegistrationEntry,
 };
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    invalid_authority_id, parameter_name, supplemental_store_full,
+    invalid_authority_id, parameter_name, state_conflict,
     ComAmazonawsTaxsettingsTaxsettingsState, ERROR_CODE_FIELD_VALIDATION_FAILED,
-    MAX_STORED_SUPPLEMENTAL_REGISTRATIONS, SUPPLEMENTAL_TRN_COUNTRIES,
+    MAX_STORED_SUPPLEMENTAL_REGISTRATIONS, SUPPLEMENTAL_TRN_COUNTRIES, TRN_VALIDATION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -79,6 +79,10 @@ fn seeded_registration_id(index: usize) -> String {
 /// END of the seeding takes; the resident bound is a thousand records, so seeding
 /// it over the wire would say nothing extra and cost a thousand requests per row.
 fn seed_to(engine: &Arc<engine::InMemoryEngine>, count: usize) -> Vec<String> {
+    // A supplemental registration supplements the account's own, so the write
+    // decision each row is about is only reached once the account holds a
+    // settled registration of its own.
+    crate::supplemental_tax_registrations::hold_a_settled_own_registration(engine);
     let state = engine.state::<ComAmazonawsTaxsettingsTaxsettingsState>();
     let mut store = state.lock();
     let mut ids = Vec::with_capacity(count);
@@ -101,6 +105,11 @@ fn seed_to(engine: &Arc<engine::InMemoryEngine>, count: usize) -> Vec<String> {
             ),
         }
     }
+    // The seeded records carry the validation their write started; a write aimed
+    // at a record whose validation is still outstanding conflicts with the
+    // current state of that record, so what the clock owed is settled here and
+    // each row's write meets the decision the row is about.
+    store.settle_due(Instant::now() + TRN_VALIDATION_DELAY);
     ids
 }
 
@@ -272,8 +281,8 @@ async fn the_write_and_the_delete_take_one_decision_each() {
             );
             assert_eq!(
                 written.get("message").as_str(),
-                Some(supplemental_store_full().message.as_str()),
-                "case {:?}: expected the resident-bound refusal's own wording, got {:?}",
+                Some(state_conflict().message.as_str()),
+                "case {:?}: expected the conflict class's own wording, got {:?}",
                 row.case,
                 written.get("message")
             );

@@ -184,11 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             // An account this service does hold something for but no exemption
-            // has nothing to report rather than a failure: it gets no entry in
-            // the map, as the single-account reads report it.
-            if let Some(details) = store.exemption_details(account_id, now) {
-                tax_exemption_details_map.insert((*account_id).to_string(), details);
-            }
+            // is not a failure: it is reported with the inheritance indicator
+            // its details carry and no exemptions, through the one projection
+            // the listing uses too.
+            tax_exemption_details_map.insert(
+                (*account_id).to_string(),
+                store.exemption_details(account_id, now),
+            );
         }
         drop(store);
 

@@ -147,7 +147,7 @@ async fn every_exemption_type_the_model_admits_is_recorded_and_read_back() {
             "PutTaxExemption",
             &json!({
                 "accountIds": [account],
-                "authority": { "country": "US", "state": "Ohio" },
+                "authority": { "country": "US", "state": "OH" },
                 "exemptionType": token,
                 "exemptionCertificate": certificate("certificate.pdf"),
             }),
@@ -188,7 +188,7 @@ async fn every_exemption_type_the_model_admits_is_recorded_and_read_back() {
             1,
             "case {case:?}: expected the one submitted exemption, got {held:?}"
         );
-        let stored_authority = json!({ "country": "US", "state": "Ohio" });
+        let stored_authority = json!({ "country": "US", "state": "OH" });
         let reported = held[0]
             .get("taxExemptionType")
             .cloned()
@@ -244,13 +244,13 @@ async fn an_unpublished_token_identifies_one_record_per_jurisdiction() {
         (
             "the same token in another state",
             "Exemption certificate on file",
-            json!({ "country": "US", "state": "Ohio" }),
+            json!({ "country": "US", "state": "OH" }),
             2,
         ),
         (
             "the same token in the same state again, re-cased and padded",
             "  EXEMPTION CERTIFICATE ON FILE  ",
-            json!({ "country": "US", "state": " ohio " }),
+            json!({ "country": "US", "state": " oh " }),
             2,
         ),
         (

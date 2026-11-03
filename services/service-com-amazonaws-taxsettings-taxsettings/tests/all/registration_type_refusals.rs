@@ -98,7 +98,11 @@ fn address_in(country_code: &str) -> Value {
 /// entries for one type.
 pub(crate) fn entry_of(registration_type: &str, country_code: Option<&str>) -> Value {
     let mut entry = json!({
-        "registrationId": format!("{registration_type}-0000000001"),
+        // A number its jurisdiction's authority issues where this service
+        // publishes a structure for the type, so what each row below is judged
+        // on is the registration TYPE and the address — never the number
+        // (`crate::fidelity_rules::number_of_type`).
+        "registrationId": crate::fidelity_rules::number_of_type(registration_type, country_code),
         "registrationType": registration_type,
         "legalName": "Example Holdings",
     });
