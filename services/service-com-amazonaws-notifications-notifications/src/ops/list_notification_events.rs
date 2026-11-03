@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNotificationEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNotificationEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNotificationEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `NotificationEventOverview` per notification event the store
+//! holds, newest first, narrowed by every filter the request carries and cut
+//! into pages of `maxResults` with an opaque resume token. A reporting
+//! operation (`@readonly`): it never writes.
+//!
+//! A `NotificationEvent` is NOT created by a request — User Notifications
+//! stores one when an event from a source service matches an `EventRule` — so
+//! this listing reports what delivery has recorded
+//! (`crate::state::ComAmazonawsNotificationsNotificationsState::record_notification_event`)
+//! and an account nothing has been delivered to reports none.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +141,17 @@ impl From<ListNotificationEventsErrorModeled> for ListNotificationEventsError {
     }
 }
 
+/// The page size this operation uses when a request names none: "Defaults to
+/// 20", from the `maxResults` member's own documentation. The modelled range
+/// (1..100) bounds what a request may ask for, and the boundary validator
+/// refuses anything outside it before this handler runs.
+const DEFAULT_MAX_RESULTS: usize = 20;
+
+// The page token codec every paginated listing in this service shares: the
+// cursor here is the delivery sequence of the last event on the page, and the
+// next page is everything older than it.
+use crate::state::{decode_page_token, encode_page_token, instant_key};
+
 /// The `ListNotificationEvents` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -175,18 +188,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNotificationEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNotificationEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNotificationEvents"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListNotificationEventsErrorModeled::InternalServerException(InternalServerException {
+                message: "the notifications store is unavailable".to_string(),
+            })
+        })?;
+        let store = state.lock();
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                // A token this process never issued is refused, rather than
+                // silently restarting the listing at the newest event.
+                ListNotificationEventsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                    reason: Some("fieldValidationFailed".to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message: "the value is not a pagination token this service issued"
+                            .to_string(),
+                    }]),
+                })
+            })?),
+            None => None,
+        };
+
+        // The request's window, as the keys a stored `creationTime` is compared
+        // against: `startTime` is "the earliest time of events to return from
+        // this call" and `endTime` "the latest", so both bounds are inclusive
+        // and a window whose earliest is after its latest selects nothing.
+        let earliest = input.start_time.map(|at| instant_key(&at));
+        let latest = input.end_time.map(|at| instant_key(&at));
+
+        // "in reverse chronological order (newest first)", so the most recently
+        // delivered event leads the listing and a page token walks backwards
+        // through delivery order.
+        let mut ordered = store.notification_events_in_delivery_order();
+        ordered.reverse();
+
+        let matching: Vec<&crate::state::NotificationEventRecord> = ordered
+            .into_iter()
+            .filter(|record| {
+                // Each filter the request carries must hold, and each narrows
+                // independently of the others.
+                if let Some(source) = input.source.as_deref() {
+                    if record.source != source {
+                        return false;
+                    }
+                }
+                let delivered = instant_key(&record.creation_time);
+                if earliest.is_some_and(|from| delivered < from) {
+                    return false;
+                }
+                if latest.is_some_and(|until| delivered > until) {
+                    return false;
+                }
+                // `aggregateNotificationEventArn` selects the events aggregated
+                // under that one, which is what a `CHILD` event names.
+                if let Some(aggregate) = input.aggregate_notification_event_arn.as_deref() {
+                    if record.aggregate_notification_event_arn.as_deref() != Some(aggregate) {
+                        return false;
+                    }
+                }
+                if let Some(unit) = input.organizational_unit_id.as_deref() {
+                    if record.organizational_unit_id.as_deref() != Some(unit) {
+                        return false;
+                    }
+                }
+                // `includeChildEvents` is what admits an aggregated child event
+                // at all — "include aggregated child events in the result" — so
+                // without it a listing reports only the events that are not
+                // aggregated under another.
+                if record.is_child() && !input.include_child_events.unwrap_or(false) {
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        let start = match resume_after {
+            Some(cursor) => matching
+                .iter()
+                .position(|record| record.sequence < cursor)
+                .unwrap_or(matching.len()),
+            None => 0,
+        };
+        let page_size = match input.max_results {
+            Some(requested) => usize::try_from(requested).map_err(|_| {
+                // The modelled range (1..100) makes this unreachable through the
+                // boundary validator; refuse rather than quietly substituting a
+                // page size the caller did not ask for.
+                ListNotificationEventsErrorModeled::ValidationException(ValidationException {
+                    message: "maxResults must be a positive count".to_string(),
+                    reason: Some("fieldValidationFailed".to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "maxResults".to_string(),
+                        message: "the value is not a positive count".to_string(),
+                    }]),
+                })
+            })?,
+            None => DEFAULT_MAX_RESULTS,
+        };
+
+        let page: Vec<&&crate::state::NotificationEventRecord> =
+            matching.iter().skip(start).take(page_size).collect();
+
+        // A token is emitted only while events remain behind this page; the
+        // final page carries none.
+        let next_token = match page.last() {
+            Some(last) if start + page.len() < matching.len() => {
+                Some(encode_page_token(last.sequence))
+            }
+            _ => None,
+        };
+
+        // `locale` names the language the retrieved event is rendered in rather
+        // than narrowing the set: the store holds one rendering of each event's
+        // message components, which is what every locale reports.
+        Ok(ListNotificationEventsOutput {
+            next_token,
+            notification_events: page.into_iter().map(|record| record.overview()).collect(),
+        })
     }
 }

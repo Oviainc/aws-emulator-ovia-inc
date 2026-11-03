@@ -832,6 +832,167 @@ fn seeded_managed_configurations() -> BTreeMap<String, ManagedNotificationConfig
         .collect()
 }
 
+/// `v1.0`, the `schemaVersion` of every `NotificationEvent` this store holds —
+/// the single value `SchemaVersion` declares
+/// (`crate::ops::types::SCHEMA_VERSION_VALUES`).
+pub const NOTIFICATION_EVENT_SCHEMA_VERSION: &str = "v1.0";
+
+/// `NONE`, the `AggregationEventType` of a notification event that neither
+/// aggregates others nor is aggregated under one. One of the three values
+/// `AggregationEventType` declares
+/// (`crate::ops::types::AGGREGATION_EVENT_TYPE_VALUES`).
+pub const AGGREGATION_EVENT_TYPE_NONE: &str = "NONE";
+
+/// `AGGREGATE`, the `AggregationEventType` of a notification event that
+/// aggregates `CHILD` events under its own arn. See
+/// [`AGGREGATION_EVENT_TYPE_NONE`].
+pub const AGGREGATION_EVENT_TYPE_AGGREGATE: &str = "AGGREGATE";
+
+/// `CHILD`, the `AggregationEventType` of a notification event aggregated under
+/// an `AGGREGATE` one, which it names in
+/// [`NotificationEventRecord::aggregate_notification_event_arn`]. See
+/// [`AGGREGATION_EVENT_TYPE_NONE`].
+pub const AGGREGATION_EVENT_TYPE_CHILD: &str = "CHILD";
+
+/// What one delivery states about the notification event it stores.
+///
+/// A `NotificationEvent` is NOT created by a request: User Notifications stores
+/// one when an event from a source service matches an `EventRule` of a
+/// configuration, which is why no operation of this service's modelled surface
+/// takes this as input. It is the argument of
+/// [`ComAmazonawsNotificationsNotificationsState::record_notification_event`],
+/// so one delivery path states every field of a stored event in one place and
+/// the reporting operations read them back from the store.
+#[derive(Debug, Clone)]
+pub struct NotificationEventDelivery {
+    /// The `NotificationConfiguration` whose `EventRule` matched. The event's
+    /// own arn nests under it, so it must be a configuration this store holds.
+    pub notification_configuration_arn: String,
+    /// The Region the event is stored in — the `NotificationEventArn` region
+    /// segment. "User Notifications stores notifications in the individual
+    /// Regions you register as notification hubs and the Region of the source
+    /// event rule."
+    pub region: String,
+    /// `creationTime`, the instant the event was delivered.
+    pub creation_time: ::aws_smithy_types::DateTime,
+    /// `sourceEventMetadata.source`, the matched EventBridge source.
+    pub source: String,
+    /// `sourceEventMetadata.eventType`, the matched EventBridge event type.
+    pub event_type: String,
+    /// `sourceEventMetadata.eventOriginRegion`, the Region the source event came
+    /// from, absent when the source event names none.
+    pub event_origin_region: Option<String>,
+    /// `messageComponents.headline`, the one-line rendering of the event.
+    pub headline: String,
+    /// `eventStatus`, one of `EventStatus`'s values
+    /// (`crate::ops::types::EVENT_STATUS_VALUES`).
+    pub event_status: String,
+    /// `notificationType`, one of `NotificationType`'s values
+    /// (`crate::ops::types::NOTIFICATION_TYPE_VALUES`).
+    pub notification_type: String,
+    /// `relatedAccount`, the account the event is about, or `None` for the
+    /// emulator's own account.
+    pub related_account: Option<String>,
+    /// `aggregationEventType` — see [`AGGREGATION_EVENT_TYPE_NONE`].
+    pub aggregation_event_type: String,
+    /// `aggregateNotificationEventArn`, the `AGGREGATE` event this one is
+    /// aggregated under, carried only by a `CHILD`.
+    pub aggregate_notification_event_arn: Option<String>,
+    /// `aggregationSummary`, the dimensions an `AGGREGATE` event rolls up, as
+    /// the delivery that aggregated them computed it.
+    pub aggregation_summary: Option<crate::ops::types::AggregationSummary>,
+    /// `organizationalUnitId`, the organizational unit the event belongs to,
+    /// absent for an account-level event.
+    pub organizational_unit_id: Option<String>,
+}
+
+/// One persisted `NotificationEvent`: one notification this Region holds.
+///
+/// Written by delivery ([`ComAmazonawsNotificationsNotificationsState::record_notification_event`])
+/// and only ever READ by the event reporters — `ListNotificationEvents` reports
+/// one [`NotificationEventOverview`](crate::ops::types::NotificationEventOverview)
+/// per record the request's filters select. Nothing in this service's modelled
+/// surface creates, mutates or deletes one, so no handler writes this record.
+#[derive(Debug, Clone)]
+pub struct NotificationEventRecord {
+    /// The minted arn — the single key for lookup.
+    pub arn: String,
+    /// `notificationConfigurationArn`, the configuration whose `EventRule`
+    /// matched. The event's arn nests under it, so this is also its prefix.
+    pub notification_configuration_arn: String,
+    /// `relatedAccount`, the account the event is about.
+    pub related_account: String,
+    /// `creationTime`, set once when the event is recorded and never rewritten.
+    /// `ListNotificationEvents` matches a request's `startTime`/`endTime` window
+    /// against it.
+    pub creation_time: ::aws_smithy_types::DateTime,
+    /// `notificationEvent.schemaVersion`
+    /// ([`NOTIFICATION_EVENT_SCHEMA_VERSION`]).
+    pub schema_version: String,
+    /// `sourceEventMetadata.source` — what the `source` filter matches.
+    pub source: String,
+    /// `sourceEventMetadata.eventType`.
+    pub event_type: String,
+    /// `sourceEventMetadata.eventOriginRegion`.
+    pub event_origin_region: Option<String>,
+    /// `messageComponents.headline`.
+    pub headline: String,
+    /// `notificationEvent.eventStatus`.
+    pub event_status: String,
+    /// `notificationEvent.notificationType`.
+    pub notification_type: String,
+    /// `aggregationEventType` — see [`AGGREGATION_EVENT_TYPE_NONE`].
+    pub aggregation_event_type: String,
+    /// `aggregateNotificationEventArn` — what the
+    /// `aggregateNotificationEventArn` filter matches.
+    pub aggregate_notification_event_arn: Option<String>,
+    /// `aggregationSummary`, reported as the delivery computed it.
+    pub aggregation_summary: Option<crate::ops::types::AggregationSummary>,
+    /// `organizationalUnitId` — what the `organizationalUnitId` filter matches.
+    pub organizational_unit_id: Option<String>,
+    /// Delivery order within this store, counting from 1.
+    /// `ListNotificationEvents` reports events in REVERSE of this order
+    /// ("newest first") and pages through it, so a listing is stable and a page
+    /// token keeps its meaning.
+    pub sequence: u64,
+}
+
+impl NotificationEventRecord {
+    /// Whether this event is aggregated under another — the events a listing
+    /// reports only when the request asks to "include aggregated child events
+    /// in the result".
+    pub fn is_child(&self) -> bool {
+        self.aggregation_event_type == AGGREGATION_EVENT_TYPE_CHILD
+    }
+
+    /// This record as the `NotificationEventOverview` a listing reports.
+    pub fn overview(&self) -> crate::ops::types::NotificationEventOverview {
+        crate::ops::types::NotificationEventOverview {
+            arn: self.arn.clone(),
+            notification_configuration_arn: self.notification_configuration_arn.clone(),
+            related_account: self.related_account.clone(),
+            creation_time: self.creation_time,
+            notification_event: crate::ops::types::NotificationEventSummary {
+                schema_version: self.schema_version.clone(),
+                source_event_metadata: crate::ops::types::SourceEventMetadataSummary {
+                    event_origin_region: self.event_origin_region.clone(),
+                    source: self.source.clone(),
+                    event_type: self.event_type.clone(),
+                },
+                message_components: crate::ops::types::MessageComponentsSummary {
+                    headline: self.headline.clone(),
+                },
+                event_status: self.event_status.clone(),
+                notification_type: self.notification_type.clone(),
+            },
+            aggregation_event_type: Some(self.aggregation_event_type.clone()),
+            aggregate_notification_event_arn: self.aggregate_notification_event_arn.clone(),
+            aggregation_summary: self.aggregation_summary.clone(),
+            organizational_unit_id: self.organizational_unit_id.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-notifications-notifications. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsNotificationsNotificationsState {
@@ -873,6 +1034,17 @@ pub struct ComAmazonawsNotificationsNotificationsState {
     /// [`MANAGED_NOTIFICATION_CATALOG`] when the store is created, because the
     /// service publishes these rather than a caller creating them.
     pub managed_configurations: BTreeMap<String, ManagedNotificationConfigurationRecord>,
+    /// arn -> delivered NotificationEvent. One flat map keyed by the event's own
+    /// arn, which nests under its configuration's, so an event is reached by the
+    /// arn a reporting operation is given without a second lookup. Empty until a
+    /// delivery records one: a notification event exists because an event from a
+    /// source service matched an `EventRule`, which no request of this service
+    /// performs.
+    pub notification_events: BTreeMap<String, NotificationEventRecord>,
+    /// How many notification events this store has ever recorded. Doubles as the
+    /// next record's [`NotificationEventRecord::sequence`] and as part of the
+    /// uniqueness seed of a new arn, so an id is never reused.
+    pub notification_events_recorded: u64,
 }
 
 impl Default for ComAmazonawsNotificationsNotificationsState {
@@ -893,6 +1065,10 @@ impl Default for ComAmazonawsNotificationsNotificationsState {
             channel_associations_minted: SEEDED_CHANNEL_ASSOCIATIONS,
             organization_access: OrganizationAccessRecord::default(),
             managed_configurations,
+            // A fresh store holds no notification event: nothing has been
+            // delivered into this Region yet.
+            notification_events: BTreeMap::new(),
+            notification_events_recorded: 0,
         }
     }
 }
@@ -1253,6 +1429,82 @@ impl ComAmazonawsNotificationsNotificationsState {
         }
     }
 
+    /// Mint a fresh `NotificationEvent` arn under `configuration_arn` for the
+    /// Region the event is stored in, and reserve its delivery sequence.
+    ///
+    /// `NotificationEventArn` is the configuration's resource path followed by
+    /// `/event/[a-z0-9]{27}`, in the Region the event is stored in — unlike a
+    /// `NotificationConfigurationArn`, which carries no Region. So the arn is
+    /// built from the configuration's own resource segment rather than assembled
+    /// again, and the id segment is minted the way every other id of this store
+    /// is (see [`mint_arn_id`]). `None` for an arn with no resource segment at
+    /// all, which no minted configuration arn has.
+    pub fn mint_notification_event_arn(
+        &mut self,
+        configuration_arn: &str,
+        region: &str,
+    ) -> Option<(String, u64)> {
+        let (_, resource) = configuration_arn.rsplit_once(':')?;
+        self.notification_events_recorded += 1;
+        let sequence = self.notification_events_recorded;
+        let id = mint_arn_id(sequence);
+        let arn = ::engine::emulator_arn("notifications", region, &format!("{resource}/event/{id}"));
+        Some((arn, sequence))
+    }
+
+    /// Record one delivered notification event and return the stored record.
+    ///
+    /// `None`, storing nothing, when this store holds no configuration with
+    /// `delivery.notification_configuration_arn`: a notification event exists
+    /// because an `EventRule` of a configuration matched a source event, so
+    /// there is no event to store for a configuration that does not exist.
+    pub fn record_notification_event(
+        &mut self,
+        delivery: NotificationEventDelivery,
+    ) -> Option<&NotificationEventRecord> {
+        if !self
+            .configurations
+            .contains_key(&delivery.notification_configuration_arn)
+        {
+            return None;
+        }
+        let (arn, sequence) = self.mint_notification_event_arn(
+            &delivery.notification_configuration_arn,
+            &delivery.region,
+        )?;
+        let record = NotificationEventRecord {
+            arn: arn.clone(),
+            notification_configuration_arn: delivery.notification_configuration_arn,
+            related_account: delivery
+                .related_account
+                .unwrap_or_else(|| ::engine::emulator_account_id().to_string()),
+            creation_time: delivery.creation_time,
+            schema_version: NOTIFICATION_EVENT_SCHEMA_VERSION.to_string(),
+            source: delivery.source,
+            event_type: delivery.event_type,
+            event_origin_region: delivery.event_origin_region,
+            headline: delivery.headline,
+            event_status: delivery.event_status,
+            notification_type: delivery.notification_type,
+            aggregation_event_type: delivery.aggregation_event_type,
+            aggregate_notification_event_arn: delivery.aggregate_notification_event_arn,
+            aggregation_summary: delivery.aggregation_summary,
+            organizational_unit_id: delivery.organizational_unit_id,
+            sequence,
+        };
+        Some(self.notification_events.entry(arn).or_insert(record))
+    }
+
+    /// Every stored notification event in delivery order — the order
+    /// `ListNotificationEvents` reverses into "reverse chronological order
+    /// (newest first)" and pages through.
+    pub fn notification_events_in_delivery_order(&self) -> Vec<&NotificationEventRecord> {
+        let mut records: Vec<&NotificationEventRecord> =
+            self.notification_events.values().collect();
+        records.sort_by_key(|record| record.sequence);
+        records
+    }
+
     /// Materialise every `EventRule` transition the clock has already made due,
     /// as of `now`: a Region in a transitional status (`CREATING` after a
     /// create, `UPDATING` after an update) becomes `ACTIVE`.
@@ -1488,6 +1740,14 @@ pub fn decode_page_token(token: &str) -> Option<u64> {
         return None;
     }
     Some(u64::from_be_bytes(bytes[8..].try_into().ok()?))
+}
+
+/// One instant as a totally ordered key: whole seconds since the epoch and the
+/// nanosecond within them. What a stored `creationTime` is compared against a
+/// request's time window by, since the modelled timestamp type carries both
+/// parts and a listing's window is inclusive at full precision.
+pub fn instant_key(at: &::aws_smithy_types::DateTime) -> (i64, u32) {
+    (at.secs(), at.subsec_nanos())
 }
 
 /// The wall-clock instant a record is stamped with, as the modelled timestamp type.

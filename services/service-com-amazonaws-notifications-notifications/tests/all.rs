@@ -35,6 +35,8 @@ mod no_content_framing;
 mod not_found_messages;
 #[path = "all/notification_configurations.rs"]
 mod notification_configurations;
+#[path = "all/notification_events.rs"]
+mod notification_events;
 #[path = "all/notification_hubs.rs"]
 mod notification_hubs;
 #[path = "all/organization_access.rs"]
