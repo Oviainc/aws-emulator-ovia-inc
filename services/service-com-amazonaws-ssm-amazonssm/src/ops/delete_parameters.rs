@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Delete a list of parameters from Parameter Store — the batch form of
+//! `DeleteParameter`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it removes is what `PutParameter` stored and `GetParameter` reads: all of them
+//! reach the one store in [`crate::state`], so every name this call removes answers
+//! `ParameterNotFound` on every later read. Each parameter is removed WHOLE — every
+//! retained version of it, and its tags — as a single delete removes it.
+//!
+//! This operation models no per-name error, so the two lists it answers with are the
+//! whole signal and both are partitioned from what the store actually held: a name whose
+//! parameter was removed is reported in `DeletedParameters`, and a name that named
+//! nothing removable — a name this Region holds no parameter for, or one that is not a
+//! bare parameter name at all — in `InvalidParameters` ("the names of parameters that
+//! weren't deleted because the parameters aren't valid").
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +146,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteParametersErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the parameter store is unavailable".to_string()),
+            })
+        })?;
+
+        // The spaces rule is applied to the whole request before any name is resolved,
+        // as `GetParameters` applies it: the service trims each name and fails a name
+        // with spaces between characters with a `ValidationException`, which this
+        // operation models no error for.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteParameters"))
+        // The names one call carries are a set: a name given twice names the one
+        // parameter, so it is deleted — and reported — once rather than being reported
+        // both deleted and invalid. The order they were given in is kept.
+        let mut asked: Vec<&str> = Vec::with_capacity(input.names.len());
+        for name in &input.names {
+            let trimmed = crate::state::trimmed_name(name)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+            if !asked.contains(&trimmed) {
+                asked.push(trimmed);
+            }
+        }
+
+        // A parameter lives in the Region its endpoint names, which is the signed
+        // credential scope's — never a Region the request body chose.
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        let mut deleted_parameters: Vec<String> = Vec::new();
+        let mut invalid_parameters: Vec<String> = Vec::new();
+        for name in asked {
+            // "You can't enter the Amazon Resource Name (ARN) for a parameter, only the
+            // parameter name itself" (`DeleteParametersRequest$Names`), and a delete
+            // addresses the parameter rather than one of its versions — so a name that is
+            // an ARN or carries a version or label selector names nothing this operation
+            // can delete, which it REPORTS rather than refuses.
+            let Some(query) = crate::state::parse_parameter_query(name) else {
+                invalid_parameters.push(name.to_string());
+                continue;
+            };
+            if query.selector.is_some() || query.account.is_some() || query.region.is_some() {
+                invalid_parameters.push(name.to_string());
+                continue;
+            }
+            // `query.name` is already the canonical form the store keys a parameter under.
+            let key = (region.clone(), query.name.to_string());
+            if store.parameters.remove(&key).is_some() {
+                deleted_parameters.push(name.to_string());
+            } else {
+                invalid_parameters.push(name.to_string());
+            }
+        }
+
+        Ok(DeleteParametersOutput {
+            // Both reported even when empty, as `GetParameters` reports its own
+            // `InvalidParameters`: the modelled list's 1..10 length bounds how many names
+            // ONE CALL carries, so it says nothing about what a response reports.
+            deleted_parameters: Some(deleted_parameters),
+            invalid_parameters: Some(invalid_parameters),
+        })
     }
 }

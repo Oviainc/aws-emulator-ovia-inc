@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UnlabelParameterVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UnlabelParameterVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Remove labels from one version of a stored parameter — the releasing half of the
+//! parameter-label workflow. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UnlabelParameterVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it erases is what `LabelParameterVersion` attached: the label set of the version
+//! this request names ([`crate::state::ParameterVersionRecord::labels`]) in the one store
+//! `PutParameter` wrote, so a `name:label` read of a released label resolves to nothing
+//! again and `GetParameterHistory` stops reporting it.
+//!
+//! The two lists it answers with are both computed from that stored set: a label the
+//! version held is taken off it and reported in `RemovedLabels` ("a list of all labels
+//! deleted from the parameter"), and one it did not hold is reported in `InvalidLabels`
+//! ("the labels that aren't attached to the given parameter version") with nothing
+//! removed for it.
+//!
+//! The version is named by `ParameterVersion`, which this operation requires: "the
+//! specific version of the parameter which you want to delete one or more labels from. If
+//! it isn't present, the call will fail."
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +165,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UnlabelParameterVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UnlabelParameterVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UnlabelParameterVersion"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UnlabelParameterVersionErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the parameter store is unavailable".to_string()),
+            })
+        })?;
+
+        // The same spaces rule every name-taking operation of this slice applies: the
+        // service trims the name and refuses one with spaces between characters, which
+        // this operation models no error for.
+        let name = crate::state::trimmed_name(&input.name)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // `ParameterNotFound` carries NO message: its `message` member is optional and
+        // Parameter Store words none for a name it holds no parameter for, so the error
+        // code is the whole of what this refusal says.
+        let not_found = || {
+            UnlabelParameterVersionErrorModeled::ParameterNotFound(ParameterNotFound {
+                message: None,
+            })
+        };
+
+        // "You can't enter the Amazon Resource Name (ARN) for a parameter, only the
+        // parameter name itself" (`UnlabelParameterVersionRequest$Name`), and the version
+        // is named by `ParameterVersion` rather than by a selector on the name — so
+        // neither an ARN nor a `name:selector` names a parameter this operation can
+        // unlabel.
+        let Some(query) = crate::state::parse_parameter_query(name) else {
+            return Err(not_found().into());
+        };
+        if query.selector.is_some() || query.account.is_some() || query.region.is_some() {
+            return Err(not_found().into());
+        }
+
+        // A parameter lives in the Region its endpoint names, which is the signed
+        // credential scope's — never a Region the request body chose.
+        let region = crate::state::request_region(ctx.parts());
+
+        // The labels one call carries are a set: a label named twice names the one label,
+        // so it is removed — or reported unattached — once rather than being reported both
+        // ways. The order they were given in is the order they are reported in.
+        let mut asked: Vec<&String> = Vec::with_capacity(input.labels.len());
+        for label in &input.labels {
+            if !asked.contains(&label) {
+                asked.push(label);
+            }
+        }
+
+        let mut store = state.lock();
+        let Some(record) = store.parameter_mut(&region, query.name) else {
+            return Err(not_found().into());
+        };
+        let parameter_name = record.name.clone();
+        let Some(version) = record.version_mut(input.parameter_version) else {
+            return Err(
+                UnlabelParameterVersionErrorModeled::ParameterVersionNotFound(
+                    ParameterVersionNotFound {
+                        message: Some(format!(
+                            "Parameter {parameter_name} has no version {}",
+                            input.parameter_version
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Both lists come from the stored set rather than from the request: a label is
+        // reported removed only because the version held it and no longer does.
+        let mut removed_labels: Vec<String> = Vec::new();
+        let mut invalid_labels: Vec<String> = Vec::new();
+        for label in asked {
+            if version.labels.remove(label) {
+                removed_labels.push(label.clone());
+            } else {
+                invalid_labels.push(label.clone());
+            }
+        }
+
+        Ok(UnlabelParameterVersionOutput {
+            // Both reported even when empty, the way this service's other partitioning
+            // response does (`GetParameters`' `InvalidParameters`): the modelled list's
+            // 1..10 length bounds how many labels ONE CALL carries, so it says nothing
+            // about what a response reports.
+            removed_labels: Some(removed_labels),
+            invalid_labels: Some(invalid_labels),
+        })
     }
 }

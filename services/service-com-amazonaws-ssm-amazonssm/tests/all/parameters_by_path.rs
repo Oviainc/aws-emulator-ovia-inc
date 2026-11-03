@@ -584,8 +584,8 @@ async fn filters_select_on_the_stored_parameter() {
             vec![],
         ),
         (
-            // `LabelParameterVersion` is still a scaffold, so no stored version carries
-            // a label and a label filter resolves against nothing invented.
+            // Nothing in this suite attaches a label, so no stored version carries one
+            // and a label filter resolves against nothing invented.
             "Label Equals a label nothing created",
             json!([{ "Key": "Label", "Option": "Equals", "Values": ["release"] }]),
             vec![],

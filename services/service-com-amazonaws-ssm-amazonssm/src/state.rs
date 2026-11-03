@@ -19,6 +19,13 @@
 //! version rather than replacing the old one, which is what lets a `name:version`
 //! selector resolve an earlier value.
 //!
+//! A version also holds the **labels** that point at it ([`label_is_well_formed`],
+//! [`ParameterRecord::attach_label`]): `LabelParameterVersion` writes them,
+//! `UnlabelParameterVersion` erases them, and a `name:label` selector resolves through
+//! them ([`ParameterRecord::select`]), so a label is held by at most one version of a
+//! parameter at a time. `DeleteParameter` and `DeleteParameters` remove a parameter
+//! whole, labels and every retained version with it.
+//!
 //! The second is **SSM documents**: `CreateDocument` registers a document and
 //! `DescribeDocument` reports it. A document is keyed by `(region, name)` the same way,
 //! and everything a read reports beyond the request's own members — the schema version,
@@ -106,6 +113,45 @@ pub const MAX_HIERARCHY_LEVELS: usize = 15;
 /// been created, Parameter Store deletes the oldest version when a new one is
 /// created" (the `ParameterMaxVersionLimitExceeded` doc).
 pub const MAX_VERSIONS_RETAINED: usize = 100;
+
+/// How many labels one version of a parameter carries: "A version of a parameter can
+/// have a maximum of 10 labels" (`LabelParameterVersion`'s own doc), which
+/// `ParameterVersionLabelLimitExceeded` ("A parameter version can have a maximum of ten
+/// labels") reports.
+pub const MAX_LABELS_PER_VERSION: usize = 10;
+
+/// The prefixes a label may not start with: "Labels can't begin with a number, "aws" or
+/// "ssm" (not case sensitive)" (`LabelParameterVersion`'s doc).
+pub const RESERVED_LABEL_PREFIXES: &[&str] = &["aws", "ssm"];
+
+/// Whether `label` meets the documented label requirements, so that attaching it
+/// associates it with a parameter version rather than reporting it among the invalid
+/// labels: "Labels can contain letters (case sensitive), numbers, periods (.), hyphens
+/// (-), or underscores (_). Labels can't begin with a number, "aws" or "ssm" (not case
+/// sensitive)" (`LabelParameterVersion`'s doc).
+///
+/// The same doc's length rule ("A label can have a maximum of 100 characters") is the
+/// modelled `ParameterLabel` length 1..100, so the boundary walk refuses a longer one
+/// before a handler sees it and no length is re-checked here.
+pub fn label_is_well_formed(label: &str) -> bool {
+    // The character set is checked first, so everything after it is ASCII and a prefix
+    // comparison lands on a character boundary.
+    if !label
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return false;
+    }
+    let Some(first) = label.chars().next() else {
+        return false;
+    };
+    if first.is_ascii_digit() {
+        return false;
+    }
+    !RESERVED_LABEL_PREFIXES
+        .iter()
+        .any(|prefix| label.len() >= prefix.len() && label[..prefix.len()].eq_ignore_ascii_case(prefix))
+}
 
 /// How many parameters one Region holds: "You can create a maximum of 10,000 standard
 /// parameters for each Region in an Amazon Web Services account" (`PutParameter`'s
@@ -381,9 +427,10 @@ pub struct ParameterVersionRecord {
     pub policies: Option<String>,
     pub last_modified_date: SystemTime,
     /// The labels that point at THIS version. `LabelParameterVersion` is what writes
-    /// them and is still a scaffold, so the set is empty today — but a `name:label`
-    /// selector resolves against it rather than against anything invented, so a label
-    /// nothing created resolves to nothing.
+    /// them ([`ParameterRecord::attach_label`]) and `UnlabelParameterVersion` what
+    /// erases them, so the set holds exactly what was attached and never released — a
+    /// `name:label` selector resolves against it rather than against anything invented,
+    /// so a label nothing created resolves to nothing.
     pub labels: BTreeSet<String>,
 }
 
@@ -542,6 +589,36 @@ impl ParameterRecord {
     pub fn next_version(&self) -> i64 {
         self.latest()
             .map_or(1, |latest| latest.version.saturating_add(1))
+    }
+
+    /// The version `version` numbers, to write its labels.
+    pub fn version_mut(&mut self, version: i64) -> Option<&mut ParameterVersionRecord> {
+        self.versions.iter_mut().find(|held| held.version == version)
+    }
+
+    /// Point `label` at the version `version` numbers, taking it off whatever other
+    /// version of this parameter held it.
+    ///
+    /// That is the whole of the documented label rule: "You can't attach the same label
+    /// to different versions of the same parameter ... You can move a label from one
+    /// version of a parameter to another" (`LabelParameterVersion`), so the label is
+    /// held by at most one version's set at a time and attaching it to a second version
+    /// MOVES it rather than duplicating it.
+    ///
+    /// Answers `false` for a version this parameter does not carry, which is the
+    /// not-found its caller reports.
+    pub fn attach_label(&mut self, version: i64, label: &str) -> bool {
+        if self.version_mut(version).is_none() {
+            return false;
+        }
+        for held in &mut self.versions {
+            if held.version == version {
+                held.labels.insert(label.to_string());
+            } else {
+                held.labels.remove(label);
+            }
+        }
+        true
     }
 
     /// Append `version`, dropping the oldest retained version once more than

@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op LabelParameterVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `LabelParameterVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Attach labels to one version of a stored parameter — the labelling half of the
+//! parameter lifecycle. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`LabelParameterVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A label is "a user-defined alias to help you manage different versions of a
+//! parameter", so what this operation writes is the label set of the version it chose
+//! ([`crate::state::ParameterVersionRecord::labels`]) in the one store `PutParameter`
+//! wrote and `GetParameter` reads: a later `name:label` read resolves through that set
+//! ([`crate::state::ParameterRecord::select`]), and `GetParameterHistory` reports it on
+//! the version that holds it.
+//!
+//! The version labelled is the one the request names, or — "if no version is specified,
+//! the system attaches the label to the latest version" — the newest the parameter
+//! carries. A label is held by at most one version of a parameter at a time ("you can't
+//! attach the same label to different versions of the same parameter"), so attaching one
+//! a different version already holds MOVES it ("you can move a label from one version of
+//! a parameter to another"), which is what
+//! [`crate::state::ParameterRecord::attach_label`] does.
+//!
+//! A label that does not meet the documented label requirements
+//! ([`crate::state::label_is_well_formed`]) "isn't associated with a parameter and the
+//! system displays it in the list of `InvalidLabels`" — it is reported, not refused, and
+//! the labels beside it in the same request are still attached.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +189,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `LabelParameterVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(LabelParameterVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("LabelParameterVersion"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            LabelParameterVersionErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the parameter store is unavailable".to_string()),
+            })
+        })?;
+
+        // The same spaces rule every name-taking operation of this slice applies: the
+        // service trims the name and refuses one with spaces between characters, which
+        // this operation models no error for.
+        let name = crate::state::trimmed_name(&input.name)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // `ParameterNotFound` carries NO message: its `message` member is optional and
+        // Parameter Store words none for a name it holds no parameter for, so the error
+        // code is the whole of what this refusal says (as in `GetParameter` and
+        // `DeleteParameter`).
+        let not_found = || {
+            LabelParameterVersionErrorModeled::ParameterNotFound(ParameterNotFound {
+                message: None,
+            })
+        };
+
+        // "You can't enter the Amazon Resource Name (ARN) for a parameter, only the
+        // parameter name itself" (`LabelParameterVersionRequest$Name`), and the version
+        // to label is named by `ParameterVersion` rather than by a selector on the name —
+        // so neither an ARN nor a `name:selector` names a parameter this operation can
+        // label.
+        let Some(query) = crate::state::parse_parameter_query(name) else {
+            return Err(not_found().into());
+        };
+        if query.selector.is_some() || query.account.is_some() || query.region.is_some() {
+            return Err(not_found().into());
+        }
+
+        // A parameter lives in the Region its endpoint names, which is the signed
+        // credential scope's — never a Region the request body chose.
+        let region = crate::state::request_region(ctx.parts());
+
+        // The labels one call carries are a set: a label named twice names the one label,
+        // so it is attached — or reported invalid — once. The order they were given in is
+        // kept, which is the order the invalid ones among them are reported in.
+        let mut accepted: Vec<String> = Vec::with_capacity(input.labels.len());
+        let mut invalid_labels: Vec<String> = Vec::new();
+        for label in &input.labels {
+            let bucket = if crate::state::label_is_well_formed(label) {
+                &mut accepted
+            } else {
+                &mut invalid_labels
+            };
+            if !bucket.contains(label) {
+                bucket.push(label.clone());
+            }
+        }
+
+        let mut store = state.lock();
+        let Some(record) = store.parameter_mut(&region, query.name) else {
+            return Err(not_found().into());
+        };
+
+        // The version to label: the one the request names, or the newest the parameter
+        // carries when it names none. A record in the store always holds at least one
+        // version, so only a named version can fail to resolve.
+        let target = match input.parameter_version {
+            None => record.latest().map(|latest| latest.version),
+            Some(asked) => record
+                .versions
+                .iter()
+                .find(|held| held.version == asked)
+                .map(|held| held.version),
+        };
+        let Some(target) = target else {
+            return Err(LabelParameterVersionErrorModeled::ParameterVersionNotFound(
+                ParameterVersionNotFound {
+                    message: Some(format!(
+                        "Parameter {} has no version {}",
+                        record.name,
+                        input.parameter_version.unwrap_or_default()
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "A version of a parameter can have a maximum of 10 labels", counted on the
+        // version as it would stand after this call: a label the version already holds
+        // adds nothing to the count, while one moved in from another version does.
+        let held = record
+            .versions
+            .iter()
+            .find(|version| version.version == target)
+            .map(|version| version.labels.clone())
+            .unwrap_or_default();
+        let arriving = accepted
+            .iter()
+            .filter(|label| !held.contains(*label))
+            .count();
+        if held.len() + arriving > crate::state::MAX_LABELS_PER_VERSION {
+            return Err(
+                LabelParameterVersionErrorModeled::ParameterVersionLabelLimitExceeded(
+                    // The wording the modelled error itself carries: "A parameter version
+                    // can have a maximum of ten labels."
+                    ParameterVersionLabelLimitExceeded {
+                        message: Some(
+                            "A parameter version can have a maximum of ten labels.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        for label in &accepted {
+            record.attach_label(target, label);
+        }
+
+        Ok(LabelParameterVersionOutput {
+            // Reported even when empty, the way this service's other partitioning
+            // response does (`GetParameters`' `InvalidParameters`): the modelled list's
+            // 1..10 length bounds how many labels ONE CALL carries, so it says nothing
+            // about a call every one of whose labels was accepted.
+            invalid_labels: Some(invalid_labels),
+            parameter_version: target,
+        })
     }
 }
