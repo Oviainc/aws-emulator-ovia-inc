@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWhatsAppFlow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWhatsAppFlow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWhatsAppFlow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Flow a WhatsApp Business Account holds under a Meta Flow id, and refuses
+//! with the modelled not-found when the account — or the Flow under it — is not the
+//! calling account's.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +170,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWhatsAppFlow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWhatsAppFlowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWhatsAppFlow"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetWhatsAppFlowErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the social-messaging store is unavailable".to_string()),
+            })
+        })?;
+        let store = state.lock();
+
+        // `id` accepts the `waba-...` short form and the account ARN alike. An id naming
+        // no linked account, and an account holding no such Flow, are the SAME miss on the
+        // names the request carried, and are answered with the one constant this lookup
+        // states — so the answer tells a caller nothing about which half missed.
+        let flow = store
+            .linked_account_id(&input.id)
+            .and_then(|account_id| {
+                let flow = store.resolve_flow(&account_id, &input.flow_id)?;
+                let account = store.linked_accounts.get(&account_id)?;
+                Some((flow, account))
+            });
+        let Some((flow, account)) = flow else {
+            return Err(GetWhatsAppFlowErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::ID_NOT_FOUND_FOR_ACCOUNT_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetWhatsAppFlowOutput {
+            flow_id: flow.flow_id.clone(),
+            flow_name: flow.flow_name.clone(),
+            flow_status: flow.status.clone(),
+            categories: Some(flow.categories.clone()),
+            // The versions the Flow's own definition declared, read off it when the create
+            // took it in; a Flow created without a definition declares neither.
+            json_version: flow.json_version.clone(),
+            data_api_version: flow.data_api_version.clone(),
+            endpoint_uri: flow.endpoint_uri.clone(),
+            // The WhatsApp Business Account this Flow belongs to, as this store holds it.
+            // The three Meta-side facts of that account — its currency, its timezone and
+            // its template namespace — are not ones any operation of this service writes,
+            // so there is none to report.
+            whats_app_business_account: Some(MetaFlowWhatsAppBusinessAccountInfo {
+                id: account.waba_id.clone(),
+                name: account.waba_name.clone(),
+                currency: None,
+                timezone_id: None,
+                message_template_namespace: None,
+            }),
+            // Meta reports validation errors against a definition it validated, a preview
+            // against one `GetWhatsAppFlowPreview` asked it for, and the application and
+            // health facts of the Meta app behind the Flow. This emulator holds none of
+            // those, and reports no value it did not compute from what it holds.
+            validation_errors: None,
+            preview: None,
+            application: None,
+            health_status: None,
+        })
     }
 }

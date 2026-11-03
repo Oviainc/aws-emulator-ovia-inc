@@ -19,9 +19,9 @@ use crate::harness::{call, emulator, link, query_escape, ACCOUNT_ID};
 /// (`RESOURCE_NOT_FOUND_MESSAGE` in `src/state.rs`).
 const NOT_FOUND: &str = "Requested resource not found.";
 
-/// The message the Conversions API paths answer their own not-found with
-/// (`DATASET_NOT_FOUND_MESSAGE` in `src/state.rs`): a constant too, and the one those
-/// paths — the dataset create and the conversion event — were recorded stating.
+/// The message the `id`-scoped lookups answer their own not-found with
+/// (`ID_NOT_FOUND_FOR_ACCOUNT_MESSAGE` in `src/state.rs`): a constant too, and the one
+/// those paths — the dataset create and the conversion event — were recorded stating.
 const DATASET_NOT_FOUND: &str = "Id not found for account.";
 
 /// The message the DISASSOCIATION answers an id that names no linked account with

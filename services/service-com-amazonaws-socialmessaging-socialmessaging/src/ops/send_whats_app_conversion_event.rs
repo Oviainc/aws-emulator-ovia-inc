@@ -178,7 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 SendWhatsAppConversionEventErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::DATASET_NOT_FOUND_MESSAGE.to_string()),
+                        message: Some(
+                            crate::state::ID_NOT_FOUND_FOR_ACCOUNT_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

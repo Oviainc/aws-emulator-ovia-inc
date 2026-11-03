@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutWhatsAppBusinessPublicKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutWhatsAppBusinessPublicKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutWhatsAppBusinessPublicKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the business public key of a registered origination phone number — the PEM itself,
+//! or the KMS key that holds it — and refuses with the modelled not-found when the number
+//! is not one this account registered.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +151,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutWhatsAppBusinessPublicKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutWhatsAppBusinessPublicKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutWhatsAppBusinessPublicKey"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutWhatsAppBusinessPublicKeyErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the social-messaging store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // The key arrives EITHER as the PEM or as the ARN of a KMS key holding it: the
+        // model documents the two members as mutually exclusive, so a request carrying
+        // both, or neither, names no key to set. That is decided from the REQUEST alone, so
+        // it is answered before any resource is resolved and leaves the store as it found
+        // it — and a caller whose request cannot hold learns nothing from it about what the
+        // account holds.
+        let names_one_key =
+            input.business_public_key.is_some() != input.kms_key_arn.is_some();
+        if !names_one_key {
+            return Err(
+                PutWhatsAppBusinessPublicKeyErrorModeled::InvalidParametersException(
+                    InvalidParametersException {
+                        message: Some(crate::state::INVALID_PARAMETERS_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Then the resource: the number must be one this account registered, and that
+        // lookup is what fails for an unknown number — before anything is done with the
+        // key the request carries.
+        let Some(phone_number_id) = store.phone_number_id(&input.origination_phone_number_id)
+        else {
+            return Err(
+                PutWhatsAppBusinessPublicKeyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::ORIGINATION_PHONE_NUMBER_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `@idempotent`: a number has ONE business public key, so the write replaces
+        // whatever was there and setting the same key twice leaves the same state.
+        if let Some(number) = store.phone_numbers.get_mut(&phone_number_id) {
+            number.business_public_key = Some(crate::state::BusinessPublicKey {
+                pem: input.business_public_key,
+                kms_key_arn: input.kms_key_arn,
+                written_at: ::std::time::SystemTime::now(),
+            });
+        }
+
+        Ok(PutWhatsAppBusinessPublicKeyOutput {})
     }
 }

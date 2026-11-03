@@ -375,6 +375,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             dataset_id: None,
                             marketing_messages_onboarding_status: None,
                             tags,
+                            // A freshly linked account holds no Flow and no message
+                            // template; the Flow and template creates are what add them.
+                            flows: ::std::collections::HashMap::new(),
+                            message_templates: ::std::collections::HashMap::new(),
                         },
                     );
                     id
@@ -406,6 +410,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         data_localization_region: entry.data_localization_region.clone(),
                         call_settings: None,
                         tags: entry.tags.clone().map(st::tag_map).unwrap_or_default(),
+                        // A freshly registered number has no business public key set and
+                        // holds no media; the public-key write and the media upload are
+                        // what put them there.
+                        business_public_key: None,
+                        media: ::std::collections::HashMap::new(),
                     },
                 );
                 registered.push(phone_number_id);

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWhatsAppMessageTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWhatsAppMessageTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWhatsAppMessageTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Submits a WhatsApp message template under a linked WhatsApp Business Account, reports
+//! the id and review status it was submitted with, and refuses with the modelled not-found
+//! when the account is not the calling account's.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWhatsAppMessageTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWhatsAppMessageTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWhatsAppMessageTemplate"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWhatsAppMessageTemplateErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the social-messaging store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `id` accepts the `waba-...` short form and the account ARN alike.
+        let Some(account_id) = store.linked_account_id(&input.id) else {
+            return Err(
+                CreateWhatsAppMessageTemplateErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::ID_NOT_FOUND_FOR_ACCOUNT_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "The complete template definition as a JSON blob": a blob that is not text, or
+        // not a JSON object naming the template, defines no template — which is a
+        // parameter that is not valid, not a resource that was not found.
+        let definition = String::from_utf8(input.template_definition).ok();
+        let parsed = definition
+            .as_deref()
+            .and_then(crate::state::parse_template_definition);
+        let (Some(definition), Some(parsed)) = (definition, parsed) else {
+            return Err(
+                CreateWhatsAppMessageTemplateErrorModeled::InvalidParametersException(
+                    InvalidParametersException {
+                        message: Some(crate::state::INVALID_PARAMETERS_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let held = store
+            .linked_accounts
+            .get(&account_id)
+            .map_or(0, |account| account.message_templates.len());
+        if held >= crate::state::MAX_MESSAGE_TEMPLATES_PER_ACCOUNT {
+            return Err(
+                CreateWhatsAppMessageTemplateErrorModeled::ThrottledRequestException(
+                    ThrottledRequestException {
+                        message: Some(crate::state::THROTTLED_REQUEST_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let submitted_at = ::std::time::SystemTime::now();
+        let meta_template_id = store.mint_meta_template_id();
+        // The definition is kept because it is what the template READ reports: there is no
+        // Meta behind this emulator to fetch it back from, so the template lives here.
+        let record = crate::state::MessageTemplateRecord {
+            meta_template_id: meta_template_id.clone(),
+            name: parsed.name,
+            language: parsed.language,
+            category: parsed.category,
+            definition,
+            created_at: submitted_at,
+            review_due_at: submitted_at + crate::state::TEMPLATE_REVIEW_SPAN,
+        };
+        let status = record.status_at(submitted_at).to_string();
+        let category = record.category.clone();
+        if let Some(account) = store.linked_accounts.get_mut(&account_id) {
+            account
+                .message_templates
+                .insert(meta_template_id.clone(), record);
+        }
+
+        Ok(CreateWhatsAppMessageTemplateOutput {
+            meta_template_id: Some(meta_template_id),
+            // The status the template is in at the instant it was submitted, which is the
+            // one its stored review deadline reports: the review it is waiting on is not
+            // due yet, so a template reads back PENDING for as long as that holds.
+            template_status: Some(status),
+            // The category the definition classified the template with, when it stated one
+            // inside the modelled bound; Meta assigns none of its own here.
+            category,
+        })
     }
 }

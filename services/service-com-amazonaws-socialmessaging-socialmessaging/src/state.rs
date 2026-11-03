@@ -100,6 +100,72 @@ pub const MAX_RETAINED_CONVERSION_EVENT_BYTES: usize = 8 * 1024 * 1024;
 /// ends, so a minted id satisfies the constraint with room on either side.
 const DATASET_ID_DIGITS: u32 = 15;
 
+/// How many digits a minted Meta-side resource id carries — a Flow id (`MetaFlowId`,
+/// `len 1..100, pattern ^[0-9]+$`) and a message-template id (`MetaTemplateId`, the same
+/// constraint). Both ranges hold [`DATASET_ID_DIGITS`] with room on either side, so one
+/// width serves every numeric id Meta hands back and the ids all read alike.
+const META_ID_DIGITS: u32 = DATASET_ID_DIGITS;
+
+/// The `MetaFlowStatus` a Flow starts in: `CreateWhatsAppFlow` documents that "the Flow is
+/// created in DRAFT status". One of the values that operation's doc lists — DRAFT,
+/// PUBLISHED, DEPRECATED, BLOCKED, THROTTLED — and inside `MetaFlowStatus`'s `len 1..20`.
+pub const FLOW_STATUS_DRAFT: &str = "DRAFT";
+
+/// The `MetaFlowStatus` a Flow reaches when the create asked for it: "if `publish` is set
+/// to `true` and a valid `flowJson` is provided, the Flow is published immediately"
+/// (`CreateWhatsAppFlow`'s doc). Immediately, so no transition is owed on it.
+pub const FLOW_STATUS_PUBLISHED: &str = "PUBLISHED";
+
+/// The `templateStatus` a submitted message template carries while Meta is still reviewing
+/// it (`CreateWhatsAppMessageTemplate`'s output member documents "the status of the created
+/// template, such as PENDING or APPROVED").
+pub const TEMPLATE_STATUS_PENDING: &str = "PENDING";
+
+/// The `templateStatus` a reviewed template carries once the review is through — the other
+/// value [`TEMPLATE_STATUS_PENDING`]'s member documents.
+pub const TEMPLATE_STATUS_APPROVED: &str = "APPROVED";
+
+/// How long a submitted template stays [`TEMPLATE_STATUS_PENDING`] before the review it is
+/// waiting on is due. Emulator-chosen: Meta publishes no review time, and the span exists
+/// so a caller reading the template straight after creating it still sees the status the
+/// create reported. Nothing sleeps for it — the due instant is stored and the status is
+/// read off the clock (see [`MessageTemplateRecord::status_at`]).
+pub const TEMPLATE_REVIEW_SPAN: Duration = Duration::from_secs(3);
+
+/// The `businessPublicKeySignatureStatus` a stored business public key reports.
+///
+/// The member documents two values, VALID and MISMATCH, and the mismatch is between the
+/// key WhatsApp holds and the one the service holds. This emulator is both sides of that
+/// comparison — the key a read reports is the one the write stored — so a stored key is
+/// always the key that was set, and the status it reports is this one.
+pub const BUSINESS_PUBLIC_KEY_SIGNATURE_VALID: &str = "VALID";
+
+/// The message this service's `InvalidParametersException` carries: the model documents the
+/// error as "one or more parameters provided to the action are not valid", and that is what
+/// a request whose members cannot hold together is refused with — a constant, like every
+/// other error text this service states, so nothing of the request reaches it.
+pub const INVALID_PARAMETERS_MESSAGE: &str =
+    "One or more parameters provided to the action are not valid.";
+
+/// The message this service's `ThrottledRequestException` carries: the model documents the
+/// error as "the request was denied due to request throttling", and that is what a create
+/// past one of this store's bounds is refused with — a constant, for the same reason as
+/// [`INVALID_PARAMETERS_MESSAGE`].
+pub const THROTTLED_REQUEST_MESSAGE: &str = "The request was denied due to request throttling.";
+
+/// How many Flows one linked account holds. Emulator-chosen, like
+/// [`MAX_PHONE_NUMBERS_PER_ACCOUNT`]: each `CreateWhatsAppFlow` call adds a record, so
+/// without a bound a stream of creates could grow the process without limit. The Flow
+/// operations model no quota error, so a create past the bound is refused with the
+/// `ThrottledRequestException` they do model — the one refusal that says the request is not
+/// being accepted now, and which stops saying so once a Flow is deleted.
+pub const MAX_FLOWS_PER_ACCOUNT: usize = 32;
+
+/// How many message templates one linked account holds, for the same reason and refused
+/// the same way as [`MAX_FLOWS_PER_ACCOUNT`]. With the modelled `1..6000` bound on a
+/// template definition it also bounds the bytes the stored definitions take.
+pub const MAX_MESSAGE_TEMPLATES_PER_ACCOUNT: usize = 32;
+
 /// The message this service's `ResourceNotFoundException` carries.
 ///
 /// The text is CONSTANT: nothing of the request reaches it, so a client's match on it does
@@ -107,8 +173,8 @@ const DATASET_ID_DIGITS: u32 = 15;
 /// keeps opaque. The model documents the error only as "The resource was not found."; this
 /// text is the one the service's READS were recorded answering, identically for two
 /// accounts named by 36- and 115-character ids, which is what shows it is not derived from
-/// the request. Every not-found path takes a constant; the Conversions API's own is
-/// [`DATASET_NOT_FOUND_MESSAGE`] and the phone-number lookups' is
+/// the request. Every not-found path takes a constant; the `id`-scoped Meta lookups' own is
+/// [`ID_NOT_FOUND_FOR_ACCOUNT_MESSAGE`] and the phone-number lookups' is
 /// [`ORIGINATION_PHONE_NUMBER_NOT_FOUND_MESSAGE`].
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Requested resource not found.";
 
@@ -120,18 +186,22 @@ pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Requested resource not found.";
 /// with the request. The rule is the one [`RESOURCE_NOT_FOUND_MESSAGE`] states — a
 /// not-found message is a constant, not a formatted one — with each lookup stating the
 /// constant it was recorded with; every operation that resolves a phone-number id (the
-/// phone-number read, the send) states this one.
+/// phone-number read, the send, the business-public-key read and write, the media delete)
+/// states this one.
 pub const ORIGINATION_PHONE_NUMBER_NOT_FOUND_MESSAGE: &str =
     "Origination phone number id not found for account.";
 
-/// The message the Conversions API's `ResourceNotFoundException` carries.
+/// The message the `id`-scoped Meta lookups' `ResourceNotFoundException` carries.
 ///
-/// A constant too, and the one the Conversions API paths were recorded answering for a
-/// `id` that names no linked account: the dataset create and the conversion event both
-/// state it. Those paths state their own text rather than the one the account reads state
+/// A constant too, and the one those paths were recorded answering for an `id` that names
+/// no linked account: the dataset create, the conversion event, the Flow read and create,
+/// the message-template read and create and the media delete all state it. They state
+/// their own text rather than the one the account read states
 /// ([`RESOURCE_NOT_FOUND_MESSAGE`]), so the rule — a not-found message is a constant, not
-/// a formatted one — holds with each path stating the constant it was recorded with.
-pub const DATASET_NOT_FOUND_MESSAGE: &str = "Id not found for account.";
+/// a formatted one — holds with each path stating the constant it was recorded with. The
+/// resource the miss is reported for is the one the `id` member names, whether the id
+/// resolved to no account or the account holds no such Flow, template or media object.
+pub const ID_NOT_FOUND_FOR_ACCOUNT_MESSAGE: &str = "Id not found for account.";
 
 /// The message the DISASSOCIATION path's `ResourceNotFoundException` carries.
 ///
@@ -265,6 +335,105 @@ pub struct LinkedAccount {
     pub marketing_messages_onboarding_status: Option<String>,
     /// Tags supplied at association time.
     pub tags: HashMap<String, String>,
+    /// The WhatsApp Flows created under this account, by [`FlowRecord::flow_id`].
+    ///
+    /// Held ON the account rather than in a store-wide map because a Flow belongs to one
+    /// WhatsApp Business Account: every Flow operation names the account beside the Flow,
+    /// and unlinking the account takes its Flows with it.
+    pub flows: HashMap<String, FlowRecord>,
+    /// The WhatsApp message templates created under this account, by
+    /// [`MessageTemplateRecord::meta_template_id`] — held on the account for the same
+    /// reason as [`Self::flows`].
+    pub message_templates: HashMap<String, MessageTemplateRecord>,
+}
+
+/// A WhatsApp Flow created under a linked account.
+#[derive(Debug, Clone)]
+pub struct FlowRecord {
+    /// The Meta-side id, a numeric string ([`ComAmazonawsSocialmessagingSocialmessagingState::mint_flow_id`]).
+    pub flow_id: String,
+    /// The name the create gave the Flow.
+    pub flow_name: String,
+    /// The categories the create classified the Flow with.
+    pub categories: Vec<String>,
+    /// One of [`FLOW_STATUS_DRAFT`] / [`FLOW_STATUS_PUBLISHED`].
+    pub status: String,
+    /// Whether the Flow HAS a JSON definition — the create supplied one, or the Flow was
+    /// cloned from one that had. A Flow cannot be published without it.
+    pub has_definition: bool,
+    /// The Flow JSON schema version the definition declares, when it declares one.
+    pub json_version: Option<String>,
+    /// The data API version the definition declares, when it declares one.
+    pub data_api_version: Option<String>,
+    /// The endpoint Meta calls for a data-exchange Flow, when the create named one.
+    pub endpoint_uri: Option<String>,
+    /// When the Flow was created.
+    pub created_at: SystemTime,
+}
+
+/// A WhatsApp message template created under a linked account.
+#[derive(Debug, Clone)]
+pub struct MessageTemplateRecord {
+    /// The Meta-side id, a numeric string
+    /// ([`ComAmazonawsSocialmessagingSocialmessagingState::mint_meta_template_id`]).
+    pub meta_template_id: String,
+    /// The template's name, as its definition declares it.
+    pub name: String,
+    /// The template's language code, when its definition declares one.
+    pub language: Option<String>,
+    /// The template's category, when its definition declares one.
+    pub category: Option<String>,
+    /// The definition exactly as the create supplied it, which is what the read reports.
+    pub definition: String,
+    /// When the template was submitted.
+    pub created_at: SystemTime,
+    /// When Meta's review of it falls due, [`TEMPLATE_REVIEW_SPAN`] after the submission.
+    pub review_due_at: SystemTime,
+}
+
+impl MessageTemplateRecord {
+    /// This template's status at `now`: [`TEMPLATE_STATUS_PENDING`] until the review it is
+    /// waiting on falls due, [`TEMPLATE_STATUS_APPROVED`] from that instant on.
+    ///
+    /// Read off the clock rather than written by a timer: the move was owed at
+    /// [`Self::review_due_at`] whether or not anybody called, so every reader sees the same
+    /// status at the same instant and no read changes what a later one sees.
+    pub fn status_at(&self, now: SystemTime) -> &'static str {
+        if now < self.review_due_at {
+            TEMPLATE_STATUS_PENDING
+        } else {
+            TEMPLATE_STATUS_APPROVED
+        }
+    }
+}
+
+/// The business public key set for a phone number by `PutWhatsAppBusinessPublicKey`.
+///
+/// The operation takes the key one of two ways — the PEM itself, or the ARN of an
+/// asymmetric KMS key — and the model documents them as mutually exclusive, so exactly one
+/// of these two members is set.
+#[derive(Debug, Clone)]
+pub struct BusinessPublicKey {
+    /// The PEM the caller set, when it set the key material directly.
+    pub pem: Option<String>,
+    /// The KMS key the caller named, when the key material lives in KMS. The key material
+    /// of a customer managed key is not this service's to hold, so a key set this way has
+    /// no PEM here and the read reports none.
+    pub kms_key_arn: Option<String>,
+    /// When the key was set.
+    pub written_at: SystemTime,
+}
+
+/// A media object held for a phone number.
+///
+/// `PostWhatsAppMessageMedia` is what uploads one (still scaffolded); the delete is what
+/// removes it, and reports a miss for a media id this number holds none of.
+#[derive(Debug, Clone)]
+pub struct MediaObject {
+    /// The media id, as the upload minted it.
+    pub media_id: String,
+    /// When the object was stored.
+    pub stored_at: SystemTime,
 }
 
 /// A phone number registered under a linked account.
@@ -292,6 +461,13 @@ pub struct PhoneNumberRecord {
     pub call_settings: Option<WhatsAppCallSettings>,
     /// Tags supplied at registration time.
     pub tags: HashMap<String, String>,
+    /// The business public key, once `PutWhatsAppBusinessPublicKey` set one. Held on the
+    /// number's own record because the key belongs to that number: one number has one key,
+    /// and unregistering the number takes it with it.
+    pub business_public_key: Option<BusinessPublicKey>,
+    /// The media objects held for this number, by [`MediaObject::media_id`] — on the
+    /// record for the same reason as [`Self::business_public_key`].
+    pub media: HashMap<String, MediaObject>,
 }
 
 /// A signup started by a `signupCallback` and not yet finalized.
@@ -506,10 +682,30 @@ impl ComAmazonawsSocialmessagingSocialmessagingState {
     /// own unique digest, so it satisfies `WhatsAppDatasetId` and two datasets never get
     /// the same id.
     pub fn mint_dataset_id(&mut self) -> String {
-        let digest = self.next_hex32("dataset");
+        self.mint_numeric_id("dataset", DATASET_ID_DIGITS)
+    }
+
+    /// Mint the Flow id `CreateWhatsAppFlow` returns: [`META_ID_DIGITS`] decimal digits,
+    /// so it satisfies `MetaFlowId` (`^[0-9]+$`) and two Flows never get the same id.
+    pub fn mint_flow_id(&mut self) -> String {
+        self.mint_numeric_id("flow", META_ID_DIGITS)
+    }
+
+    /// Mint the template id `CreateWhatsAppMessageTemplate` returns, the same way and for
+    /// the same reason as [`Self::mint_flow_id`]: `MetaTemplateId` carries the same
+    /// numeric constraint.
+    pub fn mint_meta_template_id(&mut self) -> String {
+        self.mint_numeric_id("message-template", META_ID_DIGITS)
+    }
+
+    /// `digits` decimal digits with a non-zero lead, read off this store's own unique
+    /// digest — the one place a numeric Meta-side id is minted, so the dataset, Flow and
+    /// template ids cannot drift apart in form.
+    fn mint_numeric_id(&mut self, kind: &str, digits: u32) -> String {
+        let digest = self.next_hex32(kind);
         // 15 hex characters are 60 bits, which a u64 holds.
         let value = u64::from_str_radix(&digest[..15], 16).unwrap_or(self.id_seq);
-        let lead = 10_u64.pow(DATASET_ID_DIGITS - 1);
+        let lead = 10_u64.pow(digits - 1);
         (lead + value % (9 * lead)).to_string()
     }
 
@@ -562,6 +758,56 @@ impl ComAmazonawsSocialmessagingSocialmessagingState {
             .get(id)
             .filter(|resolved| self.phone_numbers.contains_key(resolved.as_str()))
             .cloned()
+    }
+
+    /// The Flow an account holds under `flow_id`, or `None` when that account holds none.
+    ///
+    /// Scoped to the account the request named, so a Flow of ANOTHER account is a miss
+    /// here exactly as an unknown id is: a Flow is only ever read through the account that
+    /// owns it.
+    pub fn resolve_flow(&self, account_id: &str, flow_id: &str) -> Option<&FlowRecord> {
+        self.linked_accounts
+            .get(account_id)
+            .and_then(|account| account.flows.get(flow_id))
+    }
+
+    /// The template an account holds under `meta_template_id`, scoped to that account for
+    /// the same reason as [`Self::resolve_flow`].
+    pub fn resolve_template(
+        &self,
+        account_id: &str,
+        meta_template_id: &str,
+    ) -> Option<&MessageTemplateRecord> {
+        self.linked_accounts
+            .get(account_id)
+            .and_then(|account| account.message_templates.get(meta_template_id))
+    }
+
+    /// The template an account holds under `name` — and under `language` too when the
+    /// caller named one, since a template is identified at Meta by the name and language
+    /// together and one name can carry a translation per language.
+    ///
+    /// The most recently submitted match, so a name carrying more than one template
+    /// resolves to the same one on every read.
+    pub fn template_by_name(
+        &self,
+        account_id: &str,
+        name: &str,
+        language: Option<&str>,
+    ) -> Option<&MessageTemplateRecord> {
+        self.linked_accounts
+            .get(account_id)?
+            .message_templates
+            .values()
+            .filter(|template| template.name == name)
+            .filter(|template| match language {
+                Some(language) => template.language.as_deref() == Some(language),
+                None => true,
+            })
+            .max_by(|left, right| {
+                (left.created_at, &left.meta_template_id)
+                    .cmp(&(right.created_at, &right.meta_template_id))
+            })
     }
 
     /// The tags of the resource `arn` names, or `None` when this store holds no
@@ -645,6 +891,99 @@ pub fn derive_phone_number(meta_phone_number_id: &str) -> (String, String) {
         format!("+1{area}55501{line:02}"),
         format!("+1 {area} 555-01{line:02}"),
     )
+}
+
+/// What a Flow's JSON definition declares, as the read reports it back.
+///
+/// Meta's Flow JSON carries its own schema version, and a data-exchange Flow carries the
+/// data API version it speaks; the modelled `jsonVersion` and `dataApiVersion` members of
+/// the Flow read are those two values. Nothing else of the definition is retained: the
+/// modelled surface carries no Flow JSON back, so the bytes themselves are read once, here,
+/// and what the read reports is kept.
+#[derive(Debug, Clone, Default)]
+pub struct FlowDefinition {
+    /// The `version` the definition declares, when it declares one inside the modelled
+    /// `MetaFlowJsonVersion` bound (`len 1..10`).
+    pub json_version: Option<String>,
+    /// The `data_api_version` the definition declares, under the same bound
+    /// (`MetaFlowDataApiVersion`, `len 1..10`).
+    pub data_api_version: Option<String>,
+}
+
+/// Read a Flow's JSON definition, or `None` when the bytes are not a JSON object.
+///
+/// `None` is what "no valid `flowJson`" means for the create: a definition that is not a
+/// JSON object at all is not one the Flow can be published from.
+pub fn parse_flow_json(flow_json: &[u8]) -> Option<FlowDefinition> {
+    let definition: ::serde_json::Value = ::serde_json::from_slice(flow_json).ok()?;
+    let members = definition.as_object()?;
+    Some(FlowDefinition {
+        json_version: bounded_version(members.get("version")),
+        data_api_version: bounded_version(members.get("data_api_version")),
+    })
+}
+
+/// A version a Flow definition states, as the wire member carries it: Flow JSON writes a
+/// version as a string (`"7.3"`) and a definition that writes it as a number states the
+/// same value, so both read back the same way. A value past the modelled `1..10` bound is
+/// not reported at all rather than reported truncated.
+fn bounded_version(value: Option<&::serde_json::Value>) -> Option<String> {
+    let text = match value {
+        Some(::serde_json::Value::String(text)) => text.clone(),
+        Some(::serde_json::Value::Number(number)) => number.to_string(),
+        _ => return None,
+    };
+    (1..=MAX_VERSION_LENGTH.into()).contains(&text.chars().count()).then_some(text)
+}
+
+/// The modelled length both version members share: `MetaFlowJsonVersion` and
+/// `MetaFlowDataApiVersion` are each `len 1..10`.
+const MAX_VERSION_LENGTH: u8 = 10;
+
+/// What a message template's definition declares.
+///
+/// A template definition is the Meta template object: its `name` is what identifies the
+/// template, and its `language` and `category` are what the create reports back and a read
+/// by name selects on.
+#[derive(Debug, Clone)]
+pub struct TemplateDefinition {
+    /// The template's name — a template without one names nothing and is not a template.
+    pub name: String,
+    /// The template's language code, when the definition declares one.
+    pub language: Option<String>,
+    /// The template's category, when the definition declares one.
+    pub category: Option<String>,
+}
+
+/// Read a message template's definition, or `None` when the bytes are not a JSON object
+/// carrying a non-empty `name` — which is a definition no template can be created from.
+pub fn parse_template_definition(definition: &str) -> Option<TemplateDefinition> {
+    let parsed: ::serde_json::Value = ::serde_json::from_str(definition).ok()?;
+    let members = parsed.as_object()?;
+    let name = members.get("name")?.as_str()?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(TemplateDefinition {
+        name: name.to_string(),
+        language: bounded_text(members.get("language"), MAX_TEMPLATE_LANGUAGE_LENGTH),
+        category: bounded_text(members.get("category"), MAX_TEMPLATE_CATEGORY_LENGTH),
+    })
+}
+
+/// The modelled length of a template's language code (`MetaTemplateLanguage`, `len 1..6`).
+const MAX_TEMPLATE_LANGUAGE_LENGTH: usize = 6;
+
+/// The modelled length of a template's category (`MetaTemplateCategory`, `len 1..100`).
+const MAX_TEMPLATE_CATEGORY_LENGTH: usize = 100;
+
+/// A string member of a definition, reported only when it fits the modelled bound the
+/// output member carries — a longer value is not reported at all rather than truncated.
+fn bounded_text(value: Option<&::serde_json::Value>, max: usize) -> Option<String> {
+    let text = value?.as_str()?;
+    (1..=max)
+        .contains(&text.chars().count())
+        .then(|| text.to_string())
 }
 
 /// A modelled `TagList` as the key/value store a resource keeps.

@@ -159,10 +159,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(account_id) = store.linked_account_id(&input.id) else {
             return Err(CreateWhatsAppDatasetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    // The Conversions API's own not-found wording, which this dataset
-                    // create shares with the conversion event: each not-found path states
-                    // the constant that path answers, not one text for the whole service.
-                    message: Some(crate::state::DATASET_NOT_FOUND_MESSAGE.to_string()),
+                    // The not-found wording the `id`-scoped lookups state, which this
+                    // dataset create shares with the conversion event: each not-found path
+                    // states the constant that path answers, not one text for the whole
+                    // service.
+                    message: Some(crate::state::ID_NOT_FOUND_FOR_ACCOUNT_MESSAGE.to_string()),
                 },
             )
             .into());

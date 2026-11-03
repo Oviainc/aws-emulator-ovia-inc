@@ -19,6 +19,8 @@ mod conversion_events;
 mod cross_account_pass_role;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/meta_resource_lookups.rs"]
+mod meta_resource_lookups;
 #[path = "all/not_found_message.rs"]
 mod not_found_message;
 #[path = "all/resource_tags.rs"]

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWhatsAppBusinessPublicKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWhatsAppBusinessPublicKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWhatsAppBusinessPublicKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the business public key set for a registered origination phone number and its
+//! signature status, and refuses with the modelled not-found when the number is not one
+//! this account registered.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +151,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWhatsAppBusinessPublicKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWhatsAppBusinessPublicKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWhatsAppBusinessPublicKey"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetWhatsAppBusinessPublicKeyErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the social-messaging store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        // `originationPhoneNumberId` accepts the `phone-number-id-...` short form and the
+        // number's ARN alike. A number this account has not registered is the
+        // phone-number lookups' own miss, worded as that lookup words one.
+        let Some(number) = store.resolve_phone_number(&input.origination_phone_number_id) else {
+            return Err(
+                GetWhatsAppBusinessPublicKeyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::ORIGINATION_PHONE_NUMBER_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A registered number with no key set reads back as a number with no key: both
+        // output members are optional, and neither is reported for a key that was never
+        // written. A key the caller handed over as a KMS key ARN has no PEM here — the key
+        // material of a customer managed key is not this service's to report — so the
+        // status stands alone for it.
+        let key = number.business_public_key.as_ref();
+        Ok(GetWhatsAppBusinessPublicKeyOutput {
+            business_public_key: key.and_then(|key| key.pem.clone()),
+            business_public_key_signature_status: key.map(|_| {
+                crate::state::BUSINESS_PUBLIC_KEY_SIGNATURE_VALID.to_string()
+            }),
+        })
     }
 }

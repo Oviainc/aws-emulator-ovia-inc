@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWhatsAppFlow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWhatsAppFlow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWhatsAppFlow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a WhatsApp Flow under a linked WhatsApp Business Account — in DRAFT status, or
+//! published outright when the create asked for that and handed in a definition to publish
+//! — and refuses with the modelled not-found when the account is not the calling
+//! account's.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +164,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWhatsAppFlow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWhatsAppFlowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWhatsAppFlow"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWhatsAppFlowErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the social-messaging store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // `id` accepts the `waba-...` short form and the account ARN alike.
+        let Some(account_id) = store.linked_account_id(&input.id) else {
+            return Err(not_found());
+        };
+
+        // "The ID of an existing Flow WITHIN THE SAME WhatsApp Business Account to clone":
+        // a clone source the account does not hold is the same miss as an id that names no
+        // account, and is answered the same way.
+        let cloned = match input.clone_flow_id.as_deref() {
+            Some(clone_flow_id) => match store.resolve_flow(&account_id, clone_flow_id) {
+                Some(source) => Some(source.clone()),
+                None => return Err(not_found()),
+            },
+            None => None,
+        };
+
+        // "The name of the Flow. Must be unique within the WhatsApp Business Account" — a
+        // name the account already holds a Flow under is a parameter that cannot hold,
+        // which is this operation's modelled client-input refusal.
+        let name_taken = store
+            .linked_accounts
+            .get(&account_id)
+            .is_some_and(|account| {
+                account
+                    .flows
+                    .values()
+                    .any(|flow| flow.flow_name == input.flow_name)
+            });
+        if name_taken {
+            return Err(CreateWhatsAppFlowErrorModeled::InvalidParametersException(
+                InvalidParametersException {
+                    message: Some(crate::state::INVALID_PARAMETERS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let held = store
+            .linked_accounts
+            .get(&account_id)
+            .map_or(0, |account| account.flows.len());
+        if held >= crate::state::MAX_FLOWS_PER_ACCOUNT {
+            return Err(CreateWhatsAppFlowErrorModeled::ThrottledRequestException(
+                ThrottledRequestException {
+                    message: Some(crate::state::THROTTLED_REQUEST_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The definition is read once, here: what the Flow read reports of it are the
+        // versions it declares, so those are kept and the bytes are not.
+        let definition = input
+            .flow_json
+            .as_deref()
+            .and_then(crate::state::parse_flow_json);
+        let has_definition =
+            definition.is_some() || cloned.as_ref().is_some_and(|source| source.has_definition);
+        // "The Flow is created in DRAFT status. If `publish` is set to `true` and a valid
+        // `flowJson` is provided, the Flow is published immediately" — so a publish asked
+        // for without a definition to publish leaves the Flow in DRAFT.
+        let status = if input.publish == Some(true) && has_definition {
+            crate::state::FLOW_STATUS_PUBLISHED
+        } else {
+            crate::state::FLOW_STATUS_DRAFT
+        };
+        // A clone takes the source's declared versions and endpoint where this call states
+        // none of its own; the name and the categories are always this call's.
+        let (json_version, data_api_version) = match (&definition, &cloned) {
+            (Some(definition), _) => (
+                definition.json_version.clone(),
+                definition.data_api_version.clone(),
+            ),
+            (None, Some(source)) => (
+                source.json_version.clone(),
+                source.data_api_version.clone(),
+            ),
+            (None, None) => (None, None),
+        };
+        let endpoint_uri = input.endpoint_uri.clone().or_else(|| {
+            cloned
+                .as_ref()
+                .and_then(|source| source.endpoint_uri.clone())
+        });
+
+        let flow_id = store.mint_flow_id();
+        let record = crate::state::FlowRecord {
+            flow_id: flow_id.clone(),
+            flow_name: input.flow_name,
+            categories: input.categories,
+            status: status.to_string(),
+            has_definition,
+            json_version,
+            data_api_version,
+            endpoint_uri,
+            created_at: ::std::time::SystemTime::now(),
+        };
+        if let Some(account) = store.linked_accounts.get_mut(&account_id) {
+            account.flows.insert(flow_id.clone(), record);
+        }
+
+        Ok(CreateWhatsAppFlowOutput {
+            flow_id: Some(flow_id),
+            // Meta reports validation errors against a definition it validated; this
+            // emulator is no Meta validator, so it reports no verdict it did not reach.
+            validation_errors: None,
+        })
     }
+}
+
+/// The miss this operation answers for an `id` that names no linked account, and for a
+/// `cloneFlowId` the account holds no Flow under: one constant, so the answer tells a
+/// caller nothing about which half missed.
+fn not_found() -> CreateWhatsAppFlowError {
+    CreateWhatsAppFlowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::ID_NOT_FOUND_FOR_ACCOUNT_MESSAGE.to_string()),
+    })
+    .into()
 }
