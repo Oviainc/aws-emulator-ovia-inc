@@ -26,13 +26,14 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::ops::types::{
     APPLICATION_MODE_VALUES, APPLICATION_RESTORE_TYPE_VALUES, CODE_CONTENT_TYPE_VALUES,
-    LOG_LEVEL_VALUES, RUNTIME_ENVIRONMENT_VALUES, URL_TYPE_VALUES,
+    LOG_LEVEL_VALUES, URL_TYPE_VALUES,
 };
 
 use super::harness::{
     call, create_body, create_startable, describe, error_code, error_message, router,
     with_code_content, SETTLE_WAIT,
 };
+use super::stated_enum_value_set::NAMED_RUNTIME_ENVIRONMENT_VALUES;
 
 // ---------------------------------------------------------------------------
 // A name the store already holds
@@ -387,7 +388,8 @@ struct EnumCase {
 /// rule is about every enum of this service rather than the one the issue cited. Each
 /// expected set is the generated value list for that type
 /// (`src/ops/types/shared_types.rs`, which the model's own enum shapes generate), sorted
-/// here rather than taken as it is listed.
+/// here rather than taken as it is listed — except `RuntimeEnvironment`, whose set the
+/// SERVICE names rather than the model (`stated_enum_value_set.rs` owns that rule).
 #[tokio::test]
 async fn an_enumerated_value_set_is_stated_in_lexicographic_order() {
     let base = create_body("enum-probe", "FLINK-1_20");
@@ -398,7 +400,7 @@ async fn an_enumerated_value_set_is_stated_in_lexicographic_order() {
             body: create_body("enum-probe", "FLINK-99_9"),
             path: "runtimeEnvironment",
             submitted: "FLINK-99_9",
-            values: RUNTIME_ENVIRONMENT_VALUES,
+            values: NAMED_RUNTIME_ENVIRONMENT_VALUES,
         },
         EnumCase {
             case: "the mode a create names",

@@ -31,6 +31,8 @@ mod scratch;
 mod sql_input_and_configuration_defaults;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stated_enum_value_set.rs"]
+mod stated_enum_value_set;
 #[path = "all/studio_notebook_catalog.rs"]
 mod studio_notebook_catalog;
 #[path = "all/tags_versions_and_snapshots.rs"]

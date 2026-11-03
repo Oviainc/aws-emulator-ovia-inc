@@ -41,14 +41,89 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
 pub mod request_layer;
 
-/// `refusal` with every enumerated value set stated in LEXICOGRAPHIC order, and everything
-/// else — the member paths, the values echoed, every other requirement — untouched.
+/// The enumerated value sets this service NAMES differently from the enum its public model
+/// publishes, as (what the model declares, what the service names) pairs.
+///
+/// A refusal of a value outside an enumerated member states the admissible set, and the set
+/// it states is the one the SERVICE's own validator enumerates for that shape — which a
+/// public model revision can declare more values than, because the model is published from
+/// the SDK's view of the API and gains a value as soon as the API documents it. Where the two
+/// differ the service's set is carried here and replaces the model's; a set this table does
+/// not name is stated as the model declares it, which is what the framework already renders.
+///
+/// SOURCE, for adding an entry: the bracketed set in the service's OWN refusal of a value
+/// outside that enum. That is service data about the enum, so an entry is added only when
+/// such a statement is in hand and it disagrees with the model's declaration — which is why
+/// this table is short rather than one entry per enum of the model.
+///
+/// An entry is matched by its MEMBERSHIP — the values the model declares, in any order — so
+/// it answers for the SHAPE rather than for one member referencing it: every member targeting
+/// that enum, in any operation (`RuntimeEnvironment` is reached by the runtime a create names
+/// and by the runtime an update moves an application to), is stated the same way. The set
+/// stated is only what the refusal NAMES: which values the service accepts is the model's
+/// enum, unchanged, so a value this table leaves out is still taken by the boundary.
+const NAMED_BY_THE_SERVICE: [(&[&str], &[&str]); 1] = [(
+    // `RuntimeEnvironment` (`smithy_query(query="shape", shape="RuntimeEnvironment")`), whose
+    // refusals name the runtime families the service enumerates — the SQL runtime, the Flink
+    // runtimes up to 1_15 and the Zeppelin-Flink notebook runtimes — and not the later Flink
+    // releases the published model also declares.
+    &[
+        "SQL-1_0",
+        "FLINK-1_6",
+        "FLINK-1_8",
+        "ZEPPELIN-FLINK-1_0",
+        "FLINK-1_11",
+        "FLINK-1_13",
+        "ZEPPELIN-FLINK-2_0",
+        "FLINK-1_15",
+        "ZEPPELIN-FLINK-3_0",
+        "FLINK-1_18",
+        "FLINK-1_19",
+        "FLINK-1_20",
+        "FLINK-2_2",
+        "FLINK-2_3",
+    ],
+    &[
+        "FLINK-1_11",
+        "FLINK-1_13",
+        "FLINK-1_15",
+        "FLINK-1_6",
+        "FLINK-1_8",
+        "SQL-1_0",
+        "ZEPPELIN-FLINK-1_0",
+        "ZEPPELIN-FLINK-2_0",
+        "ZEPPELIN-FLINK-3_0",
+    ],
+)];
+
+/// The admissible set a refusal states for an enumerated member whose model-declared set is
+/// `declared`: the set this service names for it ([`NAMED_BY_THE_SERVICE`]), or the model's
+/// own set when the two agree.
+///
+/// The match is on membership and size, never on position, so a model revision that reordered
+/// its own declaration of the same enum is still stated as the service names it.
+fn named_value_set(declared: &[String]) -> Vec<String> {
+    for (model_names, service_names) in NAMED_BY_THE_SERVICE {
+        let same_set = declared.len() == model_names.len()
+            && model_names
+                .iter()
+                .all(|named| declared.iter().any(|value| value == named));
+        if same_set {
+            return service_names.iter().map(|value| (*value).to_string()).collect();
+        }
+    }
+    declared.to_vec()
+}
+
+/// `refusal` with every enumerated value set stated as this service states it — the set the
+/// service names ([`named_value_set`]), in LEXICOGRAPHIC order — and everything else
+/// — the member paths, the values echoed, every other requirement — untouched.
 ///
 /// A refusal of a value outside an enumerated type names the values that type admits, and
 /// the order it names them in is the service's rather than the model's: the order the model
@@ -58,16 +133,30 @@ pub mod request_layer;
 /// rule, and it is applied to the violations as they arrive, so it answers for every enum of
 /// this model and for every member targeting one, in any operation, rather than for a table
 /// of enums written out here.
-fn in_stated_value_order(refusal: &Refusal) -> Refusal {
+fn as_stated_refusal(refusal: &Refusal) -> Refusal {
     let Refusal::Invalid(violations) = refusal else {
         return refusal.clone();
     };
-    Refusal::Invalid(
-        violations
-            .iter()
-            .map(service_common::validation_message::in_sorted_enum_order)
-            .collect(),
-    )
+    Refusal::Invalid(violations.iter().map(as_stated).collect())
+}
+
+/// One violation as this service states it: an enumerated member's admissible set is the set
+/// the service names, stated sorted, and every other constraint class is returned unchanged.
+///
+/// The CLAUSE stays the framework's throughout — this only decides what goes into the
+/// bracketed set and in what order, so the member path, the echoed value and the
+/// requirement's wording keep coming from the one place that writes them.
+fn as_stated(violation: &Violation) -> Violation {
+    let named = match &violation.kind {
+        ViolationKind::EnumValue(declared) => Violation {
+            path: violation.path.clone(),
+            kind: ViolationKind::EnumValue(named_value_set(declared)),
+            value: violation.value.clone(),
+            sensitive: violation.sensitive,
+        },
+        _ => violation.clone(),
+    };
+    service_common::validation_message::in_sorted_enum_order(&named)
 }
 
 /// The `com-amazonaws-kinesisanalyticsv2-kinesisanalytics-20180523` emulated service: the generated [`ServiceDefinition`] plus
@@ -172,10 +261,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // second one here. The `@pattern` rendering passed to it is the identity, so a
         // pattern is quoted back as this model writes it, anchors included.
         //
-        // What this service chooses is the ORDER an enumerated value set is stated in
-        // ([`in_stated_value_order`]), which is not the order the model declares it in.
+        // What this service chooses is the enumerated value SET that is stated and the ORDER
+        // it is stated in ([`as_stated_refusal`]): the set the service names for that shape
+        // ([`NAMED_BY_THE_SERVICE`]), which is not always the set the public model declares,
+        // sorted rather than left in the model's declaration order.
         service_common::validation_message::aws_validation_refusal_with(
-            &in_stated_value_order(refusal),
+            &as_stated_refusal(refusal),
             |pattern| pattern.to_string(),
         )
     }

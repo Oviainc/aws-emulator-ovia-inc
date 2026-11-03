@@ -31,6 +31,7 @@ use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::ops::typ
 use super::harness::{
     call, create_body, error_code, error_message, router, ACCOUNT, SETTLE_WAIT,
 };
+use super::stated_enum_value_set::NAMED_RUNTIME_ENVIRONMENT_VALUES;
 
 // ---------------------------------------------------------------------------
 // Boundary validation: a value outside a modelled enum
@@ -66,9 +67,8 @@ async fn a_runtime_environment_outside_the_enum_is_refused_as_a_validation_excep
         );
         let message = error_message(&body);
         // The envelope, the member path and the constraint are the requirement; what is
-        // asserted here is that every admitted value is named. The ORDER the set is
-        // stated in is its own rule, asserted over several enums in
-        // `tests/all/error_envelope_wording.rs`.
+        // asserted here is WHICH values the set names. The ORDER it is stated in is its own
+        // rule, asserted over several enums in `tests/all/error_envelope_wording.rs`.
         let expected_prefix = format!(
             "1 validation error detected: Value '{value}' at 'runtimeEnvironment' failed to \
              satisfy constraint: Member must satisfy enum value set: ["
@@ -78,11 +78,24 @@ async fn a_runtime_environment_outside_the_enum_is_refused_as_a_validation_excep
             "case {value:?}: expected a refusal naming the member, the value and the enum \
              constraint ({expected_prefix}…]), got {message:?}"
         );
-        for admitted in RUNTIME_ENVIRONMENT_VALUES {
+        // The set the refusal names is the set the SERVICE names for the shape, which is
+        // not every value the model declares — `tests/all/stated_enum_value_set.rs` owns
+        // that rule and the table behind it.
+        for named in NAMED_RUNTIME_ENVIRONMENT_VALUES {
             assert!(
-                message.contains(admitted),
-                "case {value:?}: expected the refusal to list the admitted value \
-                 {admitted:?}, got {message:?}"
+                message.contains(named),
+                "case {value:?}: expected the refusal to list the named value \
+                 {named:?}, got {message:?}"
+            );
+        }
+        for declared in RUNTIME_ENVIRONMENT_VALUES
+            .iter()
+            .filter(|declared| !NAMED_RUNTIME_ENVIRONMENT_VALUES.contains(declared))
+        {
+            assert!(
+                !message.contains(declared),
+                "case {value:?}: expected the refusal not to list {declared:?}, which the \
+                 service does not name for this shape, got {message:?}"
             );
         }
     }
