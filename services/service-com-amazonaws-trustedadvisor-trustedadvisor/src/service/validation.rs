@@ -302,7 +302,8 @@ fn requirement_of(kind: &ViolationKind) -> Option<String> {
 /// * an ABSENT member held no value at all and is reported as the null it was;
 /// * a `@sensitive` member names no value — the constraint it broke is the whole of what
 ///   a caller can act on, and the value belongs in nobody's logs, which is what
-///   `@sensitive` exists to say;
+///   `@sensitive` exists to say, and the validating walk withholds such a value from the
+///   violation itself;
 /// * a COLLECTION member is reported as the collection the caller sent, in place of the
 ///   framework's `<n> items` summary of it;
 /// * everything else echoes the value the framework stored.
@@ -379,6 +380,10 @@ fn is_same_set(reported: &[&str], allowed: &[String]) -> bool {
 ///
 /// Read off the deepest NAMED segment: the steps a path carries for a position inside a
 /// collection (`1`, `member`) name no member.
+///
+/// Read BESIDE [`Violation::sensitive`], not instead of it: the flag answers for a value
+/// the validating walk itself withheld, and this answers for one this service states a
+/// clause about with the value still in hand (a handler's own violation).
 fn is_sensitive(path: &str) -> bool {
     path.split('.')
         .rfind(|segment| {

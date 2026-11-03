@@ -165,6 +165,8 @@ mod not_found_messages;
 mod otel_enrichment;
 #[path = "all/percentile_low_sample_alarms.rs"]
 mod percentile_low_sample_alarms;
+#[path = "all/percentile_policy_is_per_alarm.rs"]
+mod percentile_policy_is_per_alarm;
 #[path = "all/period_refusal_message.rs"]
 mod period_refusal_message;
 #[path = "all/probe_counts.rs"]
