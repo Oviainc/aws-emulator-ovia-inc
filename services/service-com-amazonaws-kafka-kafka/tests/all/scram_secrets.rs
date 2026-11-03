@@ -943,35 +943,25 @@ async fn the_page_size_obeys_the_models_declared_range() {
     }
 
     // Past each published bound, so neither bound is merely clamped into range.
-    // The refusal states the AWS constraint clause for the member, naming the
-    // submitted value, the member path and the bound it failed.
-    for (page_size, requirement) in [
-        (
-            -1,
-            format!("Member must have value greater than or equal to {MIN_RESULTS}"),
-        ),
-        (
-            MIN_RESULTS - 1,
-            format!("Member must have value greater than or equal to {MIN_RESULTS}"),
-        ),
-        (
-            MAX_RESULTS_LIMIT + 1,
-            format!("Member must have value less than or equal to {MAX_RESULTS_LIMIT}"),
-        ),
-    ] {
+    // The refusal states the service's ONE sentence for a parameter it will not
+    // accept — the same text whichever bound was broken, with nothing of the
+    // request in it.
+    for page_size in [-1, MIN_RESULTS - 1, MAX_RESULTS_LIMIT + 1] {
         let case = format!("maxResults={page_size}");
         let reply = list(&emulator, &cluster, &format!("?maxResults={page_size}")).await;
         assert_bad_request(&reply, &case);
-        // The crate's one rendering of a constraint clause, shared with the
-        // suite that pins this service's refusal wording.
-        let expected_clause = super::refusal_wording::clause(
-            Some(&page_size.to_string()),
-            "maxResults",
-            &requirement,
+        // The crate's one wording of a refused parameter, shared with the suite
+        // that pins this service's refusal wording.
+        let expected = super::refusal_wording::PARAMETERS_NOT_VALID;
+        assert_eq!(
+            reply.error_message(),
+            expected,
+            "case {case}: expected the refusal to state {expected:?}, got {:?}",
+            reply.error_message()
         );
         assert!(
-            reply.error_message().contains(&expected_clause),
-            "case {case}: expected the refusal to state {expected_clause:?}, got {:?}",
+            !reply.error_message().contains("maxResults"),
+            "case {case}: the refusal must not name the member, got {:?}",
             reply.error_message()
         );
     }

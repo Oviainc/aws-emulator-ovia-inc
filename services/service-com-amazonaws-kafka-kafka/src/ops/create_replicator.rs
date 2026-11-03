@@ -308,6 +308,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A replicator replicates BETWEEN clusters, so the clusters it names are
+        // a set: one Kafka cluster named twice — as both the source and the
+        // target of its flow, or simply repeated in the list — describes no
+        // replication the service can set up. Tested on the identifier each
+        // entry names its cluster by, after every entry has been found to name
+        // one, and before any ARN is minted.
+        if crate::state::names_a_kafka_cluster_twice(&input.kafka_clusters) {
+            return Err(
+                CreateReplicatorErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("kafkaClusters".to_string()),
+                    message: Some(crate::state::DUPLICATE_KAFKA_CLUSTERS_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
         // Each entry also names the subnets the replicator's own client network
         // interfaces to that cluster are created in
         // (`KafkaClusterClientVpcConfig$SubnetIds`), and MSK places those
@@ -362,17 +378,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Ok(alias) => alias,
                 Err(message) => return Err(unnamed_end_refusal(index, message)),
             };
-            // The two ends of a flow are told apart by their cluster aliases —
-            // the alias is what prefixes a replicated topic's name — so a flow
-            // whose ends resolve to one alias cannot be set up.
+            // The two ends of a flow are two clusters, so a flow whose ends
+            // resolve to one cluster names it twice — the same condition the
+            // cluster list is tested for above, answered in the same fixed
+            // words.
             if source == target {
                 return Err(CreateReplicatorErrorModeled::BadRequestException(
                     BadRequestException {
                         invalid_parameter: Some(format!("ReplicationInfoList[{index}]")),
-                        message: Some(format!(
-                            "The source and target of a replication flow must be different \
-                             Kafka clusters; both resolve to the alias '{source}'."
-                        )),
+                        message: Some(
+                            crate::state::DUPLICATE_KAFKA_CLUSTERS_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());

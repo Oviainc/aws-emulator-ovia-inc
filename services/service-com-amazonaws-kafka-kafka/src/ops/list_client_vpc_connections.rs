@@ -242,12 +242,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lookup, which materialises the transitions the clock already owed THAT
         // cluster.
         let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
+            // No `NotFoundException` is modelled here either, so the reference
+            // is refused as a bad parameter, in the service's one fixed
+            // sentence for one.
             return Err(bad_request(
                 "ClusterArn",
-                format!(
-                    "No cluster exists in {region} with the ARN {}",
-                    input.cluster_arn
-                ),
+                crate::state::UNRESOLVED_REFERENCE_MESSAGE.to_string(),
             ));
         };
         // The cluster's OWN ARN, as the registry stores it on every connection

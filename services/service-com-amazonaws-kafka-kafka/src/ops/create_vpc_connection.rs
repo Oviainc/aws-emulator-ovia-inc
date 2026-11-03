@@ -265,10 +265,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(bad_request(
                         "TargetClusterArn",
-                        format!(
-                            "No cluster exists in {region} with the ARN {}",
-                            input.target_cluster_arn
-                        ),
+                        // This operation models no `NotFoundException`, so the
+                        // reference is refused as a bad parameter, in the
+                        // service's one fixed sentence for one — which carries
+                        // nothing of the request.
+                        crate::state::UNRESOLVED_REFERENCE_MESSAGE.to_string(),
                     ))
                 }
             };

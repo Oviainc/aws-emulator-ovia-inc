@@ -79,6 +79,8 @@ mod list_clusters_v2;
 mod node_listing;
 #[path = "all/placement_subnet_resolution.rs"]
 mod placement_subnet_resolution;
+#[path = "all/refusal_text_fidelity.rs"]
+mod refusal_text_fidelity;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/replication_end_naming.rs"]

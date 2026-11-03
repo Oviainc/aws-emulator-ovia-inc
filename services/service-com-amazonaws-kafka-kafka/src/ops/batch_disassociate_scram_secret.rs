@@ -198,18 +198,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // associated in the first place. Checked before the lock and before
         // anything is removed, so a batch carrying one unusable ARN
         // disassociates none of its secrets.
-        if let Some(not_a_secret) = input
+        if input
             .secret_arn_list
             .iter()
-            .find(|arn| !crate::state::is_secrets_manager_secret_arn(arn))
+            .any(|arn| !crate::state::is_secrets_manager_secret_arn(arn))
         {
             return Err(
                 BatchDisassociateScramSecretErrorModeled::BadRequestException(
                     BadRequestException {
                         invalid_parameter: Some("SecretArnList".to_string()),
-                        message: Some(format!(
-                            "{not_a_secret} is not a valid AWS Secrets Manager secret ARN."
-                        )),
+                        // The service's fixed sentence for this condition, so
+                        // the offending entry is not echoed back into it.
+                        message: Some(
+                            crate::state::SECRET_ARN_INVALID_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

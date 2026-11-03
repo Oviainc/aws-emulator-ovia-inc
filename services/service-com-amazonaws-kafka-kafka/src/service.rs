@@ -55,30 +55,28 @@ use std::sync::Arc;
 /// mentions.
 const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
 
-/// The message this service answers an input-constraint refusal with: the AWS
-/// constraint-validation envelope, built from the REQUEST and the model —
-/// `N validation error(s) detected: Value '<submitted>' at '<member path>'
-/// failed to satisfy constraint: <requirement>`, one clause per violation in the
-/// order the walk found them.
+/// The message this service answers an input-constraint refusal with: Amazon
+/// MSK's own fixed sentence for a parameter it will not accept
+/// (`crate::state::BAD_REQUEST_MESSAGE`), which names neither the member nor the
+/// bound it broke.
 ///
-/// That envelope is the wording of AWS's own input-validation layer, which runs
-/// in front of a service's business logic and words a bound violation from the
-/// request whatever error SHAPE the service then reports it under. So only the
-/// CODE is this service's own ([`BAD_REQUEST_EXCEPTION`], which the model
-/// declares); the sentence is not, and is rendered by the framework
-/// ([`aws_smithy_schema_server::envelope`]) — the one place every violation
-/// class is already worded, so a class added upstream cannot drift here.
+/// NOT the AWS constraint-validation envelope (`N validation error(s) detected:
+/// Value '<v>' at '<member>' failed to satisfy constraint: …`): that envelope is
+/// the wording of the input-validation layer in front of the service families
+/// that use it, and MSK is not one of them — it validates a request itself and
+/// answers one request-independent sentence for every parameter it refuses,
+/// which is what the behavioural corpus records for a page size above the
+/// modelled maximum. A client therefore sees the same text whatever member it
+/// got wrong, and no part of its request comes back in the message; the member
+/// at fault is reported in `BadRequestException$InvalidParameter` by the paths
+/// that know it.
 ///
-/// The two facts a caller acts on are the value it submitted and the constraint
-/// that value failed, and the envelope states both. A per-service paraphrase
-/// would state neither any better and would be prose no rule produces, so the
-/// exact sentence a particular AWS service happens to log is not something this
-/// emulator reproduces.
-///
-/// `None` (no violations at all) declines the override, since there is nothing
-/// to state and the framework's own wording is then the better answer.
+/// `violations` is taken but not read: the sentence is the same for every
+/// violation class, and the parameter is still what the refusal is ABOUT, so a
+/// refusal with no violations at all declines the override (`None`) and leaves
+/// the framework's own wording, exactly as before.
 fn refusal_message(violations: &[Violation]) -> Option<String> {
-    ::aws_smithy_schema_server::envelope(violations)
+    (!violations.is_empty()).then(|| crate::state::BAD_REQUEST_MESSAGE.to_string())
 }
 
 /// The `com-amazonaws-kafka-kafka` emulated service: the generated [`ServiceDefinition`] plus
@@ -139,11 +137,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // This service answers such a refusal with the error code it models for a
         // bad request, [`BAD_REQUEST_EXCEPTION`], instead of the framework's
         // default `ValidationException`, which this model does not declare
-        // anywhere. Only the CODE changes: the sentence stays the AWS
-        // constraint-validation envelope [`refusal_message`] renders, which is
-        // the text AWS's input-validation layer emits whatever shape carries it.
-        // The HTTP status stays with the protocol (400), which is the status this
-        // error models.
+        // anywhere, and with the one fixed sentence MSK words a refused
+        // parameter in ([`refusal_message`]). The HTTP status stays with the
+        // protocol (400), which is the status this error models.
         //
         // An authentication refusal keeps the framework's wording: it is not an
         // input-constraint failure, and this service's 401/403 errors are raised

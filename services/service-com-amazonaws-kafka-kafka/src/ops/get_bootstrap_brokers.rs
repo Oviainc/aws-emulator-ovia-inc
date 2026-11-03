@@ -223,21 +223,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.cluster_arn,
             std::time::SystemTime::now(),
         ) else {
-            return Err(GetBootstrapBrokersErrorModeled::BadRequestException(
-                BadRequestException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    // NOT `state::RESOURCE_NOT_FOUND_MESSAGE`, which the readers that
-                    // model `NotFoundException` share: this operation models
-                    // none, so it refuses the ARN as a bad PARAMETER and its
-                    // message says what is wrong with that parameter rather
-                    // than announcing a resource-not-found this error is not.
-                    message: Some(format!(
-                        "No cluster exists in {region} with the ARN {}",
-                        input.cluster_arn
-                    )),
-                },
-            )
-            .into());
+            // This operation's model declares NO `NotFoundException`, yet the
+            // service answers one for a cluster reference it cannot resolve —
+            // the same 404 and the same fixed sentence every reader that DOES
+            // model it answers ([`crate::state::RESOURCE_NOT_FOUND_MESSAGE`]).
+            // A client branches on the code, so the code the service answers is
+            // the code that goes on the wire, through the unmodelled channel
+            // ([`crate::scaffolded::Scaffolded::unmodeled`]).
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NOT_FOUND_CODE,
+                crate::state::NOT_FOUND_STATUS,
+                crate::state::RESOURCE_NOT_FOUND_MESSAGE,
+            ));
         };
 
         // A cluster the service is still provisioning has no brokers yet, so

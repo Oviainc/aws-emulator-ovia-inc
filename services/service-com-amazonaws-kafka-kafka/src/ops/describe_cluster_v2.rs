@@ -187,10 +187,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeClusterV2ErrorModeled::NotFoundException(NotFoundException {
                     invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(format!(
-                        "No cluster exists in {region} with the ARN {}",
-                        input.cluster_arn
-                    )),
+                    // The service's ONE sentence for a resource it does not
+                    // hold ([`crate::state::RESOURCE_NOT_FOUND_MESSAGE`]),
+                    // which the V1 reader and every other operation that
+                    // models this error answer too: nothing of the request —
+                    // not the ARN, not the region this endpoint serves — is
+                    // part of it.
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 })
                 .into(),
             );

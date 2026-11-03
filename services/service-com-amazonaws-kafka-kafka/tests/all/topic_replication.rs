@@ -986,8 +986,8 @@ async fn a_pattern_list_that_selects_no_topics_is_refused() {
         .collect();
     // One character past the length the model's `__stringMax249` member allows:
     // that bound belongs to the member, so the request never reaches the handler
-    // — the framework's boundary validator refuses it with the service's own
-    // constraint wording and names no single input member.
+    // — the boundary validator refuses it with the service's own ONE sentence
+    // for a parameter it will not accept, which names no input member.
     let too_long = "o".repeat(MAX_TOPIC_PATTERN_LENGTH + 1);
     // Each row is a pattern list the service could not select topics by: an
     // unparsable regular expression in either member, a pattern longer than the
@@ -1054,11 +1054,10 @@ async fn a_pattern_list_that_selects_no_topics_is_refused() {
                     reply.body
                 );
             }
-            None => assert!(
-                reply.error_message().contains(&format!(
-                    "Member must have length less than or equal to {MAX_TOPIC_PATTERN_LENGTH}"
-                )),
-                "case {case}: expected the refusal to quote the member's length constraint, got {}",
+            None => assert_eq!(
+                reply.error_message(),
+                super::refusal_wording::PARAMETERS_NOT_VALID,
+                "case {case}: expected the service's parameter refusal, got {}",
                 reply.body
             ),
         }

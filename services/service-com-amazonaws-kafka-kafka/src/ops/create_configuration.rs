@@ -245,24 +245,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service publishes — the one catalogue `ListKafkaVersions` reports and
         // every other version-aware operation answers from. Checked before the
         // lock, and so before anything is stored: a list carrying an unknown entry
-        // registers no configuration at all, whichever position it is in. EVERY
-        // offending entry is named, so a caller with several of them needs one
-        // round trip rather than one per entry.
-        let unknown: Vec<String> = input
+        // registers no configuration at all, whichever position it is in. The
+        // FIRST offending entry is the one the refusal names, followed by the
+        // versions the service does offer — the actionable half of the sentence.
+        let unknown = input
             .kafka_versions
             .iter()
             .flatten()
-            .filter(|version| crate::state::kafka_version_index(version).is_none())
-            .map(|version| format!("'{version}'"))
-            .collect();
-        if !unknown.is_empty() {
-            let listed = unknown.join(", ");
+            .find(|version| crate::state::kafka_version_index(version).is_none());
+        if let Some(unknown) = unknown {
             return Err(
                 CreateConfigurationErrorModeled::BadRequestException(BadRequestException {
                     invalid_parameter: Some("kafkaVersions".to_string()),
-                    message: Some(format!(
-                        "Amazon MSK supports none of these Apache Kafka versions: {listed}."
-                    )),
+                    message: Some(crate::state::unsupported_kafka_version_message(unknown)),
                 })
                 .into(),
             );

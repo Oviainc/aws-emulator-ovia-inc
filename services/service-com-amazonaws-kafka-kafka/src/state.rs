@@ -506,6 +506,13 @@ pub const KAFKA_CLUSTERS_PER_REPLICATOR: usize = 2;
 /// neither the submitted count nor the required one.
 pub const KAFKA_CLUSTER_COUNT_MESSAGE: &str = "Too many or too few kafka clusters specified.";
 
+/// What MSK answers a `KafkaClusters` list that names one Kafka cluster more
+/// than once: the list is a SET of clusters — a replicator replicates between
+/// distinct clusters — so a repeated cluster ARN is refused with this fixed
+/// text, which names neither the repeated ARN nor its position.
+pub const DUPLICATE_KAFKA_CLUSTERS_MESSAGE: &str = "Kafka cluster list contains duplicate cluster \
+     ARNs. Please ensure all the cluster ARNs are unique.";
+
 /// The fewest subnets ONE Kafka cluster's client VPC configuration may name
 /// (`KafkaClusterClientVpcConfig$SubnetIds`, "The list of subnets in the client VPC
 /// to connect to").
@@ -869,6 +876,32 @@ pub fn kafka_version_status(version: &str) -> Option<&'static str> {
         .map(|entry| entry.status)
 }
 
+/// The sentence Amazon MSK answers a request naming an Apache Kafka version it
+/// does not offer with: the fixed text `Unsupported KafkaVersion [`, `].
+/// Valid values: [`, `]`, around two variable parts — the rejected version,
+/// taken verbatim from the request, and the versions that ARE valid, read from
+/// [`KAFKA_VERSION_CATALOG`] in its published order.
+///
+/// The listed set is exactly the set the check this refusal comes from admits
+/// ([`kafka_version_index`]): every version the catalog publishes, a deprecated
+/// one included, since a configuration may name a version existing clusters
+/// still run. A list narrower than the gate would name a value the same request
+/// is accepted with, which is worse than no list at all.
+///
+/// The valid-value list is the actionable half of this refusal, so it is
+/// derived from the catalog rather than written out: a version the catalog gains
+/// or loses is gained or lost here too.
+pub fn unsupported_kafka_version_message(rejected: &str) -> String {
+    let valid: Vec<&str> = KAFKA_VERSION_CATALOG
+        .iter()
+        .map(|entry| entry.version)
+        .collect();
+    format!(
+        "Unsupported KafkaVersion [{rejected}]. Valid values: [{}]",
+        valid.join(", ")
+    )
+}
+
 /// Whether the service still OFFERS `version`: whether the catalog publishes it
 /// and its status is [`KAFKA_VERSION_ACTIVE`]. This is what makes a version an
 /// upgrade target and what a deprecation check reads.
@@ -952,6 +985,18 @@ pub fn kafka_version_page(resume_after: Option<usize>, page_size: usize) -> Kafk
 /// knows which member it was still says the same thing about the resource.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{2019}t exist.";
 
+/// The wire error code that refusal carries, and the status the model gives the
+/// `NotFoundException` shape (`@httpError 404`).
+///
+/// Named here because an operation whose model declares NO `NotFoundException`
+/// still answers one for a reference it cannot resolve — the service answers the
+/// code whatever its published model lists — so such an operation carries it
+/// through the unmodelled channel
+/// ([`crate::scaffolded::Scaffolded::unmodeled`]) with these two values.
+pub const NOT_FOUND_CODE: &str = "NotFoundException";
+/// The status that refusal carries.
+pub const NOT_FOUND_STATUS: u16 = 404;
+
 /// The same refusal, as the replicator APIs phrase it: the input member that
 /// failed to resolve, then [`RESOURCE_NOT_FOUND_MESSAGE`] and nothing else.
 ///
@@ -977,14 +1022,17 @@ pub fn cluster_not_deletable_message(state: &str) -> String {
 }
 
 /// The same refusal, for the reader of a cluster's bootstrap endpoints: there
-/// are no brokers to bootstrap against until the cluster has them.
+/// are no brokers to bootstrap against until the cluster has them. Fixed text
+/// apart from the state, in the form the service words this family of refusals
+/// in ("You can't … in <STATE> state.", as the delete above).
 pub fn bootstrap_brokers_unavailable_message(state: &str) -> String {
-    format!("You can't get bootstrap brokers for a cluster that is in the {state} state.")
+    format!("You can't get bootstrap broker nodes for a cluster in {state} state.")
 }
 
-/// The same refusal, for the reader of a cluster's broker nodes.
+/// The same refusal, for the reader of a cluster's broker nodes, in the same
+/// form. The subject is this reader's own; the form is the family's.
 pub fn nodes_unavailable_message(state: &str) -> String {
-    format!("You can't list the nodes for a cluster that is in the {state} state.")
+    format!("You can't list nodes for a cluster in {state} state.")
 }
 
 /// The input member every replicator operation resolves its target through, named
@@ -4557,6 +4605,22 @@ pub const MAX_TAG_KEY_LENGTH: usize = 128;
 /// that begin with this prefix on your behalf, but you can't edit or delete them."
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
+/// The sentence Amazon MSK answers a tag key that starts with the reserved
+/// prefix with: fixed text end to end — the offending key is NOT named — and
+/// stating that the test is applied without regard to case, which is how the
+/// service applies it ([`starts_with_reserved_tag_prefix`]).
+pub const RESERVED_TAG_KEY_MESSAGE: &str =
+    "Invalid tag key. Customers cannot set tag keys starting with aws: (case insensitive)";
+
+/// Whether `key` starts with the reserved prefix, compared WITHOUT regard to
+/// case: `AWS:`, `Aws:` and `aws:` are one prefix, which is what the refusal
+/// says ([`RESERVED_TAG_KEY_MESSAGE`]) and what keeps a caller from writing a
+/// key the service reserves by spelling it differently.
+pub fn starts_with_reserved_tag_prefix(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
 /// Why `key` is not a tag key a caller may set or remove, phrased as the message
 /// a `BadRequestException` carries — or `None` when the key is acceptable.
 ///
@@ -4566,8 +4630,11 @@ pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 /// Reference, "Tagging AWS resources"): Unicode letters, digits, white space and
 /// the characters `+ - = . _ : / @` — the colon included, which is what makes a
 /// namespaced key (`<namespace>:<name>`) a legal key everywhere tags are written.
-/// The message names the member's constraint and the offending key, so a caller
-/// can fix the request from the text alone.
+///
+/// The reserved-prefix clause is the service's own fixed sentence
+/// ([`RESERVED_TAG_KEY_MESSAGE`]), which names neither the key nor the prefix;
+/// the other two state the constraint and the offending key, for which no
+/// wording of the real service has been observed.
 pub fn tag_key_violation(key: &str) -> Option<String> {
     let length = key.chars().count();
     if !(1..=MAX_TAG_KEY_LENGTH).contains(&length) {
@@ -4575,10 +4642,8 @@ pub fn tag_key_violation(key: &str) -> Option<String> {
             "Tag key '{key}' is {length} Unicode characters long; a tag key must be between 1 and {MAX_TAG_KEY_LENGTH} Unicode characters in length."
         ));
     }
-    if key.starts_with(RESERVED_TAG_KEY_PREFIX) {
-        return Some(format!(
-            "Tag key '{key}' starts with '{RESERVED_TAG_KEY_PREFIX}', a prefix reserved for use by AWS."
-        ));
+    if starts_with_reserved_tag_prefix(key) {
+        return Some(RESERVED_TAG_KEY_MESSAGE.to_string());
     }
     if let Some(offending) = key.chars().find(|c| !is_tag_key_character(*c)) {
         return Some(format!(
@@ -4860,6 +4925,37 @@ pub fn kafka_cluster_alias(cluster: &KafkaCluster) -> Option<String> {
         .apache_kafka_cluster
         .as_ref()
         .map(|apache| apache.apache_kafka_cluster_id.clone())
+}
+
+/// WHICH Kafka cluster one `KafkaClusters` entry names, as the request names it:
+/// the Amazon MSK cluster's ARN, or the Apache Kafka cluster's id — the value
+/// the entry identifies its cluster by, and `None` for an entry that identifies
+/// none.
+///
+/// This is what makes the list a set: two entries are the same cluster when
+/// they name the same one ([`DUPLICATE_KAFKA_CLUSTERS_MESSAGE`]). Read from the
+/// entry itself rather than from the alias derived for it, so the test is over
+/// the identifier the caller sent.
+pub fn kafka_cluster_identity(cluster: &KafkaCluster) -> Option<&str> {
+    if let Some(msk) = cluster.amazon_msk_cluster.as_ref() {
+        return Some(msk.msk_cluster_arn.as_str());
+    }
+    cluster
+        .apache_kafka_cluster
+        .as_ref()
+        .map(|apache| apache.apache_kafka_cluster_id.as_str())
+}
+
+/// Whether the `KafkaClusters` list `clusters` names any one Kafka cluster more
+/// than once ([`kafka_cluster_identity`]) — the condition
+/// [`DUPLICATE_KAFKA_CLUSTERS_MESSAGE`] is answered for.
+///
+/// An entry that identifies no cluster is not compared: that request is refused
+/// on the entry itself, which is a different condition.
+pub fn names_a_kafka_cluster_twice(clusters: &[KafkaCluster]) -> bool {
+    let named: Vec<&str> = clusters.iter().filter_map(kafka_cluster_identity).collect();
+    let distinct: std::collections::BTreeSet<&str> = named.iter().copied().collect();
+    distinct.len() != named.len()
 }
 
 /// The alias of the cluster a replication flow names at one end, from the ARN or
@@ -6795,6 +6891,20 @@ pub fn invalid_cluster_arn() -> BadRequestException {
     parameter_refusal(CLUSTER_ARN_MEMBER, CLUSTER_ARN_NOT_VALID_MESSAGE)
 }
 
+/// The sentence an operation that models NO `NotFoundException` answers a
+/// well-formed resource ARN this endpoint's region holds nothing for with.
+///
+/// The SAME fixed, request-independent sentence [`malformed_arn`] carries
+/// ([`BAD_REQUEST_MESSAGE`]): both are the one thing this service says about a
+/// parameter it cannot act on, and neither takes any part of its text from the
+/// request — not the value, not the region the endpoint serves. Operations that
+/// DO model `NotFoundException` answer [`RESOURCE_NOT_FOUND_MESSAGE`] instead,
+/// which is that error's own sentence.
+///
+/// Named here, beside the shape refusal, so no handler composes a sentence of
+/// its own around the reference it was handed.
+pub const UNRESOLVED_REFERENCE_MESSAGE: &str = BAD_REQUEST_MESSAGE;
+
 /// One `BadRequestException` naming a request member and carrying one of the
 /// service's fixed sentences, so the two refusals above cannot drift apart on
 /// how a parameter is named or on the fact that the message carries nothing of
@@ -6839,6 +6949,13 @@ pub fn is_secrets_manager_secret_arn(value: &str) -> bool {
         .strip_prefix("secret:")
         .is_some_and(|name| !name.is_empty())
 }
+
+/// The sentence Amazon MSK answers a `SecretArnList` entry that is not an AWS
+/// Secrets Manager secret ARN at all with: fixed text end to end, with the
+/// offending value NOT echoed back, like this service's other parameter
+/// refusals. Shared by the two SCRAM batch operations, so one condition is
+/// stated one way whichever of them met it.
+pub const SECRET_ARN_INVALID_MESSAGE: &str = "The provided secret ARN is invalid.";
 
 /// Whether `value`'s resource part is `<kind>/<name>/<id>` — the shape a
 /// cluster, a configuration and a replicator ARN all take, so the predicates

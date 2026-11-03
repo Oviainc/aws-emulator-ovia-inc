@@ -403,8 +403,9 @@ async fn an_unknown_or_malformed_configuration_arn_is_refused() {
 /// applied to, so every entry has to BE a version this service publishes — the
 /// catalogue `ListKafkaVersions` reports. A list carrying an entry that is not is
 /// refused HTTP 400 `BadRequestException` and stores nothing, whichever position
-/// the entry is in; a list whose every entry is catalogued is stored and read back
-/// verbatim.
+/// the entry is in, and the refusal states the first such entry together with
+/// the versions the service does publish; a list whose every entry is catalogued
+/// is stored and read back verbatim.
 #[tokio::test]
 async fn kafka_versions_must_name_versions_the_service_publishes() {
     let emulator = Emulator::new();
@@ -495,8 +496,8 @@ async fn kafka_versions_must_name_versions_the_service_publishes() {
         ("first-of-three", vec!["0.0.1-does-not-exist", "2.8.1", "3.6.0"]),
         ("middle-of-three", vec!["2.8.1", "nope", "3.6.0"]),
         ("last-of-three", vec!["2.8.1", "3.6.0", "4.0.0-preview"]),
-        // Several bad entries at once: the refusal names every one of them, so a
-        // caller does not have to fix them one round trip at a time.
+        // Several bad entries at once: the refusal is about the FIRST of them,
+        // and offers the versions the service does publish.
         (
             "two-of-four",
             vec!["2.8.1", "0.0.1-does-not-exist", "3.6.0", "9.9.9"],
@@ -523,18 +524,29 @@ async fn kafka_versions_must_name_versions_the_service_publishes() {
             "case {case}: the refusal must name the offending member, got {}",
             reply.body
         );
-        // The message is built from the request: every entry that named no
-        // catalogued version is in it, not only the first.
+        // The message is the service's template over the FIRST uncatalogued
+        // entry and the versions that ARE valid: fixed text, the rejected
+        // version verbatim from the request, and the catalogue in its published
+        // order — exactly the set this check admits, deprecated entries
+        // included, since a configuration may name a version clusters still
+        // run.
         let message = reply.at("/message").as_str().unwrap_or_default();
-        for entry in versions
+        let first_unknown = versions
             .iter()
-            .filter(|entry| !KAFKA_VERSION_CATALOG.iter().any(|row| row.version == **entry))
-        {
-            assert!(
-                message.contains(*entry),
-                "case {case}: expected the refusal to name {entry:?}, got {message:?}"
-            );
-        }
+            .find(|entry| !KAFKA_VERSION_CATALOG.iter().any(|row| row.version == **entry))
+            .unwrap_or_else(|| panic!("case {case}: the row names no uncatalogued version"));
+        let catalogued: Vec<&str> = KAFKA_VERSION_CATALOG
+            .iter()
+            .map(|row| row.version)
+            .collect();
+        let expected = format!(
+            "Unsupported KafkaVersion [{first_unknown}]. Valid values: [{}]",
+            catalogued.join(", ")
+        );
+        assert_eq!(
+            message, expected,
+            "case {case}: expected the refusal {expected:?}, got {message:?}"
+        );
         // Nothing was stored: the name never appears in a listing, so it is still
         // free for a create that names catalogued versions only.
         let listed = list(&emulator, "").await;

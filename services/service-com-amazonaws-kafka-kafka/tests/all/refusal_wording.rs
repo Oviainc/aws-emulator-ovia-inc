@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! How this service answers a request the MODEL refuses, before any handler ran:
-//! the error code MSK declares for bad client input, and the AWS
-//! constraint-validation message built from that request.
+//! the error code MSK declares for bad client input, and the ONE fixed sentence
+//! it words such a refusal in.
 //!
 //! The rule under test is service-wide, so the table below spans the violation
 //! classes the model can produce (a value above a `range` maximum, one below its
 //! minimum, a string shorter and longer than a `length` bound, an absent
 //! required scalar and an absent required structure, and two constraint
 //! violations in one request) ACROSS operations (`ListConfigurations`,
-//! `ListClusters`, `CreateConfiguration`, `CreateCluster`) — a page-size bound is
-//! the same rule whichever list carries it. Every bound and member path is taken
+//! `ListClusters`, `CreateConfiguration`, `CreateCluster`) — every one of them is
+//! answered with the same text, which is what makes it the service's sentence
+//! rather than a report of the request. Every bound and member path is taken
 //! from the model, cited on the constant that states it.
 
 use serde_json::{json, Value};
@@ -26,32 +27,23 @@ use super::kafka_harness::{ClusterRequest, Emulator};
 /// * `NumberOfBrokerNodes` (`CreateCluster`) — `range` 1..15.
 const MAX_RESULTS_MIN: i64 = 1;
 const MAX_RESULTS_MAX: i64 = 100;
-const CLUSTER_NAME_MIN_LENGTH: usize = 1;
 const CLUSTER_NAME_MAX_LENGTH: usize = 64;
 const BROKER_NODES_MIN: i64 = 1;
 const BROKER_NODES_MAX: i64 = 15;
 
-/// One clause of the AWS constraint-validation message: the value the caller
-/// submitted (`None` for a member it omitted), the member path the violation is
-/// reported on, and the requirement that value failed.
+/// The sentence Amazon MSK refuses a parameter it will not accept with: fixed
+/// text end to end, naming neither the member at fault, nor the bound it broke,
+/// nor the value submitted.
 ///
 /// Shared with the other suites of this binary, so one wording serves every
 /// operation's pre-handler refusal rather than one copy per suite.
-pub(crate) fn clause(submitted: Option<&str>, path: &str, requirement: &str) -> String {
-    match submitted {
-        Some(value) => {
-            format!("Value '{value}' at '{path}' failed to satisfy constraint: {requirement}")
-        }
-        None => format!("Value null at '{path}' failed to satisfy constraint: {requirement}"),
-    }
-}
+pub(crate) const PARAMETERS_NOT_VALID: &str = "One or more of the parameters are not valid.";
 
-/// The envelope the clauses of ONE refusal are stated in, which counts them.
-fn envelope_prefix(clauses: usize) -> String {
-    match clauses {
-        1 => "1 validation error detected: ".to_string(),
-        n => format!("{n} validation errors detected: "),
-    }
+/// What a row submitted: the member paths and the values, so an assertion can
+/// check the refusal states NONE of them.
+struct Submitted {
+    paths: Vec<&'static str>,
+    values: Vec<String>,
 }
 
 /// A `CreateCluster` body whose required members are all present and legal, so a
@@ -60,24 +52,25 @@ fn valid_cluster_body(name: &str) -> Value {
     ClusterRequest::named(name).to_json()
 }
 
-/// One row of the table: a request the model refuses, and every clause its
-/// refusal must state.
+/// One row of the table: a request the model refuses, plus the member paths and
+/// submitted values its refusal must state NOTHING of.
 struct Row {
     case: &'static str,
     method: &'static str,
     uri: String,
     body: Option<Value>,
-    clauses: Vec<String>,
+    submitted: Submitted,
 }
 
 /// RULE: a request the model refuses before any handler runs is answered with
 /// HTTP 400 and `BadRequestException` — the client-input error every MSK
 /// operation declares, MSK's model declaring no `ValidationException` anywhere —
-/// and with the AWS constraint-validation message built from that request: one
-/// clause per violation, each naming the submitted value, the member path and the
-/// requirement it failed, inside an envelope that counts them.
+/// and with the service's ONE fixed sentence for a parameter it will not accept
+/// ([`PARAMETERS_NOT_VALID`]): the same text for every violation class, naming
+/// neither the member at fault nor the bound it broke nor the value submitted,
+/// however many constraints one request breaks.
 #[tokio::test]
-async fn a_refused_request_states_every_violation_in_the_validation_envelope() {
+async fn a_refused_request_is_answered_with_the_services_one_parameter_sentence() {
     let emulator = Emulator::new();
 
     let too_long_name = "n".repeat(CLUSTER_NAME_MAX_LENGTH + 1);
@@ -94,8 +87,8 @@ async fn a_refused_request_states_every_violation_in_the_validation_envelope() {
         .as_object_mut()
         .expect("the CreateCluster body is a JSON object")
         .remove("brokerNodeGroupInfo");
-    // Two constraint violations in ONE request, so the envelope has to count
-    // them: constraint clauses accumulate across members.
+    // Two constraint violations in ONE request: the answer is still the one
+    // sentence, so a refusal cannot be read as a count of what went wrong.
     let mut two_violations = valid_cluster_body("placeholder");
     two_violations["clusterName"] = json!(too_long_name);
     two_violations["numberOfBrokerNodes"] = json!(BROKER_NODES_MAX + 1);
@@ -106,60 +99,62 @@ async fn a_refused_request_states_every_violation_in_the_validation_envelope() {
             method: "GET",
             uri: format!("/v1/configurations?maxResults={}", MAX_RESULTS_MAX + 1),
             body: None,
-            clauses: vec![clause(
-                Some(&(MAX_RESULTS_MAX + 1).to_string()),
-                "maxResults",
-                &format!("Member must have value less than or equal to {MAX_RESULTS_MAX}"),
-            )],
+            submitted: Submitted {
+                paths: vec!["maxResults"],
+                values: vec![(MAX_RESULTS_MAX + 1).to_string()],
+            },
         },
         Row {
             case: "ListConfigurations maxResults below the modelled minimum",
             method: "GET",
             uri: format!("/v1/configurations?maxResults={}", MAX_RESULTS_MIN - 1),
             body: None,
-            clauses: vec![clause(
-                Some(&(MAX_RESULTS_MIN - 1).to_string()),
-                "maxResults",
-                &format!("Member must have value greater than or equal to {MAX_RESULTS_MIN}"),
-            )],
+            submitted: Submitted {
+                paths: vec!["maxResults"],
+                values: vec![(MAX_RESULTS_MIN - 1).to_string()],
+            },
         },
         Row {
-            // The same bound on another operation: the rule is the model's, not
-            // one list's.
+            // The same bound on another operation: the rule is the service's,
+            // not one list's.
             case: "ListClusters maxResults above the modelled maximum",
             method: "GET",
             uri: format!("/v1/clusters?maxResults={}", MAX_RESULTS_MAX + 1),
             body: None,
-            clauses: vec![clause(
-                Some(&(MAX_RESULTS_MAX + 1).to_string()),
-                "maxResults",
-                &format!("Member must have value less than or equal to {MAX_RESULTS_MAX}"),
-            )],
+            submitted: Submitted {
+                paths: vec!["maxResults"],
+                values: vec![(MAX_RESULTS_MAX + 1).to_string()],
+            },
         },
         Row {
             case: "ListClusters maxResults far below the modelled minimum",
             method: "GET",
             uri: "/v1/clusters?maxResults=-7".to_string(),
             body: None,
-            clauses: vec![clause(
-                Some("-7"),
-                "maxResults",
-                &format!("Member must have value greater than or equal to {MAX_RESULTS_MIN}"),
-            )],
+            submitted: Submitted {
+                paths: vec!["maxResults"],
+                values: vec!["-7".to_string()],
+            },
         },
         Row {
             case: "CreateConfiguration without its required name",
             method: "POST",
             uri: "/v1/configurations".to_string(),
             body: Some(json!({ "serverProperties": "" })),
-            clauses: vec![clause(None, "name", "Member must not be null")],
+            submitted: Submitted {
+                paths: vec!["name"],
+                values: Vec::new(),
+            },
         },
         Row {
             case: "CreateConfiguration without its required serverProperties",
             method: "POST",
             uri: "/v1/configurations".to_string(),
             body: Some(json!({ "name": "no-properties" })),
-            clauses: vec![clause(None, "serverProperties", "Member must not be null")],
+            submitted: Submitted {
+                paths: vec!["serverProperties"],
+                values: Vec::new(),
+            },
         },
         Row {
             // A required member of another operation again, this one a
@@ -168,86 +163,68 @@ async fn a_refused_request_states_every_violation_in_the_validation_envelope() {
             method: "POST",
             uri: "/v1/clusters".to_string(),
             body: Some(no_broker_group),
-            clauses: vec![clause(
-                None,
-                "brokerNodeGroupInfo",
-                "Member must not be null",
-            )],
+            submitted: Submitted {
+                paths: vec!["brokerNodeGroupInfo"],
+                values: Vec::new(),
+            },
         },
         Row {
-            // Two violations in one request: the envelope counts them and
-            // states every one.
+            // Two violations in one request: still the one sentence.
             case: "CreateCluster violating two modelled constraints at once",
             method: "POST",
             uri: "/v1/clusters".to_string(),
             body: Some(two_violations),
-            clauses: vec![
-                clause(
-                    Some(&too_long_name),
-                    "clusterName",
-                    &format!(
-                        "Member must have length less than or equal to {CLUSTER_NAME_MAX_LENGTH}"
-                    ),
-                ),
-                clause(
-                    Some(&(BROKER_NODES_MAX + 1).to_string()),
-                    "numberOfBrokerNodes",
-                    &format!("Member must have value less than or equal to {BROKER_NODES_MAX}"),
-                ),
-            ],
+            submitted: Submitted {
+                paths: vec!["clusterName", "numberOfBrokerNodes"],
+                values: vec![too_long_name.clone(), (BROKER_NODES_MAX + 1).to_string()],
+            },
         },
         Row {
             case: "CreateCluster clusterName shorter than the modelled minimum",
             method: "POST",
             uri: "/v1/clusters".to_string(),
             body: Some(short_name_body),
-            clauses: vec![clause(
-                Some(""),
-                "clusterName",
-                &format!(
-                    "Member must have length greater than or equal to {CLUSTER_NAME_MIN_LENGTH}"
-                ),
-            )],
+            submitted: Submitted {
+                paths: vec!["clusterName"],
+                // The submitted value is the empty string, which every text
+                // contains, so only the member path is checked for this row.
+                values: Vec::new(),
+            },
         },
         Row {
             case: "CreateCluster clusterName longer than the modelled maximum",
             method: "POST",
             uri: "/v1/clusters".to_string(),
             body: Some(long_name_body),
-            clauses: vec![clause(
-                Some(&too_long_name),
-                "clusterName",
-                &format!("Member must have length less than or equal to {CLUSTER_NAME_MAX_LENGTH}"),
-            )],
+            submitted: Submitted {
+                paths: vec!["clusterName"],
+                values: vec![too_long_name.clone()],
+            },
         },
         Row {
             case: "CreateCluster numberOfBrokerNodes above the modelled maximum",
             method: "POST",
             uri: "/v1/clusters".to_string(),
             body: Some(too_many_brokers),
-            clauses: vec![clause(
-                Some(&(BROKER_NODES_MAX + 1).to_string()),
-                "numberOfBrokerNodes",
-                &format!("Member must have value less than or equal to {BROKER_NODES_MAX}"),
-            )],
+            submitted: Submitted {
+                paths: vec!["numberOfBrokerNodes"],
+                values: vec![(BROKER_NODES_MAX + 1).to_string()],
+            },
         },
         Row {
             case: "CreateCluster numberOfBrokerNodes below the modelled minimum",
             method: "POST",
             uri: "/v1/clusters".to_string(),
             body: Some(too_few_brokers),
-            clauses: vec![clause(
-                Some(&(BROKER_NODES_MIN - 1).to_string()),
-                "numberOfBrokerNodes",
-                &format!("Member must have value greater than or equal to {BROKER_NODES_MIN}"),
-            )],
+            submitted: Submitted {
+                paths: vec!["numberOfBrokerNodes"],
+                values: vec![(BROKER_NODES_MIN - 1).to_string()],
+            },
         },
     ];
 
     for row in &rows {
-        let reply = emulator
-            .call(row.method, &row.uri, row.body.clone())
-            .await;
+        let reply = emulator.call(row.method, &row.uri, row.body.clone()).await;
         assert_eq!(
             reply.status, 400,
             "case {}: expected HTTP 400, got {} {}",
@@ -261,16 +238,22 @@ async fn a_refused_request_states_every_violation_in_the_validation_envelope() {
             reply.body
         );
         let message = reply.body["message"].as_str().unwrap_or_default();
-        let prefix = envelope_prefix(row.clauses.len());
-        assert!(
-            message.starts_with(&prefix),
-            "case {}: expected the refusal message to open with {prefix:?}, got {message:?}",
+        assert_eq!(
+            message, PARAMETERS_NOT_VALID,
+            "case {}: expected the refusal message {PARAMETERS_NOT_VALID:?}, got {message:?}",
             row.case
         );
-        for expected in &row.clauses {
+        for path in &row.submitted.paths {
             assert!(
-                message.contains(expected.as_str()),
-                "case {}: expected the refusal message to state {expected:?}, got {message:?}",
+                !message.contains(path),
+                "case {}: the refusal must not name the member {path:?}, got {message:?}",
+                row.case
+            );
+        }
+        for value in &row.submitted.values {
+            assert!(
+                !message.contains(value.as_str()),
+                "case {}: the refusal must not echo the submitted {value:?}, got {message:?}",
                 row.case
             );
         }

@@ -855,13 +855,13 @@ async fn delete_is_observable_by_every_later_reader() {
         described.status,
         described.body
     );
-    // `GetBootstrapBrokers` models no NotFoundException, so it refuses the ARN as
-    // a bad request instead.
+    // `GetBootstrapBrokers` models no NotFoundException, yet the service answers
+    // one for a cluster it cannot resolve, like every other reader.
     let brokers = emulator.bootstrap_brokers(&arn).await;
     assert_eq!(
         (brokers.status, brokers.error_code()),
-        (400, "BadRequestException"),
-        "expected a 400 BadRequestException after the delete, got {} {}",
+        (404, "NotFoundException"),
+        "expected a 404 NotFoundException after the delete, got {} {}",
         brokers.status,
         brokers.body
     );
@@ -1047,8 +1047,8 @@ async fn a_cluster_is_only_visible_in_its_own_region() {
             .await;
         assert_eq!(
             (brokers.status, brokers.error_code()),
-            (400, "BadRequestException"),
-            "case region={region}: expected a 400 from GetBootstrapBrokers, got {} {}",
+            (404, "NotFoundException"),
+            "case region={region}: expected a 404 from GetBootstrapBrokers, got {} {}",
             brokers.status,
             brokers.body
         );
@@ -1159,11 +1159,14 @@ async fn an_unknown_or_malformed_cluster_arn_is_refused() {
             deleted.status,
             deleted.body
         );
+        // `GetBootstrapBrokers` models no `NotFoundException`, yet the service
+        // answers the same code and status for the same reference: a malformed
+        // ARN is the bad request, an absent one the not-found.
         let brokers = emulator.bootstrap_brokers(arn).await;
         assert_eq!(
             (brokers.status, brokers.error_code()),
-            (400, "BadRequestException"),
-            "case arn={arn:?}: expected a 400 BadRequestException from GetBootstrapBrokers, got {} {}",
+            (*status, *code),
+            "case arn={arn:?}: expected {status} {code} from GetBootstrapBrokers, got {} {}",
             brokers.status,
             brokers.body
         );

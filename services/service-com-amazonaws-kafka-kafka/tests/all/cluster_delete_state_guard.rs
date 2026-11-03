@@ -350,15 +350,13 @@ async fn the_broker_level_reads_are_refused_until_the_cluster_has_brokers() {
             case: "GetBootstrapBrokers",
             suffix: "/bootstrap-brokers",
             refusal: |state| {
-                format!("You can't get bootstrap brokers for a cluster that is in the {state} state.")
+                format!("You can't get bootstrap broker nodes for a cluster in {state} state.")
             },
         },
         BrokerRead {
             case: "ListNodes",
             suffix: "/nodes",
-            refusal: |state| {
-                format!("You can't list the nodes for a cluster that is in the {state} state.")
-            },
+            refusal: |state| format!("You can't list nodes for a cluster in {state} state."),
         },
     ];
     // Cluster rows, so the refusal is not keyed to one shape of cluster.

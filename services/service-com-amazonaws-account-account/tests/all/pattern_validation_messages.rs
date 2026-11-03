@@ -318,7 +318,7 @@ async fn a_pattern_violation_is_reported_as_the_ecma_262_reason() {
         );
         assert_eq!(
             answer.message(),
-            bracketed(&[reason(pattern, value)]),
+            bracketed(std::slice::from_ref(&reason(pattern, value))),
             "case {case:?}: expected the ECMA 262 reason, got {:?}",
             answer.message()
         );
