@@ -13,7 +13,8 @@
 //! not evaluate on (10, 20, 30 or a multiple of 60), a total evaluation period
 //! (`Period` x `EvaluationPeriods`) past the published ceiling, a `Period` no clock boundary
 //! matches on an alarm whose `EvaluationWindow` is a wall clock window, and a `Metrics` query
-//! array that does not resolve to the single time series an alarm watches, and an action
+//! array that does not designate exactly one query as the single time series an alarm
+//! watches, and an action
 //! naming a Region other than the alarm's own (CloudWatch executes an alarm's actions in the
 //! alarm's Region). Each is checked
 //! before the write, so a refused request stores nothing.
@@ -453,13 +454,13 @@ const SEARCH_FUNCTION: &str = "SEARCH";
 /// alarm however it is called, so the message names neither the query nor the expression.
 const SEARCH_REFUSAL: &str = "SEARCH is not supported on Metric Alarms.";
 
-/// CloudWatch's refusal for a `Metrics` array that designates no query as the one the alarm
-/// watches.
+/// CloudWatch's refusal for a `Metrics` array that does not designate EXACTLY ONE query as the
+/// one the alarm watches — neither when it designates none nor when it designates several.
 ///
-/// A fixed sentence too: what is missing is the designation itself, so there is no query to
-/// name — "One item in the Metrics array is the expression that the alarm watches. You
-/// designate this expression by setting ReturnData to true for this object in the array."
-/// (`PutMetricAlarmInput$Metrics`)
+/// A fixed sentence too: what is wrong is the count of designations, not any one query, so
+/// there is no query to name — "One item in the Metrics array is the expression that the alarm
+/// watches. You designate this expression by setting ReturnData to true for this object in the
+/// array." (`PutMetricAlarmInput$Metrics`)
 const NO_RETURNED_QUERY_REFUSAL: &str = "Exactly one element of the metrics list should return data.";
 
 /// The envelope CloudWatch wraps a metric math expression refusal in.
@@ -566,7 +567,7 @@ const METRICS: &str = "Metrics";
 /// Why the request's `Metrics` array does not define the one time series an alarm watches, or
 /// `None` when it does.
 ///
-/// Three rules, all from `MetricDataQuery`, whose documentation is written for this operation
+/// Four rules, all from `MetricDataQuery`, whose documentation is written for this operation
 /// as well as for `GetMetricData`:
 ///
 /// * "A math expression can use the `Id` of the other metrics or queries to refer to those
@@ -580,6 +581,12 @@ const METRICS: &str = "Metrics";
 ///   data): it may not be a multi-series expression, while the same call wrapped in a function
 ///   that reduces it to one series is fine — which is why that check is for a multi-series
 ///   call nothing encloses.
+/// * "When used in `PutMetricAlarm`, specify true for the one expression result to use as the
+///   alarm. For all other metrics and expressions in the same `PutMetricAlarm` operation,
+///   specify `ReturnData` as False." — an alarm grades ONE result, so the array has to
+///   designate exactly one query as the one it watches ([`is_watched`]): an array designating
+///   none gives the alarm nothing to grade, and one designating several gives it no single
+///   result to grade.
 ///
 /// The query the alarm's THRESHOLD comes from is not the one it watches: "If this is an alarm
 /// based on an anomaly detection model, make this value match the ID of the
@@ -595,15 +602,6 @@ fn unresolvable_metrics(input: &PutMetricAlarmInput) -> Option<String> {
     // member for the array.
     if let Some(message) = crate::state::metric_query::query_id_refusal(queries, METRICS) {
         return Some(message);
-    }
-    // "One item in the Metrics array is the expression that the alarm watches. You designate
-    // this expression by setting ReturnData to true for this object in the array."
-    // (`smithy_query(query="doc",shape="PutMetricAlarmInput",member="Metrics")`) — an array
-    // that designates none designates no series for the alarm to watch, so there is nothing to
-    // grade and no alarm to create. An omitted `ReturnData` IS the designation: "If you omit
-    // this, the default of true is used." (`MetricDataQuery$ReturnData`)
-    if !queries.iter().any(|query| query.return_data != Some(false)) {
-        return Some(NO_RETURNED_QUERY_REFUSAL.to_string());
     }
     let defined: HashSet<&str> = queries.iter().map(|query| query.id.as_str()).collect();
     for query in queries {
@@ -644,14 +642,10 @@ fn unresolvable_metrics(input: &PutMetricAlarmInput) -> Option<String> {
         if crate::state::metric_math::calls_function(&parsed, SEARCH_FUNCTION) {
             return Some(SEARCH_REFUSAL.to_string());
         }
-        // "When used in PutMetricAlarm, specify true for the one expression result to use as
-        // the alarm." … "If you omit this, the default of true is used."
-        // (`MetricDataQuery$ReturnData`) — and the query the alarm takes its THRESHOLD from
-        // is not the result it watches, so its value may be the pair of bounds a band is.
-        if query.return_data != Some(false)
-            && input.threshold_metric_id.as_deref() != Some(query.id.as_str())
-            && crate::state::metric_math::returns_many_series(&parsed)
-        {
+        // The single-series rule speaks about the result the alarm WATCHES ([`is_watched`]),
+        // so a query feeding that result — and the pair of bounds a band the threshold comes
+        // from is — may be a multi-series expression.
+        if is_watched(input, query) && crate::state::metric_math::returns_many_series(&parsed) {
             return Some(format!(
                 "the Expression of query {} returns more than one time series, and the \
                  expression an alarm watches must return a single time series",
@@ -659,7 +653,32 @@ fn unresolvable_metrics(input: &PutMetricAlarmInput) -> Option<String> {
             ));
         }
     }
+    // The DESIGNATION last, over the whole array: an alarm grades one result, so an array that
+    // designates none designates nothing to grade and one that designates several designates no
+    // single result either — neither is an alarm there is anything to create.
+    if queries.iter().filter(|query| is_watched(input, query)).count() != 1 {
+        return Some(NO_RETURNED_QUERY_REFUSAL.to_string());
+    }
     None
+}
+
+/// Whether the alarm WATCHES the result of `query`: whether this is a query whose value the
+/// alarm grades, rather than one that only feeds the query it grades or states what that value
+/// is compared against.
+///
+/// Two halves, both from the model. The query has to RETURN DATA — "When used in
+/// `PutMetricAlarm`, specify true for the one expression result to use as the alarm. For all
+/// other metrics and expressions in the same `PutMetricAlarm` operation, specify `ReturnData`
+/// as False." … "If you omit this, the default of true is used."
+/// (`smithy_query(query="doc",shape="MetricDataQuery",member="ReturnData")`), so an omitted
+/// member returns data like an explicit `true`. And it must not be the query the alarm's
+/// THRESHOLD comes from — "If this is an alarm based on an anomaly detection model, make this
+/// value match the ID of the ANOMALY_DETECTION_BAND function."
+/// (`PutMetricAlarmInput$ThresholdMetricId`) — which is what the watched result is compared
+/// AGAINST rather than a result the alarm grades.
+fn is_watched(input: &PutMetricAlarmInput, query: &MetricDataQuery) -> bool {
+    query.return_data != Some(false)
+        && input.threshold_metric_id.as_deref() != Some(query.id.as_str())
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative

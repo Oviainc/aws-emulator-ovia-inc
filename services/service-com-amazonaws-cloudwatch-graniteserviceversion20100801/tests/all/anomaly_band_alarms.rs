@@ -193,9 +193,16 @@ async fn the_single_series_rule_spares_the_query_the_threshold_comes_from() {
         if let (Some(return_data), Value::Object(members)) = (row.return_data, &mut band) {
             members.insert("ReturnData".to_string(), Value::Bool(return_data));
         }
+        // Exactly one query of the array is the result the alarm watches, and the query its
+        // THRESHOLD comes from is not that result ("specify true for the one expression result
+        // to use as the alarm", `MetricDataQuery$ReturnData`): so the retrieval query returns
+        // data where the band is the designated threshold, and the band is the watched result
+        // itself where nothing designates it.
+        let mut retrieval = retrieval_query();
+        retrieval["ReturnData"] = Value::Bool(row.designated);
         let request = math_alarm(
             &name,
-            json!([retrieval_query(), band]),
+            json!([retrieval, band]),
             row.designated.then_some("ad1"),
         );
         let (status, body) = put_alarm(&emulator, &request).await;

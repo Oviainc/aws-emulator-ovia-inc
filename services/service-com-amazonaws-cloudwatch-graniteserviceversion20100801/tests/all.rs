@@ -51,6 +51,8 @@ mod alarm_reason_statistic;
 mod alarm_rule_parse_diagnosis;
 #[path = "all/alarm_update_regrades.rs"]
 mod alarm_update_regrades;
+#[path = "all/alarm_watched_query_designation.rs"]
+mod alarm_watched_query_designation;
 #[path = "all/announced_value_sets.rs"]
 mod announced_value_sets;
 #[path = "all/anomaly_band_alarm_evaluation.rs"]

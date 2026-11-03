@@ -105,6 +105,16 @@ fn metric_query(id: &str, dimensions: Value) -> Value {
     })
 }
 
+/// The same query FEEDING the one the alarm watches rather than being it: exactly one query of
+/// a `Metrics` array returns data ("For all other metrics and expressions in the same
+/// PutMetricAlarm operation, specify ReturnData as False.", `MetricDataQuery$ReturnData`), so
+/// an array holding a second metric states that one this way.
+fn feeding_query(id: &str, dimensions: Value) -> Value {
+    let mut query = metric_query(id, dimensions);
+    query["ReturnData"] = json!(false);
+    query
+}
+
 /// The alarms `DescribeAlarms` reports for exactly `name`.
 async fn described(router: &smithy_server_runtime::MultiServiceRouter, name: &str) -> Vec<Value> {
     let body = ok(router, "DescribeAlarms", &json!({"AlarmNames": [name]})).await;
@@ -281,7 +291,7 @@ async fn an_alarm_whose_metrics_name_an_instance_keeps_its_ec2_actions() {
             json!({
                 "Metrics": [
                     metric_query("m1", json!([{"Name": "InstanceId", "Value": "i-0123456789abcdef0"}])),
-                    metric_query("m2", json!([{"Name": "InstanceId", "Value": "i-0fedcba9876543210"}])),
+                    feeding_query("m2", json!([{"Name": "InstanceId", "Value": "i-0fedcba9876543210"}])),
                 ],
                 "AlarmActions": ["arn:aws:automate:us-east-1:ec2:reboot"],
             }),
