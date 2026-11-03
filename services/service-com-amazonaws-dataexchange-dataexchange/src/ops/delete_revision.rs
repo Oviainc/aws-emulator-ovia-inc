@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRevision
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRevision`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRevision::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the revision — and the assets and tags it holds — from the
+//! data set it belongs to, and answers 204 with no body. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +163,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRevision` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRevisionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteRevisionErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // Both ids are `@httpLabel` with pattern ^[a-zA-Z0-9]{30,40}$, so an id of the
+        // wrong shape was already refused as a 400 `ValidationException` before this
+        // handler ran; reaching here, each id is well-formed but may name nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRevision"))
+        // A revision belongs to exactly one data set — the URI nests it under
+        // `/v1/data-sets/{DataSetId}/revisions/{RevisionId}` and the store keeps the
+        // revisions inside their data set — so the removal is scoped to the named data
+        // set: a revision of some OTHER data set is as absent here as one that was
+        // never created.
+        let mut store = state.lock();
+        let Some(data_set) = store.data_sets.get_mut(&input.data_set_id) else {
+            return Err(DeleteRevisionErrorModeled::ResourceNotFoundException(
+                crate::state::data_set_not_found(&input.data_set_id),
+            )
+            .into());
+        };
+        // Removing the revision removes the assets and the tags it holds with it: they
+        // live on the record, so nothing is left behind for a later reader to find.
+        if data_set.revisions.remove(&input.revision_id).is_none() {
+            // Already gone (or never there): the id names no revision of this data
+            // set, which is the same 404 a never-created id answers with.
+            return Err(DeleteRevisionErrorModeled::ResourceNotFoundException(
+                crate::state::revision_not_found(&input.revision_id),
+            )
+            .into());
+        }
+        data_set.revision_order.retain(|id| *id != input.revision_id);
+
+        Ok(DeleteRevisionOutput)
     }
 }

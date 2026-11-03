@@ -33,6 +33,8 @@ mod optional_page_size;
 mod resource_tags;
 #[path = "all/revision_assets.rs"]
 mod revision_assets;
+#[path = "all/revision_deletion.rs"]
+mod revision_deletion;
 #[path = "all/revision_finalization.rs"]
 mod revision_finalization;
 #[path = "all/revisions.rs"]

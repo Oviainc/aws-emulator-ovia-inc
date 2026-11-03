@@ -86,7 +86,7 @@ fn message(answer: &Answer) -> String {
 /// `data_set_notifications.rs` writes a data set's Marketplace product. It is also
 /// what proves the handler's answer comes from the stored record rather than from the
 /// request.
-fn import_assets(
+pub(crate) fn import_assets(
     engine: &Arc<engine::InMemoryEngine>,
     data_set_id: &str,
     revision_id: &str,
