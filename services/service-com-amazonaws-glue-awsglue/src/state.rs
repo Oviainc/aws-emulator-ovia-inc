@@ -30,6 +30,10 @@
 //! write was encrypted under ([`catalog_encryption::ObjectEncryption`]), because the
 //! setting applies "to every catalog write thereafter" and not to what is already stored.
 //!
+//! It holds ONE migration record in the same way ([`Catalog::migration`]): the import of
+//! an Athena-managed data catalog an `ImportCatalogToGlue` performed into it, which is
+//! what a later `GetCatalogImportStatus` of that catalog reports.
+//!
 //! Crawlers sit BESIDE that tree too, in one per-account namespace keyed by crawler name:
 //! every operation that addresses a crawler does so by name alone, so a crawler's
 //! `CatalogId` says where its output goes, not where the crawler itself lives.
@@ -257,7 +261,8 @@ use std::time::{Duration, SystemTime};
 use self::catalog_encryption::ObjectEncryption;
 
 use crate::ops::types::{
-    Action, AssetFormEntry, AssetTypeFormReference, CatalogInput, CatalogProperties,
+    Action, AssetFormEntry, AssetTypeFormReference, CatalogImportStatus, CatalogInput,
+    CatalogProperties,
     CatalogPropertiesOutput,
     Classifier,
     CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, ColumnStatisticsTaskSettings,
@@ -1821,6 +1826,34 @@ impl ComAmazonawsGlueAwsglueState {
         }
     }
 
+    /// The migration status `catalog_id` REPORTS: whether a migration of an
+    /// Athena-managed data catalog into it has completed, who initiated it, and, when an
+    /// `ImportCatalogToGlue` migrated one here, the instant that import was served
+    /// ([`CatalogMigrationEntry`]).
+    ///
+    /// A Data Catalog this emulator serves is a Glue Data Catalog and holds no migration
+    /// still running: an import has nothing left to copy once it has been served, so the
+    /// catalog's migration is complete whether an import ran here or the catalog was a
+    /// Glue Data Catalog all along — which is what "`True` if the migration has
+    /// completed" reports. The catalog whose status no caller's import set carries it by
+    /// DEFAULT, so the principal reported for it is the service's own marker
+    /// ([`STATUS_SET_BY_DEFAULT`]) rather than a person, and it carries no instant at all:
+    /// no import was served, so there is no time a migration was started.
+    pub fn catalog_import_status(&self, catalog_id: &str) -> CatalogImportStatus {
+        let migration = self
+            .catalogs
+            .get(catalog_id)
+            .and_then(|catalog| catalog.migration.as_ref());
+        CatalogImportStatus {
+            import_completed: true,
+            import_time: migration.map(|stored| to_date_time(stored.import_time)),
+            imported_by: Some(migration.map_or_else(
+                || STATUS_SET_BY_DEFAULT.to_string(),
+                |stored| stored.imported_by.clone(),
+            )),
+        }
+    }
+
     /// The resource policy attached to `resource_arn`, or `None` when no policy is
     /// attached to that resource.
     ///
@@ -3267,6 +3300,14 @@ pub struct Catalog {
     /// than merging into it. What a read reports from it, defaults included, is
     /// [`ComAmazonawsGlueAwsglueState::data_catalog_encryption_settings`].
     pub encryption_settings: Option<DataCatalogEncryptionSettings>,
+    /// The MIGRATION of an Athena-managed data catalog into this catalog that an
+    /// `ImportCatalogToGlue` performed, or `None` while no such request has migrated one.
+    ///
+    /// ONE record per catalog, like [`Self::encryption_settings`]: every operation that
+    /// starts or reports a migration names only a `CatalogId`, so a later migration of the
+    /// same catalog REPLACES this record rather than adding to it. What a read reports from
+    /// it is [`ComAmazonawsGlueAwsglueState::catalog_import_status`].
+    pub migration: Option<CatalogMigrationEntry>,
     /// The catalog RESOURCE record a `CreateCatalog` wrote for this catalog id, or
     /// `None` for a catalog that is only a container — the account's own Data Catalog,
     /// which no create brought into existence and which therefore has no name,
@@ -3299,6 +3340,42 @@ impl Catalog {
     /// [`MAX_CONNECTIONS_PER_CATALOG`].
     pub fn can_store_connection(&self) -> bool {
         self.connections.len() < MAX_CONNECTIONS_PER_CATALOG
+    }
+}
+
+/// `CatalogImportStatus$ImportedBy` of a Data Catalog whose migration status no caller's
+/// import set: the marker the service reports in place of "the name of the person who
+/// initiated the migration", because nobody initiated it — the catalog's status is the one
+/// it carries by default.
+///
+/// A value of the member's own `NameString` shape (len 1..255), reported for every catalog
+/// no `ImportCatalogToGlue` has migrated, and replaced on one that has by the identity that
+/// initiated that migration ([`CatalogMigrationEntry::imported_by`]).
+pub const STATUS_SET_BY_DEFAULT: &str = "StatusSetByDefault";
+
+/// The migration of an Athena-managed data catalog into one Data Catalog that an
+/// `ImportCatalogToGlue` performed: when it ran and who initiated it, which is what a
+/// later `GetCatalogImportStatus` of that catalog reports beside its completion.
+#[derive(Debug, Clone)]
+pub struct CatalogMigrationEntry {
+    /// `CatalogImportStatus$ImportTime`: "the time that the migration was started" — the
+    /// instant the import was served, stored so every later read reports the same
+    /// timestamp.
+    pub import_time: SystemTime,
+    /// `CatalogImportStatus$ImportedBy`: "the name of the person who initiated the
+    /// migration" — the identity the request speaks for ([`request_principal`]), never a
+    /// value the request itself carried.
+    pub imported_by: String,
+}
+
+impl CatalogMigrationEntry {
+    /// Record the migration an `ImportCatalogToGlue` served at `now` on behalf of the
+    /// calling identity.
+    pub fn from_import(now: SystemTime) -> Self {
+        Self {
+            import_time: now,
+            imported_by: request_principal(),
+        }
     }
 }
 

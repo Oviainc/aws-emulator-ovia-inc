@@ -51,6 +51,8 @@ mod blueprints;
 mod catalog_encryption;
 #[path = "all/catalog_identity.rs"]
 mod catalog_identity;
+#[path = "all/catalog_import_status.rs"]
+mod catalog_import_status;
 #[path = "all/catalog_mutations.rs"]
 mod catalog_mutations;
 #[path = "all/catalog_projections.rs"]

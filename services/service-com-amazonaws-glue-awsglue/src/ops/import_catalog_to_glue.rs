@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportCatalogToGlue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportCatalogToGlue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportCatalogToGlue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Migrates an Athena-managed data catalog into ONE Glue Data Catalog: the catalog this
+//! request addresses records the migration — when it ran and who initiated it — which a
+//! later `GetCatalogImportStatus` of that catalog reports. The response carries no
+//! members, so the migration record is the whole observable effect.
 //!
 //! ## Shape of an operation
 //!
@@ -73,12 +69,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ImportCatalogToGlueError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#ImportCatalogToGlue")]
+// here — hence the `ImportCatalogToGlueError` alias below. `AccessDeniedException` comes
+// with the extra_errors list because a `CatalogId` of another account is refused as
+// unauthorized, exactly as the other catalog-addressed writes of this service refuse one.
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#ImportCatalogToGlue",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum ImportCatalogToGlueErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServiceException(InternalServiceException),
     OperationTimeoutException(OperationTimeoutException),
 }
@@ -134,18 +134,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportCatalogToGlue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportCatalogToGlueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportCatalogToGlue"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ImportCatalogToGlueErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // A `CatalogId` this emulator holds no Data Catalog under must not be conjured
+        // into existence by the migration: any id but this account's names another
+        // account's catalog, reachable only through that catalog's own resource policy, so
+        // the request is refused as unauthorized (see
+        // `crate::state::foreign_catalog_refusal`).
+        if let Some(message) = crate::state::foreign_catalog_refusal(
+            &catalog_id,
+            &crate::state::request_region(ctx.parts()),
+            Self::NAME,
+        ) {
+            return Err(ImportCatalogToGlueErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // The catalog container is materialised here if this store does not hold it yet,
+        // through the one place a catalog is brought into existence. `None` means the
+        // store already holds the maximum number of catalogs without holding this one,
+        // which the check above makes unreachable (only this account's id gets here), so
+        // it is answered as the server-side failure it would be rather than blamed on the
+        // request.
+        let Some(catalog) = store.catalog_mut_for_create(&catalog_id) else {
+            return Err(ImportCatalogToGlueErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(format!(
+                        "the Glue Data Catalog store cannot hold a catalog under CatalogId \
+                         {catalog_id}"
+                    )),
+                },
+            )
+            .into());
+        };
+        // ONE migration record per catalog, so a second import REPLACES it: the status a
+        // read reports is of the migration last performed, stamped with the instant this
+        // request was served and the identity it speaks for.
+        catalog.migration = Some(crate::state::CatalogMigrationEntry::from_import(
+            ::std::time::SystemTime::now(),
+        ));
+        ::tracing::info!(
+            operation = "ImportCatalogToGlue",
+            catalog_id = %catalog_id,
+            "migrated an Athena-managed data catalog into a Data Catalog"
+        );
+
+        Ok(ImportCatalogToGlueOutput {})
     }
 }
