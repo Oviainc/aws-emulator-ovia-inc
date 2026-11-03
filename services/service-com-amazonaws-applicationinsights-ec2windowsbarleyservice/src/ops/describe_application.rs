@@ -151,12 +151,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let not_found = || {
             DescribeApplicationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "no application exists for resource group {}",
-                    input.resource_group_name
-                )),
+                message: Some(crate::state::APPLICATION_MISSING_MESSAGE.to_string()),
             })
         };
+
+        // `AccountId` selects the resource-group owner whose application is read,
+        // and this emulator serves exactly one account: another account's
+        // applications are not the caller's to read.
+        if let Some(requested) = crate::state::foreign_account(input.account_id.as_deref()) {
+            return Err(DescribeApplicationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::foreign_account_message(requested)),
+                },
+            )
+            .into());
+        }
 
         let now = ::std::time::SystemTime::now();
         let application_info = {
@@ -164,16 +173,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(application) = store.applications.get(&input.resource_group_name) else {
                 return Err(not_found().into());
             };
-            // `AccountId` names the account that owns the application. This
-            // emulator serves exactly one account, so an application asked for
-            // under any other account does not exist there.
-            if input
-                .account_id
-                .as_deref()
-                .is_some_and(|asked| asked != application.account_id)
-            {
-                return Err(not_found().into());
-            }
             application.info(now)
         };
 

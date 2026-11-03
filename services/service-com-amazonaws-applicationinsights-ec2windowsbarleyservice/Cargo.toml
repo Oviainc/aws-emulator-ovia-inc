@@ -23,6 +23,15 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes the opaque `NextToken` the paginated List* operations emit.
 hex = { workspace = true }
+# Reads the base64 payload a pagination token carries, so a token this service
+# did not issue is refused by the schema that payload declares.
+base64 = "0.22"
+# Resolves the resource group an application is created over against Resource
+# Groups, driven over the in-process callback (`OperationContext::callback`):
+# a resource group is Resource Groups' resource, so `CreateApplication` asks it
+# rather than assuming the group exists. Only the generated client is needed —
+# the emulator supplies the transport.
+aws-sdk-resourcegroups = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

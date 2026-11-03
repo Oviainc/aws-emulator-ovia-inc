@@ -235,7 +235,7 @@ async fn application_and_component_lifecycle_round_trips() {
         json!({ "ResourceGroupName": "my-rg", "ComponentName": "no-such-tier" }),
     )
     .await;
-    assert_eq!(status, 404, "unknown component: got body {body:?}");
+    assert_eq!(status, 400, "unknown component: got body {body:?}");
     assert_eq!(
         error_code(&body),
         "ResourceNotFoundException",
@@ -257,7 +257,7 @@ async fn application_and_component_lifecycle_round_trips() {
         json!({ "ResourceGroupName": "my-rg" }),
     )
     .await;
-    assert_eq!(status, 404, "describe after delete: got body {body:?}");
+    assert_eq!(status, 400, "describe after delete: got body {body:?}");
     assert_eq!(
         error_code(&body),
         "ResourceNotFoundException",
@@ -279,7 +279,7 @@ async fn application_and_component_lifecycle_round_trips() {
         json!({ "ResourceGroupName": "my-rg" }),
     )
     .await;
-    assert_eq!(status, 404, "delete of an unknown group: got body {body:?}");
+    assert_eq!(status, 400, "delete of an unknown group: got body {body:?}");
     assert_eq!(
         error_code(&body),
         "ResourceNotFoundException",
@@ -315,10 +315,10 @@ async fn discovery_type_follows_the_grouping_type() {
     }
 }
 
-/// The ARN-derived `ResourceType` of a component, over the resource types the
-/// `ApplicationComponent$ResourceType` member documents ("EC2 instances, Auto
-/// Scaling group, Classic ELB, Application ELB, and SQS Queue"), plus a mixed
-/// group and an unsupported one — neither of which has a single type to report.
+/// The ARN-derived `ResourceType` of a custom component, over the resource lists
+/// a custom component may carry: one EC2 instance and several of them. The
+/// resources a custom component may NOT group are the subject of
+/// `tests/all/admission_checks.rs`.
 #[tokio::test]
 async fn component_resource_type_is_derived_from_the_grouped_arns() {
     let router = router();
@@ -337,45 +337,12 @@ async fn component_resource_type_is_derived_from_the_grouped_arns() {
             Some("AWS::EC2::Instance"),
         ),
         (
-            "autoscaling-group",
-            &["arn:aws:autoscaling:us-east-1:000000000000:autoScalingGroup:uuid:autoScalingGroupName/my-asg"],
-            Some("AWS::AutoScaling::AutoScalingGroup"),
-        ),
-        (
-            "classic-elb",
-            &["arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/my-classic-lb"],
-            Some("AWS::ElasticLoadBalancing::LoadBalancer"),
-        ),
-        (
-            "application-elb",
-            &["arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/my-alb/0123456789abcdef"],
-            Some("AWS::ElasticLoadBalancingV2::LoadBalancer"),
-        ),
-        (
-            "sqs-queue",
-            &["arn:aws:sqs:us-east-1:000000000000:my-queue"],
-            Some("AWS::SQS::Queue"),
-        ),
-        (
             "two-instances",
             &[
                 "arn:aws:ec2:us-east-1:000000000000:instance/i-0123456789abcdef0",
                 "arn:aws:ec2:us-east-1:000000000000:instance/i-00000000000000002",
             ],
             Some("AWS::EC2::Instance"),
-        ),
-        (
-            "mixed-types",
-            &[
-                "arn:aws:ec2:us-east-1:000000000000:instance/i-0123456789abcdef0",
-                "arn:aws:sqs:us-east-1:000000000000:my-queue",
-            ],
-            None,
-        ),
-        (
-            "unsupported-type",
-            &["arn:aws:lambda:us-east-1:000000000000:function:my-fn"],
-            None,
         ),
     ];
 
@@ -612,15 +579,15 @@ async fn bad_requests_are_refused_with_the_modelled_error() {
             "describe-application-unknown-group",
             "DescribeApplication",
             json!({ "ResourceGroupName": "never-created" }),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (
             "describe-application-other-account",
             "DescribeApplication",
             json!({ "ResourceGroupName": "refusals-rg", "AccountId": "111111111111" }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "describe-application-malformed-account",
@@ -674,7 +641,7 @@ async fn bad_requests_are_refused_with_the_modelled_error() {
                 "ComponentName": "web-tier",
                 "ResourceList": ["arn:aws:ec2:us-east-1:000000000000:instance/i-0123456789abcdef0"],
             }),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (
@@ -699,7 +666,7 @@ async fn bad_requests_are_refused_with_the_modelled_error() {
             "list-components-unknown-group",
             "ListComponents",
             json!({ "ResourceGroupName": "never-created" }),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (
@@ -713,7 +680,7 @@ async fn bad_requests_are_refused_with_the_modelled_error() {
             "delete-application-unknown-group",
             "DeleteApplication",
             json!({ "ResourceGroupName": "never-created" }),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
     ];
@@ -732,12 +699,11 @@ async fn bad_requests_are_refused_with_the_modelled_error() {
     }
 }
 
-/// `AccountId` scopes a read to one account, and the two list operations answer
-/// the mismatch differently BECAUSE their modelled error sets differ:
-/// `ListApplications` declares no not-found error, so another account is an empty
-/// page; `ListComponents` declares one, so an unknown group there is a 404.
+/// `AccountId` selects the resource-group owner a read is served for: the
+/// caller's own account is served, and an account that is not the caller's is
+/// refused rather than answered from the local account's state.
 #[tokio::test]
-async fn another_account_holds_nothing() {
+async fn another_account_is_not_the_callers_to_read() {
     let router = router();
     let (status, body) = call(
         &router,
@@ -767,36 +733,32 @@ async fn another_account_holds_nothing() {
         "case own-account: the application must be listed, got {listed:?}"
     );
 
-    // Any other 12-digit account holds none of it.
+    // Any other 12-digit account is not the caller's to read.
     for other in ["111111111111", "999999999999"] {
-        let (status, listed) =
-            call(&router, "ListApplications", json!({ "AccountId": other })).await;
-        assert_eq!(status, 200, "case {other:?}: got body {listed:?}");
-        assert_eq!(
-            listed["ApplicationInfoList"],
-            json!([]),
-            "case {other:?}: another account holds no applications, got {listed:?}"
-        );
-        assert!(
-            listed.get("NextToken").is_none(),
-            "case {other:?}: an empty page carries no token, got {listed:?}"
-        );
-
-        let (status, body) = call(
-            &router,
-            "ListComponents",
-            json!({ "ResourceGroupName": "owned-rg", "AccountId": other }),
-        )
-        .await;
-        assert_eq!(
-            status, 404,
-            "case {other:?}: ListComponents models a not-found error, got {body:?}"
-        );
-        assert_eq!(
-            error_code(&body),
-            "ResourceNotFoundException",
-            "case {other:?}: expected ResourceNotFoundException, got {body:?}"
-        );
+        for operation in ["ListApplications", "ListComponents"] {
+            let mut request = json!({ "AccountId": other });
+            if operation == "ListComponents" {
+                request["ResourceGroupName"] = json!("owned-rg");
+            }
+            let (status, body) = call(&router, operation, request).await;
+            assert_eq!(
+                status, 400,
+                "case {other:?} on {operation}: expected the request to be refused, got {body:?}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {other:?} on {operation}: expected ValidationException, got {body:?}"
+            );
+            assert_eq!(
+                body["Message"],
+                json!(format!(
+                    "Account {} is not able to access applications that belong to account {other}",
+                    account_id()
+                )),
+                "case {other:?} on {operation}: unexpected message in {body:?}"
+            );
+        }
     }
 }
 
@@ -1051,7 +1013,7 @@ async fn components_are_keyed_per_application() {
     )
     .await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "the deleted application has no component list, got {body:?}"
     );
 }

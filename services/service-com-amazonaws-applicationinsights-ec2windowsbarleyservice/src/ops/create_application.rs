@@ -5,6 +5,11 @@
 //! [`crate::state`] and reports it back through [`crate::state::Application::info`], so
 //! `DescribeApplication` and `ListApplications` answer from the same stored record.
 //!
+//! The resource group the application is created over is Resource Groups'
+//! resource, so it is resolved there first
+//! ([`crate::state::resource_groups`]) and a group that account holds none of is
+//! refused.
+//!
 //! A create that names no `ResourceGroupName` is refused, including the
 //! `GroupingType=ACCOUNT_BASED` case where the real service onboards the whole
 //! account under a group name it mints itself: minting that name is part of the
@@ -174,7 +179,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateApplicationErrorModeled::InternalServerException(
                 InternalServerException {
@@ -199,6 +203,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+
+        // An application is created OVER a resource group, which is Resource
+        // Groups' resource, so the group this request names is resolved there
+        // before anything is written. Only Resource Groups ANSWERING that the
+        // account holds no such group refuses the create; an emulator with no
+        // Resource Groups mounted knows nothing about the group and refuses
+        // nothing.
+        let region = crate::state::request_region(ctx);
+        if crate::state::resource_groups::resolve_group(ctx, &region, &resource_group_name).await
+            == crate::state::resource_groups::GroupLookup::Absent
+        {
+            return Err(CreateApplicationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_group_missing_message(
+                        &resource_group_name,
+                    )),
+                },
+            )
+            .into());
+        }
 
         let discovery_type = crate::state::discovery_type_for(input.grouping_type.as_deref());
         let now = ::std::time::SystemTime::now();

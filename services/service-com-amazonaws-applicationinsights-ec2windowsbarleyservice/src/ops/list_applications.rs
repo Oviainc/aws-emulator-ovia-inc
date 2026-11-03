@@ -151,36 +151,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `AccountId` scopes the list to one account. This emulator serves
-        // exactly one, so every other account holds no applications at all — an
-        // empty page, not a 404: `ListApplications` models only
-        // `InternalServerException` and `ValidationException`, so it has no
-        // not-found error to answer with. (`ListComponents` does model one, and
-        // answers 404 for an unknown group.)
-        if input
-            .account_id
-            .as_deref()
-            .is_some_and(|asked| asked != ::engine::emulator_account_id())
-        {
-            return Ok(ListApplicationsOutput {
-                application_info_list: Some(Vec::new()),
-                next_token: None,
-            });
+        // `AccountId` selects the resource-group owner whose applications are
+        // listed, and this emulator serves exactly one account: another account's
+        // applications are not the caller's to read, so the request is refused
+        // rather than answered from the local account's state.
+        if let Some(requested) = crate::state::foreign_account(input.account_id.as_deref()) {
+            return Err(ListApplicationsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::foreign_account_message(requested)),
+                },
+            )
+            .into());
         }
 
         let now = ::std::time::SystemTime::now();
         let (application_info_list, next_token) = {
             let store = state.lock();
+            // A pagination-token exception is answered by the layer that reads the
+            // token rather than by this operation's own modelled error shape, so its
+            // body carries the lowercase `message` member that layer writes — see
+            // `crate::scaffolded::Scaffolded::validation`. Every other refusal here is
+            // the modelled `ValidationException`.
             let page = crate::state::paginate(
                 &store.applications,
                 input.next_token.as_deref(),
                 input.max_results,
+                Self::NAME,
             )
-            .map_err(|message| {
-                ListApplicationsErrorModeled::ValidationException(ValidationException {
-                    message: Some(message.to_string()),
-                })
-            })?;
+            .map_err(ListApplicationsError::validation)?;
             let infos: Vec<ApplicationInfo> =
                 page.values.iter().map(|app| app.info(now)).collect();
             (infos, page.next_token)

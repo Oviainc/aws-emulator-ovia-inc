@@ -19,6 +19,11 @@
 // else appends to.
 #[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
 mod cloudformation_refuses_s3vectors_vector_buckets;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `a…` span (beside the other application* suites) are both regions concurrently
+// landing suites add their line to.
+#[path = "all/applicationinsights_resource_group_admission.rs"]
+mod applicationinsights_resource_group_admission;
 // Declared at the head for the reason the entry above records: the appended tail and the
 // sorted `s…` span (where the other sagemaker suites land) are both regions concurrently
 // landing suites add their line to.

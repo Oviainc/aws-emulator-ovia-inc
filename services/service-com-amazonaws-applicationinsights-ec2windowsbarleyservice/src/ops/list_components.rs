@@ -157,41 +157,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `AccountId` selects the resource-group owner whose application is read,
+        // and this emulator serves exactly one account: another account's
+        // applications are not the caller's to read.
+        if let Some(requested) = crate::state::foreign_account(input.account_id.as_deref()) {
+            return Err(ListComponentsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::foreign_account_message(requested)),
+                },
+            )
+            .into());
+        }
+
         let (application_component_list, next_token) = {
             let store = state.lock();
-            let application = store
-                .applications
-                .get(&input.resource_group_name)
-                // `AccountId` names the account that owns the application; this
-                // emulator serves exactly one, so under any other account the
-                // application does not exist.
-                .filter(|application| {
-                    input
-                        .account_id
-                        .as_deref()
-                        .is_none_or(|asked| asked == application.account_id)
-                });
-            let Some(application) = application else {
+            let Some(application) = store.applications.get(&input.resource_group_name) else {
                 return Err(ListComponentsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no application exists for resource group {}",
-                            input.resource_group_name
-                        )),
+                        message: Some(crate::state::APPLICATION_MISSING_MESSAGE.to_string()),
                     },
                 )
                 .into());
             };
+            // The same pagination-token exception `ListApplications` answers, from the
+            // same layer and in the same envelope: the lowercase `message` member that
+            // layer writes, not the modelled shape's.
             let page = crate::state::paginate(
                 &application.components,
                 input.next_token.as_deref(),
                 input.max_results,
+                Self::NAME,
             )
-            .map_err(|message| {
-                ListComponentsErrorModeled::ValidationException(ValidationException {
-                    message: Some(message.to_string()),
-                })
-            })?;
+            .map_err(ListComponentsError::validation)?;
             let components: Vec<ApplicationComponent> =
                 page.values.iter().map(|c| c.describe()).collect();
             (components, page.next_token)

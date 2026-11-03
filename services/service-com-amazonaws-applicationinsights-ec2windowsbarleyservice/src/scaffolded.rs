@@ -177,6 +177,20 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The wire error code of the modeled error this service answers a lookup that
+/// resolved nothing with ([`NOT_FOUND_STATUS`] states the status it carries).
+const NOT_FOUND_CODE: &str = "ResourceNotFoundException";
+
+/// The HTTP status Application Insights answers `ResourceNotFoundException` with.
+///
+/// This service answers a request it refuses because of what the caller asked for
+/// with HTTP 400 throughout, the not-found refusal included, while the `@httpError`
+/// trait the model puts on that one shape says 404. A generated error variant reports
+/// its own trait, so the status the SERVICE answers is stated here — the one place
+/// every operation's error channel passes through — rather than in each handler, where
+/// two operations could state it differently.
+const NOT_FOUND_STATUS: u16 = 400;
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -282,9 +296,13 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed.
+    ///
+    /// A modeled error answers the model's own status, except for the not-found one,
+    /// which answers [`NOT_FOUND_STATUS`] — see that constant for why.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
+            Self::Modeled(e) if e.shape_name() == NOT_FOUND_CODE => NOT_FOUND_STATUS,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
         }

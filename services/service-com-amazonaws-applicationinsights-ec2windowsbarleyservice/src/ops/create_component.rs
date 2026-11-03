@@ -5,6 +5,9 @@
 //! the parent application in [`crate::state`], so `DescribeComponent` and
 //! `ListComponents` report it from there.
 //!
+//! A custom component groups standalone EC2 instances, so a resource list naming
+//! anything else is refused rather than stored.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -153,6 +156,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // see `crate::state::resource_type_of`.
         let resource_type = crate::state::resource_type_of(&input.resource_list);
 
+        // A custom component groups standalone EC2 instances, so a resource of any
+        // other type cannot be grouped into one — whatever else its ARN is a
+        // well-formed ARN of.
+        if let Some(other) = input
+            .resource_list
+            .iter()
+            .find(|arn| !crate::state::is_ec2_instance(arn))
+        {
+            ::tracing::debug!(
+                resource = %other,
+                "a custom component may group only EC2 instances"
+            );
+            return Err(CreateComponentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::ONLY_EC2_INSTANCES_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // `ResourceList` is stored verbatim and carries no modelled length bound,
         // so the emulator's own bound is what stops one request growing the store
         // without end.
@@ -171,10 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(application) = store.applications.get_mut(&input.resource_group_name) else {
             return Err(CreateComponentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no application exists for resource group {}",
-                        input.resource_group_name
-                    )),
+                    message: Some(crate::state::APPLICATION_MISSING_MESSAGE.to_string()),
                 },
             )
             .into());

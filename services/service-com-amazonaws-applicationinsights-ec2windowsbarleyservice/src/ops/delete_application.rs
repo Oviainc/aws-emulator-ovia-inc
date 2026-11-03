@@ -155,10 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !removed {
             return Err(DeleteApplicationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no application exists for resource group {}",
-                        input.resource_group_name
-                    )),
+                    message: Some(crate::state::APPLICATION_MISSING_MESSAGE.to_string()),
                 },
             )
             .into());

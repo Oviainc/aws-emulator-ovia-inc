@@ -1254,6 +1254,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-resourcegroups"
+version = "1.121.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce7e6ccb80d8c0e117afb2b690c5e0d904c1c59ae50401cf1e9159cfe5b30ea"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.0",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.1.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.155.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6225,9 +6250,11 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-resourcegroups",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
+ "base64 0.22.1",
  "bytes",
  "hex",
  "http",

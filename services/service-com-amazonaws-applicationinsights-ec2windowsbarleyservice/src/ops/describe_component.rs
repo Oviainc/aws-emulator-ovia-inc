@@ -154,27 +154,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `AccountId` selects the owner of the resource group the component
+        // belongs to, and this emulator serves exactly one account: another
+        // account's applications are not the caller's to read.
+        if let Some(requested) = crate::state::foreign_account(input.account_id.as_deref()) {
+            return Err(DescribeComponentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::foreign_account_message(requested)),
+                },
+            )
+            .into());
+        }
+
         let (application_component, resource_list) = {
             let store = state.lock();
-            let application = store
-                .applications
-                .get(&input.resource_group_name)
-                // `AccountId` names the account that owns the application; this
-                // emulator serves exactly one, so under any other account the
-                // application does not exist.
-                .filter(|application| {
-                    input
-                        .account_id
-                        .as_deref()
-                        .is_none_or(|asked| asked == application.account_id)
-                });
-            let Some(application) = application else {
+            let Some(application) = store.applications.get(&input.resource_group_name) else {
                 return Err(DescribeComponentErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no application exists for resource group {}",
-                            input.resource_group_name
-                        )),
+                        message: Some(crate::state::APPLICATION_MISSING_MESSAGE.to_string()),
                     },
                 )
                 .into());
@@ -182,9 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(component) = application.components.get(&input.component_name) else {
                 return Err(DescribeComponentErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no component {} exists in resource group {}",
-                            input.component_name, input.resource_group_name
+                        message: Some(crate::state::component_missing_message(
+                            &input.component_name,
+                            &input.resource_group_name,
                         )),
                     },
                 )

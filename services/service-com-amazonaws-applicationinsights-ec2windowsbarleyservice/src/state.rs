@@ -15,6 +15,68 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{ApplicationComponent, ApplicationInfo, Tag};
 
+pub mod resource_groups;
+
+/// The region a request is attributed to when it carries no SigV4 credential
+/// scope. `emulator_server::emulator_arn`'s own documentation names `us-east-1`
+/// as the emulator default.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The region this request was signed for, which is the region every resource it
+/// resolves in another service belongs to.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// What Application Insights answers when the resource group a request names is
+/// not a group of the account: the group name from the request, and the account
+/// the caller is in.
+pub fn resource_group_missing_message(resource_group_name: &str) -> String {
+    format!(
+        "Resource Group with name {resource_group_name} does not exist in {}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// What Application Insights answers when no application it monitors answers to
+/// the resource group a request named — the whole sentence, with no variable part:
+/// the request already names the group, and the answer is only that nothing here
+/// monitors it.
+pub const APPLICATION_MISSING_MESSAGE: &str = "Application does not exist";
+
+/// What Application Insights answers when the application exists and holds no
+/// custom component of the name a request asked for: the component name and the
+/// resource group, both from the request.
+pub fn component_missing_message(component_name: &str, resource_group_name: &str) -> String {
+    format!("Custom component {component_name} does not exist for {resource_group_name}")
+}
+
+/// What Application Insights answers a request that would group anything other
+/// than EC2 instances into a custom component.
+pub const ONLY_EC2_INSTANCES_MESSAGE: &str = "Only EC2 Instance can be grouped.";
+
+/// What Application Insights answers a request whose `AccountId` names an account
+/// other than the caller's: the caller's account and the one it asked for.
+pub fn foreign_account_message(requested_account_id: &str) -> String {
+    format!(
+        "Account {} is not able to access applications that belong to account {requested_account_id}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The account whose applications a request asks for, when that is NOT the
+/// caller's own account.
+///
+/// `AccountId` selects the owner of the resource groups an operation reads, and
+/// this emulator serves exactly one account: the caller can only read its own
+/// applications, so any other account it names is refused rather than answered
+/// from local state. A request that names none asks for the caller's own.
+pub fn foreign_account(account_id: Option<&str>) -> Option<&str> {
+    account_id.filter(|asked| *asked != ::engine::emulator_account_id())
+}
+
 /// `LifeCycle` an application carries while Application Insights is still
 /// onboarding the resources it was created over.
 pub const LIFE_CYCLE_CREATING: &str = "CREATING";
@@ -54,8 +116,59 @@ pub const ONBOARDING_SPAN: Duration = Duration::from_millis(500);
 /// `MaxResults` member (`MaxEntities`) is 1..40.
 pub const MAX_PAGE_SIZE: i32 = 40;
 
-/// Why a `NextToken` was refused: it is not one this service handed out.
-pub const INVALID_NEXT_TOKEN: &str = "NextToken is not a pagination token this service issued";
+/// What Application Insights answers a `NextToken` it cannot read.
+///
+/// A pagination token carries a WRAPPED PAYLOAD, and the first field of that
+/// payload says which wrapping schema the rest of it is written in. A token this
+/// service did not issue declares a schema it does not write, so the refusal
+/// names the operation that was called and the schema id read off the token —
+/// both taken from the request, nothing stored.
+pub fn invalid_next_token_message(operation: &str, token: &str) -> String {
+    format!(
+        "Pagination token exception in operation '{operation}': invalid payload wrapping schema {}",
+        token_wrapping_schema(token)
+    )
+}
+
+/// The wrapping schema a pagination token's payload declares: the 16-bit signed
+/// big-endian integer its first two bytes carry.
+///
+/// A token is base64 text, so the first FOUR characters of that text are the one
+/// group the two bytes come from. Characters outside the alphabet are not part of
+/// the payload, and the two alphabets (standard and URL-safe) encode the same
+/// bits, so the text is reduced to the standard alphabet before it is decoded. A
+/// payload shorter than one group declares the schema that group does, with the
+/// bits it does not carry unset — so every token this service refuses reports the
+/// schema its payload begins with.
+fn token_wrapping_schema(token: &str) -> i16 {
+    /// The character a zero sextet is written as: what a group the token does not
+    /// fill out is padded with.
+    const ZERO: char = 'A';
+
+    let group: String = token
+        .chars()
+        .filter_map(|character| match character {
+            // The URL-safe alphabet's last two characters, as the standard
+            // alphabet writes the same two values.
+            '-' => Some('+'),
+            '_' => Some('/'),
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '+' | '/' => Some(character),
+            _ => None,
+        })
+        .take(4)
+        .collect();
+    let group: String = group
+        .chars()
+        .chain(::std::iter::repeat(ZERO))
+        .take(4)
+        .collect();
+    let payload = ::base64::Engine::decode(&::base64::engine::general_purpose::STANDARD, group)
+        .unwrap_or_default();
+    i16::from_be_bytes([
+        payload.first().copied().unwrap_or_default(),
+        payload.get(1).copied().unwrap_or_default(),
+    ])
+}
 
 /// How many applications the store holds before `CreateApplication` refuses.
 ///
@@ -195,6 +308,21 @@ pub fn discovery_type_for(grouping_type: Option<&str>) -> &'static str {
     }
 }
 
+/// The `ResourceType` an EC2 instance carries, as the resource-type vocabulary
+/// `ApplicationComponent$ResourceType` documents names it.
+pub const RESOURCE_TYPE_EC2_INSTANCE: &str = "AWS::EC2::Instance";
+
+/// Whether `arn` names an EC2 instance.
+///
+/// A CUSTOM component groups standalone instances to monitor
+/// (`smithy_query(query="operation",operation="CreateComponent")`: "Creates a
+/// custom component by grouping similar standalone instances to monitor"), so
+/// this is what decides whether a resource a request asks to group may be
+/// grouped at all.
+pub fn is_ec2_instance(arn: &str) -> bool {
+    resource_type_of_arn(arn) == Some(RESOURCE_TYPE_EC2_INSTANCE)
+}
+
 /// The resource type a component reports, derived from the ARNs it groups.
 ///
 /// The supported set is the one the `ApplicationComponent$ResourceType` member
@@ -203,6 +331,10 @@ pub fn discovery_type_for(grouping_type: Option<&str>) -> &'static str {
 /// (`smithy_query(query="shape",shape="ApplicationComponent")`). A component
 /// whose resources are not all of one supported type has no single type to
 /// report, so the member stays absent rather than naming one of them.
+///
+/// A CUSTOM component groups EC2 instances only ([`is_ec2_instance`]), so one
+/// reports their type; the rest of that set is what a component Application
+/// Insights discovers from the resource group itself can carry.
 pub fn resource_type_of(resources: &[String]) -> Option<String> {
     let mut kinds = resources.iter().map(|arn| resource_type_of_arn(arn));
     let first = kinds.next()??;
@@ -241,7 +373,7 @@ fn resource_type_of_arn(arn: &str) -> Option<&'static str> {
     // name (SQS queues), so the kind is its first segment under either separator.
     let kind = resource.split(['/', ':']).next().unwrap_or(resource);
     match (service, kind) {
-        ("ec2", "instance") => Some("AWS::EC2::Instance"),
+        ("ec2", "instance") => Some(RESOURCE_TYPE_EC2_INSTANCE),
         ("autoscaling", "autoScalingGroup") => Some("AWS::AutoScaling::AutoScalingGroup"),
         // One ARN kind covers both load balancers; only the v2 (Application and
         // Network) ones carry a type segment after `loadbalancer/`.
@@ -274,16 +406,21 @@ pub struct Page<'a, V> {
 /// modelled 1..40 range by the time a handler runs, and clamped here so a
 /// future caller of this helper cannot ask for an unbounded page. Absent means
 /// [`MAX_PAGE_SIZE`]. A token this service did not issue is refused with
-/// [`INVALID_NEXT_TOKEN`].
+/// [`invalid_next_token_message`], which names `operation` — the operation the
+/// caller asked for, as its `Operation::NAME` spells it.
 pub fn paginate<'a, V>(
     items: &'a BTreeMap<String, V>,
     next_token: Option<&str>,
     max_results: Option<i32>,
-) -> Result<Page<'a, V>, &'static str> {
+    operation: &str,
+) -> Result<Page<'a, V>, String> {
     let limit = max_results.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE);
     let limit = usize::try_from(limit).unwrap_or(1);
     let after = match next_token {
-        Some(token) => Bound::Excluded(decode_token(token).ok_or(INVALID_NEXT_TOKEN)?),
+        Some(token) => Bound::Excluded(
+            decode_token(token)
+                .ok_or_else(|| invalid_next_token_message(operation, token))?,
+        ),
         None => Bound::Unbounded,
     };
     let mut rest = items.range((after, Bound::Unbounded));
