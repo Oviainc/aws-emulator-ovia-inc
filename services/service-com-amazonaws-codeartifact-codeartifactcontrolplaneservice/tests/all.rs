@@ -103,3 +103,5 @@ mod policy_delete_idempotence;
 mod package_listing_filter_pairing;
 #[path = "all/package_version_publish_conflict.rs"]
 mod package_version_publish_conflict;
+#[path = "all/package_delete_cascade.rs"]
+mod package_delete_cascade;

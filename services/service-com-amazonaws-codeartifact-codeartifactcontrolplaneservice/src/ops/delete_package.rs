@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePackage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a PACKAGE from the repository that holds it, together with everything the
+//! package record holds — every version published into it, the assets of those versions
+//! and the distribution tags pointing at them — and answers with the `PackageSummary` of
+//! the record it removed, which is what makes the removal observable to the caller:
+//!
+//! * the addressed domain and repository are the SCOPE the request is directed at, not
+//!   what it removes, so one this caller does not hold is `ResourceNotFoundException`
+//!   (404) naming the resource kind that could not be resolved;
+//! * the package itself is addressed by its whole `(format, namespace, package)` triple,
+//!   the same key [`crate::state::package_key`] builds for every package-scoped
+//!   operation: a request naming the right package name under another format or namespace
+//!   addresses a DIFFERENT package, and one the repository does not hold is refused with
+//!   the package-scoped sentence [`crate::state::package_not_found_message`] states — the
+//!   wording `DescribePackage` already answers that absence with;
+//! * the removal CASCADES to the versions, because "Deletes a package and all associated
+//!   package versions. A deleted package cannot be restored. To delete one or more package
+//!   versions, use the DeletePackageVersions API" (this operation's own documentation): a
+//!   version is held inside the package record, so removing the record removes them all,
+//!   and neither `DescribePackage`, `ListPackages`, `DescribePackageVersion` nor
+//!   `ListPackageVersions` can still report the package or any version of it. The domain's
+//!   derived `assetSizeBytes` drops by what those versions' assets held;
+//! * each cascaded version's disappearance is a state change OF THAT VERSION, so it is
+//!   announced on the account's default event bus exactly as the removals
+//!   `DeletePackageVersions` makes are ([`crate::state::package_version_events`]) — one
+//!   event per version the package held, carrying the record as it last stood.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +203,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         )
         .map_err(DeletePackageErrorModeled::AccessDeniedException)?;
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePackage"))
+        // The store's own work holds this service's lock and contains no await, so the
+        // guard cannot outlive it: a lock over state shared between requests must not be
+        // held across the announcement below.
+        let output = self.remove_package(input)?;
+        // The state changes it recorded: every version the removed package held,
+        // announced on the account's default event bus.
+        crate::state::package_version_events::publish(ctx, &*self.engine).await;
+        Ok(output)
     }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeletePackage<Eng> {
+    /// Remove the package this request addresses, and RECORD the state change each of its
+    /// versions underwent by going with it — the whole of this operation's work on the
+    /// store.
+    ///
+    /// Separate from the handler, and not `async`, because the announcement the handler
+    /// makes is an await: this is the critical section, and its end is where the store's
+    /// guard is released.
+    fn remove_package(
+        &self,
+        input: DeletePackageInput,
+    ) -> Result<DeletePackageOutput, DeletePackageError> {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeletePackageErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The domain and the repository are the SCOPE the request is addressed to rather
+        // than what it removes, so one this caller does not hold is the modelled
+        // not-found refusal, naming the kind that could not be resolved.
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(not_found(
+                crate::state::domain_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                ),
+                &input.domain,
+                "domain",
+            ));
+        };
+        let Some(repository) = domain.repositories.get_mut(&input.repository) else {
+            return Err(not_found(
+                crate::state::repository_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                    &input.repository,
+                ),
+                &input.repository,
+                "repository",
+            ));
+        };
+
+        // A package is addressed by its whole (format, namespace, name) triple, the same
+        // key `DescribePackage` resolves: a request naming the right package name under a
+        // different format or namespace addresses a DIFFERENT package, and that one is not
+        // found — in the sentence the PACKAGE-scoped operations state.
+        let key =
+            crate::state::package_key(&input.format, input.namespace.as_deref(), &input.package);
+        let Some(removed) = repository.packages.remove(&key) else {
+            return Err(not_found(
+                crate::state::package_not_found_message(
+                    &input.format,
+                    input.namespace.as_deref(),
+                    &input.package,
+                ),
+                &input.package,
+                "package",
+            ));
+        };
+
+        // Removing the record is the whole operation: the versions it held, their assets
+        // and its distribution tags go with it, because every one of them is kept inside
+        // it. The answer is the record as it last stood, including the origin
+        // configuration it carried.
+        let summary = removed.summary();
+
+        // Each version that went with the package is a version whose state changed, so it
+        // is announced the way a directly deleted version is: the record as it last stood,
+        // in the state a version the repository no longer holds is in.
+        //
+        // Collected rather than recorded in the loop because the loop borrows the
+        // REPOSITORY (the event reads the repository the version lived in) while
+        // recording borrows the store that holds it; the collection ends that borrow. It
+        // is bounded by what one package can hold
+        // ([`crate::state::MAX_PACKAGE_VERSIONS_PER_PACKAGE`]), never by the request.
+        let at = ::std::time::SystemTime::now();
+        let changes: Vec<crate::state::package_version_events::VersionChange> = removed
+            .versions
+            .values()
+            .map(|version| {
+                crate::state::package_version_events::VersionChange::deleted(
+                    repository, &removed, version, at,
+                )
+            })
+            .collect();
+        for change in changes {
+            store.record_version_change(change);
+        }
+
+        Ok(DeletePackageOutput {
+            deleted_package: Some(summary),
+        })
+    }
+}
+
+/// A `ResourceNotFoundException` (404) naming the resource that was addressed, so a caller
+/// can tell an unknown domain from an unknown repository or package.
+fn not_found(message: String, resource_id: &str, resource_type: &str) -> DeletePackageError {
+    DeletePackageErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
 }
