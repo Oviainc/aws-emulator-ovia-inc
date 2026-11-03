@@ -15954,6 +15954,7 @@ dependencies = [
  "tokio",
  "tracing",
  "whatlang",
+ "zip",
 ]
 
 [[package]]

@@ -98,133 +98,12 @@
 use super::types::*;
 
 use crate::state::{
-    applied_term, is_supported_language, language_for_detector_code, service_state,
-    terminology_not_found, text_size_limit_exceeded, unsupported_language_pair,
-    AUTO_LANGUAGE_CODE, MAX_APPLIED_TERMS, MAX_TERMINOLOGIES_PER_TRANSLATION, MAX_TEXT_BYTES,
-    MAX_TRANSLATED_TEXT_CHARS, TERMINOLOGY_RESOURCE,
+    applied_term, invalid_request, is_supported_language, language_for_detector_code,
+    resolve_terminologies, service_state, substitute, terminology_not_found,
+    text_size_limit_exceeded, translation_marker, unsupported_language_pair, AUTO_LANGUAGE_CODE,
+    MAX_TERMINOLOGIES_PER_TRANSLATION, MAX_TEXT_BYTES, MAX_TRANSLATED_TEXT_CHARS,
+    TERMINOLOGY_RESOURCE,
 };
-
-/// The marker a synthetic translation carries, so a caller can never mistake
-/// this emulator's output for a real translation. The target language is part of
-/// it, which is what makes the output differ per requested pair.
-const SYNTHETIC_MARKER: &str = "mt";
-
-/// One requested terminology, resolved against the store: the stored record's
-/// name and the `(source text, target text)` pairs it provides for this
-/// translation's language pair, longest source first so a longer phrase wins
-/// over a word inside it.
-struct ResolvedTerminology {
-    name: String,
-    pairs: Vec<(String, String)>,
-}
-
-/// Substitute every terminology term that occurs in `text` as a whole word, and
-/// report the pairs that matched in the order they first occur in the source
-/// text.
-///
-/// A term matches only at a word boundary, so a terminology for `hello` does not
-/// rewrite the middle of `othello`, and a multi-word phrase matches as a phrase.
-/// The scan is a single left-to-right pass over the text, which the model bounds
-/// at 10,000 characters, against at most one terminology's terms.
-///
-/// `budget` is how many characters the substituted text may still grow to.
-/// Substituting a term EMITS text rather than copying it, so without a ceiling
-/// a short request against long stored terms would build an arbitrarily long
-/// answer; the scan stops the moment the budget would be passed and reports
-/// that (the third value), which the handler refuses.
-fn substitute<'t>(
-    text: &str,
-    pairs: &'t [(String, String)],
-    budget: usize,
-) -> (String, Vec<(&'t str, &'t str)>, bool) {
-    let mut translated = String::new();
-    let mut emitted = 0usize;
-    let mut applied: Vec<(&'t str, &'t str)> = Vec::new();
-    let mut remaining = text;
-    let mut previous: Option<char> = None;
-
-    while !remaining.is_empty() {
-        let at_word_start = previous.is_none_or(|character| !character.is_alphanumeric());
-        let matched = if at_word_start {
-            pairs.iter().find_map(|(source, target)| {
-                let tail = remaining.strip_prefix(source.as_str())?;
-                let ends_word = tail
-                    .chars()
-                    .next()
-                    .is_none_or(|character| !character.is_alphanumeric());
-                (!source.is_empty() && ends_word).then_some((source.as_str(), target.as_str()))
-            })
-        } else {
-            None
-        };
-
-        match matched {
-            Some((source, target)) => {
-                let grows_by = target.chars().count();
-                if emitted.saturating_add(grows_by) > budget {
-                    return (translated, applied, true);
-                }
-                translated.push_str(target);
-                emitted = emitted.saturating_add(grows_by);
-                if !applied.iter().any(|(seen, _)| *seen == source)
-                    && applied.len() < MAX_APPLIED_TERMS
-                {
-                    applied.push((source, target));
-                }
-                // The boundary the NEXT match is judged against is the text
-                // that was emitted, which is the target term.
-                previous = target.chars().next_back();
-                remaining = remaining.get(source.len()..).unwrap_or_default();
-            }
-            None => {
-                let Some(character) = remaining.chars().next() else {
-                    break;
-                };
-                if emitted.saturating_add(1) > budget {
-                    return (translated, applied, true);
-                }
-                translated.push(character);
-                emitted = emitted.saturating_add(1);
-                previous = Some(character);
-                remaining = remaining.get(character.len_utf8()..).unwrap_or_default();
-            }
-        }
-    }
-
-    (translated, applied, false)
-}
-
-/// The marker the synthetic translation carries in front of the
-/// terminology-substituted text: the resolved language pair and the settings
-/// this translation honoured.
-///
-/// The settings are part of the output rather than merely echoed back, so
-/// `AppliedSettings` reports settings the translation really applied: a
-/// different `Settings` produces a different `TranslatedText`, and `Brevity`
-/// — which "reduces the length of the translation output" — produces a shorter
-/// one by dropping the pair and setting detail from the marker.
-fn marker(
-    source_language_code: &str,
-    target_language_code: &str,
-    settings: Option<&TranslationSettings>,
-) -> String {
-    let brevity = settings.and_then(|settings| settings.brevity.clone());
-    if brevity.is_some() {
-        return format!("[{SYNTHETIC_MARKER}:{target_language_code}] ");
-    }
-    let mut detail = format!("{source_language_code}->{target_language_code}");
-    for applied in [
-        settings.and_then(|settings| settings.formality.clone()),
-        settings.and_then(|settings| settings.profanity.clone()),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        detail.push(':');
-        detail.push_str(&applied);
-    }
-    format!("[{SYNTHETIC_MARKER}:{detail}] ")
-}
 
 /// The source language of `text`, for a request that asked for `auto`.
 ///
@@ -358,16 +237,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You can use one custom terminology resource in your translation
         // request."
         if requested_terminologies.len() > MAX_TERMINOLOGIES_PER_TRANSLATION {
-            return Err(TranslateTextErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(
-                        "The request that you made is not valid. Check your request to \
-                         determine why it's not valid and then retry the request."
-                            .to_string(),
-                    ),
-                },
-            )
-            .into());
+            return Err(
+                TranslateTextErrorModeled::InvalidRequestException(invalid_request()).into(),
+            );
         }
 
         // `auto` asks the service to determine the source language from the
@@ -394,36 +266,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let resolved = {
             let store = state.lock();
-            let mut resolved = Vec::new();
-            for name in &requested_terminologies {
-                let record = store.terminologies.get(name).ok_or_else(|| {
-                    TranslateTextErrorModeled::ResourceNotFoundException(terminology_not_found(
-                        TERMINOLOGY_RESOURCE,
-                        name,
-                    ))
-                })?;
-                let mut pairs: Vec<(String, String)> = record
-                    .term_pairs(&source_language_code, &target_language_code)
-                    .into_iter()
-                    .map(|(source, target)| (source.to_string(), target.to_string()))
-                    .collect();
-                // Longest source text first, so a phrase is substituted as a
-                // phrase rather than word by word.
-                pairs.sort_by(|left, right| {
-                    right.0.len().cmp(&left.0.len()).then(left.0.cmp(&right.0))
-                });
-                resolved.push(ResolvedTerminology {
-                    name: record.name.clone(),
-                    pairs,
-                });
-            }
-            resolved
+            resolve_terminologies(
+                &store,
+                &requested_terminologies,
+                &source_language_code,
+                &target_language_code,
+            )
+            .map_err(|name| {
+                TranslateTextErrorModeled::ResourceNotFoundException(terminology_not_found(
+                    TERMINOLOGY_RESOURCE,
+                    &name,
+                ))
+            })?
         };
 
         // The marker is part of the answer, so the substitution's own ceiling
         // is what is left of the modelled output length once it is accounted
         // for.
-        let marker = marker(
+        let marker = translation_marker(
             &source_language_code,
             &target_language_code,
             input.settings.as_ref(),

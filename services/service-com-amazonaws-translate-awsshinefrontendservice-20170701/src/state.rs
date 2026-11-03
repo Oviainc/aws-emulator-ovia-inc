@@ -11,7 +11,10 @@
 //!
 //! The shapes shared by those five operations live here rather than in one
 //! `ops/` file so two of them cannot report one stored terminology by different
-//! rules.
+//! rules. For the same reason the translation transform the two synchronous
+//! translate operations share — resolving a requested terminology, substituting
+//! its terms and marking the output as synthetic — lives here too, so `Text`
+//! and a document of the same text are translated by one rule.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -19,9 +22,10 @@ use std::time::SystemTime;
 use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    EncryptionKey, InvalidParameterValueException, ResourceNotFoundException, Tag, Term,
-    TerminologyDataLocation, TerminologyProperties, TextSizeLimitExceededException,
-    TooManyTagsException, UnsupportedLanguagePairException,
+    EncryptionKey, InvalidParameterValueException, InvalidRequestException,
+    LimitExceededException, ResourceNotFoundException, Tag, Term, TerminologyDataLocation,
+    TerminologyProperties, TextSizeLimitExceededException, TooManyTagsException,
+    TranslationSettings, UnsupportedLanguagePairException,
 };
 
 /// The ARN namespace this service stamps into every resource ARN: `translate`
@@ -667,4 +671,195 @@ pub fn applied_term(source_text: &str, target_text: &str) -> Term {
 /// only keeps the conversion total.
 pub fn counted(value: usize) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
+}
+
+/// The largest document one synchronous translation carries, in BYTES: "The
+/// document size must not exceed 100 KB" (`smithy_query
+/// shape=TranslateDocumentRequest member=Document`), which is also the length
+/// `DocumentContent` is modelled with (`length 0..102400`).
+pub const MAX_DOCUMENT_BYTES: usize = 100 * 1024;
+
+/// The `InvalidRequestException` a request this service cannot act on is
+/// refused with: the sentence the model documents for the error class
+/// (`smithy_query shape=InvalidRequestException`), for a request whose own
+/// members are each admissible but that asks for something the service does not
+/// do.
+pub fn invalid_request() -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(
+            "The request that you made is not valid. Check your request to determine why \
+             it's not valid and then retry the request."
+                .to_string(),
+        ),
+    }
+}
+
+/// The `LimitExceededException` a request whose document grew past what one
+/// synchronous translation carries is refused with: the sentence the model
+/// documents for the error class (`smithy_query shape=LimitExceededException`),
+/// since what was exceeded is a size limit on the request's own document.
+pub fn limit_exceeded() -> LimitExceededException {
+    LimitExceededException {
+        message: Some(
+            "The specified limit has been exceeded. Review your request and retry it with a \
+             quantity below the stated limit."
+                .to_string(),
+        ),
+    }
+}
+
+/// The marker a synthetic translation carries, so a caller can never mistake
+/// this emulator's output for a real translation. The target language is part of
+/// it, which is what makes the output differ per requested pair.
+const SYNTHETIC_MARKER: &str = "mt";
+
+/// The marker the synthetic translation carries in front of the
+/// terminology-substituted text: the resolved language pair and the settings
+/// this translation honoured.
+///
+/// The settings are part of the output rather than merely echoed back, so
+/// `AppliedSettings` reports settings the translation really applied: a
+/// different `Settings` produces a different translation, and `Brevity`
+/// — which "reduces the length of the translation output" — produces a shorter
+/// one by dropping the pair and setting detail from the marker.
+pub fn translation_marker(
+    source_language_code: &str,
+    target_language_code: &str,
+    settings: Option<&TranslationSettings>,
+) -> String {
+    let brevity = settings.and_then(|settings| settings.brevity.clone());
+    if brevity.is_some() {
+        return format!("[{SYNTHETIC_MARKER}:{target_language_code}] ");
+    }
+    let mut detail = format!("{source_language_code}->{target_language_code}");
+    for applied in [
+        settings.and_then(|settings| settings.formality.clone()),
+        settings.and_then(|settings| settings.profanity.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        detail.push(':');
+        detail.push_str(&applied);
+    }
+    format!("[{SYNTHETIC_MARKER}:{detail}] ")
+}
+
+/// One requested terminology, resolved against the store: the stored record's
+/// name and the `(source text, target text)` pairs it provides for this
+/// translation's language pair, longest source first so a longer phrase wins
+/// over a word inside it.
+pub struct ResolvedTerminology {
+    pub name: String,
+    pub pairs: Vec<(String, String)>,
+}
+
+/// Every terminology a translation request named, resolved against the store for
+/// one language pair.
+///
+/// `Err` carries the requested name this account holds no terminology under,
+/// which each translation operation reports through its own modelled
+/// not-found error.
+pub fn resolve_terminologies(
+    store: &ComAmazonawsTranslateAwsshinefrontendservice20170701State,
+    requested: &[String],
+    source_language_code: &str,
+    target_language_code: &str,
+) -> Result<Vec<ResolvedTerminology>, String> {
+    let mut resolved = Vec::new();
+    for name in requested {
+        let record = store
+            .terminologies
+            .get(name)
+            .ok_or_else(|| name.clone())?;
+        let mut pairs: Vec<(String, String)> = record
+            .term_pairs(source_language_code, target_language_code)
+            .into_iter()
+            .map(|(source, target)| (source.to_string(), target.to_string()))
+            .collect();
+        // Longest source text first, so a phrase is substituted as a phrase
+        // rather than word by word.
+        pairs.sort_by(|left, right| right.0.len().cmp(&left.0.len()).then(left.0.cmp(&right.0)));
+        resolved.push(ResolvedTerminology {
+            name: record.name.clone(),
+            pairs,
+        });
+    }
+    Ok(resolved)
+}
+
+/// Substitute every terminology term that occurs in `text` as a whole word, and
+/// report the pairs that matched in the order they first occur in the source
+/// text.
+///
+/// A term matches only at a word boundary, so a terminology for `hello` does not
+/// rewrite the middle of `othello`, and a multi-word phrase matches as a phrase.
+/// The scan is a single left-to-right pass over the text against at most one
+/// terminology's terms.
+///
+/// `budget` is how many characters the substituted text may still grow to.
+/// Substituting a term EMITS text rather than copying it, so without a ceiling
+/// a short request against long stored terms would build an arbitrarily long
+/// answer; the scan stops the moment the budget would be passed and reports
+/// that (the third value), which the calling operation refuses.
+pub fn substitute<'t>(
+    text: &str,
+    pairs: &'t [(String, String)],
+    budget: usize,
+) -> (String, Vec<(&'t str, &'t str)>, bool) {
+    let mut translated = String::new();
+    let mut emitted = 0usize;
+    let mut applied: Vec<(&'t str, &'t str)> = Vec::new();
+    let mut remaining = text;
+    let mut previous: Option<char> = None;
+
+    while !remaining.is_empty() {
+        let at_word_start = previous.is_none_or(|character| !character.is_alphanumeric());
+        let matched = if at_word_start {
+            pairs.iter().find_map(|(source, target)| {
+                let tail = remaining.strip_prefix(source.as_str())?;
+                let ends_word = tail
+                    .chars()
+                    .next()
+                    .is_none_or(|character| !character.is_alphanumeric());
+                (!source.is_empty() && ends_word).then_some((source.as_str(), target.as_str()))
+            })
+        } else {
+            None
+        };
+
+        match matched {
+            Some((source, target)) => {
+                let grows_by = target.chars().count();
+                if emitted.saturating_add(grows_by) > budget {
+                    return (translated, applied, true);
+                }
+                translated.push_str(target);
+                emitted = emitted.saturating_add(grows_by);
+                if !applied.iter().any(|(seen, _)| *seen == source)
+                    && applied.len() < MAX_APPLIED_TERMS
+                {
+                    applied.push((source, target));
+                }
+                // The boundary the NEXT match is judged against is the text
+                // that was emitted, which is the target term.
+                previous = target.chars().next_back();
+                remaining = remaining.get(source.len()..).unwrap_or_default();
+            }
+            None => {
+                let Some(character) = remaining.chars().next() else {
+                    break;
+                };
+                if emitted.saturating_add(1) > budget {
+                    return (translated, applied, true);
+                }
+                translated.push(character);
+                emitted = emitted.saturating_add(1);
+                previous = Some(character);
+                remaining = remaining.get(character.len_utf8()..).unwrap_or_default();
+            }
+        }
+    }
+
+    (translated, applied, false)
 }

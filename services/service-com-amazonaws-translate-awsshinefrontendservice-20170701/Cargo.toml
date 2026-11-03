@@ -33,8 +33,11 @@ csv = "1"
 # (src/ops/import_terminology.rs).
 quick-xml = "0.41"
 # Determines the source language of the text when TranslateText is asked for
-# `auto` (src/ops/translate_text.rs).
+# `auto` (src/ops/translate_text.rs, src/ops/translate_document.rs).
 whatlang = "0.18"
+# Reads and rewrites the Office Open XML package a Word document
+# TranslateDocument translates is (src/ops/translate_document.rs).
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

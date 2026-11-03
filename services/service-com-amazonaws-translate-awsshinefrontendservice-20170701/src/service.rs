@@ -46,7 +46,8 @@ use smithy_server_runtime::{
 use std::sync::Arc;
 
 use crate::state::{
-    text_size_limit_exceeded, DISPLAY_LANGUAGE_CODE_VALUE_SET, MAX_TEXT_BYTES,
+    limit_exceeded, text_size_limit_exceeded, DISPLAY_LANGUAGE_CODE_VALUE_SET, MAX_DOCUMENT_BYTES,
+    MAX_TEXT_BYTES,
 };
 
 /// The error code this service answers an input-constraint violation with when
@@ -58,6 +59,14 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// The error class the service answers a request whose text is larger than the
 /// documented limit with (`smithy_query operation=TranslateText`).
 const TEXT_SIZE_LIMIT_EXCEEDED: &str = "TextSizeLimitExceededException";
+
+/// The error class the service answers a request whose document is larger than
+/// the documented limit with (`smithy_query operation=TranslateDocument`).
+const LIMIT_EXCEEDED: &str = "LimitExceededException";
+
+/// The dotted path of the member carrying the content of the document one
+/// synchronous translation translates, as a refusal names it.
+const DOCUMENT_CONTENT_MEMBER_PATH: &str = "document.content";
 
 /// The dotted path of the member carrying the text one translation request
 /// translates, as a refusal names it.
@@ -89,6 +98,22 @@ fn oversize_text(violations: &[Violation]) -> Option<&Violation> {
         violation.path == TEXT_MEMBER_PATH
             && matches!(violation.kind, ViolationKind::MaxLength(max)
                 if usize::try_from(max).is_ok_and(|bound| bound == MAX_TEXT_BYTES))
+    })
+}
+
+/// The violation reporting that a request's document is larger than the
+/// documented limit allows, if any.
+///
+/// "The document size must not exceed 100 KB" is a limit of the operation, and
+/// the error class it names is the operation's own `LimitExceededException`
+/// rather than this service's generic input-constraint refusal — which is also
+/// the only class the model declares for it, since the document member's length
+/// bound states exactly that limit.
+fn oversize_document(violations: &[Violation]) -> Option<&Violation> {
+    violations.iter().find(|violation| {
+        violation.path == DOCUMENT_CONTENT_MEMBER_PATH
+            && matches!(violation.kind, ViolationKind::MaxLength(max)
+                if usize::try_from(max).is_ok_and(|bound| bound == MAX_DOCUMENT_BYTES))
     })
 }
 
@@ -206,11 +231,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this
         // service reword it.
         //
-        // Two classes are not this service's generic input-constraint refusal:
+        // Three classes are not this service's generic input-constraint refusal:
         //
         // - a translation request carrying more text than the service allows,
         //   which is a modelled size refusal of that operation and names its own
         //   error class, the limit and the size the request sent;
+        // - a document translation whose document is larger than the operation
+        //   allows, which is that operation's own modelled limit refusal;
         // - an out-of-enum value, whose accepted-value set this service states in
         //   its own order.
         //
@@ -225,6 +252,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             return Some(Refused {
                 code: TEXT_SIZE_LIMIT_EXCEEDED.to_string(),
                 message: text_size_limit_exceeded(bytes).message.unwrap_or_default(),
+            });
+        }
+        if oversize_document(violations).is_some() {
+            return Some(Refused {
+                code: LIMIT_EXCEEDED.to_string(),
+                message: limit_exceeded().message.unwrap_or_default(),
             });
         }
         Some(Refused {
