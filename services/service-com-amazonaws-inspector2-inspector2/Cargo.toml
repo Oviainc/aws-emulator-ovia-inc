@@ -24,6 +24,10 @@ tracing = { workspace = true }
 # Encodes/decodes the opaque `nextToken` cursors this service's paginated list
 # operations hand out.
 hex = { workspace = true }
+# `validation_message`: the shared home for how a service states the framework's boundary
+# refusal — the `@pattern` rendering and the clause that states no value — so this crate
+# does not spell either itself.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

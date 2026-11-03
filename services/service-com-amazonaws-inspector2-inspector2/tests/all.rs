@@ -21,6 +21,8 @@ mod encryption_key;
 mod filters_and_enablement;
 #[path = "all/finding_aggregations.rs"]
 mod finding_aggregations;
+#[path = "all/pattern_refusal_wording.rs"]
+mod pattern_refusal_wording;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/usage_totals.rs"]

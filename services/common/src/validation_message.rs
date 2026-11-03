@@ -60,6 +60,14 @@
 //! [`aws_validation_refusal_withholding`]; the clause, the envelope and every other
 //! requirement stay this module's and the framework's.
 //!
+//! A service whose recordings drop that half for a whole constraint CLASS instead — every
+//! `@pattern` requirement, say, whatever member broke it, because the requirement is the
+//! expression and not the one value that missed it — cannot state that as a set of member
+//! paths, since the same member states its value for one requirement and withholds it for
+//! another. It passes the decision to [`aws_validation_refusal_withholding_violations`],
+//! which asks it about the VIOLATION; that is the only difference between the two, and both
+//! run the one body below.
+//!
 //! One rendering here is not a sentence but an ORDER: [`in_sorted_enum_order`] states an
 //! enumerated type's value set lexicographically, which is how AWS lists it where a model
 //! declares its members in an order of its own. A service hands its violations through it
@@ -763,6 +771,27 @@ pub fn aws_validation_refusal_withholding(
     refusal: &Refusal,
     withholds_value: impl Fn(&str) -> bool,
 ) -> Option<Refused> {
+    stated_refusal(refusal, unanchored, |violation| {
+        withholds_value(&violation.path)
+    })
+}
+
+/// [`aws_validation_refusal_withholding`], with the clauses that state NO VALUE decided from
+/// the VIOLATION rather than from its member path.
+///
+/// A service needs this when its recordings show the value withheld for a whole CONSTRAINT
+/// CLASS — every `@pattern` requirement, say, whatever member broke it — which no set of
+/// member paths can express: the same member states its value for one requirement and
+/// withholds it for another, so the decision belongs to the violation and not to the path.
+/// `withholds_value` is asked about each violation as it will be STATED (its `@pattern`
+/// requirement already requoted), and everything else — which refusals are restated, the
+/// code, the envelope, the member paths, the `@pattern` rendering, the clause count's bound
+/// and every other requirement — is the same [`stated_refusal`] body every other entry point
+/// here runs, so a class-keyed choice cannot drift into a second envelope.
+pub fn aws_validation_refusal_withholding_violations(
+    refusal: &Refusal,
+    withholds_value: impl Fn(&Violation) -> bool,
+) -> Option<Refused> {
     stated_refusal(refusal, unanchored, withholds_value)
 }
 
@@ -779,7 +808,9 @@ pub fn aws_validation_refusal_withholding_with(
     quote_pattern: impl Fn(&str) -> String,
     withholds_value: impl Fn(&str) -> bool,
 ) -> Option<Refused> {
-    stated_refusal(refusal, quote_pattern, withholds_value)
+    stated_refusal(refusal, quote_pattern, |violation| {
+        withholds_value(&violation.path)
+    })
 }
 
 /// [`aws_validation_refusal`], with the `@pattern` rendering CHOSEN by the caller.
@@ -861,7 +892,12 @@ pub fn parameter_pattern_mismatch(member: &str, pattern: &str) -> String {
 /// The ONE body behind every entry point above: the framework's envelope over the
 /// framework's clauses, with the two renderings this module owns applied — the `@pattern`
 /// quoting the caller chose, and the value half dropped from a clause that states none (a
-/// collection's `@length`, or a member the caller withholds the value of).
+/// collection's `@length`, or a violation the caller withholds the value of).
+///
+/// `withholds_value` is asked about the violation rather than about its path, because the
+/// two things a service decides it by — which MEMBERS its model marks `@sensitive` and which
+/// constraint CLASSES its recordings state without a value — are both properties of the
+/// violation; the path-keyed entry points above pass the path out of it.
 ///
 /// LINEAR in the number of violations: each clause is decided BEFORE the envelope is
 /// rendered, so no clause is rewritten inside an already-rendered message (which would
@@ -870,7 +906,7 @@ pub fn parameter_pattern_mismatch(member: &str, pattern: &str) -> String {
 fn stated_refusal(
     refusal: &Refusal,
     quote_pattern: impl Fn(&str) -> String,
-    withholds_value: impl Fn(&str) -> bool,
+    withholds_value: impl Fn(&Violation) -> bool,
 ) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
@@ -881,7 +917,7 @@ fn stated_refusal(
     let clauses: Vec<String> = restated_violations(violations, &quote_pattern)
         .iter()
         .map(|violation| {
-            let stated = if withholds_value(&violation.path) {
+            let stated = if withholds_value(violation) {
                 valueless_clause(violation)
             } else {
                 collection_length_clause(violation)
@@ -1224,12 +1260,12 @@ fn envelope_over(clauses: &[String]) -> Option<String> {
 mod tests {
     use super::{
         aws_validation_refusal, aws_validation_refusal_over_elements, aws_validation_refusal_with,
-        aws_validation_refusal_withholding, aws_validation_refusal_withholding_with,
-        enum_value_not_found, envelope_over, float_value_text, in_float_value_rendering,
-        in_pattern_first_order, map_key_refusal, map_key_refusal_quoting,
-        parameter_pattern_refusal, pattern_mismatch, property_count_refusal,
-        quoting_the_submitted_collection, quoting_the_whole_submitted_value, string_too_long,
-        string_too_short,
+        aws_validation_refusal_withholding, aws_validation_refusal_withholding_violations,
+        aws_validation_refusal_withholding_with, enum_value_not_found, envelope_over,
+        float_value_text, in_float_value_rendering, in_pattern_first_order, map_key_refusal,
+        map_key_refusal_quoting, parameter_pattern_refusal, pattern_mismatch,
+        property_count_refusal, quoting_the_submitted_collection,
+        quoting_the_whole_submitted_value, string_too_long, string_too_short,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
@@ -1913,6 +1949,72 @@ mod tests {
             "expected {expected:?}, got {:?}",
             stated.message
         );
+    }
+
+    /// RULE: the value half is dropped for a whole CONSTRAINT CLASS when the caller decides
+    /// withholding from the violation — here the `@pattern` class — and every other class of
+    /// the same refusal, and the same member, keeps the framework's value half.
+    #[test]
+    fn a_withheld_class_states_no_value_for_that_class_alone() {
+        // The decision a service whose recordings state a pattern requirement over the
+        // expression alone passes: the CLASS, not the member.
+        let withholds = |violation: &Violation| matches!(violation.kind, ViolationKind::Pattern(_));
+        // (case, the violations, the message stated)
+        let rows: [(&str, Vec<Violation>, &str); 3] = [
+            (
+                "one member outside its pattern",
+                vec![violation(
+                    "name",
+                    ViolationKind::Pattern("^[a-z]+$".to_owned()),
+                    "A B",
+                )],
+                "1 validation error detected: Value at 'name' failed to satisfy constraint: \
+                 Member must satisfy regular expression pattern: [a-z]+",
+            ),
+            (
+                "another class keeps its value half",
+                vec![violation("name", ViolationKind::MinLength(4), "ab")],
+                "1 validation error detected: Value 'ab' at 'name' failed to satisfy \
+                 constraint: Member must have length greater than or equal to 4",
+            ),
+            (
+                "one member breaking both classes",
+                vec![
+                    violation("name", ViolationKind::MinLength(4), "A B"),
+                    violation("name", ViolationKind::Pattern("^[a-z]+$".to_owned()), "A B"),
+                ],
+                "2 validation errors detected: Value 'A B' at 'name' failed to satisfy \
+                 constraint: Member must have length greater than or equal to 4; Value at \
+                 'name' failed to satisfy constraint: Member must satisfy regular expression \
+                 pattern: [a-z]+",
+            ),
+        ];
+
+        for (case, violations, expected) in rows {
+            let refusal = Refusal::Invalid(violations);
+            let stated = aws_validation_refusal_withholding_violations(&refusal, withholds)
+                .expect("a constraint refusal is stated");
+            assert_eq!(
+                stated.code, "ValidationException",
+                "case {case:?}: unexpected code, got {:?}",
+                stated.code
+            );
+            assert_eq!(
+                stated.message, expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                stated.message
+            );
+        }
+
+        for (case, refusal) in [
+            ("an unauthenticated caller", Refusal::Unauthenticated),
+            ("no violation at all", Refusal::Invalid(Vec::new())),
+        ] {
+            assert!(
+                aws_validation_refusal_withholding_violations(&refusal, withholds).is_none(),
+                "case {case:?}: expected the framework's own wording"
+            );
+        }
     }
 
     /// RULE: the entry point that takes BOTH choices applies both — the caller's
