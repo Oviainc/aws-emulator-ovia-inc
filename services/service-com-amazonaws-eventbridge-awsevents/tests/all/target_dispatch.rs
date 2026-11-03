@@ -356,8 +356,42 @@ pub(crate) fn xml_text(xml: &str, tag: &str) -> Option<String> {
     Some(xml[start..end].to_string())
 }
 
-/// A queue called `name`; answers its url and the ARN a rule names it by.
+/// A queue called `name`, carrying the policy a rule's target needs
+/// ([`granting_events`]); answers its url and the ARN a rule names it by.
+///
+/// The grant is part of the PREREQUISITE because "for Lambda functions, Amazon SNS
+/// topics and Amazon SQS queues, EventBridge relies on resource-based policies"
+/// (`PutTargets`): a queue that has granted nothing receives nothing, which is the
+/// rule `tests/all/queue_target_policy_authorization.rs` is the suite for. The suites
+/// here are about what a delivery CARRIES and which targets it reaches, so their
+/// queues grant the send.
 pub(crate) async fn given_queue(emulator: &Emulator, name: &str) -> (String, String) {
+    given_queue_with_policy(emulator, name, Some(&granting_events)).await
+}
+
+/// The queue policy a rule's SQS target needs for EventBridge to deliver to it: the
+/// service principal allowed `sqs:SendMessage` on that queue, unconditionally.
+pub(crate) fn granting_events(queue_arn: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AllowEventBridge",
+            "Effect": "Allow",
+            "Principal": {"Service": SERVICE_PRINCIPAL},
+            "Action": "sqs:SendMessage",
+            "Resource": queue_arn,
+        }],
+    })
+    .to_string()
+}
+
+/// A queue called `name` carrying the document `policy` builds from the queue's own
+/// ARN, or none at all when `policy` is `None`; answers its url and that ARN.
+pub(crate) async fn given_queue_with_policy(
+    emulator: &Emulator,
+    name: &str,
+    policy: Option<&dyn Fn(&str) -> String>,
+) -> (String, String) {
     let (status, body) = sqs(emulator, "CreateQueue", &json!({ "QueueName": name })).await;
     assert_eq!(status, 200, "case {name}: CreateQueue answered {status} {body}");
     let url = body["QueueUrl"]
@@ -378,6 +412,18 @@ pub(crate) async fn given_queue(emulator: &Emulator, name: &str) -> (String, Str
         .as_str()
         .unwrap_or_else(|| panic!("case {name}: no QueueArn in {body}"))
         .to_string();
+    if let Some(policy) = policy {
+        let (status, body) = sqs(
+            emulator,
+            "SetQueueAttributes",
+            &json!({ "QueueUrl": url, "Attributes": { "Policy": policy(&arn) } }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name}: SetQueueAttributes answered {status} {body}"
+        );
+    }
     (url, arn)
 }
 

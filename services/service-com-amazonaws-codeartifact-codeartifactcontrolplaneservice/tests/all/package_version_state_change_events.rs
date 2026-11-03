@@ -243,7 +243,10 @@ async fn registry(
     parsed
 }
 
-/// An SQS queue, answering its url and the ARN a rule names it by.
+/// An SQS queue carrying the grant a rule's target needs — EventBridge makes the
+/// target's `sqs:SendMessage` as its own service principal and "relies on
+/// resource-based policies" for a queue (`PutTargets`), so a queue that has granted it
+/// nothing receives nothing — answering its url and the ARN a rule names it by.
 async fn queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, String) {
     let created = sqs(router, case, "CreateQueue", &json!({"QueueName": name})).await;
     let url = member(case, &created, "/QueueUrl");
@@ -255,6 +258,23 @@ async fn queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, 
     )
     .await;
     let arn = member(case, &attributes, "/Attributes/QueueArn");
+    let policy = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "events.amazonaws.com"},
+            "Action": "sqs:SendMessage",
+            "Resource": &arn,
+        }],
+    })
+    .to_string();
+    sqs(
+        router,
+        case,
+        "SetQueueAttributes",
+        &json!({"QueueUrl": &url, "Attributes": {"Policy": policy}}),
+    )
+    .await;
     (url, arn)
 }
 

@@ -282,6 +282,29 @@ impl Emulator {
             .as_str()
             .unwrap_or_else(|| panic!("expected a QueueArn, got {attributes}"))
             .to_string();
+        // The grant a rule's queue target needs: EventBridge makes that target's
+        // `sqs:SendMessage` as its own service principal and "relies on resource-based
+        // policies" for a queue (`PutTargets`), so a queue that has granted it nothing
+        // receives nothing. The helper asserts the write's own 200.
+        self.sqs(
+            "SetQueueAttributes",
+            &json!({
+                "QueueUrl": queue_url,
+                "Attributes": {
+                    "Policy": json!({
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Effect": "Allow",
+                            "Principal": {"Service": "events.amazonaws.com"},
+                            "Action": "sqs:SendMessage",
+                            "Resource": queue_arn,
+                        }],
+                    })
+                    .to_string(),
+                },
+            }),
+        )
+        .await;
         self.events(
             "PutRule",
             &json!({

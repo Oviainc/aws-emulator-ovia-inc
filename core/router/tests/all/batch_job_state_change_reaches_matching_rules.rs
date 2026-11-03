@@ -331,13 +331,6 @@ struct Row {
     /// detail type, built over the submitted job's queue ARN. `None` filters on the source
     /// and detail type alone.
     detail: Option<fn(&str) -> Value>,
-    /// Whether the two target queues carry a resource policy admitting EventBridge.
-    ///
-    /// It decides nothing about delivery HERE: this emulator does not evaluate a
-    /// resource-based policy, so the dimension is varied to pin that a policy a client
-    /// installs neither blocks a delivery nor is needed for one — not to assert what AWS
-    /// would do to a queue whose policy withholds `sqs:SendMessage` from EventBridge.
-    policy: bool,
     /// Whether the caller ends the job once it has come to rest.
     terminate: bool,
     /// The statuses the matching rule's queue must receive, sorted.
@@ -362,28 +355,24 @@ async fn every_job_state_change_reaches_the_rules_that_match_it_and_no_others() 
         Row {
             case: "the source and detail type alone",
             detail: None,
-            policy: false,
             terminate: false,
             expected: RESTING,
         },
         Row {
             case: "the job's queue inside the detail, behind a queue policy",
             detail: Some(|queue_arn| json!({"jobQueue": [queue_arn]})),
-            policy: true,
             terminate: false,
             expected: RESTING,
         },
         Row {
             case: "one status inside the detail",
             detail: Some(|_| json!({"status": ["RUNNABLE"]})),
-            policy: true,
             terminate: false,
             expected: RUNNABLE_ONLY,
         },
         Row {
             case: "a job the caller terminates",
             detail: Some(|queue_arn| json!({"jobQueue": [queue_arn]})),
-            policy: true,
             terminate: true,
             expected: TERMINATED,
         },
@@ -477,11 +466,16 @@ async fn every_job_state_change_reaches_the_rules_that_match_it_and_no_others() 
             &other_arn,
         )
         .await;
-        if row.policy {
-            admit_events(&router, case, &matching_url, &matching_arn, &matching_rule).await;
-            admit_events(&router, case, &other_url, &other_arn, &other_rule).await;
-        }
-
+        // The grant a rule's queue target needs: EventBridge makes that target's
+        // `sqs:SendMessage` as its own service principal and "relies on resource-based
+        // policies" for a queue (`PutTargets`), so a queue that has granted it nothing
+        // receives nothing. What a document WITHHOLDING it does is asserted where that
+        // rule lives, in
+        // `services/service-com-amazonaws-eventbridge-awsevents/tests/all/queue_target_policy_authorization.rs`;
+        // here it is a prerequisite, so every row admits EventBridge and what a row
+        // varies is the PATTERN alone.
+        admit_events(&router, case, &matching_url, &matching_arn, &matching_rule).await;
+        admit_events(&router, case, &other_url, &other_arn, &other_rule).await;
         let job_name = format!("job-{index}");
         let submitted = batch(
             &router,

@@ -34,7 +34,14 @@
 //! target's `RoleArn` it acts as that role, so a role it cannot assume or whose
 //! policies withhold the call is a delivery that fails: the event is sent to the
 //! target's dead-letter queue and counted on `FailedInvocations`, where one the
-//! target accepted is counted on `Invocations` — each per rule of its bus. What
+//! target accepted is counted on `Invocations` — each per rule of its bus. For
+//! the kinds AWS governs by the TARGET's own resource-based policy instead —
+//! "for Lambda functions, Amazon SNS topics and Amazon SQS queues, EventBridge
+//! relies on resource-based policies" — the call is made as this service's own
+//! principal, so that document alone decides the delivery and a target which has
+//! granted it nothing, or which denies it, receives nothing
+//! ([`crate::state::target_policy_admits`], read on a queue target and on a
+//! dead-letter queue by [`queue_delivery_refusal`]). What
 //! came of every handover is recorded in
 //! [`crate::state::ComAmazonawsEventbridgeAwseventsState::invocations`] (see
 //! [`deliver`]).
@@ -1569,9 +1576,10 @@ pub(crate) async fn deliver(
     // call, is a delivery that fails before the call is made. The decision is
     // taken with the IAM guard held only for as long as reading the role takes,
     // never across the invocation. For a kind whose invocation is governed by the
-    // target's own resource policy instead, the `RoleArn` is not what decides it,
-    // and nothing here refuses the delivery: this emulator does not evaluate a
-    // resource-based policy, so it has nothing to show against such a target.
+    // target's own resource policy instead, the `RoleArn` is not what decides it
+    // and this gate refuses nothing: that target's own document is what decides
+    // the delivery, where the invocation reads it (a queue's `Policy`, see
+    // [`queue_delivery_refusal`]).
     let role_arn = target
         .role_arn
         .as_deref()
@@ -1736,7 +1744,8 @@ async fn dead_letter_refusal(
     let dlq_region =
         ::service_common::arn::region_of(dead_letter_arn, SQS_ARN_NAMESPACE).unwrap_or(region);
     dead_letter(
-        ctx, clients, dlq_region, &queue, handover, body, code, message, retries,
+        ctx, clients, dlq_region, &queue, dead_letter_arn, handover, body, code, message,
+        retries,
     )
     .await;
 }
@@ -2217,8 +2226,18 @@ impl TargetKind {
                         "the target ARN names no queue".to_string(),
                     );
                 };
-                let mut request = clients
-                    .sqs(ctx, region)
+                // One client for both calls this delivery makes on the queue:
+                // the handle is a copy over the shared in-process transport, so
+                // it addresses the same endpoint the cached one does.
+                let client = clients.sqs(ctx, region).clone();
+                // The QUEUE's own policy decides this delivery before anything
+                // is enqueued ([`queue_delivery_refusal`]).
+                if let Some(refusal) =
+                    queue_delivery_refusal(&client, &queue, self.action(), arn, handover).await
+                {
+                    return refusal;
+                }
+                let mut request = client
                     .send_message()
                     .queue_url(queue)
                     .message_body(body);
@@ -2756,6 +2775,97 @@ async fn attempt_api_destination(
 /// (`MessageAttributeValue$DataType`: "String").
 const STRING_ATTRIBUTE_TYPE: &str = "String";
 
+/// Why the queue at `queue_url` does not accept this delivery, as the invocation
+/// outcome that records it — or `None` when its own policy permits it.
+///
+/// The rule AWS follows: "for Lambda functions, Amazon SNS topics and Amazon SQS
+/// queues, EventBridge relies on resource-based policies", and the call it makes
+/// on a queue is `sqs:SendMessage` as the service principal
+/// [`crate::state::SERVICE_PRINCIPAL`]. So the queue's OWN `Policy` attribute is
+/// the only document in force over this delivery, and what it states decides it
+/// ([`crate::state::target_policy_admits`]): nothing is enqueued without a grant
+/// for that principal, an explicit deny refuses whatever else is granted, and a
+/// grant scoped by `aws:SourceArn` authorizes the deliveries of the rule it names
+/// and no other. A refusal is the delivery FAILING rather than one nobody
+/// attempted, so it is dead-lettered and counted on `FailedInvocations` like any
+/// other failed invocation (see [`deliver`]), under the condition and sentence
+/// Amazon SQS's own refusal gives it
+/// ([`crate::state::queue_access_refusal`]).
+///
+/// The policy is read through the queue's own `GetQueueAttributes`, so what
+/// decides a delivery is the document a client's last write left on the queue —
+/// a policy just written grants the next delivery and one just cleared stops
+/// granting it. A queue that does not ANSWER that read decides nothing here:
+/// the `SendMessage` that follows reports what such a queue answers, which is
+/// the queue's own refusal rather than a verdict read off a policy this never
+/// saw.
+async fn queue_delivery_refusal(
+    client: &::aws_sdk_sqs::Client,
+    queue_url: &str,
+    action: &str,
+    resource: &str,
+    handover: &Handover<'_>,
+) -> Option<crate::state::InvocationOutcome> {
+    let policy = queue_policy(client, queue_url).await?;
+    let attempt = crate::state::DeliveryAttempt {
+        rule: handover.rule,
+        target_id: &handover.target.id,
+        action,
+        resource,
+    };
+    if crate::state::target_policy_admits(policy.as_deref(), &attempt, handover.rule_arn) {
+        return None;
+    }
+    ::tracing::warn!(
+        queue = %queue_url,
+        rule = %handover.rule,
+        %resource,
+        "an EventBridge delivery was withheld: the queue's own policy does not allow this \
+         service to send it a message"
+    );
+    let (code, message) = crate::state::queue_access_refusal();
+    Some(crate::state::InvocationOutcome::Failed { code, message })
+}
+
+/// What the queue at `queue_url` answered when its `Policy` attribute was read:
+/// `Some(Some(document))` for a queue carrying one, `Some(None)` for a queue
+/// that carries none, and `None` for a queue that did not answer the read at
+/// all.
+///
+/// The last case is told apart from the second because they mean different
+/// things for a delivery: a queue that answered and carries no policy has
+/// granted nothing, while a queue that did not answer is one nothing is known
+/// about (see [`queue_delivery_refusal`]).
+async fn queue_policy(
+    client: &::aws_sdk_sqs::Client,
+    queue_url: &str,
+) -> Option<Option<String>> {
+    let answered = client
+        .get_queue_attributes()
+        .queue_url(queue_url)
+        .attribute_names(::aws_sdk_sqs::types::QueueAttributeName::Policy)
+        .send()
+        .await;
+    match answered {
+        Ok(answer) => Some(
+            answer
+                .attributes()
+                .and_then(|attributes| {
+                    attributes.get(&::aws_sdk_sqs::types::QueueAttributeName::Policy)
+                })
+                .cloned(),
+        ),
+        Err(error) => {
+            ::tracing::warn!(
+                queue = %queue_url,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "an EventBridge target queue's policy could not be read"
+            );
+            None
+        }
+    }
+}
+
 /// Send one undeliverable event to the target's dead-letter queue.
 ///
 /// "EventBridge adds the following custom attributes to the dead-letter
@@ -2764,12 +2874,20 @@ const STRING_ATTRIBUTE_TYPE: &str = "String";
 /// which delivery failed and why without parsing the event. A delivery that was
 /// RETRIED also carries how many retries it made and, when the allowance is what
 /// stopped it, that condition.
+///
+/// The dead-letter write is the SAME `sqs:SendMessage` by the same service
+/// principal that a queue target's delivery is, so the dead-letter queue's own
+/// policy decides it the same way ([`queue_delivery_refusal`]): a queue that has
+/// granted this service nothing receives no dead letter either, and the event is
+/// dropped with that fact in the log rather than enqueued where AWS would not
+/// have enqueued it.
 #[allow(clippy::too_many_arguments)]
 async fn dead_letter(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     clients: &mut Clients,
     region: &str,
     queue: &str,
+    dead_letter_arn: &str,
     handover: &Handover<'_>,
     body: &str,
     code: &str,
@@ -2791,8 +2909,20 @@ async fn dead_letter(
             ));
         }
     }
-    let mut request = clients
-        .sqs(ctx, region)
+    let client = clients.sqs(ctx, region).clone();
+    if queue_delivery_refusal(
+        &client,
+        queue,
+        TargetKind::Queue.action(),
+        dead_letter_arn,
+        handover,
+    )
+    .await
+    .is_some()
+    {
+        return;
+    }
+    let mut request = client
         .send_message()
         .queue_url(queue)
         .message_body(body);

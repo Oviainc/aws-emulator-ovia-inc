@@ -106,7 +106,11 @@ async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value)
     rpc(emulator, "sqs", "AmazonSQS", "1.0", operation, body).await
 }
 
-/// A queue called `name`; answers its url and the ARN a rule names it by.
+/// A queue called `name`, carrying the policy a rule's target needs: EventBridge
+/// "relies on resource-based policies" for a queue (`PutTargets`), so one that has
+/// granted the service nothing receives nothing — the rule
+/// `tests/all/queue_target_policy_authorization.rs` is the suite for. Answers its url
+/// and the ARN a rule names it by.
 async fn given_queue(emulator: &Emulator, case: &str, name: &str) -> (String, String) {
     let (status, body) = sqs(emulator, "CreateQueue", &json!({ "QueueName": name })).await;
     assert_eq!(
@@ -131,6 +135,19 @@ async fn given_queue(emulator: &Emulator, case: &str, name: &str) -> (String, St
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected a QueueArn, got {body}"))
         .to_string();
+    let (status, body) = sqs(
+        emulator,
+        "SetQueueAttributes",
+        &json!({
+            "QueueUrl": url,
+            "Attributes": { "Policy": crate::target_dispatch::granting_events(&arn) },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected SetQueueAttributes to answer 200, got {status} {body}"
+    );
     (url, arn)
 }
 

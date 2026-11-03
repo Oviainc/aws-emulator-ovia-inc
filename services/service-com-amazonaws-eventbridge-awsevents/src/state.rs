@@ -3928,6 +3928,141 @@ pub fn publication_refusal(
     ))
 }
 
+/// The condition key naming the resource a cross-service call was made ON BEHALF
+/// OF — the rule whose target is being invoked — which is what a target's own
+/// resource policy scopes its grant to.
+pub const SOURCE_ARN_CONDITION_KEY: &str = "aws:SourceArn";
+
+/// The condition key naming the ACCOUNT that resource belongs to.
+pub const SOURCE_ACCOUNT_CONDITION_KEY: &str = "aws:SourceAccount";
+
+/// Every condition key ONE target invocation carries a value for.
+///
+/// They are DECLARED on the request
+/// ([`::service_common::iam_authorization::Request::with_published_keys`]),
+/// because this invocation knows each of them exactly: a statement asking
+/// whether one is PRESENT — rather than what it equals — is therefore decided
+/// rather than left undecided.
+const TARGET_INVOCATION_CONDITION_KEYS: [&str; 2] =
+    [SOURCE_ARN_CONDITION_KEY, SOURCE_ACCOUNT_CONDITION_KEY];
+
+/// The condition context ONE invocation of a rule's target carries: the ARN of
+/// the rule the invocation is made for, and the account that rule belongs to.
+///
+/// The account is the RULE's own, read off its ARN through the one shared parse,
+/// so a rule of another account is reported under that account rather than under
+/// this emulator's.
+fn target_invocation_condition_context(rule_arn: &str) -> Vec<(String, String)> {
+    let account = ::service_common::arn::parse(rule_arn)
+        .map(|arn| arn.account.to_string())
+        .unwrap_or_default();
+    vec![
+        (SOURCE_ARN_CONDITION_KEY.to_string(), rule_arn.to_string()),
+        (SOURCE_ACCOUNT_CONDITION_KEY.to_string(), account),
+    ]
+}
+
+/// Whether the TARGET whose own resource policy is `policy` admits the invocation
+/// `attempt` describes.
+///
+/// "For Lambda functions, Amazon SNS topics and Amazon SQS queues, EventBridge
+/// relies on resource-based policies": such a target is invoked as this
+/// service's own principal ([`SERVICE_PRINCIPAL`]) rather than as the target
+/// owner or as a role, and a service principal holds no identity-based policies
+/// — so the TARGET's document is the only one in force and it alone decides the
+/// invocation. In IAM's own order: an explicit `Deny` about the invocation
+/// refuses it whatever any grant says, and otherwise the invocation needs an
+/// `Allow` about it — a target carrying no policy at all, or one whose
+/// statements are about something else, has granted nothing, which is IAM's
+/// implicit deny. That is the opposite reading from a bus's own policy
+/// ([`publication_refusal`]), where the publisher is an identity whose own
+/// documents may grant the call; here there is no second document to grant it.
+///
+/// The decision carries the keys such a grant is scoped by
+/// ([`target_invocation_condition_context`]), so a statement conditioned on the
+/// invoking rule is decided for the rule being invoked and no other: a grant
+/// scoped to one rule's ARN authorizes that rule's deliveries alone.
+///
+/// WHICH of the two refusals it was is deliberately not answered: the target's
+/// service does not tell EventBridge either, and what EventBridge reports for a
+/// delivery it could not make is the answer that service gave it (see
+/// [`queue_access_refusal`]).
+pub fn target_policy_admits(
+    policy: Option<&str>,
+    attempt: &DeliveryAttempt<'_>,
+    rule_arn: &str,
+) -> bool {
+    let (action, resource) = (attempt.action, attempt.resource);
+    let principals = [SERVICE_PRINCIPAL.to_string()];
+    let context = target_invocation_condition_context(rule_arn);
+    let request = ::service_common::iam_authorization::Request::new(action, resource, &principals)
+        .with_context(&context)
+        .with_published_keys(&TARGET_INVOCATION_CONDITION_KEYS);
+    policy.is_some_and(|document| {
+        ::service_common::iam_authorization::resource_decision(document, &request)
+            == ::service_common::iam_authorization::Decision::Allowed
+    })
+}
+
+/// The condition EventBridge reports for a delivery whose target was not there
+/// for it to hand the event to.
+///
+/// Distinct from [`NO_PERMISSIONS`], which is about the identity the call was
+/// made as: this one is about the RESOURCE, and it is what a target service
+/// answering "no such resource" earns — including a target whose own policy
+/// withholds the call from this service, because the service answers a caller it
+/// has granted nothing exactly as it answers one naming a resource that is not
+/// there.
+pub const NO_RESOURCE: &str = "NO_RESOURCE";
+
+/// The fixed text Amazon SQS answers a caller that may not address the queue it
+/// named — which is also what it answers one naming a queue that is not there,
+/// so neither tells the caller which it was.
+///
+/// NOT the same sentence as that service's own `QueueDoesNotExist` payload
+/// (`service-com-amazonaws-sqs-amazonsqs`'s `state::QUEUE_DOES_NOT_EXIST_MESSAGE`,
+/// "The specified queue does not exist."): this is the answer as the caller of
+/// `sqs:SendMessage` reads it, which is what a dead-lettered EventBridge delivery
+/// reports. The two are deliberately distinct and neither follows the other.
+const QUEUE_INACCESSIBLE_MESSAGE: &str =
+    "The specified queue does not exist or you do not have access to it.";
+
+/// The error code that answer carries, as Amazon SQS publishes it for the
+/// condition (its model's `awsQueryError` code for `QueueDoesNotExist`).
+const QUEUE_INACCESSIBLE_ERROR_CODE: &str = "AWS.SimpleQueueService.NonExistentQueue";
+
+/// The HTTP status that answer carries.
+const QUEUE_INACCESSIBLE_STATUS: u16 = 400;
+
+/// The condition and the sentence EventBridge reports for a queue target it could
+/// not hand an event to, because the queue granted this service nothing.
+///
+/// The queue's own policy is what governs the delivery
+/// ([`target_policy_admits`]), and what the delivery SEES when that document
+/// grants nothing is Amazon SQS's own refusal of the `sqs:SendMessage` — the
+/// sentence that service answers for a queue the caller may not address. So the
+/// condition names the resource rather than the permission ([`NO_RESOURCE`]) and
+/// the message is that answer as the caller read it: the service, the status, the
+/// error code and the id of the refused request.
+///
+/// The request id is MINTED here and nowhere else: it identifies the one refused
+/// call, so it is drawn fresh rather than derived from the event or the target,
+/// which is what makes two refused deliveries distinguishable in a dead-letter
+/// queue. It comes from the tree's one mint of an AWS request id
+/// (`::service_common::query_error_envelope::new_request_id`), so this service
+/// cannot report one in a form no other service reports.
+pub fn queue_access_refusal() -> (String, String) {
+    let request_id = ::service_common::query_error_envelope::new_request_id();
+    (
+        NO_RESOURCE.to_string(),
+        format!(
+            "{QUEUE_INACCESSIBLE_MESSAGE} (Service: AmazonSQS; Status Code: \
+             {QUEUE_INACCESSIBLE_STATUS}; Error Code: {QUEUE_INACCESSIBLE_ERROR_CODE}; Request \
+             ID: {request_id}; Proxy: null)"
+        ),
+    )
+}
+
 /// The IAM action publishing an event onto an event bus performs — the action an
 /// event bus's resource policy grants or denies a publisher, and the one
 /// `PutPermission` installs a grant for.

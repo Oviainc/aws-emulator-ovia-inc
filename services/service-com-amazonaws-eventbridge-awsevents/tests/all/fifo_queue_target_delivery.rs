@@ -50,7 +50,11 @@ const FIFO_SUFFIX: &str = ".fifo";
 /// Create the queue `name`, as a FIFO queue when `fifo`, and answer its url and ARN.
 ///
 /// A FIFO queue is created with `ContentBasedDeduplication` enabled, which is the
-/// prerequisite `Target$SqsParameters` documents for a queue named as a target.
+/// prerequisite `Target$SqsParameters` documents for a queue named as a target, and
+/// with the policy a rule's target needs: EventBridge "relies on resource-based
+/// policies" for a queue (`PutTargets`), so one that has granted the service nothing
+/// receives nothing — the rule
+/// `tests/all/queue_target_policy_authorization.rs` is the suite for.
 async fn given_queue(emulator: &Emulator, case: &str, name: &str, fifo: bool) -> (String, String) {
     let attributes = if fifo {
         json!({ "FifoQueue": "true", "ContentBasedDeduplication": "true" })
@@ -72,6 +76,19 @@ async fn given_queue(emulator: &Emulator, case: &str, name: &str, fifo: bool) ->
         .unwrap_or_else(|| panic!("case {case:?}: no QueueUrl in {body}"))
         .to_string();
     let arn = format!("arn:aws:sqs:{REGION}:{}:{name}", engine::emulator_account_id());
+    let (status, body) = sqs(
+        emulator,
+        "SetQueueAttributes",
+        &json!({
+            "QueueUrl": url,
+            "Attributes": { "Policy": crate::target_dispatch::granting_events(&arn) },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: SetQueueAttributes {name} answered {status} {body}"
+    );
     (url, arn)
 }
 

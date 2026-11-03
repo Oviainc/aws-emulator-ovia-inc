@@ -487,13 +487,47 @@ impl Emulator {
         }
     }
 
-    /// Create the queue named `name` and answer its url.
+    /// Create the queue named `name`, carrying the grant a rule's target needs —
+    /// EventBridge makes that target's `sqs:SendMessage` as its own service principal
+    /// and "relies on resource-based policies" for a queue (`PutTargets`), so a queue
+    /// that has granted it nothing receives nothing — and answer its url. Each call
+    /// below goes through [`Emulator::sqs`], which asserts its own 200.
     pub(crate) async fn create_queue(&self, name: &str) -> String {
         let created = self.sqs("CreateQueue", &json!({ "QueueName": name })).await;
-        created["QueueUrl"]
+        let url = created["QueueUrl"]
             .as_str()
             .unwrap_or_else(|| panic!("CreateQueue must answer a QueueUrl, got {created}"))
-            .to_string()
+            .to_string();
+        let attributes = self
+            .sqs(
+                "GetQueueAttributes",
+                &json!({ "QueueUrl": url, "AttributeNames": ["QueueArn"] }),
+            )
+            .await;
+        let arn = attributes["Attributes"]["QueueArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("GetQueueAttributes must answer a QueueArn, got {attributes}"))
+            .to_string();
+        self.sqs(
+            "SetQueueAttributes",
+            &json!({
+                "QueueUrl": url,
+                "Attributes": {
+                    "Policy": json!({
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Effect": "Allow",
+                            "Principal": {"Service": "events.amazonaws.com"},
+                            "Action": "sqs:SendMessage",
+                            "Resource": arn,
+                        }],
+                    })
+                    .to_string(),
+                },
+            }),
+        )
+        .await;
+        url
     }
 
     /// The url SQS addresses the queue `arn` names, read from SQS itself rather than

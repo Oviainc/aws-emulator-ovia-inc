@@ -1,18 +1,10 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: events__lambda__sqs.eventbridge-sqs-target-without-queue-policy-no-delivery events__lambda__sqs.sqs-queue-policy-explicit-deny-blocks-eventbridge-delivery events__lambda__sqs.eventbridge-sqs-queue-policy-wrong-principal-blocks-delivery events__lambda__sqs.eventbridge-sqs-target-arn-must-match-queue-arn events__lambda__sqs.cli-sqs-missing-queue-policy-put-targets-succeeds-but-no-delivery events__lambda__sqs.cli-update-sqs-queue-policy-enables-eventbridge-delivery events__lambda__sqs.cfn-deploy-eventbridge-rule-missing-sqs-policy-no-delivery events__lambda__sqs.eventbridge-event-envelope-format-to-lambda events__lambda__sqs.eventbridge-lambda-sourcearn-condition-arn-resolution events__lambda__sqs.eventbridge-multiple-rules-single-event-fanout events__lambda__sqs.eventbridge-sqs-target-missing-queue-policy-dlq events__lambda__sqs.cli-eventbridge-remove-targets-stops-delivery-negative events__lambda__sqs.cli-lambda-add-permission-for-eventbridge-invoke events__lambda__sqs.cli-put-rule-put-targets-lambda-sqs-fanout events__lambda__sqs.eventbridge-fanout-lambda-and-sqs events__lambda__sqs.eventbridge-lambda-target-missing-permission-dlq events__lambda__sqs.eventbridge-lambda-target-without-resource-policy-no-invoke events__lambda__sqs.eventbridge-rule-dlq-on-failed-lambda-invoke events__lambda__sqs.eventbridge-rule-input-transformer-reshapes-lambda-payload events__lambda__sqs.eventbridge-rule-sqs-lambda-nested-detail-survives-to-dynamodb events__lambda__sqs.eventbridge-schedule-expression-triggers-lambda events__lambda__sqs.eventbridge-to-lambda-to-sqs-chain events__lambda__sqs.events-delivery-and-failure-deleted-lambda-target-dead-letters-as-no-permissions events__lambda__sqs.cli-create-event-source-mapping-sqs-lambda events__lambda__sqs.cli-delete-event-source-mapping-stops-polling events__lambda__sqs.lambda-esm-dlq-on-repeated-failure events__lambda__sqs.lambda-sqs-partial-batch-failure-reporting events__lambda__sqs.sqs-esm-batch-size-controls-invocation-count events__lambda__sqs.sqs-esm-disabled-mapping-stops-delivery events__lambda__sqs.sqs-esm-partial-batch-failure-retries-only-failed events__lambda__sqs.sqs-fifo-esm-preserves-message-group-order events__lambda__sqs.sqs-lambda-event-source-mapping-basic events__lambda__sqs.sqs-to-lambda-event-source-mapping events__lambda__sqs.lambda-role-missing-sqs-permissions-blocks-poll events__lambda__sqs.lambda-without-sqs-permission-esm-creation-fails events__lambda__sqs.sqs-lambda-event-source-mapping-missing-role-permission-rejected events__lambda__sqs.sqs-esm-dlq-redrive-after-max-receive events__lambda__sqs.xsvc-lambda-1-durable-execution-timeout-emits-timed-out-status-change-to-sqs events__lambda__sqs.xsvc-lambda-1-durable-failed-status-rule-rejects-succeeded-executions events__lambda__sqs.cfn-deploy-eventbridge-rule-lambda-target
-Issue-Key: events__lambda__sqs.eventbridge-sqs-target-without-queue-policy-no-delivery|run#19|AssertionError|assert leaked == [], (
-Issue-Key: events__lambda__sqs.sqs-queue-policy-explicit-deny-blocks-eventbridge-delivery|run#23|AssertionError|assert denied is None, "Explicit Deny must not be overridden by the Allow statement"
-Issue-Key: events__lambda__sqs.eventbridge-sqs-queue-policy-wrong-principal-blocks-delivery|run#10|AssertionError|assert dropped == [], f"message delivered despite wrong queue-policy principal: {dropped}"
-Issue-Key: events__lambda__sqs.eventbridge-sqs-target-arn-must-match-queue-arn|run#23|AssertionError|assert leaked == [], f"rule B delivered despite SourceArn policy mismatch: {leaked}"
-Issue-Key: events__lambda__sqs.cli-sqs-missing-queue-policy-put-targets-succeeds-but-no-delivery|run#22|AssertionError|assert delivered_without_policy is None, "event was delivered to a queue that lacked a permissive queue policy"
-Issue-Key: events__lambda__sqs.cli-update-sqs-queue-policy-enables-eventbridge-delivery|run#13|AssertionError|assert before is None, "message delivered to SQS target despite missing queue policy"
-Issue-Key: events__lambda__sqs.cfn-deploy-eventbridge-rule-missing-sqs-policy-no-delivery|run#12|AssertionError|assert delivered is None, f"event was unexpectedly delivered without a queue policy: {delivered}"
+Issue-Trace-Ids: events__lambda__sqs.eventbridge-event-envelope-format-to-lambda events__lambda__sqs.eventbridge-lambda-sourcearn-condition-arn-resolution events__lambda__sqs.eventbridge-multiple-rules-single-event-fanout events__lambda__sqs.cli-eventbridge-remove-targets-stops-delivery-negative events__lambda__sqs.cli-lambda-add-permission-for-eventbridge-invoke events__lambda__sqs.cli-put-rule-put-targets-lambda-sqs-fanout events__lambda__sqs.eventbridge-fanout-lambda-and-sqs events__lambda__sqs.eventbridge-lambda-target-missing-permission-dlq events__lambda__sqs.eventbridge-lambda-target-without-resource-policy-no-invoke events__lambda__sqs.eventbridge-rule-dlq-on-failed-lambda-invoke events__lambda__sqs.eventbridge-rule-input-transformer-reshapes-lambda-payload events__lambda__sqs.eventbridge-rule-sqs-lambda-nested-detail-survives-to-dynamodb events__lambda__sqs.eventbridge-schedule-expression-triggers-lambda events__lambda__sqs.eventbridge-to-lambda-to-sqs-chain events__lambda__sqs.events-delivery-and-failure-deleted-lambda-target-dead-letters-as-no-permissions events__lambda__sqs.cli-create-event-source-mapping-sqs-lambda events__lambda__sqs.cli-delete-event-source-mapping-stops-polling events__lambda__sqs.lambda-esm-dlq-on-repeated-failure events__lambda__sqs.lambda-sqs-partial-batch-failure-reporting events__lambda__sqs.sqs-esm-batch-size-controls-invocation-count events__lambda__sqs.sqs-esm-disabled-mapping-stops-delivery events__lambda__sqs.sqs-esm-partial-batch-failure-retries-only-failed events__lambda__sqs.sqs-fifo-esm-preserves-message-group-order events__lambda__sqs.sqs-lambda-event-source-mapping-basic events__lambda__sqs.sqs-to-lambda-event-source-mapping events__lambda__sqs.lambda-role-missing-sqs-permissions-blocks-poll events__lambda__sqs.lambda-without-sqs-permission-esm-creation-fails events__lambda__sqs.sqs-lambda-event-source-mapping-missing-role-permission-rejected events__lambda__sqs.sqs-esm-dlq-redrive-after-max-receive events__lambda__sqs.xsvc-lambda-1-durable-execution-timeout-emits-timed-out-status-change-to-sqs events__lambda__sqs.xsvc-lambda-1-durable-failed-status-rule-rejects-succeeded-executions events__lambda__sqs.cfn-deploy-eventbridge-rule-lambda-target
 Issue-Key: events__lambda__sqs.eventbridge-event-envelope-format-to-lambda|_reemit_until_delivered#13|AssertionError|raise AssertionError(
 Issue-Key: events__lambda__sqs.eventbridge-lambda-sourcearn-condition-arn-resolution|_reemit_until_delivered#17|AssertionError|raise AssertionError(
 Issue-Key: events__lambda__sqs.eventbridge-multiple-rules-single-event-fanout|_emit_until_delivered#11|AssertionError|raise AssertionError(f"event never delivered to: {missing} after {attempts} attempts")
-Issue-Key: events__lambda__sqs.eventbridge-sqs-target-missing-queue-policy-dlq|_drain#15|Timeout|resp = sqs.receive_message(
 Issue-Key: events__lambda__sqs.cli-eventbridge-remove-targets-stops-delivery-negative|_drain_queue_for#16|Timeout|resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=5)
 Issue-Key: events__lambda__sqs.cli-lambda-add-permission-for-eventbridge-invoke|_drain_queue_for#19|Timeout|resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=5)
 Issue-Key: events__lambda__sqs.cli-put-rule-put-targets-lambda-sqs-fanout|_drain_queue_for#18|Timeout|resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=5)
@@ -44,29 +36,54 @@ Issue-Key: events__lambda__sqs.xsvc-lambda-1-durable-failed-status-rule-rejects-
 Issue-Key: events__lambda__sqs|GetPolicy|ResourceNotFoundException
 Issue-Commit: b1cd28f1ca277d6a032df605f83af5017e934043
 
-# events/lambda/sqs: EventBridge SQS targets ignore the queue policy (including explicit Deny), Lambda targets and SQS ESMs never fire, ESM role validation is absent, and DLQ redrive counts wrong (8 causes)
+# events/lambda/sqs: EventBridge Lambda targets and SQS event source mappings never fire, ESM role validation is absent, and DLQ redrive counts wrong (7 causes)
 
-> _Note: this issue was identified against the code base at commit `b1cd28f1ca277d6a032df605f83af5017e934043`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+> _These are the seven still-open causes of
+> `20261029T182228Z-events-lambda-sqs-eventbridge-sqs-targets-ignore-the.md`, re-filed under
+> their own name when the eighth (cause 1 of that bundle — an EventBridge SQS target ignoring
+> the queue's resource policy) was fixed and its report moved to `issues/things-that-now-work/`.
+> Thirty of that bundle's forty checks still fail, and they are the ones below. The cause
+> numbering is kept as it was filed so the evidence lines up._
+>
+> _Note: the bundle was identified against the code base at commit
+> `b1cd28f1ca277d6a032df605f83af5017e934043`. The code base has drifted since, so trace each
+> cause back to the current code before changing anything._
 
 ## Operation
 PutTargets
 
 ## Description
-Eight root causes. 20261025T084539Z-events-lambda-sqs-an-eventbridge-rule-s-target.md, 20261025T002357Z-events-lambda-sqs-eventbridge-lambda-targets-and-sqs-event-source-mappings.md, 20261025T022656Z-events-lambda-sqs-a-fifo-queue-event-source.md, 20261027T191349Z-events-lambda-sqs-lambda-durable-execution-status-change-events-are-never.md and 20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md own other checks in this service; none of the checks below were bound to them.
 
-Cause 1 of 8: EventBridge delivers to an SQS target regardless of the queue's resource policy — including when the policy explicitly Denies, names a different principal, or scopes aws:SourceArn to a different rule.
-AWS: EventBridge calls sqs:SendMessage as the service principal events.amazonaws.com. With no matching Allow, with an explicit Deny, with a different principal, or with an aws:SourceArn condition that does not equal the invoking rule's ARN, the call is refused: nothing is enqueued. An explicit Deny always wins over an Allow.
-Emulator: the message is enqueued in every one of those states. "AssertionError: SQS must not receive messages without a queue policy grant, got [...]", "AssertionError: Explicit Deny must not be overridden by the Allow statement", "AssertionError: message delivered despite wrong queue-policy principal", "AssertionError: rule B delivered despite SourceArn policy mismatch". The requirement is zero messages; the message ids and bodies in the recordings are per-run values.
-Why: the emulator fabricates deliveries AWS refuses, and it ignores an explicit Deny — the mechanism clients use as a hard kill switch and as the basis of data-boundary controls. A cross-tenant leak that AWS would block passes here.
-Fix: resource-policy authorization (including explicit-Deny precedence and aws:SourceArn condition evaluation) in the EventBridge SQS-target invoker.
-Traces: events__lambda__sqs.eventbridge-sqs-target-without-queue-policy-no-delivery, events__lambda__sqs.sqs-queue-policy-explicit-deny-blocks-eventbridge-delivery, events__lambda__sqs.eventbridge-sqs-queue-policy-wrong-principal-blocks-delivery, events__lambda__sqs.eventbridge-sqs-target-arn-must-match-queue-arn, events__lambda__sqs.cli-sqs-missing-queue-policy-put-targets-succeeds-but-no-delivery, events__lambda__sqs.cli-update-sqs-queue-policy-enables-eventbridge-delivery, events__lambda__sqs.cfn-deploy-eventbridge-rule-missing-sqs-policy-no-delivery
+Seven root causes. 20261025T084539Z-events-lambda-sqs-an-eventbridge-rule-s-target.md, 20261025T002357Z-events-lambda-sqs-eventbridge-lambda-targets-and-sqs-event-source-mappings.md, 20261025T022656Z-events-lambda-sqs-a-fifo-queue-event-source.md, 20261027T191349Z-events-lambda-sqs-lambda-durable-execution-status-change-events-are-never.md and 20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md own other checks in this service; none of the checks below were bound to them.
 
-Cause 2 of 8: in other configurations the same SQS target never receives anything at all.
+**What blocks most of them.** Causes 2, 3, 4, 6 and 7 all wait on a Lambda function RUNNING its
+deployment package: every one of their checks asserts on a queue that the function under test
+writes to, and
+`services/service-com-amazonaws-lambda-awsgirapiservice/src/ops/invoke.rs` states in its own
+header that "running the deployment package is NOT implemented: this emulator has no in-process
+runtime for a Lambda zip archive or container image". That engine is the subject of
+`20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md` and
+`20261024T055421Z-lambda-opensearch-s3-lambda-invoke-cannot-execute-a-deployment-package-so.md`,
+and nothing below can be observed until one of them lands.
+
+**A related gap, already fixed for one target kind.** EventBridge now authorizes a QUEUE
+target's delivery against that queue's own resource policy
+(`service-com-amazonaws-eventbridge-awsevents`: `state::target_policy_admits`,
+`ops::put_events::queue_delivery_refusal`). "For Lambda functions, Amazon SNS topics and Amazon
+SQS queues, EventBridge relies on resource-based policies" (`PutTargets`), so the same decision
+is owed by a Lambda function target and an SNS topic target — filed as
+`20261029T182228Z-events-iam-lambda-sqs-an-eventbridge-rule-with-no-lambda-invokefunction-grant.md`
+and `20261029T182228Z-events-lambda-sns-eventbridge-publishes-to-sns-topics-with-no-topic....md`.
+`state::target_policy_admits` takes the attempt's action and resource, so those invokers reuse it
+rather than restating the rule. Cause 3's negative checks (a Lambda target with no resource
+policy, and the dead letter that records one) need both that gate and the execution engine.
+
+Cause 2 of 8 (the dead-letter trace of this cause now passes; the three lambda-to-SQS chains remain): in other configurations the same SQS target never receives anything at all.
 AWS: a matching event reaches every SQS target of every matching rule exactly once.
-Emulator: "AssertionError: event never delivered to <queue url> after 8 attempts of 6.0s each" and "AssertionError: event never delivered to: ['<queue url>'] after 15 attempts" — the queue URL is a per-run value; the requirement is one message per matched rule.
-Why: delivery is not merely unauthorized-but-permissive, it is also unreliable: the same surface both over-delivers (cause 1) and under-delivers, so no client can reason about it.
+Emulator: "AssertionError: event never delivered to <queue url> after 8 attempts of 6.0s each" and "AssertionError: event never delivered to: ['<queue url>'] after 15 attempts" — the queue URL is a per-run value; the requirement is one message per matched rule. The three remaining traces are lambda-to-SQS chains: the queue they read is one the invoked FUNCTION writes to, so they wait on the execution engine rather than on the rule dispatcher.
+Why: delivery is not merely unauthorized-but-permissive, it is also unreliable: the same surface both over-delivers and under-delivers, so no client can reason about it.
 Fix: the EventBridge rule dispatcher's SQS-target invoker and its multi-rule fan-out loop.
-Traces: events__lambda__sqs.eventbridge-event-envelope-format-to-lambda, events__lambda__sqs.eventbridge-lambda-sourcearn-condition-arn-resolution, events__lambda__sqs.eventbridge-multiple-rules-single-event-fanout, events__lambda__sqs.eventbridge-sqs-target-missing-queue-policy-dlq
+Traces: events__lambda__sqs.eventbridge-event-envelope-format-to-lambda, events__lambda__sqs.eventbridge-lambda-sourcearn-condition-arn-resolution, events__lambda__sqs.eventbridge-multiple-rules-single-event-fanout
 
 Cause 3 of 8: an EventBridge rule never invokes its Lambda target, on a pattern or on a schedule.
 AWS: a matching PutEvents, or a ScheduleExpression firing, invokes each Lambda target once with the envelope (or the InputTransformer rendering); RemoveTargets stops it; a target lacking the resource-policy grant is dead-lettered with ERROR_CODE naming the permission failure.
@@ -86,14 +103,14 @@ Cause 5 of 8: CreateEventSourceMapping accepts an execution role with no SQS per
 AWS: the call is refused with HTTP 400 InvalidParameterValueException, message of the fixed form "The provided execution role does not have permissions to call ReceiveMessage on SQS".
 Emulator: the call returns HTTP 202 with a UUID, BatchSize, EventSourceArn, FunctionArn, State="Creating" and an EventSourceMappingArn. "AssertionError: expected the call to be rejected, but it SUCCEEDED and returned {... 'State': 'Creating' ...}" — the UUID/ARNs are per-run values; the requirement is the 400 and that message.
 Why: the one validation AWS performs at create time is skipped, so a mapping that can never poll is created and the caller is told it succeeded.
-Fix: execution-role permission validation in the Lambda CreateEventSourceMapping handler.
+Fix: execution-role permission validation in the Lambda CreateEventSourceMapping handler. NOTE for the fixer: the handler already asks — `create_event_source_mapping.rs` calls `state::unreadable_event_source`, and `state::event_source_authorization` lists the queue reads (`ReceiveMessage`, `DeleteMessage`, `GetQueueAttributes`) and the sentence. The recorded roles get past it through that module's documented "shows nothing" escape: a role carrying an attachment whose document this account's IAM store does not hold (an AWS-managed policy) is not refused, because refusing on evidence the emulator does not have would deny access AWS permits. Deciding whether that escape should hold for an event source is a decision about every service that resolves a caller-supplied role, and the refusal's wording has to be settled against the recording too (the emulator words it "The function execution role does not have permissions to call ReceiveMessage on SQS").
 Traces: events__lambda__sqs.lambda-role-missing-sqs-permissions-blocks-poll, events__lambda__sqs.lambda-without-sqs-permission-esm-creation-fails, events__lambda__sqs.sqs-lambda-event-source-mapping-missing-role-permission-rejected
 
 Cause 6 of 8: a queue's redrive policy moves a message to the DLQ after zero delivery attempts.
 AWS: with a RedrivePolicy of maxReceiveCount=N, a message is moved to the dead-letter queue only after it has been received N times; with N=2 it must survive at least the first receive.
 Emulator: the message appears in the DLQ having never been delivered. "AssertionError: message reached the DLQ after 0 delivery attempt(s); maxReceiveCount=2 requires it to survive at least the first". maxReceiveCount is a value from the request; the rule — move only after the count is exceeded — is the requirement.
 Why: every message is dead-lettered immediately instead of being processed, so a client's retry budget is nullified and healthy traffic lands in the DLQ.
-Fix: the SQS receive path's receive-count accounting and redrive evaluation.
+Fix: the SQS receive path's receive-count accounting and redrive evaluation. NOTE for the fixer: "0 delivery attempt(s)" is counted by the scenario's own function, which never runs (cause 4); the SQS store itself already moves a message only once its per-queue receive count has reached maxReceiveCount, so check this cause again once the ESM poller delivers.
 Traces: events__lambda__sqs.sqs-esm-dlq-redrive-after-max-receive
 
 Cause 7 of 8: Lambda durable-execution status-change events are never published to EventBridge.
@@ -111,7 +128,6 @@ Fix: the CloudFormation AWS::Lambda::Function provider must register the functio
 Traces: events__lambda__sqs.cfn-deploy-eventbridge-rule-lambda-target
 
 ## Evidence
-Cause 1: "AssertionError: SQS must not receive messages without a queue policy grant, got [{'body': {'version': '0', ...}}]"; "AssertionError: Explicit Deny must not be overridden by the Allow statement"; "AssertionError: message delivered despite wrong queue-policy principal"; "AssertionError: rule B delivered despite SourceArn policy mismatch"; "AssertionError: event was unexpectedly delivered without a queue policy"; "AssertionError: event was delivered to a queue that lacked a permissive queue policy"; "AssertionError: message delivered to SQS target despite missing queue policy".
 Cause 2: "AssertionError: event never delivered to https://127.0.0.1:<port>/<account>/<queue> after 8 attempts of 6.0s each"; "AssertionError: event never delivered to: [...] after 15 attempts".
 Causes 3, 4 and 7: 25 checks end "Error: Check timed out after 60.0s".
 Cause 5: "AssertionError: expected the call to be rejected, but it SUCCEEDED and returned {'ResponseMetadata': {'HTTPStatusCode': 202, ...}, 'UUID': ..., 'State': 'Creating', ...}" — expected HTTP 400 InvalidParameterValueException naming the missing ReceiveMessage permission.
@@ -119,4 +135,4 @@ Cause 6: "AssertionError: message reached the DLQ after 0 delivery attempt(s); m
 Cause 8: "botocore.errorfactory.ResourceNotFoundException: An error occurred (ResourceNotFoundException) when calling the GetPolicy operation: Function not found: arn:aws:lambda:<region>:<account>:function:<stack>-ForwarderFunction-<suffix>".
 
 ## Steps to Reproduce
-(1) Create an SQS queue with no policy / an explicit Deny for events.amazonaws.com / a policy naming another principal / an aws:SourceArn condition for a different rule; PutRule + PutTargets with that queue; PutEvents a matching entry; read the queue — the message arrives in every case. (2) Repeat with a permissive policy in other scenarios — the message never arrives. (3) PutRule with a Lambda target plus AddPermission, and a scheduled rule — never invoked. (4) CreateEventSourceMapping on a standard and a FIFO queue, SendMessage — never invoked. (5) CreateEventSourceMapping with a role lacking sqs:ReceiveMessage — 202. (6) SetQueueAttributes with RedrivePolicy maxReceiveCount=2, SendMessage, poll the DLQ — the message is already there. (7) Run a durable execution to TIMED_OUT and poll a rule's queue — empty. (8) CreateStack with AWS::Lambda::Function, then GetPolicy on the physical id — 404.
+(1) PutRule with a Lambda target plus AddPermission, and a scheduled rule — never invoked. (2) Repeat cause 2's chains: PutRule with a Lambda target whose function forwards to a queue, PutEvents a matching entry, read that queue — the message never arrives. (3) CreateEventSourceMapping on a standard and a FIFO queue, SendMessage — never invoked. (4) CreateEventSourceMapping with a role lacking sqs:ReceiveMessage — 202. (5) SetQueueAttributes with RedrivePolicy maxReceiveCount=2, SendMessage, let an ESM poll it — the message reaches the DLQ with no delivery. (6) Run a durable execution to TIMED_OUT and poll a rule's queue — empty. (7) CreateStack with AWS::Lambda::Function, then GetPolicy on the physical id — 404.

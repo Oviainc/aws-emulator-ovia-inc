@@ -130,7 +130,11 @@ async fn sqs(emulator: &Emulator, region: &str, operation: &str, body: &Value) -
     parsed
 }
 
-/// A queue called `name` in `region`; answers its url and its ARN.
+/// A queue called `name` in `region`, carrying the policy a rule's target needs:
+/// EventBridge "relies on resource-based policies" for a queue (`PutTargets`), so one
+/// that has granted the service nothing receives nothing — the rule
+/// `tests/all/queue_target_policy_authorization.rs` is the suite for. Answers its url
+/// and its ARN.
 async fn given_queue(emulator: &Emulator, region: &str, name: &str) -> (String, String) {
     let created = sqs(emulator, region, "CreateQueue", &json!({ "QueueName": name })).await;
     let url = created["QueueUrl"]
@@ -148,6 +152,16 @@ async fn given_queue(emulator: &Emulator, region: &str, name: &str) -> (String, 
         .as_str()
         .unwrap_or_else(|| panic!("case {name}: no QueueArn in {attributes}"))
         .to_string();
+    sqs(
+        emulator,
+        region,
+        "SetQueueAttributes",
+        &json!({
+            "QueueUrl": url,
+            "Attributes": { "Policy": crate::target_dispatch::granting_events(&arn) },
+        }),
+    )
+    .await;
     (url, arn)
 }
 

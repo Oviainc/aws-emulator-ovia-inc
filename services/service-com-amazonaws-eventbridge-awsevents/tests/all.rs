@@ -95,6 +95,8 @@ mod pattern_refusal_location;
 mod pattern_refusal_wording;
 #[path = "all/publication_identity_authorization.rs"]
 mod publication_identity_authorization;
+#[path = "all/queue_target_policy_authorization.rs"]
+mod queue_target_policy_authorization;
 #[path = "all/regional_bus_namespace.rs"]
 mod regional_bus_namespace;
 #[path = "all/replay_cancellation.rs"]

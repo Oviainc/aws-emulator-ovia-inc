@@ -89,8 +89,11 @@ pub(crate) fn published_for(batch: &Batch, job_id: &str) -> Vec<Published> {
         .collect()
 }
 
-/// An SQS queue called `name`, created through SQS itself; answers its url and the ARN a
-/// rule names it by.
+/// An SQS queue called `name`, created through SQS itself and carrying the grant a
+/// rule's target needs — EventBridge makes the target's `sqs:SendMessage` as its own
+/// service principal and "relies on resource-based policies" for a queue
+/// (`PutTargets`), so a queue that has granted it nothing receives nothing; answers
+/// its url and the ARN a rule names it by.
 pub(crate) async fn given_queue(batch: &Batch, name: &str) -> (String, String) {
     let (status, body) = batch.sqs("CreateQueue", json!({ "QueueName": name })).await;
     assert_eq!(
@@ -115,6 +118,26 @@ pub(crate) async fn given_queue(batch: &Batch, name: &str) -> (String, String) {
         .as_str()
         .unwrap_or_else(|| panic!("case {name}: no QueueArn in {body}"))
         .to_string();
+    let policy = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "events.amazonaws.com"},
+            "Action": "sqs:SendMessage",
+            "Resource": &arn,
+        }],
+    })
+    .to_string();
+    let (status, body) = batch
+        .sqs(
+            "SetQueueAttributes",
+            json!({ "QueueUrl": url, "Attributes": { "Policy": policy } }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {name}: SetQueueAttributes answered {status} {body}"
+    );
     (url, arn)
 }
 
