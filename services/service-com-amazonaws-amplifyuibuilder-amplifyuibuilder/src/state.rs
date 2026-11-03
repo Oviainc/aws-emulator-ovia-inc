@@ -32,8 +32,9 @@
 //! reports it from the single [`StoredTheme`] record, `UpdateTheme` merges into
 //! that record and `DeleteTheme` removes it, all keyed by the same
 //! (appId, environmentName) a component is keyed by and all with the projection
-//! the model asks for — `ListThemes` reports a page of the `ThemeSummary`
-//! projection of the same records.
+//! the model asks for — `ListForms` reports a page of the `FormSummary`
+//! projection and `ListThemes` a page of the `ThemeSummary` projection of those
+//! same records.
 //!
 //! ## The tagging surface
 //!
@@ -74,14 +75,16 @@ use crate::ops::types::{
     CodegenJobSummary, Component, ComponentBindingPropertiesValue, ComponentChild,
     ComponentDataConfiguration,
     ComponentEvent, ComponentProperty, ComponentSummary, ComponentVariant, FieldConfig, Form,
-    FormCTA, FormDataTypeConfig, FormStyle, InvalidParameterException, ResourceConflictException,
-    ResourceNotFoundException, SectionalElement, Theme, ThemeSummary, ThemeValues,
+    FormCTA, FormDataTypeConfig, FormStyle, FormSummary, InvalidParameterException,
+    ResourceConflictException, ResourceNotFoundException, SectionalElement, Theme, ThemeSummary,
+    ThemeValues,
 };
 
 /// The largest page an entity list serves, and the page size it uses when the
 /// request names no `maxResults`: that member targets `ListEntityLimit`, which
 /// the model constrains `@range(min: 1, max: 100)`, on every operation that
-/// pages over an app environment's entities (`ListComponents`, `ListThemes`).
+/// pages over an app environment's entities (`ListComponents`, `ListForms`,
+/// `ListThemes`).
 pub const LIST_ENTITY_PAGE_LIMIT: i32 = 100;
 
 /// How many records one export page carries, for every export this service
@@ -466,7 +469,8 @@ pub struct StoredForm {
     pub label_decorator: Option<String>,
     /// The position this form holds in its environment's creation order.
     ///
-    /// It is what an `ExportForms` page token indexes into: drawn from the same
+    /// It is what a `ListForms` or an `ExportForms` page token indexes into:
+    /// drawn from the same
     /// counter [`StoredComponent::cursor`] is drawn from, it never changes and
     /// never repeats, so a page resumes at the same place whether or not forms
     /// were created or deleted since the previous page.
@@ -490,6 +494,19 @@ impl StoredForm {
             tags: self.tags.clone(),
             cta: self.cta.clone(),
             label_decorator: self.label_decorator.clone(),
+        }
+    }
+
+    /// The `FormSummary` projection `ListForms` returns: the six members the
+    /// model declares on it, read off the one stored record.
+    pub fn to_summary(&self) -> FormSummary {
+        FormSummary {
+            app_id: self.app_id.clone(),
+            data_type: self.data_type.clone(),
+            environment_name: self.environment_name.clone(),
+            form_action_type: self.form_action_type.clone(),
+            id: self.id.clone(),
+            name: self.name.clone(),
         }
     }
 }

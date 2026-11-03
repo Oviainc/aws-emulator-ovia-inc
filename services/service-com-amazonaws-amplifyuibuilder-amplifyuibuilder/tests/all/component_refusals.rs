@@ -557,20 +557,27 @@ async fn no_modelled_refusal_names_its_error_type() {
 
     // The emulator's own signal keeps its name: an operation nobody has written yet
     // answers 501 `NotImplemented`, which no AmplifyUIBuilder exception stands for.
-    // `ListForms` is one such operation today (`src/ops/list_forms.rs` still carries the
-    // scaffold marker); when it is implemented, point this row at another operation that
-    // still carries one. The rule itself is pinned independently of any operation by the
-    // unit tests in `src/service/untyped_errors.rs`.
+    // `ExchangeCodeForToken` is one such operation today
+    // (`src/ops/exchange_code_for_token.rs` still carries the scaffold marker); when it is
+    // implemented, point this row at another operation that still carries one. The rule
+    // itself is pinned independently of any operation by the unit tests in
+    // `src/service/untyped_errors.rs`.
+    //
+    // The request has to satisfy the model first — `provider` is the `TokenProviders`
+    // value `figma` and the `@httpPayload` body carries the two members
+    // `ExchangeCodeForTokenRequestBody` requires
+    // (`smithy_query(query="operation", operation="ExchangeCodeForToken")`) — because a
+    // refusal the framework makes before the handler would never reach the scaffold.
     let stub = call(
         &router,
-        "GET",
-        &format!("/app/{APP_ID}/environment/{ENVIRONMENT}/forms"),
-        None,
+        "POST",
+        "/tokens/figma",
+        Some(json!({"code": "an-access-code", "redirectUri": "https://example.test/callback"})),
     )
     .await;
     assert_eq!(
         stub.status, 501,
-        "ListForms is still scaffolded, so it must answer 501, got {} with {:?}",
+        "ExchangeCodeForToken is still scaffolded, so it must answer 501, got {} with {:?}",
         stub.status, stub.body
     );
     assert_eq!(

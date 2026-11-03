@@ -47,6 +47,9 @@ mod form_delete;
 #[path = "all/form_lifecycle.rs"]
 mod form_lifecycle;
 
+#[path = "all/form_list.rs"]
+mod form_list;
+
 #[path = "all/form_update.rs"]
 mod form_update;
 

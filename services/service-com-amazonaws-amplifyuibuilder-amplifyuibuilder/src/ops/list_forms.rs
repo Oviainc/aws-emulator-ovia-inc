@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListForms
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListForms`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListForms::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one page of the forms stored for the app environment the request names, in
+//! creation order, as the `FormSummary` projection of each stored record. `nextToken`
+//! carries the app environment it was issued for and the cursor the next page resumes
+//! at; a token this operation never issued for that app environment is refused with the
+//! modelled `InvalidParameterException`.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +140,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListForms` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFormsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListForms"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFormsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the amplifyuibuilder form store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` targets `ListEntityLimit`, modelled `@range(min: 1, max:
+        // 100)`, and the boundary validator refused anything outside it before
+        // this handler ran, so the only case left is an absent value: serve the
+        // largest page the model allows. The `clamp` states that invariant rather
+        // than correcting a caller — a value reaching here outside the range is a
+        // validator bug, which the debug assertion surfaces.
+        let requested = input
+            .max_results
+            .unwrap_or(crate::state::LIST_ENTITY_PAGE_LIMIT);
+        debug_assert!(
+            (1..=crate::state::LIST_ENTITY_PAGE_LIMIT).contains(&requested),
+            "maxResults {requested} should have been refused at the boundary"
+        );
+        let page_size = usize::try_from(requested.clamp(1, crate::state::LIST_ENTITY_PAGE_LIMIT))
+            .expect("a page size clamped into 1..=100 fits in usize");
+
+        let key = (input.app_id.clone(), input.environment_name.clone());
+        let store = state.lock();
+
+        // One page of this app environment's forms, through the service's one page
+        // walk (`crate::state::page_of`): it resumes where the token says, serves
+        // at most `page_size` summaries and issues the token of the next page. A
+        // token this operation never issued — a malformed one, one issued while
+        // listing another app environment, or one whose cursor is not among those
+        // handed out, whether above the highest or below the first — names no
+        // page, so it is refused rather than silently served as a page of this
+        // list. With no token at all the list starts at the first cursor the
+        // service ever hands out, i.e. at its head.
+        let page = crate::state::page_of(
+            store.forms_in(&input.app_id, &input.environment_name),
+            &key,
+            store.cursor_seq,
+            input.next_token.as_deref(),
+            page_size,
+            crate::state::StoredForm::to_summary,
+        )
+        .map_err(|unknown| {
+            ListFormsErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(unknown.message(Self::NAME)),
+            })
+        })?;
+
+        Ok(ListFormsOutput {
+            entities: page.entities,
+            next_token: page.next_token,
+        })
     }
 }
