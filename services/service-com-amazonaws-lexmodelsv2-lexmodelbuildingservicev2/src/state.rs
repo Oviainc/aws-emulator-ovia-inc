@@ -565,6 +565,22 @@ pub fn no_utterances_failure_reason(locale_id: &str) -> String {
     )
 }
 
+/// The reason Amazon Lex gives for refusing to build a locale holding an intent whose
+/// slots are not all ordered: the elicitation order of an intent's slots is carried by
+/// its `slotPriorities`, and a slot no entry of that list names has no place in it.
+///
+/// The variable parts are the slots of that intent nothing orders — named one after
+/// another, comma separated, inside the brackets — and the name of the intent holding
+/// them; everything else is fixed text for this failure. One reason covers one intent,
+/// however many of its slots are unordered.
+pub fn unprioritised_slots_failure_reason(slots: &[String], intent_name: &str) -> String {
+    format!(
+        "Slot ids [{}] in intent {intent_name} don't define a slot priority. Update the \
+         intent to add a priority to these slots.",
+        slots.join(", ")
+    )
+}
+
 /// A bot locale, as `CreateBotLocale` stored it and `DescribeBotLocale` reads it back.
 #[derive(Debug, Clone)]
 pub struct BotLocale {
@@ -705,6 +721,17 @@ impl Intent {
     /// empty list when nothing has ordered the intent's slots.
     pub fn wire_slot_priorities(&self) -> Option<Vec<SlotPriority>> {
         (!self.slot_priorities.is_empty()).then(|| self.slot_priorities.clone())
+    }
+
+    /// Does an entry of this intent's `slotPriorities` order the slot that id names?
+    ///
+    /// A `SlotPriority` names the slot it orders by its id
+    /// (`smithy_query(query="shape",shape="SlotPriority")`), so that is what an entry is
+    /// matched on.
+    pub fn orders_slot(&self, slot_id: &str) -> bool {
+        self.slot_priorities
+            .iter()
+            .any(|priority| priority.slot_id == slot_id)
     }
 }
 
@@ -1374,23 +1401,79 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
     /// Why a build of that locale cannot succeed, as the `failureReasons` the failed
     /// locale reports; empty for a locale the service can build.
     ///
-    /// A locale is buildable once it holds a custom intent with at least one valid sample
-    /// utterance: with nothing to recognise, Amazon Lex has no bot to build, and it says
-    /// so with [`no_utterances_failure_reason`].
+    /// A build validates the locale as a whole, and reports one reason per thing it found
+    /// wrong:
+    ///
+    /// * the locale has to hold a custom intent with at least one valid sample utterance —
+    ///   with nothing to recognise, Amazon Lex has no bot to build, and it says so with
+    ///   [`no_utterances_failure_reason`];
+    /// * every slot of every intent has to be ordered by an entry in that intent's
+    ///   `slotPriorities` — the modelled `SlotConstraint` admits only `Required` and
+    ///   `Optional`, both of which Amazon Lex elicits in the order that list fixes — and an
+    ///   intent holding slots nothing orders is reported with
+    ///   [`unprioritised_slots_failure_reason`].
+    ///
+    /// The reasons are ordered the way the locale acquired what they are about, so the
+    /// list a read reports does not depend on how the store happens to hold its records.
     pub fn build_failure_reasons(
         &self,
         bot_id: &str,
         bot_version: &str,
         locale_id: &str,
     ) -> Vec<String> {
-        let buildable = self
+        let mut intents: Vec<&Intent> = self
             .intents_in_locale(bot_id, bot_version, locale_id)
+            .collect();
+        intents.sort_by(|left, right| {
+            left.creation_date_time
+                .cmp(&right.creation_date_time)
+                .then_with(|| left.intent_name.cmp(&right.intent_name))
+        });
+
+        let mut reasons = Vec::new();
+        let buildable = intents
+            .iter()
             .any(|intent| intent.is_custom() && intent.has_valid_utterance());
-        if buildable {
-            Vec::new()
-        } else {
-            vec![no_utterances_failure_reason(locale_id)]
+        if !buildable {
+            reasons.push(no_utterances_failure_reason(locale_id));
         }
+        for intent in intents {
+            let unordered: Vec<String> = self
+                .unprioritised_slots(intent)
+                .into_iter()
+                .map(|slot| slot.slot_name.clone())
+                .collect();
+            if !unordered.is_empty() {
+                reasons.push(unprioritised_slots_failure_reason(
+                    &unordered,
+                    &intent.intent_name,
+                ));
+            }
+        }
+        reasons
+    }
+
+    /// The slots of `intent` that no entry of its `slotPriorities` orders, in the order
+    /// the intent acquired them.
+    ///
+    /// Nothing adds a slot to `slotPriorities` as it is created — ordering the slots of an
+    /// intent is `UpdateIntent`'s — so this is what a build has to check.
+    pub fn unprioritised_slots<'a>(&'a self, intent: &'a Intent) -> Vec<&'a Slot> {
+        let mut unordered: Vec<&Slot> = self
+            .slots_in_intent(
+                &intent.bot_id,
+                &intent.bot_version,
+                &intent.locale_id,
+                &intent.intent_id,
+            )
+            .filter(|slot| !intent.orders_slot(&slot.slot_id))
+            .collect();
+        unordered.sort_by(|left, right| {
+            left.creation_date_time
+                .cmp(&right.creation_date_time)
+                .then_with(|| left.slot_name.cmp(&right.slot_name))
+        });
+        unordered
     }
 }
 

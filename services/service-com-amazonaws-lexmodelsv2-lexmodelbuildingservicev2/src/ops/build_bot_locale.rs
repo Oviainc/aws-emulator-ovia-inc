@@ -182,8 +182,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // What the locale holds decides the outcome of the build, so it is evaluated
-        // against the stored intents BEFORE the submission is recorded: a locale with no
-        // custom intent carrying a valid utterance has nothing to build.
+        // against the stored intents and their slots BEFORE the submission is recorded: a
+        // build is the only thing that validates the locale as a whole.
         let failure_reasons =
             store.build_failure_reasons(&input.bot_id, &input.bot_version, &input.locale_id);
 
