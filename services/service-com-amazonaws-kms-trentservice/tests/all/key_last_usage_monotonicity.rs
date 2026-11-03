@@ -3,19 +3,21 @@
 //! End-to-end tests for the MONOTONICITY of the last-usage record `GetKeyLastUsage`
 //! reports, driven over the wire through the shared [`super::harness`].
 //!
-//! The rule under test: once KMS's usage tracking has produced a last-usage record for a
-//! key, `GetKeyLastUsage` keeps reporting a record for that key — "if the KeyLastUsage
-//! response element is present, the key has been used for a successful cryptographic
-//! operation since the TrackingStartDate"
-//! (`smithy_query(query="doc",shape="GetKeyLastUsage")`) is a monotone fact about the
-//! key, so a later use REPLACES the reported record once the tracking produces the newer
-//! one and never takes the key back to the "not used since tracking began" state its
-//! EMPTY record reports. The reported `Timestamp` therefore only advances: it is held at
-//! the value a reader has already been told while the newer use is still in the pipeline
-//! ([`state::USAGE_TRACKING_LAG`]), and then moves strictly forward.
+//! The rule under test: KMS's usage tracking begins recording a key with the first
+//! cryptographic operation that uses it and takes a span to produce that key's first
+//! record ([`state::USAGE_TRACKING_LAG`]); while it has produced none the element is
+//! EMPTY, and from the instant it is recording the key `GetKeyLastUsage` reports "the last
+//! successful cryptographic operation performed with" it
+//! (`smithy_query(query="doc",shape="GetKeyLastUsage")`). So once a record has been
+//! reported for a key, a LATER use replaces it — on the read taken straight after that
+//! use, with no further wait — and never takes the key back to the "not used since
+//! tracking began" state its empty record reports: "if the KeyLastUsage response element
+//! is present, the key has been used for a successful cryptographic operation since the
+//! TrackingStartDate" (same doc) is a monotone fact about the key, and the reported
+//! `Timestamp` only moves forward.
 //!
 //! What a read taken straight after the FIRST use of a key is answered — the empty record
-//! — is the subject of [`super::key_last_usage`]; this suite is about every use after
+//! — is also [`super::key_last_usage`]'s subject; this suite is about every use after
 //! that one.
 //!
 //! The rows are the tracked operations
@@ -25,8 +27,8 @@
 //! Each row is driven through THREE successive uses, so the advance is asserted on a
 //! record that replaced a record that had itself replaced one.
 //!
-//! The rows are driven in PHASES — every row's call first, then one wait for the tracking
-//! — so the suite waits out the lag once per round rather than once per row.
+//! The rows are driven in PHASES — every row's first call first, then one wait for the
+//! tracking — so the suite waits out the start-up span once rather than once per row.
 
 use serde_json::{json, Value};
 
@@ -40,6 +42,11 @@ const MESSAGE: &[u8] = b"the advancing last usage record";
 /// How many successive uses of one key each row performs. Three, so the last record
 /// asserted replaced a record that had itself replaced one.
 const USES_PER_ROW: usize = 3;
+
+/// How far apart the rows space two uses of one key. The wire renders an instant in
+/// milliseconds, so two uses are spaced past that resolution for the advance of the
+/// reported `Timestamp` to be observable at all.
+const PAST_THE_WIRE_RESOLUTION: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// One row of the table: a tracked operation, the key it needs and the request that uses
 /// that key.
@@ -105,10 +112,7 @@ fn table() -> Vec<Row> {
 
 /// The `GetKeyLastUsage` answer for `key_id`, taken as it is — without waiting for the
 /// tracking.
-async fn reported(
-    router: &smithy_server_runtime::MultiServiceRouter,
-    key_id: &str,
-) -> Value {
+async fn reported(router: &smithy_server_runtime::MultiServiceRouter, key_id: &str) -> Value {
     ok(router, "GetKeyLastUsage", &json!({"KeyId": key_id})).await
 }
 
@@ -128,7 +132,9 @@ fn assert_present(case: &str, operation: &str, answer: &Value, floor: f64) -> f6
         );
     };
     assert_eq!(
-        answer["KeyLastUsage"]["Operation"].as_str().unwrap_or_default(),
+        answer["KeyLastUsage"]["Operation"]
+            .as_str()
+            .unwrap_or_default(),
         operation,
         "case {case}: expected the record to name {operation}, got {answer}"
     );
@@ -138,6 +144,33 @@ fn assert_present(case: &str, operation: &str, answer: &Value, floor: f64) -> f6
          {reported_at}"
     );
     reported_at
+}
+
+/// Assert the record `advanced` carries is the one the use just made wrote: it names
+/// `operation`, its `Timestamp` is strictly after `previous`, and its CloudTrail event id
+/// and KMS request id are this call's own rather than the replaced record's.
+fn assert_advanced(case: &str, operation: &str, advanced: &Value, before: &Value) {
+    let previous = timestamp(before).unwrap_or_default();
+    let reported_at = assert_present(case, operation, advanced, previous);
+    assert!(
+        reported_at > previous,
+        "case {case}: the record of the later use replaces the one reported, so the \
+         Timestamp must advance past {previous}, got {reported_at}"
+    );
+    for member in ["CloudTrailEventId", "KmsRequestId"] {
+        let value = advanced["KeyLastUsage"][member]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !value.is_empty(),
+            "case {case}: expected a {member} on the advanced record, got {advanced}"
+        );
+        assert_ne!(
+            value,
+            before["KeyLastUsage"][member].as_str().unwrap_or_default(),
+            "case {case}: expected a {member} of this call's own, got the replaced record's"
+        );
+    }
 }
 
 /// Wait until the tracking has produced the FIRST record of a key — until then the
@@ -166,111 +199,75 @@ async fn poll_for_first_record(
     }
 }
 
-/// Wait until the tracking has produced the record of the use just made — a record whose
-/// `Timestamp` is strictly after `previous` — asserting on EVERY read in between that the
-/// record stays present and never regresses, which is what a client polling for the
-/// advance observes.
-async fn poll_for_advance(
-    router: &smithy_server_runtime::MultiServiceRouter,
-    case: &str,
-    operation: &str,
-    key_id: &str,
-    previous: f64,
-) -> Value {
-    let deadline = std::time::Instant::now() + USAGE_TRACKING_LAG * 20;
-    loop {
-        let answer = reported(router, key_id).await;
-        let reported_at = assert_present(case, operation, &answer, previous);
-        if reported_at > previous {
-            return answer;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "case {case}: the tracking must produce the newer record, so the reported \
-             Timestamp must advance past {previous}, got {answer}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-}
-
-/// The rule: a use the tracking has not caught up with never erases the record already
-/// reported, and the reported `Timestamp` advances strictly once it has.
+/// The rule: once the tracking is recording a key, the record of a later use is what the
+/// very next read reports, and the reported `Timestamp` advances strictly.
 #[tokio::test]
-async fn the_reported_last_usage_record_is_held_over_and_then_advances() {
+async fn the_reported_last_usage_record_advances_with_every_later_use() {
     let router = router();
     let rows = table();
 
     // One key per row, and the record every row's first use produced.
     let mut key_ids: Vec<String> = Vec::new();
+    let mut creation_dates: Vec<f64> = Vec::new();
     for row in &rows {
         let metadata = create_key(&router, &row.key).await;
         key_ids.push(text(row.operation, &metadata, "KeyId"));
+        creation_dates.push(metadata["CreationDate"].as_f64().unwrap_or_default());
     }
 
-    // Round 1: the first use of every key, then one wait for the tracking.
+    // Round 1: the first use of every key. The tracking has produced nothing for the key
+    // yet, so the read taken straight after it is answered the empty record …
     for (row, key_id) in rows.iter().zip(&key_ids) {
         ok(&router, row.operation, &(row.request)(key_id)).await;
+        let straight_after = reported(&router, key_id).await;
+        assert_eq!(
+            straight_after["KeyLastUsage"],
+            json!({}),
+            "case {} use 1 straight after the call: the tracking has produced no record \
+             for this key yet, so the element is empty, got {straight_after}",
+            row.operation
+        );
     }
+    // … and then one wait, for the whole table, until it has.
     let mut records: Vec<Value> = Vec::new();
-    for (row, key_id) in rows.iter().zip(&key_ids) {
+    for ((row, key_id), creation_date) in rows.iter().zip(&key_ids).zip(&creation_dates) {
         let case = format!("{} use 1", row.operation);
         // The key's creation date is the floor of its first record: tracking starts when
         // the key is minted.
-        let floor = reported(&router, key_id).await["KeyCreationDate"]
-            .as_f64()
-            .unwrap_or_default();
-        records.push(poll_for_first_record(&router, &case, row.operation, key_id, floor).await);
+        records.push(
+            poll_for_first_record(&router, &case, row.operation, key_id, *creation_date).await,
+        );
     }
 
-    // Rounds 2..: each later use is held over while the tracking produces it, and then
-    // advances the reported record.
+    // Rounds 2..: each later use is reported by the read that follows it, with a
+    // Timestamp strictly after the record it replaced.
     for use_number in 2..=USES_PER_ROW {
-        for (index, (row, key_id)) in rows.iter().zip(&key_ids).enumerate() {
-            let case = format!("{} use {use_number} straight after the call", row.operation);
-            let before = records[index].clone();
-            ok(&router, row.operation, &(row.request)(key_id)).await;
-
-            // The read a caller takes straight after this use: the record the tracking
-            // has already produced is still the answer — the newer use replaces nothing
-            // until the tracking produces it, and it never takes the key back to the
-            // "not used since tracking began" state an empty record reports.
-            let straight_after = reported(&router, key_id).await;
-            assert_eq!(
-                straight_after, before,
-                "case {case}: expected the record already reported, got {straight_after}"
-            );
-            records[index] = straight_after;
-        }
-
         for (index, (row, key_id)) in rows.iter().zip(&key_ids).enumerate() {
             let case = format!("{} use {use_number}", row.operation);
             let before = records[index].clone();
-            let previous = timestamp(&before).unwrap_or_default();
-            let advanced =
-                poll_for_advance(&router, &case, row.operation, key_id, previous).await;
 
-            // The record that replaced it is this call's own: its CloudTrail event id and
-            // its KMS request id belong to the call being recorded, so neither is the one
-            // the replaced record carried.
-            for member in ["CloudTrailEventId", "KmsRequestId"] {
-                let value = advanced["KeyLastUsage"][member].as_str().unwrap_or_default();
-                assert!(
-                    !value.is_empty(),
-                    "case {case}: expected a {member} on the advanced record, got {advanced}"
-                );
-                assert_ne!(
-                    value,
-                    before["KeyLastUsage"][member].as_str().unwrap_or_default(),
-                    "case {case}: expected a {member} of this call's own, got the replaced \
-                     record's"
-                );
-            }
+            tokio::time::sleep(PAST_THE_WIRE_RESOLUTION).await;
+            ok(&router, row.operation, &(row.request)(key_id)).await;
+
+            // The read a caller takes straight after this use: the tracking is recording
+            // the key, so what it reports is this use — the element never goes back to
+            // the "not used since tracking began" state an empty record reports, and the
+            // Timestamp moves forward.
+            let advanced = reported(&router, key_id).await;
+            assert_advanced(&case, row.operation, &advanced, &before);
+
+            // Reading the record does not change it: asking again answers the same.
+            let again = reported(&router, key_id).await;
+            assert_eq!(
+                again, advanced,
+                "case {case}: a second read must answer the same record, got {again}"
+            );
             records[index] = advanced;
         }
     }
 
     // Every row advanced, so no row sat on the record its first use produced.
-    for (row, key_id) in rows.iter().zip(&key_ids) {
+    for ((row, key_id), record) in rows.iter().zip(&key_ids).zip(&records) {
         let answer = reported(&router, key_id).await;
         assert_eq!(
             answer["KeyId"].as_str().unwrap_or_default(),
@@ -278,20 +275,20 @@ async fn the_reported_last_usage_record_is_held_over_and_then_advances() {
             "case {} final: this answer names the key by its key ID, got {answer}",
             row.operation
         );
-        assert!(
-            timestamp(&answer).is_some(),
-            "case {} final: the key has been used {USES_PER_ROW} times, so the record must \
-             be present, got {answer}",
+        assert_eq!(
+            answer, *record,
+            "case {} final: the key has been used {USES_PER_ROW} times, so the record of \
+             the last of them is what is reported, got {answer}",
             row.operation
         );
     }
 }
 
-/// The rule, on one key beside another: the record held over belongs to the key that was
+/// The rule, on one key beside another: the record reported belongs to the key that was
 /// used, and a key the tracking has produced no record for holds nothing — neither its
 /// own first use, until the tracking produces it, nor another key's.
 #[tokio::test]
-async fn a_held_over_record_belongs_to_the_key_that_was_used() {
+async fn the_reported_record_belongs_to_the_key_that_was_used() {
     let router = router();
     let used = create_key(&router, &json!({"Description": "used twice"})).await;
     let used_id = text("setup", &used, "KeyId");
@@ -300,9 +297,9 @@ async fn a_held_over_record_belongs_to_the_key_that_was_used() {
 
     let encrypt = json!({"KeyId": used_id, "Plaintext": b64(MESSAGE)});
     ok(&router, "Encrypt", &encrypt).await;
-    // Nothing is held over for a FIRST use the tracking has not produced yet: the record
+    // Nothing is reported for a FIRST use the tracking has not produced yet: the record
     // is reported empty, which is what the recorded answer of a read taken straight after
-    // a cryptographic operation carries.
+    // the first cryptographic operation on a key carries.
     let before_any_record = reported(&router, &used_id).await;
     assert_eq!(
         before_any_record["KeyLastUsage"],
@@ -319,15 +316,13 @@ async fn a_held_over_record_belongs_to_the_key_that_was_used() {
     )
     .await;
 
+    tokio::time::sleep(PAST_THE_WIRE_RESOLUTION).await;
     ok(&router, "Encrypt", &encrypt).await;
-    // Held over for the key that was used …
-    let straight_after = reported(&router, &used_id).await;
-    assert_eq!(
-        straight_after, first,
-        "case held over: expected the record already reported, got {straight_after}"
-    );
-    // … and for the key that never was, nothing is held at all: its record stays empty,
-    // because the element is empty exactly while the key has not been used since
+    // Reported for the key that was used …
+    let advanced = reported(&router, &used_id).await;
+    assert_advanced("second use", "Encrypt", &advanced, &first);
+    // … and for the key that never was, nothing is reported at all: its record stays
+    // empty, because the element is empty exactly while the key has not been used since
     // tracking began.
     let other = reported(&router, &untouched_id).await;
     assert_eq!(
@@ -342,30 +337,22 @@ async fn a_held_over_record_belongs_to_the_key_that_was_used() {
         "case untouched: expected the answer to name its own key, got {other}"
     );
 
-    let advanced = poll_for_advance(
-        &router,
-        "second use",
-        "Encrypt",
-        &used_id,
-        timestamp(&first).unwrap_or_default(),
-    )
-    .await;
-    assert!(
-        timestamp(&advanced) > timestamp(&first),
-        "case second use: expected the Timestamp to advance past {:?}, got {advanced}",
-        timestamp(&first)
-    );
-    // The untouched key is still untouched: the advance belongs to one key.
+    // The untouched key is still untouched after a further use of the other one: the
+    // advance belongs to one key.
+    tokio::time::sleep(PAST_THE_WIRE_RESOLUTION).await;
+    ok(&router, "Encrypt", &encrypt).await;
+    let advanced_again = reported(&router, &used_id).await;
+    assert_advanced("third use", "Encrypt", &advanced_again, &advanced);
     let other_again = reported(&router, &untouched_id).await;
     assert_eq!(
         other_again, other,
         "case untouched again: a use of another key must not fill this key's record"
     );
-    // And the reads above, which are the only calls this key has had besides the two
+    // And the reads above, which are the only calls this key has had besides the three
     // uses, left the record where it was: asking again answers the same.
     let again = reported(&router, &used_id).await;
     assert_eq!(
-        again, advanced,
+        again, advanced_again,
         "case reread: a second read must answer the same record, got {again}"
     );
 }

@@ -224,19 +224,22 @@ pub const MAX_ON_DEMAND_ROTATIONS: usize = 25;
 /// under the material it had, because that is what an in-progress rotation is.
 pub const ON_DEMAND_ROTATION_SPAN: Duration = Duration::from_millis(300);
 
-/// How long KMS's usage tracking takes to produce the record `GetKeyLastUsage`
-/// reports: "the TrackingStartDate in the GetKeyLastUsage response indicates the date
-/// from which KMS began recording cryptographic activity for a given key"
-/// (`smithy_query(query="doc",shape="GetKeyLastUsage")`) — the recording is a pipeline
-/// of its own and lags the call it records, which is why the recorded response of a
-/// `GetKeyLastUsage` made straight after a cryptographic operation carries the usage
-/// record EMPTY.
+/// How long KMS's usage tracking takes to START producing records for a key, counted
+/// from the first cryptographic operation that uses it: "the TrackingStartDate in the
+/// GetKeyLastUsage response indicates the date from which KMS began recording
+/// cryptographic activity for a given key"
+/// (`smithy_query(query="doc",shape="GetKeyLastUsage")`) — the recording is a pipeline of
+/// its own, which is why the recorded response of a `GetKeyLastUsage` made straight after
+/// the first use of a key carries the usage record EMPTY. Once the pipeline is recording
+/// a key, it reports "the last successful cryptographic operation performed with" it
+/// (`smithy_query(query="doc",shape="GetKeyLastUsage")`), so a later use is reported as
+/// the record it is, without a further span.
 ///
-/// The documentation puts no number on that lag, so the length of the span is this
+/// The documentation puts no number on that start-up, so the length of the span is this
 /// emulator's, like [`ON_DEMAND_ROTATION_SPAN`]. It is NON-ZERO, so a caller reading the
-/// record straight after using the key still sees what AWS answers there — nothing
-/// recorded yet — and it is a few seconds at most, so a caller polling for the record
-/// gets it without waiting long.
+/// record straight after the first use of a key still sees what AWS answers there —
+/// nothing recorded yet — and it is a few seconds at most, so a caller polling for the
+/// first record gets it without waiting long.
 pub const USAGE_TRACKING_LAG: Duration = Duration::from_secs(3);
 
 /// The rotation period an `EnableKeyRotation` that names none gets: "If no value is
@@ -1983,18 +1986,20 @@ pub struct Cmk {
     pub rotation_schedule: Option<RotationSchedule>,
     /// The last successful cryptographic operation performed with this key, or
     /// `None` while it has had none — the record `GetKeyLastUsage` reports once the
-    /// usage tracking has caught up with it ([`USAGE_TRACKING_LAG`]). Every
+    /// usage tracking is recording this key ([`Self::usage_tracking_due`]). Every
     /// cryptographic operation that succeeds writes it ([`Self::record_last_usage`]);
     /// a reporting operation never does.
     pub last_usage: Option<KeyUsage>,
-    /// The newest usage record the tracking had ALREADY produced when [`Self::last_usage`]
-    /// was written, or `None` while it had produced none.
+    /// When the usage tracking is due to have produced its FIRST record for this key —
+    /// [`USAGE_TRACKING_LAG`] after the first cryptographic operation that used it — or
+    /// `None` while the key has had none.
     ///
-    /// It is what `GetKeyLastUsage` goes on reporting while the newer use is still in the
-    /// pipeline: a record the tracking has produced is replaced by a newer one, never
-    /// erased by a use the tracking has not caught up with — see
-    /// [`Self::reported_last_usage`].
-    pub tracked_last_usage: Option<KeyUsage>,
+    /// It is the instant from which `GetKeyLastUsage` reports a record for this key at
+    /// all: before it the element is empty however often the key has been used, and from
+    /// it on the pipeline is recording the key, so what is reported is the latest use —
+    /// see [`Self::reported_last_usage`]. It is set once and never moved, which is what
+    /// makes the element's presence a monotone fact about the key.
+    pub usage_tracking_due: Option<SystemTime>,
     /// What the caller stated about the key material it imported, or `None` for a key
     /// whose material KMS generated and for one still waiting for material — see
     /// [`ImportedKeyMaterial`]. It is what the `ExpirationModel` and `ValidTo`
@@ -2100,10 +2105,10 @@ impl std::fmt::Debug for PendingRotationMaterial {
 /// tracking records it and `GetKeyLastUsage` reports it
 /// (`smithy_query(query="shape",shape="KeyLastUsageData")`).
 ///
-/// The record is written by the call it describes and reported only once the tracking
-/// that produces it has caught up ([`USAGE_TRACKING_LAG`]), which is what a reader sees
-/// as "the KeyLastUsage response element is empty" straight after a cryptographic
-/// operation.
+/// The record is written by the call it describes and reported once the tracking is
+/// recording this key, which it begins doing [`USAGE_TRACKING_LAG`] after the key's first
+/// use — which is what a reader sees as "the KeyLastUsage response element is empty"
+/// straight after the first cryptographic operation on a key.
 #[derive(Debug, Clone)]
 pub struct KeyUsage {
     /// The name of the KMS API operation that used the key.
@@ -2118,12 +2123,6 @@ pub struct KeyUsage {
 }
 
 impl KeyUsage {
-    /// Whether the usage tracking has produced this record by `now`, which is what
-    /// makes it reportable: it is due [`USAGE_TRACKING_LAG`] after the call it records.
-    pub fn tracked_by(&self, now: SystemTime) -> bool {
-        now >= self.at + USAGE_TRACKING_LAG
-    }
-
     /// This record as `GetKeyLastUsage` projects it onto the wire — the one place a
     /// usage record is serialized, so two readers cannot disagree.
     pub fn last_usage_data(&self) -> KeyLastUsageData {
@@ -2167,7 +2166,7 @@ impl std::fmt::Debug for Cmk {
             .field("rotations", &self.rotations)
             .field("rotation_schedule", &self.rotation_schedule)
             .field("last_usage", &self.last_usage)
-            .field("tracked_last_usage", &self.tracked_last_usage)
+            .field("usage_tracking_due", &self.usage_tracking_due)
             .field("imported_material", &self.imported_material)
             .field("pending_rotation_material", &self.pending_rotation_material)
             .finish()
@@ -2239,7 +2238,7 @@ impl Cmk {
             // "the KeyLastUsage response element is empty"
             // (`smithy_query(query="doc",shape="GetKeyLastUsage")`).
             last_usage: None,
-            tracked_last_usage: None,
+            usage_tracking_due: None,
             // A key created with no key material has not been given any yet, and a key
             // whose material KMS generated never carries imported material.
             imported_material: None,
@@ -2339,7 +2338,7 @@ impl Cmk {
             // "primary and replica keys track last usage independently"
             // (`smithy_query(query="doc",shape="GetKeyLastUsage")`).
             last_usage: None,
-            tracked_last_usage: None,
+            usage_tracking_due: None,
             // A replica of a key with imported material holds none until the same
             // material is imported into it, and one of a key whose material KMS
             // generated never carries imported material.
@@ -2365,19 +2364,19 @@ impl Cmk {
     /// here rather than derived from the request.
     pub fn record_last_usage(&mut self, operation: &str) {
         let now = SystemTime::now();
-        // The record the tracking has already PRODUCED is kept beside the new one, so
-        // the use being recorded replaces nothing a reader has been told until the
-        // tracking produces it too: "if the KeyLastUsage response element is present,
-        // the key has been used for a successful cryptographic operation since the
-        // TrackingStartDate"
-        // (`smithy_query(query="doc",shape="GetKeyLastUsage")`) is a monotone fact
-        // about the key, so a further use never takes it back to the empty record.
-        // A use the tracking had NOT produced yet is superseded by this one instead —
-        // the pipeline coalesces the two, and only the later record is ever reported,
-        // which keeps what one key holds bounded however often it is used.
-        if let Some(produced) = self.last_usage.take().filter(|usage| usage.tracked_by(now)) {
-            self.tracked_last_usage = Some(produced);
-        }
+        // The FIRST use of a key is what starts the tracking recording it, and the
+        // pipeline takes [`USAGE_TRACKING_LAG`] to come up: the instant its first record
+        // is due is set by that use and never moved again, so "if the KeyLastUsage
+        // response element is present, the key has been used for a successful
+        // cryptographic operation since the TrackingStartDate"
+        // (`smithy_query(query="doc",shape="GetKeyLastUsage")`) stays a monotone fact
+        // about the key — a later use never takes it back to the empty record.
+        self.usage_tracking_due
+            .get_or_insert(now + USAGE_TRACKING_LAG);
+        // Only the latest use is kept: this operation "returns usage information about
+        // the LAST successful cryptographic operation performed with a specified KMS
+        // key" (same doc), so the one before it is reported by nothing, and what a key
+        // holds stays bounded however often it is used.
         self.last_usage = Some(KeyUsage {
             operation: operation.to_string(),
             at: now,
@@ -2388,23 +2387,25 @@ impl Cmk {
 
     /// The usage record `GetKeyLastUsage` reports for this key at `now`.
     ///
-    /// The record a use of the key wrote is reported only once the usage tracking has
-    /// produced it ([`KeyUsage::tracked_by`]); until then what is reported is the record
-    /// the tracking produced BEFORE it ([`Self::tracked_last_usage`]), because the
-    /// element's presence is a monotone fact about the key — a later use replaces the
-    /// reported record and never erases it. For a key no use of which the tracking has
-    /// produced a record for yet — including one whose only use is still in the pipeline,
-    /// and one that has had no cryptographic operation at all — what is reported is the
-    /// EMPTY record, every member of which is "absent if the key has not been used since
-    /// KMS began tracking"
+    /// Once the tracking is recording this key — from [`Self::usage_tracking_due`] on —
+    /// what is reported is the LATEST use of it, since this operation "returns usage
+    /// information about the last successful cryptographic operation performed with a
+    /// specified KMS key"
+    /// (`smithy_query(query="doc",shape="GetKeyLastUsage")`): the reported record is
+    /// replaced by each later use, so the element stays present and its `Timestamp` only
+    /// moves forward. Before that instant — while the pipeline has produced no record for
+    /// this key, including for a key whose only uses are the ones that started it, and for
+    /// one that has had no cryptographic operation at all — what is reported is the EMPTY
+    /// record, every member of which is "absent if the key has not been used since KMS
+    /// began tracking"
     /// (`smithy_query(query="shape",shape="KeyLastUsageData")`). Reporting it writes
-    /// nothing: whether the tracking has caught up follows from the instant the use was
-    /// recorded at, so every reader agrees without one of them persisting the answer.
+    /// nothing: whether the tracking is recording the key follows from the instant its
+    /// first record is due, so every reader agrees without one of them persisting the
+    /// answer.
     pub fn reported_last_usage(&self, now: SystemTime) -> KeyLastUsageData {
         self.last_usage
             .as_ref()
-            .filter(|usage| usage.tracked_by(now))
-            .or(self.tracked_last_usage.as_ref())
+            .filter(|_| self.usage_tracking_due.is_some_and(|due| now >= due))
             .map(KeyUsage::last_usage_data)
             .unwrap_or_default()
     }

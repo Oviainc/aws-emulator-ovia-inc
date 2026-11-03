@@ -713,10 +713,10 @@ pub(crate) async fn settle_rotation_in(
 /// tracking has PRODUCED a record that names `operation` and is not the one `previous`
 /// carries (pass `&Value::Null` when there was none).
 ///
-/// The tracking lags the call it records (`state::USAGE_TRACKING_LAG`), so a read taken
-/// straight after a cryptographic operation is answered the empty record; a case that is
-/// about WHAT was recorded waits for it here, and the empty answer a read gets in the
-/// meantime is asserted by the suite that is about that
+/// The tracking takes a span to begin recording a key (`state::USAGE_TRACKING_LAG`), so a
+/// read taken straight after the FIRST cryptographic operation on a key is answered the
+/// empty record; a case that is about WHAT was recorded waits for it here, and the empty
+/// answer a read gets in the meantime is asserted by the suite that is about that
 /// (`tests/all/key_last_usage.rs`).
 pub(crate) async fn tracked_last_usage(
     router: &MultiServiceRouter,
