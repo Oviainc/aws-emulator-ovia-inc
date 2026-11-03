@@ -383,8 +383,8 @@ async fn every_connection_refusal_names_the_call_that_failed() {
             // The framework's own boundary validator refuses a value outside a
             // modelled ENUM before any handler runs, in AWS's own wording for
             // that class, so the row here is a refusal the HANDLER makes: the
-            // parameters do not match the type.
-            "a create whose parameters are missing for the type it names",
+            // parameters name no authorization type at all.
+            "a create whose parameters name no authorization type",
             "CreateConnection",
             json!({
                 "Name": "parameterless",
@@ -393,8 +393,8 @@ async fn every_connection_refusal_names_the_call_that_failed() {
             }),
             "create",
             "ValidationException",
-            "Parameter AuthParameters is not valid. Reason: BasicAuthParameters is required \
-             for AuthorizationType BASIC."
+            "Parameter AuthParameters is not valid. Reason: The value for AuthParameters must \
+             include exactly one authorization type."
                 .to_string(),
         ),
         (
@@ -426,8 +426,8 @@ async fn every_connection_refusal_names_the_call_that_failed() {
             }),
             "create",
             "ValidationException",
-            "Parameter AuthParameters is not valid. Reason: ApiKeyAuthParameters may only be \
-             provided for AuthorizationType API_KEY."
+            "Parameter AuthParameters is not valid. Reason: The value for AuthParameters must \
+             include exactly one authorization type."
                 .to_string(),
         ),
         (

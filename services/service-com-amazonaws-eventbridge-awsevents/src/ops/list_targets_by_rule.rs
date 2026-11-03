@@ -145,8 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(after) => Some(after),
                 None => {
                     return Err(crate::scaffolded::Scaffolded::validation(
-                        "Parameter NextToken is not valid. Reason: it is not a token this \
-                         service issued.",
+                        crate::state::INVALID_NEXT_TOKEN,
                     ))
                 }
             },
@@ -177,11 +176,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(after) => match rule.target_position(after) {
                 Some(index) => index + 1,
                 None => {
-                    return Err(crate::scaffolded::Scaffolded::validation(format!(
-                        "Parameter NextToken is not valid. Reason: rule {} no longer has the \
-                         target the token resumes after.",
-                        input.rule
-                    )))
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        crate::state::INVALID_NEXT_TOKEN,
+                    ))
                 }
             },
         };

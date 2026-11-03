@@ -4551,10 +4551,7 @@ pub fn merge_tags(stored: &mut Vec<Tag>, submitted: Vec<Tag>) -> Result<(), Stri
         }
     }
     if merged.len() > MAX_TAGS_PER_RESOURCE {
-        return Err(tag_quota_violation(
-            "the request would leave it carrying",
-            merged.len(),
-        ));
+        return Err(too_many_tags());
     }
     *stored = merged;
     Ok(())
@@ -4570,21 +4567,28 @@ pub fn merge_tags(stored: &mut Vec<Tag>, submitted: Vec<Tag>) -> Result<(), Stri
 /// bounded by the quota rather than by the request body.
 pub fn bound_tag_count(count: usize) -> Result<(), String> {
     if count > MAX_TAGS_PER_RESOURCE {
-        return Err(tag_quota_violation("the request carries", count));
+        return Err(too_many_tags());
     }
     Ok(())
 }
 
-/// What a refusal states for a tag write past [`MAX_TAGS_PER_RESOURCE`]: the
-/// quota, and how many tags the request named or would have left.
+/// What a refusal states for a tag write past [`MAX_TAGS_PER_RESOURCE`].
 ///
-/// The message is built from the request, naming the parameter and the count
-/// that was rejected, the way this service's other request-derived refusals do.
-fn tag_quota_violation(subject: &str, count: usize) -> String {
-    format!(
-        "Parameter Tags is not valid. Reason: a resource can carry at most \
-         {MAX_TAGS_PER_RESOURCE} tags, and {subject} {count}."
-    )
+/// A per-resource tag ceiling is a COUNT quota of this service like the targets
+/// a rule holds or the rules a bus holds, so the refusal carries the one
+/// sentence this service states for a count quota ([`QUOTA_EXCEEDED`]) rather
+/// than prose of this emulator's own: it names neither the resource the request
+/// was about nor the number that bounds it, so it reads the same whichever
+/// resource was tagged and whichever write crossed the quota. What differs from
+/// the other quotas is only the channel it travels on, because the tag writes
+/// model no quota error and refuse on the bad-request channel instead.
+///
+/// The quota is charged on the set a write would LEAVE — "You can use the
+/// TagResource action with a resource that already has tags ... the new tag
+/// value that you specify replaces the previous value for that tag"
+/// (`TagResource`), so re-setting a stored key leaves the set the size it was.
+fn too_many_tags() -> String {
+    QUOTA_EXCEEDED.to_string()
 }
 
 /// Remove from `stored` every tag whose key `keys` names, leaving the order of
@@ -4787,6 +4791,19 @@ pub fn connection_call_failed(verb: &str) -> String {
 pub fn connection_refusal(verb: &str, reason: &str) -> String {
     format!("{} {reason}", connection_call_failed(verb))
 }
+
+/// What a connection write states about `AuthParameters` that do not name
+/// exactly one authorization type.
+///
+/// Each authorization type has exactly one member of the auth-parameters shape
+/// that carries its credentials, so a set naming none of them and a set naming
+/// several both fail one rule, and the service states that rule rather than
+/// naming a member of the request. Written once, so `CreateConnection` and
+/// `UpdateConnection` refuse it in the same words; the failing call's own clause
+/// ([`connection_refusal`]) is stated before it.
+pub const ONE_AUTHORIZATION_TYPE: &str =
+    "Parameter AuthParameters is not valid. Reason: The value for AuthParameters must include \
+     exactly one authorization type.";
 
 /// What any refusal states about a name this store holds no connection for: the
 /// missing CONNECTION by name, as the request named it.
@@ -5476,6 +5493,15 @@ pub fn to_event_time(at: SystemTime) -> String {
 pub fn encode_page_token(after: &str) -> String {
     ::hex::encode(::serde_json::json!({ "a": after }).to_string())
 }
+
+/// What every list operation refuses a `NextToken` it cannot resume from with.
+///
+/// The service states the parameter that was rejected and nothing else — no
+/// reason clause and no echo of the token — so a token this service never
+/// minted and a well-formed one whose position is gone are refused in exactly
+/// these words. Written once, so the twelve paginated listings cannot word it
+/// differently.
+pub const INVALID_NEXT_TOKEN: &str = "Parameter NextToken is not valid.";
 
 /// Decode a list page token. `None` when it is not one this service minted,
 /// which the caller turns into a refusal rather than an empty page.
@@ -6338,9 +6364,12 @@ pub mod event_pattern {
     /// refused — which is what decides the position it reports.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Read {
-        /// Nothing of it yet: the reader stands at the node's first character,
-        /// which is where reading the member name that introduces it leaves it.
-        Pending,
+        /// Its first character, which is where reading the member NAME that
+        /// introduces it leaves the reader: a reader that has just read a
+        /// member name has consumed the colon after it and the first character
+        /// of the value as well. What a refusal about a member name itself had
+        /// read.
+        Entered,
         /// Its opening token only — a string's opening quote, an object's or a
         /// list's bracket, or the whole of any other scalar, which is one token.
         /// What a refusal decided from the node's TYPE had read.
@@ -6469,7 +6498,10 @@ pub mod event_pattern {
         let text = node.get();
         let start = offset_in(pattern, text)?;
         Some(match read {
-            Read::Pending => start,
+            // Reading the member name that introduces a value consumes the
+            // colon after the name and the value's first character too, so a
+            // refusal about the NAME stands one character into the value.
+            Read::Entered => start + text.chars().next().map_or(0, char::len_utf8),
             // A string is read as far as its opening quote and an object or a
             // list as far as its bracket; every other value is a single token,
             // so reading it at all reads the whole of it.
@@ -6724,9 +6756,13 @@ pub mod event_pattern {
                     validate_object(child, &at, depth + 1, validator)?;
                 }
                 _ => {
+                    // The reader names the MEMBER whose value is neither, as it
+                    // is spelled in the pattern — not the dotted field path it
+                    // sits under, which is this module's own way of naming a
+                    // field and belongs only to the reasons it words itself.
                     return Err(at.refuse(
                         Read::Opening,
-                        format!("\"{field}\" must be an object or an array"),
+                        format!("\"{key}\" must be an object or an array"),
                     ));
                 }
             }
@@ -6751,9 +6787,10 @@ pub mod event_pattern {
                 validate_operator(operator, argument, &at.key(operator))
             }
             Value::Object(map) if map.is_empty() => Err(at.refuse(Read::Whole, EMPTY_OBJECT)),
-            // The reader finds this out where the SECOND match type it names
-            // begins, which is as far as it had read.
-            Value::Object(_) => Err(at.nth_key(1).refuse(Read::Pending, ONE_KEY_ONLY)),
+            // The reader finds this out on the SECOND match type the object
+            // names, having read that name and entered its argument, which is
+            // as far as it had got.
+            Value::Object(_) => Err(at.nth_key(1).refuse(Read::Entered, ONE_KEY_ONLY)),
             _ => Err(at.refuse(
                 Read::Opening,
                 format!(

@@ -473,9 +473,9 @@ async fn an_update_no_configuration_can_be_built_from_is_refused() {
 /// A granted permission is a statement of the bus's resource policy: the policy
 /// `DescribeEventBus` reports is the IAM document the grants installed so far
 /// make, each statement carrying the grant it was given. The rows differ along
-/// the principal (one account, every account), the action, whether the grant
-/// carries a condition, and whether the statement id is new or already
-/// installed.
+/// the principal (one account, every account), the length of the statement id,
+/// whether the grant carries a condition, and whether the statement id is new or
+/// already installed.
 #[tokio::test]
 async fn a_granted_permission_is_reported_in_the_bus_policy() {
     let emulator = emulator();
@@ -521,10 +521,10 @@ async fn a_granted_permission_is_reported_in_the_bus_policy() {
             }),
         ),
         (
-            "another action, and a statement id at the modelled bound",
+            "a statement id at the modelled bound",
             json!({
                 "StatementId": "s".repeat(STATEMENT_ID_MAX),
-                "Action": "events:PutRule",
+                "Action": "events:PutEvents",
                 "Principal": "210987654321",
             }),
         ),
@@ -535,7 +535,7 @@ async fn a_granted_permission_is_reported_in_the_bus_policy() {
             "a statement id already installed",
             json!({
                 "StatementId": "CrossAccount",
-                "Action": "events:PutRule",
+                "Action": "events:PutEvents",
                 "Principal": "999988887777",
             }),
         ),

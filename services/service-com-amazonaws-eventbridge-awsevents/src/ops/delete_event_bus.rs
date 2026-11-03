@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // channel rather than on a modelled error that means something else.
         if name == crate::state::DEFAULT_EVENT_BUS_NAME {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Event bus {name} is the account's default event bus and cannot be deleted."
+                "Cannot delete event bus {name}."
             )));
         }
 
@@ -164,11 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // never silently discards rules a caller can still describe.
         if let Some(bus) = store.bus(&region, &name) {
             if !bus.rules.is_empty() {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Event bus {name} cannot be deleted since it still has {} rule(s). \
-                     Delete them with DeleteRule first.",
-                    bus.rules.len()
-                )));
+                return Err(crate::scaffolded::Scaffolded::validation(BUS_HAS_RULES));
             }
         }
 
@@ -198,3 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DeleteEventBusOutput)
     }
 }
+
+/// What this operation refuses a bus that still carries rules with.
+///
+/// The precondition is the operation's own ("All rules associated with this event
+/// bus need to be deleted"), and the refusal states it as the service does: one
+/// sentence about the bus's rules, naming neither the bus nor how many rules it
+/// carries — the same shape as the targets precondition `DeleteRule` enforces.
+const BUS_HAS_RULES: &str = "EventBus can't be deleted since it has rules.";

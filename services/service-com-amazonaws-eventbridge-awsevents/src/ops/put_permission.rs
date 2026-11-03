@@ -222,7 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let install = match (document, input.statement_id, input.action, input.principal) {
-            (Some(policy), None, None, None) => {
+            (Some(policy), None, None, None) if input.condition.is_none() => {
                 match crate::state::parse_policy_document(&policy) {
                     Ok(installed) => Install::Document(installed),
                     Err(reason) => {
@@ -234,12 +234,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             (Some(_), _, _, _) => {
                 return Err(crate::scaffolded::Scaffolded::validation(
-                    "Parameter Policy is not valid. Reason: Policy describes the whole \
-                     permission policy, so it cannot be combined with StatementId, Action \
-                     or Principal.",
+                    POLICY_COMBINED_WITH_GRANT_MEMBERS,
                 ))
             }
             (None, Some(sid), Some(action), Some(principal)) => {
+                // A grant on an event bus enables the other account to PUBLISH
+                // onto it, which is the one action an event bus's resource
+                // policy has to grant ([`crate::state::PUT_EVENTS_ACTION`]):
+                // `Action`'s modelled pattern (`^events:[a-zA-Z]+$`) admits
+                // every operation name of this service, so any other one
+                // reaches this handler and is refused here rather than stored
+                // as a grant that authorizes nothing.
+                if action != crate::state::PUT_EVENTS_ACTION {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        UNSUPPORTED_GRANT_ACTION,
+                    ));
+                }
                 let condition = input.condition.as_ref().map(|condition| {
                     (
                         condition.r#type.as_str(),
@@ -256,19 +266,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             }
             (None, statement_id, action, principal) => {
+                // The grant form needs all three members, and the refusal names
+                // the FIRST one the request lacks, in the order
+                // `PutPermissionRequest` declares them (`Action`, `Principal`,
+                // `StatementId`): one member per refusal, rather than a list
+                // this service composed.
                 let missing = [
-                    ("StatementId", statement_id.is_none()),
                     ("Action", action.is_none()),
                     ("Principal", principal.is_none()),
+                    ("StatementId", statement_id.is_none()),
                 ]
-                .iter()
-                .filter(|(_, absent)| *absent)
-                .map(|(member, _)| *member)
-                .collect::<Vec<_>>()
-                .join(", ");
+                .into_iter()
+                .find_map(|(member, absent)| absent.then_some(member))
+                // The arm above matched the request that carries all three, so
+                // one of them is always absent here; the fallback only keeps
+                // this expression total, without a panic in a handler.
+                .unwrap_or("StatementId");
                 return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Parameter(s) {missing} must be specified, or Policy must describe the \
-                     whole permission policy."
+                    "Parameter(s) {missing} must be specified."
                 )));
             }
         };
@@ -317,3 +332,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(PutPermissionOutput)
     }
 }
+
+/// What this operation refuses a request that carries `Policy` together with the
+/// members that name ONE grant with.
+///
+/// "You can include a Policy parameter in the request instead of using the
+/// StatementId, Action, Principal, or Condition parameters": the two forms are
+/// alternatives, so the refusal names every member that cannot come with
+/// `Policy` and echoes none of the values the request carried.
+const POLICY_COMBINED_WITH_GRANT_MEMBERS: &str =
+    "Action, Principal, StatementId and Condition could not be combined with Policy parameter.";
+
+/// What this operation refuses an `Action` other than the one an event bus's
+/// resource policy grants with.
+///
+/// The refusal names the parameter in the spelling the service uses for it and
+/// echoes neither the value the request carried nor the action it would have
+/// accepted.
+const UNSUPPORTED_GRANT_ACTION: &str = "Provided value in parameter 'action' is not supported.";

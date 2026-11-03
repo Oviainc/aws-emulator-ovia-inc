@@ -155,14 +155,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a request that names neither names nothing to revoke.
         if input.remove_all_permissions && input.statement_id.is_some() {
             return Err(crate::scaffolded::Scaffolded::validation(
-                "Parameter StatementId is not valid. Reason: RemoveAllPermissions revokes \
-                 every grant on the event bus, so it cannot be combined with StatementId.",
+                STATEMENT_ID_COMBINED_WITH_ALL,
             ));
         }
         if !input.remove_all_permissions && input.statement_id.is_none() {
             return Err(crate::scaffolded::Scaffolded::validation(
-                "Parameter StatementId must be specified, or RemoveAllPermissions must \
-                 revoke every grant on the event bus.",
+                STATEMENT_ID_MUST_BE_SPECIFIED,
             ));
         }
 
@@ -208,3 +206,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(RemovePermissionOutput)
     }
 }
+
+/// What this operation refuses a request that names ONE grant and asks for every
+/// grant at the same time with.
+///
+/// The two members are alternatives — one revokes the statement it names, the
+/// other the whole policy — and the refusal names them as the service does,
+/// echoing neither the statement id nor the bus the request carried.
+const STATEMENT_ID_COMBINED_WITH_ALL: &str =
+    "StatementId could not be combined with All parameter.";
+
+/// What this operation refuses a request that neither names a grant nor asks for
+/// every grant with.
+///
+/// One of the two members has to be there, and the refusal names the one the
+/// request would ordinarily carry — the same sentence `PutPermission` states
+/// for a member its grant form lacks.
+const STATEMENT_ID_MUST_BE_SPECIFIED: &str = "Parameter(s) StatementId must be specified.";

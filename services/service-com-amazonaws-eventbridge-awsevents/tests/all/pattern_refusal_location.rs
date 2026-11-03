@@ -150,8 +150,9 @@ fn expected_refusal(pattern: &str, reason: &str, read: &str) -> String {
 /// One malformed-pattern row: the case, the pattern as submitted, the reason the
 /// refusal states, and the PREFIX of the pattern the validator had to read before
 /// it could state it — a string's opening quote for a fault its type alone shows,
-/// the whole of a value for a fault read out of its content, and the text up to a
-/// member's value for a fault about that member.
+/// the whole of a value for a fault read out of its content, and the first
+/// character of a member's value for a fault about that member's NAME, which is
+/// where reading the name leaves the reader.
 struct Row {
     case: &'static str,
     pattern: &'static str,
@@ -180,7 +181,7 @@ fn location_rows() -> Vec<Row> {
         Row {
             case: "a leaf value nested inside detail",
             pattern: r#"{"detail": {"status": "FULFILLED"}}"#,
-            reason: r#""detail.status" must be an object or an array"#,
+            reason: r#""status" must be an object or an array"#,
             read: r#"{"detail": {"status": ""#,
         },
         // A numeric range whose bottom is not below its top admits no number at
@@ -313,13 +314,15 @@ fn location_rows() -> Vec<Row> {
             reason: "exists match pattern must be either true or false.",
             read: r#"{"detail": {"k": [{"exists": 1"#,
         },
-        // A match expression names ONE match type, so the second one it names is
-        // where the validator stops.
+        // A match expression names ONE match type, so the validator stops on
+        // the second one it names: reading that member's name consumes the
+        // colon after it and the first character of its argument too, so the
+        // position is one character into that argument.
         Row {
             case: "a match expression carrying two match types",
             pattern: r#"{"detail": {"k": [{"prefix": "a", "suffix": "b"}]}}"#,
             reason: "Only one key allowed in match expression",
-            read: r#"{"detail": {"k": [{"prefix": "a", "suffix": "#,
+            read: r#"{"detail": {"k": [{"prefix": "a", "suffix": ""#,
         },
         Row {
             // The column counts CHARACTERS, so a multi-byte character before the
@@ -327,14 +330,14 @@ fn location_rows() -> Vec<Row> {
             case: "a match expression whose first argument is multi-byte",
             pattern: r#"{"detail": {"k": [{"prefix": "é", "suffix": "b"}]}}"#,
             reason: "Only one key allowed in match expression",
-            read: r#"{"detail": {"k": [{"prefix": "é", "suffix": "#,
+            read: r#"{"detail": {"k": [{"prefix": "é", "suffix": ""#,
         },
         Row {
             // The position is a fact about the TEXT, so a pattern spelled over
             // several lines reports the line the fault falls on.
             case: "a pattern spelled over several lines",
             pattern: "{\n  \"detail\": {\n    \"k\": \"ok\"\n  }\n}",
-            reason: r#""detail.k" must be an object or an array"#,
+            reason: r#""k" must be an object or an array"#,
             read: "{\n  \"detail\": {\n    \"k\": \"",
         },
         Row {

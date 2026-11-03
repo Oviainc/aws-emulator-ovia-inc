@@ -354,9 +354,12 @@ fn refused(reason: &str) -> String {
 /// "You must include only authorization parameters for the AuthorizationType you
 /// specify" (`CreateConnection$AuthParameters`), and each type has exactly one
 /// member of `UpdateConnectionAuthRequestParameters` that carries its
-/// credentials. `changes_type` is what makes those credentials REQUIRED: an update
-/// that only renames the type would leave the connection holding the credentials
-/// of the old one, which authorize nothing.
+/// credentials. So a request that carries `AuthParameters` at all has to name ONE
+/// authorization type in them, which the service states as its own rule
+/// ([`crate::state::ONE_AUTHORIZATION_TYPE`]) — the same rule `CreateConnection`
+/// charges. `changes_type` is what makes those credentials REQUIRED when the
+/// request carries none: an update that only renames the type would leave the
+/// connection holding the credentials of the old one, which authorize nothing.
 fn auth_parameters_violation(
     authorization_type: &str,
     parameters: Option<&UpdateConnectionAuthRequestParameters>,
@@ -380,6 +383,10 @@ fn auth_parameters_violation(
             parameters.is_some_and(|given| given.o_auth_parameters.is_some()),
         ),
     ];
+    let named = supplied.iter().filter(|(_, _, present)| *present).count();
+    if parameters.is_some() && named != 1 {
+        return Some(crate::state::ONE_AUTHORIZATION_TYPE.to_string());
+    }
     for (kind, member, present) in supplied {
         if kind == authorization_type && changes_type && !present {
             return Some(format!(

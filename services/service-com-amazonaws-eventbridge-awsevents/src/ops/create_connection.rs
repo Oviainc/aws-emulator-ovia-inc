@@ -365,9 +365,14 @@ fn refused(reason: &str) -> String {
 /// specify" (`CreateConnection$AuthParameters`), and each type has exactly one
 /// member of `CreateConnectionAuthRequestParameters` that carries its
 /// credentials: `API_KEY` -> `ApiKeyAuthParameters`, `BASIC` ->
-/// `BasicAuthParameters`, `OAUTH_CLIENT_CREDENTIALS` -> `OAuthParameters`. The
-/// refusal names the member and what was expected of it, the way this service's
-/// other request-derived refusals do.
+/// `BasicAuthParameters`, `OAUTH_CLIENT_CREDENTIALS` -> `OAuthParameters`.
+///
+/// So the parameters have to name ONE authorization type: a set naming none
+/// (`InvocationHttpParameters` alone, or nothing at all) and a set naming
+/// several both fail the same rule, and the service states that rule itself
+/// ([`crate::state::ONE_AUTHORIZATION_TYPE`]) rather than naming a member. The
+/// one named still has to be the one `AuthorizationType` asks for, which is a
+/// different mismatch and keeps its own reason.
 fn auth_parameters_violation(
     authorization_type: &str,
     parameters: &CreateConnectionAuthRequestParameters,
@@ -390,17 +395,14 @@ fn auth_parameters_violation(
             parameters.o_auth_parameters.is_some(),
         ),
     ];
+    if supplied.iter().filter(|(_, _, present)| *present).count() != 1 {
+        return Some(crate::state::ONE_AUTHORIZATION_TYPE.to_string());
+    }
     for (kind, member, present) in supplied {
         if kind == authorization_type && !present {
             return Some(format!(
                 "Parameter AuthParameters is not valid. Reason: {member} is required for \
                  AuthorizationType {kind}."
-            ));
-        }
-        if kind != authorization_type && present {
-            return Some(format!(
-                "Parameter AuthParameters is not valid. Reason: {member} may only be \
-                 provided for AuthorizationType {kind}."
             ));
         }
     }

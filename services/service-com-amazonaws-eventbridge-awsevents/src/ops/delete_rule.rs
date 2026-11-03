@@ -210,12 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Force` says.
         if let Some(rule) = bus.rules.get(&input.name) {
             if !rule.targets.is_empty() {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Rule {} cannot be deleted since it still has {} target(s). Remove them \
-                     with RemoveTargets first.",
-                    input.name,
-                    rule.targets.len()
-                )));
+                return Err(crate::scaffolded::Scaffolded::validation(RULE_HAS_TARGETS));
             }
         }
 
@@ -227,3 +222,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DeleteRuleOutput)
     }
 }
+
+/// What this operation refuses a rule that still carries targets with.
+///
+/// The precondition is the operation's own ("Before you can delete the rule, you
+/// must remove all targets, using RemoveTargets"), and the refusal states it as
+/// the service does: one sentence about the rule's targets, naming neither the
+/// rule nor how many targets it carries, so every refused delete reads the same.
+const RULE_HAS_TARGETS: &str = "Rule can't be deleted since it has targets.";

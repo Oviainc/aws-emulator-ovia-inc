@@ -155,8 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(after) => Some(after),
                 None => {
                     return Err(crate::scaffolded::Scaffolded::validation(
-                        "Parameter NextToken is not valid. Reason: it is not a token this \
-                         service issued.",
+                        crate::state::INVALID_NEXT_TOKEN,
                     ))
                 }
             },

@@ -55,6 +55,8 @@ mod event_bus_lifecycle;
 mod event_bus_write_semantics;
 #[path = "all/fifo_queue_target_delivery.rs"]
 mod fifo_queue_target_delivery;
+#[path = "all/fixed_refusal_sentences.rs"]
+mod fixed_refusal_sentences;
 #[path = "all/global_endpoint.rs"]
 mod global_endpoint;
 #[path = "all/global_endpoint_deletion.rs"]
