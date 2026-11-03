@@ -354,6 +354,123 @@ pub async fn fleet(router: &MultiServiceRouter) -> Fleet {
     Fleet { panels }
 }
 
+/// The rule configuration a safety rule is created with: the three members of the control
+/// plane's modelled `RuleConfig` (`Type`, `Threshold`, `Inverted`).
+#[derive(Debug, Clone, Copy)]
+pub struct RuleConfigSpec {
+    /// A value of the modelled `RuleType` enum: `ATLEAST`, `AND` or `OR`.
+    pub rule_type: &'static str,
+    pub threshold: i32,
+    pub inverted: bool,
+}
+
+impl RuleConfigSpec {
+    /// This configuration as the `RuleConfig` body the control plane takes.
+    fn body(self) -> Value {
+        json!({
+            "Type": self.rule_type,
+            "Threshold": self.threshold,
+            "Inverted": self.inverted,
+        })
+    }
+}
+
+/// Create one ASSERTION safety rule over `asserted` and answer its `SafetyRuleArn`, once
+/// the control plane reports the rule `DEPLOYED`.
+pub async fn create_assertion_rule(
+    router: &MultiServiceRouter,
+    panel_arn: &str,
+    name: &str,
+    asserted: &[String],
+    config: RuleConfigSpec,
+) -> String {
+    create_safety_rule(
+        router,
+        name,
+        json!({
+            "AssertionRule": {
+                "AssertedControls": asserted,
+                "ControlPanelArn": panel_arn,
+                "Name": name,
+                "RuleConfig": config.body(),
+                "WaitPeriodMs": 5000,
+            }
+        }),
+        "AssertionRule",
+    )
+    .await
+}
+
+/// Create one GATING safety rule whose `gating` controls gate `targets`, and answer its
+/// `SafetyRuleArn` once the control plane reports it `DEPLOYED`.
+pub async fn create_gating_rule(
+    router: &MultiServiceRouter,
+    panel_arn: &str,
+    name: &str,
+    gating: &[String],
+    targets: &[String],
+    config: RuleConfigSpec,
+) -> String {
+    create_safety_rule(
+        router,
+        name,
+        json!({
+            "GatingRule": {
+                "ControlPanelArn": panel_arn,
+                "GatingControls": gating,
+                "Name": name,
+                "RuleConfig": config.body(),
+                "TargetControls": targets,
+                "WaitPeriodMs": 5000,
+            }
+        }),
+        "GatingRule",
+    )
+    .await
+}
+
+/// `CreateSafetyRule` with `body`, then poll `DescribeSafetyRule` until the rule's
+/// `Status` is `DEPLOYED` — the point from which it guards state updates.
+async fn create_safety_rule(
+    router: &MultiServiceRouter,
+    name: &str,
+    body: Value,
+    member: &str,
+) -> String {
+    let (status, created) = control_plane(router, "POST", "/safetyrule", Some(body)).await;
+    assert_eq!(
+        status, 200,
+        "case CreateSafetyRule({name}): expected 200, got {status} with {created}"
+    );
+    let arn = created[member]["SafetyRuleArn"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case CreateSafetyRule({name}): a created rule has an ARN, got {created}")
+        })
+        .to_string();
+
+    // The control plane deploys a created rule asynchronously, so the rule is waited for
+    // rather than assumed; the bound makes a rule that never deploys fail the test.
+    for _ in 0..400 {
+        let (status, described) = control_plane(
+            router,
+            "GET",
+            &format!("/safetyrule/{}", encode_arn(&arn)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case DescribeSafetyRule({name}): expected 200, got {status} with {described}"
+        );
+        if described[member]["Status"].as_str() == Some("DEPLOYED") {
+            return arn;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("case CreateSafetyRule({name}): the rule never reached Status DEPLOYED");
+}
+
 /// `GetRoutingControlState` for `arn`, expecting success.
 pub async fn get_state(router: &MultiServiceRouter, arn: &str) -> Value {
     let (status, body) = call(

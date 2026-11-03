@@ -24,6 +24,11 @@
 //! `GetRoutingControlState` and `ListRoutingControls` stay pure reads: nothing is written
 //! merely because a control was read.
 //!
+//! The safety rules that decide whether a switch may MOVE are the control plane's
+//! records as well, so they are read from the registry too and no copy of them is kept
+//! here: [`DataPlane::safety_rule_violation`] evaluates them for a proposed transaction,
+//! which is what the two update operations ask before they write anything.
+//!
 //! No pagination-token table lives here either: `ListRoutingControls` encodes its cursor
 //! (the filter it was issued for, plus the routing control the next page starts at) into
 //! the opaque `NextToken` itself, so issuing a page costs no state write.
@@ -45,7 +50,11 @@ use std::sync::MutexGuard;
 /// engine, so the two services cannot disagree about which routing controls exist.
 use service_com_amazonaws_route53recoverycontrolconfig_route53recoverycontrolconfig as recovery_control_config;
 
-use recovery_control_config::state::{RoutingControlRecord, Store as Registry};
+use recovery_control_config::ops::types::RuleConfig;
+use recovery_control_config::state::{
+    status_at, RoutingControlRecord, SafetyRuleControls, SafetyRuleRecord, Store as Registry,
+    STATUS_DEPLOYED,
+};
 
 /// The most routing control states one `UpdateRoutingControlStates` call may carry.
 ///
@@ -230,6 +239,100 @@ impl DataPlane<'_> {
         Some(previous)
     }
 
+    /// The switch `routing_control_arn` is in right now — [`INITIAL_ROUTING_CONTROL_STATE`]
+    /// while no update has moved it.
+    pub fn state_of(&self, routing_control_arn: &str) -> RoutingControlState {
+        self.switches
+            .routing_control_states
+            .get(routing_control_arn)
+            .copied()
+            .unwrap_or(INITIAL_ROUTING_CONTROL_STATE)
+    }
+
+    /// The state `routing_control_arn` would be in once `proposed` is applied: the state
+    /// the transaction sets it to, or the one it is in now when the transaction does not
+    /// name it.
+    fn state_after(
+        &self,
+        routing_control_arn: &str,
+        proposed: &[(String, RoutingControlState)],
+    ) -> RoutingControlState {
+        proposed
+            .iter()
+            .find(|(arn, _)| arn == routing_control_arn)
+            .map_or_else(
+                || self.state_of(routing_control_arn),
+                |(_, state)| *state,
+            )
+    }
+
+    /// The first deployed safety rule the transaction `proposed` would leave unsatisfied,
+    /// or `None` when every rule that governs it holds — which is what decides whether
+    /// the transaction may be written at all.
+    ///
+    /// A rule governs a transaction that changes one of the controls it guards (an
+    /// assertion rule's `AssertedControls`, a gating rule's `TargetControls`), and is
+    /// evaluated over the post-transaction state of the controls its configuration reads
+    /// (the same `AssertedControls`, a gating rule's `GatingControls`) — so a gating
+    /// control is not itself gated by its own rule. A rule whose ARN the caller listed in
+    /// `overridden` is left out of the evaluation, and only a rule whose configuration has
+    /// finished deploying guards anything.
+    ///
+    /// Reporting is pure: nothing here writes.
+    pub fn safety_rule_violation(
+        &self,
+        proposed: &[(String, RoutingControlState)],
+        overridden: Option<&[String]>,
+    ) -> Option<SafetyRuleViolation> {
+        let overridden = overridden.unwrap_or_default();
+
+        // Creation order, so the rule a refusal names is stable rather than a function of
+        // how the ARNs happen to sort.
+        let mut rules: Vec<&SafetyRuleRecord> = self.registry.safety_rules.values().collect();
+        rules.sort_by_key(|rule| rule.seq);
+
+        for rule in rules {
+            if overridden.contains(&rule.arn) {
+                continue;
+            }
+            if status_at(rule.deploy_due) != STATUS_DEPLOYED {
+                continue;
+            }
+
+            let (guarded, evaluated) = match &rule.controls {
+                SafetyRuleControls::Assertion { asserted_controls } => {
+                    (asserted_controls.as_slice(), asserted_controls.as_slice())
+                }
+                SafetyRuleControls::Gating {
+                    gating_controls,
+                    target_controls,
+                } => (target_controls.as_slice(), gating_controls.as_slice()),
+            };
+
+            if !proposed.iter().any(|(arn, _)| guarded.contains(arn)) {
+                continue;
+            }
+            let Some(required_on) = controls_required_on(&rule.rule_config, evaluated.len()) else {
+                continue;
+            };
+
+            let would_be_on = evaluated
+                .iter()
+                .filter(|arn| self.state_after(arn, proposed) == RoutingControlState::On)
+                .count();
+            // `Inverted` is the logical negation of the rule, so it flips the verdict
+            // rather than the count.
+            if (would_be_on >= required_on) == rule.rule_config.inverted {
+                return Some(SafetyRuleViolation {
+                    safety_rule_arn: rule.arn.clone(),
+                    message: safety_rule_violation_message(rule, would_be_on, evaluated.len()),
+                });
+            }
+        }
+
+        None
+    }
+
     /// One registry record as the routing control this data plane reports.
     fn project(&self, record: &RoutingControlRecord) -> RoutingControl {
         RoutingControl {
@@ -242,15 +345,69 @@ impl DataPlane<'_> {
                 .get(&record.control_panel_arn)
                 .map(|panel| panel.name.clone()),
             cluster_arn: record.cluster_arn.clone(),
-            state: self
-                .switches
-                .routing_control_states
-                .get(&record.arn)
-                .copied()
-                .unwrap_or(INITIAL_ROUTING_CONTROL_STATE),
+            state: self.state_of(&record.arn),
             owner: record.owner.clone(),
         }
     }
+}
+
+/// A deployed safety rule a proposed transaction would leave unsatisfied.
+///
+/// Carries the rule's ARN as well as the sentence the refusal states, because that ARN is
+/// what a caller puts in `SafetyRulesToOverride` to force the change through.
+#[derive(Debug, Clone)]
+pub struct SafetyRuleViolation {
+    /// ARN of the rule whose configuration does not hold.
+    pub safety_rule_arn: String,
+    /// The `ValidationException$Message` the refusal states.
+    pub message: String,
+}
+
+/// How many of the routing controls a rule evaluates must be `On` for its configuration
+/// to hold, before `Inverted` is applied.
+///
+/// The modelled `RuleType` values define it
+/// (`smithy_query(query="doc",shape="RuleType",model_path="services/service-com-amazonaws-route53recoverycontrolconfig-route53recoverycontrolconfig/smithy-model/com-amazonaws-route53recoverycontrolconfig-route53recoverycontrolconfig.json")`):
+/// `ATLEAST` is the rule's own `Threshold` ("at least N routing controls must be set",
+/// N being the threshold), `AND` is every control the rule evaluates ("a shortcut for
+/// 'at least N', where N is the total number of controls in the rule") and `OR` is one
+/// ("a shortcut for 'at least N', where N is 1"). A type outside that value set is no
+/// modelled rule type and decides nothing, so such a rule guards nothing.
+fn controls_required_on(config: &RuleConfig, evaluated: usize) -> Option<usize> {
+    match config.r#type.as_str() {
+        "ATLEAST" => Some(config.threshold.max(0).unsigned_abs() as usize),
+        "AND" => Some(evaluated),
+        "OR" => Some(1),
+        _ => None,
+    }
+}
+
+/// The `ValidationException$Message` an update a safety rule refuses states.
+///
+/// Names the rule that does not hold — its kind, its name and the ARN that overrides it —
+/// then the count of its controls that the transaction would leave `On` against the rule
+/// configuration that count has to satisfy. Every value comes from the stored rule and
+/// the proposed transaction.
+fn safety_rule_violation_message(
+    rule: &SafetyRuleRecord,
+    would_be_on: usize,
+    evaluated: usize,
+) -> String {
+    let (kind, controls) = match &rule.controls {
+        SafetyRuleControls::Assertion { .. } => ("assertion", "asserted"),
+        SafetyRuleControls::Gating { .. } => ("gating", "gating"),
+    };
+    format!(
+        "Routing control state update would violate the {kind} safety rule '{name}' ({arn}): \
+         {would_be_on} of its {evaluated} {controls} routing controls would be On, which does \
+         not satisfy its rule configuration (Type {rule_type}, Threshold {threshold}, Inverted \
+         {inverted}).",
+        name = rule.name,
+        arn = rule.arn,
+        rule_type = rule.rule_config.r#type,
+        threshold = rule.rule_config.threshold,
+        inverted = rule.rule_config.inverted,
+    )
 }
 
 /// The `ResourceNotFoundException$ResourceType` a routing control lookup reports.

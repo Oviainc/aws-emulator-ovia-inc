@@ -17,5 +17,7 @@ mod common;
 mod control_plane_registry;
 #[path = "all/routing_control_toggle.rs"]
 mod routing_control_toggle;
+#[path = "all/safety_rule_enforcement.rs"]
+mod safety_rule_enforcement;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

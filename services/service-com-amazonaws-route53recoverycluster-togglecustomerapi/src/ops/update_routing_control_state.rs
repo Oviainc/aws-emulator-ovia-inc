@@ -9,8 +9,11 @@
 //! `ResourceNotFoundException` (404), and a state outside the modelled `On`/`Off` value
 //! set is a `ValidationException` (400).
 //!
-//! `SafetyRulesToOverride` is accepted and IGNORED in this first slice: safety-rule
-//! assertion and gating is left to its own gap issue.
+//! The deployed safety rules of the control panels the change touches are evaluated
+//! BEFORE the switch moves ([`crate::state::DataPlane::safety_rule_violation`]): an
+//! update that would leave a rule's configuration unsatisfied is a `ValidationException`
+//! (400) and writes nothing, and a rule whose ARN the request lists in
+//! `SafetyRulesToOverride` is left out of that evaluation (the "break glass" override).
 //!
 //! ## Shape of an operation
 //!
@@ -177,10 +180,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // presented access-key id from it.
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
 
-        // `SafetyRulesToOverride` is accepted and ignored in this slice (see the
-        // module header): no safety rule is asserted yet, so there is none to override.
-        let _ = &input.safety_rules_to_override;
-
         // The modelled `RoutingControlState` value set is enforced at the boundary
         // before this handler runs; parsing it again here keeps the stored state a
         // typed switch rather than whatever string arrived.
@@ -217,22 +216,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // Resolve and move the switch under ONE pair of guards, so the control cannot
-        // vanish between the lookup and the write.
+        // Resolve, gate and move the switch under ONE pair of guards, so neither the
+        // control nor a rule guarding it can change between the checks and the write.
         let mut plane = stores.lock();
-        let Some(previous_state) = plane.set_state(&input.routing_control_arn, new_state) else {
+
+        // An ARN the control plane minted nothing for addresses no resource at all, which
+        // is answered before any rule is consulted.
+        if plane.cluster_of(&input.routing_control_arn).is_none() {
+            return Err(not_found(&input.routing_control_arn));
+        }
+
+        // The safety rules of the control panel hosting this control are the standing
+        // answer to whether this change may be made, so they are evaluated over the state
+        // the control WOULD be in, and nothing is written when one of them does not hold.
+        let proposed = [(input.routing_control_arn.clone(), new_state)];
+        if let Some(violation) = plane.safety_rule_violation(
+            &proposed,
+            input.safety_rules_to_override.as_deref(),
+        ) {
             return Err(
-                UpdateRoutingControlStateErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::routing_control_not_found_message(
-                            &input.routing_control_arn,
-                        ),
-                        resource_id: input.routing_control_arn.clone(),
-                        resource_type: crate::state::ROUTING_CONTROL_RESOURCE_TYPE.to_string(),
-                    },
-                )
+                UpdateRoutingControlStateErrorModeled::ValidationException(ValidationException {
+                    message: violation.message,
+                    reason: Some("other".to_string()),
+                    fields: None,
+                })
                 .into(),
             );
+        }
+
+        let Some(previous_state) = plane.set_state(&input.routing_control_arn, new_state) else {
+            return Err(not_found(&input.routing_control_arn));
         };
 
         // Audit record for a state-changing call: the caller's presented access-key
@@ -249,4 +262,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The modelled output carries no members: the state change IS the result.
         Ok(UpdateRoutingControlStateOutput {})
     }
+}
+
+/// The modelled `ResourceNotFoundException` (404) for a `RoutingControlArn` the control
+/// plane minted no routing control for, worded in the one place this service words it.
+fn not_found(routing_control_arn: &str) -> UpdateRoutingControlStateError {
+    UpdateRoutingControlStateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::routing_control_not_found_message(routing_control_arn),
+        resource_id: routing_control_arn.to_string(),
+        resource_type: crate::state::ROUTING_CONTROL_RESOURCE_TYPE.to_string(),
+    })
+    .into()
 }

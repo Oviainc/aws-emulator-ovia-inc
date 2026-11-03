@@ -10,8 +10,14 @@
 //! `ServiceLimitExceededException` (402); a duplicate ARN in one batch, entries spanning
 //! more than one cluster, or a state outside the modelled `On`/`Off` value set is a
 //! `ValidationException` (400); an ARN no control-plane routing control was minted for is
-//! a `ResourceNotFoundException` (404). `SafetyRulesToOverride` is accepted and IGNORED in
-//! this first slice: safety-rule assertion and gating is left to its own gap issue.
+//! a `ResourceNotFoundException` (404).
+//!
+//! The deployed safety rules of the control panels the batch touches are evaluated over
+//! the WHOLE proposed entry set before anything is written
+//! ([`crate::state::DataPlane::safety_rule_violation`]): a batch that would leave a rule's
+//! configuration unsatisfied is a `ValidationException` (400) and leaves no partial
+//! mutation, and a rule whose ARN the request lists in `SafetyRulesToOverride` is left out
+//! of that evaluation (the "break glass" override).
 //!
 //! ## Shape of an operation
 //!
@@ -178,10 +184,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // presented access-key id from it.
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
 
-        // `SafetyRulesToOverride` is accepted and ignored in this slice (see the
-        // module header): no safety rule is asserted yet, so there is none to override.
-        let _ = &input.safety_rules_to_override;
-
         let entries = &input.update_routing_control_state_entries;
 
         // The batch cap is a request-shape rule, so it is answered before the
@@ -287,6 +289,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             resolved.push((entry.routing_control_arn.clone(), new_state));
+        }
+
+        // The batch is ONE transaction, so the safety rules are evaluated over the state
+        // every named control would be in once the whole set is applied — a batch can
+        // therefore satisfy a rule that neither of its entries could on its own. A rule
+        // the request named is left out of the evaluation (break glass).
+        if let Some(violation) =
+            plane.safety_rule_violation(&resolved, input.safety_rules_to_override.as_deref())
+        {
+            return Err(
+                UpdateRoutingControlStatesErrorModeled::ValidationException(ValidationException {
+                    message: violation.message,
+                    reason: Some("other".to_string()),
+                    fields: None,
+                })
+                .into(),
+            );
         }
 
         // Commit: every ARN above resolved through these same guards, so each write
