@@ -155,9 +155,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         domain.remove_profile(&input.profile_id).ok_or_else(|| {
             DeleteProfileError::from(DeleteProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "The profile {} does not exist in domain {}",
-                        input.profile_id, input.domain_name
+                    message: Some(crate::state::profile_not_found(
+                        &input.domain_name,
+                        &input.profile_id,
                     )),
                 },
             ))

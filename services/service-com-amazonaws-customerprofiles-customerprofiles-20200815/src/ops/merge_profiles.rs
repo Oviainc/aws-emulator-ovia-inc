@@ -187,10 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut participants: Vec<(String, Profile)> = Vec::with_capacity(merge_order.len());
         for id in &merge_order {
             let stored = domain.profiles.get(*id).ok_or_else(|| {
-                not_found(format!(
-                    "The profile {} does not exist in domain {}",
-                    id, input.domain_name
-                ))
+                not_found(crate::state::profile_not_found(&input.domain_name, id))
             })?;
             participants.push(((*id).to_string(), stored.profile.clone()));
         }

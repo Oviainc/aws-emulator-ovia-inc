@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the update to the stored profile member by member: a member the request does
+//! not carry keeps the value already there, a string member carrying the empty string
+//! has its value removed, and any other value replaces it. The profile is written back
+//! under its own id, re-indexed, so a later search finds it under the keys the update
+//! left it with. The attributes a request carries are MERGED into the ones stored, so the
+//! merged map is what carries this service's per-profile attribute cap.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +190,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProfile"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let domain = store
+            .domains
+            .get_mut(&input.domain_name)
+            .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+        // The profile is addressed inside one domain, so an id that domain does not hold
+        // is not found however many profiles another domain holds under it.
+        let stored = domain
+            .profiles
+            .get(&input.profile_id)
+            .cloned()
+            .ok_or_else(|| {
+                not_found(crate::state::profile_not_found(
+                    &input.domain_name,
+                    &input.profile_id,
+                ))
+            })?;
+
+        let mut profile = stored.profile;
+        // Applied member by member, never as a wholesale replacement: a member the request
+        // omits is left exactly as it was stored.
+        apply(&mut profile.account_number, input.account_number);
+        apply(&mut profile.additional_information, input.additional_information);
+        apply(&mut profile.party_type, input.party_type);
+        apply(&mut profile.business_name, input.business_name);
+        apply(&mut profile.first_name, input.first_name);
+        apply(&mut profile.middle_name, input.middle_name);
+        apply(&mut profile.last_name, input.last_name);
+        apply(&mut profile.birth_date, input.birth_date);
+        apply(&mut profile.gender, input.gender);
+        apply(&mut profile.phone_number, input.phone_number);
+        apply(&mut profile.mobile_phone_number, input.mobile_phone_number);
+        apply(&mut profile.home_phone_number, input.home_phone_number);
+        apply(&mut profile.business_phone_number, input.business_phone_number);
+        apply(&mut profile.email_address, input.email_address);
+        apply(&mut profile.personal_email_address, input.personal_email_address);
+        apply(&mut profile.business_email_address, input.business_email_address);
+        apply(&mut profile.party_type_string, input.party_type_string);
+        apply(&mut profile.gender_string, input.gender_string);
+        apply(&mut profile.profile_type, input.profile_type);
+        apply_address(&mut profile.address, input.address);
+        apply_address(&mut profile.shipping_address, input.shipping_address);
+        apply_address(&mut profile.mailing_address, input.mailing_address);
+        apply_address(&mut profile.billing_address, input.billing_address);
+        apply_attributes(&mut profile.attributes, input.attributes, &input.profile_id)?;
+        // `EngagementPreferences` carries no string of its own, so no empty string could
+        // clear it: the structure a request carries replaces the one stored, and a request
+        // without it keeps what is there.
+        if input.engagement_preferences.is_some() {
+            profile.engagement_preferences = input.engagement_preferences;
+        }
+        // The id is the profile's identity rather than an updatable member.
+        profile.profile_id = Some(input.profile_id.clone());
+        // `FoundByItems` describes which search keys matched one `SearchProfiles`
+        // response, so it is never stored on a profile.
+        profile.found_by_items = None;
+
+        // Re-stored under the same id and the instant it was created at: this is an edit
+        // of one profile, not a new one. `put_profile` re-indexes it, so a search answers
+        // from the values the update left behind rather than the ones it replaced.
+        domain.put_profile(crate::state::StoredProfile {
+            profile,
+            created_at: stored.created_at,
+            last_updated_at: now,
+        });
+
+        Ok(UpdateProfileOutput {
+            profile_id: input.profile_id,
+        })
     }
+}
+
+/// One updatable string member: a member the request does not carry keeps the stored
+/// value, the empty string removes it, and any other value replaces it.
+fn apply(stored: &mut Option<String>, update: Option<String>) {
+    if let Some(value) = update {
+        *stored = (!value.is_empty()).then_some(value);
+    }
+}
+
+/// One updatable address member: the same rule applied to each of the address's own
+/// string members, so one request can clear a line of an address and keep the rest. An
+/// address left carrying no member at all is no address.
+fn apply_address(stored: &mut Option<Address>, update: Option<UpdateAddress>) {
+    let Some(update) = update else {
+        return;
+    };
+    let mut address = stored.take().unwrap_or_default();
+    // The members are walked once, paired with what the request said about each, so the
+    // address cannot gain a member here that the walk below does not also see.
+    let mut carries_a_member = false;
+    let members: [(&mut Option<String>, Option<String>); 10] = [
+        (&mut address.address1, update.address1),
+        (&mut address.address2, update.address2),
+        (&mut address.address3, update.address3),
+        (&mut address.address4, update.address4),
+        (&mut address.city, update.city),
+        (&mut address.county, update.county),
+        (&mut address.state, update.state),
+        (&mut address.province, update.province),
+        (&mut address.country, update.country),
+        (&mut address.postal_code, update.postal_code),
+    ];
+    for (member, value) in members {
+        apply(&mut *member, value);
+        carries_a_member |= member.is_some();
+    }
+    *stored = carries_a_member.then_some(address);
+}
+
+/// `Attributes` updated entry by entry: an entry whose value is the empty string removes
+/// that attribute, any other value sets it, and a key the request does not mention keeps
+/// whatever is stored under it. A profile left with no attribute carries none.
+///
+/// The update MERGES into what is stored, so one request's map does not bound what
+/// accumulates on a profile: the merged map is refused past
+/// [`crate::state::MAX_ATTRIBUTES_PER_PROFILE`] before anything is written.
+fn apply_attributes(
+    stored: &mut Option<::std::collections::HashMap<String, String>>,
+    update: Option<::std::collections::HashMap<String, String>>,
+    profile_id: &str,
+) -> Result<(), UpdateProfileError> {
+    let Some(update) = update else {
+        return Ok(());
+    };
+    let mut attributes = stored.take().unwrap_or_default();
+    for (key, value) in update {
+        if value.is_empty() {
+            attributes.remove(&key);
+        } else {
+            attributes.insert(key, value);
+        }
+    }
+    if attributes.len() > crate::state::MAX_ATTRIBUTES_PER_PROFILE {
+        return Err(bad_request(format!(
+            "The maximum number of attributes for profile {} has been reached: {}",
+            profile_id,
+            crate::state::MAX_ATTRIBUTES_PER_PROFILE
+        )));
+    }
+    *stored = (!attributes.is_empty()).then_some(attributes);
+    Ok(())
+}
+
+/// The request is invalid — HTTP 400, the error code a client branches on.
+fn bad_request(message: String) -> UpdateProfileError {
+    UpdateProfileErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A domain or profile the request names is not stored.
+fn not_found(message: String) -> UpdateProfileError {
+    UpdateProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> UpdateProfileError {
+    UpdateProfileErrorModeled::InternalServerException(crate::state::store_unavailable()).into()
 }

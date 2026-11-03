@@ -70,6 +70,16 @@ pub const MAX_DOMAINS: usize = 100;
 /// any realistic emulator workload.
 pub const MAX_PROFILES_PER_DOMAIN: usize = 10_000;
 
+/// Emulator resource guard, NOT an AWS quota (the service publishes no limit on a
+/// profile's attribute map): the most attributes this emulator keeps on one profile.
+///
+/// `UpdateProfile` MERGES the attributes a request carries into the ones already stored,
+/// so one request's own map does not bound what accumulates on a profile: the cap is
+/// checked against the MERGED map, before it is stored, which is what keeps repeated
+/// updates from growing one profile without bound. Set well above any realistic emulator
+/// workload.
+pub const MAX_ATTRIBUTES_PER_PROFILE: usize = 1_000;
+
 /// Emulator resource guard, NOT an AWS quota: the most profile object types this
 /// emulator stores for one domain. Set well above any realistic emulator workload, and
 /// checked before the insert so repeated `PutProfileObjectType` calls cannot grow the
@@ -931,6 +941,15 @@ pub fn clear_if_empty(value: String) -> Option<String> {
 /// same whichever of them was called.
 pub fn domain_not_found(domain_name: &str) -> String {
     format!("Domain {domain_name} is not found")
+}
+
+/// The `ResourceNotFoundException` message for a profile a domain does not hold, worded
+/// like every other per-domain resource this service reports absent: the resource kind,
+/// the identifier the request carried, and the domain it was looked for in. Shared by
+/// every operation addressing one profile, so the same absent id reads the same whichever
+/// of them was called.
+pub fn profile_not_found(domain_name: &str, profile_id: &str) -> String {
+    format!("The profile {profile_id} does not exist in domain {domain_name}")
 }
 
 /// The `ResourceNotFoundException` message for a recommender schema a domain does not
