@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAppInstanceAdmin
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAppInstanceAdmin`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAppInstanceAdmin::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! DEMOTES an administrator of the named `AppInstance` back to an ordinary
+//! `AppInstanceUser` or `AppInstanceBot`: it drops the recorded promotion from the shared
+//! app-instance admin directory ([`crate::state::app_instance_admins`]) and leaves the
+//! identity itself in place, so `DescribeAppInstanceUser` still reads the user back while
+//! `DescribeAppInstanceAdmin` no longer finds a promotion.
+//!
+//! Dropping a promotion is IDEMPOTENT: an identity the directory holds no promotion for is
+//! already not an administrator, so the modelled 204 is the truthful answer and nothing is
+//! written. Only the app instance the request is scoped to has to exist, because the
+//! operation addresses a subresource of it: an ARN whose app instance was DELETED is
+//! refused as a request the caller may no longer make, and one that never named an app
+//! instance as absent.
 //!
 //! ## Shape of an operation
 //!
@@ -176,20 +180,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAppInstanceAdmin` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAppInstanceAdminErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAppInstanceAdmin"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAppInstanceAdminErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the AppInstance store is unavailable".to_string()),
+            })
+        })?;
+        let directory = crate::state::app_instance_admins(&*self.engine).ok_or_else(|| {
+            DeleteAppInstanceAdminErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the AppInstanceAdmin directory is unavailable".to_string()),
+            })
+        })?;
+
+        // The promotion being dropped belongs to an app instance, so that app instance has
+        // to exist for the request to address anything at all. An ARN whose app instance
+        // was DELETED is refused as a request this caller may no longer make, and one that
+        // never named an app instance as absent — the two answers the rest of this service
+        // gives for an ARN it cannot resolve.
+        {
+            let store = state.lock();
+            if !store.app_instances.contains_key(&input.app_instance_arn) {
+                return Err(unresolved(
+                    store.unresolved_arn(&input.app_instance_arn),
+                    format!("AppInstance {} does not exist", input.app_instance_arn),
+                ));
+            }
+        }
+
+        // Demoting is the removal of one record from a SET, so it is idempotent: whether
+        // the directory held a promotion for this identity or not, after this call it holds
+        // none and the identity administers nothing. The identity itself is left in place —
+        // only the promotion is dropped. `demote` answers whether a record was there,
+        // which is deliberately discarded: the answer is 204 either way.
+        directory
+            .lock()
+            .demote(&input.app_instance_arn, &input.app_instance_admin_arn);
+
+        Ok(DeleteAppInstanceAdminOutput)
     }
 }
+
+/// Refuse the request for an ARN this service holds no resource for.
+///
+/// An ARN whose `AppInstance` has been DELETED is refused as a request this caller may no
+/// longer make: the instance that scoped the promotion is gone, and that is a different
+/// answer from the one an ARN that never named a resource earns.
+fn unresolved(
+    unresolved: crate::state::UnresolvedArn,
+    absent: String,
+) -> DeleteAppInstanceAdminError {
+    match unresolved {
+        crate::state::UnresolvedArn::DeletedAppInstance => {
+            DeleteAppInstanceAdminErrorModeled::ForbiddenException(ForbiddenException {
+                code: Some("Forbidden".to_string()),
+                message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+            })
+            .into()
+        }
+        crate::state::UnresolvedArn::NeverExisted => not_found(absent),
+    }
+}
+
+/// Refuse the request for a resource this service does not hold.
+///
+/// This operation models no 404 shape, so an absent resource is reported the way the rest
+/// of this service reports one: the modelled `BadRequestException` carrying the `NotFound`
+/// error code.
+fn not_found(message: String) -> DeleteAppInstanceAdminError {
+    DeleteAppInstanceAdminErrorModeled::BadRequestException(BadRequestException {
+        code: Some("NotFound".to_string()),
+        message: Some(message),
+    })
+    .into()
+}
+
