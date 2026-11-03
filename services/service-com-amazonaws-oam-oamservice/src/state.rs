@@ -28,13 +28,12 @@
 //!
 //! A few stored members are not reported by any operation in this slice — a link's
 //! `sink_id` and `created_at`, and a sink's `owner_account` and `created_at`. They are
-//! written where the resource is created so the slices that read them (`UntagResource`
-//! and `ListSinks`, still 501 stubs) read the same record rather than a second copy of
-//! it, and so the account that owns a sink is the one `CreateLink` compares a source
-//! account against.
+//! written where the resource is created so any later slice that reads them reads the
+//! same record rather than a second copy of it, and so the account that owns a sink is
+//! the one `CreateLink` compares a source account against.
 //!
-//! Tags live on the resource record itself, so `TagResource` writes through the very
-//! map `CreateSink`/`CreateLink` seeded and `GetSink`/`GetLink` and
+//! Tags live on the resource record itself, so `TagResource` and `UntagResource` write
+//! through the very map `CreateSink`/`CreateLink` seeded and `GetSink`/`GetLink` and
 //! `ListTagsForResource` report
 //! ([`ComAmazonawsOamOamserviceState::resource_tags`]): a resource has ONE tag set
 //! however it is reached.

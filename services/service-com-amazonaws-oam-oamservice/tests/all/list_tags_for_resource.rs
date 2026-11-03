@@ -40,7 +40,11 @@ const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found.";
 /// what the framework's own path decoder (`percent_decode_path` in
 /// `vendor/smithy-schema-server/src/http_binding.rs`) reads back, so the handler sees
 /// the ARN decoded. Encoding `/` is what makes the ARN ONE segment rather than two.
-fn percent_encode_segment(value: &str) -> String {
+///
+/// `pub(crate)` so the sibling `UntagResource` suite encodes a wire value — a path
+/// label or an `@httpQuery` entry — through this one encoder rather than a second copy
+/// of it.
+pub(crate) fn percent_encode_segment(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
@@ -78,7 +82,10 @@ fn tags_request(resource_arn: &str, akid: &str, region: &str) -> http::Request<b
 }
 
 /// Status and parsed body of one `ListTagsForResource` call signed for `region`.
-async fn list_tags(
+///
+/// `pub(crate)` so the sibling `UntagResource` suite reads a resource's tags back
+/// through the very operation that reports them.
+pub(crate) async fn list_tags(
     router: &MultiServiceRouter,
     resource_arn: &str,
     region: &str,

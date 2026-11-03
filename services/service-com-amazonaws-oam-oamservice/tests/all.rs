@@ -29,5 +29,7 @@ mod sink_policy;
 mod sinks_and_links;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
 #[path = "all/update_link.rs"]
 mod update_link;
