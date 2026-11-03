@@ -264,6 +264,14 @@ pub const MAX_ARN_LEN: usize = 2048;
 /// one arrives at the cap, so a long-running emulator cannot grow without bound.
 pub const MAX_CLIENT_TOKENS: usize = 1024;
 
+/// The message every `IdempotentParameterMismatchException` this service answers
+/// carries: RAM words this refusal with one fixed sentence, identical for every
+/// tokened operation and interpolating nothing from the request, so every handler
+/// that compares a [`ClientTokenRecord`]'s fingerprint reports it from here.
+pub const IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
+    "The request has the same client token as a previous request, but the requests are not the \
+     same.";
+
 /// The largest page any paginated read here builds, and the size it uses when the
 /// request omits `maxResults`: the maximum of the modelled `MaxResults` range
 /// (1..500).

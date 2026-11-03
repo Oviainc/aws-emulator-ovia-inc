@@ -296,8 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         AssociateResourceShareErrorModeled::IdempotentParameterMismatchException(
                             IdempotentParameterMismatchException {
-                                message: "clientToken was already used for an \
-                                          AssociateResourceShare request with different parameters"
+                                message: crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE
                                     .to_string(),
                             },
                         )
