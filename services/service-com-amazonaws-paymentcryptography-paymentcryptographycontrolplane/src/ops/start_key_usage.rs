@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartKeyUsage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartKeyUsage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartKeyUsage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +169,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartKeyUsage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartKeyUsageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartKeyUsage"))
+        // `KeyIdentifier`'s pattern and 7..322 length are modelled, so the
+        // centralized walk has already refused anything that is neither a key ARN nor
+        // an alias before this body runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartKeyUsageErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the payment cryptography key store is unavailable".to_string()),
+            })
+        })?;
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        let key = store.key_mut(&input.key_identifier).ok_or_else(|| {
+            StartKeyUsageErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                resource_id: Some(input.key_identifier.clone()),
+            })
+        })?;
+
+        // Only a key that is still active can be made active for cryptographic
+        // operations: one waiting to be deleted has to be restored first, and one the
+        // clock has deleted is gone.
+        if !key.is_active(now) {
+            let current = key.effective_state(now).to_string();
+            return Err(StartKeyUsageErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "the key {} is {current}, not {}, so its usage cannot be started",
+                    input.key_identifier,
+                    crate::state::KEY_STATE_CREATE_COMPLETE
+                )),
+            })
+            .into());
+        }
+
+        // "Enables an Amazon Web Services Payment Cryptography key, which makes it
+        // active for cryptographic operations" (this operation's own documentation):
+        // the key is enabled, its material is used from this instant on, and nothing
+        // stops its use any more.
+        key.start_usage(now);
+
+        // Answered from the record as it now stands, so `GetKey` and every other
+        // Key-returning read observes the same enabled key.
+        let key = key.to_key(now);
+        crate::state::record_mutation(ctx.parts(), Self::NAME, &key.key_arn);
+        Ok(StartKeyUsageOutput { key })
     }
 }

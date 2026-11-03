@@ -199,7 +199,9 @@ fn stored_regions(engine: &engine::InMemoryEngine, arn: &str) -> Vec<String> {
         .get(arn)
         .unwrap_or_else(|| panic!("the store holds the key {arn}"))
         .replication_regions
-        .clone()
+        .keys()
+        .cloned()
+        .collect()
 }
 
 #[tokio::test]

@@ -1417,13 +1417,14 @@ fn the_key_check_value_computation_matches_published_vectors() {
 }
 
 #[tokio::test]
-async fn replication_regions_are_persisted_and_no_replication_status_is_claimed() {
+async fn replication_regions_a_create_named_are_persisted_and_reported() {
     let (router, engine) = router_with_engine();
     let table = algorithm_table();
 
     // A key created with no replication regions follows the account's default
     // replication configuration, which `UsingDefaultReplicationRegions`' own
-    // documentation is what reports.
+    // documentation is what reports. This account has enabled none, so the key
+    // replicates nowhere and is not a Multi-Region key at all.
     let plain = ok_call(&router, "CreateKey", &create_key_body(&table[0], json!({}))).await;
     let key = plain.get("Key").expect("a Key");
     assert_eq!(
@@ -1432,11 +1433,17 @@ async fn replication_regions_are_persisted_and_no_replication_status_is_claimed(
         Some(true),
         "case no regions: a key with no custom replication follows the defaults: {key}"
     );
+    for member in ["ReplicationStatus", "MultiRegionKeyType", "PrimaryRegion"] {
+        assert!(
+            key.get(member).is_none(),
+            "case no regions: {member} must be absent for a key that replicates nowhere: {key}"
+        );
+    }
 
-    // A key created WITH regions carries a custom configuration, and that
-    // configuration is persisted — but nothing in this slice replicates a key (the
-    // key-replication-region operations still answer 501), so no multi-region role
-    // and no per-region replication status is reported for work nothing performed.
+    // A key created WITH regions carries a custom configuration, that configuration
+    // is persisted, and it is the primary of its own Multi-Region hierarchy with one
+    // replication entry per region it was asked to replicate to. The states those
+    // entries move through are what `key_usage_and_replication` covers.
     for regions in [vec!["us-east-1"], vec!["us-east-2", "eu-west-1"]] {
         let case = format!("{regions:?}");
         let created = ok_call(
@@ -1453,16 +1460,24 @@ async fn replication_regions_are_persisted_and_no_replication_status_is_claimed(
             Some(false),
             "case {case}: a key whose create named its regions overrides the defaults: {key}"
         );
-        for member in ["ReplicationStatus", "MultiRegionKeyType", "PrimaryRegion"] {
-            assert!(
-                key.get(member).is_none(),
-                "case {case}: {member} must be absent while nothing has replicated \
-                 this key: {key}"
-            );
-        }
+        assert_eq!(
+            key.get("MultiRegionKeyType").and_then(Value::as_str),
+            Some("PRIMARY"),
+            "case {case}: a replicated key is the primary of its hierarchy: {key}"
+        );
+        let status = key
+            .get("ReplicationStatus")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("case {case}: no ReplicationStatus in {key}"));
+        let reported: BTreeSet<&str> = status.keys().map(String::as_str).collect();
+        let expected: BTreeSet<&str> = regions.iter().copied().collect();
+        assert_eq!(
+            reported, expected,
+            "case {case}: expected one replication entry per requested region, got {key}"
+        );
 
-        // The configuration the create accepted IS stored, for the slice that will
-        // replicate it: read the persisted record straight out of the engine.
+        // The configuration the create accepted IS stored: read the persisted record
+        // straight out of the engine.
         {
             let store = engine.state::<KeyStore>();
             let guard = store.lock();
@@ -1470,19 +1485,36 @@ async fn replication_regions_are_persisted_and_no_replication_status_is_claimed(
                 .keys
                 .get(&arn)
                 .unwrap_or_else(|| panic!("case {case}: no key stored under {arn}"));
+            let held: BTreeSet<&str> = stored
+                .replication_regions
+                .keys()
+                .map(String::as_str)
+                .collect();
             assert_eq!(
-                stored.replication_regions, regions,
+                held, expected,
                 "case {case}: the stored replication regions must be the ones requested"
             );
         }
 
-        // And a later read says the same thing: no replication state appears on its
-        // own as the clock moves.
+        // And a later read answers from that record: the same entries, for the same
+        // regions.
         let fetched = ok_call(&router, "GetKey", &json!({"KeyIdentifier": arn})).await;
+        let fetched_key = fetched.get("Key").expect("a Key");
         assert_eq!(
-            fetched.get("Key"),
-            Some(key),
-            "case {case}: GetKey must report the created Key unchanged"
+            fetched_key.get("MultiRegionKeyType"),
+            key.get("MultiRegionKeyType"),
+            "case {case}: GetKey must report the same multi-region role: {fetched}"
+        );
+        let fetched_regions: BTreeSet<&str> = fetched_key
+            .get("ReplicationStatus")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("case {case}: no ReplicationStatus in {fetched}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            fetched_regions, expected,
+            "case {case}: GetKey must report the stored replication regions: {fetched}"
         );
     }
 }

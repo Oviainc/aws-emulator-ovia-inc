@@ -37,7 +37,10 @@ use x509_cert::spki::{AlgorithmIdentifierOwned, ObjectIdentifier, SubjectPublicK
 use x509_cert::time::{Time, Validity as CertificateValidity};
 use x509_cert::{Certificate, TbsCertificate, Version};
 
-use crate::ops::types::{Alias, Key, KeyAttributes, KeySummary, Tag, SYMMETRIC_KEY_ALGORITHM_VALUES};
+use crate::ops::types::{
+    Alias, Key, KeyAttributes, KeySummary, ReplicationStatusType, Tag,
+    SYMMETRIC_KEY_ALGORITHM_VALUES,
+};
 
 /// The ARN service namespace for this service (`arnNamespace` / sigv4 name
 /// `payment-cryptography`, from OPERATIONS.md's wire-protocol section).
@@ -135,6 +138,34 @@ pub const KEY_STATE_DELETE_COMPLETE: &str = "DELETE_COMPLETE";
 /// Cryptography, the value is `AWS_PAYMENT_CRYPTOGRAPHY`."
 pub const KEY_ORIGIN_AWS: &str = "AWS_PAYMENT_CRYPTOGRAPHY";
 
+/// `KeyReplicationState` values, from
+/// `smithy_query(query="shape",shape="KeyReplicationState")`.
+pub const KEY_REPLICATION_STATE_IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`KEY_REPLICATION_STATE_IN_PROGRESS`].
+pub const KEY_REPLICATION_STATE_SYNCHRONIZED: &str = "SYNCHRONIZED";
+/// See [`KEY_REPLICATION_STATE_IN_PROGRESS`].
+pub const KEY_REPLICATION_STATE_DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
+
+/// The `MultiRegionKeyType` of a key that has replication regions of its own.
+///
+/// From that member's own documentation: a key "is a Primary Region key (PRK)
+/// (which can be replicated to other Amazon Web Services Regions) or a Replica
+/// Region key (RRK) (which is a copy of a PRK in another Region)". Every key this
+/// store holds is one a caller created here and whose replicas are reported through
+/// its own `ReplicationStatus`, so it is the primary of its own hierarchy.
+pub const MULTI_REGION_KEY_TYPE_PRIMARY: &str = "PRIMARY";
+
+/// How long replication to a region takes to settle, in either direction.
+///
+/// `ReplicationStatusType.Status` names both the states where the work is in flight
+/// (`IN_PROGRESS` while a replica is being made, `DELETE_IN_PROGRESS` while one is
+/// being torn down) and the one where it has settled (`SYNCHRONIZED`), so the move
+/// between them is a transition the CLOCK owes: it falls due this long after the call
+/// that asked for it and is derived from the stored instant, never slept for. The
+/// span is deliberately non-zero, so a caller that reads the key straight after the
+/// call still observes the in-flight state the real service reports.
+pub const REPLICATION_SPAN: Duration = Duration::from_secs(3);
+
 /// The largest page any list operation in this service builds.
 ///
 /// The maximum of the modelled `MaxResults` range (1..100), which the centralized
@@ -173,6 +204,15 @@ pub const MAX_TAGS: usize = 200;
 /// figure only has to be comfortably above the number of Regions AWS publishes, so no
 /// real configuration meets it.
 pub const MAX_ENABLED_REPLICATION_REGIONS: usize = 64;
+
+/// The most replication regions this emulator will hold for ONE key.
+///
+/// Emulator resource guard, NOT an AWS quota, for the same reason as
+/// [`MAX_ENABLED_REPLICATION_REGIONS`]: a key's replication configuration is grown by
+/// caller-supplied region strings (`CreateKey`, `AddKeyReplicationRegions`) and every
+/// read projects an entry per region, so the configuration needs a bound. The figure
+/// only has to be comfortably above the number of Regions AWS publishes.
+pub const MAX_KEY_REPLICATION_REGIONS: usize = 64;
 
 /// The tag-key namespace AWS reserves for itself, in every service: a caller may not
 /// set a tag whose key starts with it.
@@ -273,6 +313,64 @@ impl ExportParameters {
 // The stored key
 // ---------------------------------------------------------------------------
 
+/// One region a key is replicated to: when replication there was asked for, and when
+/// its teardown was, if it has been.
+///
+/// Instants rather than a status string, because `ReplicationStatusType.Status` moves
+/// on its own once the work falls due ([`REPLICATION_SPAN`]) — so the state a reader
+/// reports is derived from these and no reader has to write.
+#[derive(Debug, Clone)]
+pub struct ReplicaRegion {
+    /// The instant the call that asked for replication to this region ran: where the
+    /// `IN_PROGRESS` span starts.
+    pub replication_requested: SystemTime,
+    /// The instant the call that asked for this region's replica to be torn down ran,
+    /// if one has: where the `DELETE_IN_PROGRESS` span starts, after which this
+    /// region is no longer one of the key's.
+    pub removal_requested: Option<SystemTime>,
+}
+
+impl ReplicaRegion {
+    /// A region whose replication starts at `now`.
+    pub fn started(now: SystemTime) -> Self {
+        Self {
+            replication_requested: now,
+            removal_requested: None,
+        }
+    }
+
+    /// This region's `ReplicationStatusType.Status` at `now`, or `None` once its
+    /// replica has finished being torn down and the region is no longer one this key
+    /// replicates to.
+    ///
+    /// `key_is_deleting` is the key itself being scheduled for deletion, which takes
+    /// its replicas with it: every region of a key waiting to be deleted reports the
+    /// teardown that deletion started.
+    fn status(&self, now: SystemTime, key_is_deleting: bool) -> Option<&'static str> {
+        if let Some(requested) = self.removal_requested {
+            if replication_span_elapsed(requested, now) {
+                return None;
+            }
+            return Some(KEY_REPLICATION_STATE_DELETE_IN_PROGRESS);
+        }
+        if key_is_deleting {
+            return Some(KEY_REPLICATION_STATE_DELETE_IN_PROGRESS);
+        }
+        Some(if replication_span_elapsed(self.replication_requested, now) {
+            KEY_REPLICATION_STATE_SYNCHRONIZED
+        } else {
+            KEY_REPLICATION_STATE_IN_PROGRESS
+        })
+    }
+}
+
+/// Whether the replication work started at `since` has fallen due by `now`.
+fn replication_span_elapsed(since: SystemTime, now: SystemTime) -> bool {
+    since
+        .checked_add(REPLICATION_SPAN)
+        .is_some_and(|due| now >= due)
+}
+
 /// One stored key: every member `Key` and `KeySummary` report, plus the secret the
 /// key check value is computed from.
 #[derive(Debug, Clone)]
@@ -307,25 +405,20 @@ pub struct StoredKey {
     /// would not match it.
     pub delete_key_in_days: Option<i32>,
     pub derive_key_usage: Option<String>,
-    /// The regions `CreateKey` asked this key to be replicated to.
+    /// The regions this key is replicated to, each with the instants the clock owes
+    /// its replication state from.
     ///
-    /// Persisted for the slice that implements the key-replication-region
-    /// operations. Nothing reports a replication state from them yet, and that is
-    /// deliberate: this emulator holds no per-region partition and the operations
-    /// that would materialise a replica (`AddKeyReplicationRegions`,
-    /// `RemoveKeyReplicationRegions`, `Enable/Disable/GetDefaultKeyReplicationRegions`)
-    /// all still answer 501, so no replica record exists anywhere in the store.
-    /// Reporting a multi-region role or a per-region replication state — least of all
-    /// a terminal `SYNCHRONIZED` — would be a status for work nothing performed, so
-    /// `MultiRegionKeyType`, `PrimaryRegion` and `ReplicationStatus` are left absent
-    /// until the slice that actually replicates a key fills them in from a replica it
-    /// created. `UsingDefaultReplicationRegions` is reported, because whether this
-    /// key carries a replication configuration of its own is a fact about what was
-    /// stored.
-    pub replication_regions: Vec<String>,
+    /// Written by the create that named a replication configuration and by the
+    /// operations that change one afterwards (`AddKeyReplicationRegions`,
+    /// `RemoveKeyReplicationRegions`); every member a reader reports about
+    /// replication — `MultiRegionKeyType` and `ReplicationStatus` — is projected from
+    /// it by [`StoredKey::replication_status`], so a key replicates to exactly the
+    /// regions some call asked for and to nothing else.
+    pub replication_regions: BTreeMap<String, ReplicaRegion>,
     /// Whether this key replicates to the account's DEFAULT replication regions
     /// rather than to a configuration of its own — true for a create that named no
-    /// `ReplicationRegions`, which is what `UsingDefaultReplicationRegions` reports.
+    /// `ReplicationRegions`, which is what `UsingDefaultReplicationRegions` reports,
+    /// and false from the moment a call writes a configuration onto this key.
     pub uses_default_replication_regions: bool,
     pub tags: BTreeMap<String, String>,
     /// The generated secret. Never returned and never logged: it is the source of
@@ -405,6 +498,152 @@ impl StoredKey {
         self.delete_pending_timestamp
     }
 
+    /// Whether this key is in the active state at `now`: the state a key is in once
+    /// it has been created and before anything scheduled its deletion.
+    ///
+    /// What the operations that change a created key require of it — "The key must be
+    /// in an active state to add Replication Regions"
+    /// (`AddKeyReplicationRegions`' own documentation) — so a key on its way out is
+    /// refused rather than quietly mutated.
+    pub fn is_active(&self, now: SystemTime) -> bool {
+        self.effective_state(now) == KEY_STATE_CREATE_COMPLETE
+    }
+
+    /// `ReplicationStatus`: the replication state of each region this key is
+    /// replicated to at `now`, in one stable order.
+    ///
+    /// Derived, never written: each region's state is a function of the instant the
+    /// call that asked for it ran, of [`REPLICATION_SPAN`] and of whether the key
+    /// itself is on its way out — so a caller polling for a replica to settle sees it
+    /// settle without anything else running, and a read leaves the record alone.
+    /// Empty for a key nothing has replicated, and for one the clock has finished
+    /// deleting: its replicas went with it.
+    pub fn replication_status(&self, now: SystemTime) -> BTreeMap<String, &'static str> {
+        let state = self.effective_state(now);
+        if state == KEY_STATE_DELETE_COMPLETE {
+            return BTreeMap::new();
+        }
+        let key_is_deleting = state == KEY_STATE_DELETE_PENDING;
+        self.replication_regions
+            .iter()
+            .filter_map(|(region, replica)| {
+                replica
+                    .status(now, key_is_deleting)
+                    .map(|status| (region.clone(), status))
+            })
+            .collect()
+    }
+
+    /// `MultiRegionKeyType`: this key's role in the Multi-Region key hierarchy at
+    /// `now`, or `None` for a key that replicates nowhere and so is not a
+    /// Multi-Region key at all.
+    pub fn multi_region_key_type(&self, now: SystemTime) -> Option<&'static str> {
+        (!self.replication_status(now).is_empty()).then_some(MULTI_REGION_KEY_TYPE_PRIMARY)
+    }
+
+    /// Stop using this key's material for cryptographic operations, as of `now`.
+    ///
+    /// `Enabled` "specifies whether the key is enabled" and `UsageStopTimestamp` is
+    /// "the date and time after which Amazon Web Services Payment Cryptography will
+    /// stop using the key material for cryptographic operations", so the call that
+    /// makes the key inactive is what clears the one and stamps the other.
+    pub fn stop_usage(&mut self, now: SystemTime) {
+        self.enabled = false;
+        self.usage_stop_timestamp = Some(now);
+    }
+
+    /// Start using this key's material for cryptographic operations again, as of
+    /// `now`.
+    ///
+    /// The mirror of [`StoredKey::stop_usage`]: the key is enabled, usage starts at
+    /// this instant, and the stop instant is cleared because nothing stops the key's
+    /// use any more.
+    pub fn start_usage(&mut self, now: SystemTime) {
+        self.enabled = true;
+        self.usage_start_timestamp = Some(now);
+        self.usage_stop_timestamp = None;
+    }
+
+    /// Replicate this key to `regions` from `now`, and answer `None` — storing
+    /// nothing — when that would take it past [`MAX_KEY_REPLICATION_REGIONS`].
+    ///
+    /// A region this key already replicates to is left where it is, so a repeat does
+    /// not restart a span the first call already owes; one whose replica is being torn
+    /// down starts replicating again from this call.
+    pub fn add_replication_regions(
+        &mut self,
+        regions: &[String],
+        now: SystemTime,
+    ) -> Option<()> {
+        self.retire_removed_replicas(now);
+        let would_hold = self
+            .replication_regions
+            .keys()
+            .chain(regions.iter())
+            .collect::<BTreeSet<&String>>()
+            .len();
+        if would_hold > MAX_KEY_REPLICATION_REGIONS {
+            return None;
+        }
+        for region in regions {
+            let replicating = self
+                .replication_regions
+                .get(region)
+                .is_some_and(|replica| replica.removal_requested.is_none());
+            if !replicating {
+                self.replication_regions
+                    .insert(region.clone(), ReplicaRegion::started(now));
+            }
+        }
+        self.uses_default_replication_regions = false;
+        Some(())
+    }
+
+    /// Tear down the replicas in `regions` from `now`, and answer the regions named
+    /// that this key does not replicate to — storing nothing when there are any,
+    /// since the caller named a configuration this key does not have.
+    pub fn remove_replication_regions(
+        &mut self,
+        regions: &[String],
+        now: SystemTime,
+    ) -> Vec<String> {
+        self.retire_removed_replicas(now);
+        let unreplicated: Vec<String> = regions
+            .iter()
+            .filter(|region| !self.replication_regions.contains_key(*region))
+            .cloned()
+            .collect();
+        if !unreplicated.is_empty() {
+            return unreplicated;
+        }
+        for region in regions {
+            if let Some(replica) = self.replication_regions.get_mut(region) {
+                // The teardown already under way keeps the instant it started from,
+                // so a repeat does not extend it.
+                if replica.removal_requested.is_none() {
+                    replica.removal_requested = Some(now);
+                }
+            }
+        }
+        self.uses_default_replication_regions = false;
+        Vec::new()
+    }
+
+    /// Drop the regions whose replicas the clock has finished tearing down.
+    ///
+    /// Called only from the two operations that WRITE a replication configuration:
+    /// [`StoredKey::replication_status`] already leaves a finished teardown out of
+    /// what it reports, so no reader needs this — it keeps the record itself from
+    /// holding a region the key no longer replicates to once a caller changes the
+    /// configuration again.
+    fn retire_removed_replicas(&mut self, now: SystemTime) {
+        self.replication_regions.retain(|_, replica| {
+            replica
+                .removal_requested
+                .is_none_or(|requested| !replication_span_elapsed(requested, now))
+        });
+    }
+
     /// This key as the modelled `Key` structure, every member read from what is
     /// stored.
     pub fn to_key(&self, now: SystemTime) -> Key {
@@ -431,15 +670,38 @@ impl StoredKey {
                 .delete_timestamp_output(now)
                 .map(::aws_smithy_types::DateTime::from),
             derive_key_usage: self.derive_key_usage.clone(),
-            // `MultiRegionKeyType`, `PrimaryRegion` and `ReplicationStatus` are
-            // absent for every key in this slice: see
-            // [`StoredKey::replication_regions`].
-            multi_region_key_type: None,
+            multi_region_key_type: self
+                .multi_region_key_type(now)
+                .map(str::to_string),
+            // `PrimaryRegion` names the Region of the primary key, which is what a
+            // REPLICA key reports about the key it is a copy of. Every record this
+            // store holds is a primary, reporting its replicas through
+            // `ReplicationStatus` below, so there is no replica record to report a
+            // primary region for.
             primary_region: None,
-            replication_status: None,
+            replication_status: Some(self.replication_status(now))
+                .filter(|status| !status.is_empty())
+                .map(|status| {
+                    status
+                        .into_iter()
+                        .map(|(region, state)| {
+                            (
+                                region,
+                                ReplicationStatusType {
+                                    status: state.to_string(),
+                                    // `StatusMessage` carries "details about any
+                                    // issues or progress updates": this replication
+                                    // is proceeding as asked, so there are none.
+                                    status_message: None,
+                                },
+                            )
+                        })
+                        .collect()
+                }),
             // `UsingDefaultReplicationRegions`' own documentation: false means "the
             // key has a custom replication configuration that overrides the account
-            // defaults", which is exactly a key whose create named its regions.
+            // defaults", which is exactly a key whose create named its regions or
+            // whose configuration a later call wrote.
             using_default_replication_regions: Some(self.uses_default_replication_regions),
             // Multi-Party Approval is a separate slice; this key went through none,
             // so it carries no MPA status.
@@ -457,9 +719,11 @@ impl StoredKey {
             key_check_value: self.key_check_value.clone(),
             exportable: self.exportable,
             enabled: self.enabled,
+            // The same projection `Key` carries, so a listed key and a fetched one
+            // report the same multi-region role.
+            multi_region_key_type: self.multi_region_key_type(now).map(str::to_string),
             // Absent for the same reason as on `Key`: see
-            // [`StoredKey::replication_regions`].
-            multi_region_key_type: None,
+            // [`StoredKey::to_key`].
             primary_region: None,
         }
     }
@@ -610,11 +874,23 @@ impl ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
         // regions of its own takes the account's defaults as they stand now, and one
         // that named its own keeps them and overrides the defaults.
         let uses_default_replication_regions = request.replication_regions.is_empty();
-        let replication_regions = if uses_default_replication_regions {
+        let requested_regions: Vec<String> = if uses_default_replication_regions {
             self.enabled_replication_regions.iter().cloned().collect()
         } else {
             request.replication_regions
         };
+        // Replication to each of them starts with this call, so the key is a
+        // Multi-Region primary from the moment it exists and its replicas settle a
+        // span later, exactly as they do when a later call adds a region.
+        let replication_regions: BTreeMap<String, ReplicaRegion> = requested_regions
+            .into_iter()
+            .map(|region| (region, ReplicaRegion::started(now)))
+            .collect();
+        if replication_regions.len() > MAX_KEY_REPLICATION_REGIONS {
+            return Err(MintRejection::QuotaExceeded(format!(
+                "a key cannot replicate to more than {MAX_KEY_REPLICATION_REGIONS} regions"
+            )));
+        }
 
         let material = self.fresh_material(material_len);
         // An id no stored key is using, so the insert below can only add a record.
@@ -641,7 +917,7 @@ impl ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
             // The material exists from the moment the key does, so the key is
             // usable for cryptographic operations from then on.
             usage_start_timestamp: Some(now),
-            // Written only by `StopKeyUsage`, which is a later slice.
+            // Written by `StopKeyUsage`, the call that stops this key's use.
             usage_stop_timestamp: None,
             delete_pending_timestamp: None,
             delete_key_in_days: None,

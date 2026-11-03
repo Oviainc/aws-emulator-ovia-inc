@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddKeyReplicationRegions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddKeyReplicationRegions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddKeyReplicationRegions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +180,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddKeyReplicationRegions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddKeyReplicationRegionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddKeyReplicationRegions"))
+        // `KeyIdentifier`'s pattern and length and each `ReplicationRegions` entry's
+        // `Region` pattern are modelled, so the centralized walk has already refused
+        // anything outside them before this body runs. What is left for this body is
+        // what the model cannot say: that the list names at least one Region, that
+        // the key is in an active state, and how many regions one key may replicate
+        // to in this emulator.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AddKeyReplicationRegionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the payment cryptography key store is unavailable".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        if input.replication_regions.is_empty() {
+            return Err(AddKeyReplicationRegionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "ReplicationRegions must name at least one Amazon Web Services Region"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        let key = store.key_mut(&input.key_identifier).ok_or_else(|| {
+            AddKeyReplicationRegionsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    resource_id: Some(input.key_identifier.clone()),
+                },
+            )
+        })?;
+
+        // "The key must be in an active state to add Replication Regions" (this
+        // operation's own documentation).
+        if !key.is_active(now) {
+            let current = key.effective_state(now).to_string();
+            return Err(AddKeyReplicationRegionsErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "the key {} is {current}, not {}, so replication regions cannot be \
+                         added to it",
+                        input.key_identifier,
+                        crate::state::KEY_STATE_CREATE_COMPLETE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Each region named starts replicating now, which is what the key's
+        // `MultiRegionKeyType` and its per-region `ReplicationStatus` are projected
+        // from. The regions are caller-supplied strings and the model bounds neither
+        // the list nor how many calls may add to the configuration, so a call that
+        // would take the key past the configuration this emulator holds is refused
+        // with the modelled `ServiceQuotaExceededException` and stores nothing.
+        key.add_replication_regions(&input.replication_regions, now)
+            .ok_or_else(|| {
+                AddKeyReplicationRegionsErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "a key cannot replicate to more than {} regions",
+                            crate::state::MAX_KEY_REPLICATION_REGIONS
+                        )),
+                    },
+                )
+            })?;
+
+        // Answered from the record as it now stands, so `GetKey` reports the same
+        // replication configuration and the same per-region state.
+        let key = key.to_key(now);
+        crate::state::record_mutation(ctx.parts(), Self::NAME, &key.key_arn);
+        Ok(AddKeyReplicationRegionsOutput { key })
     }
 }

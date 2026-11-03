@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveKeyReplicationRegions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveKeyReplicationRegions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveKeyReplicationRegions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +178,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveKeyReplicationRegions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveKeyReplicationRegionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveKeyReplicationRegions"))
+        // `KeyIdentifier`'s pattern and length and each `ReplicationRegions` entry's
+        // `Region` pattern are modelled, so the centralized walk has already refused
+        // anything outside them before this body runs. What is left for this body is
+        // what the model cannot say: that the list names at least one Region, and
+        // that this key replicates to each Region it names.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RemoveKeyReplicationRegionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the payment cryptography key store is unavailable".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        if input.replication_regions.is_empty() {
+            return Err(RemoveKeyReplicationRegionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "ReplicationRegions must name at least one Amazon Web Services Region"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        let key = store.key_mut(&input.key_identifier).ok_or_else(|| {
+            RemoveKeyReplicationRegionsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    resource_id: Some(input.key_identifier.clone()),
+                },
+            )
+        })?;
+
+        // Only a key that is still active has a replication configuration a caller
+        // can change: the replicas of one scheduled for deletion are already being
+        // torn down with it.
+        if !key.is_active(now) {
+            let current = key.effective_state(now).to_string();
+            return Err(RemoveKeyReplicationRegionsErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "the key {} is {current}, not {}, so replication regions cannot be \
+                         removed from it",
+                        input.key_identifier,
+                        crate::state::KEY_STATE_CREATE_COMPLETE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The key "must ... have replication enabled in the specified regions"
+        // (`ReplicationRegions`' own documentation on this operation), so a request
+        // naming a Region this key does not replicate to describes a configuration it
+        // does not have and is refused whole: nothing is torn down.
+        let unreplicated = key.remove_replication_regions(&input.replication_regions, now);
+        if !unreplicated.is_empty() {
+            return Err(RemoveKeyReplicationRegionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "the key {} has no replication enabled in {}",
+                        input.key_identifier,
+                        unreplicated.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Answered from the record as it now stands, so `GetKey` reports the same
+        // teardown the caller just asked for.
+        let key = key.to_key(now);
+        crate::state::record_mutation(ctx.parts(), Self::NAME, &key.key_arn);
+        Ok(RemoveKeyReplicationRegionsOutput { key })
     }
 }
