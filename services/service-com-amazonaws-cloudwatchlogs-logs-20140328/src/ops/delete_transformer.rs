@@ -199,15 +199,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Deletes the log transformer for the specified log group": the transformer is
         // what this call names, so a group that carries none names a resource that is not
-        // there rather than a deletion with nothing to do. The request identifies that
-        // transformer by nothing of its own — only by the group it belongs to — so the
-        // refusal states nothing about it beyond that the resource is not there. The
+        // there rather than a deletion with nothing to do. The transformer is identified by
+        // the log group it belongs to, so the refusal states the kind of resource and the
+        // group it was looked for on ([`crate::state::transformer_not_found_message`]). The
         // refusal is decided BEFORE anything is written, so a refused delete leaves the
         // record exactly as it was.
         if group.transformer.is_none() {
-            return Err(not_found(
-                crate::state::UNIDENTIFIED_RESOURCE_NOT_FOUND_MESSAGE,
-            ));
+            return Err(not_found(&crate::state::transformer_not_found_message(
+                &log_group_name,
+            )));
         }
         group.transformer = None;
 

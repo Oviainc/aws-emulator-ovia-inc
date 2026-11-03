@@ -687,8 +687,9 @@ async fn reading_a_detector_the_account_does_not_hold_is_refused() {
             "case {case:?}: expected {NOT_FOUND}, got {code} {message:?}"
         );
         assert_eq!(
-            message, "The specified anomaly detector does not exist.",
-            "case {case:?}: expected the refusal to name the missing resource, got {message:?}"
+            message,
+            format!("The specified ARN does not exist or already deleted : {arn}"),
+            "case {case:?}: expected the refusal to name the ARN that was not found, got {message:?}"
         );
     }
 

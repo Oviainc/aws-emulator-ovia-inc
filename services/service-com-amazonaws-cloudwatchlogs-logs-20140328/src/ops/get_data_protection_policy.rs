@@ -170,10 +170,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
-        let group = store
-            .log_groups
-            .get(log_group_name)
-            .ok_or_else(|| not_found(&crate::state::resource_not_found_message("log group")))?;
+        let group = store.log_groups.get(log_group_name).ok_or_else(|| {
+            // A data protection policy is readable across accounts, so a group the account
+            // does not hold is refused by naming what was looked for and the account that
+            // would own it ([`crate::state::log_group_not_found_for_owner_message`]).
+            not_found(&crate::state::log_group_not_found_for_owner_message(
+                log_group_name,
+                ::engine::emulator_account_id(),
+            ))
+        })?;
         // A group that holds no policy has no policy to report: the resource this
         // operation reads is the policy, not the group. The request identifies that policy
         // by nothing of its own — only by the group it is attached to — so the refusal

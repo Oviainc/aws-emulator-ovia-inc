@@ -475,6 +475,18 @@ pub const METRIC_EXTRACTION_STATUS_DISABLED: &str = "Disabled";
 /// policy document')`. See [`METRIC_EXTRACTION_EMF_MEMBER`].
 pub const INVALID_JSON_POLICY_DOCUMENT_MESSAGE: &str = "Invalid json policy document";
 
+/// The refusal CloudWatch Logs answers a `policyDocument` it cannot READ as the JSON
+/// structure the policy type's grammar states: a document that is not JSON at all, one that
+/// is not the object the policy is expressed as, and one whose member carries a JSON type
+/// the grammar does not admit (an array written as a string, an object written as an array).
+///
+/// The text is FIXED for that class — it names neither the member at fault nor the type it
+/// should have had — because the complaint is about the document's FORM rather than about
+/// what an otherwise readable document says: a document the service can read and then
+/// rejects for what it states (a value outside a catalogue, a quota, a rule between two of
+/// its members) is refused with that rule's own sentence instead.
+pub const MALFORMED_POLICY_DOCUMENT_MESSAGE: &str = "Policy document contains invalid JSON format.";
+
 /// How many account-level policies of one type the account may hold when the policy being
 /// put is "scoped to a subset of log groups with the selectionCriteria parameter": for a
 /// transformer policy, "you can create as many as 20 account-level transformer policies",
@@ -4675,28 +4687,22 @@ pub const FIELDS_ARRAY_INDEX_TYPE: &str = "FIELD_INDEX";
 /// The per-policy field quotas are NOT judged here, because they are a log-group-level
 /// policy's own ([`check_index_policy_quotas`]).
 pub fn check_field_index_policy_document(document: &str) -> Result<Vec<IndexedField>, String> {
-    let members = policy_object(document)?;
+    // The document's FORM is refused with the service's fixed text for a policy document it
+    // cannot read ([`MALFORMED_POLICY_DOCUMENT_MESSAGE`]); what a readable document SAYS is
+    // refused below with the sentence of the rule it breaks.
+    let malformed = || MALFORMED_POLICY_DOCUMENT_MESSAGE.to_string();
+    let members = policy_object(document).map_err(|_| malformed())?;
     let fields = match members.get("Fields") {
         Some(fields) => fields
             .as_array()
-            .ok_or_else(|| "Fields in policyDocument must be an array of field names".to_string())?
+            .ok_or_else(malformed)?
             .iter()
-            .map(|field| {
-                field.as_str().map(str::to_string).ok_or_else(|| {
-                    "Fields in policyDocument must be an array of field names".to_string()
-                })
-            })
+            .map(|field| field.as_str().map(str::to_string).ok_or_else(malformed))
             .collect::<Result<Vec<String>, String>>()?,
         None => Vec::new(),
     };
     let fields_v2 = match members.get("FieldsV2") {
-        Some(fields_v2) => fields_v2
-            .as_object()
-            .ok_or_else(|| {
-                "FieldsV2 in policyDocument must be an object of field names and their types"
-                    .to_string()
-            })?
-            .clone(),
+        Some(fields_v2) => fields_v2.as_object().ok_or_else(malformed)?.clone(),
         None => serde_json::Map::new(),
     };
     let mut typed: Vec<IndexedField> = Vec::new();
@@ -7292,6 +7298,74 @@ pub const INVALID_DELIVERY_DESTINATION_POLICY_MESSAGE: &str =
 /// allows delivery to the chosen destination".
 pub fn is_delivery_destination_policy(document: &str) -> bool {
     ::service_common::iam_policy::resource_policy_defect(document).is_none()
+}
+
+/// The spelling the data protection half of this service gives the fixed missing-resource
+/// sentence: the same sentence as [`UNIDENTIFIED_RESOURCE_NOT_FOUND_MESSAGE`], with the
+/// verb inflected the way the data protection path words it. The text is fixed for the
+/// class and carries nothing of the request.
+pub const UNIDENTIFIED_DATA_PROTECTION_RESOURCE_NOT_FOUND_MESSAGE: &str =
+    "Specified resource does not exists!";
+
+/// The refusal `DeleteAccountPolicy` answers for a `(policyType, policyName)` pair the
+/// account does not hold.
+///
+/// The account-level policy a delete addresses is identified by the two members of the
+/// request and by nothing else, so — like every other resource this service identifies
+/// nothing of — it is refused with the fixed missing-resource sentence, which interpolates
+/// neither the name nor the type. The one variation is the SPELLING: the delete of a data
+/// protection policy is served by the same path the log-group-level data protection
+/// operations are served by, which inflects that sentence its own way
+/// ([`UNIDENTIFIED_DATA_PROTECTION_RESOURCE_NOT_FOUND_MESSAGE`]), while every other policy
+/// type answers [`UNIDENTIFIED_RESOURCE_NOT_FOUND_MESSAGE`].
+pub fn account_policy_not_found_message(policy_type: &str) -> &'static str {
+    if policy_type == POLICY_TYPE_DATA_PROTECTION {
+        UNIDENTIFIED_DATA_PROTECTION_RESOURCE_NOT_FOUND_MESSAGE
+    } else {
+        UNIDENTIFIED_RESOURCE_NOT_FOUND_MESSAGE
+    }
+}
+
+/// The refusal CloudWatch Logs answers when the `integrationName` an operation resolves is
+/// not an integration this account holds. The fixed text states the kind of resource and
+/// the condition around ONE variable part — the requested name, taken from the request
+/// verbatim — so a caller managing several integrations can attribute the refusal to one of
+/// them instead of guessing which of its requests failed.
+pub fn integration_not_found_message(integration_name: &str) -> String {
+    format!("Integration with name {integration_name} does not exist.")
+}
+
+/// The refusal CloudWatch Logs answers when the `anomalyDetectorArn` an operation resolves
+/// is not a log anomaly detector this account holds.
+///
+/// The service reports the ARN it was handed rather than the kind of resource, and keeps the
+/// ambiguity it draws deliberately: an ARN nothing ever minted and a detector a previous
+/// delete already removed are refused identically, so the sentence states both
+/// possibilities. The only variable part is that ARN, taken from the request verbatim.
+pub fn anomaly_detector_not_found_message(anomaly_detector_arn: &str) -> String {
+    format!("The specified ARN does not exist or already deleted : {anomaly_detector_arn}")
+}
+
+/// The refusal `DeleteTransformer` answers when the log group it names holds no transformer.
+///
+/// The transformer a delete addresses is identified by the log group it belongs to, so the
+/// sentence states the kind of resource that is missing and the group it was looked for on —
+/// the group the request named, resolved from its `logGroupIdentifier` — rather than the
+/// fixed text a resource the request identifies nothing of is refused with.
+pub fn transformer_not_found_message(log_group_name: &str) -> String {
+    format!("Transformer does not exist on log group '{log_group_name}'")
+}
+
+/// The refusal the data protection policy READ answers when the `logGroupIdentifier` it
+/// resolves names a log group the account does not hold.
+///
+/// A data protection policy is readable across accounts, so this refusal states both halves
+/// of what was looked for: the group name the request asked for, and the account that would
+/// own it — which is what makes the sentence usable when the group exists in another
+/// account. Both variable parts are taken from the request and from the emulator's own
+/// account identity; the sentence is otherwise fixed.
+pub fn log_group_not_found_for_owner_message(log_group_name: &str, owner_account_id: &str) -> String {
+    format!("Log group '{log_group_name}' for owner '{owner_account_id}' cannot be found")
 }
 
 /// The refusal CloudWatch Logs builds from the request when the identifier a

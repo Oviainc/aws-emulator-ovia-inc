@@ -256,9 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !store.anomaly_detectors.contains_key(arn) {
                 return Err(ListAnomaliesErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::resource_not_found_message(
-                            "anomaly detector",
-                        )),
+                        message: Some(crate::state::anomaly_detector_not_found_message(arn)),
                     },
                 )
                 .into());

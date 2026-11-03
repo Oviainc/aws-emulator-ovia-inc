@@ -237,7 +237,7 @@ async fn a_detector_or_a_finding_the_store_does_not_hold_is_a_missing_resource()
                 "anomalyId": reported_anomaly,
                 "suppressionType": SUPPRESSION_TYPE_INFINITE,
             }),
-            "The specified anomaly detector does not exist.".to_string(),
+            format!("The specified ARN does not exist or already deleted : {arn}-absent"),
         ),
         (
             "an ARN of another resource kind".to_string(),
@@ -246,7 +246,10 @@ async fn a_detector_or_a_finding_the_store_does_not_hold_is_a_missing_resource()
                 "anomalyId": reported_anomaly,
                 "suppressionType": SUPPRESSION_TYPE_INFINITE,
             }),
-            "The specified anomaly detector does not exist.".to_string(),
+            format!(
+                "The specified ARN does not exist or already deleted : {}",
+                log_group_arn(REGION, GROUP, false)
+            ),
         ),
         (
             "an anomalyId this detector has not reported".to_string(),
@@ -575,9 +578,10 @@ async fn the_reported_anomalies_are_filtered_by_detector_and_suppression_state()
         "case an ARN no detector is stored under: expected {NOT_FOUND}, got {code} / {message}"
     );
     assert_eq!(
-        message, "The specified anomaly detector does not exist.",
-        "case an ARN no detector is stored under: expected this service's missing-resource \
-         sentence, got {message:?}"
+        message,
+        format!("The specified ARN does not exist or already deleted : {arn}-absent"),
+        "case an ARN no detector is stored under: expected the sentence naming the ARN that \
+         was not found, got {message:?}"
     );
     let (code, _) = logs
         .refusal("ListAnomalies", &json!({"nextToken": "not-a-token"}))

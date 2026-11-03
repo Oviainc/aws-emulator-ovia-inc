@@ -186,16 +186,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An account-level policy is identified by the two members this request carries:
         // its type and its name, which is how the store is keyed. Deleting one that is not
-        // there is refused with the sentence the model documents for
-        // `ResourceNotFoundException` ("The specified resource does not exist."), naming
-        // the kind of resource that is missing: the recorded service answers one constant
-        // sentence here rather than interpolating the `policyName` it was given, so the
-        // refusal states the rule instead of echoing the request.
+        // there is refused with the fixed missing-resource sentence of the class: the
+        // resource is identified by the request's two members and by nothing of its own, so
+        // the refusal interpolates neither of them
+        // ([`crate::state::account_policy_not_found_message`]).
         let key = (input.policy_type, input.policy_name);
         if store.account_policies.remove(&key).is_none() {
             return Err(DeleteAccountPolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message("account policy")),
+                    message: Some(
+                        crate::state::account_policy_not_found_message(&key.0).to_string(),
+                    ),
                 },
             )
             .into());

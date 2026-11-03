@@ -341,11 +341,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if held >= limit {
                 return Err(PutAccountPolicyErrorModeled::LimitExceededException(
                     LimitExceededException {
-                        message: Some(format!(
-                            "an account can have up to {limit} account-level {} policies of this kind",
-                            input.policy_type
-                        )),
-
+                        // The fixed text of the class, which states neither the quota that
+                        // was reached nor the type it belongs to.
+                        message: Some(crate::state::LIMIT_EXCEEDED_MESSAGE.to_string()),
                     },
                 )
                 .into());

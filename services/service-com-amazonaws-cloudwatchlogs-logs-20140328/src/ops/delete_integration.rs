@@ -166,7 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.integrations.contains_key(&input.integration_name) {
             return Err(DeleteIntegrationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message("integration")),
+                    message: Some(crate::state::integration_not_found_message(
+                        &input.integration_name,
+                    )),
                 },
             )
             .into());

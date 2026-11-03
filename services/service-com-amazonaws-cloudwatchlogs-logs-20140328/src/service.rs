@@ -106,6 +106,12 @@
 //! also where the handler-side refusal in `crate::state` reads its wording from
 //! ([`one_violation_message`]), so both refusal paths read alike.
 //!
+//! One violation class is not worded as a clause at all: a LOG GROUP or LOG STREAM NAME
+//! longer than the 512 characters the model allows either of them is refused with the
+//! service's own sentence for that pair of names ([`log_name_length_message`]), which the
+//! service answers in place of the envelope because it holds both names to that one bound
+//! itself rather than reporting the member the name arrived on.
+//!
 //! The subject rule is the half `services/common/src/validation.rs` names as "still to
 //! come", and ~26 service crates word it inline today. Migrating them onto one shared
 //! helper is a change of its own rather than a side effect of this service's issues, so it
@@ -338,6 +344,11 @@ const PUBLISHED_PATTERNS: &[(&str, &str)] = &[
     // name states ("Pattern: [\.\-_/#A-Za-z0-9]+", in the `logGroupIdentifier` docs of
     // `PutLogGroupDeletionProtection` and `PutBearerTokenAuthentication`).
     (r"^[\.\-_/#A-Za-z0-9]+$", r"[\.\-_/#A-Za-z0-9]+"),
+    // `LogStreamName` (`@length` 1..512, `@pattern ^[^:*]*$`), reached by the
+    // `logStreamName` member of every operation that names a log stream, by the
+    // `logStreamNamePrefix` of the reads and the export, and by the `logStreamNames` list of
+    // the filtering reads. Published UNANCHORED like the log group name it sits beside.
+    (r"^[^:*]*$", r"[^:*]*"),
 ];
 
 /// The expression this service states for the `@pattern` the model spells `pattern`: the
@@ -423,12 +434,61 @@ pub(crate) fn one_violation_message(member: &str, requirement: &str) -> String {
     one_error_envelope(&clause_at(member, requirement))
 }
 
+/// The `@length` maximum the model declares on BOTH `LogGroupName` and `LogStreamName`
+/// (1..512 on each): the characters either name may be long.
+const MAX_LOG_NAME_CHARS: i64 = 512;
+
+/// The members whose value IS a log group name or a log stream name, by the name a
+/// violation's member path carries. Source: the model — `logGroupName` and
+/// `logGroupNamePrefix` target `LogGroupName`, and `logStreamName`, `logStreamNamePrefix`,
+/// `logStreamNames` and `logStreamNamePrefixes` target `LogStreamName` — as the crate root's
+/// `OPERATIONS.md` lists them per operation. A list member's path steps into its element, so
+/// the match is on any segment of the path rather than on the whole of it.
+const LOG_NAME_MEMBERS: &[&str] = &[
+    "logGroupName",
+    "logGroupNamePrefix",
+    "logStreamName",
+    "logStreamNamePrefix",
+    "logStreamNames",
+    "logStreamNamePrefixes",
+];
+
+/// The whole message CloudWatch Logs refuses a log group or log stream name longer than the
+/// [`MAX_LOG_NAME_CHARS`] both are held to with.
+///
+/// The service checks the two names against that ONE shared bound itself, before the
+/// modelled walk has a member to report, so the refusal states the PAIR and the bound rather
+/// than a clause naming the member the name arrived on — which is why this message carries no
+/// `N validation error(s) detected` envelope. Only the bound is interpolated, from the
+/// model's own maximum; nothing of the submitted name is.
+fn log_name_length_message() -> String {
+    format!(
+        "Invalid LogGroup or LogStream, both must have length less than or equal to \
+         {MAX_LOG_NAME_CHARS}."
+    )
+}
+
+/// Whether one violation is a log group or log stream name past the bound both share.
+fn is_log_name_length_breach(violation: &Violation) -> bool {
+    matches!(violation.kind, ViolationKind::MaxLength(max) if max == MAX_LOG_NAME_CHARS)
+        && violation
+            .path
+            .split('.')
+            .any(|segment| LOG_NAME_MEMBERS.contains(&segment))
+}
+
 /// The refusal message for a framework-level refusal: the AWS envelope
 /// (`N validation error(s) detected: `) over one clause per violation, in the order the
 /// validating walk found them.
 ///
 /// `None` declines the whole refusal — see [`requirement`].
 fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    // The one violation class this service words as a sentence of its own rather than as a
+    // clause: a log group or log stream name past the bound the service holds both to
+    // ([`log_name_length_message`]), which it answers whatever else the request also broke.
+    if violations.iter().any(is_log_name_length_breach) {
+        return Some(log_name_length_message());
+    }
     let clauses: Vec<String> = violations
         .iter()
         .map(constraint_clause)

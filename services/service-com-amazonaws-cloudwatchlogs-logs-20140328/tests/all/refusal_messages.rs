@@ -378,6 +378,8 @@ async fn invalid_system_field_refusals_list_the_documented_values() {
 /// sentence, naming the resource KIND that is missing — the form the model documents for
 /// `ResourceNotFoundException` ("The specified resource does not exist."). The table
 /// spans the operations that can refuse one, and both kinds of resource they address.
+/// The one operation whose own sentence differs — the data protection policy read, which
+/// names the group and its owner — is asserted after the table, as that boundary.
 #[tokio::test]
 async fn a_missing_resource_is_refused_with_the_services_sentence() {
     let logs = Logs::new();
@@ -514,11 +516,6 @@ async fn a_missing_resource_is_refused_with_the_services_sentence() {
         ),
         (
             "log group",
-            "GetDataProtectionPolicy",
-            json!({"logGroupIdentifier": missing}),
-        ),
-        (
-            "log group",
             "DeleteDataProtectionPolicy",
             json!({"logGroupIdentifier": missing}),
         ),
@@ -550,4 +547,26 @@ async fn a_missing_resource_is_refused_with_the_services_sentence() {
             "case {operation} ({kind}): expected {expected:?}, got {message:?}"
         );
     }
+
+    // The boundary of that sentence: the data protection policy READ is the one operation
+    // that words a missing log group differently, because such a policy is readable across
+    // accounts — it names the group that was looked for AND the account that would own it.
+    let (code, message) = refusal(
+        &logs,
+        "GetDataProtectionPolicy",
+        &json!({"logGroupIdentifier": missing}),
+    )
+    .await;
+    let expected = format!(
+        "Log group '{missing}' for owner '{}' cannot be found",
+        engine::emulator_account_id()
+    );
+    assert_eq!(
+        code, "ResourceNotFoundException",
+        "case GetDataProtectionPolicy (log group): a missing resource is a not-found, got {message:?}"
+    );
+    assert_eq!(
+        message, expected,
+        "case GetDataProtectionPolicy (log group): expected {expected:?}, got {message:?}"
+    );
 }

@@ -172,7 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(integration) = store.integrations.get(&input.integration_name) else {
             return Err(GetIntegrationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message("integration")),
+                    message: Some(crate::state::integration_not_found_message(
+                        &input.integration_name,
+                    )),
                 },
             )
             .into());

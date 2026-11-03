@@ -621,8 +621,9 @@ async fn a_name_no_integration_is_stored_under_is_a_missing_resource() {
             "case {case:?}: expected {NOT_FOUND}, got {code} {message:?}"
         );
         assert_eq!(
-            message, "The specified integration does not exist.",
-            "case {case:?}: expected the service's missing-resource sentence, got {message:?}"
+            message,
+            format!("Integration with name {case} does not exist."),
+            "case {case:?}: expected the refusal to name the integration, got {message:?}"
         );
     }
 }
@@ -948,8 +949,9 @@ async fn deleting_an_integration_removes_it_and_refuses_what_it_must() {
             "case {case:?}: expected {NOT_FOUND}, got {code} {message:?}"
         );
         assert_eq!(
-            message, "The specified integration does not exist.",
-            "case {case:?}: expected the service's missing-resource sentence, got {message:?}"
+            message,
+            format!("Integration with name {name} does not exist."),
+            "case {case:?}: expected the refusal to name the integration, got {message:?}"
         );
     }
 

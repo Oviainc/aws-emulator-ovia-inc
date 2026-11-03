@@ -29,7 +29,7 @@
 use serde_json::{json, Map, Value};
 
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
-    anomaly_detector_arn, log_group_arn, resource_not_found_message,
+    anomaly_detector_arn, anomaly_detector_not_found_message, log_group_arn,
     ComAmazonawsCloudwatchlogsLogs20140328State, AnomalyDetectorRecord,
     ANOMALY_DETECTOR_STATUS_ANALYZING, MAX_ANOMALY_DETECTORS, SUPPRESSION_TYPE_INFINITE,
 };
@@ -394,9 +394,8 @@ async fn each_deleted_detector_is_gone_from_every_read() {
             );
             assert_eq!(
                 message,
-                resource_not_found_message("anomaly detector"),
-                "case {case:?}: {operation} states the resource kind that is missing, got \
-                 {message:?}"
+                anomaly_detector_not_found_message(arn),
+                "case {case:?}: {operation} names the ARN that is not there, got {message:?}"
             );
         }
 
@@ -554,8 +553,8 @@ async fn deleting_a_detector_the_account_does_not_hold_is_refused() {
         );
         assert_eq!(
             message,
-            resource_not_found_message("anomaly detector"),
-            "case {case:?}: expected the refusal to name the missing resource, got {message:?}"
+            anomaly_detector_not_found_message(&arn),
+            "case {case:?}: expected the refusal to name the ARN that is not there, got {message:?}"
         );
     }
 

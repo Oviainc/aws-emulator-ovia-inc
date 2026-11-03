@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .anomaly_detectors
             .get_mut(&input.anomaly_detector_arn)
         else {
-            return Err(not_found("anomaly detector"));
+            return Err(detector_not_found(&input.anomaly_detector_arn));
         };
 
         // Suppression acts on a finding the DETECTOR reported — "You can find anomaly IDs by
@@ -304,11 +304,14 @@ fn invalid_parameter(message: String) -> UpdateAnomalyError {
     .into()
 }
 
-/// Refuse a request naming a resource this account does not hold, in the one sentence form
-/// this service refuses a missing resource with.
-fn not_found(resource_kind: &str) -> UpdateAnomalyError {
+/// Refuse a request whose `anomalyDetectorArn` names no detector this account holds, in the
+/// one sentence form this service refuses such an ARN with
+/// ([`crate::state::anomaly_detector_not_found_message`]).
+fn detector_not_found(anomaly_detector_arn: &str) -> UpdateAnomalyError {
     UpdateAnomalyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::resource_not_found_message(resource_kind)),
+        message: Some(crate::state::anomaly_detector_not_found_message(
+            anomaly_detector_arn,
+        )),
     })
     .into()
 }

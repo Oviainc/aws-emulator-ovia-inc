@@ -169,6 +169,8 @@ mod query_definitions;
 mod query_window_refusal;
 #[path = "all/refusal_error_codes.rs"]
 mod refusal_error_codes;
+#[path = "all/refusal_message_fidelity.rs"]
+mod refusal_message_fidelity;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
 #[path = "all/refusal_wording.rs"]

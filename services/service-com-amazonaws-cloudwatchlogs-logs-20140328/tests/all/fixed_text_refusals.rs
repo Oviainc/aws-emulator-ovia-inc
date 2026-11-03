@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the two refusal messages CloudWatch Logs states as FIXED TEXT for
-//! their error class — text that interpolates nothing from the request or from state:
+//! End-to-end tests for the refusal messages CloudWatch Logs states as FIXED TEXT for
+//! their error class — text that interpolates nothing from the request or from state — and
+//! for the boundaries of that fixed text:
 //!
 //! * a missing resource the request identifies NOTHING of — a log-group level policy
 //!   document addressed by the identifier of the log group it is attached to and by nothing
 //!   else — is refused with the service's own missing-resource text, naming neither the log
 //!   group, nor a policy name, nor a word for the kind of resource (`DeleteIndexPolicy`,
-//!   `GetDataProtectionPolicy` / `DeleteDataProtectionPolicy`, `DeleteTransformer`);
+//!   `GetDataProtectionPolicy` / `DeleteDataProtectionPolicy`);
 //! * an `expectedRevisionId` that IS a revision the service issued and a later write
 //!   superseded is refused as a conflict against the resource the caller is to re-read and
 //!   retry, naming neither the revision presented, nor the stored one, nor the policy's name
@@ -15,9 +16,10 @@
 //!   as a revision is a bad parameter instead, refused with that class's own fixed text,
 //!   because no retry of it can ever succeed.
 //!
-//! Where a request DOES identify the missing resource the refusal still names it — a log
-//! group the account does not hold is refused by naming the log group — so the boundary of
-//! the fixed text is asserted here too.
+//! Where a request DOES identify the missing resource the refusal names it — a log group the
+//! account does not hold is refused by naming the log group, and the transformer delete
+//! names the group it found no transformer on — so the boundary of the fixed text is
+//! asserted here too.
 //!
 //! Every case drives the service the way a client does — `POST /` with
 //! `X-Amz-Target: Logs_20140328.<Operation>` through the router that mounts it — so a
@@ -68,7 +70,8 @@ const LOG_GROUP_NOT_FOUND: &str = "The specified log group does not exist.";
 struct Row {
     /// The case name, and the slug the groups of this row are named under.
     slug: &'static str,
-    /// The word for this kind of resource — which the refusal must NOT carry.
+    /// The word for this kind of resource — which a refusal stating the fixed text must NOT
+    /// carry.
     resource: &'static str,
     /// The operation that stores one on a log group.
     put: &'static str,
@@ -78,6 +81,22 @@ struct Row {
     readers: &'static [&'static str],
     /// The operation that removes one, which refuses a group holding none too.
     delete: &'static str,
+    /// The whole message this row's operations refuse a group holding none of its resource
+    /// with, given that group's NAME: the service's fixed text where the request identifies
+    /// nothing of the missing resource, and a sentence naming the resource and its group
+    /// where it does.
+    refusal: fn(&str) -> String,
+}
+
+/// The fixed text, for a row whose missing resource the request identifies nothing of.
+fn unidentified_refusal(_log_group_name: &str) -> String {
+    UNIDENTIFIED_NOT_FOUND.to_string()
+}
+
+/// The sentence the transformer delete refuses a group holding no transformer with: the kind
+/// of resource that is missing, and the group it was looked for on.
+fn transformer_refusal(log_group_name: &str) -> String {
+    format!("Transformer does not exist on log group '{log_group_name}'")
 }
 
 /// The log-group level resources a request addresses by its log group's identifier alone.
@@ -92,6 +111,7 @@ fn rows() -> Vec<Row> {
             document: json!({"policyDocument": json!({"Fields": ["requestId"]}).to_string()}),
             readers: &[],
             delete: "DeleteIndexPolicy",
+            refusal: unidentified_refusal,
         },
         Row {
             slug: "data-protection-policy",
@@ -100,6 +120,7 @@ fn rows() -> Vec<Row> {
             document: json!({"policyDocument": data_protection_document("EmailAddress")}),
             readers: &["GetDataProtectionPolicy"],
             delete: "DeleteDataProtectionPolicy",
+            refusal: unidentified_refusal,
         },
         Row {
             slug: "transformer",
@@ -115,6 +136,7 @@ fn rows() -> Vec<Row> {
             // `tests/all/transformers.rs` is about.
             readers: &[],
             delete: "DeleteTransformer",
+            refusal: transformer_refusal,
         },
     ]
 }
@@ -181,15 +203,18 @@ async fn group_identifier(logs: &Logs, name: &str, use_arn: bool) -> String {
     }
 }
 
-/// Assert one operation refuses `identifier` as a missing resource the request identifies
-/// nothing of: the fixed text, carrying nothing from the request.
-async fn assert_unidentified_refusal(
+/// Assert one operation refuses a group holding none of `row`'s resource with the message
+/// that row states — and, where that message is the fixed text, that it carries nothing of
+/// the request and no word for the kind of resource.
+async fn assert_missing_resource_refusal(
     logs: &Logs,
     case: &str,
     operation: &str,
     identifier: &str,
-    resource: &str,
+    log_group_name: &str,
+    row: &Row,
 ) {
+    let expected = (row.refusal)(log_group_name);
     let (code, message) = logs
         .refusal(operation, &json!({"logGroupIdentifier": identifier}))
         .await;
@@ -198,23 +223,26 @@ async fn assert_unidentified_refusal(
         "case {case:?} ({operation}): a resource that is not there is a not-found, got {code} {message:?}"
     );
     assert_eq!(
-        message, UNIDENTIFIED_NOT_FOUND,
-        "case {case:?} ({operation}): expected {UNIDENTIFIED_NOT_FOUND:?}, got {message:?}"
+        message, expected,
+        "case {case:?} ({operation}): expected {expected:?}, got {message:?}"
     );
-    assert!(
-        !message.contains(identifier),
-        "case {case:?} ({operation}): the refusal carries nothing of the request, got {message:?}"
-    );
-    assert!(
-        !message.contains(resource),
-        "case {case:?} ({operation}): the refusal names no kind of resource, got {message:?}"
-    );
+    if expected == UNIDENTIFIED_NOT_FOUND {
+        assert!(
+            !message.contains(identifier),
+            "case {case:?} ({operation}): the fixed text carries nothing of the request, got {message:?}"
+        );
+        assert!(
+            !message.contains(row.resource),
+            "case {case:?} ({operation}): the fixed text names no kind of resource, got {message:?}"
+        );
+    }
 }
 
 /// A log-group level policy document the request identifies nothing of — it is addressed by
 /// its log group's identifier alone — is refused with the service's fixed missing-resource
 /// text, whichever resource it is, whichever operation asks for it, whichever identifier
-/// form names its group, and however it came to be missing.
+/// form names its group, and however it came to be missing; and where the refusal does name
+/// the resource and its group (the transformer delete) it does so under the same conditions.
 #[tokio::test]
 async fn an_unidentified_missing_resource_is_refused_with_the_services_fixed_text() {
     let logs = Logs::new();
@@ -226,8 +254,15 @@ async fn an_unidentified_missing_resource_is_refused_with_the_services_fixed_tex
             let identifier = group_identifier(&logs, &never, use_arn).await;
             for operation in refusing_operations(&row) {
                 let case = format!("{} never held, by {form}", row.slug);
-                assert_unidentified_refusal(&logs, &case, operation, &identifier, row.resource)
-                    .await;
+                assert_missing_resource_refusal(
+                    &logs,
+                    &case,
+                    operation,
+                    &identifier,
+                    &never,
+                    &row,
+                )
+                .await;
             }
 
             // A group that held one and no longer does, and the same group asked twice.
@@ -244,15 +279,29 @@ async fn an_unidentified_missing_resource_is_refused_with_the_services_fixed_tex
                 .await;
             for operation in refusing_operations(&row) {
                 let case = format!("{} deleted, by {form}", row.slug);
-                assert_unidentified_refusal(&logs, &case, operation, &identifier, row.resource)
-                    .await;
+                assert_missing_resource_refusal(
+                    &logs,
+                    &case,
+                    operation,
+                    &identifier,
+                    &deleted,
+                    &row,
+                )
+                .await;
             }
             // Asking a second time refuses identically: the refusal follows the state, not
             // the history of the request.
             for operation in refusing_operations(&row) {
                 let case = format!("{} asked twice after the delete, by {form}", row.slug);
-                assert_unidentified_refusal(&logs, &case, operation, &identifier, row.resource)
-                    .await;
+                assert_missing_resource_refusal(
+                    &logs,
+                    &case,
+                    operation,
+                    &identifier,
+                    &deleted,
+                    &row,
+                )
+                .await;
             }
 
             // A put after the refusals stores the resource again, so nothing above left the
@@ -289,14 +338,29 @@ async fn a_missing_log_group_is_still_named_in_the_refusal() {
                     "case {} by {form} ({operation}): a group the account does not hold is a not-found, got {code} {message:?}",
                     row.slug
                 );
+                let expected = missing_group_message(operation, ABSENT);
                 assert_eq!(
-                    message, LOG_GROUP_NOT_FOUND,
-                    "case {} by {form} ({operation}): expected {LOG_GROUP_NOT_FOUND:?}, got {message:?}",
+                    message, expected,
+                    "case {} by {form} ({operation}): expected {expected:?}, got {message:?}",
                     row.slug
                 );
             }
         }
     }
+}
+
+/// The message an operation refuses a log group the account does not hold with: the
+/// service's sentence naming the resource kind, except the data protection policy READ,
+/// which \u2014 because such a policy is readable across accounts \u2014 names the group that was
+/// looked for and the account that would own it.
+fn missing_group_message(operation: &str, log_group_name: &str) -> String {
+    if operation == "GetDataProtectionPolicy" {
+        return format!(
+            "Log group '{log_group_name}' for owner '{}' cannot be found",
+            engine::emulator_account_id()
+        );
+    }
+    LOG_GROUP_NOT_FOUND.to_string()
 }
 
 /// A resource policy document of the form `PutResourcePolicy$policyDocument` documents:
