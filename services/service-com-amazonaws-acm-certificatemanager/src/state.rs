@@ -182,25 +182,40 @@ pub const DOMAIN_STATUS_FAILED: &str = "FAILED";
 pub const FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED: &str =
     "ADDITIONAL_VERIFICATION_REQUIRED";
 
+/// The span this emulator gives a transition it owes a REQUESTED certificate: the least
+/// time a transition the clock makes due on its own stays owed for.
+///
+/// Every such span is measured from the call that started the transition and is never
+/// slept on, so the only thing that decides whether a client ever observes the
+/// transient state is how long the span is against that client's OWN next calls. A span
+/// shorter than a client's call sequence makes the state it guards unobservable over
+/// the network — the same request sequence then gets one answer from a fast client and
+/// another from a slow one — so it is this floor rather than the wall-clock time AWS
+/// happens to take.
+pub const OWED_TRANSITION_SPAN: Duration = Duration::from_secs(3);
+
 /// How long after `RequestCertificate` an outcome ACM reaches WITHOUT waiting on proof
 /// of domain control falls due — issuance for a request that needs no validation, and
 /// the up-front refusal of a name that can never be validated.
 ///
 /// A CHOSEN span, not a documented one: AWS takes seconds to minutes to answer either,
-/// which no client could poll through here. It is never zero, so a caller that reads
-/// straight after requesting — over the network, not in process — still observes
-/// `PENDING_VALIDATION` and the refusals that go with it, and it is never slept on: the
-/// due instant is stored on the record and materialised by whichever call next touches
-/// the store (see [`ComAmazonawsAcmCertificatemanagerState::materialize_due`]).
+/// which no client could poll through here, so it is [`OWED_TRANSITION_SPAN`] — long
+/// enough that a caller that describes and then acts on the certificate straight after
+/// requesting it, over the network rather than in process, still observes
+/// `PENDING_VALIDATION` and every refusal keyed on it. It is never slept on: the due
+/// instant is stored on the record and materialised by whichever call next touches the
+/// store (see [`ComAmazonawsAcmCertificatemanagerState::materialize_due`]).
 ///
 /// It sits BELOW [`VALIDATION_EMAIL_DISPATCH_DELAY`], so an outcome ACM reaches
 /// without waiting on proof of domain control falls due before the initial validation
 /// mail would have: such a request never reaches the domain validation the mail belongs
 /// to, so the owed dispatch is dropped rather than sent
-/// ([`Certificate::materialize_due`]). The outcome of a request ACM DOES wait on proof
-/// for is the timeout at the end of the documented [`VALIDATION_WINDOW`], which the
-/// mail falls due long before.
-pub const VALIDATION_SETTLE_DELAY: Duration = Duration::from_secs(2);
+/// ([`Certificate::materialize_due`]). That ordering also makes THIS span the one that
+/// bounds how long the pre-dispatch resend gate answers for such a request, which is
+/// why it carries the same floor as the dispatch itself. The outcome of a request ACM
+/// DOES wait on proof for is the timeout at the end of the documented
+/// [`VALIDATION_WINDOW`], which the mail falls due long before.
+pub const VALIDATION_SETTLE_DELAY: Duration = OWED_TRANSITION_SPAN;
 
 /// How long after `RequestCertificate` the initial domain-validation EMAIL falls due,
 /// for a request ACM carries into domain validation.
@@ -212,6 +227,10 @@ pub const VALIDATION_SETTLE_DELAY: Duration = Duration::from_secs(2);
 /// an empty mailbox list, and the resend gate that goes with it. It is never slept on:
 /// the due instant is stored on the record ([`Certificate::pending_validation_email`])
 /// and materialised by whichever call next touches the store.
+///
+/// It is at least [`OWED_TRANSITION_SPAN`], for the same reason that span exists, and
+/// strictly ABOVE [`VALIDATION_SETTLE_DELAY`], so a request that settles without
+/// waiting on proof of domain control is never mailed.
 pub const VALIDATION_EMAIL_DISPATCH_DELAY: Duration = Duration::from_secs(4);
 
 /// How long ACM waits for proof of domain control before the request times out.

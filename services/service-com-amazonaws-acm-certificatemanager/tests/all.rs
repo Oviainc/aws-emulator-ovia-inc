@@ -117,6 +117,8 @@ mod pending_validation_and_tag_envelopes;
 mod refusal_codes_and_search_projection;
 #[path = "all/refusal_message_templates.rs"]
 mod refusal_message_templates;
+#[path = "all/requested_certificate_transition_spans.rs"]
+mod requested_certificate_transition_spans;
 #[path = "all/resend_validation_email.rs"]
 mod resend_validation_email;
 #[path = "all/resource_tag_input_constraints.rs"]
