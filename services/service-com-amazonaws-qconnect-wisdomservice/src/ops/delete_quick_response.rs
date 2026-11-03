@@ -79,6 +79,14 @@ fn not_found(message: &str, resource_name: &str) -> DeleteQuickResponseError {
     .into()
 }
 
+/// The modelled `ValidationException` (HTTP 400), stating the rule the request broke.
+fn validation(message: String) -> DeleteQuickResponseError {
+    DeleteQuickResponseErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,10 +172,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A quick response is reachable only through the knowledge base it was created
         // under, so the parent is resolved first and a knowledge base this account does
         // not hold is reported as the resource that is missing.
-        if store.knowledge_base(&input.knowledge_base_id).is_none() {
+        let Some(knowledge_base_type) = store
+            .knowledge_base(&input.knowledge_base_id)
+            .map(|knowledge_base| knowledge_base.knowledge_base_type.clone())
+        else {
             return Err(not_found(
                 crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND,
                 &input.knowledge_base_id,
+            ));
+        };
+        // Quick responses live only in a knowledge base whose type holds them, so a
+        // delete addressed to a knowledge base of any other modelled type is refused
+        // exactly as a create against it is, and removes nothing.
+        if knowledge_base_type != crate::state::KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES {
+            return Err(validation(
+                crate::state::message_quick_response_plane_unsupported(&knowledge_base_type),
             ));
         }
         // The record goes with everything that named it, so a later read cannot answer out

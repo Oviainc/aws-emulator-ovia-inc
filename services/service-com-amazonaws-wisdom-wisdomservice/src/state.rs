@@ -17,7 +17,8 @@ use crate::ops::types::{
     AssistantData, AssistantSummary,
     ContentData, ContentSummary,
     GroupingConfiguration, KnowledgeBaseAssociationData, KnowledgeBaseData,
-    QuickResponseContentProvider, QuickResponseContents, QuickResponseData, QuickResponseSummary,
+    QuickResponseContentProvider, QuickResponseContents, QuickResponseData,
+    QuickResponseSearchResultData, QuickResponseSummary,
     RecommendationData, RecommendationTrigger, RenderingConfiguration,
     ServerSideEncryptionConfiguration, SessionData, SourceConfiguration,
 };
@@ -179,6 +180,20 @@ pub const QUICK_RESPONSE_TYPE_MARKDOWN: &str = "application/x.quickresponse;form
 /// `ResourceNotFoundException`'s own `resourceName` member.
 pub const MESSAGE_QUICK_RESPONSE_NOT_FOUND: &str = "QuickResponse does not exist.";
 
+/// Whether a quick response whose create named no `isActive` is in service.
+///
+/// `isActive` is OPTIONAL on `CreateQuickResponse` and on `QuickResponseData`, but
+/// REQUIRED on `QuickResponseSearchResultData`
+/// (`smithy_query(query="shape",shape="QuickResponseSearchResultData")`), so a search hit
+/// has to report a value for a record whose create named none. A quick response nothing
+/// deactivated is usable the moment it is created — that is what the create answering it
+/// already [`QUICK_RESPONSE_STATUS_CREATED`] means — so the value reported, and the one a
+/// filter on `isActive` matches against, is this one. The Amazon Q in Connect view of this
+/// same endpoint reads the member from its own copy of this constant
+/// (`services/service-com-amazonaws-qconnect-wisdomservice/src/state.rs`), so a client
+/// cannot read a different value depending on which model it addressed.
+pub const QUICK_RESPONSE_ACTIVE_BY_DEFAULT: bool = true;
+
 /// The sentence a create past [`MAX_QUICK_RESPONSES_PER_KNOWLEDGE_BASE`] is refused
 /// with, stating the RULE — the ceiling and what to do about it — and carrying nothing
 /// from the request or from what the knowledge base already holds.
@@ -284,15 +299,22 @@ pub const EMPTY_RESPONSE_SUCCESS_STATUS: u16 = 204;
 /// be used.
 pub const KNOWLEDGE_BASE_TYPE_CUSTOM: &str = "CUSTOM";
 
-/// The modelled `KnowledgeBaseType` whose INTERNAL name is not its modelled value
+/// The only `KnowledgeBaseType` whose knowledge bases hold quick responses, and the
+/// modelled type whose INTERNAL name is not its modelled value
 /// (`smithy_query(query="shape",shape="KnowledgeBaseType")`: `EXTERNAL`, `CUSTOM`,
-/// `QUICK_RESPONSES`), and that internal name.
+/// `QUICK_RESPONSES`).
+///
+/// Every quick-response operation documents the rule on its own `knowledgeBaseId`
+/// (`smithy_query(query="doc",shape="SearchQuickResponsesRequest",member="knowledgeBaseId")`:
+/// "This should be a QUICK_RESPONSES type knowledge base"), so a knowledge base of any
+/// other modelled type exposes no quick-response plane at all
+/// ([`message_quick_response_plane_unsupported`]).
 ///
 /// The recorded wire answer of this endpoint for an upload against a knowledge base of
 /// this type names the type `quick_replies` — the name it carried before the API spelled
-/// it `QUICK_RESPONSES` — so the token travels from the recording rather than from the
+/// it `QUICK_RESPONSES` — so that token travels from the recording rather than from the
 /// modelled value. See [`knowledge_base_type_token`].
-const KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES: &str = "QUICK_RESPONSES";
+pub const KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES: &str = "QUICK_RESPONSES";
 const KNOWLEDGE_BASE_TYPE_TOKEN_QUICK_RESPONSES: &str = "quick_replies";
 
 /// The name this service uses for a `KnowledgeBaseType` INTERNALLY, which is what its
@@ -325,6 +347,19 @@ pub fn message_unsupported_content_type(knowledge_base_type: &str) -> String {
         "Unsupported ContentType for KnowledgeBaseType: {}",
         knowledge_base_type_token(knowledge_base_type)
     )
+}
+
+/// The sentence every operation of the quick-response plane refuses a knowledge base that
+/// holds no quick responses with — one whose `knowledgeBaseType` is not
+/// [`KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES`].
+///
+/// It is the fixed text the recorded wire answer of this endpoint carries for that class,
+/// and its one variable part is the MODELLED type of the knowledge base the request named,
+/// read from the STORED record: the only thing a caller learns from it is which type it
+/// addressed, which is what the refusal is for. Every operation of that plane words the
+/// class from here, so a client gets one sentence however it reached it.
+pub fn message_quick_response_plane_unsupported(knowledge_base_type: &str) -> String {
+    format!("QuickResponse APIs are not supported for {knowledge_base_type} knowledge bases")
 }
 
 /// How long an upload URL stays valid when the caller names no
@@ -1016,6 +1051,47 @@ impl QuickResponse {
             tags: wire_tags(&self.tags),
         }
     }
+
+    /// Whether this quick response is in service, as the REQUIRED `isActive` of a search
+    /// hit reports it: the value the create or an update named, or
+    /// [`QUICK_RESPONSE_ACTIVE_BY_DEFAULT`] for a record that names none.
+    pub fn is_active_or_default(&self) -> bool {
+        self.is_active.unwrap_or(QUICK_RESPONSE_ACTIVE_BY_DEFAULT)
+    }
+
+    /// The `QuickResponseSearchResultData` a search of this quick response's knowledge
+    /// base reports it as: the same stored fields the other two projections answer with,
+    /// shaped to the members the search result declares
+    /// (`smithy_query(query="shape",shape="QuickResponseSearchResultData")`), so a search
+    /// hit and a read of the same record cannot disagree.
+    pub fn to_search_result(&self) -> QuickResponseSearchResultData {
+        QuickResponseSearchResultData {
+            quick_response_arn: self.quick_response_arn.clone(),
+            quick_response_id: self.quick_response_id.clone(),
+            knowledge_base_arn: self.knowledge_base_arn.clone(),
+            knowledge_base_id: self.knowledge_base_id.clone(),
+            name: self.name.clone(),
+            content_type: self.content_type.clone(),
+            status: self.status.clone(),
+            contents: self.contents(),
+            created_time: ::aws_smithy_types::DateTime::from(self.created_at),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_at),
+            is_active: self.is_active_or_default(),
+            description: self.description.clone(),
+            grouping_configuration: self.grouping_configuration.clone(),
+            shortcut_key: self.shortcut_key.clone(),
+            // See [`Self::to_data`]: the identity the stored record was last written by.
+            last_modified_by: Some(self.last_modified_by.clone()),
+            channels: self.channels.clone(),
+            language: self.language.clone(),
+            // These two report which of the contact attributes a search was given were
+            // resolved into the content it answers with. This endpoint resolves none — the
+            // content travels exactly as it was stored — so neither list is claimed.
+            attributes_not_interpolated: None,
+            attributes_interpolated: None,
+            tags: wire_tags(&self.tags),
+        }
+    }
 }
 
 /// One content upload `StartContentUpload` opened: the slot the URL it handed out
@@ -1235,8 +1311,9 @@ pub struct Content {
     /// content's own name when it gave none.
     pub title: String,
     /// `ContentData$revisionId`: which revision of this content a read is of. It changes
-    /// when the content's asset does, which is what makes it a revision rather than a
-    /// second name for the content id.
+    /// whenever something writes the content, which is what lets a writer name the
+    /// revision it read and be refused when another writer got there first — the
+    /// optimistic lock `UpdateContent`'s `revisionId` documents.
     pub revision_id: String,
     /// The media type the upload this content was created from was started for, so the
     /// content reports the type its asset actually is.
@@ -2268,12 +2345,11 @@ impl ComAmazonawsWisdomWisdomserviceState {
         if self.contents_of(&content.knowledge_base_id).len() >= MAX_CONTENTS_PER_KNOWLEDGE_BASE {
             return false;
         }
-        let stored_bytes: usize = self
-            .contents
-            .values()
-            .map(|content| content.body.len())
-            .sum();
-        if stored_bytes.saturating_add(content.body.len()) > MAX_STORED_CONTENT_BYTES {
+        if self
+            .stored_content_bytes()
+            .saturating_add(content.body.len())
+            > MAX_STORED_CONTENT_BYTES
+        {
             return false;
         }
         self.content_arn_index.insert(
@@ -2293,6 +2369,25 @@ impl ComAmazonawsWisdomWisdomserviceState {
         (0..MINT_ATTEMPTS)
             .map(|_| new_resource_id())
             .find(|candidate| !self.contents.contains_key(candidate))
+    }
+
+    /// The same content as [`Self::content`], for a caller that WRITES to it: the seam
+    /// `UpdateContent` applies its changes through, so an update and a read reach one
+    /// record rather than two copies.
+    pub fn content_mut(
+        &mut self,
+        knowledge_base_id: &str,
+        content_label: &str,
+    ) -> Option<&mut Content> {
+        let content_id = self.content(knowledge_base_id, content_label)?.content_id.clone();
+        self.contents.get_mut(&content_id)
+    }
+
+    /// The asset bytes every content of this store holds together — what
+    /// [`MAX_STORED_CONTENT_BYTES`] bounds, so a write that REPLACES an asset is measured
+    /// against the same figure a create is.
+    pub fn stored_content_bytes(&self) -> usize {
+        self.contents.values().map(|content| content.body.len()).sum()
     }
 }
 
@@ -2328,6 +2423,29 @@ pub fn is_resource_id(value: &str) -> bool {
                     .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
         })
     }) && groups.next().is_none()
+}
+
+/// What a pagination cursor this service minted carries, so a token it did not mint is
+/// refused rather than read as some position by accident.
+const CURSOR_SCOPE: &str = "wisdom-quick-response-search\u{1f}";
+
+/// The pagination cursor for a page that starts at `key`.
+///
+/// Hex of a scoped key rather than the key itself, so a caller cannot read structure into
+/// the token and has nothing to build one from: a `nextToken` is opaque and only ever
+/// travels back unchanged. It is used where a page's position is NOT simply an id — a
+/// search whose order the caller chooses — while the plain listings of this crate resume
+/// at the id of the next entry. Well inside the modelled `NonEmptyString` length
+/// (1..4096), and hex is safe in the query string the token travels in.
+pub fn encode_cursor(key: &str) -> String {
+    ::hex::encode(format!("{CURSOR_SCOPE}{key}").as_bytes())
+}
+
+/// The start key a cursor minted by [`encode_cursor`] carries, or `None` when the token
+/// was not minted by this service.
+pub fn decode_cursor(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    decoded.strip_prefix(CURSOR_SCOPE).map(str::to_string)
 }
 
 /// The region a request was signed for, read from its SigV4 credential scope

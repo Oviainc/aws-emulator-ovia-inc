@@ -154,8 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A quick response is reachable only through the knowledge base it was created
         // under, so the parent is resolved first and a knowledge base this account does
         // not hold is reported as the resource that is missing.
-        let Some(knowledge_base_id) = state.resolve_knowledge_base_id(&input.knowledge_base_id)
-        else {
+        let Some(knowledge_base) = state.knowledge_base(&input.knowledge_base_id) else {
             return Err(GetQuickResponseErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND.to_string()),
@@ -164,6 +163,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // Quick responses live only in a knowledge base whose type holds them, so a read
+        // addressed to a knowledge base of any other modelled type is refused exactly as a
+        // create against it is: that knowledge base exposes no quick-response plane.
+        if knowledge_base.knowledge_base_type != crate::state::KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES {
+            return Err(GetQuickResponseErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::message_quick_response_plane_unsupported(
+                        &knowledge_base.knowledge_base_type,
+                    )),
+                },
+            )
+            .into());
+        }
+        let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
         // A label pair that crosses one knowledge base with another's quick response
         // names nothing either.
         let Some(quick_response) =

@@ -203,6 +203,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // A quick response lives only in a knowledge base whose type holds quick
+        // responses, which the member's own documentation states ("This should not be a
+        // QUICK_RESPONSES type knowledge base if you're storing Wisdom Content resource to
+        // it"), so a create against a knowledge base of any other modelled type is refused
+        // before anything is minted rather than answered with a resource the service would
+        // never hold. The type is read off the STORED knowledge base.
+        if knowledge_base.knowledge_base_type != crate::state::KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES {
+            return Err(CreateQuickResponseErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::message_quick_response_plane_unsupported(
+                        &knowledge_base.knowledge_base_type,
+                    )),
+                },
+            )
+            .into());
+        }
         let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
         let knowledge_base_arn = knowledge_base.knowledge_base_arn.clone();
 

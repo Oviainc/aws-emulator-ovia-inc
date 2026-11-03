@@ -164,8 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The listing is of ONE knowledge base, so the parent is resolved first: a
         // knowledge base this account does not hold is not found rather than an empty
         // page.
-        let Some(knowledge_base_id) = state.resolve_knowledge_base_id(&input.knowledge_base_id)
-        else {
+        let Some(knowledge_base) = state.knowledge_base(&input.knowledge_base_id) else {
             return Err(ListQuickResponsesErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND.to_string()),
@@ -174,6 +173,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // Quick responses live only in a knowledge base whose type holds them, so a
+        // knowledge base of any other modelled type exposes no quick-response plane at
+        // all: the listing is refused exactly as a create against it is, rather than
+        // answered with the empty page of a collection that cannot exist.
+        if knowledge_base.knowledge_base_type != crate::state::KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES {
+            return Err(ListQuickResponsesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::message_quick_response_plane_unsupported(
+                        &knowledge_base.knowledge_base_type,
+                    )),
+                },
+            )
+            .into());
+        }
+        let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
 
         // A page's `nextToken` is the `quickResponseId` the next page starts at, so a
         // token that is no id of this service's form names no position and is refused

@@ -154,14 +154,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A quick response is reachable only through the knowledge base it was created
         // under, so the parent is resolved first and a knowledge base this account does
         // not hold is reported as the resource that is missing.
-        if state
-            .resolve_knowledge_base_id(&input.knowledge_base_id)
-            .is_none()
-        {
+        let Some(knowledge_base) = state.knowledge_base(&input.knowledge_base_id) else {
             return Err(DeleteQuickResponseErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND.to_string()),
                     resource_name: Some(input.knowledge_base_id.clone()),
+                },
+            )
+            .into());
+        };
+        // Quick responses live only in a knowledge base whose type holds them, so a
+        // delete addressed to a knowledge base of any other modelled type is refused
+        // exactly as a create against it is, and removes nothing.
+        if knowledge_base.knowledge_base_type != crate::state::KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES {
+            return Err(DeleteQuickResponseErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::message_quick_response_plane_unsupported(
+                        &knowledge_base.knowledge_base_type,
+                    )),
                 },
             )
             .into());

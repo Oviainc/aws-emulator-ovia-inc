@@ -173,6 +173,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
 
+        // Quick responses live only in a knowledge base whose type holds them, so a
+        // knowledge base of any other modelled type exposes no quick-response plane at
+        // all: the listing is refused exactly as a create against it is, rather than
+        // answered with the empty page of a collection that cannot exist.
+        if knowledge_base.knowledge_base_type != crate::state::KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES {
+            return Err(ListQuickResponsesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::message_quick_response_plane_unsupported(
+                        &knowledge_base.knowledge_base_type,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // A token this service did not mint names no position, so it is refused rather
         // than silently read as "from the beginning".
         let start_at = match input.next_token.as_deref() {

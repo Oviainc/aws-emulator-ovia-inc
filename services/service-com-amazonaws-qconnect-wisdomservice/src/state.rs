@@ -704,15 +704,22 @@ pub fn message_conflicting_update_members(set_member: &str, remove_member: &str)
 /// be used.
 pub const KNOWLEDGE_BASE_TYPE_CUSTOM: &str = "CUSTOM";
 
-/// The modelled `KnowledgeBaseType` whose INTERNAL name is not its modelled value
+/// The only `KnowledgeBaseType` whose knowledge bases hold quick responses, and the
+/// modelled type whose INTERNAL name is not its modelled value
 /// (`smithy_query(query="shape",shape="KnowledgeBaseType")`: `EXTERNAL`, `CUSTOM`,
-/// `QUICK_RESPONSES`, `MESSAGE_TEMPLATES`, `MANAGED`), and that internal name.
+/// `QUICK_RESPONSES`, `MESSAGE_TEMPLATES`, `MANAGED`).
+///
+/// Every quick-response operation documents the rule on its own `knowledgeBaseId`
+/// (`smithy_query(query="doc",shape="SearchQuickResponsesRequest",member="knowledgeBaseId")`:
+/// "This should be a QUICK_RESPONSES type knowledge base"), so a knowledge base of any
+/// other modelled type exposes no quick-response plane at all
+/// ([`message_quick_response_plane_unsupported`]).
 ///
 /// The recorded wire answer of this endpoint for an upload against a knowledge base of
 /// this type names the type `quick_replies` — the name it carried before the API spelled
-/// it `QUICK_RESPONSES` — so the token travels from the recording rather than from the
+/// it `QUICK_RESPONSES` — so that token travels from the recording rather than from the
 /// modelled value. See [`knowledge_base_type_token`].
-const KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES: &str = "QUICK_RESPONSES";
+pub const KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES: &str = "QUICK_RESPONSES";
 const KNOWLEDGE_BASE_TYPE_TOKEN_QUICK_RESPONSES: &str = "quick_replies";
 
 /// The name this service uses for a `KnowledgeBaseType` INTERNALLY, which is what its
@@ -745,6 +752,21 @@ pub fn message_unsupported_content_type(knowledge_base_type: &str) -> String {
         "Unsupported ContentType for KnowledgeBaseType: {}",
         knowledge_base_type_token(knowledge_base_type)
     )
+}
+
+/// The sentence every operation of the quick-response plane refuses a knowledge base that
+/// holds no quick responses with — one whose `knowledgeBaseType` is not
+/// [`KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES`].
+///
+/// It is the fixed text the recorded wire answer of this endpoint carries for that class,
+/// and its one variable part is the MODELLED type of the knowledge base the request named,
+/// read from the STORED record: the only thing a caller learns from it is which type it
+/// addressed, which is what the refusal is for. The legacy Amazon Connect Wisdom view of
+/// this same endpoint words it from its own copy of this text
+/// (`services/service-com-amazonaws-wisdom-wisdomservice/src/state.rs`), so a client cannot
+/// get a different sentence depending on which model it addressed.
+pub fn message_quick_response_plane_unsupported(knowledge_base_type: &str) -> String {
+    format!("QuickResponse APIs are not supported for {knowledge_base_type} knowledge bases")
 }
 
 /// The `KnowledgeBaseType` values whose content comes from a source OUTSIDE this service
@@ -2452,8 +2474,9 @@ pub struct Content {
     /// content's own name when it gave none.
     pub title: String,
     /// `ContentData$revisionId`: which revision of this content a read is of. It changes
-    /// when the content's asset does, which is what makes it a revision rather than a
-    /// second name for the content id.
+    /// whenever something writes the content, which is what lets a writer name the
+    /// revision it read and be refused when another writer got there first — the
+    /// optimistic lock `UpdateContent`'s `revisionId` documents.
     pub revision_id: String,
     /// The media type the upload this content was created from was started for, so the
     /// content reports the type its asset actually is.
@@ -2772,16 +2795,34 @@ impl ComAmazonawsQconnectWisdomserviceState {
         if self.contents_of(&content.knowledge_base_id).len() >= MAX_CONTENTS_PER_KNOWLEDGE_BASE {
             return false;
         }
-        let stored_bytes: usize = self
-            .contents
-            .values()
-            .map(|content| content.body.len())
-            .sum();
-        if stored_bytes.saturating_add(content.body.len()) > MAX_STORED_CONTENT_BYTES {
+        if self
+            .stored_content_bytes()
+            .saturating_add(content.body.len())
+            > MAX_STORED_CONTENT_BYTES
+        {
             return false;
         }
         self.contents.insert(content.content_id.clone(), content);
         true
+    }
+
+    /// The same content as [`Self::content`], for a caller that WRITES to it: the seam
+    /// `UpdateContent` applies its changes through, so an update and a read reach one
+    /// record rather than two copies.
+    pub fn content_mut(&mut self, knowledge_base_id: &str, label: &str) -> Option<&mut Content> {
+        self.contents
+            .get_mut(resolve_id(label))
+            .filter(|content| content.knowledge_base_id == knowledge_base_id)
+    }
+
+    /// The asset bytes every content of this store holds together — what
+    /// [`MAX_STORED_CONTENT_BYTES`] bounds, so a write that REPLACES an asset is measured
+    /// against the same figure a create is.
+    pub fn stored_content_bytes(&self) -> usize {
+        self.contents
+            .values()
+            .map(|content| content.body.len())
+            .sum()
     }
 
     /// The upload an `uploadId` names, whatever its state.

@@ -218,15 +218,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A quick response is reachable only through the knowledge base it was created
         // under, so the parent is resolved first and a knowledge base this account does
         // not hold is reported as the resource that is missing.
-        let Some(knowledge_base_id) = store
+        let Some((knowledge_base_id, knowledge_base_type)) = store
             .knowledge_base(&input.knowledge_base_id)
-            .map(|knowledge_base| knowledge_base.knowledge_base_id.clone())
+            .map(|knowledge_base| {
+                (
+                    knowledge_base.knowledge_base_id.clone(),
+                    knowledge_base.knowledge_base_type.clone(),
+                )
+            })
         else {
             return Err(not_found(
                 crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND,
                 &input.knowledge_base_id,
             ));
         };
+        // Quick responses live only in a knowledge base whose type holds them, so an
+        // update addressed to a knowledge base of any other modelled type is refused
+        // exactly as a create against it is, and writes nothing.
+        if knowledge_base_type != crate::state::KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES {
+            return Err(validation(
+                crate::state::message_quick_response_plane_unsupported(&knowledge_base_type),
+            ));
+        }
         // A label pair that crosses one knowledge base with another's quick response
         // names nothing either, and an update of a record that is gone writes nothing.
         let Some(quick_response_id) = store

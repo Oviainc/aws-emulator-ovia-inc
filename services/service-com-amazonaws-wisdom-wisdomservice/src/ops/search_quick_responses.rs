@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchQuickResponses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchQuickResponses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchQuickResponses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the quick responses the knowledge base the route names HOLDS that
+//! the `searchExpression` selects — a record matching at least one `queries` entry (an
+//! expression carrying none selects the whole knowledge base) and every `filters` entry —
+//! projected out of the stored record, ordered by `orderOnField` and paged by
+//! `maxResults`/`nextToken`. A knowledge base this account does not hold is the modelled
+//! not-found, and one whose type holds no quick responses is refused as the rest of that
+//! plane refuses it.
 //!
 //! ## Shape of an operation
 //!
@@ -125,6 +123,216 @@ impl From<SearchQuickResponsesErrorModeled> for SearchQuickResponsesError {
     }
 }
 
+/// The quick-response fields a `searchExpression.queries` entry may name, as the model's
+/// own catalog lists them (`smithy_query(query="doc",shape="QuickResponseQueryField")`:
+/// "The following is the list of supported field names" — content, name, description,
+/// shortcutKey).
+pub const QUERYABLE_FIELDS: [&str; 4] = ["content", "name", "description", "shortcutKey"];
+
+/// The quick-response fields a `searchExpression.filters` entry — and the expression's
+/// `orderOnField` — may name, as the model's own catalog lists them
+/// (`smithy_query(query="doc",shape="QuickResponseFilterField")`).
+pub const FILTERABLE_FIELDS: [&str; 12] = [
+    "name",
+    "description",
+    "shortcutKey",
+    "isActive",
+    "channels",
+    "language",
+    "contentType",
+    "createdTime",
+    "lastModifiedTime",
+    "lastModifiedBy",
+    "groupingConfiguration.criteria",
+    "groupingConfiguration.values",
+];
+
+/// The `QuickResponseQueryOperator` that treats the last term of a value as a prefix
+/// (`smithy_query(query="shape",shape="QuickResponseQueryOperator")` declares it beside
+/// `CONTAINS`, and the boundary refuses any other value before this handler runs).
+const QUERY_OPERATOR_CONTAINS_AND_PREFIX: &str = "CONTAINS_AND_PREFIX";
+
+/// The `QuickResponseFilterOperator` that admits a stored value the filter value starts
+/// (`smithy_query(query="shape",shape="QuickResponseFilterOperator")` declares it beside
+/// `EQUALS`).
+const FILTER_OPERATOR_PREFIX: &str = "PREFIX";
+
+/// The `Order` that reverses the ordering, and the one the hits are served in otherwise
+/// (`smithy_query(query="shape",shape="Order")` declares `ASC` and `DESC`).
+const ORDER_DESCENDING: &str = "DESC";
+const ORDER_ASCENDING: &str = "ASC";
+
+/// The modelled `ValidationException` (HTTP 400). Every sentence below names the member it
+/// is about and states the rule it broke, quoting nothing from the request.
+///
+/// Neither the model nor a recorded answer of this endpoint pins the TEXT for the two
+/// classes below, so the wording is this crate's: what a client needs from it is which
+/// member was wrong and what this service accepts there.
+fn validation(message: String) -> SearchQuickResponsesError {
+    SearchQuickResponsesErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The sentence a page token that names no position in THIS search is refused with,
+/// worded as this crate's other paged readers word that class.
+const MESSAGE_NEXT_TOKEN_INVALID: &str = "The nextToken is not a token of this search.";
+
+/// The sentence a request naming a field outside one of the two catalogs is refused with.
+fn message_unknown_field(member: &str, catalog: &[&str]) -> String {
+    format!("{member}: name must be one of {}.", catalog.join(", "))
+}
+
+/// The ordering a page token is minted under, as the prefix that token carries: the
+/// ordering field (none at all is its own value) and the direction the hits were served
+/// in. A token is only a position in the order it was minted for, so this is what makes a
+/// token replayed against another ordering refusable rather than silently resumable.
+fn order_signature(order_on_field: Option<&QuickResponseOrderField>, descending: bool) -> String {
+    let field = order_on_field
+        .map(|field| field.name.as_str())
+        .unwrap_or_default();
+    let direction = if descending {
+        ORDER_DESCENDING
+    } else {
+        ORDER_ASCENDING
+    };
+    format!("{field}\u{1e}{direction}\u{1e}")
+}
+
+/// One stored instant as the value a filter on it is compared against: whole epoch
+/// seconds, the unit these members' `@timestampFormat` is in
+/// (`smithy_query(query="shape",shape="QuickResponseSearchResultData")` gives `createdTime`
+/// and `lastModifiedTime` as `epoch-seconds` timestamps).
+fn epoch_seconds(at: ::std::time::SystemTime) -> String {
+    match at.duration_since(::std::time::UNIX_EPOCH) {
+        Ok(since) => since.as_secs().to_string(),
+        // No record this store holds is dated before the epoch: every instant on one is
+        // read off the clock while a call is being served.
+        Err(_) => "0".to_string(),
+    }
+}
+
+/// The values one stored quick response carries for the named field — several for a
+/// list-valued field, and NONE where the record carries no value for it, which is what a
+/// filter's `includeNoExistence` is the switch for.
+fn field_values(quick_response: &crate::state::QuickResponse, field: &str) -> Vec<String> {
+    let grouping = quick_response.grouping_configuration.as_ref();
+    match field {
+        "content" => vec![quick_response.content.clone()],
+        "name" => vec![quick_response.name.clone()],
+        "description" => quick_response.description.clone().into_iter().collect(),
+        "shortcutKey" => quick_response.shortcut_key.clone().into_iter().collect(),
+        "isActive" => vec![quick_response.is_active_or_default().to_string()],
+        "channels" => quick_response.channels.clone().unwrap_or_default(),
+        "language" => quick_response.language.clone().into_iter().collect(),
+        "contentType" => vec![quick_response.content_type.clone()],
+        "createdTime" => vec![epoch_seconds(quick_response.created_at)],
+        "lastModifiedTime" => vec![epoch_seconds(quick_response.last_modified_at)],
+        // The ARN of the identity that last wrote the record, which every stored quick
+        // response carries because each write stamped it.
+        "lastModifiedBy" => vec![quick_response.last_modified_by.clone()],
+        "groupingConfiguration.criteria" => grouping
+            .and_then(|configuration| configuration.criteria.clone())
+            .into_iter()
+            .collect(),
+        "groupingConfiguration.values" => grouping
+            .and_then(|configuration| configuration.values.clone())
+            .unwrap_or_default(),
+        // Unreachable: a name is checked against the catalog of the entry it came from
+        // before its values are ever asked for.
+        _ => Vec::new(),
+    }
+}
+
+/// Whether one stored field value matches one query value under one operator.
+///
+/// `allowFuzziness` is the member's documented switch between an approximate match and an
+/// exact one ("Whether the query expects only exact matches on the attribute field
+/// values"), and here it is letter case: an exact match needs the value to occur as given.
+fn query_hit(holding: &str, value: &str, operator: &str, allow_fuzziness: bool) -> bool {
+    let (holding, value) = if allow_fuzziness {
+        (holding.to_lowercase(), value.to_lowercase())
+    } else {
+        (holding.to_string(), value.to_string())
+    };
+    if operator == QUERY_OPERATOR_CONTAINS_AND_PREFIX {
+        // Every term but the last must occur in the field, and the last one is a prefix of
+        // a word of it: the search-as-you-type reading of the operator's name.
+        let mut terms: Vec<&str> = value.split_whitespace().collect();
+        let Some(prefix) = terms.pop() else {
+            return false;
+        };
+        return terms.iter().all(|term| holding.contains(term))
+            && holding
+                .split_whitespace()
+                .any(|word| word.starts_with(prefix));
+    }
+    // `CONTAINS`, the operator's other modelled value.
+    holding.contains(&value)
+}
+
+/// Whether one `queries` entry selects this quick response: its `values` are
+/// alternatives, so one of them matching one of the field's stored values is a hit.
+fn selected_by_query(
+    query: &QuickResponseQueryField,
+    quick_response: &crate::state::QuickResponse,
+) -> bool {
+    let holdings = field_values(quick_response, &query.name);
+    let allow_fuzziness = query.allow_fuzziness.unwrap_or(false);
+    query.values.iter().any(|value| {
+        holdings
+            .iter()
+            .any(|holding| query_hit(holding, value, &query.operator, allow_fuzziness))
+    })
+}
+
+/// Whether one `filters` entry admits this quick response.
+fn admitted_by_filter(
+    filter: &QuickResponseFilterField,
+    quick_response: &crate::state::QuickResponse,
+) -> bool {
+    let holdings = field_values(quick_response, &filter.name);
+    if holdings.is_empty() {
+        // The record carries no value for the field: `includeNoExistence` is the switch
+        // that says whether that absence itself is a match.
+        return filter.include_no_existence.unwrap_or(false);
+    }
+    let Some(values) = filter.values.as_ref() else {
+        // A filter carrying no value matches no stored value, so only the absence above
+        // can satisfy it.
+        return false;
+    };
+    values.iter().any(|value| {
+        holdings.iter().any(|holding| {
+            if filter.operator == FILTER_OPERATOR_PREFIX {
+                holding.starts_with(value.as_str())
+            } else {
+                // `EQUALS`, the operator's other modelled value.
+                holding == value
+            }
+        })
+    })
+}
+
+/// The key a hit is ordered by: the ordering field's first stored value — empty where the
+/// record carries none — ahead of the `quickResponseId`, which makes the order TOTAL, so
+/// two records sharing a field value still have one position each and a page token names
+/// exactly one position.
+fn order_key(
+    order_on_field: Option<&QuickResponseOrderField>,
+    quick_response: &crate::state::QuickResponse,
+) -> String {
+    let leading = match order_on_field {
+        None => String::new(),
+        Some(field) => field_values(quick_response, &field.name)
+            .first()
+            .cloned()
+            .unwrap_or_default(),
+    };
+    format!("{leading}\u{1f}{}", quick_response.quick_response_id)
+}
+
 /// The `SearchQuickResponses` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -161,18 +369,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchQuickResponses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchQuickResponsesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The modelled `UuidOrArn` pattern on `knowledgeBaseId` and every constraint on
+        // the search expression — each list's length, each value's bounds, `maxResults`'
+        // `range 1..100` and both operator enumerations — are already refused BEFORE this
+        // handler runs, so what is left here is whether the parent exists and what it
+        // holds.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchQuickResponses"))
+        // `SearchQuickResponses` reports the stored records and writes nothing, so a
+        // search cannot change what a later caller sees.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: there is nothing to report, and
+            // this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SearchQuickResponses",
+            ));
+        };
+        let store = state.lock();
+
+        // A search is scoped to one knowledge base, so a parent this account does not hold
+        // is reported absent rather than searched as if it were empty.
+        let Some(knowledge_base) = store.knowledge_base(&input.knowledge_base_id) else {
+            return Err(SearchQuickResponsesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND.to_string()),
+                    resource_name: Some(input.knowledge_base_id.clone()),
+                },
+            )
+            .into());
+        };
+        // Quick responses live only in a knowledge base whose type holds them — the
+        // member's own documentation: "This should be a QUICK_RESPONSES type knowledge
+        // base" — so a search of a knowledge base of any other modelled type is refused
+        // exactly as a create against it is, rather than answered with the empty page of a
+        // collection that cannot exist.
+        if knowledge_base.knowledge_base_type != crate::state::KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES {
+            return Err(validation(
+                crate::state::message_quick_response_plane_unsupported(
+                    &knowledge_base.knowledge_base_type,
+                ),
+            ));
+        }
+        let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
+
+        // `maxResults` is modelled `range 1..100`, which the boundary validator has
+        // already enforced; the only choice left here is the page size for a caller who
+        // named none, which is the modelled maximum. The clamp keeps a page from being
+        // empty-with-a-token — a loop that never ends — independently of the validator, as
+        // the sibling readers of this crate do.
+        let page_size = usize::try_from(input.max_results.unwrap_or(crate::state::MAX_PAGE_SIZE))
+            .unwrap_or(crate::state::MAX_PAGE_SIZE as usize)
+            .clamp(1, crate::state::MAX_PAGE_SIZE as usize);
+
+        // A field name is not an enumeration in the model — it is a plain string — so the
+        // catalog it has to come from is checked here. A misspelled name is reported rather
+        // than answered with a page that selects nothing, which a client cannot tell from
+        // "the knowledge base holds no match".
+        let expression = &input.search_expression;
+        let queries: &[QuickResponseQueryField] = expression.queries.as_deref().unwrap_or_default();
+        let filters: &[QuickResponseFilterField] = expression.filters.as_deref().unwrap_or_default();
+        if queries
+            .iter()
+            .any(|query| !QUERYABLE_FIELDS.contains(&query.name.as_str()))
+        {
+            return Err(validation(message_unknown_field(
+                "searchExpression.queries",
+                &QUERYABLE_FIELDS,
+            )));
+        }
+        if filters
+            .iter()
+            .any(|filter| !FILTERABLE_FIELDS.contains(&filter.name.as_str()))
+        {
+            return Err(validation(message_unknown_field(
+                "searchExpression.filters",
+                &FILTERABLE_FIELDS,
+            )));
+        }
+        let order_on_field = expression.order_on_field.as_ref();
+        if order_on_field.is_some_and(|field| !FILTERABLE_FIELDS.contains(&field.name.as_str())) {
+            return Err(validation(message_unknown_field(
+                "searchExpression.orderOnField",
+                &FILTERABLE_FIELDS,
+            )));
+        }
+        let descending = order_on_field
+            .and_then(|field| field.order.as_deref())
+            .is_some_and(|order| order == ORDER_DESCENDING);
+
+        // A page token names a position in ONE order, so it carries the ordering it was
+        // minted under: a token this service did not mint, or one replayed against a
+        // different ordering, names no position in THIS search and is refused rather than
+        // silently read as some position in another order.
+        let ordering = order_signature(order_on_field, descending);
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_cursor(token)
+                    .as_deref()
+                    .and_then(|cursor| cursor.strip_prefix(&ordering))
+                    .map(str::to_string)
+                    .ok_or_else(|| validation(MESSAGE_NEXT_TOKEN_INVALID.to_string()))?,
+            ),
+        };
+
+        // The quick responses this knowledge base holds that the expression selects: a
+        // record matching at least ONE query (an expression carrying none selects the
+        // whole knowledge base) and EVERY filter.
+        let mut selected: Vec<&crate::state::QuickResponse> = store
+            .quick_responses_of(&knowledge_base_id)
+            .into_iter()
+            .filter(|quick_response| {
+                (queries.is_empty()
+                    || queries
+                        .iter()
+                        .any(|query| selected_by_query(query, quick_response)))
+                    && filters
+                        .iter()
+                        .all(|filter| admitted_by_filter(filter, quick_response))
+            })
+            .collect();
+
+        // One total order over the selection, so a page token names one position in it.
+        selected.sort_by_key(|quick_response| order_key(order_on_field, quick_response));
+        if descending {
+            selected.reverse();
+        }
+
+        // A continuation resumes at the first entry at or after the cursor IN THAT ORDER,
+        // so a quick response created or deleted between two pages cannot invalidate a
+        // token already handed out.
+        let mut remaining = selected.into_iter().skip_while(|quick_response| {
+            start_at.as_ref().is_some_and(|from| {
+                let key = order_key(order_on_field, quick_response);
+                if descending {
+                    key > *from
+                } else {
+                    key < *from
+                }
+            })
+        });
+        let results: Vec<QuickResponseSearchResultData> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::QuickResponse::to_search_result)
+            .collect();
+        // Only a selection that outruns the page has a position to continue from.
+        let next_token = remaining.next().map(|quick_response| {
+            crate::state::encode_cursor(&format!(
+                "{ordering}{}",
+                order_key(order_on_field, quick_response)
+            ))
+        });
+
+        Ok(SearchQuickResponsesOutput {
+            results,
+            next_token,
+        })
     }
 }

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateContent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateContent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateContent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: writes the stored content the route names and answers out of that one
+//! record. `revisionId` is the optimistic lock the member documents — a request naming a
+//! revision the content no longer carries is refused `PreconditionFailedException` (412)
+//! and writes nothing — and every write that lands mints a new revision, so of two writers
+//! naming one revision exactly one wins and the other is told to re-read. A `uploadId`
+//! replaces the asset with the bytes that upload received.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +131,37 @@ impl From<UpdateContentErrorModeled> for UpdateContentError {
     }
 }
 
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> UpdateContentError {
+    UpdateContentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400), stating the rule the request broke.
+fn validation(message: String) -> UpdateContentError {
+    UpdateContentErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The sentence a write naming a revision the content no longer carries is refused with.
+///
+/// It is the fixed text the recorded wire answer of this endpoint carries for that class,
+/// and it carries NO value: neither the revision the request named nor the one the record
+/// holds, so a refused writer learns only that the precondition it stated did not hold —
+/// which, with the rule the member documents ("this argument acts as an optimistic lock to
+/// ensure content was not modified since it was last read"), is the whole of what it can
+/// act on. The legacy Amazon Connect Wisdom view of this same endpoint words it from its
+/// own copy of this text
+/// (`services/service-com-amazonaws-wisdom-wisdomservice/src/ops/update_content.rs`), so a
+/// client cannot get a different sentence depending on which model it addressed.
+const MESSAGE_STALE_REVISION: &str = "Request precondition failed";
+
 /// The `UpdateContent` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -170,18 +198,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateContent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateContentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateContent"))
+        // Modelled constraints — both path labels' `UuidOrArn` pattern, `revisionId`'s and
+        // `uploadId`'s lengths, `title`'s and `overrideLinkOutUri`'s lengths and the
+        // `metadata` map's size — are already refused BEFORE this handler runs, so reaching
+        // here means the input satisfies every one of them.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("UpdateContent")
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A content is reachable only through the knowledge base it was created in, so the
+        // parent is resolved first and a knowledge base this account does not hold is
+        // reported as the resource that is missing.
+        let Some(knowledge_base_id) = store
+            .knowledge_base(&input.knowledge_base_id)
+            .map(|knowledge_base| knowledge_base.knowledge_base_id.clone())
+        else {
+            return Err(not_found(
+                crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND,
+                &input.knowledge_base_id,
+            ));
+        };
+        // A label pair that crosses one knowledge base with another's content names
+        // nothing either, and an update of a record that is gone writes nothing.
+        let Some((content_id, current_revision)) = store
+            .content(&knowledge_base_id, &input.content_id)
+            .map(|content| (content.content_id.clone(), content.revision_id.clone()))
+        else {
+            return Err(not_found(
+                crate::state::MESSAGE_CONTENT_NOT_FOUND,
+                &input.content_id,
+            ));
+        };
+
+        // `revisionId` is the optimistic lock: a request that names the revision it read is
+        // applied only while that revision is still the current one, so of two writers
+        // naming the SAME revision the first to be served wins (it mints the next revision
+        // below) and the second is refused rather than silently overwriting it. A request
+        // naming no revision asks for no precondition and is applied as it stands.
+        if input
+            .revision_id
+            .as_deref()
+            .is_some_and(|named| named != current_revision)
+        {
+            return Err(UpdateContentErrorModeled::PreconditionFailedException(
+                PreconditionFailedException {
+                    message: Some(MESSAGE_STALE_REVISION.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // `overrideLinkOutUri` is paired with a `remove…` flag, and a request carrying
+        // both halves asks for two incompatible outcomes on one member: it is refused and
+        // the stored record is left as it was, the way the other paired update of this
+        // service refuses that class.
+        if input.override_link_out_uri.is_some() && input.remove_override_link_out_uri == Some(true)
+        {
+            return Err(validation(crate::state::message_conflicting_update_members(
+                "overrideLinkOutUri",
+                "removeOverrideLinkOutUri",
+            )));
+        }
+
+        // An `uploadId` is a receipt THIS service issued (`StartContentUpload`) naming an
+        // upload of the knowledge base this content lives in. An id no upload of it holds —
+        // one never issued, one a previous call already consumed, or one whose URL expired
+        // and was reclaimed — points at no asset, so the update is refused with the
+        // modelled input failure instead of leaving the content pointing at nothing.
+        let replacement = match input.upload_id.as_deref() {
+            None => None,
+            Some(upload_id) => {
+                let upload = store
+                    .content_upload(upload_id)
+                    .filter(|upload| upload.knowledge_base_id == knowledge_base_id)
+                    .filter(|upload| !upload.has_expired(now))
+                    .cloned();
+                let Some(upload) = upload else {
+                    return Err(validation(
+                        crate::state::MESSAGE_INVALID_UPLOAD_ID.to_string(),
+                    ));
+                };
+                // The store holds as many asset bytes as this emulator keeps, and a
+                // replacement is measured against that same figure: the bytes this content
+                // already holds are the ones it would release.
+                let body = upload.body.clone().unwrap_or_default();
+                let held = store
+                    .content(&knowledge_base_id, &content_id)
+                    .map(|content| content.body.len())
+                    .unwrap_or_default();
+                if store
+                    .stored_content_bytes()
+                    .saturating_sub(held)
+                    .saturating_add(body.len())
+                    > crate::state::MAX_STORED_CONTENT_BYTES
+                {
+                    return Err(validation(crate::state::message_content_store_full()));
+                }
+                Some((upload.upload_id.clone(), upload.content_type.clone(), body))
+            }
+        };
+
+        // Every write that lands moves the content to a NEW revision, which is what makes
+        // `revisionId` an optimistic lock rather than a second name for the content id: a
+        // writer holding the revision this call supersedes is refused above. The id is
+        // minted the way the create mints the first one.
+        let Some(next_revision) = store.mint_content_id() else {
+            return Err(validation(
+                "could not mint a unique revisionId; retry the request".to_string(),
+            ));
+        };
+
+        // Nothing is refused past this point, so the record is written once: a member the
+        // request supplied replaces the stored one, the `remove…` flag clears the member it
+        // names, and a member the request carries neither half of keeps the value it had.
+        let Some(content) = store.content_mut(&knowledge_base_id, &input.content_id) else {
+            // Unreachable: the record was resolved above under the same lock.
+            return Err(not_found(
+                crate::state::MESSAGE_CONTENT_NOT_FOUND,
+                &input.content_id,
+            ));
+        };
+        if let Some(title) = input.title {
+            content.title = title;
+        }
+        if input.remove_override_link_out_uri == Some(true) {
+            content.link_out_uri = None;
+        } else if let Some(override_link_out_uri) = input.override_link_out_uri {
+            content.link_out_uri = Some(override_link_out_uri);
+        }
+        if let Some(metadata) = input.metadata {
+            content.metadata = metadata;
+        }
+        if let Some((_, content_type, body)) = replacement.clone() {
+            // The asset is the bytes the named upload received, and the media type is the
+            // one that upload was STARTED for, so the content reports the type of the asset
+            // it actually holds.
+            content.content_type = content_type;
+            content.body = body;
+        }
+        content.revision_id = next_revision;
+        let content = content.to_content_data(now);
+
+        if let Some((upload_id, _, _)) = replacement {
+            // The receipt is SPENT: the asset it named now belongs to this content, so the
+            // same `uploadId` cannot be written into a second one.
+            store.content_uploads.remove(&upload_id);
+        }
+
+        // Answer from what was just persisted, so this response and a later `GetContent`
+        // cannot disagree.
+        Ok(UpdateContentOutput {
+            content: Some(content),
+        })
     }
 }

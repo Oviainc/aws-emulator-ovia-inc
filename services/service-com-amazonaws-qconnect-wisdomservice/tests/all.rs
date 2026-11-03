@@ -27,6 +27,8 @@ mod assistant_lifecycle;
 mod authorization_precedence;
 #[path = "all/built_in_ai_agent_revisions.rs"]
 mod built_in_ai_agent_revisions;
+#[path = "all/content_revisions.rs"]
+mod content_revisions;
 #[path = "all/content_search.rs"]
 mod content_search;
 #[path = "all/content_summary.rs"]
@@ -47,6 +49,8 @@ mod modelled_refusals;
 mod quick_response;
 #[path = "all/quick_response_mutations.rs"]
 mod quick_response_mutations;
+#[path = "all/quick_response_plane_gate.rs"]
+mod quick_response_plane_gate;
 #[path = "all/quick_response_search.rs"]
 mod quick_response_search;
 #[path = "all/resource_tags.rs"]

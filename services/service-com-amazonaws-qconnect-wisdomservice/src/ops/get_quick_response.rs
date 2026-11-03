@@ -166,6 +166,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
+        // Quick responses live only in a knowledge base whose type holds them, so a read
+        // addressed to a knowledge base of any other modelled type is refused exactly as a
+        // create against it is: that knowledge base exposes no quick-response plane.
+        if knowledge_base.knowledge_base_type != crate::state::KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES {
+            return Err(GetQuickResponseErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::message_quick_response_plane_unsupported(
+                        &knowledge_base.knowledge_base_type,
+                    )),
+                },
+            )
+            .into());
+        }
         // A label pair that crosses one knowledge base with another's quick response
         // names nothing either.
         let Some(quick_response) = store.quick_response(&knowledge_base_id, &input.quick_response_id)

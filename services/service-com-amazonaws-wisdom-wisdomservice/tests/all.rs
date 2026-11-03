@@ -19,6 +19,8 @@ mod assistant_association;
 mod assistant_lifecycle;
 #[path = "all/client_error_refusals.rs"]
 mod client_error_refusals;
+#[path = "all/content_revisions.rs"]
+mod content_revisions;
 #[path = "all/content_search.rs"]
 mod content_search;
 #[path = "all/content_summary.rs"]
@@ -33,6 +35,8 @@ mod knowledge_base_lifecycle;
 mod quick_response;
 #[path = "all/quick_response_mutations.rs"]
 mod quick_response_mutations;
+#[path = "all/quick_response_search.rs"]
+mod quick_response_search;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/session_recommendations.rs"]

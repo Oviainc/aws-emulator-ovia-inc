@@ -444,6 +444,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
+        // Quick responses live only in a knowledge base whose type holds them — the
+        // member's own documentation: "This should be a QUICK_RESPONSES type knowledge
+        // base" — so a search of a knowledge base of any other modelled type is refused
+        // exactly as a create against it is, rather than answered with the empty page of a
+        // collection that cannot exist.
+        if knowledge_base.knowledge_base_type != crate::state::KNOWLEDGE_BASE_TYPE_QUICK_RESPONSES {
+            return Err(validation(
+                crate::state::message_quick_response_plane_unsupported(
+                    &knowledge_base.knowledge_base_type,
+                ),
+            ));
+        }
 
         // `maxResults` is modelled `range 1..100`, so the boundary validator refuses
         // anything outside it before this handler runs. Refuse explicitly rather than
