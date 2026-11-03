@@ -58,9 +58,9 @@ const ECHO_DEFINITION: &str =
     r#"{"StartAt":"Echo","States":{"Echo":{"Type":"Pass","End":true}}}"#;
 
 /// A definition whose only state names no integration call this emulator makes (a
-/// bare Lambda function ARN as its `Resource`), so the execution ends `FAILED` with
-/// ASL's own `States.Runtime`.
-const TASK_DEFINITION: &str = r#"{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:f","End":true}}}"#;
+/// bare resource ARN of a service whose resources are not work in themselves), so the
+/// execution ends `FAILED` with ASL's own `States.Runtime`.
+const TASK_DEFINITION: &str = r#"{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:dynamodb:us-west-2:000000000000:table/t","End":true}}}"#;
 
 /// A definition that waits long enough that the execution stays non-terminal for the
 /// whole test.

@@ -33,3 +33,8 @@ Each starts an execution containing a Lambda task and then polls CloudWatch for 
 
 ## Steps to Reproduce
 Replay the three check ids: create a function and a state machine with a Lambda task (both the stream/SDK-integration form and the optimized `arn:aws:states:::lambda:invoke` form), start an execution with a role that may invoke and with a twin role that may not, then poll CloudWatch for the AWS/Lambda series under the function's dimension.
+
+## Resolution
+The cause above is fixed: a `Task` state whose `Resource` is a Lambda function's ARN now performs the real invocation of that function, authorized as the state machine's execution role, so the function's own `AWS/Lambda` `Invocations` series is populated for every invocation a Lambda task makes (both bare-function-ARN and `lambda:invoke` Resource forms) and stays empty for the denied twin. Asserted end to end over the wire in `core/router/tests/all/sfn_lambda_task_invocation.rs`.
+
+The three replay checks above still exhaust their budget, on a different cause: their warm-up retries an execution until it SUCCEEDS, which needs the invoked function's RETURN VALUE. Running a deployment package is not implemented in this emulator, which is the open issue `20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md`; the `AWS/States` `LambdaFunctions*` / `LambdaFunctionRunTime` families one of the three checks also reads are the open issue `20261101T210635Z-cloudwatch-lambda-sfn-step-functions-lambda-task-work.md`.

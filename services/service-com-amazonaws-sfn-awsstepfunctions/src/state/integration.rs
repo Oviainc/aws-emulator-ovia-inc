@@ -61,8 +61,23 @@
 //! * a run-a-job (`.sync`) pattern over an integration that is not in the
 //!   [`RUN_A_JOB`] catalogue below, because the job it starts is reported and
 //!   stopped through calls only that integration names;
-//! * a bare resource ARN (a Lambda function ARN as the `Resource`), which names a
-//!   resource rather than an integration call.
+//! * a bare resource ARN of any other service, which names a resource this emulator
+//!   does not invoke directly — only a Lambda FUNCTION's ARN is work in itself (see
+//!   below).
+//!
+//! ## The direct Lambda invocation
+//!
+//! A `Resource` that is the ARN of a LAMBDA FUNCTION names no integration token: it
+//! names the function, and the unit of work is one synchronous invocation of it. The
+//! state's effective input is then not the operation's input but the function's EVENT,
+//! so the call is the invocation that carries it — the function the `Resource` named as
+//! `FunctionName`, that document as the `Payload` ([`Call::operation_input`]) — and it
+//! is subject to the same access request the optimized `lambda:invoke` integration is,
+//! `lambda:InvokeFunction` on that function's ARN, because it is the same call on the
+//! same resource. What the task reports is the function's OWN response payload
+//! ([`reported_result`]): the members around it on the wire — the status, the version
+//! that ran — are facts of the API call rather than of the function's output, and this
+//! form reports the output alone.
 //!
 //! ## The run-a-job (`.sync`) pattern
 //!
@@ -191,6 +206,15 @@ const STATES_NAMESPACE: &str = "states";
 /// The ARN namespace of AWS Lambda, whose functions a `Task` state invokes
 /// (`awsService.arnNamespace`).
 const LAMBDA_NAMESPACE: &str = "lambda";
+
+/// The Lambda operation that invokes a function, as that service's model spells it.
+const LAMBDA_INVOKE_OPERATION: &str = "Invoke";
+
+/// The `<namespace>:<action>` the optimized family names that same invocation by,
+/// which is the key its [`TARGET_RESOURCES`] entry is carried under: a `Resource`
+/// naming a function directly makes the same call on the same resource, so it is
+/// subject to that entry's access request too.
+const LAMBDA_INVOKE_INTEGRATION: &str = "lambda:invoke";
 
 /// The ARN namespace of Amazon SQS, whose queues a `Task` state sends to.
 const SQS_NAMESPACE: &str = "sqs";
@@ -627,6 +651,47 @@ pub struct Call {
     /// whose target is named by the request ([`TARGET_RESOURCES`]); `None` for a call
     /// no such entry is carried for.
     pub targets: Option<&'static TargetResource>,
+    /// The Lambda FUNCTION this task invokes DIRECTLY, as the `Resource` named it, for
+    /// a `Resource` that is a function's ARN rather than one of this service's
+    /// integration tokens.
+    ///
+    /// `None` for every `Resource` that names an integration, whose request IS the
+    /// document the state built. For a direct invocation that document is the
+    /// function's event instead ([`Call::operation_input`]), and the task's result is
+    /// the function's own response payload ([`reported_result`]).
+    pub invokes: Option<String>,
+}
+
+/// The member of `Invoke`'s input that names the function to invoke, which that
+/// operation binds as its `httpLabel`, and the member carrying the event, which it
+/// binds as its `httpPayload` — both as [`LAMBDA_REST`] reads them off the operation's
+/// own bindings.
+const FUNCTION_NAME_MEMBER: &str = "FunctionName";
+/// See [`FUNCTION_NAME_MEMBER`].
+const PAYLOAD_MEMBER: &str = "Payload";
+
+impl Call {
+    /// The document the invoked operation receives as its INPUT, for a task whose state
+    /// built `document`.
+    ///
+    /// For a `Resource` naming an INTEGRATION the two are the same thing: "the state's
+    /// effective input IS that operation's request". For a `Resource` naming a Lambda
+    /// FUNCTION the state's document is the EVENT the function is invoked with, so the
+    /// operation's input is the invocation that carries it: the function the `Resource`
+    /// named, and the document as the payload.
+    #[must_use]
+    pub fn operation_input(&self, document: &Value) -> Value {
+        let Some(function) = self.invokes.as_deref() else {
+            return document.clone();
+        };
+        let mut input = Map::new();
+        input.insert(
+            FUNCTION_NAME_MEMBER.to_string(),
+            Value::String(function.to_string()),
+        );
+        input.insert(PAYLOAD_MEMBER.to_string(), document.clone());
+        Value::Object(input)
+    }
 }
 
 /// Where an integration's request names the resource its call acts ON, which IAM
@@ -956,7 +1021,11 @@ impl TargetResource {
 /// refuse, which is its own answer to give rather than an authorization decision.
 pub fn access_request(call: &Call, request: &Value, region: &str) -> Option<(String, String)> {
     let targets = call.targets?;
-    let resource = targets.resource_of(request, region)?;
+    // The resource is the one the invoked operation's own INPUT names, which for a
+    // `Resource` naming a function directly is not the document the state built: the
+    // call is the same one on the same function either way, so it is judged on the
+    // request that is actually made ([`Call::operation_input`]).
+    let resource = targets.resource_of(&call.operation_input(request), region)?;
     // The action is the invoked service's namespace and the operation's own name,
     // unless the entry states the permission that operation PUBLISHES instead.
     let action = targets.action.map_or_else(
@@ -1346,6 +1415,11 @@ pub fn read(resource: &str) -> Result<Call, String> {
             ))
         }
     };
+    // A LAMBDA FUNCTION's ARN names no integration token: it names the function, and
+    // the task's work is one synchronous invocation of it (`direct_invocation`).
+    if vendor == LAMBDA_NAMESPACE && rest.starts_with(FUNCTION_RESOURCE_TYPE_PREFIX) {
+        return direct_invocation(resource, &shown);
+    }
     if vendor != STATES_NAMESPACE {
         return Err(format!(
             "'{shown}' names a resource of '{}' rather than a service integration, which this \
@@ -1485,6 +1559,54 @@ pub fn read(resource: &str) -> Result<Call, String> {
         targets: TARGET_RESOURCES
             .iter()
             .find(|entry| entry.integration == integration),
+        // Only a `Resource` that names a function itself invokes one directly; this
+        // one named an integration, whose request is the document the state built.
+        invokes: None,
+    })
+}
+
+/// The call a `Resource` that is a Lambda FUNCTION's ARN names: one synchronous
+/// invocation of that function, with the state's effective input as the event it
+/// carries ([`Call::operation_input`]).
+///
+/// It is the same call on the same resource as the optimized `lambda:invoke`
+/// integration makes, so it is bound to the wire by that operation's own bindings
+/// ([`LAMBDA_REST`]) and subject to the same access request
+/// (`lambda:InvokeFunction` on the function's ARN, [`TARGET_RESOURCES`]). What differs
+/// is the two ends a definition sees: the request is built from the function the
+/// `Resource` named rather than from a `FunctionName` parameter, and the result is the
+/// function's own payload rather than the SDK response around it.
+///
+/// `shown` is the `Resource` as a cause may echo it ([`super::asl::echoed`]).
+fn direct_invocation(function: &str, shown: &str) -> Result<Call, String> {
+    let unserved = || {
+        format!(
+            "'{shown}' names a Lambda function whose invocation this emulator does not bind to \
+             that service's REST protocol, so nothing was run for it"
+        )
+    };
+    let api = APIS
+        .iter()
+        .find(|api| api.namespace == LAMBDA_NAMESPACE)
+        .ok_or_else(unserved)?;
+    let rest = api.rest(LAMBDA_INVOKE_OPERATION).ok_or_else(unserved)?;
+    Ok(Call {
+        api,
+        operation: LAMBDA_INVOKE_OPERATION.to_string(),
+        rest: Some(rest),
+        // A function ARN asks for no integration pattern: the invocation IS the task's
+        // whole work, so there is no job to park at and no member to convert.
+        job: None,
+        parsed_output: false,
+        json_text: &[],
+        // The result of this form is the function's own payload, not the SDK response
+        // the optimized integration reports ([`reported_result`]).
+        sdk_envelope: false,
+        epoch_millis: &[],
+        targets: TARGET_RESOURCES
+            .iter()
+            .find(|entry| entry.integration == LAMBDA_INVOKE_INTEGRATION),
+        invokes: Some(function.to_string()),
     })
 }
 
@@ -1572,6 +1694,7 @@ fn pattern_call(api: &'static Api, operation: &str) -> Call {
         sdk_envelope: false,
         epoch_millis: &[],
         targets: None,
+        invokes: None,
     }
 }
 
@@ -1873,6 +1996,22 @@ pub fn task_result(answer: &Value) -> Value {
     Value::Object(reported)
 }
 
+/// The document a `Task` state REPORTS as the result of `call`, which depends on what
+/// its `Resource` named.
+///
+/// A `Resource` naming an INTEGRATION reports the invoked operation's response
+/// document, read in the integration's own convention ([`task_result`]). A `Resource`
+/// naming a LAMBDA FUNCTION reports what that function RETURNED — its own document,
+/// which is a caller's data and not an operation's members — so it is reported exactly
+/// as the function wrote it, keys and all.
+#[must_use]
+pub fn reported_result(call: &Call, answer: &Value) -> Value {
+    match call.invokes {
+        Some(_) => answer.clone(),
+        None => task_result(answer),
+    }
+}
+
 /// The document `request` goes on the wire as: every TOP-LEVEL member under the
 /// spelling the invoked service's model uses for it ([`MemberCase`]), and every
 /// member the integration documents as a document the operation types as a string
@@ -1923,7 +2062,7 @@ struct Wired {
 /// The request `call` makes with `request` as the operation's input, or why it could
 /// not be built.
 fn wired(call: &Call, request: &Value) -> Result<Wired, String> {
-    let document = wire_request(call, request);
+    let document = wire_request(call, &call.operation_input(request));
     let Some(rest) = call.rest else {
         // An AWS JSON request body IS the operation's input document, posted to the
         // root and named in a header.
@@ -2129,8 +2268,11 @@ pub async fn call_api(
             // The result of an OPTIMIZED integration is the literal SDK response of
             // the call, which renders each instant the response carries as whole
             // epoch milliseconds and carries the SDK's own response envelope beside
-            // the operation's members; a refusal carries no result to wrap.
+            // the operation's members; a refusal carries no result to wrap. A
+            // `Resource` that named the FUNCTION reports the function's own payload
+            // out of that response instead.
             match read {
+                Ok(document) if call.invokes.is_some() => Ok(invocation_payload(call, &document)),
                 Ok(document) if call.sdk_envelope => Ok(with_sdk_envelope(
                     in_epoch_millis(document, call.epoch_millis),
                     &answered,
@@ -2153,6 +2295,21 @@ pub async fn call_api(
 /// response reports them: the status the call answered, and its headers under both
 /// spellings the SDK exposes them in.
 const SDK_HTTP_METADATA: &str = "SdkHttpMetadata";
+/// What a task whose `Resource` named a Lambda FUNCTION reports out of the
+/// invocation's answer: the function's own response payload, the member that operation
+/// binds its body to.
+///
+/// The rest of the answer's members are facts of the API CALL — the status it came
+/// back with, the version that ran — rather than of the function's output, and this
+/// form is the function's output. An invocation whose function returned nothing
+/// answers no payload at all, which is reported as the null document rather than as an
+/// object the function did not produce.
+///
+/// Pure, so the reading is pinned by this module's own tests.
+fn invocation_payload(call: &Call, document: &Value) -> Value {
+    let member = call.rest.map_or(PAYLOAD_MEMBER, |rest| rest.response_payload);
+    document.get(member).cloned().unwrap_or(Value::Null)
+}
 
 /// The member a task's result carries the call's response metadata under: the
 /// identifier of the request the call made.
@@ -2599,7 +2756,7 @@ mod tests {
     #[test]
     fn a_resource_names_the_call_its_action_does() {
         // (case, the Resource, the signing name and operation it names, parks at a job)
-        let rows: [ResourceRow; 25] = [
+        let rows: [ResourceRow; 28] = [
             (
                 "the optimized DynamoDB integration",
                 "arn:aws:states:::dynamodb:putItem",
@@ -2743,9 +2900,29 @@ mod tests {
                 None,
                 false,
             ),
+            // A LAMBDA FUNCTION's ARN is work in itself: the task invokes that
+            // function, through the same operation the optimized integration calls.
             (
-                "a bare resource ARN",
+                "a Lambda function's ARN",
                 "arn:aws:lambda:us-west-2:000000000000:function:f",
+                Some(("lambda", "Invoke")),
+                false,
+            ),
+            (
+                "the same function at one of its aliases",
+                "arn:aws:lambda:us-west-2:000000000000:function:f:live",
+                Some(("lambda", "Invoke")),
+                false,
+            ),
+            (
+                "a bare resource ARN of a service whose resources are not work",
+                "arn:aws:dynamodb:us-west-2:000000000000:table/t",
+                None,
+                false,
+            ),
+            (
+                "a Lambda ARN naming no function",
+                "arn:aws:lambda:us-west-2:000000000000:layer:l",
                 None,
                 false,
             ),
@@ -3163,7 +3340,7 @@ mod tests {
         let queue_arn = ::engine::emulator_arn(SQS_NAMESPACE, region, "orders");
         let function_arn = ::engine::emulator_arn(LAMBDA_NAMESPACE, region, "function:handler");
         // (case, the Resource, the request the state built, the expected pair)
-        let rows: [AccessRow; 17] = [
+        let rows: [AccessRow; 20] = [
             (
                 "a nested execution, the member in the integration's own spelling",
                 "arn:aws:states:::states:startExecution",
@@ -3280,7 +3457,32 @@ mod tests {
                 "the same function named by its ARN",
                 "arn:aws:states:::lambda:invoke",
                 ::serde_json::json!({"FunctionName": function_arn.clone()}),
-                Some(("lambda:InvokeFunction", function_arn)),
+                Some(("lambda:InvokeFunction", function_arn.clone())),
+            ),
+            // A `Resource` that names the FUNCTION makes the same call on the same
+            // function, so it is subject to the same access request — and the document
+            // the state built is that invocation's EVENT, which names no resource of
+            // its own whatever it happens to carry.
+            (
+                "a function named by the Resource itself",
+                "arn:aws:lambda:us-west-2:000000000000:function:handler",
+                ::serde_json::json!({"order": 1}),
+                Some(("lambda:InvokeFunction", function_arn.clone())),
+            ),
+            (
+                "the same, where the event names a function of its own",
+                "arn:aws:lambda:us-west-2:000000000000:function:handler",
+                ::serde_json::json!({"FunctionName": "elsewhere"}),
+                Some(("lambda:InvokeFunction", function_arn.clone())),
+            ),
+            (
+                "a function named by the Resource at one of its aliases",
+                "arn:aws:lambda:us-west-2:000000000000:function:handler:live",
+                ::serde_json::json!({}),
+                Some((
+                    "lambda:InvokeFunction",
+                    format!("{function_arn}:live"),
+                )),
             ),
         ];
 
@@ -3566,6 +3768,114 @@ mod tests {
             result,
             ::serde_json::json!({ "StatusCode": 202, "Payload": "not json" }),
             "case \"an answer carrying no document and no headers\": got {result}"
+        );
+    }
+
+    /// The two ends of a task whose `Resource` names a Lambda FUNCTION: the state's
+    /// document is the EVENT the function is invoked with, and what the task reports is
+    /// the function's own returned document.
+    ///
+    /// The rows span what the rule generalises over: the shape of the event (an object,
+    /// an array, a bare value, the empty object), and the shape of what the function
+    /// returned (a document, a bare value, nothing at all).
+    #[test]
+    fn a_function_resource_carries_the_event_and_reports_what_the_function_returned() {
+        let function = "arn:aws:lambda:us-west-2:000000000000:function:handler";
+        let call = read(function).expect("a function's ARN names an invocation");
+        // (case, the document the state built, the body the invocation is to carry)
+        let events: [(&str, Value, &str); 4] = [
+            (
+                "an event that is an object",
+                ::serde_json::json!({"mode": "ok", "n": 0}),
+                r#"{"mode":"ok","n":0}"#,
+            ),
+            (
+                "an event that is a list",
+                ::serde_json::json!([1, 2]),
+                "[1,2]",
+            ),
+            (
+                "an event that is a bare value",
+                ::serde_json::json!(7),
+                "7",
+            ),
+            ("the empty event", ::serde_json::json!({}), "{}"),
+        ];
+
+        for (case, event, body) in events {
+            let input = call.operation_input(&event);
+            assert_eq!(
+                input.get(FUNCTION_NAME_MEMBER),
+                Some(&Value::String(function.to_string())),
+                "case {case:?}: expected the invocation to name the function the Resource did, \
+                 got {input}"
+            );
+            assert_eq!(
+                input.get(PAYLOAD_MEMBER),
+                Some(&event),
+                "case {case:?}: expected the state's document as the event, got {input}"
+            );
+            let built = wired(&call, &event).expect("the invocation is a request");
+            let sent = String::from_utf8_lossy(&built.body).to_string();
+            assert_eq!(
+                sent, body,
+                "case {case:?}: expected the event as the request body, got {sent:?}"
+            );
+            assert_eq!(
+                built.uri,
+                format!("/2015-03-31/functions/{function}/invocations"),
+                "case {case:?}: expected the invocation of that function, got {:?}",
+                built.uri
+            );
+        }
+
+        // (case, the payload the function returned, the result the task reports)
+        let returned: [(&str, &str, Value); 3] = [
+            (
+                "a function that returned a document",
+                r#"{"ok":true,"count":2}"#,
+                ::serde_json::json!({"ok": true, "count": 2}),
+            ),
+            (
+                "a function that returned a bare value",
+                "42",
+                ::serde_json::json!(42),
+            ),
+            (
+                "a function that returned nothing",
+                "",
+                ::serde_json::Value::Null,
+            ),
+        ];
+
+        for (case, payload, expected) in returned {
+            let answered = Answered {
+                status: 200,
+                error_type: None,
+                headers: vec![("x-amz-executed-version".to_string(), "$LATEST".to_string())],
+                payload: payload.as_bytes().to_vec(),
+            };
+            let document = call
+                .rest
+                .expect("the invocation carries its own bindings")
+                .result(&answered);
+            let payload = invocation_payload(&call, &document);
+            let reported = reported_result(&call, &payload);
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected the function's own document {expected}, got {reported}"
+            );
+        }
+
+        // The optimized integration of the same operation reports the SDK response
+        // instead, so the two forms differ in exactly that.
+        let optimized = read("arn:aws:states:::lambda:invoke").expect("this names a call");
+        let answer = ::serde_json::json!({"StatusCode": 200, "Payload": {"ok": true}});
+        let reported = reported_result(&optimized, &answer);
+        assert_eq!(
+            reported, answer,
+            "case \"the optimized integration\": expected the invocation's own members, got \
+             {reported}"
         );
     }
 }

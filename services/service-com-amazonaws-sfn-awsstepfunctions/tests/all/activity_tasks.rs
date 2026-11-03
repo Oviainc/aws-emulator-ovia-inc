@@ -647,26 +647,36 @@ async fn stopping_an_execution_withdraws_its_task() {
 // ---------------------------------------------------------------------------
 
 /// A `Task` state that names any other integration schedules nothing: it is a call to
-/// another service, which this emulator does not make, so the execution ends `FAILED`
-/// with `States.Runtime` and no poll of any activity is handed anything.
+/// another service rather than work a worker claims, so the execution ends `FAILED`
+/// and no poll of any activity is handed anything.
+///
+/// Most rows are not run at all, which is `States.Runtime`. A `Resource` that is a
+/// Lambda FUNCTION's ARN IS a call — the task invokes that function — so this suite,
+/// which mounts this service alone, fails it on the INVOCATION it cannot make, under
+/// an error of Lambda's own: either way no activity task is scheduled, which is what
+/// this asserts.
 #[tokio::test]
 async fn a_task_state_that_is_not_an_activity_schedules_nothing() {
     let emulator = Emulator::new();
     let activity = create_activity(&emulator, "untouched").await;
 
     // Each row is a `Resource` that is not an activity ARN of this service, or an
-    // activity task somewhere the walk cannot wait at.
-    let cases: Vec<(&str, String)> = vec![
+    // activity task somewhere the walk cannot wait at, beside the error name expected
+    // of it — the whole name for a row nothing was run for, and the service half of it
+    // for the row whose failure is the invoked service's.
+    let cases: Vec<(&str, String, &str)> = vec![
         (
             "a Lambda function ARN",
             activity_definition(
                 &format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:f"),
                 json!({}),
             ),
+            "Lambda.",
         ),
         (
             "an optimised service integration",
             activity_definition("arn:aws:states:::lambda:invoke", json!({})),
+            RUNTIME_ERROR,
         ),
         (
             "a state machine ARN, which is not an activity",
@@ -674,6 +684,7 @@ async fn a_task_state_that_is_not_an_activity_schedules_nothing() {
                 &format!("arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:other"),
                 json!({}),
             ),
+            RUNTIME_ERROR,
         ),
         (
             "an activity task inside a Map iteration, which has nowhere to wait",
@@ -694,27 +705,35 @@ async fn a_task_state_that_is_not_an_activity_schedules_nothing() {
                 },
             })
             .to_string(),
+            RUNTIME_ERROR,
         ),
     ];
 
     let mut started = Vec::new();
-    for (index, (case, definition)) in cases.into_iter().enumerate() {
+    for (index, (case, definition, expected)) in cases.into_iter().enumerate() {
         let machine = create_machine(&emulator, &format!("other-{index}"), &definition).await;
-        started.push((case, start_execution(&emulator, &machine, "only", "{}").await));
+        started.push((
+            case,
+            expected,
+            start_execution(&emulator, &machine, "only", "{}").await,
+        ));
     }
     std::thread::sleep(PAST_THE_EXECUTION_DELAY);
 
-    for (case, execution) in started {
+    for (case, expected, execution) in started {
         let described = describe_execution(&emulator, &execution).await;
         assert_eq!(
             described.get("status").and_then(Value::as_str),
             Some("FAILED"),
             "case {case:?}: expected FAILED, got {described:?}"
         );
-        assert_eq!(
-            described.get("error").and_then(Value::as_str),
-            Some(RUNTIME_ERROR),
-            "case {case:?}: expected the error {RUNTIME_ERROR}, got {described:?}"
+        let reported = described
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            reported.starts_with(expected),
+            "case {case:?}: expected the error {expected}, got {reported:?} in {described:?}"
         );
     }
 

@@ -25,10 +25,13 @@
 //!    one name apart ("for EXPRESS workflows, execution names can be reused
 //!    immediately").
 //!
-//! Each table below spans one class of those rules; the recorded Express workflow
-//! this suite's issue was filed about — a definition whose `Task` state names a bare
-//! Lambda function ARN, which is no service-integration call — is ONE row of the
-//! first one.
+//! Each table below spans one class of those rules. The recorded Express workflow
+//! this suite's issue was filed about has a `Task` state whose `Resource` is a bare
+//! Lambda function ARN, which names the FUNCTION the task invokes
+//! (`state::integration`); that invocation is driven where Lambda is mounted beside
+//! this service (`core/router/tests/all/sfn_lambda_task_invocation.rs`), and the row
+//! here is the rule it shares with every other state — a `Resource` this emulator
+//! makes no call for is reported rather than faked.
 
 use serde_json::{json, Value};
 
@@ -194,13 +197,12 @@ async fn a_sync_start_answers_the_outcome_the_definition_computed() {
             least_millis: 0,
         },
         SyncCase {
-            // The shape of the recorded Express workflow this suite's issue was
-            // filed about: a `Task` state whose `Resource` is a bare Lambda
-            // function ARN, which names a resource rather than one of the service
-            // integrations this emulator calls (`state::integration`), so nothing
-            // is run for it and nothing is faked.
+            // A `Task` state whose `Resource` is a bare resource ARN of a service
+            // whose resources are not work in themselves, which names none of the
+            // service integrations this emulator calls (`state::integration`), so
+            // nothing is run for it and nothing is faked.
             case: "a Task state whose Resource names no integration call is not run",
-            definition: r#"{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:f","End":true}}}"#,
+            definition: r#"{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:dynamodb:us-west-2:000000000000:table/t","End":true}}}"#,
             input: Some(r#"{"first_name":"Alejandro"}"#),
             status: "FAILED",
             output: None,

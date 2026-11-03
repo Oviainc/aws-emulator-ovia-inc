@@ -1155,7 +1155,7 @@ async fn an_execution_runs_the_definition_to_its_own_outcome() {
         },
         RunCase {
             case: "a Task state whose Resource names no integration call",
-            definition: r#"{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:f","End":true}}}"#,
+            definition: r#"{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:dynamodb:us-west-2:000000000000:table/t","End":true}}}"#,
             input: "{}",
             status: "FAILED",
             output: None,

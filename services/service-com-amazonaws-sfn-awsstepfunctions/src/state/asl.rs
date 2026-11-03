@@ -5077,8 +5077,8 @@ impl Interpreter<'_> {
             let answered = me.tasks.perform(&call, &request, within);
             // The identifier of the job a run-a-job call STARTED is read from the
             // answer as the invoked model spells it, before that answer becomes the
-            // task's result in the integration's own convention
-            // ([`super::integration::task_result`]).
+            // task's result in the convention the `Resource` reports it in
+            // ([`super::integration::reported_result`]).
             let started = answered.as_ref().ok().and_then(|answer| {
                 let job = call.job?;
                 answer
@@ -5091,7 +5091,7 @@ impl Interpreter<'_> {
                 // against the same ceiling every state's document is measured
                 // against.
                 Ok(answer) => {
-                    let result = super::integration::task_result(&answer);
+                    let result = super::integration::reported_result(&call, &answer);
                     match measure_payload(&result, &format!("the 'Task' state '{name}'")) {
                         Ok(_bytes) => Ok(result),
                         Err(failure) => Err(failure),

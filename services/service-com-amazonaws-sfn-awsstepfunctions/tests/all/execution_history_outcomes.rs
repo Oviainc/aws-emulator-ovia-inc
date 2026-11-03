@@ -50,9 +50,10 @@ const FAIL_DEFINITION: &str =
     r#"{"StartAt":"Bang","States":{"Bang":{"Type":"Fail","Error":"Boom","Cause":"on purpose"}}}"#;
 
 /// A definition whose `Task` state names work this emulator makes no call for (a bare
-/// Lambda function ARN), so the execution ends `FAILED` with ASL's own
-/// [`RUNTIME_ERROR`] and a cause naming what was not run.
-const UNRUNNABLE_DEFINITION: &str = r#"{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:absent","End":true}}}"#;
+/// resource ARN of a service whose resources are not work in themselves), so the
+/// execution ends `FAILED` with ASL's own [`RUNTIME_ERROR`] and a cause naming what
+/// was not run.
+const UNRUNNABLE_DEFINITION: &str = r#"{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:dynamodb:us-west-2:000000000000:table/absent","End":true}}}"#;
 
 /// A definition that waits far longer than these tests run, so an execution of it is
 /// still `RUNNING` when it is stopped.
@@ -223,7 +224,7 @@ async fn the_terminal_event_reports_what_the_attempt_ended_with() {
             event_type: "ExecutionFailed",
             output: None,
             error: Some(RUNTIME_ERROR),
-            cause: Cause::Naming("arn:aws:lambda:us-west-2:000000000000:function:absent"),
+            cause: Cause::Naming("arn:aws:dynamodb:us-west-2:000000000000:table/absent"),
         },
         Row {
             case: "an execution stopped with an error and a cause",

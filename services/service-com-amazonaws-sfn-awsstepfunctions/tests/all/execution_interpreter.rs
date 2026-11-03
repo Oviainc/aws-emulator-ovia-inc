@@ -383,7 +383,7 @@ async fn what_cannot_be_run_in_process_fails_rather_than_being_faked() {
     let cases = [
         RunCase {
             case: "a Task state whose Resource names no integration call",
-            definition: r#"{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:f","End":true}}}"#,
+            definition: r#"{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:dynamodb:us-west-2:000000000000:table/t","End":true}}}"#,
             input: "{}",
             expected: Expected::Failure("States.Runtime"),
         },
@@ -416,7 +416,7 @@ async fn what_cannot_be_run_in_process_fails_rather_than_being_faked() {
             // execution to fail. A retry or catch on States.ALL won't catch
             // States.Runtime errors."
             case: "a Catch on States.ALL does not catch States.Runtime",
-            definition: r#"{"StartAt":"M","States":{"M":{"Type":"Map","ItemProcessor":{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:f","End":true}}},"Catch":[{"ErrorEquals":["States.ALL"],"Next":"Report"}],"End":true},"Report":{"Type":"Pass","Result":"caught","End":true}}}"#,
+            definition: r#"{"StartAt":"M","States":{"M":{"Type":"Map","ItemProcessor":{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:dynamodb:us-west-2:000000000000:table/t","End":true}}},"Catch":[{"ErrorEquals":["States.ALL"],"Next":"Report"}],"End":true},"Report":{"Type":"Pass","Result":"caught","End":true}}}"#,
             input: "[1]",
             expected: Expected::Failure("States.Runtime"),
         },

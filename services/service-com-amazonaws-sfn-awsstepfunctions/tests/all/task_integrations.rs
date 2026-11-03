@@ -625,8 +625,11 @@ async fn a_resource_no_call_is_made_for_fails_rather_than_being_faked() {
             "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
         ),
         (
+            // A bare resource ARN of a service whose resources are not work in
+            // themselves. A Lambda FUNCTION's ARN is not one of these: it names the
+            // function the task invokes.
             "a bare resource ARN",
-            "arn:aws:lambda:us-west-2:000000000000:function:f",
+            "arn:aws:dynamodb:us-west-2:000000000000:table/orders",
         ),
         ("a Resource that is no ARN at all", "putItem"),
     ];

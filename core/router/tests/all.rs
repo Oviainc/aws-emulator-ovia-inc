@@ -571,6 +571,9 @@ mod sfn_glue_run_a_job_sync;
 // line, so a declaration there conflicts with all of them.
 #[path = "all/sfn_task_target_authorization.rs"]
 mod sfn_task_target_authorization;
+// Declared beside the other Step Functions suites, for the reason the lines above give.
+#[path = "all/sfn_lambda_task_invocation.rs"]
+mod sfn_lambda_task_invocation;
 // Declared HERE, in the sorted list at its own name, rather than at the head or the tail
 // of this file: both of those are where every concurrently landing suite puts its line, so
 // a declaration there conflicts with all of them, while these neighbouring lines are
