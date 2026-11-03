@@ -5749,12 +5749,28 @@ pub struct SamplingClientReport {
 pub struct SamplingAllocation {
     /// The share of the rule's reservoir the cycle gave this service.
     pub reservoir_quota: i32,
-    /// The rule's `FixedRate` as the cycle found it — what a service is told
-    /// for a rule that has since left the account, whose allocation it still
-    /// holds.
-    pub fixed_rate: f64,
     /// When the cycle ran, in seconds of epoch time.
     pub allocated_at: f64,
+}
+
+/// The pool one allocation cycle divided, as that cycle found the rule it is
+/// for configured.
+///
+/// Held per rule NAME, because that is what a `SamplingTargetDocument`
+/// identifies what it allocates by: the target computation answers a report out
+/// of the division it last made for that name, so it keeps the rate and the
+/// pool size that division was made under rather than re-reading the rule
+/// store. A name no cycle has divided a pool for has none of this, which is the
+/// only case a reported document is answered as unprocessed.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingPool {
+    /// The rule's `FixedRate` as the cycle found it.
+    pub fixed_rate: f64,
+    /// The rule's `ReservoirSize` as the cycle found it — the size of the pool
+    /// the cycle divided.
+    pub reservoir_size: i32,
+    /// When the cycle divided it, in seconds of epoch time.
+    pub divided_at: f64,
 }
 
 /// The account's sampling results and the allocations computed from them.
@@ -5791,6 +5807,10 @@ pub struct SamplingStatisticsStore {
     /// by the reporting service's `ClientID`, at most
     /// [`MAX_SAMPLING_CLIENTS_PER_RULE`] of them per rule.
     clients: BTreeMap<String, BTreeMap<String, SamplingClientReport>>,
+    /// The pool the latest allocation cycle divided for a rule, keyed by rule
+    /// NAME ([`SamplingPool`]) — the state the target computation answers a
+    /// report out of, which is why it survives the rule leaving the store.
+    pools: BTreeMap<String, SamplingPool>,
     /// When a rule's sampling boost was last granted to a service, keyed by
     /// rule and then by the reporting `ServiceName` — what the configured
     /// cooldown window is measured from.
@@ -5803,6 +5823,7 @@ impl Default for SamplingStatisticsStore {
             rules_modified_at: now_epoch_seconds(),
             windows: BTreeMap::new(),
             clients: BTreeMap::new(),
+            pools: BTreeMap::new(),
             boosts: BTreeMap::new(),
         }
     }
@@ -5819,18 +5840,17 @@ impl SamplingStatisticsStore {
     /// than adding to them; a summary of the window adds up what each service
     /// stated for it.
     ///
-    /// Answers the allocation the reporting service HOLDS for the rule — the one
-    /// computed at the end of a cycle it already took part in — which is what
-    /// this call is answered with. `None` means no cycle has run for it yet, so
-    /// there is no reservoir share to hand out: the first report a service makes
-    /// precedes the first allocation cycle for it.
+    /// The share the reporting service is answered is the one it already HOLDS
+    /// ([`Self::held_allocation`]), computed at the end of a cycle it took part
+    /// in, so recording a report never hands out a share of its own: the first
+    /// report a service makes precedes the first allocation cycle for it.
     pub fn record(
         &mut self,
         rule_name: &str,
         client_id: &str,
         report: ReportedSamplingCounts,
         now: f64,
-    ) -> Option<SamplingAllocation> {
+    ) {
         let windows = self.windows.entry(rule_name.to_string()).or_default();
         let window = windows
             .entry(sampling_window_start(report.timestamp))
@@ -5885,35 +5905,59 @@ impl SamplingStatisticsStore {
         }
         self.clients.retain(|_, clients| !clients.is_empty());
         self.prune_rules();
-        held
     }
 
-    /// Whether an allocation cycle is LIVE for `rule_name`: whether any service
-    /// reporting for it has already been granted a share that has not aged past
-    /// [`SAMPLING_ALLOCATION_CACHE_SECONDS`].
+    /// The pool the latest allocation cycle divided for `rule_name`, while that
+    /// division is still live — the state the target computation answers a
+    /// report for that rule NAME out of.
     ///
-    /// Until the first cycle has run, there is no reservoir to divide and no
-    /// service is told a share of one. Once there is, EVERY service reporting
-    /// for the rule is told its share — including a service whose first report
-    /// this is, whose share of a pool already divided is nothing until the next
-    /// cycle has run.
-    pub fn cycle_is_live(&self, rule_name: &str, now: f64) -> bool {
-        self.clients.get(rule_name).is_some_and(|clients| {
-            clients.values().any(|report| {
-                report.allocation.is_some_and(|allocation| {
+    /// `None` means no cycle has divided a pool for the name, or the last one
+    /// has aged past [`SAMPLING_ALLOCATION_CACHE_SECONDS`]: there is no division
+    /// to tell a reporting service its share of. Whether the account still
+    /// holds a rule under the name does not enter into it — the division stands
+    /// on its own, exactly as the share granted out of it does.
+    pub fn divided_pool(&self, rule_name: &str, now: f64) -> Option<SamplingPool> {
+        self.pools
+            .get(rule_name)
+            .copied()
+            .filter(|pool| now - pool.divided_at <= SAMPLING_ALLOCATION_CACHE_SECONDS)
+    }
+
+    /// What is left UNCLAIMED of a divided pool of `reservoir_size`: the size
+    /// of the pool less every share the services still live hold out of it.
+    ///
+    /// This is what a service that was not in the division is told, because the
+    /// pool "applies to all services using the rule collectively" and is
+    /// zero-sum: a newcomer may have what the division did not give away, which
+    /// is nothing once the pool is fully claimed. Never negative, and never more
+    /// than the pool.
+    pub fn unclaimed(&self, rule_name: &str, reservoir_size: i32, now: f64) -> i32 {
+        if reservoir_size <= 0 {
+            return 0;
+        }
+        let claimed = self.clients.get(rule_name).map_or(0_i64, |clients| {
+            clients
+                .values()
+                .filter(|report| now - report.reported_at <= SAMPLING_CLIENT_REPORT_TTL_SECONDS)
+                .filter_map(|report| report.allocation)
+                .filter(|allocation| {
                     now - allocation.allocated_at <= SAMPLING_ALLOCATION_CACHE_SECONDS
                 })
-            })
-        })
+                .map(|allocation| i64::from(allocation.reservoir_quota))
+                .fold(0_i64, i64::saturating_add)
+        });
+        i32::try_from(i64::from(reservoir_size).saturating_sub(claimed))
+            .unwrap_or(0)
+            .clamp(0, reservoir_size)
     }
 
     /// The allocation the service `client_id` still HOLDS for `rule_name`,
     /// without reporting anything new.
     ///
-    /// This is what a service reporting for a rule that has LEFT the account is
-    /// answered: the share a cycle already granted it stands until it ages past
-    /// [`SAMPLING_ALLOCATION_CACHE_SECONDS`], because deleting a rule does not
-    /// reach into an allocation the service was already told about.
+    /// This is the share a cycle already granted it, which stands until it ages
+    /// past [`SAMPLING_ALLOCATION_CACHE_SECONDS`] — including when the rule has
+    /// left the account in between, because deleting a rule does not reach into
+    /// an allocation the service was already told about.
     pub fn held_allocation(
         &self,
         rule_name: &str,
@@ -5940,9 +5984,24 @@ impl SamplingStatisticsStore {
         fixed_rate: f64,
         now: f64,
     ) {
+        // The cycle divides the pool as it finds the rule configured NOW, and
+        // records what it divided under the rule's name, so the target
+        // computation keeps answering out of that division without re-reading
+        // the rule store.
+        self.pools.insert(
+            rule_name.to_string(),
+            SamplingPool {
+                fixed_rate,
+                reservoir_size,
+                divided_at: now,
+            },
+        );
+        // A division that has aged past the span a share of it stays live can
+        // no longer be answered out of, so it is dropped rather than kept.
+        self.pools
+            .retain(|_, pool| now - pool.divided_at <= SAMPLING_ALLOCATION_CACHE_SECONDS);
         let allocation = SamplingAllocation {
             reservoir_quota: self.reservoir_quota(rule_name, client_id, reservoir_size, now),
-            fixed_rate,
             allocated_at: now,
         };
         if let Some(report) = self
@@ -5968,6 +6027,7 @@ impl SamplingStatisticsStore {
             };
             self.windows.remove(&stale);
             self.clients.remove(&stale);
+            self.pools.remove(&stale);
             self.boosts.remove(&stale);
         }
     }

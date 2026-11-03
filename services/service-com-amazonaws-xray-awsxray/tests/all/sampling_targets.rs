@@ -21,8 +21,9 @@
 //!   it: each service is allocated the share of it its own reported
 //!   `RequestCount` is of everything reported, the shares never add up to more
 //!   than the pool, and the only service reporting gets all of it;
-//! * statistics reported against a rule the account does not hold are answered
-//!   in `UnprocessedStatistics`, never with an allocation;
+//! * statistics reported against a rule the account does not hold and no
+//!   division of a reservoir stands for are answered in `UnprocessedStatistics`,
+//!   never with an allocation;
 //! * the documents arrive in the `Priority` order a service applies its rules
 //!   in;
 //! * reported statistics are READ BACK by `GetSamplingStatisticSummaries`,
@@ -525,8 +526,9 @@ async fn statistics_for_a_rule_the_account_does_not_hold_are_unprocessed() {
         "CreateSamplingRule must succeed, got {created:?}"
     );
 
-    // Rows: names no rule was ever created under, and one that was deleted
-    // again, each reported beside a rule that does exist.
+    // Rows: names no rule was ever created under, and one that was created and
+    // deleted again without anything ever reporting for it, so no division of
+    // its reservoir stands either — each reported beside a rule that does exist.
     let deleted = "deleted-rule";
     let seeded = create_rule(&xray, deleted, 101, 0.3, 2, None).await;
     assert_eq!(seeded.status, 200, "seeding must succeed, got {seeded:?}");
@@ -835,23 +837,26 @@ async fn a_rules_lifecycle_moves_what_the_targets_serve() {
         list(&fifth, "UnprocessedStatistics").is_empty(),
         "a service holding an allocation is served it rather than told it was unprocessed, got {fifth:?}"
     );
-    // But a service that never held one for the rule is told so.
+    // And a service that was NOT in the division is answered out of it too: the
+    // rate it was made under, and what it left unclaimed — nothing, the earlier
+    // service having claimed the whole pool of 6.
     let stranger = get_targets(
         &xray,
         &[statistics(rule, &client_id(44), reported_at, 20, 2, 0)],
     )
     .await;
-    assert!(
-        target_for(&stranger, rule).is_none(),
-        "a deleted rule serves no new allocation, got {stranger:?}"
-    );
+    let target = report(&stranger);
     assert_eq!(
-        list(&stranger, "UnprocessedStatistics")
-            .first()
-            .and_then(|entry| entry.get("RuleName"))
-            .and_then(Value::as_str),
-        Some(rule),
-        "statistics for a deleted rule nothing was allocated for are unprocessed, got {stranger:?}"
+        (
+            target.get("FixedRate").and_then(Value::as_f64),
+            target.get("ReservoirQuota").and_then(Value::as_i64)
+        ),
+        (Some(0.75), Some(0)),
+        "a service that was not in the division is told what it left unclaimed, got {target:?}"
+    );
+    assert!(
+        list(&stranger, "UnprocessedStatistics").is_empty(),
+        "a standing division answers every service reporting for the rule, got {stranger:?}"
     );
 }
 

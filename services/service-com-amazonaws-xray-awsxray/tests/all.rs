@@ -89,6 +89,9 @@ mod sampling_target_cadence_and_processed_window;
 #[path = "all/sampling_targets.rs"]
 mod sampling_targets;
 
+#[path = "all/sampling_targets_for_a_divided_reservoir.rs"]
+mod sampling_targets_for_a_divided_reservoir;
+
 #[path = "all/service_graph.rs"]
 mod service_graph;
 

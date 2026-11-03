@@ -20,8 +20,10 @@
 //!   reporting ([`crate::state::SamplingStatisticsStore::reservoir_quota`]).
 //!   Before any cycle has divided a rule's pool there is no share to report at
 //!   all, so a rule's first report carries none; once one has, every reporting
-//!   service is told its share, which is nothing for a service that joined
-//!   after the division;
+//!   service is told its share — a service that was not in the division is told
+//!   what the division left UNCLAIMED
+//!   ([`crate::state::SamplingStatisticsStore::unclaimed`]), the pool being
+//!   zero-sum, which is nothing once it is fully claimed;
 //! * when that share expires, and when to come back for the next one.
 //!
 //! `Interval` goes WITH the share a document grants: a service that was given
@@ -29,12 +31,17 @@
 //! cadence at all, so it carries no interval and the reporting service keeps
 //! the one it came with.
 //!
-//! A statistics document naming a rule the account does not hold is answered in
-//! `UnprocessedStatistics` rather than with an allocation for a rule nobody
-//! configured — unless the reporting service still HOLDS an allocation for it,
-//! because deleting a rule does not reach into a share a service was already
-//! granted. The same holds for boost statistics, which are answered with a
-//! `SamplingBoost` only for a rule whose configuration asked for one.
+//! The target computation is keyed by rule NAME — that is what a
+//! `SamplingTargetDocument` identifies what it allocates by — and runs off the
+//! division it last made for that name, not off the rule store: so a rule that
+//! has LEFT the account is still answered, for every service reporting for it,
+//! out of the division that stands, because deleting a rule reaches neither
+//! into a share already granted nor into what that division left unclaimed. A
+//! statistics document is answered in `UnprocessedStatistics` only when it
+//! names a rule the account does not hold AND no division of its reservoir
+//! stands, so there is nothing to compute an allocation from. Boost statistics
+//! are answered with a `SamplingBoost` only for a rule whose configuration
+//! asked for one.
 //!
 //! The documents are ordered by the `Priority` of the rule each one is for, the
 //! order a service applies its rules in, so a rule that matches first is
@@ -218,48 +225,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut reported: Vec<ReportedRule> = Vec::new();
         for document in &input.sampling_statistics_documents {
             let stored = store.visible_sampling_rule(&region, &document.rule_name);
-            let Some(stored) = stored else {
-                // The rule has left the account, but a service that was already
-                // granted a share of it still holds that allocation: it is told
-                // the same thing until the allocation ages out. Only a rule
-                // nothing was ever allocated for is unprocessed.
-                match store.sampling.held_allocation(
+            // The division of the rule's reservoir the target computation
+            // stands on, read BEFORE this call's cycle runs — because what a
+            // service is told is the division that preceded its report — and
+            // read by rule NAME, so it is there for a rule the account no
+            // longer holds just as it is for one it does.
+            let divided = store.sampling.divided_pool(&document.rule_name, now);
+            if stored.is_none() && divided.is_none() {
+                // Nothing configured under the name and no division of its
+                // reservoir to answer out of, so there is no allocation to
+                // compute at all.
+                unprocessed.push(unknown_rule(&document.rule_name));
+                continue;
+            }
+            // The share this report is answered: once the pool has been
+            // divided, EVERY service reporting for the rule is told its share
+            // of that division — the one it was granted, or what the division
+            // left unclaimed for a service that was not in it, which is nothing
+            // once the pool is fully claimed. Before any division there is no
+            // share to tell a service about at all.
+            let share = divided.map(|pool| {
+                store
+                    .sampling
+                    .held_allocation(&document.rule_name, &document.client_id, now)
+                    .map_or_else(
+                        || {
+                            store.sampling.unclaimed(
+                                &document.rule_name,
+                                pool.reservoir_size,
+                                now,
+                            )
+                        },
+                        |held| held.reservoir_quota,
+                    )
+            });
+            if stored.is_some() {
+                // A report is accumulated into the rule's reporting windows,
+                // and counted in the next division of its pool, for as long as
+                // the account holds the rule: there is no configuration left to
+                // divide a pool under once it does not.
+                store.sampling.record(
                     &document.rule_name,
                     &document.client_id,
+                    crate::state::ReportedSamplingCounts {
+                        timestamp: crate::state::epoch_seconds(&document.timestamp),
+                        request_count: i64::from(document.request_count),
+                        sampled_count: i64::from(document.sampled_count),
+                        borrow_count: i64::from(document.borrow_count),
+                    },
                     now,
-                ) {
-                    Some(held) => reported.push(ReportedRule {
-                        rule_name: document.rule_name.clone(),
-                        client_id: document.client_id.clone(),
-                        rule: None,
-                        held: Some(held),
-                        cycle_is_live: true,
-                    }),
-                    None => unprocessed.push(unknown_rule(&document.rule_name)),
-                }
-                continue;
-            };
-            // Whether the rule's reservoir has been divided at all yet — read
-            // BEFORE this call's cycle runs, because what a service is told is
-            // the division that preceded its report.
-            let cycle_is_live = store.sampling.cycle_is_live(&document.rule_name, now);
-            let held = store.sampling.record(
-                &document.rule_name,
-                &document.client_id,
-                crate::state::ReportedSamplingCounts {
-                    timestamp: crate::state::epoch_seconds(&document.timestamp),
-                    request_count: i64::from(document.request_count),
-                    sampled_count: i64::from(document.sampled_count),
-                    borrow_count: i64::from(document.borrow_count),
-                },
-                now,
-            );
+                );
+            }
             reported.push(ReportedRule {
                 rule_name: document.rule_name.clone(),
                 client_id: document.client_id.clone(),
-                rule: Some(stored),
-                held,
-                cycle_is_live,
+                rule: stored,
+                pool: divided,
+                share,
             });
         }
 
@@ -270,9 +292,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let (fixed_rate, priority) = match &entry.rule {
                 Some(stored) => (stored.rule.fixed_rate, stored.rule.priority),
                 None => (
-                    entry.held.map_or(0.0, |held| held.fixed_rate),
+                    entry.pool.map_or(0.0, |pool| pool.fixed_rate),
                     // A rule that is no longer configured has no priority to
-                    // sort by, so its cached allocation sorts last.
+                    // sort by, so what the standing division answers for it
+                    // sorts last.
                     i32::MAX,
                 ),
             };
@@ -286,13 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
             priorities.insert(entry.rule_name.clone(), priority);
-            // Once the rule's reservoir has been divided, every service
-            // reporting for it is told its share — nothing, for one whose first
-            // report this is, because the pool was divided before it was there.
-            // Before any cycle, there is no share to tell it about at all.
-            let reservoir_quota = entry
-                .cycle_is_live
-                .then(|| entry.held.map_or(0, |held| held.reservoir_quota));
+            let reservoir_quota = entry.share;
             targets.insert(
                 entry.rule_name.clone(),
                 SamplingTargetDocument {
@@ -393,20 +410,22 @@ struct ReportedRule {
     /// The `ClientID` that reported it.
     client_id: String,
     /// The rule as the account holds it, or `None` for a rule that has left the
-    /// account since an allocation for it was granted.
+    /// account since its reservoir was divided.
     rule: Option<crate::state::StoredSamplingRule>,
-    /// The allocation this service already holds for the rule, which is what it
-    /// is answered now. `None` before any cycle has run for it.
-    held: Option<crate::state::SamplingAllocation>,
-    /// Whether the rule's reservoir had been divided before this report, so
-    /// every service reporting for it is told its share of that division.
-    cycle_is_live: bool,
+    /// The division of the rule's reservoir the target computation stands on,
+    /// which is what a rule the account no longer holds is answered out of.
+    /// `None` before any cycle has divided it.
+    pool: Option<crate::state::SamplingPool>,
+    /// The share of that division this report is answered. `None` before any
+    /// cycle has divided the pool, there being no share to report.
+    share: Option<i32>,
 }
 
-/// What a reported document naming a rule the account does not hold is answered
-/// with: the rule it named, the client-error code of the refusal a request for
-/// that rule would get, and the FIXED sentence a declined statistics document
-/// carries ([`crate::state::UNKNOWN_SAMPLING_RULE_MESSAGE`]) — which is the
+/// What a reported document naming a rule neither configured nor holding a
+/// standing division of its reservoir is answered with: the rule it named, the
+/// client-error code of the refusal a request for that rule would get, and the
+/// FIXED sentence a declined statistics document carries
+/// ([`crate::state::UNKNOWN_SAMPLING_RULE_MESSAGE`]) — which is the
 /// per-document note of a 200, not the message of a whole-request refusal.
 fn unknown_rule(rule_name: &str) -> UnprocessedStatistics {
     UnprocessedStatistics {
@@ -417,7 +436,7 @@ fn unknown_rule(rule_name: &str) -> UnprocessedStatistics {
 }
 
 /// The `UnprocessedStatistics$ErrorCode` for statistics reported against a rule
-/// the account does not hold.
+/// nothing configures and no division of a reservoir stands for.
 ///
 /// CHOSEN, not modelled: `ErrorCode` is "the error code", an untyped `String`
 /// the model names no value for
