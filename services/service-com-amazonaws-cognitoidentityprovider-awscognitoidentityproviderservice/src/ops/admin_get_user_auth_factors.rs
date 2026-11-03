@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AdminGetUserAuthFactors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AdminGetUserAuthFactors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AdminGetUserAuthFactors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The authentication options of one user of a pool, named administratively: the
+//! `UserPoolId` names the STORED pool and `Username` the STORED user of it
+//! ([`crate::state::UserPool::user`], which resolves a username, a `sub` or a
+//! sign-in name of the pool), and the MFA settings and the choice-based
+//! (`USER_AUTH`) authentication factors are computed from that pool and that user
+//! ([`crate::state::UserPool::configured_user_auth_factors`]) — the same
+//! computation the self-service `GetUserAuthFactors` reports for the signed-in
+//! user. A pure read: nothing is written, so a later caller sees what this one saw.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +180,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AdminGetUserAuthFactors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AdminGetUserAuthFactorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AdminGetUserAuthFactors"))
+        // Request metadata only: the pool and the user this reports on are named in
+        // the body, and this operation is authorized by the caller's IAM credentials.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // A read: this handler takes the lock to READ and writes nothing, so a later
+        // caller sees exactly what it saw.
+        let guard = state.lock();
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        // "The value of this parameter is typically your user's username, but it can
+        // be any of their alias attributes" (`Username`), which is the lookup every
+        // administrative operation of this service resolves a user by.
+        let user = pool.user(&input.username).ok_or_else(user_not_found)?;
+
+        // Every member is computed from the STORED pool and the STORED user: this
+        // operation "lists the authentication options for a user in a user pool"
+        // (this service's model).
+        Ok(AdminGetUserAuthFactorsOutput {
+            username: user.username.clone(),
+            preferred_mfa_setting: user.preferred_mfa_setting.clone(),
+            // A user with no activated MFA factor carries no list rather than an
+            // empty one, exactly as `AdminGetUser` reports the same member.
+            user_mfa_setting_list: crate::state::non_empty(&user.mfa_setting_list),
+            configured_user_auth_factors: crate::state::non_empty(
+                &pool.configured_user_auth_factors(user),
+            ),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> AdminGetUserAuthFactorsError {
+    AdminGetUserAuthFactorsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for an absent user. Carries the fixed
+/// message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no username.
+fn user_not_found() -> AdminGetUserAuthFactorsError {
+    AdminGetUserAuthFactorsErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> AdminGetUserAuthFactorsError {
+    AdminGetUserAuthFactorsErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }
