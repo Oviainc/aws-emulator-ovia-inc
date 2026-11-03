@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddArtifact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddArtifact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddArtifact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Uploads an artifact into an agent space: stores a record carrying the bytes, the file
+//! name and the type the request supplied under a freshly minted `artifactId`, and
+//! answers that id — so a later read of the store reports exactly what was uploaded.
 //!
 //! ## Shape of an operation
 //!
@@ -91,15 +86,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityagent-securitya
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `AddArtifactError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityagent#AddArtifact")]
+// here — hence the `AddArtifactError` alias below.
+//
+// `ServiceQuotaExceededException` (HTTP 402, "The request exceeds a service quota") is
+// a shape the SERVICE models that this operation does not list, so it is widened in
+// with `extra_errors`: it is what an upload past the agent space's artifact quota
+// answers, the same shape `CreateAgentSpace` answers past the account's.
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityagent#AddArtifact",
+    extra_errors = ["ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum AddArtifactErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -155,18 +157,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddArtifact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddArtifactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddArtifact"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AddArtifactErrorModeled::InternalServerException(InternalServerException {
+                message: "the artifact store is unavailable".to_string(),
+            })
+        })?;
+
+        // `agentSpaceId` is `@required` but carries no `@length` in the model, so an
+        // empty one reaches the handler. It names no agent space and never could, so it
+        // is a bad request rather than a missing resource — the same split every
+        // operation of this service that looks an id up applies.
+        if input.agent_space_id.is_empty() {
+            return Err(refused("agentSpaceId", "member must not be empty"));
+        }
+        // `fileName` is `@required` and also carries no `@length`, so a blank one reaches
+        // the handler too. An artifact whose file name is only whitespace has no file
+        // name, so it is refused naming the member rather than stored.
+        if input.file_name.trim().is_empty() {
+            return Err(refused("fileName", "member must not be blank"));
+        }
+        // `artifactContent` targets the prelude `Blob`, which carries no `@length`, so
+        // the boundary validator passes an upload of any size. The bytes are kept on the
+        // stored record and reported on every later read of the artifact, so an upload
+        // past the ceiling is refused naming the member instead of stored.
+        if input.artifact_content.len() > crate::state::MAX_ARTIFACT_CONTENT_BYTES {
+            let limit = crate::state::MAX_ARTIFACT_CONTENT_BYTES;
+            return Err(refused(
+                "artifactContent",
+                &format!("member must have at most {limit} bytes"),
+            ));
+        }
+
+        let mut state = state.lock();
+
+        // An artifact is uploaded INTO an agent space, so a space the account does not
+        // hold has nothing to upload to: the operation's own `ResourceNotFoundException`
+        // (HTTP 404), with the service's fixed sentence for an agent space it cannot
+        // resolve, and nothing written to the store.
+        if !state.agent_spaces.contains_key(&input.agent_space_id) {
+            return Err(AddArtifactErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::AGENT_SPACE_NOT_FOUND.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Every artifact is a stored record holding the bytes it was uploaded with, so
+        // how many one agent space can accumulate is bounded, as it is on the real
+        // service: past the quota this operation answers the service's own
+        // `ServiceQuotaExceededException` (HTTP 402) instead of growing the store
+        // without end.
+        if state.artifact_count(&input.agent_space_id)
+            >= crate::state::MAX_ARTIFACTS_PER_AGENT_SPACE
+        {
+            return Err(AddArtifactErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The request would exceed the maximum number of artifacts ({}) \
+                         for this agent space",
+                        crate::state::MAX_ARTIFACTS_PER_AGENT_SPACE
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A fresh identity per call: the id is the service's to choose, so two uploads
+        // of the same file are two distinct artifacts, and the record is stamped with
+        // the instant it was written.
+        let artifact_id = state.mint_artifact_id();
+        let record = crate::state::ArtifactRecord {
+            artifact_id,
+            agent_space_id: input.agent_space_id,
+            file_name: input.file_name,
+            artifact_type: input.artifact_type,
+            // The uploaded bytes, verbatim: what a read of the artifact reports is the
+            // content this call persisted.
+            content: input.artifact_content,
+            updated_at: ::std::time::SystemTime::now(),
+        };
+
+        // "The unique identifier assigned to the uploaded artifact": the id of the
+        // record that was just persisted, read off that record.
+        let artifact_id = record.artifact_id.clone();
+        state.artifacts.insert(record.artifact_id.clone(), record);
+
+        Ok(AddArtifactOutput { artifact_id })
     }
+}
+
+/// The operation's `ValidationException` (HTTP 400) for a required member whose value
+/// cannot name anything, naming the member and the constraint it failed — the form every
+/// client-input refusal of this service takes.
+fn refused(path: &str, violation: &str) -> AddArtifactError {
+    AddArtifactErrorModeled::ValidationException(ValidationException {
+        message: format!(
+            "1 validation error detected: value for '{path}' failed to satisfy \
+             constraint: {violation}"
+        ),
+        field_list: Some(vec![ValidationExceptionField {
+            path: path.to_string(),
+            message: violation.to_string(),
+        }]),
+    })
+    .into()
 }

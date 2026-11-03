@@ -180,11 +180,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // hold is refused rather than answered as a delete that happened, so a client
         // cannot read the deletion of a typo as the deletion of the agent space it meant.
         //
-        // "and all of its associated resources": this service's store holds no record
-        // that hangs off an agent space yet (`crate::state`), so there is nothing beside
-        // the agent space itself to cascade to. The target domains it was associated
-        // with are records of their own, registered independently of any agent space,
-        // so they are not removed with it.
+        // "and all of its associated resources": the artifacts uploaded into the agent
+        // space are the records this service's store hangs off one (`crate::state`), so
+        // they go with it below. The target domains it was associated with are records
+        // of their own, registered independently of any agent space, so they are not
+        // removed with it.
         let removed = state
             .agent_spaces
             .remove(&input.agent_space_id)
@@ -198,6 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
             })?;
+
+        // The artifacts of the removed agent space, which are reachable only through it,
+        // are dropped with it: every artifact of every OTHER space is left alone.
+        let removed_id = removed.agent_space_id.clone();
+        state
+            .artifacts
+            .retain(|_, artifact| artifact.agent_space_id != removed_id);
 
         // "The unique identifier of the deleted agent space": the id of the record that
         // was removed, read off that record rather than off the request — under the

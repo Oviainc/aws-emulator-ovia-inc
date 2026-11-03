@@ -18,7 +18,15 @@ pub struct GetArtifactInput {
     pub artifact_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#GetArtifactOutput")]
+/// `GetArtifactOutput`, with its schema and serializer written out instead of derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the input beside it, as
+/// `super::wire_shape` spells out: `updatedAt` carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="operation",
+/// operation="GetArtifact",
+/// model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`),
+/// which the derive drops, so it would go out as an epoch-second NUMBER where the model
+/// (and every SDK's generated deserializer) requires an RFC 3339 string.
 #[derive(Debug, Clone)]
 pub struct GetArtifactOutput {
     pub agent_space_id: String,
@@ -27,6 +35,22 @@ pub struct GetArtifactOutput {
     pub file_name: String,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+sa_schema_and_codec!(
+    GetArtifactOutput,
+    GET_ARTIFACT_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#GetArtifactOutput",
+    "com.amazonaws.securityagent",
+    "GetArtifactOutput",
+    modelled: [
+        (M_AGENT_SPACE_ID, agent_space_id, "agentSpaceId", 0, req, string),
+        (M_ARTIFACT_ID, artifact_id, "artifactId", 1, req, string),
+        (M_ARTIFACT, artifact, "artifact", 2, req, struct_of(Artifact)),
+        (M_FILE_NAME, file_name, "fileName", 3, req, string),
+        (M_UPDATED_AT, updated_at, "updatedAt", 4, req, date_time),
+    ],
+    recorded: [],
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.securityagent#Artifact")]
 #[derive(Debug, Clone, Default)]

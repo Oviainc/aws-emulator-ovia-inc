@@ -14,6 +14,11 @@
 //! and `BatchGetAgentSpaces` — and every agent space operation implemented after them —
 //! read ONE copy of each agent space.
 //!
+//! The artifacts uploaded into an agent space live here too, keyed by their own id and
+//! carrying the id of the space that holds them, so `AddArtifact` writes one record and
+//! `GetArtifact` — and every artifact operation implemented after it — reads back THAT
+//! record rather than a second copy of it.
+//!
 //! The security requirement packs live here for the same reason:
 //! `CreateSecurityRequirementPack`, `GetSecurityRequirementPack`,
 //! `ListSecurityRequirementPacks` — and every pack operation implemented after them —
@@ -29,7 +34,7 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AWSResources, AgentSpace, ApplicationSummary, CodeReviewSettings, DnsVerification,
+    AWSResources, AgentSpace, ApplicationSummary, Artifact, CodeReviewSettings, DnsVerification,
     HttpVerification, IdCConfiguration, PrivateConnectionSummary,
     SecurityRequirementPackSummary, TargetDomain, VerificationDetails,
 };
@@ -177,6 +182,30 @@ pub const MAX_AGENT_SPACE_TARGET_DOMAINS: usize = 100;
 /// CLASS under the name the service's own records use for an agent space, and carries no
 /// value from the request, so a refusal never echoes a caller's own identifier back.
 pub const AGENT_SPACE_NOT_FOUND: &str = "The specified agent instance does not exist.";
+
+/// The sentence a refusal of an artifact the named agent space does not hold states.
+///
+/// Fixed text naming the resource CLASS, the form every other not-found sentence of
+/// this service takes ([`AGENT_SPACE_NOT_FOUND`], [`TARGET_DOMAIN_NOT_FOUND`]), so a
+/// refusal carries no value the request sent back to the caller.
+pub const ARTIFACT_NOT_FOUND: &str = "The specified artifact does not exist.";
+
+/// The most artifacts ONE agent space holds before `AddArtifact` answers the service's
+/// `ServiceQuotaExceededException`.
+///
+/// CHOSEN, not cited, for the same reason as [`MAX_AGENT_SPACES`]: the real service's
+/// artifact quota is not in the model. Every artifact is a stored record holding the
+/// bytes that were uploaded, so this bounds what one agent space can accumulate; it is
+/// set far above any plausible client's artifact count, so normal use never meets it.
+pub const MAX_ARTIFACTS_PER_AGENT_SPACE: usize = 100;
+
+/// The most bytes one uploaded artifact may carry.
+///
+/// CHOSEN, not cited: `AddArtifact$artifactContent` targets the prelude `Blob`, which
+/// carries no `@length`, so nothing pins this value. The bytes are kept on the stored
+/// record and reported on every later read of the artifact, so without a ceiling a
+/// single request could grow both the store and a response without end.
+pub const MAX_ARTIFACT_CONTENT_BYTES: usize = 1 << 20;
 
 /// The most security requirement packs this emulator stores for the account before
 /// `CreateSecurityRequirementPack` answers the service's
@@ -453,6 +482,55 @@ pub const AGENT_SPACE_ARN_KIND: &str = "agent-instance";
 /// carry it (`smithy_query(query="shape",shape="AgentSpace")`).
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
+}
+
+/// One stored artifact: the file `AddArtifact` uploaded into an agent space, plus the
+/// identity and the timestamps the service minted for it.
+///
+/// An artifact belongs to exactly ONE agent space — every operation that names an
+/// artifact names the space beside it — so the owning id is part of the record and a
+/// read resolves the PAIR rather than the artifact id alone.
+#[derive(Debug, Clone)]
+pub struct ArtifactRecord {
+    pub artifact_id: String,
+    /// The agent space the artifact was uploaded to.
+    pub agent_space_id: String,
+    pub file_name: String,
+    /// The `ArtifactType` the upload declared. One of the enum's members: the boundary
+    /// validator refuses every other value before the handler runs.
+    pub artifact_type: String,
+    /// The bytes the upload carried, stored exactly as they arrived, so a read reports
+    /// the content that was uploaded rather than a value rebuilt from anything else.
+    pub content: Vec<u8>,
+    /// When the artifact was last written — the instant it was uploaded, until something
+    /// updates it. The only timestamp any artifact shape of this service carries
+    /// (`smithy_query(query="shape",shape="ArtifactMetadataItem,ArtifactSummary")` and
+    /// `GetArtifact`'s output: `updatedAt` and nothing beside it).
+    pub updated_at: SystemTime,
+}
+
+impl ArtifactRecord {
+    /// This artifact projected onto the [`Artifact`] shape a read of it answers: the
+    /// stored content and the stored type, never request text.
+    pub fn modelled(&self) -> Artifact {
+        Artifact {
+            contents: self.contents(),
+            r#type: self.artifact_type.clone(),
+        }
+    }
+
+    /// The stored bytes as the `contents` string a read reports: their base64 form, the
+    /// same encoding the blob itself travels in on the wire.
+    ///
+    /// `Artifact$contents` is a string while the upload member (`AddArtifact`'s
+    /// `artifactContent`) is a blob, and the artifact types the service accepts include
+    /// binary documents (PNG, JPEG, PDF, DOC, DOCX) whose bytes encode no text at all,
+    /// so the content a read reports is the base64 of the stored bytes — the one
+    /// rendering that carries ANY uploaded file through a string member unchanged, and
+    /// the one a caller reverses to get the bytes it uploaded back.
+    pub fn contents(&self) -> String {
+        ::aws_smithy_types::base64::encode(self.content.as_slice())
+    }
 }
 
 /// One stored security requirement pack: the named collection of security
@@ -914,6 +992,14 @@ pub struct ComAmazonawsSecurityagentSecurityagentState {
     /// `CreateSecurityRequirementPack` calls are two distinct records even when they
     /// carry byte-identical input.
     pub next_security_requirement_pack_seq: u64,
+    /// Every stored artifact, keyed by its `artifactId`. A `BTreeMap` for the same
+    /// reason as [`Self::applications`]: the ids come from the counter below, so one
+    /// stable order — the upload order — for a read that walks the artifacts of an
+    /// agent space.
+    pub artifacts: BTreeMap<String, ArtifactRecord>,
+    /// Monotonic counter behind every minted `artifactId`, so two `AddArtifact` calls
+    /// are two distinct artifacts even when they upload the same file name and bytes.
+    pub next_artifact_seq: u64,
 }
 
 impl Default for ComAmazonawsSecurityagentSecurityagentState {
@@ -945,6 +1031,8 @@ impl Default for ComAmazonawsSecurityagentSecurityagentState {
                 })
                 .collect(),
             next_security_requirement_pack_seq: 0,
+            artifacts: BTreeMap::new(),
+            next_artifact_seq: 0,
         }
     }
 }
@@ -1080,6 +1168,43 @@ impl ComAmazonawsSecurityagentSecurityagentState {
         self.next_security_requirement_pack_seq =
             self.next_security_requirement_pack_seq.wrapping_add(1);
         format!("{:032x}", self.next_security_requirement_pack_seq)
+    }
+
+    /// Mint the `artifactId` of a newly uploaded artifact.
+    ///
+    /// Drawn from the store's own monotonic counter while the store is locked, so two
+    /// uploads — including two carrying the same file name and bytes — are two distinct
+    /// artifacts and neither overwrites the other. 32 lowercase hex characters, the same
+    /// opaque form as a minted `agentSpaceId`: `ArtifactId` carries no `@pattern` or
+    /// `@length` in the model, so the shape is this emulator's to choose.
+    pub fn mint_artifact_id(&mut self) -> String {
+        self.next_artifact_seq = self.next_artifact_seq.wrapping_add(1);
+        format!("{:032x}", self.next_artifact_seq)
+    }
+
+    /// How many artifacts the agent space `agent_space_id` holds, i.e. how many count
+    /// against that space's artifact quota ([`MAX_ARTIFACTS_PER_AGENT_SPACE`]).
+    pub fn artifact_count(&self, agent_space_id: &str) -> usize {
+        self.artifacts
+            .values()
+            .filter(|artifact| artifact.agent_space_id == agent_space_id)
+            .count()
+    }
+
+    /// The artifact `artifact_id` names IN the agent space `agent_space_id`, or `None`
+    /// when that space holds no such artifact.
+    ///
+    /// An artifact is reachable only through the space that holds it, so an id that
+    /// names an artifact of ANOTHER agent space resolves to nothing here — a read of it
+    /// is refused exactly as a read of an id nothing minted is.
+    pub fn artifact_in(
+        &self,
+        agent_space_id: &str,
+        artifact_id: &str,
+    ) -> Option<&ArtifactRecord> {
+        self.artifacts
+            .get(artifact_id)
+            .filter(|artifact| artifact.agent_space_id == agent_space_id)
     }
 }
 

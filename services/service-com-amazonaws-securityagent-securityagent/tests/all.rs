@@ -19,6 +19,8 @@ mod agent_space_lifecycle;
 mod agent_space_update;
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
+#[path = "all/artifact_storage.rs"]
+mod artifact_storage;
 #[path = "all/error_message_wording.rs"]
 mod error_message_wording;
 #[path = "all/private_connection_lifecycle.rs"]

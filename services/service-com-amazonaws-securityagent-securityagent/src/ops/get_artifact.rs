@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetArtifact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetArtifact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetArtifact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Retrieves one artifact of an agent space: resolves the stored record the pair of ids
+//! names and projects it, writing nothing — so a later caller sees exactly what this
+//! call saw.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +151,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetArtifact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetArtifactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetArtifact"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetArtifactErrorModeled::InternalServerException(InternalServerException {
+                message: "the artifact store is unavailable".to_string(),
+            })
+        })?;
+
+        // Both ids are `@required` but carry no `@length` in the model, so an empty one
+        // reaches the handler. It names no resource and never could, so it is a bad
+        // request rather than a missing resource — the same split every operation of
+        // this service that looks an id up applies.
+        for (path, value) in [
+            ("agentSpaceId", &input.agent_space_id),
+            ("artifactId", &input.artifact_id),
+        ] {
+            if value.is_empty() {
+                let violation = "member must not be empty";
+                return Err(GetArtifactErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "1 validation error detected: value for '{path}' failed to \
+                             satisfy constraint: {violation}"
+                        ),
+                        field_list: Some(vec![ValidationExceptionField {
+                            path: path.to_string(),
+                            message: violation.to_string(),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A read: it resolves the record and projects it, and writes nothing.
+        let state = state.lock();
+
+        // An artifact is retrieved FROM an agent space, so a space the account does not
+        // hold has no artifact to retrieve: refused with the service's fixed sentence
+        // for an agent space it cannot resolve, before the artifact id is looked at.
+        if !state.agent_spaces.contains_key(&input.agent_space_id) {
+            return Err(GetArtifactErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::AGENT_SPACE_NOT_FOUND.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The record the PAIR of ids names: an id the space does not hold — including
+        // one that names an artifact of another agent space — resolves to nothing and is
+        // refused with the service's fixed sentence for an artifact it cannot resolve,
+        // never by serving another space's artifact.
+        let record = state
+            .artifact_in(&input.agent_space_id, &input.artifact_id)
+            .ok_or_else(|| {
+                GetArtifactErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::ARTIFACT_NOT_FOUND.to_string(),
+                })
+            })?;
+
+        // Every member comes off the stored record — the ids it resolved to, the file
+        // name and the content it was uploaded with, and the instant it was last written
+        // — rather than off the request.
+        Ok(GetArtifactOutput {
+            agent_space_id: record.agent_space_id.clone(),
+            artifact_id: record.artifact_id.clone(),
+            artifact: record.modelled(),
+            file_name: record.file_name.clone(),
+            updated_at: crate::state::timestamp(record.updated_at),
+        })
     }
 }
