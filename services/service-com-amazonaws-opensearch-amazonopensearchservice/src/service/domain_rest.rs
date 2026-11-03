@@ -184,6 +184,30 @@ type Hit = (String, String, Value);
 /// How many documents a request SELECTED, and the page of hits it asked for.
 type Selected = (usize, Vec<Hit>);
 
+/// The separator a cross-cluster index pattern names its remote cluster with:
+/// `<cluster>:<index>`.
+const REMOTE_CLUSTER_SEPARATOR: char = ':';
+
+/// What the remote clusters of a cross-cluster search answered: the documents each
+/// `<cluster>:<index>` pattern of ONE request resolved to, and the aliases it named that
+/// this domain has no connection to search through.
+///
+/// A cross-cluster search runs against ANOTHER domain's indexes, which this plane reaches
+/// through the store rather than through the one domain it serves — so the remote half is
+/// resolved out of the store BEFORE that domain is borrowed, and carried in. It is empty
+/// for every request that names no remote cluster, which is the whole surface apart from a
+/// search or a count.
+#[derive(Debug, Default)]
+struct CrossCluster {
+    /// The hits each pattern resolved to, keyed by the pattern AS WRITTEN. Each hit names
+    /// its index the way a cross-cluster hit does — `<cluster>:<index>` — so a client can
+    /// tell which cluster answered.
+    resolved: BTreeMap<String, Vec<Hit>>,
+    /// The cluster aliases the request named that resolve to no connection this domain can
+    /// search through: none at all, or one that is not yet (or no longer) `ACTIVE`.
+    unknown: BTreeSet<String>,
+}
+
 /// What a request ADDRESSES, as the wire carries it: the host it was sent to — absent on a
 /// request that names neither a `Host` header nor an absolute URI — and its path.
 ///
@@ -400,6 +424,10 @@ pub fn serve<Eng: Send + Sync + 'static>(
     };
     let now = SystemTime::now();
     let mut store = state.lock();
+    // The remote half of a cross-cluster search: resolved out of the store before the
+    // domain this request addresses is borrowed, since the indexes it reads belong to
+    // ANOTHER domain of the same store.
+    let across = cross_cluster(&mut store, &resolved.domain_name, &request, now);
     // The read materialises any configuration change the clock already owes this domain,
     // which this request neither starts nor changes.
     let Some(domain) = store.settled_mut(&resolved.domain_name, now) else {
@@ -412,7 +440,112 @@ pub fn serve<Eng: Send + Sync + 'static>(
             "blocked by: [SERVICE_UNAVAILABLE/1/state not recovered / initialized]",
         );
     }
-    serve_resolved(domain, &request, now)
+    serve_resolved(domain, &request, now, &across)
+}
+
+/// The documents the remote clusters of a cross-cluster search hold for the patterns
+/// `request` names, or an empty set for a request that names no remote cluster.
+///
+/// A cross-cluster query names its cluster in the index pattern itself
+/// (`<cluster>:<index>`), where `<cluster>` is the `ConnectionAlias` the source domain's
+/// own outbound connection carries. Only a connection that is `ACTIVE` can be searched
+/// through — the status move the clock owes a connection is materialised first, so a
+/// connection that became active while nobody was looking is searchable — and only the
+/// domain that connection names is read. Every other alias is reported back as a cluster
+/// this domain cannot search.
+///
+/// Reading the remote domain materialises what the clock already owed IT, exactly as a
+/// read of that domain would have; nothing else is written.
+fn cross_cluster(
+    store: &mut Store,
+    local_domain: &str,
+    request: &Request<'_>,
+    now: SystemTime,
+) -> CrossCluster {
+    let mut across = CrossCluster::default();
+    let patterns: Vec<&str> = remote_patterns(request);
+    if patterns.is_empty() {
+        return across;
+    }
+    store.settle_connections(now);
+    // ONE budget over the whole request rather than one per pattern, so what a request
+    // materialises from the remote clusters is bounded by the same count a local search
+    // visits however many patterns it names.
+    let mut budget = MAX_DOCUMENTS_VISITED;
+    for pattern in patterns {
+        let Some((alias, named)) = pattern.split_once(REMOTE_CLUSTER_SEPARATOR) else {
+            continue;
+        };
+        let remote_domain = store.connections.values().find_map(|connection| {
+            (connection.connection_alias == alias
+                && connection.local_domain.domain_name == local_domain
+                && connection.status == state::CONNECTION_STATUS_ACTIVE)
+                .then(|| connection.remote_domain.domain_name.clone())
+        });
+        let Some(remote_domain) = remote_domain else {
+            across.unknown.insert(alias.to_string());
+            continue;
+        };
+        let Some(remote) = store.settled_mut(&remote_domain, now) else {
+            across.unknown.insert(alias.to_string());
+            continue;
+        };
+        let mut hits = Vec::new();
+        let mut names = false;
+        for index in remote
+            .indexes
+            .values()
+            .filter(|index| matched_index(named, &index.index_name))
+        {
+            names = true;
+            for document in index.documents.values() {
+                if budget == 0 {
+                    break;
+                }
+                budget -= 1;
+                hits.push((
+                    format!("{alias}{REMOTE_CLUSTER_SEPARATOR}{}", index.index_name),
+                    document.id.clone(),
+                    document.source.clone(),
+                ));
+            }
+        }
+        // An index the remote cluster does not hold resolves to no entry at all, so the
+        // search refuses the pattern the same way it refuses a local index that is absent.
+        if names {
+            across.resolved.insert(pattern.to_string(), hits);
+        }
+    }
+    across
+}
+
+/// Whether `pattern` — one index name, or one wildcard pattern, or `_all` — names `index`.
+/// The same reading the local resolution applies, so a remote pattern and a local one
+/// select by the same rule.
+fn matched_index(pattern: &str, index: &str) -> bool {
+    if pattern == "_all" || pattern.contains('*') || pattern.contains('?') {
+        return ::service_common::iam_authorization::wildcard_match(
+            if pattern == "_all" { "*" } else { pattern },
+            index,
+            true,
+        );
+    }
+    pattern == index
+}
+
+/// The `<cluster>:<index>` patterns `request` names, which only a search or a count can
+/// carry: those are the two routes whose first segment is an index pattern AND that read
+/// documents, so nothing else resolves a remote cluster.
+fn remote_patterns<'r>(request: &'r Request<'r>) -> Vec<&'r str> {
+    let segments = request.segments();
+    let [patterns, "_search" | "_count"] = segments.as_slice() else {
+        return Vec::new();
+    };
+    patterns
+        .split(',')
+        .filter(|pattern| pattern.contains(REMOTE_CLUSTER_SEPARATOR))
+        .take(MAX_NAMED_INDEX_PATTERNS)
+        .collect()
 }
 
 /// One data-plane request, as the surface below reads it.
@@ -478,8 +611,14 @@ impl Request<'_> {
     }
 }
 
-/// Answer the request against the domain it resolved to.
-fn serve_resolved(domain: &mut Domain, request: &Request<'_>, now: SystemTime) -> RtResponse {
+/// Answer the request against the domain it resolved to, and the remote clusters a
+/// cross-cluster search named ([`cross_cluster`]).
+fn serve_resolved(
+    domain: &mut Domain,
+    request: &Request<'_>,
+    now: SystemTime,
+    across: &CrossCluster,
+) -> RtResponse {
     // IAM first, as AWS takes it: the resource is the domain path the request addresses.
     let resource = format!("{}/{}", domain.arn, request.path.trim_start_matches('/'));
     if let Err(refusal) = ingest::iam_decision(
@@ -571,13 +710,13 @@ fn serve_resolved(domain: &mut Domain, request: &Request<'_>, now: SystemTime) -
         }
         [index, "_count"] => match request.method {
             "GET" | "POST" => guarded(domain, request, fgac::ACTION_COUNT, |domain| {
-                count(domain, request, index)
+                count(domain, request, index, across)
             }),
             _ => wrong_method(request, "GET, POST"),
         },
         [index, "_search"] => match request.method {
             "GET" | "POST" => guarded(domain, request, fgac::ACTION_SEARCH, |domain| {
-                search(domain, request, index)
+                search(domain, request, index, across)
             }),
             _ => wrong_method(request, "GET, POST"),
         },
@@ -1891,9 +2030,14 @@ fn refresh(domain: &Domain, request: &Request<'_>, index_name: Option<&str>) -> 
 }
 
 /// The count a `_count` answers, over the documents the selected indexes hold.
-fn count(domain: &Domain, request: &Request<'_>, index_name: &str) -> RtResponse {
+fn count(
+    domain: &Domain,
+    request: &Request<'_>,
+    index_name: &str,
+    across: &CrossCluster,
+) -> RtResponse {
     // No hit is reported by a count, so none is materialised for it.
-    let (total, _) = match selected_documents(domain, request, index_name, 0, 0) {
+    let (total, _) = match selected_documents(domain, request, index_name, 0, 0, across) {
         Ok(selected) => selected,
         Err(refusal) => return *refusal,
     };
@@ -1903,8 +2047,14 @@ fn count(domain: &Domain, request: &Request<'_>, index_name: &str) -> RtResponse
     }))
 }
 
-/// The hits a `_search` answers, over the documents the selected indexes hold.
-fn search(domain: &Domain, request: &Request<'_>, index_name: &str) -> RtResponse {
+/// The hits a `_search` answers, over the documents the selected indexes hold — this
+/// domain's own, and those of a remote cluster the request named ([`CrossCluster`]).
+fn search(
+    domain: &Domain,
+    request: &Request<'_>,
+    index_name: &str,
+    across: &CrossCluster,
+) -> RtResponse {
     let body = match request.json() {
         Ok(body) => body.unwrap_or_else(|| json!({})),
         Err(refusal) => return *refusal,
@@ -1931,7 +2081,7 @@ fn search(domain: &Domain, request: &Request<'_>, index_name: &str) -> RtRespons
             ),
         );
     }
-    let (total, hits) = match selected_documents(domain, request, index_name, from, size) {
+    let (total, hits) = match selected_documents(domain, request, index_name, from, size, across) {
         Ok(selected) => selected,
         Err(refusal) => return *refusal,
     };
@@ -1984,6 +2134,7 @@ fn selected_documents(
     index_name: &str,
     from: usize,
     size: usize,
+    across: &CrossCluster,
 ) -> Result<Selected, Box<RtResponse>> {
     let body = request.json()?.unwrap_or_else(|| json!({}));
     let select = selector(body.get("query"), 0)?;
@@ -2002,7 +2153,20 @@ fn selected_documents(
     // A `BTreeSet` of names, so an index named twice is scanned once and the order is the
     // store's own: two reads of one domain report the same documents in the same order.
     let mut named = ::std::collections::BTreeSet::new();
+    // The remote patterns, de-duplicated the same way, and resolved against what the
+    // remote clusters answered rather than against this domain's own indexes.
+    let mut remote = BTreeSet::new();
     for pattern in patterns {
+        if let Some((alias, _)) = pattern.split_once(REMOTE_CLUSTER_SEPARATOR) {
+            if across.unknown.contains(alias) {
+                return Err(Box::new(no_such_remote_cluster(alias)));
+            }
+            if !across.resolved.contains_key(pattern) {
+                return Err(Box::new(index_not_found(pattern)));
+            }
+            remote.insert(pattern);
+            continue;
+        }
         if pattern == "_all" || pattern.contains('*') || pattern.contains('?') {
             named.extend(
                 domain
@@ -2024,33 +2188,44 @@ fn selected_documents(
         }
         named.insert(pattern);
     }
+    // This domain's own documents first, then every remote cluster's, each in index then
+    // id order — so one query over a local and a remote index reports a stable sequence.
+    let local = named
+        .into_iter()
+        .filter_map(|name| domain.indexes.get(name))
+        .flat_map(|index| {
+            index.documents.values().map(move |document| {
+                (
+                    index.index_name.as_str(),
+                    document.id.as_str(),
+                    &document.source,
+                )
+            })
+        });
+    let searched = remote
+        .into_iter()
+        .filter_map(|pattern| across.resolved.get(pattern))
+        .flatten()
+        .map(|(index, id, source)| (index.as_str(), id.as_str(), source));
     let mut visited = 0_usize;
     let mut total = 0_usize;
     let mut page = Vec::new();
-    for index in named.into_iter().filter_map(|name| domain.indexes.get(name)) {
-        for document in index.documents.values() {
-            visited = visited.saturating_add(1);
-            if visited > MAX_DOCUMENTS_VISITED {
-                return Err(Box::new(error(
-                    400,
-                    ingest::ILLEGAL_ARGUMENT_EXCEPTION,
-                    &format!(
-                        "a request may visit at most {MAX_DOCUMENTS_VISITED} documents"
-                    ),
-                )));
-            }
-            if !select.matches(&document.id, &document.source) {
-                continue;
-            }
-            if total >= from && page.len() < size {
-                page.push((
-                    index.index_name.clone(),
-                    document.id.clone(),
-                    document.source.clone(),
-                ));
-            }
-            total = total.saturating_add(1);
+    for (index_name, id, source) in local.chain(searched) {
+        visited = visited.saturating_add(1);
+        if visited > MAX_DOCUMENTS_VISITED {
+            return Err(Box::new(error(
+                400,
+                ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+                &format!("a request may visit at most {MAX_DOCUMENTS_VISITED} documents"),
+            )));
         }
+        if !select.matches(id, source) {
+            continue;
+        }
+        if total >= from && page.len() < size {
+            page.push((index_name.to_string(), id.to_string(), source.clone()));
+        }
+        total = total.saturating_add(1);
     }
     Ok((total, page))
 }
@@ -2588,6 +2763,23 @@ fn index_not_found(index_name: &str) -> RtResponse {
         index_name,
     )
 }
+
+/// The refusal for a cluster alias the request named that this domain cannot search
+/// through: the engine's own answer for a remote cluster it has no connection to.
+///
+/// 400 rather than 404: the request named a cluster the local cluster does not know, which
+/// the engine reports as an argument it cannot act on rather than as a missing resource.
+fn no_such_remote_cluster(alias: &str) -> RtResponse {
+    error(
+        400,
+        NO_SUCH_REMOTE_CLUSTER_EXCEPTION,
+        &format!("no such remote cluster: [{alias}]"),
+    )
+}
+
+/// The engine's error type for a cross-cluster request naming a cluster it has no
+/// connection to.
+const NO_SUCH_REMOTE_CLUSTER_EXCEPTION: &str = "no_such_remote_cluster_exception";
 
 /// An error naming the index it is about, which is what the engine's index errors carry
 /// beside the type and the reason.

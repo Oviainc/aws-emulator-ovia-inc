@@ -25,6 +25,8 @@ mod application_updates;
 mod applications;
 #[path = "all/change_progress.rs"]
 mod change_progress;
+#[path = "all/clock_owed_readiness.rs"]
+mod clock_owed_readiness;
 #[path = "all/cluster_apis.rs"]
 mod cluster_apis;
 #[path = "all/cluster_config_round_trip.rs"]
@@ -45,6 +47,8 @@ mod connection_records_at_rest;
 mod constraint_refusal_messages;
 #[path = "all/cross_cluster_connections.rs"]
 mod cross_cluster_connections;
+#[path = "all/cross_cluster_search.rs"]
+mod cross_cluster_search;
 #[path = "all/data_source_attachment_authorization.rs"]
 mod data_source_attachment_authorization;
 #[path = "all/data_source_attachments.rs"]
