@@ -25,6 +25,8 @@ mod not_found_message;
 mod resource_tags;
 #[path = "all/setup_enabled_listing.rs"]
 mod setup_enabled_listing;
+#[path = "all/signup_admission_order.rs"]
+mod signup_admission_order;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_message_rendering.rs"]
