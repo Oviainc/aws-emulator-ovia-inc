@@ -8020,16 +8020,16 @@ const UNMASKED_DESTINATION_SUFFIX: usize = 4;
 ///
 /// Amazon Cognito reports the address it sent the code to MASKED, so the reply
 /// tells the caller which of the user's addresses was used without disclosing
-/// an address the caller does not already hold. An email address keeps the
-/// first character of its local part, the first of its domain and the domain's
-/// last label; anything else keeps a leading `+` and its last
-/// [`UNMASKED_DESTINATION_SUFFIX`] characters.
+/// an address the caller does not already hold. An email address keeps only the
+/// FIRST character of its local part and the first character of its domain,
+/// each followed by a fixed `***` run — nothing of the domain past that first
+/// character is disclosed, not even its last label; anything else keeps a
+/// leading `+` and its last [`UNMASKED_DESTINATION_SUFFIX`] characters.
 pub fn masked_destination(destination: &str) -> String {
     if let Some((local, domain)) = destination.split_once('@') {
         let local_initial = local.chars().next().unwrap_or('*');
         let domain_initial = domain.chars().next().unwrap_or('*');
-        let last_label = domain.rfind('.').map_or("", |dot| &domain[dot..]);
-        return format!("{local_initial}***@{domain_initial}***{last_label}");
+        return format!("{local_initial}***@{domain_initial}***");
     }
     let characters: Vec<char> = destination.chars().collect();
     let readable_from = characters

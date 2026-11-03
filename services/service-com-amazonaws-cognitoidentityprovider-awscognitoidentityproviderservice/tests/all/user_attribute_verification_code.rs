@@ -278,7 +278,7 @@ async fn a_verification_code_is_sent_to_the_stored_value_of_the_attribute_it_nam
             "email",
             200,
             "EMAIL",
-            Some("b***@e***.com"),
+            Some("b***@e***"),
         ),
         (
             "phone_number, which the same user also stores",
@@ -294,7 +294,7 @@ async fn a_verification_code_is_sent_to_the_stored_value_of_the_attribute_it_nam
             "email",
             200,
             "EMAIL",
-            Some("m***@e***.net"),
+            Some("m***@e***"),
         ),
         (
             "phone_number of a user that stores only that",
@@ -414,7 +414,7 @@ async fn a_verification_code_is_sent_to_the_stored_value_of_the_attribute_it_nam
     .await;
     assert_eq!(
         again.1["CodeDeliveryDetails"]["Destination"],
-        json!("b***@e***.com"),
+        json!("b***@e***"),
         "a repeated request reports the same stored destination, got {}",
         again.1
     );

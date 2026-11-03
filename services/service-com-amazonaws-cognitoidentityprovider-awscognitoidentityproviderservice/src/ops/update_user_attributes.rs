@@ -287,10 +287,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .pool_mut(&plan.user_pool_id)
             .and_then(|pool| pool.apply_attribute_update(&plan, now))
             .ok_or_else(internal_error)?;
-        // The member is PRESENT and empty when nothing was sent, which is what
-        // a client reading the list sees.
+        // Delivery details report the messages this update actually sent, so
+        // when it sent none there is nothing to report and the member is
+        // OMITTED rather than serialised as an empty list — the same answer
+        // every code-delivery reply gives when no message went out.
         Ok(UpdateUserAttributesOutput {
-            code_delivery_details_list: Some(deliveries),
+            code_delivery_details_list: Some(deliveries).filter(|sent| !sent.is_empty()),
         })
     }
 }

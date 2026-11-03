@@ -57,6 +57,8 @@ mod change_password;
 mod client_secret_not_found_message;
 #[path = "all/clock_dependent_state.rs"]
 mod clock_dependent_state;
+#[path = "all/code_delivery_destination_masking.rs"]
+mod code_delivery_destination_masking;
 #[path = "all/constraint_refusal_values.rs"]
 mod constraint_refusal_values;
 #[path = "all/delete_group.rs"]

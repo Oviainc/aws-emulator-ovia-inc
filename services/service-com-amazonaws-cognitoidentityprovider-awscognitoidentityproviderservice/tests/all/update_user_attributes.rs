@@ -356,10 +356,21 @@ async fn stored_attributes(
 
 /// The `CodeDeliveryDetailsList` of one reply as
 /// `(AttributeName, DeliveryMedium, Destination)` triples.
+///
+/// A reply that sent no message carries no list at all, so an absent member
+/// reads as no deliveries rather than as a malformed reply.
 fn deliveries_of(payload: &Value, case: &str) -> Vec<(String, String, String)> {
-    payload["CodeDeliveryDetailsList"]
-        .as_array()
-        .unwrap_or_else(|| panic!("case {case:?}: the reply must carry CodeDeliveryDetailsList, got {payload}"))
+    let entries = match payload["CodeDeliveryDetailsList"].as_array() {
+        Some(entries) => entries.clone(),
+        None => {
+            assert!(
+                payload["CodeDeliveryDetailsList"].is_null(),
+                "case {case:?}: CodeDeliveryDetailsList must be a list or absent, got {payload}"
+            );
+            Vec::new()
+        }
+    };
+    entries
         .iter()
         .map(|details| {
             (
@@ -544,7 +555,7 @@ const UPDATE_CASES: &[UpdateCase] = &[
             ("email", Some("ada@new.example")),
             ("email_verified", Some("false")),
         ],
-        deliveries: &[("email", "EMAIL", "a***@n***.example")],
+        deliveries: &[("email", "EMAIL", "a***@n***")],
     },
     UpdateCase {
         case: "a new phone number in a pool that verifies it applies at once, unverified, with a texted code",
@@ -581,7 +592,7 @@ const UPDATE_CASES: &[UpdateCase] = &[
             ("email", Some("ada@old.example")),
             ("email_verified", Some("true")),
         ],
-        deliveries: &[("email", "EMAIL", "a***@n***.example")],
+        deliveries: &[("email", "EMAIL", "a***@n***")],
     },
     UpdateCase {
         case: "a pool that neither verifies nor defers stores the new email and sends nothing",
@@ -649,7 +660,7 @@ const UPDATE_CASES: &[UpdateCase] = &[
             ("email", Some("ada@new.example")),
             ("email_verified", Some("true")),
         ],
-        deliveries: &[("email", "EMAIL", "a***@n***.example")],
+        deliveries: &[("email", "EMAIL", "a***@n***")],
     },
     UpdateCase {
         case: "an email and a phone number in one call each report their own delivery",
@@ -672,7 +683,7 @@ const UPDATE_CASES: &[UpdateCase] = &[
             ("phone_number_verified", Some("false")),
         ],
         deliveries: &[
-            ("email", "EMAIL", "g***@h***.example"),
+            ("email", "EMAIL", "g***@h***"),
             ("phone_number", "SMS", "+****0123"),
         ],
     },
@@ -704,6 +715,14 @@ async fn an_update_stores_the_submitted_values_on_the_signed_in_user() {
         assert_eq!(
             status, 200,
             "case {case:?}: UpdateUserAttributes must succeed, got {status} with {payload}"
+        );
+        // Nothing delivered means no delivery member at all: the reply is the
+        // empty object, not an empty list.
+        assert_eq!(
+            payload.get("CodeDeliveryDetailsList").is_some(),
+            !deliveries.is_empty(),
+            "case {case:?}: CodeDeliveryDetailsList is reported only when a message was sent, \
+             got {payload}"
         );
         let answered = deliveries_of(&payload, case);
         let wanted: Vec<(String, String, String)> = deliveries

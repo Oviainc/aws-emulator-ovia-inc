@@ -82,17 +82,17 @@ const SIMULATED_DESTINATION: &str = "a***@b***";
 /// (`smithy_query(query="doc",shape="CodeDeliveryDetailsType",member="Destination")`:
 /// "The email address or phone number destination where Amazon Cognito sent the code").
 /// Amazon Cognito reports it MASKED, as the Developer Guide's account-recovery and
-/// sign-up messages show — the first character of the local part, the first character of
-/// the domain and the domain's last label stay readable, so a caller learns which address
-/// was used without being told an address it does not hold. The entries differ along the
+/// sign-up messages show — only the first character of the local part and the first
+/// character of the domain stay readable, so a caller learns which address was used
+/// without being told an address it does not hold. The entries differ along the
 /// local part's length, the domain's label count and its last label, so what a served row
 /// asserts is the masking RULE rather than one rendering of it. Each row takes the entry
 /// its index names and appends that index to the local part, which leaves the first
 /// character — and so the reported destination — as written here.
 const ADDRESSES: [(&str, &str, &str); 3] = [
-    ("caller", "example.net", "c***@e***.net"),
-    ("a.very.long.local.part", "mail.example.co.uk", "a***@m***.uk"),
-    ("x", "q.io", "x***@q***.io"),
+    ("caller", "example.net", "c***@e***"),
+    ("a.very.long.local.part", "mail.example.co.uk", "a***@m***"),
+    ("x", "q.io", "x***@q***"),
 ];
 
 /// Whether a request carries a SigV4 credential scope.

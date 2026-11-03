@@ -341,7 +341,7 @@ async fn a_resend_addresses_the_pools_auto_verified_attribute_and_supersedes_the
             "the one attribute the pool auto-verifies, held by the user",
             vec!["email"],
             vec![("email", "ada@example.com")],
-            Some(("email", "EMAIL", "a***@e***.com")),
+            Some(("email", "EMAIL", "a***@e***")),
         ),
         (
             "a pool that auto-verifies the phone number texts the stored number",
@@ -695,7 +695,7 @@ async fn a_resend_is_refused_for_a_request_it_cannot_serve() {
             // The one served row: the code goes to the stored address, masked.
             assert_eq!(
                 payload["CodeDeliveryDetails"]["Destination"],
-                json!("s***@e***.com"),
+                json!("s***@e***"),
                 "case {case:?}: expected the stored address reported masked, got {payload}"
             );
             assert!(
