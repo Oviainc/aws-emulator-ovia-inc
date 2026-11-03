@@ -17,11 +17,13 @@
 //!
 //! The first is Amazon Web Services: the public extensions it publishes are in every
 //! account's registry without anybody registering them, which [`aws_published`] is — the
-//! resource types this emulator provisions, reported as the public extensions they are, and
-//! the extensions it has PUBLISHED to the registry ([`PUBLIC_EXTENSION_CATALOG`]), which are
-//! Hooks rather than resource types and which belong to the publisher that published them.
-//! So the public half of this registry is no more one KIND of extension than the private
-//! half is.
+//! resource types this emulator provisions, reported as the public extensions they are, the
+//! public resource types no resource provider stands behind
+//! ([`aws_published_resource_types`], which the registry reports in the provisioning class
+//! that says so), and the extensions it has PUBLISHED to the registry
+//! ([`PUBLIC_EXTENSION_CATALOG`]), which are Hooks rather than resource types and which
+//! belong to the publisher that published them. So the public half of this registry is no
+//! more one KIND of extension, or one provisioning class, than the private half is.
 //!
 //! The second is this account's own registry WRITERS — `RegisterType` and `ActivateType`
 //! (which add an extension version), `SetTypeConfiguration` (`ConfigurationSchema`),
@@ -1085,18 +1087,17 @@ pub const AWS_PUBLISHED_VERSION_ID: &str = "00000001";
 /// without anybody registering them — `DescribeType` reads "an extension from the
 /// CloudFormation registry in your current account and Region", and `RegisterType` reserves
 /// the `AWS` namespace, so no account's own registration can own one of these names. The
-/// set the emulator holds is the set of resource types it actually provisions
-/// ([`crate::state::template::IMPLEMENTED_RESOURCE_TYPES`]); a name outside that set is not
-/// in this registry, which is what makes the answer for it a `TypeNotFoundException`
-/// instead of a record nothing stands behind.
+/// set the emulator holds is [`aws_published_resource_types`]: the resource types it
+/// actually provisions, and the ones no resource provider stands behind; a name outside
+/// that set is not in this registry, which is what makes the answer for it a
+/// `TypeNotFoundException` instead of a record nothing stands behind.
 ///
 /// The record carries only what is known about such an extension: it is `PUBLIC`, it is
-/// `LIVE`, it is `FULLY_MUTABLE` (the emulator's own stack operations create, update and
-/// delete these resource types, which is what that value states: "the resource type
-/// includes an update handler to process updates to the type during stack update
-/// operations"), it has no publisher id — "extensions provided by Amazon Web Services are
-/// not assigned a publisher ID" — its `SourceUrl` is the open-source repository AWS
-/// publishes that type's resource provider in ([`aws_published_source_url`]), and its
+/// `LIVE`, it carries the provisioning behaviour its resource provider's handlers give it
+/// ([`published_provisioning_type`]), it has no publisher id — "extensions provided by
+/// Amazon Web Services are not assigned a publisher ID" — its `SourceUrl` is the
+/// open-source repository AWS publishes that type's resource provider in
+/// ([`aws_published_source_url`]), and its
 /// registration instants are the instant this registry came into being
 /// ([`REGISTRY_GENESIS`]), which is how long it has held them. Its `Schema` is "the schema
 /// that defines the extension": the resource schema this registry holds for the type
@@ -1112,11 +1113,53 @@ pub fn aws_published(region: &str, type_kind: &str, type_name: &str) -> Option<S
         return Some(published_catalog_record(region, published));
     }
     if type_kind != registry_type::RESOURCE
-        || !crate::state::template::IMPLEMENTED_RESOURCE_TYPES.contains(&type_name)
+        || !aws_published_resource_types().any(|published| published == type_name)
     {
         return None;
     }
     Some(aws_published_record(region, type_name))
+}
+
+/// Every RESOURCE type the registry of an account and Region holds an
+/// Amazon-Web-Services-published record for.
+///
+/// Two catalogues, because a public resource type is in this registry whether or not
+/// anything provisions one: the types this emulator provisions
+/// ([`crate::state::template::IMPLEMENTED_RESOURCE_TYPES`]), and the types no resource
+/// provider stands behind at all
+/// ([`::service_common::cfn_provisioning::NON_PROVISIONABLE_RESOURCE_TYPES`]) — which
+/// CloudFormation serves itself inside a stack and which the registry therefore reports in
+/// the provisioning class that says so ([`published_provisioning_type`]). A read of ONE
+/// type and a listing of all of them both resolve the set here, so they cannot disagree
+/// about which types this registry holds.
+pub fn aws_published_resource_types() -> impl Iterator<Item = &'static str> {
+    crate::state::template::IMPLEMENTED_RESOURCE_TYPES
+        .iter()
+        .copied()
+        .chain(
+            ::service_common::cfn_provisioning::NON_PROVISIONABLE_RESOURCE_TYPES
+                .iter()
+                .copied(),
+        )
+}
+
+/// The provisioning behaviour the registry reports for the Amazon-Web-Services-published
+/// resource type `type_name`: "for resource types, the provisioning behavior of the
+/// resource type", which the handlers that type's resource provider publishes decide.
+///
+/// A type CloudFormation serves ITSELF inside a stack publishes no handler package at all,
+/// so it has no create, read or delete handler and is `NON_PROVISIONABLE`: "the resource
+/// type doesn't include create, read, and delete handlers, and therefore can't actually be
+/// provisioned". Every other published type here is provisioned by a provider that creates,
+/// reads, updates and deletes it — the emulator's own stack operations do all four — which
+/// is `FULLY_MUTABLE`: "the resource type includes an update handler to process updates to
+/// the type during stack update operations".
+pub fn published_provisioning_type(type_name: &str) -> &'static str {
+    if ::service_common::cfn_provisioning::is_non_provisionable(type_name) {
+        provisioning_type::NON_PROVISIONABLE
+    } else {
+        provisioning_type::FULLY_MUTABLE
+    }
 }
 
 /// Every Amazon-Web-Services-published public extension the registry of this Region holds,
@@ -1131,8 +1174,7 @@ pub fn aws_published(region: &str, type_kind: &str, type_name: &str) -> Option<S
 /// Web Services provides, and the extensions it PUBLISHES
 /// ([`PUBLIC_EXTENSION_CATALOG`]), are both in it.
 pub fn aws_published_all(region: &str) -> Vec<StoredExtension> {
-    crate::state::template::IMPLEMENTED_RESOURCE_TYPES
-        .iter()
+    aws_published_resource_types()
         .map(|type_name| aws_published_record(region, type_name))
         .chain(
             PUBLIC_EXTENSION_CATALOG
@@ -1333,8 +1375,7 @@ pub fn aws_published_by_arn(region: &str, arn: &str) -> Option<StoredExtension> 
     }) {
         return Some(published_catalog_record(region, published));
     }
-    let type_name = crate::state::template::IMPLEMENTED_RESOURCE_TYPES
-        .iter()
+    let type_name = aws_published_resource_types()
         .find(|type_name| public_type_arn(region, registry_type::RESOURCE, type_name) == arn)?;
     Some(aws_published_record(region, type_name))
 }
@@ -1522,6 +1563,8 @@ impl Publication<'_> {
 /// The record [`aws_published`] and [`aws_published_by_arn`] both answer with.
 fn aws_published_record(region: &str, type_name: &str) -> StoredExtension {
     let arn = public_type_arn(region, registry_type::RESOURCE, type_name);
+    let provisionable =
+        published_provisioning_type(type_name) != provisioning_type::NON_PROVISIONABLE;
     let version = StoredTypeVersion {
         version_id: AWS_PUBLISHED_VERSION_ID.to_string(),
         // A public extension is addressed by the extension's own ARN — that is the ARN
@@ -1532,13 +1575,20 @@ fn aws_published_record(region: &str, type_name: &str) -> StoredExtension {
         // for the type, derived from the properties the type publishes rather than read
         // out of a handler package — nobody registered this extension, so there is none.
         schema: crate::state::resource_schema::resource_type_schema(type_name),
-        provisioning_type: Some(provisioning_type::FULLY_MUTABLE.to_string()),
+        // The provisioning behaviour this type's own resource provider gives it, which for
+        // a type no provider stands behind is the class that states exactly that.
+        provisioning_type: Some(published_provisioning_type(type_name).to_string()),
         deprecated_status: deprecated_status::LIVE.to_string(),
         // "CloudFormation doesn't return this information for public extensions": the
         // contract-test status belongs to registered private extension versions.
         type_tests_status: None,
         type_tests_status_description: None,
-        source_url: aws_published_source_url(type_name),
+        // "The URL of the source code for the extension": the repository the type's
+        // resource provider is published in — which a type no resource provider stands
+        // behind has none of, so it names none rather than a repository holding nothing.
+        source_url: provisionable
+            .then(|| aws_published_source_url(type_name))
+            .flatten(),
         documentation_url: None,
         public_version_number: None,
         execution_role_arn: None,

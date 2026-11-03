@@ -30,10 +30,9 @@ use service_com_amazonaws_cloudformation_cloudformation::state::publisher::{
     identity_provider, StoredPublisher,
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::registry::{
-    deprecated_status, provisioning_type, public_type_arn, registry_type, type_arn, visibility,
-    PUBLIC_EXTENSION_CATALOG,
+    aws_published_resource_types, deprecated_status, provisioning_type, public_type_arn,
+    published_provisioning_type, registry_type, type_arn, visibility, PUBLIC_EXTENSION_CATALOG,
 };
-use service_com_amazonaws_cloudformation_cloudformation::state::template::IMPLEMENTED_RESOURCE_TYPES;
 use service_com_amazonaws_cloudformation_cloudformation::state::{encode_next_token, PageOf};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -133,15 +132,15 @@ async fn walk_names(
 /// The Amazon-Web-Services-published extensions of the registry, in the order the listing
 /// must report them (by type name).
 ///
-/// Source: `crate::state::template::IMPLEMENTED_RESOURCE_TYPES` (the resource types Amazon
-/// Web Services provides a record for here) and
+/// Source: `crate::state::registry::aws_published_resource_types` (every resource type
+/// Amazon Web Services provides a record for here — the ones this emulator provisions and
+/// the ones no resource provider stands behind) and
 /// `crate::state::registry::PUBLIC_EXTENSION_CATALOG` (the extensions it has PUBLISHED,
 /// which are of another kind) — the two catalogues
 /// `crate::state::registry::aws_published` answers single reads from, so this suite and
 /// `extension_registry.rs` cannot disagree about which published extensions exist.
 fn published_catalog() -> Vec<String> {
-    let mut names: Vec<String> = IMPLEMENTED_RESOURCE_TYPES
-        .iter()
+    let mut names: Vec<String> = aws_published_resource_types()
         .map(|name| name.to_string())
         .chain(
             PUBLIC_EXTENSION_CATALOG
@@ -156,8 +155,7 @@ fn published_catalog() -> Vec<String> {
 /// The published catalogue, narrowed to the extensions of ONE kind: what a listing filtered
 /// by that `Type` must report of it.
 fn published_catalog_of_kind(type_kind: &str) -> Vec<String> {
-    let mut names: Vec<String> = IMPLEMENTED_RESOURCE_TYPES
-        .iter()
+    let mut names: Vec<String> = aws_published_resource_types()
         .filter(|_| type_kind == registry_type::RESOURCE)
         .map(|name| name.to_string())
         .chain(
@@ -166,6 +164,21 @@ fn published_catalog_of_kind(type_kind: &str) -> Vec<String> {
                 .filter(|published| published.type_kind == type_kind)
                 .map(|published| published.type_name.to_string()),
         )
+        .collect();
+    names.sort();
+    names
+}
+
+/// The published catalogue of RESOURCE types, narrowed to ONE provisioning behaviour: what
+/// a listing filtered by that `ProvisioningType` must report of it.
+///
+/// Source: `crate::state::registry::published_provisioning_type`, the one place the class a
+/// published resource type is reported in is decided, so this suite and the records the
+/// registry builds cannot disagree about which class a type is in.
+fn published_catalog_provisioned(provisioning: &str) -> Vec<String> {
+    let mut names: Vec<String> = aws_published_resource_types()
+        .filter(|type_name| published_provisioning_type(type_name) == provisioning)
+        .map(|name| name.to_string())
         .collect();
     names.sort();
     names
@@ -307,6 +320,38 @@ fn list_cases() -> Vec<ListCase> {
                 ("Type", registry_type::MODULE),
             ],
             listed: published_catalog_of_kind(registry_type::MODULE),
+        },
+        ListCase {
+            // The provisioning behaviour narrows the PUBLIC resource types the same way:
+            // a public resource type no resource provider stands behind is in the registry
+            // as a `NON_PROVISIONABLE` record, which is how a client enumerating the
+            // registry discovers one.
+            case: "Visibility=PUBLIC, Type=RESOURCE, ProvisioningType=NON_PROVISIONABLE",
+            members: vec![
+                ("Visibility", visibility::PUBLIC),
+                ("Type", registry_type::RESOURCE),
+                ("ProvisioningType", provisioning_type::NON_PROVISIONABLE),
+                ("DeprecatedStatus", deprecated_status::LIVE),
+            ],
+            listed: published_catalog_provisioned(provisioning_type::NON_PROVISIONABLE),
+        },
+        ListCase {
+            // The other side of that narrowing: the published types a provider does
+            // provision, plus the two seeded public resource records, whose own versions
+            // carry that behaviour.
+            case: "Visibility=PUBLIC, Type=RESOURCE, ProvisioningType=FULLY_MUTABLE",
+            members: vec![
+                ("Visibility", visibility::PUBLIC),
+                ("Type", registry_type::RESOURCE),
+                ("ProvisioningType", provisioning_type::FULLY_MUTABLE),
+            ],
+            listed: {
+                let mut listed = published_catalog_provisioned(provisioning_type::FULLY_MUTABLE);
+                listed.push(ACTIVATED_PUBLIC.to_string());
+                listed.push(PUBLIC_NO_PUBLISHER.to_string());
+                listed.sort();
+                listed
+            },
         },
         ListCase {
             // "AWS_TYPES: extensions available for use from Amazon" — the public records

@@ -260,6 +260,11 @@ pub mod chime_identity_names;
 /// keyed by its ARN, so whichever member serves one of the generic tagging routes reads
 /// and writes the same tags.
 pub mod chime_tags;
+/// The ONE answer to which Amazon-Web-Services-published CloudFormation resource types no
+/// resource provider stands behind: the class CloudFormation reports on a registry read of
+/// such a type, and the one an API that acts through a provider's handlers has nothing to
+/// call for — so the registry and that API cannot disagree about one type.
+pub mod cfn_provisioning;
 /// The ONE rule for what a caller-supplied CloudWatch Logs log group NAME may be, for
 /// every service whose API takes one and then writes into the group it names — so two
 /// services asked whether CloudWatch Logs could hold a name cannot answer differently.

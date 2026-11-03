@@ -25,3 +25,5 @@ mod resource_lifecycle;
 mod resource_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/unsupported_actions.rs"]
+mod unsupported_actions;

@@ -361,6 +361,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The registry's record also says whether the type has a provider to run at all:
+        // a type whose provider publishes no create, read or delete handler has nothing
+        // this update could call, so the action is refused as one the type does not
+        // support rather than accepted and then failed by a handler that does not exist.
+        if !crate::state::type_supports_actions(&input.type_name) {
+            return Err(UpdateResourceErrorModeled::UnsupportedActionException(
+                UnsupportedActionException {
+                    message: Some(crate::state::unsupported_action_message(
+                        &input.type_name,
+                        crate::state::OPERATION_UPDATE,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // What the REQUEST ITSELF carries is judged before anything it names is
         // resolved: `PatchDocument` is "a JavaScript Object Notation (JSON) document
         // that describes a list of patch operations", so it is read by the RFC 6902

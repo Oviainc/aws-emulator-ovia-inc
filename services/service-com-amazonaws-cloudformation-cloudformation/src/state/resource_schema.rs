@@ -46,10 +46,9 @@
 //!   the same reason the record's own `Description` member stays absent.
 //!
 //! A type the catalogue carries nothing for gets NO schema rather than an empty document:
-//! the registry holds no record for such a type at all ([`super::registry::aws_published`]
-//! answers `None` outside [`super::template::IMPLEMENTED_RESOURCE_TYPES`]), and a record
-//! without a schema is what an extension whose schema this emulator does not hold — a
-//! private extension registered from a handler package, say — reports.
+//! a record without a schema is what an extension whose schema this emulator does not hold
+//! — a private extension registered from a handler package, or a public resource type no
+//! resource provider stands behind, whose defining document is nowhere here — reports.
 
 use ::serde_json::{json, Map, Value};
 

@@ -656,6 +656,61 @@ async fn every_implemented_resource_type_is_an_aws_published_public_extension() 
     }
 }
 
+/// A public resource type no resource provider stands behind is in the registry too, as the
+/// `NON_PROVISIONABLE` record it is: "the resource type doesn't include create, read, and
+/// delete handlers, and therefore can't actually be provisioned". It carries no schema and
+/// no source URL either — a type with no handler package has no document defining it and no
+/// provider repository to name — which is what tells it apart from a provisioned one.
+#[tokio::test]
+async fn a_published_resource_type_with_no_provider_is_non_provisionable() {
+    let (router, _engine) = router_with_registry();
+
+    for type_name in ::service_common::cfn_provisioning::NON_PROVISIONABLE_RESOURCE_TYPES {
+        let (status, body) = describe_type(
+            &router,
+            &[("Type", registry_type::RESOURCE), ("TypeName", type_name)],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {type_name:?}: expected HTTP 200, got {status} with {body:?}"
+        );
+        for (tag, expected) in [
+            ("TypeName", present(type_name)),
+            ("Type", present(registry_type::RESOURCE)),
+            (
+                "Arn",
+                present(&public_type_arn(REGION, registry_type::RESOURCE, type_name)),
+            ),
+            ("Visibility", present(visibility::PUBLIC)),
+            ("DeprecatedStatus", present(deprecated_status::LIVE)),
+            (
+                "ProvisioningType",
+                present(provisioning_type::NON_PROVISIONABLE),
+            ),
+            ("IsDefaultVersion", present("true")),
+            // No handler package stands behind it, so neither the document that would
+            // define it nor the repository that would publish it exists here.
+            ("Schema", None),
+            ("SourceUrl", None),
+            // Not known for a published extension, as for every other one of them.
+            ("DefaultVersionId", None),
+            ("PublisherId", None),
+            ("IsActivated", None),
+            ("ExecutionRoleArn", None),
+            ("TypeTestsStatus", None),
+        ] {
+            let actual = xml_text(&body, tag);
+            assert_eq!(
+                actual.as_deref(),
+                expected.as_deref(),
+                "case {type_name:?}: expected <{tag}> to be {expected:?}, got {actual:?} \
+                 from {body:?}"
+            );
+        }
+    }
+}
+
 /// A published extension is addressable by its ARN too — the account-less form a public
 /// extension carries — and only in the Region the request names.
 #[tokio::test]

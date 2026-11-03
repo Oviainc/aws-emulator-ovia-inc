@@ -1334,6 +1334,30 @@ pub fn type_is_registered(type_name: &str) -> bool {
         .is_some_and(|namespace| REGISTERED_NAMESPACES.contains(&namespace.as_str()))
 }
 
+/// Whether a resource type's provider publishes handlers for this service to call at all.
+///
+/// Cloud Control API acts on a resource ONLY through the handlers the resource type's
+/// provider publishes — "the necessary permissions for each event handler are defined in
+/// the handlers section of the resource type definition schema"
+/// (`CreateResource$RoleArn`) — so a type whose provider publishes none of them, the
+/// provisioning class the CloudFormation registry reports as `NON_PROVISIONABLE`, has
+/// nothing for any action of this service to run. Which types those are is
+/// [`::service_common::cfn_provisioning`]'s to answer, so the registry that REPORTS the
+/// class and this service, which REFUSES the action, cannot disagree about one type.
+pub fn type_supports_actions(type_name: &str) -> bool {
+    !::service_common::cfn_provisioning::is_non_provisionable(type_name)
+}
+
+/// The `READ` action, which `GetResource` performs: the action names this service refuses
+/// by are its resource actions, which the three a `ProgressEvent` reports as its
+/// `Operation` ([`OPERATION_CREATE`], [`OPERATION_UPDATE`], [`OPERATION_DELETE`]) are the
+/// mutating half of — a read and a listing start no resource operation request, so neither
+/// is an `Operation` the model carries.
+pub const ACTION_READ: &str = "READ";
+
+/// The `LIST` action, which `ListResources` performs; see [`ACTION_READ`].
+pub const ACTION_LIST: &str = "LIST";
+
 // ---------------------------------------------------------------------------
 // Refusal wording
 // ---------------------------------------------------------------------------
@@ -1617,6 +1641,12 @@ pub fn request_token_not_found_message(request_token: &str) -> String {
 /// How an operation that names a `TypeName` words one the registry does not hold.
 pub fn type_not_found_message(type_name: &str) -> String {
     format!("The type '{type_name}' cannot be found.")
+}
+
+/// How an operation words an action the resource type it names does not support: the type
+/// from the request, and the resource action this operation performs.
+pub fn unsupported_action_message(type_name: &str, action: &str) -> String {
+    format!("Resource type {type_name} does not support {action} action")
 }
 
 /// How a mutating operation words a request it has no room to accept.

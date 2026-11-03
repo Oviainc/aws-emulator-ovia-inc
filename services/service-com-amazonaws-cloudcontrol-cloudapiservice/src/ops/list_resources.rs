@@ -227,6 +227,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The registry's record also says whether the type has a provider to run at all:
+        // a type whose provider publishes no create, read or delete handler has no list
+        // handler for this operation to call, so the action is refused as one the type
+        // does not support rather than answered with an empty inventory.
+        if !crate::state::type_supports_actions(&input.type_name) {
+            return Err(ListResourcesErrorModeled::UnsupportedActionException(
+                UnsupportedActionException {
+                    message: Some(crate::state::unsupported_action_message(
+                        &input.type_name,
+                        crate::state::ACTION_LIST,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // "The resource model to use to select the resources to return": a partial
         // model, so the listing reports the resources whose own model carries every
         // property it names with the same value. Judged on the REQUEST alone, before

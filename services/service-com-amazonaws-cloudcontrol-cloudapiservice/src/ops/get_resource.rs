@@ -224,6 +224,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The registry's record also says whether the type has a provider to run at all:
+        // a type whose provider publishes no create, read or delete handler has no read
+        // handler for this operation to call, so the action is refused as one the type
+        // does not support rather than reported as a resource that cannot be found.
+        if !crate::state::type_supports_actions(&input.type_name) {
+            return Err(GetResourceErrorModeled::UnsupportedActionException(
+                UnsupportedActionException {
+                    message: Some(crate::state::unsupported_action_message(
+                        &input.type_name,
+                        crate::state::ACTION_READ,
+                    )),
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
         // What the clock already owes the store: a create whose work has fallen due has
         // provisioned its resource and a delete whose work has fallen due has removed
