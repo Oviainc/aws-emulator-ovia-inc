@@ -166,6 +166,14 @@ pub const MAX_HISTORY_EVENTS_PER_EXECUTION: usize = 25_000;
 /// limitation has been reached").
 pub const MAX_POLLERS_PER_TASK_LIST: usize = 1_000;
 
+/// The `LimitExceededFault` message a poll offered past [`MAX_POLLERS_PER_TASK_LIST`]
+/// carries, whichever kind of task is polled for. SWF reports this condition with one
+/// fixed sentence: nothing of the request or of the store is interpolated into it — not
+/// the task list, not the domain, not the number of pollers the list admits — so every
+/// such refusal carries this text byte for byte.
+pub const POLLER_LIMIT_EXCEEDED_MESSAGE: &str =
+    "Limit on maximum concurrent poll requests per task list reached";
+
 /// How long a long poll holds its answer open while its task list is empty. Both polling
 /// operations document the same hold: `PollForDecisionTask`'s "If no decision task is
 /// available in the specified task list before the timeout of 60 seconds expires, an

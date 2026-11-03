@@ -10,7 +10,9 @@
 //! open poll is counted against the task list it is waiting on, so a task list admits at
 //! most `MAX_POLLERS_PER_TASK_LIST` simultaneous pollers (the Amazon SWF Developer
 //! Guide's quota of 1,000 pollers per task list) and a poll offered past that is refused
-//! promptly with 400 `LimitExceededFault` — never `OperationNotPermittedFault`. The cap is
+//! promptly with 400 `LimitExceededFault` — never `OperationNotPermittedFault` — carrying
+//! this condition's own fixed message ([`POLLER_LIMIT_EXCEEDED_MESSAGE`], whose wording
+//! `poller_cap_limit_message` asserts over the whole class). The cap is
 //! counted per task list, and the slot is given back the moment the poll holding it ends,
 //! however it ends.
 //!
@@ -30,6 +32,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_swf_simpleworkflowservice::state::{
     service_state, ComAmazonawsSwfSimpleworkflowserviceState, MAX_POLLERS_PER_TASK_LIST,
+    POLLER_LIMIT_EXCEEDED_MESSAGE,
 };
 use service_com_amazonaws_swf_simpleworkflowservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -60,13 +63,16 @@ const PROMPT: Duration = Duration::from_secs(5);
 
 /// One emulator, with the engine kept beside the router so the test can read this
 /// service's own poller counter.
-struct Harness {
+///
+/// `pub(crate)` so the sibling suite that asserts the over-cap refusal's wording drives
+/// the service through this same harness rather than standing up one of its own.
+pub(crate) struct Harness {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -75,7 +81,7 @@ impl Harness {
     }
 
     /// Call one operation and return `(status, body)`.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/swf/aws4_request, \
              SignedHeaders=host;x-amz-target, Signature=0123456789abcdef"
@@ -108,7 +114,7 @@ impl Harness {
     }
 
     /// Call one operation, requiring a 200, and return the body.
-    async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -119,18 +125,24 @@ impl Harness {
 
     /// How many decision-task pollers this service's state counts on `task_list`.
     fn open_pollers(&self, domain: &str, task_list: &str) -> usize {
-        let state: ::engine::ServiceState<ComAmazonawsSwfSimpleworkflowserviceState> =
-            service_state(&*self.engine).expect("the SWF state is reachable");
+        let state = self.state();
         let guard = state.lock();
         guard
             .domains
             .get(domain)
             .map_or(0, |domain| domain.open_decision_pollers(task_list))
     }
+
+    /// This service's own store, reached the way its handlers reach it.
+    pub(crate) fn state(
+        &self,
+    ) -> ::engine::ServiceState<ComAmazonawsSwfSimpleworkflowserviceState> {
+        service_state(&*self.engine).expect("the SWF state is reachable")
+    }
 }
 
 /// Register a domain and the workflow type every run here uses.
-async fn seed(harness: &Harness, case: &str, domain: &str) {
+pub(crate) async fn seed(harness: &Harness, case: &str, domain: &str) {
     harness
         .ok(case, "RegisterDomain", &register_domain_body(domain, "7"))
         .await;
@@ -264,6 +276,11 @@ async fn a_task_list_admits_at_most_the_documented_number_of_simultaneous_poller
         (400, "LimitExceededFault"),
         "a poll past the per-task-list cap is 400 LimitExceededFault (never \
          OperationNotPermittedFault), got {status} {code} with {body:?}"
+    );
+    assert_eq!(
+        body.get("message").and_then(Value::as_str),
+        Some(POLLER_LIMIT_EXCEEDED_MESSAGE),
+        "the over-cap refusal carries this condition's fixed message, got {body:?}"
     );
 
     // The cap is counted PER TASK LIST: another list of the same domain still admits a

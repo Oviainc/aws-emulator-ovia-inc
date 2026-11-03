@@ -55,6 +55,8 @@ mod pending_activity_task_count;
 mod poll_for_activity_task;
 #[path = "all/poll_for_decision_task.rs"]
 mod poll_for_decision_task;
+#[path = "all/poller_cap_limit_message.rs"]
+mod poller_cap_limit_message;
 #[path = "all/request_cancel_workflow_execution.rs"]
 mod request_cancel_workflow_execution;
 #[path = "all/respond_decision_task_completed.rs"]

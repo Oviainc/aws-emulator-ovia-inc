@@ -286,11 +286,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // simultaneous pollers of one task list; past it a poll is refused with the
             // modelled `LimitExceededFault` ("Returned by any operation if a system
             // imposed limitation has been reached"), never with the permission fault.
+            // The fault's message is this condition's own fixed sentence, with no part of
+            // the request or of the store in it.
             PollForDecisionTaskErrorModeled::LimitExceededFault(LimitExceededFault {
-                message: Some(format!(
-                    "a task list admits at most {} simultaneous pollers",
-                    crate::state::MAX_POLLERS_PER_TASK_LIST
-                )),
+                message: Some(crate::state::POLLER_LIMIT_EXCEEDED_MESSAGE.to_string()),
             })
         })?;
 
