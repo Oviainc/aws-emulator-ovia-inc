@@ -21,7 +21,7 @@
 //! * A configuration the API's own documentation rules out — `RedirectAllRequestsTo`
 //!   beside any other property, a configuration that neither redirects everything nor
 //!   names an index document, an index suffix that is empty or carries a slash, a
-//!   `Condition` or `Redirect` naming nothing, both key replacements at once, a redirect
+//!   `Condition` naming nothing, both key replacements at once, a redirect
 //!   code that is not an HTTP redirect, or more than the 50 routing rules per website
 //!   configuration AWS documents — is refused with HTTP 400 and leaves the stored
 //!   configuration untouched.
@@ -79,7 +79,10 @@ pub(crate) fn error_document(key: &str) -> String {
 }
 
 /// A `RoutingRule` carrying `condition` (omitted when empty) and `redirect`.
-fn routing_rule(condition: &str, redirect: &str) -> String {
+///
+/// `pub(crate)`, with [`routing_rules`]: the published-refusal suite beside this one builds
+/// the same documents through these helpers rather than spelling the XML a second way.
+pub(crate) fn routing_rule(condition: &str, redirect: &str) -> String {
     format!("<RoutingRule>{condition}{redirect}</RoutingRule>")
 }
 
@@ -88,7 +91,7 @@ fn routing_rule(condition: &str, redirect: &str) -> String {
 /// `RoutingRules` is a non-flattened list whose member carries `xmlName` `RoutingRule`
 /// (`smithy_query(query="shape",shape="RoutingRules")`), so each rule is a `<RoutingRule>`
 /// child of the container.
-fn routing_rules(rules: &[String]) -> String {
+pub(crate) fn routing_rules(rules: &[String]) -> String {
     format!("<RoutingRules>{}</RoutingRules>", rules.concat())
 }
 
@@ -542,12 +545,14 @@ async fn a_refused_website_configuration_changes_nothing() {
     // (case, the refused configuration, the wire error code it must answer with).
     //
     // One row per way a configuration can fall outside what the API accepts. The code is
-    // per row because two channels refuse them: a value outside a MODELLED constraint (a
-    // `Protocol` outside the enum, an `ErrorDocument$Key` shorter than its `length {min 1}`)
-    // is refused by the boundary validator before the handler runs, and everything the
-    // model cannot express is refused by the handler with the `InvalidArgument` S3
-    // publishes for a value that is not valid for the member carrying it. Either way the
-    // status is 400 and nothing is stored.
+    // per row because S3 publishes a code per class of fault — a member whose value, or
+    // whose absence, is not one it may carry is `InvalidArgument`; a configuration asking for
+    // behaviour the service cannot carry out (a redirect over a scheme it does not make, two
+    // replacements for one key, more rules than it holds) is `InvalidRequest`; and a document
+    // that does not validate against the published schema is `MalformedXML`. Each refusal's
+    // own sentence and `<ArgumentName>` pair are pinned in
+    // [`super::bucket_website_refusals`]; what this table says is that the status is 400 and
+    // nothing is stored, whichever class it is.
     let past_the_ceiling = routing_rules(
         &(0..=MAX_WEBSITE_ROUTING_RULES)
             .map(|rule| {
@@ -611,7 +616,7 @@ async fn a_refused_website_configuration_changes_nothing() {
         (
             format!("one routing rule past the documented {MAX_WEBSITE_ROUTING_RULES}"),
             format!("{}{past_the_ceiling}", index_document("index.html")),
-            "InvalidArgument",
+            "InvalidRequest",
         ),
         (
             "a Condition naming neither of its members".to_string(),
@@ -623,16 +628,7 @@ async fn a_refused_website_configuration_changes_nothing() {
                     "<Redirect><HostName>other.example.com</HostName></Redirect>",
                 )])
             ),
-            "InvalidArgument",
-        ),
-        (
-            "a Redirect naming none of its members".to_string(),
-            format!(
-                "{}{}",
-                index_document("index.html"),
-                routing_rules(&[routing_rule("", "<Redirect></Redirect>")])
-            ),
-            "InvalidArgument",
+            "InvalidRequest",
         ),
         (
             "both key replacements in one Redirect".to_string(),
@@ -645,41 +641,41 @@ async fn a_refused_website_configuration_changes_nothing() {
                      <ReplaceKeyPrefixWith>one/</ReplaceKeyPrefixWith></Redirect>",
                 )])
             ),
-            "InvalidArgument",
+            "InvalidRequest",
         ),
         (
             "a redirect code one below the published range".to_string(),
             redirect_code_configuration(&(HTTP_REDIRECT_CODES.start() - 1).to_string()),
-            "InvalidArgument",
+            "InvalidRequest",
         ),
         (
             "a redirect code one above the published range".to_string(),
             redirect_code_configuration(&(HTTP_REDIRECT_CODES.end() + 1).to_string()),
-            "InvalidArgument",
+            "InvalidRequest",
         ),
         (
             "a redirect code that is not a number".to_string(),
             redirect_code_configuration("found"),
-            "InvalidArgument",
+            "InvalidRequest",
         ),
         (
             "a protocol outside the published set".to_string(),
             "<RedirectAllRequestsTo><HostName>www.example.com</HostName>\
              <Protocol>ftp</Protocol></RedirectAllRequestsTo>"
                 .to_string(),
-            "MalformedXML",
+            "InvalidRequest",
         ),
         (
             "a published protocol differing only in case".to_string(),
             "<RedirectAllRequestsTo><HostName>www.example.com</HostName>\
              <Protocol>HTTPS</Protocol></RedirectAllRequestsTo>"
                 .to_string(),
-            "MalformedXML",
+            "InvalidRequest",
         ),
         (
             "an empty error document key".to_string(),
             format!("{}{}", index_document("index.html"), error_document("")),
-            "MalformedXML",
+            "InvalidArgument",
         ),
     ];
 

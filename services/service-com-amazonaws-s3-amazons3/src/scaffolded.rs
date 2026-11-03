@@ -883,8 +883,9 @@ pub enum ErrorDetail {
     Argument {
         /// The request field, as the API publishes it (`versionId`, `RetainUntilDate`).
         name: String,
-        /// The value that field carried, as the request spelled it.
-        value: String,
+        /// The value that field carried, as the request spelled it, or `None` for a field
+        /// that is a container and carried no value of its own.
+        value: Option<String>,
     },
     /// A refusal about one multipart UPLOAD, named by `<UploadId>`: the upload the refusal is
     /// about, where it is not simply the one the request addressed (which
@@ -952,7 +953,10 @@ impl ErrorDetail {
             }
             Self::Argument { name, value } => {
                 s.write_string(&ARGUMENT_NAME, name)?;
-                s.write_string(&ARGUMENT_VALUE, value)
+                match value.as_deref() {
+                    Some(value) => s.write_string(&ARGUMENT_VALUE, value),
+                    None => Ok(()),
+                }
             }
             Self::Upload(upload_id) => s.write_string(&UPLOAD_ID, upload_id),
             Self::Part {
@@ -1242,9 +1246,17 @@ impl<E> Scaffolded<E> {
     /// as the API publishes it and `value` is what the request spelled, so neither is
     /// invented here.
     ///
+    /// `value` is `None` where the refused field is a CONTAINER rather than a value: the
+    /// field is named and no value is written for it, because the refusal is about the
+    /// container being there at all and there is no scalar it carried.
+    ///
     /// The ONE place that pair is attached, so every field this service refuses a value in
     /// names it the same way.
-    pub fn invalid_argument(argument: &str, value: &str, message: impl Into<String>) -> Self {
+    pub fn invalid_argument(
+        argument: &str,
+        value: Option<&str>,
+        message: impl Into<String>,
+    ) -> Self {
         Self::unmodeled(
             crate::state::INVALID_ARGUMENT_CODE,
             crate::state::INVALID_ARGUMENT_STATUS,
@@ -1252,7 +1264,7 @@ impl<E> Scaffolded<E> {
         )
         .naming(ErrorDetail::Argument {
             name: argument.to_string(),
-            value: value.to_string(),
+            value: value.map(str::to_string),
         })
     }
 
@@ -1265,7 +1277,7 @@ impl<E> Scaffolded<E> {
     pub fn invalid_version_id(version_id: &str) -> Self {
         Self::invalid_argument(
             crate::state::VERSION_ID_ARGUMENT,
-            version_id,
+            Some(version_id),
             crate::state::INVALID_VERSION_ID_MESSAGE,
         )
     }
@@ -1281,7 +1293,7 @@ impl<E> Scaffolded<E> {
     ) -> Self {
         Self::invalid_argument(
             crate::state::OBJECT_LOCK_RETAIN_UNTIL_DATE_HEADER,
-            &crate::state::echoed_retain_until_date(spelled, date),
+            Some(&crate::state::echoed_retain_until_date(spelled, date)),
             crate::state::RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE,
         )
     }

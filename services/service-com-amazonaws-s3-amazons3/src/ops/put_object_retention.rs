@@ -284,13 +284,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         if retain_until <= ::std::time::SystemTime::now() {
                             return Err(crate::scaffolded::Scaffolded::invalid_argument(
                                 crate::state::RETAIN_UNTIL_DATE_ARGUMENT,
-                                &crate::state::echoed_retain_until_date(
+                                Some(&crate::state::echoed_retain_until_date(
                                     crate::service::wire::spelled_in_request(
                                         crate::state::RETAIN_UNTIL_DATE_ARGUMENT,
                                     )
                                     .as_deref(),
                                     Some(date),
-                                ),
+                                )),
                                 crate::state::RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE,
                             ));
                         }

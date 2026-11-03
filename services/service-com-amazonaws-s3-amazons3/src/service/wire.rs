@@ -49,7 +49,9 @@
 //! A `Grantee` is not the ACL's alone: `LoggingEnabled$TargetGrants` reaches one too
 //! (`smithy_query(query="shape",shape="TargetGrant")`), so both normalizations are keyed on
 //! the DOCUMENT — a request whose body is an XML document, a response whose body spells the
-//! attribute — and never on which operation is being served.
+//! attribute — and not on which operation is being served. (The one normalization that IS
+//! keyed on an operation's payload member is the website document below, which exists
+//! BECAUSE one operation owns that document's refusals.)
 //!
 //! ## `@xmlName` on a UNION member: an element the codec does not match
 //!
@@ -65,8 +67,27 @@
 //! the member name the codec binds. Nothing is normalized on the way OUT: no operation in
 //! this service answers a union.
 //!
-//! ## A MODE header, whose value S3 reads case-insensitively
+//! ## A document the OPERATION, not the boundary, refuses
 //!
+//! One normalization IS keyed on the operation, and on purpose. S3 publishes a refusal of
+//! its own for several members of a `WebsiteConfiguration` — one that names the member in
+//! `<ArgumentName>` and echoes what it held in `<ArgumentValue>` — and two of those members
+//! carry a MODELLED constraint as well (`ErrorDocument$Key`'s minimum length and
+//! `Protocol`'s value set), so the request boundary would refuse them before
+//! `PutBucketWebsite` ran, in a [`smithy_server_runtime::Refused`] that carries a code and a
+//! sentence and has no room for either element. The same goes for a document the published
+//! schema rejects: the codec reads an element it does not know by IGNORING it, so what
+//! reaches a handler no longer says whether the caller spelled one.
+//!
+//! So a website document `crate::state::website_document_rejection` reports a rejection for
+//! is withheld from the codec in full — the codec is handed
+//! [`EMPTY_WEBSITE_CONFIGURATION`], a container with no member in it — and that operation
+//! answers the refusal from the bytes the request carried, which [`request_document`] keeps
+//! verbatim. It is keyed on the payload MEMBER ([`carries_website_document`]) rather than on
+//! anything the document spells, and it changes what the codec reads only for a
+//! configuration that is refused, so no accepted request is affected by it.
+//!
+//! ## A MODE header, whose value S3 reads case-insensitively//!
 //! The last thing this protocol normalizes is in a HEADER rather than in a document. S3 reads
 //! the value of `x-amz-checksum-mode` as the NAME OF A MODE, not as a case-sensitive
 //! identifier: the AWS CLI's own `s3 cp` download path sends it lowercase and AWS serves the
@@ -593,6 +614,30 @@ fn xml_charset_violation(request: &Request, input_schema: &Schema) -> Option<Vio
 pub(crate) const XML_CHARACTER_SET: &str =
     "#x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]";
 
+/// Whether the input's XML document payload is a `WebsiteConfiguration` — the one document
+/// whose own refusals `PutBucketWebsite` is the place that states them, so the rewrite above
+/// is scoped to it by the member the codec would bind rather than by anything the
+/// document happens to spell.
+fn carries_website_document(input_schema: &Schema) -> bool {
+    input_schema
+        .members()
+        .iter()
+        .find(|member| is_xml_document_payload(member))
+        .and_then(|payload| payload.member_name())
+        == Some(WEBSITE_CONFIGURATION_MEMBER)
+}
+
+/// The input member `PutBucketWebsite` binds its document as
+/// (`smithy_query(query="operation",operation="PutBucketWebsite")` reports
+/// `WebsiteConfiguration` as the `@httpPayload`).
+const WEBSITE_CONFIGURATION_MEMBER: &str = "WebsiteConfiguration";
+
+/// The website document handed to the codec in place of one the published schema rejects: the
+/// container with no member in it, which parses to the configuration a refused request never
+/// stores anything from. `PutBucketWebsite` reads the document the request actually carried
+/// (`request_document`) and refuses it from that, so nothing is read from this stand-in.
+const EMPTY_WEBSITE_CONFIGURATION: &[u8] = b"<WebsiteConfiguration></WebsiteConfiguration>";
+
 /// The violation to refuse `request` with when its body is an XML DOCUMENT in which a member
 /// the model declares a UNION does not carry EXACTLY ONE member, or `None` when every union
 /// the document spells carries one (and for every request whose body is not a document).
@@ -710,6 +755,7 @@ fn union_without_exactly_one_member(
         }
     }
 }
+
 
 /// `document` with every `@xmlAttribute` member moved out of its element's start tag and
 /// into a child element of that element, or `None` when it carries none (in which case
@@ -1388,6 +1434,22 @@ pub fn spelled_in_request(element: &str) -> Option<String> {
     })
 }
 
+/// The WHOLE XML document the request this thread is serving carried, as it arrived, or
+/// `None` for a request whose body is not one.
+///
+/// What a handler judging the DOCUMENT rather than one value in it reads: whether a payload
+/// validates against the schema S3 publishes for it is a question about the elements the
+/// caller spelled, and the parsed input no longer carries them — a codec reads an element it
+/// does not know by ignoring it, so an undeclared one is indistinguishable, after parsing,
+/// from a member that was never sent.
+///
+/// Read under the same discipline as [`spelled_in_request`]: the handler runs in the same
+/// stretch of the one dispatch that deserialized the request, and the note is replaced by
+/// the next request this thread reads.
+pub fn request_document() -> Option<Vec<u8>> {
+    REQUEST_DOCUMENT.with(|note| note.borrow().clone())
+}
+
 /// The text of the first element of `document` whose name is `element`, read through the
 /// same XML reader this module normalizes documents with.
 fn element_text(document: &[u8], element: &str) -> Option<String> {
@@ -1615,6 +1677,21 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                 if let Some(document) = published_names_as_members(current) {
                     normalized = Some(document);
                 }
+            }
+            // And a THIRD, for the one document whose refusals `PutBucketWebsite` is the
+            // one place that can state them: a website document that operation refuses on
+            // the DOCUMENT — because the published schema rejects it, or because a member
+            // carries a value only the document still holds — is withheld from the codec in
+            // full, so the operation answers the refusal S3 publishes, naming the member,
+            // rather than the boundary refusing it in a document with no room for the
+            // member's name. Judged on the body AS IT ARRIVED, which is the same bytes the
+            // handler reads it from ([`request_document`]), so the two cannot disagree
+            // about which documents that operation is the one to refuse. See
+            // `crate::state::website_document_rejection`.
+            if carries_website_document(input_schema)
+                && crate::state::website_document_rejection(body).is_some()
+            {
+                normalized = Some(EMPTY_WEBSITE_CONFIGURATION.to_vec());
             }
             if let Some(document) = normalized {
                 let uri = request.uri();

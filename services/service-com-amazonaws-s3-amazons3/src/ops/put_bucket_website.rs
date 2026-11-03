@@ -218,6 +218,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = (&input.checksum_algorithm, &input.content_md5);
         let configuration = stored_configuration(&input.website_configuration);
 
+        // The DOCUMENT is judged first, from the bytes the request carried: a codec reads
+        // an element it does not know by ignoring it, so a document that misspells,
+        // misnests or invents one parses to a configuration missing the member that element
+        // was meant to carry — and what S3 answers such a document is that the document did
+        // not validate, not that the configuration it parsed to is wrong. The one member
+        // whose own refusal can be read only here goes out from the same pass
+        // (`crate::state::website_document_rejection`). Before the bucket lookup, which is
+        // where the boundary's own refusal of this document would have been answered too.
+        if let Some(rejection) = crate::service::wire::request_document()
+            .as_deref()
+            .and_then(crate::state::website_document_rejection)
+        {
+            return Err(refusal(&rejection));
+        }
+
         // The bucket is looked up FIRST, so a request that names a bucket this emulator
         // does not hold answers that — the order every other bucket subresource put keeps —
         // rather than reporting whatever is wrong with a configuration the bucket could
@@ -228,17 +243,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Validated BEFORE anything is written, so a refused put leaves the bucket's
-        // current website configuration exactly as it was. AWS refuses a configuration its
-        // own documentation rules out with `InvalidArgument`, a code this service's model
-        // declares no shape for, so the refusal goes out through the unmodelled channel
-        // carrying the code and status a client branches on — the same channel
-        // `PutBucketNotificationConfiguration` answers its container refusals through.
+        // current website configuration exactly as it was. Each refusal carries the code,
+        // the sentence and — for one about a single member of the document — the
+        // `<ArgumentName>` / `<ArgumentValue>` pair S3's own refusal of that member states
+        // (`crate::state::WebsiteConfigurationRejection`); none of those codes is one this
+        // service's model declares a shape for, so they travel on the unmodelled channel.
         if let Err(rejection) = crate::state::validate_website_configuration(&configuration) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::INVALID_ARGUMENT_CODE,
-                crate::state::INVALID_ARGUMENT_STATUS,
-                rejection.to_string(),
-            ));
+            return Err(refusal(&rejection));
         }
 
         // "Sets the configuration of the website that is specified in the website
@@ -249,6 +260,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Unit` output: success is the modelled 200 and an empty body.
         Ok(PutBucketWebsiteOutput)
+    }
+}
+
+/// How `rejection` goes out on the wire: its own code and status, its sentence, and the
+/// `<ArgumentName>` / `<ArgumentValue>` pair for a refusal about one member of the document.
+///
+/// A rejection that names an argument is one S3 answers `InvalidArgument`
+/// (`crate::state::WebsiteConfigurationRejection::code` decides it, and the pair is only
+/// attached to that code), which is the code and status
+/// [`crate::scaffolded::Scaffolded::invalid_argument`] renders; every other rejection carries
+/// its own code and status.
+///
+/// The ONE place this operation turns a rejected configuration into a refusal, so a
+/// configuration refused for the DOCUMENT it arrived in and one refused for what that
+/// document described reach a caller as the same shape of document.
+fn refusal(rejection: &crate::state::WebsiteConfigurationRejection) -> PutBucketWebsiteError {
+    let message = rejection.to_string();
+    match rejection.argument() {
+        Some((name, value)) => {
+            crate::scaffolded::Scaffolded::invalid_argument(name, value, message)
+        }
+        None => crate::scaffolded::Scaffolded::unmodeled(
+            rejection.code(),
+            rejection.status(),
+            message,
+        ),
     }
 }
 
