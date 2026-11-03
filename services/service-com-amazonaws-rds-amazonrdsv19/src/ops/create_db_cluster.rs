@@ -1015,11 +1015,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             db_cluster_instance_class: input.db_cluster_instance_class,
             publicly_accessible: input.publicly_accessible,
             // `AutoMinorVersionUpgrade`: "By default, minor engine upgrades are applied
-            // automatically" — for a cluster of an engine whose control plane takes the
-            // setting at all ([`crate::state::default_cluster_auto_minor_version_upgrade`]).
-            auto_minor_version_upgrade: input.auto_minor_version_upgrade.unwrap_or_else(|| {
-                crate::state::default_cluster_auto_minor_version_upgrade(&input.engine)
-            }),
+            // automatically" — the control plane's default, which stands for a cluster
+            // created through a control plane whose own `CreateDBCluster` cannot name the
+            // setting at all ([`crate::state::DEFAULT_CLUSTER_AUTO_MINOR_VERSION_UPGRADE`]).
+            auto_minor_version_upgrade: input
+                .auto_minor_version_upgrade
+                .unwrap_or(crate::state::DEFAULT_CLUSTER_AUTO_MINOR_VERSION_UPGRADE),
             deletion_protection: input.deletion_protection.unwrap_or(false),
             copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
             http_endpoint_enabled: input.enable_http_endpoint.unwrap_or(false),

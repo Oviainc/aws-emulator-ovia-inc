@@ -3157,8 +3157,20 @@ impl DbClusterRecord {
             db_system_id: self.db_system_id.clone(),
             upgrade_rollout_order: Some(DEFAULT_UPGRADE_ROLLOUT_ORDER.to_string()),
             // `StartActivityStream` is still a stub, so no cluster this service holds has
-            // a database activity stream running.
+            // a database activity stream running. The Amazon DocumentDB view of this front
+            // door carries the status under a member name of its own as well, so a cluster
+            // of that control plane's engine reports the one status under both names, as
+            // the recorded envelope does.
             activity_stream_status: Some(ACTIVITY_STREAM_STOPPED.to_string()),
+            db_activity_stream_status: is_docdb_engine(&self.engine)
+                .then(|| ACTIVITY_STREAM_STOPPED.to_string()),
+            // The two capability flags the Amazon DocumentDB view reports on every cluster
+            // of its own engine, and only there: a cluster of another engine has no such
+            // capability to report on.
+            docdb_analytics_enabled: is_docdb_engine(&self.engine)
+                .then_some(DEFAULT_DOCDB_ANALYTICS_ENABLED),
+            custom_data_group_present: is_docdb_engine(&self.engine)
+                .then_some(DEFAULT_CUSTOM_DATA_GROUP_PRESENT),
             // "Indicates whether the DB cluster is a clone of a DB cluster owned by a
             // different Amazon Web Services account": nothing here clones one.
             cross_account_clone: Some(false),
@@ -5823,6 +5835,30 @@ pub const GP3_BASELINE_STORAGE_THROUGHPUT: i32 = 125;
 /// this is the status every instance this service holds reports.
 pub const ACTIVITY_STREAM_STOPPED: &str = "stopped";
 
+/// Whether `engine` is the engine of the Amazon DocumentDB control plane this front door
+/// also serves, the one whose cluster envelope carries members of its own; see
+/// [`DOCDB_ENGINE`] and [`DbClusterRecord::to_wire`].
+pub fn is_docdb_engine(engine: &str) -> bool {
+    engine.eq_ignore_ascii_case(DOCDB_ENGINE)
+}
+
+/// `DocdbAnalyticsEnabled` for a cluster of [`DOCDB_ENGINE`] created without the Amazon
+/// DocumentDB analytics capability: no member of either control plane's `CreateDBCluster`
+/// turns it on, so a cluster this service holds never has it.
+pub const DEFAULT_DOCDB_ANALYTICS_ENABLED: bool = false;
+
+/// `CustomDataGroupPresent` for a cluster of [`DOCDB_ENGINE`] created without a custom
+/// data group: no member of either control plane's `CreateDBCluster` supplies one.
+pub const DEFAULT_CUSTOM_DATA_GROUP_PRESENT: bool = false;
+
+/// `AutoMinorVersionUpgrade` for a cluster whose request named nothing:
+/// `CreateDBClusterMessage$AutoMinorVersionUpgrade` — "By default, minor engine upgrades
+/// are applied automatically." It is the control plane's default, so it holds for a
+/// cluster created through a sibling control plane whose own `CreateDBCluster` carries no
+/// such member too (`smithy_query(query="operation",operation="CreateDBCluster",model_path="services/service-com-amazonaws-docdb-amazonrdsv19/smithy-model/com-amazonaws-docdb-amazonrdsv19.json")`):
+/// the absent member leaves the default standing rather than turning it off.
+pub const DEFAULT_CLUSTER_AUTO_MINOR_VERSION_UPGRADE: bool = true;
+
 /// The upgrade rollout order of an instance nothing configured one for:
 /// `UpgradeRolloutOrder` "[second] - Default order for resources not specifically
 /// configured". No operation this service implements configures it.
@@ -5974,19 +6010,6 @@ pub fn assigned_master_username(engine: &str) -> Option<&'static str> {
 
 /// The master user Amazon Neptune assigns a cluster; see [`assigned_master_username`].
 pub const NEPTUNE_ASSIGNED_MASTER_USERNAME: &str = "admin";
-
-/// Whether a cluster of `engine` has `AutoMinorVersionUpgrade` on when its request named
-/// nothing.
-///
-/// The default belongs to the control plane the cluster was created through: for this
-/// model's own engines "minor engine upgrades are applied automatically"
-/// (`CreateDBClusterMessage$AutoMinorVersionUpgrade`), while the two sibling control
-/// planes' `CreateDBCluster` carries NO `AutoMinorVersionUpgrade` member at all
-/// (`smithy_query(query="operation",operation="CreateDBCluster",model_path="services/service-com-amazonaws-neptune-amazonrdsv19/smithy-model/com-amazonaws-neptune-amazonrdsv19.json")`),
-/// so nothing can turn it on for such a cluster and it is off.
-pub fn default_cluster_auto_minor_version_upgrade(engine: &str) -> bool {
-    !is_sibling_control_plane_engine(engine)
-}
 
 /// The name of the default DB parameter group of one engine-version family.
 ///

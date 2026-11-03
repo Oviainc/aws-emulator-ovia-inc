@@ -82,9 +82,9 @@ const CLUSTER_CASES: &[ClusterCase] = &[
         // `CreateDBClusterMessage$MasterUsername` is "Not supported by Neptune", so the
         // control plane assigns the cluster's master user.
         master_username: Some("admin"),
-        // Neptune's own `CreateDBCluster` carries no `AutoMinorVersionUpgrade` member at
-        // all, so nothing can have turned it on.
-        auto_minor_version_upgrade: "false",
+        // "By default, minor engine upgrades are applied automatically" — the control
+        // plane's default, which a request that cannot name the member leaves standing.
+        auto_minor_version_upgrade: "true",
         security_groups: &[],
     },
     ClusterCase {
@@ -96,7 +96,7 @@ const CLUSTER_CASES: &[ClusterCase] = &[
             ("VpcSecurityGroupIds.VpcSecurityGroupId.2", "sg-0a1b2c3d4e5f60722"),
         ],
         master_username: Some("admin"),
-        auto_minor_version_upgrade: "false",
+        auto_minor_version_upgrade: "true",
         security_groups: &["sg-0a1b2c3d4e5f60711", "sg-0a1b2c3d4e5f60722"],
     },
     ClusterCase {
@@ -108,7 +108,7 @@ const CLUSTER_CASES: &[ClusterCase] = &[
             ("MasterUserPassword", "pw1-Secret"),
         ],
         master_username: Some("emuadmin"),
-        auto_minor_version_upgrade: "false",
+        auto_minor_version_upgrade: "true",
         security_groups: &[],
     },
     ClusterCase {
@@ -190,6 +190,27 @@ fn assert_cluster_members(case: &str, label: &str, cluster: &str, row: &ClusterC
         assert_eq!(
             status, "active",
             "case {case:?}: expected the membership status \"active\", got {status:?}"
+        );
+    }
+
+    // The members the Amazon DocumentDB view of this front door reports on a cluster of
+    // ITS engine, and only there: the two capability flags, and the activity-stream status
+    // under that view's own member name — which it carries BESIDE this model's own name
+    // for such a cluster, while a cluster of any other engine reports only this model's.
+    let docdb = state::is_docdb_engine(row.engine);
+    for (member, on_docdb, on_other) in [
+        ("DocdbAnalyticsEnabled", Some("false"), None),
+        ("CustomDataGroupPresent", Some("false"), None),
+        ("DBActivityStreamStatus", Some("stopped"), None),
+        ("ActivityStreamStatus", Some("stopped"), Some("stopped")),
+    ] {
+        let expected = if docdb { on_docdb } else { on_other };
+        let reported = optional_text(cluster, member);
+        assert_eq!(
+            reported.as_deref(),
+            expected,
+            "case {case:?}: expected {member} {expected:?} for engine {:?}, got {reported:?}",
+            row.engine
         );
     }
 

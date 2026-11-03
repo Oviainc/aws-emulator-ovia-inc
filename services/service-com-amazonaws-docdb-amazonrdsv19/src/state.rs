@@ -105,6 +105,26 @@ pub const STATUS_DELETING: &str = "deleting";
 /// the one its cluster carries.
 pub const PARAMETER_GROUP_IN_SYNC: &str = "in-sync";
 
+/// `DBCluster$AutoMinorVersionUpgrade` for a cluster created without any
+/// minor-version-upgrade input: neither `CreateDBClusterMessage` nor
+/// `ModifyDBClusterMessage` models such a member, and the member was added to the
+/// `DBCluster` shape from the recorded responses, where automatic minor version upgrade is
+/// on for a cluster nothing asked to pin.
+pub const DEFAULT_CLUSTER_AUTO_MINOR_VERSION_UPGRADE: bool = true;
+
+/// `DBCluster$DBActivityStreamStatus` for a cluster that has never started a database
+/// activity stream: the steady state AWS reports, and the only one this service can reach
+/// (the model binds no activity-stream operation to start or stop one).
+pub const ACTIVITY_STREAM_STOPPED: &str = "stopped";
+
+/// `DBCluster$DocdbAnalyticsEnabled` for a cluster created without the Amazon DocumentDB
+/// analytics capability: no input member in this model turns it on.
+pub const DEFAULT_DOCDB_ANALYTICS_ENABLED: bool = false;
+
+/// `DBCluster$CustomDataGroupPresent` for a cluster created without a custom data group:
+/// no input member in this model supplies one.
+pub const DEFAULT_CUSTOM_DATA_GROUP_PRESENT: bool = false;
+
 /// `VpcSecurityGroupMembership$Status` for a security group attached to a live resource.
 pub const SECURITY_GROUP_ACTIVE: &str = "active";
 
@@ -411,6 +431,14 @@ pub struct DbClusterRecord {
     pub copy_tags_to_snapshot: bool,
     /// `ServerlessV2ScalingConfiguration` as (min capacity, max capacity).
     pub serverless_v2_scaling: Option<(f64, f64)>,
+    /// `AutoMinorVersionUpgrade`; see [`DEFAULT_CLUSTER_AUTO_MINOR_VERSION_UPGRADE`].
+    pub auto_minor_version_upgrade: bool,
+    /// `DBActivityStreamStatus`; see [`ACTIVITY_STREAM_STOPPED`].
+    pub activity_stream_status: String,
+    /// `DocdbAnalyticsEnabled`; see [`DEFAULT_DOCDB_ANALYTICS_ENABLED`].
+    pub docdb_analytics_enabled: bool,
+    /// `CustomDataGroupPresent`; see [`DEFAULT_CUSTOM_DATA_GROUP_PRESENT`].
+    pub custom_data_group_present: bool,
     /// `DBClusterMembers`, in the order the instances joined.
     pub members: Vec<ClusterMember>,
     /// The cluster's tags, as (key, value).
@@ -1400,6 +1428,16 @@ pub fn cluster_to_shape(
         .map(|instance| instance.availability_zone.as_str())
         .collect();
     DBCluster {
+        // The members AWS's cluster envelope always carries, each read from the record so
+        // one projection reports what every path stored; see
+        // [`DEFAULT_CLUSTER_AUTO_MINOR_VERSION_UPGRADE`] and its neighbours. The
+        // activity-stream status is carried under both of the names the envelope reports
+        // it under, out of the one stored status.
+        activity_stream_status: Some(record.activity_stream_status.clone()),
+        auto_minor_version_upgrade: Some(record.auto_minor_version_upgrade),
+        db_activity_stream_status: Some(record.activity_stream_status.clone()),
+        docdb_analytics_enabled: Some(record.docdb_analytics_enabled),
+        custom_data_group_present: Some(record.custom_data_group_present),
         availability_zones: Some(record.availability_zones.clone()),
         backup_retention_period: Some(record.backup_retention_period),
         db_cluster_identifier: Some(record.identifier.clone()),

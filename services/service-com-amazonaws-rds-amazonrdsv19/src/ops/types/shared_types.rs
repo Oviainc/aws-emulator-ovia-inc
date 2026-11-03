@@ -747,6 +747,21 @@ pub struct DBClusterAssociatedRole {
 #[smithy_macros::smithy(shape = "com.amazonaws.rds#DBCluster")]
 #[derive(Debug, Clone, Default)]
 pub struct DBCluster {
+    /// The cluster's database-activity-stream status as the Amazon DocumentDB control
+    /// plane this front door also serves reports it. The member was added to this
+    /// service's on-disk model from the recorded AWS responses — the shipped model
+    /// snapshot carries no such member on this shape, while the recorded cluster envelope
+    /// of that control plane always carries it — and its value is projected by
+    /// [`crate::state::DbClusterRecord::to_wire`], the one place a stored cluster becomes
+    /// this shape.
+    pub db_activity_stream_status: Option<String>,
+    /// Whether the Amazon DocumentDB analytics capability is enabled for the cluster;
+    /// added to the on-disk model from the recorded AWS responses, like
+    /// [`DBCluster::db_activity_stream_status`].
+    pub docdb_analytics_enabled: Option<bool>,
+    /// Whether the cluster carries a custom data group; added to the on-disk model from
+    /// the recorded AWS responses, like [`DBCluster::db_activity_stream_status`].
+    pub custom_data_group_present: Option<bool>,
     pub allocated_storage: Option<i32>,
     pub availability_zones: Option<Vec<String>>,
     pub backup_retention_period: Option<i32>,

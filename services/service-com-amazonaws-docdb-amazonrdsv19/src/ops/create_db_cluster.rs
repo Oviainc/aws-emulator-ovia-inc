@@ -517,6 +517,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             network_type: input.network_type,
             copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
             serverless_v2_scaling,
+            // No input member of this operation carries any of the four flags AWS's
+            // cluster envelope always reports, so each is born at the default the service
+            // reports for a cluster created without it; the constants cite them.
+            auto_minor_version_upgrade: docdb::DEFAULT_CLUSTER_AUTO_MINOR_VERSION_UPGRADE,
+            activity_stream_status: docdb::ACTIVITY_STREAM_STOPPED.to_string(),
+            docdb_analytics_enabled: docdb::DEFAULT_DOCDB_ANALYTICS_ENABLED,
+            custom_data_group_present: docdb::DEFAULT_CUSTOM_DATA_GROUP_PRESENT,
             members: Vec::new(),
             tags: docdb::tag_pairs(input.tags),
         };
