@@ -164,16 +164,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let workflow = DescribedWorkflow {
             arn: stored.arn.clone(),
             description: stored.description.clone(),
-            steps: Some(stored.steps.clone()),
-            on_exception_steps: Some(stored.on_exception_steps.clone()),
+            // Each element of a step list is rendered with the type discriminator the
+            // service tags a `WorkflowStep` element with (`ReportedWorkflowStep`), so a
+            // client that identifies a step element by that tag finds it.
+            steps: Some(stored.steps.iter().cloned().map(ReportedWorkflowStep).collect()),
+            on_exception_steps: Some(
+                stored
+                    .on_exception_steps
+                    .iter()
+                    .cloned()
+                    .map(ReportedWorkflowStep)
+                    .collect(),
+            ),
             workflow_id: Some(stored.workflow_id.clone()),
-            // The two step lists are modelled `len 0..8`, so the empty list is a value
-            // they can hold and a workflow with no exception steps reports `[]`.
-            // `Tags` is `len 1..50`, so an empty list is NOT a value it can hold: a
-            // workflow created without tags reports the member absent rather than
-            // empty. Same for `StructuredLogDestinations`, whose absence means no log
-            // group.
-            tags: Some(stored.tags.clone()).filter(|tags| !tags.is_empty()),
+            // The step lists and the tag set are collections the workflow always holds,
+            // so each member is always reported, EMPTY rather than absent for a workflow
+            // with no exception steps or no tags: "none" and "not reported" are
+            // different answers, and the modelled `len 1..50` on `Tags` bounds a tag set
+            // a CALLER supplies, not what a read renders.
+            //
+            // `StructuredLogDestinations` is NOT such a collection: it reports the log
+            // group a workflow's logs are sent to, which a workflow either has or does
+            // not, so a workflow configured with none reports no member at all.
+            tags: Some(stored.tags.clone()),
             structured_log_destinations: Some(stored.structured_log_destinations.clone())
                 .filter(|destinations| !destinations.is_empty()),
         };

@@ -63,6 +63,8 @@ mod not_found_errors;
 mod profile_deletion;
 #[path = "all/profile_lifecycle.rs"]
 mod profile_lifecycle;
+#[path = "all/read_collection_rendering.rs"]
+mod read_collection_rendering;
 #[path = "all/refusal_message_rules.rs"]
 mod refusal_message_rules;
 #[path = "all/resource_resolution_refusals.rs"]

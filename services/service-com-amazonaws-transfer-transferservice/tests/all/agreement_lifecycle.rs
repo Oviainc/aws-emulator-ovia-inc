@@ -161,7 +161,9 @@ impl Case {
             "Status": self.status.unwrap_or(DEFAULT_STATUS),
             "PreserveFilename": self.preserve_filename.unwrap_or(DEFAULT_TOGGLE),
             "EnforceMessageSigning": self.enforce_message_signing.unwrap_or(DEFAULT_TOGGLE),
-            "Tags": if self.tags.is_empty() { Value::Null } else { self.tags_json() },
+            // The tag set is a collection the agreement always holds, so a row that
+            // sent no tags reads back the EMPTY list rather than no member.
+            "Tags": self.tags_json(),
         });
         let object = expected
             .as_object_mut()

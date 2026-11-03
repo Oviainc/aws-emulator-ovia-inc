@@ -28,10 +28,69 @@ pub struct DescribeWorkflowOutput {
 pub struct DescribedWorkflow {
     pub arn: String,
     pub description: Option<String>,
-    pub steps: Option<Vec<WorkflowStep>>,
-    pub on_exception_steps: Option<Vec<WorkflowStep>>,
+    pub steps: Option<Vec<ReportedWorkflowStep>>,
+    pub on_exception_steps: Option<Vec<ReportedWorkflowStep>>,
     pub workflow_id: Option<String>,
     pub tags: Option<Vec<Tag>>,
     pub structured_log_destinations: Option<Vec<String>>,
+}
+
+/// One element of a `WorkflowSteps` list as a workflow READ renders it: the step's own
+/// modelled members, preceded by the type discriminator the service tags each element
+/// of that list with.
+///
+/// The discriminator is not a member of the `WorkflowStep` shape — the model declares
+/// none — so it cannot be carried on [`WorkflowStep`] itself; it is a property of how
+/// a step element is RENDERED, which is what this wrapper owns. Everything else about
+/// the element, including its own members and their wire names, stays the shape's:
+/// this type writes the discriminator and then delegates.
+#[derive(Debug, Clone, Default)]
+pub struct ReportedWorkflowStep(pub WorkflowStep);
+
+impl ReportedWorkflowStep {
+    /// The element's schema is the step shape's own: the wrapper renames nothing.
+    ///
+    /// The generated serializer of a list-of-structure member names the element schema
+    /// as `<element type>::SCHEMA`, so this constant is what makes the wrapper usable
+    /// as that element type.
+    pub const SCHEMA: ::aws_smithy_schema::Schema = WorkflowStep::SCHEMA;
+}
+
+/// The schema the discriminator is written against. A member schema is what the codec
+/// needs to write a string, and its member name is the key the JSON body carries.
+static STEP_TYPE_DISCRIMINATOR_SCHEMA: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static("smithy.api#__type", "smithy.api", "__type"),
+        ::aws_smithy_schema::ShapeType::String,
+        "__type",
+        0,
+    )
+    .with_json_name("__type");
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ReportedWorkflowStep {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // The discriminator names the element's own shape, read off that shape's
+        // schema rather than spelled out here, so it cannot drift from the model.
+        serializer.write_string(
+            &STEP_TYPE_DISCRIMINATOR_SCHEMA,
+            WorkflowStep::SCHEMA.shape_id().shape_name(),
+        )?;
+        self.0.serialize_members(serializer)
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ReportedWorkflowStep {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        Ok(Self(
+            <WorkflowStep as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(
+                deserializer,
+            )?,
+        ))
+    }
 }
 

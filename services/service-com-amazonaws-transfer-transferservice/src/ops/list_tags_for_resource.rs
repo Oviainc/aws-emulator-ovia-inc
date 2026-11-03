@@ -14,8 +14,8 @@
 //!
 //! The model declares NO not-found error for this operation, so an `Arn` nothing in
 //! the store answers to is not refused: it has no tags, which is reported as the
-//! `Arn` echoed back and the `Tags` member absent (`Tags` is modelled `len 1..50`,
-//! which an empty list does not satisfy).
+//! `Arn` echoed back and an EMPTY `Tags` — the paginated items member is always
+//! reported, so every page of every call has the same shape.
 //!
 //! ## Shape of an operation
 //!
@@ -220,9 +220,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: Some(input.arn),
             // A token only when a further page remains.
             next_token: next_key.as_deref().map(st::encode_page_token),
-            // `Tags` is modelled `len 1..50`: a resource with no tags reports the
-            // member absent rather than an empty list.
-            tags: Some(page_tags).filter(|tags| !tags.is_empty()),
+            // `Tags` is the `@paginated` items member, so it is always reported —
+            // EMPTY for a resource with no tags rather than absent, which keeps every
+            // page the same shape for a paginator that concatenates them. The modelled
+            // `len 1..50` bounds a tag set a CALLER supplies, not what a read renders.
+            tags: Some(page_tags),
         })
     }
 }

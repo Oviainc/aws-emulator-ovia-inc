@@ -86,8 +86,8 @@ fn expected(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 /// A `Tags` list on the wire as the key -> value map it denotes.
 ///
-/// An absent member reads as the empty map: `Tags` is modelled `len 1..50`, so a
-/// resource carrying no tags reports no list rather than an empty one.
+/// An absent member reads as the empty map, as the empty list does — a reader reports
+/// the EMPTY list for a resource with no tags.
 fn tag_map(tags: &Value) -> BTreeMap<String, String> {
     tags.as_array()
         .map(|list| {
@@ -540,7 +540,7 @@ async fn a_tag_key_identifies_one_tag_and_a_write_sets_only_the_keys_it_names() 
 /// the modelled `ResourceNotFoundException` — answered, like every not-found in this
 /// service, with HTTP 400 and the requested ARN in `Resource` alone — and writes
 /// nothing. `ListTagsForResource` models no not-found error, so the same ARN simply has
-/// no tags: HTTP 200, the ARN echoed, no `Tags`.
+/// no tags: HTTP 200, the ARN echoed, and an EMPTY `Tags`.
 ///
 /// The rows differ along WHY the ARN resolves to nothing: an id never minted, the right
 /// id in another region or under another account (the ARN is the identity, not the id),
@@ -660,9 +660,10 @@ async fn a_tag_write_refuses_an_arn_no_stored_resource_answers_to() {
             "case {case:?}: expected the requested Arn echoed, got {}",
             answer.body
         );
-        assert!(
-            answer.get("Tags").is_null(),
-            "case {case:?}: expected no Tags member for an ARN nothing answers to, got {}",
+        assert_eq!(
+            answer.get("Tags"),
+            &json!([]),
+            "case {case:?}: expected an empty Tags member for an ARN nothing answers to, got {}",
             answer.body
         );
     }

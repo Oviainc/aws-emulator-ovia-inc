@@ -197,10 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             not_after_date: stored.not_after.map(::aws_smithy_types::DateTime::from),
             r#type: Some(stored.certificate_type.clone()),
             description: stored.description.clone(),
-            // `Tags` is an optional list modelled `len 1..50`, which an empty list does
-            // not satisfy, so an untagged certificate carries no member — the same
-            // rendering every other `Describe*` in this service gives an empty tag set.
-            tags: Some(stored.tags.clone()).filter(|tags| !tags.is_empty()),
+            // The tag set is a collection the certificate always holds, so the member is
+            // always reported, EMPTY for an untagged certificate rather than absent —
+            // the same rendering every other `Describe*` in this service gives an empty
+            // tag set. The modelled `len 1..50` bounds a tag set a CALLER supplies, not
+            // what a read renders.
+            tags: Some(stored.tags.clone()),
         };
 
         Ok(DescribeCertificateOutput { certificate })

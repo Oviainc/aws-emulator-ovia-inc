@@ -63,12 +63,10 @@ impl Case {
         json!({
             "As2Id": self.as2_id,
             "ProfileType": self.profile_type,
-            "CertificateIds": if self.certificate_ids.is_empty() {
-                Value::Null
-            } else {
-                json!(self.certificate_ids)
-            },
-            "Tags": if self.tags.is_empty() { Value::Null } else { self.tags_json() },
+            // Both are collections the profile always holds, so a profile created
+            // without certificates or without tags reports them EMPTY, not absent.
+            "CertificateIds": json!(self.certificate_ids),
+            "Tags": self.tags_json(),
         })
     }
 }

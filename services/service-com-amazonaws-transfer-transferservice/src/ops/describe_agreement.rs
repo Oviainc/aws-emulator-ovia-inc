@@ -186,9 +186,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             access_role: Some(stored.access_role.clone()),
             preserve_filename: Some(stored.preserve_filename.clone()),
             enforce_message_signing: Some(stored.enforce_message_signing.clone()),
-            // `Tags` is modelled `len 1..50`: absent, not empty, for an agreement
-            // created without any — as `DescribeProfile` reports the same member.
-            tags: Some(stored.tags.clone()).filter(|tags| !tags.is_empty()),
+            // The tag set is a collection the agreement always holds, so the member is
+            // always reported, EMPTY for an agreement created without any rather than
+            // absent: "no tags" and "not reported" are different answers, and a caller
+            // that reads the member unconditionally gets the first one. The modelled
+            // `len 1..50` bounds a tag set a CALLER supplies, not what a read renders.
+            tags: Some(stored.tags.clone()),
         };
 
         Ok(DescribeAgreementOutput { agreement })

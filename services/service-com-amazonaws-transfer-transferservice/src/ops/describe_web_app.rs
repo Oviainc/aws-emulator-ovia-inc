@@ -176,9 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             access_endpoint: Some(stored.access_endpoint.clone()),
             web_app_endpoint: Some(stored.web_app_endpoint.clone()),
             web_app_units: stored.web_app_units.clone(),
-            // `Tags` is modelled `len 1..50`, so an empty list is not a value this
-            // member can carry: an untagged web app reports no `Tags` member at all.
-            tags: Some(stored.tags.clone()).filter(|tags| !tags.is_empty()),
+            // The tag set is a collection the web app always holds, so the member is
+            // always reported, EMPTY for an untagged web app rather than absent. The
+            // modelled `len 1..50` bounds a tag set a CALLER supplies, not what a read
+            // renders.
+            tags: Some(stored.tags.clone()),
             web_app_endpoint_policy: Some(stored.web_app_endpoint_policy.clone()),
             endpoint_type: Some(stored.endpoint_type.clone()),
             described_endpoint_details: stored.endpoint_details.clone(),

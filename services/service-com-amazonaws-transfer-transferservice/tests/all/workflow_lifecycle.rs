@@ -415,8 +415,9 @@ async fn a_created_workflow_reads_back_with_its_documented_step_defaults_resolve
                 "WorkflowId": &workflow_id,
                 "Arn": format!("arn:aws:transfer:{REGION}:{ACCOUNT}:workflow/{workflow_id}"),
                 "Description": format!("defaults-{}", step_type.to_lowercase()),
-                // Neither was sent, so neither is reported.
-                "Tags": null,
+                // No tags were sent, so the tag set is reported EMPTY; no log group
+                // was, so that member is not reported at all.
+                "Tags": [],
                 "StructuredLogDestinations": null,
             }),
         );
@@ -528,9 +529,8 @@ async fn a_created_workflow_keeps_the_values_the_request_named() {
             "Description": "kept-as-submitted",
             "Tags": [{"Key": "owner", "Value": "platform"}],
             "StructuredLogDestinations": [LOG_GROUP],
-            // `OnExceptionSteps` is modelled `len 0..8`, so an empty list is a value
-            // the member can hold: a workflow created without exception steps reports
-            // it as the empty list, unlike `Tags` (`len 1..50`), which is absent.
+            // `OnExceptionSteps` is a list the workflow always holds, so a workflow
+            // created without exception steps reports it as the empty list.
             "OnExceptionSteps": [],
         }),
     );

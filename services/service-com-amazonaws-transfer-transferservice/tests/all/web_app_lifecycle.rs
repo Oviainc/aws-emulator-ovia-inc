@@ -124,8 +124,8 @@ async fn describe_web_app_rebuilds_every_created_member_from_stored_state() {
                     "EndpointType": "PUBLIC",
                     // The model documents no `WebAppUnits` default, so none is invented.
                     "WebAppUnits": null,
-                    // `Tags` is modelled `len 1..50`: an untagged web app carries none.
-                    "Tags": null,
+                    // The tag set an untagged web app holds is reported EMPTY.
+                    "Tags": [],
                     "DescribedEndpointDetails": null,
                 })
             },
@@ -190,7 +190,7 @@ async fn describe_web_app_rebuilds_every_created_member_from_stored_state() {
                     "WebAppUnits": {"Provisioned": 50},
                     "WebAppEndpointPolicy": "STANDARD",
                     "EndpointType": "PUBLIC",
-                    "Tags": null,
+                    "Tags": [],
                 })
             },
         ),

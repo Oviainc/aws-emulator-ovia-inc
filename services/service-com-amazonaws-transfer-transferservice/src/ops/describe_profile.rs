@@ -164,13 +164,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             profile_id: Some(stored.profile_id.clone()),
             profile_type: Some(stored.profile_type.clone()),
             as2_id: Some(stored.as2_id.clone()),
-            // `CertificateIds` and `Tags` are optional LISTS: a profile created
-            // without either carries none, so the member is absent rather than an
-            // empty list (`Tags` is modelled `len 1..50`, which an empty list does not
-            // satisfy).
-            certificate_ids: Some(stored.certificate_ids.clone())
-                .filter(|ids| !ids.is_empty()),
-            tags: Some(stored.tags.clone()).filter(|tags| !tags.is_empty()),
+            // The attached certificates and the tag set are collections the profile
+            // always holds, so both members are always reported, EMPTY for a profile
+            // created without either rather than absent: a caller inspects
+            // `CertificateIds` to decide whether the profile still has certificates
+            // attached, and an absent member answers that question differently from an
+            // empty one. The modelled `len 1..50` on `Tags` bounds a tag set a CALLER
+            // supplies, not what a read renders.
+            certificate_ids: Some(stored.certificate_ids.clone()),
+            tags: Some(stored.tags.clone()),
         };
 
         Ok(DescribeProfileOutput { profile })

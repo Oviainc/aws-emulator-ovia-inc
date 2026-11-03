@@ -431,11 +431,9 @@ async fn an_imported_certificate_is_reported_by_its_own_reader() {
             "case {name:?}: expected Description {:?}, got {described}",
             case.description
         );
-        let expected_tags = if case.tags.is_empty() {
-            Value::Null
-        } else {
-            tag_list(&case.tags)
-        };
+        // The tag set is a collection the certificate always holds, so an import that
+        // carried no tags reads back the EMPTY list rather than no member.
+        let expected_tags = tag_list(&case.tags);
         assert_eq!(
             member_of(&described, "Tags"),
             &expected_tags,

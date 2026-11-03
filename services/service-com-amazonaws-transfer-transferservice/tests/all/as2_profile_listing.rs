@@ -32,6 +32,17 @@ use crate::harness::{
 /// `As2Id` is modelled `len 1..128`: the longest id the model admits.
 const LONGEST_AS2_ID_LEN: usize = 128;
 
+/// A list member of a `CreateProfile` request as the profile's reader reports it back:
+/// the list the request named, or the EMPTY list when it named none — both
+/// `CertificateIds` and `Tags` are collections the profile always holds, so the reader
+/// reports them whether or not the create supplied them.
+fn requested_list(request: &Value, member: &str) -> Value {
+    match member_of(request, member) {
+        Value::Null => json!([]),
+        supplied => supplied.clone(),
+    }
+}
+
 /// One row of the profile table: the case name and the `CreateProfile` request.
 struct Row {
     case: &'static str,
@@ -214,9 +225,9 @@ async fn list_profiles_reports_every_created_profile_projected_from_the_stored_r
             profile.listed()
         );
 
-        // Round trip: the same record, read back through `DescribeProfile`. The list
-        // members are absent when the create named none — `Tags` is modelled
-        // `len 1..50`, so an empty list is not a value the model admits.
+        // Round trip: the same record, read back through `DescribeProfile`. Both list
+        // members are collections the profile always holds, so a create that named
+        // neither reads back as the empty list rather than as an absent member.
         let described = emulator
             .call("DescribeProfile", json!({"ProfileId": &profile.profile_id}))
             .await;
@@ -234,8 +245,8 @@ async fn list_profiles_reports_every_created_profile_projected_from_the_stored_r
                 "ProfileId": profile.profile_id,
                 "As2Id": member_of(&profile.request, "As2Id"),
                 "ProfileType": profile.profile_type(),
-                "CertificateIds": member_of(&profile.request, "CertificateIds"),
-                "Tags": member_of(&profile.request, "Tags"),
+                "CertificateIds": requested_list(&profile.request, "CertificateIds"),
+                "Tags": requested_list(&profile.request, "Tags"),
             }),
         );
     }

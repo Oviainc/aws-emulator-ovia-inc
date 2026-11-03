@@ -110,15 +110,24 @@ fn profile_type_of(request: &Value) -> &str {
 }
 
 /// What `DescribeProfile` must report for the profile a row created: the create's own
-/// members, where an optional list the create did not name must stay ABSENT (a `null`
-/// expectation in [`assert_members`]).
+/// members, where a list the create did not name reads back as the EMPTY list —
+/// `CertificateIds` and `Tags` are collections the profile always holds.
 fn expected_members(request: &Value) -> Value {
     json!({
         "As2Id": member_of(request, "As2Id"),
         "ProfileType": profile_type_of(request),
-        "CertificateIds": member_of(request, "CertificateIds"),
-        "Tags": member_of(request, "Tags"),
+        "CertificateIds": requested_list(request, "CertificateIds"),
+        "Tags": requested_list(request, "Tags"),
     })
+}
+
+/// A list member of a create request as the profile's reader reports it back: the list
+/// the request named, or the EMPTY list when it named none.
+fn requested_list(request: &Value, member: &str) -> Value {
+    match member_of(request, member) {
+        Value::Null => json!([]),
+        supplied => supplied.clone(),
+    }
 }
 
 /// Create one profile from `request`, signed for `region`, and return its minted id.
