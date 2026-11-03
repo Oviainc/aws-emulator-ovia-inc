@@ -166,6 +166,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // The `AppInstance` an administrator is an identity OF is what serves a read of
+        // that promotion, so once that instance has been deleted the read is refused as a
+        // request this caller may no longer make rather than answered from a record the
+        // delete left behind. A reporting operation: nothing here writes.
+        if state.lock().unresolved_arn(&input.app_instance_arn)
+            == crate::state::UnresolvedArn::DeletedAppInstance
+        {
+            return Err(
+                DescribeAppInstanceAdminErrorModeled::ForbiddenException(ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
         // A reporting operation: it reads the recorded promotion and writes nothing.
         let record = directory
             .lock()

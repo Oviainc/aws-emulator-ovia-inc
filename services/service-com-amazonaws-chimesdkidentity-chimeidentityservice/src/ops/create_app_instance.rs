@@ -172,18 +172,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
-        // Idempotency (`@idempotencyToken` on `ClientRequestToken`): the same token
-        // names the same AppInstance, so a retry answers with the ARN the first call
-        // minted instead of creating a second instance.
-        //
-        // Unlike `CreateAppInstanceUser`, there is nothing to compare the replay
-        // against: an AppInstanceArn is a fresh uuid, not a value derived from the
-        // request, so a token reused with a different Name or Metadata cannot be told
-        // apart from a retry here and replays the first instance.
-        if let Some(existing) = state.idempotent_arn(Self::NAME, &input.client_request_token) {
-            return Ok(CreateAppInstanceOutput {
-                app_instance_arn: Some(existing),
-            });
+        // `TagList` is `@length(min: 1)`, so the member is either absent or non-empty.
+        // Sorted for the FINGERPRINT below, because a tag set is unordered: the same tags
+        // in another order are the same request. The order is not observable — the shared
+        // tag directory holds a resource's tags keyed by tag key and reports them in key
+        // order — so sorting here changes nothing a caller can read back.
+        let mut tags: Vec<(String, String)> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        tags.sort();
+
+        // The request this token stands for: every member the create persists, in one
+        // fixed order.
+        let fingerprint = {
+            let mut fields: Vec<Option<&str>> =
+                vec![Some(input.name.as_str()), input.metadata.as_deref()];
+            for (key, value) in &tags {
+                fields.push(Some(key.as_str()));
+                fields.push(Some(value.as_str()));
+            }
+            crate::state::request_fingerprint(&fields)
+        };
+
+        // Idempotency (`@idempotencyToken` on `ClientRequestToken`): one token names one
+        // AppInstance, so a RETRY — the same token presented with the same request —
+        // answers with the ARN the first call minted and creates nothing new. A token
+        // already associated with an instance but presented with a DIFFERENT request is
+        // not a retry of anything, and is refused with the modelled conflict rather than
+        // silently answering about an instance whose Name and Metadata are not the ones
+        // the caller just asked for.
+        match state.token_replay(Self::NAME, &input.client_request_token, &fingerprint) {
+            crate::state::TokenReplay::Fresh => {}
+            crate::state::TokenReplay::Replays(existing) => {
+                return Ok(CreateAppInstanceOutput {
+                    app_instance_arn: Some(existing),
+                });
+            }
+            crate::state::TokenReplay::Mismatch => {
+                return Err(CreateAppInstanceErrorModeled::ConflictException(
+                    ConflictException {
+                        code: Some("Conflict".to_string()),
+                        message: Some(crate::state::TOKEN_ALREADY_ASSOCIATED_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
         }
 
         let now = ::std::time::SystemTime::now();
@@ -205,13 +241,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let arn = crate::state::new_app_instance_arn(&crate::state::request_region(ctx.parts()));
-        // `TagList` is `@length(min: 1)`, so the member is either absent or non-empty.
-        let tags: Vec<(String, String)> = input
-            .tags
-            .unwrap_or_default()
-            .into_iter()
-            .map(|tag| (tag.key, tag.value))
-            .collect();
         let record = crate::state::AppInstanceRecord {
             arn: arn.clone(),
             name: input.name,
@@ -234,7 +263,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // The instance is stored either way; at the structural token ceiling the token
         // is simply not recorded, so the map cannot grow past it.
-        let _recorded = state.record_idempotency(Self::NAME, &input.client_request_token, &arn);
+        let _recorded = state.record_idempotency(
+            Self::NAME,
+            &input.client_request_token,
+            &arn,
+            &fingerprint,
+        );
 
         Ok(CreateAppInstanceOutput {
             app_instance_arn: Some(arn),

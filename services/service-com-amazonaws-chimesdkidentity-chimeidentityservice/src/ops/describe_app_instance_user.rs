@@ -150,18 +150,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A reporting operation: it reads the stored user and writes nothing.
         let Some(record) = state.user(&input.app_instance_user_arn) else {
-            // This operation models no 404 shape, so an unknown ARN is refused with
-            // the modelled `BadRequestException` carrying the `NotFound` error code.
-            return Err(DescribeAppInstanceUserErrorModeled::BadRequestException(
-                BadRequestException {
-                    code: Some("NotFound".to_string()),
-                    message: Some(format!(
-                        "AppInstanceUser {} does not exist",
-                        input.app_instance_user_arn
-                    )),
-                },
-            )
-            .into());
+            return Err(match state.unresolved_arn(&input.app_instance_user_arn) {
+                // The AppInstance this user hung off has been deleted, taking the user
+                // with it, so nothing is left to serve a read of that ARN: the answer is
+                // the modelled permanent refusal.
+                crate::state::UnresolvedArn::DeletedAppInstance => {
+                    DescribeAppInstanceUserErrorModeled::ForbiddenException(ForbiddenException {
+                        code: Some("Forbidden".to_string()),
+                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                    })
+                    .into()
+                }
+                // This operation models no 404 shape, so an ARN that never named a user
+                // is refused with the modelled `BadRequestException` carrying the
+                // `NotFound` error code.
+                crate::state::UnresolvedArn::NeverExisted => {
+                    DescribeAppInstanceUserErrorModeled::BadRequestException(
+                        BadRequestException {
+                            code: Some("NotFound".to_string()),
+                            message: Some(format!(
+                                "AppInstanceUser {} does not exist",
+                                input.app_instance_user_arn
+                            )),
+                        },
+                    )
+                    .into()
+                }
+            });
         };
 
         Ok(DescribeAppInstanceUserOutput {

@@ -303,8 +303,9 @@ async fn tags_supplied_at_create_time_are_listed_and_can_be_changed() {
             "case {case:?}: expected the create-time tags as the later calls left them"
         );
 
-        // The resource's tags go with the resource: once it is deleted, the ARN is not a
-        // resource of this service any more and the listing refuses it.
+        // The resource's tags go with the resource: once the instance is deleted, the ARN
+        // is one this caller may no longer address and the listing refuses it with the
+        // modelled permanent refusal.
         let (status, _) = emulator
             .call(
                 "DELETE",
@@ -318,7 +319,7 @@ async fn tags_supplied_at_create_time_are_listed_and_can_be_changed() {
             .await;
         assert_eq!(
             (status, body["Code"].as_str()),
-            (400, Some("NotFound")),
+            (403, Some("Forbidden")),
             "case {case:?}: expected a deleted resource's tags to be refused, got {body:?}"
         );
     }

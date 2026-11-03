@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DescribeAppInstanceBotErrorModeled::ForbiddenException(
                 ForbiddenException {
                     code: Some("Forbidden".to_string()),
-                    message: Some(FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                    message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -190,10 +190,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The `Message` an authorization refusal of an Amazon Chime SDK Identity ARN carries.
-///
-/// One sentence, whichever resource the caller asked for and whatever left the ARN
-/// unresolvable: a client branches on the `Code` (`Forbidden`), and the reason a
-/// particular request was refused stays in the comment at the refusal rather than being
-/// disclosed to a caller that may not read the resource.
-const FORBIDDEN_REQUEST_MESSAGE: &str = "You are not allowed to make this request.";

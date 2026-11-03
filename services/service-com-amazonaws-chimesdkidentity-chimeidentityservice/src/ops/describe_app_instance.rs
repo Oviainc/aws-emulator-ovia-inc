@@ -151,18 +151,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A reporting operation: it reads the stored instance and writes nothing.
         let Some(record) = state.app_instances.get(&input.app_instance_arn) else {
-            // This operation models no 404 shape, so an unknown ARN is refused with
-            // the modelled `BadRequestException` carrying the `NotFound` error code.
-            return Err(DescribeAppInstanceErrorModeled::BadRequestException(
-                BadRequestException {
-                    code: Some("NotFound".to_string()),
-                    message: Some(format!(
-                        "AppInstance {} does not exist",
-                        input.app_instance_arn
-                    )),
-                },
-            )
-            .into());
+            return Err(match state.unresolved_arn(&input.app_instance_arn) {
+                // The AppInstance this ARN names has been deleted, so it can no longer
+                // serve a read of its own ARN: the answer is the modelled permanent
+                // refusal, which is what a caller polling a deleted instance waits for.
+                crate::state::UnresolvedArn::DeletedAppInstance => {
+                    DescribeAppInstanceErrorModeled::ForbiddenException(ForbiddenException {
+                        code: Some("Forbidden".to_string()),
+                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                    })
+                    .into()
+                }
+                // This operation models no 404 shape, so an ARN that never named an
+                // instance is refused with the modelled `BadRequestException` carrying
+                // the `NotFound` error code.
+                crate::state::UnresolvedArn::NeverExisted => {
+                    DescribeAppInstanceErrorModeled::BadRequestException(BadRequestException {
+                        code: Some("NotFound".to_string()),
+                        message: Some(format!(
+                            "AppInstance {} does not exist",
+                            input.app_instance_arn
+                        )),
+                    })
+                    .into()
+                }
+            });
         };
 
         Ok(DescribeAppInstanceOutput {

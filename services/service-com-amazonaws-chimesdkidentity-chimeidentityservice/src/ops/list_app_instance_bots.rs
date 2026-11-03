@@ -160,16 +160,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         let Some(instance) = state.app_instances.get(&input.app_instance_arn) else {
-            return Err(ListAppInstanceBotsErrorModeled::BadRequestException(
-                BadRequestException {
-                    code: Some("NotFound".to_string()),
-                    message: Some(format!(
-                        "AppInstance {} does not exist",
-                        input.app_instance_arn
-                    )),
-                },
-            )
-            .into());
+            return Err(match state.unresolved_arn(&input.app_instance_arn) {
+                // The AppInstance this ARN names has been deleted, so it can no longer
+                // serve a listing of the bots it held: the answer is the modelled
+                // permanent refusal.
+                crate::state::UnresolvedArn::DeletedAppInstance => {
+                    ListAppInstanceBotsErrorModeled::ForbiddenException(ForbiddenException {
+                        code: Some("Forbidden".to_string()),
+                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                    })
+                    .into()
+                }
+                // This operation models no 404 shape, so an ARN that never named an
+                // instance is refused with the modelled `BadRequestException` carrying
+                // the `NotFound` error code.
+                crate::state::UnresolvedArn::NeverExisted => {
+                    ListAppInstanceBotsErrorModeled::BadRequestException(BadRequestException {
+                        code: Some("NotFound".to_string()),
+                        message: Some(format!(
+                            "AppInstance {} does not exist",
+                            input.app_instance_arn
+                        )),
+                    })
+                    .into()
+                }
+            });
         };
 
         // `NextToken` is opaque and scoped to the listing that issued it, so one this

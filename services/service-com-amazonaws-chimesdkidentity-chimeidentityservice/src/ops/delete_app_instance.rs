@@ -189,16 +189,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Deleting an AppInstance deletes everything it owns, so the users and bots it
         // holds go with it and a later Describe of one of them resolves to nothing.
         let Some(removed) = state.remove_app_instance(&input.app_instance_arn) else {
-            return Err(DeleteAppInstanceErrorModeled::BadRequestException(
-                BadRequestException {
-                    code: Some("NotFound".to_string()),
-                    message: Some(format!(
-                        "AppInstance {} does not exist",
-                        input.app_instance_arn
-                    )),
-                },
-            )
-            .into());
+            return Err(match state.unresolved_arn(&input.app_instance_arn) {
+                // This instance is already deleted, so a second delete addressed to its
+                // ARN is a request this caller may no longer make rather than a report
+                // that the ARN is unknown.
+                crate::state::UnresolvedArn::DeletedAppInstance => {
+                    DeleteAppInstanceErrorModeled::ForbiddenException(ForbiddenException {
+                        code: Some("Forbidden".to_string()),
+                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                    })
+                    .into()
+                }
+                // This operation models no 404 shape, so an ARN that never named an
+                // instance is refused with the modelled `BadRequestException` carrying
+                // the `NotFound` error code.
+                crate::state::UnresolvedArn::NeverExisted => {
+                    DeleteAppInstanceErrorModeled::BadRequestException(BadRequestException {
+                        code: Some("NotFound".to_string()),
+                        message: Some(format!(
+                            "AppInstance {} does not exist",
+                            input.app_instance_arn
+                        )),
+                    })
+                    .into()
+                }
+            });
         };
 
         // The cascade reaches the tags too: the instance's own and those of every child

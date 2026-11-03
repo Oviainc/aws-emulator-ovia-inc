@@ -5,7 +5,7 @@
 //! The `AppInstance` is this service's root resource: every other identity resource
 //! (users, bots, admins, endpoints, retention settings) hangs off exactly one of them.
 //! State is therefore a single `BTreeMap` of app instances keyed by ARN, with each
-//! instance owning its users and its bots, plus three index maps:
+//! instance owning its users and its bots, plus four index maps:
 //!
 //! * `users_by_arn` — a user ARN to its owning instance ARN, because
 //!   `DescribeAppInstanceUser` / `DeleteAppInstanceUser` are keyed only by the user ARN.
@@ -13,6 +13,10 @@
 //!   operations are keyed only by the bot ARN.
 //! * `idempotency` — a create operation's `ClientRequestToken` to the ARN that token
 //!   already minted, so repeating one token never mints a second resource.
+//! * `deleted_app_instances` — the ARN of every app instance this store has deleted, so
+//!   a request addressed to a dead instance (or to a resource the delete cascaded away
+//!   with it) is refused as one this caller may no longer make rather than as an ARN
+//!   that never named anything.
 //!
 //! An `AppInstanceUserEndpoint` is not addressed by an ARN of its own — every operation
 //! on one names its owning user's ARN plus an `EndpointId` — so an endpoint is held in
@@ -94,6 +98,34 @@ pub const MAX_APP_INSTANCE_USER_ENDPOINTS: usize = 100;
 /// records a token without minting anything: past it, a token is not recorded.
 pub const MAX_IDEMPOTENCY_TOKENS: usize =
     MAX_APP_INSTANCES * (1 + MAX_APP_INSTANCE_USERS + MAX_APP_INSTANCE_BOTS);
+
+/// How many deleted `AppInstance` ARNs the store remembers, so a request addressed to a
+/// deleted instance — or to a resource that hung off one — is told apart from a request
+/// addressed to an ARN that never named anything.
+///
+/// One entry per instance the store can hold ([`MAX_APP_INSTANCES`]), which keeps the
+/// set bounded: past it the oldest deletion is forgotten and its ARN reads as an unknown
+/// one again.
+pub const MAX_DELETED_APP_INSTANCES: usize = MAX_APP_INSTANCES;
+
+/// The `Message` a refusal of a request this caller may not make carries.
+///
+/// One sentence, whichever resource the caller addressed and whatever left that ARN
+/// unresolvable: a client branches on the `Code` (`Forbidden`), and the reason a
+/// particular request was refused stays in the comment at the refusal rather than being
+/// disclosed to a caller that may not read the resource.
+pub const FORBIDDEN_REQUEST_MESSAGE: &str = "You are not allowed to make this request.";
+
+/// The `Message` the modelled conflict carries when a create's `ClientRequestToken`
+/// already named a resource and the request it is presented with is not the one that
+/// token made.
+pub const TOKEN_ALREADY_ASSOCIATED_MESSAGE: &str =
+    "The provided ClientRequestToken is already associated with an existing resource.";
+
+/// The `Message` the modelled conflict carries when the resource a create names already
+/// exists.
+pub const RESOURCE_ALREADY_EXISTS_MESSAGE: &str =
+    "The resource that you are trying to create already exists.";
 
 /// A persisted `AppInstanceUser`.
 #[derive(Debug, Clone)]
@@ -248,6 +280,40 @@ pub enum InsertBot {
     AtCapacity,
 }
 
+/// What a create's `ClientRequestToken` minted, and the request it minted it for.
+#[derive(Debug, Clone)]
+pub struct IdempotentCreate {
+    /// The ARN that create minted.
+    pub arn: String,
+    /// The request the token carried, as [`request_fingerprint`] renders it.
+    pub request_fingerprint: String,
+}
+
+/// What a create found for the `ClientRequestToken` it carries, so the handler answers
+/// each case with what the model declares for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenReplay {
+    /// This token has minted nothing that is still live, so the create mints a resource.
+    Fresh,
+    /// The same request again: answer with the ARN it already minted and create nothing.
+    Replays(String),
+    /// A token already associated with a live resource, presented with a DIFFERENT
+    /// request: not a retry of anything.
+    Mismatch,
+}
+
+/// Why an ARN this service holds no live resource for is unresolvable, which is what
+/// decides WHICH modelled refusal a request addressed to it earns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnresolvedArn {
+    /// The ARN is a deleted `AppInstance`'s own ARN, or the ARN of a resource that hung
+    /// off one: the instance that would have served the request is gone, so the request
+    /// is one this caller may no longer make.
+    DeletedAppInstance,
+    /// No resource of this service ever carried this ARN.
+    NeverExisted,
+}
+
 /// Per-service state for com-amazonaws-chimesdkidentity-chimeidentityservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsChimesdkidentityChimeidentityserviceState {
@@ -257,8 +323,22 @@ pub struct ComAmazonawsChimesdkidentityChimeidentityserviceState {
     pub users_by_arn: BTreeMap<String, String>,
     /// `AppInstanceBotArn` -> owning `AppInstanceArn`.
     pub bots_by_arn: BTreeMap<String, String>,
-    /// `<operation>:<ClientRequestToken>` -> the ARN that token minted.
-    pub idempotency: BTreeMap<String, String>,
+    /// `<operation>:<ClientRequestToken>` -> what that token minted, and for which
+    /// request.
+    pub idempotency: BTreeMap<String, IdempotentCreate>,
+    /// The ARN of every `AppInstance` this store has deleted -> the sequence number of
+    /// that deletion, so the oldest can be dropped once the set holds
+    /// [`MAX_DELETED_APP_INSTANCES`].
+    ///
+    /// A deleted `AppInstance` is what told this emulator it could serve a request
+    /// against its own ARN and against the ARNs of the resources that hung off it, so
+    /// once it is gone such a request is refused differently from one naming an ARN that
+    /// never existed — see [`unresolved_arn`](
+    /// ComAmazonawsChimesdkidentityChimeidentityserviceState::unresolved_arn).
+    pub deleted_app_instances: BTreeMap<String, u64>,
+    /// The sequence number the next deletion is recorded under, so the set's eviction
+    /// order is the deletion order rather than the ARN order.
+    deletions: u64,
 }
 
 impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
@@ -427,6 +507,7 @@ impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
     /// its children are released too.
     pub fn remove_app_instance(&mut self, arn: &str) -> Option<AppInstanceRecord> {
         let instance = self.app_instances.remove(arn)?;
+        self.record_app_instance_deletion(arn);
         self.users_by_arn
             .retain(|_, owning_arn| owning_arn.as_str() != arn);
         self.bots_by_arn
@@ -435,7 +516,7 @@ impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
         gone.extend(instance.bots.keys().map(String::as_str));
         gone.insert(arn);
         self.idempotency
-            .retain(|_, minted| !gone.contains(minted.as_str()));
+            .retain(|_, minted| !gone.contains(minted.arn.as_str()));
         Some(instance)
     }
 
@@ -445,7 +526,46 @@ impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
     /// entry per live resource rather than one per create ever made.
     fn forget_idempotency_for(&mut self, arns: &[&str]) {
         self.idempotency
-            .retain(|_, minted| !arns.contains(&minted.as_str()));
+            .retain(|_, minted| !arns.contains(&minted.arn.as_str()));
+    }
+
+    /// Remember that the `AppInstance` `arn` named has been deleted.
+    ///
+    /// Bounded at [`MAX_DELETED_APP_INSTANCES`] by forgetting the oldest deletion, so
+    /// the set never outgrows the instances the store itself can hold.
+    fn record_app_instance_deletion(&mut self, arn: &str) {
+        self.deletions = self.deletions.wrapping_add(1);
+        self.deleted_app_instances
+            .insert(arn.to_string(), self.deletions);
+        while self.deleted_app_instances.len() > MAX_DELETED_APP_INSTANCES {
+            let Some(oldest) = self
+                .deleted_app_instances
+                .iter()
+                .min_by_key(|(_, recorded)| **recorded)
+                .map(|(deleted_arn, _)| deleted_arn.clone())
+            else {
+                break;
+            };
+            self.deleted_app_instances.remove(&oldest);
+        }
+    }
+
+    /// Why `arn` resolves to no live resource of this service: because the `AppInstance`
+    /// it belongs to has been deleted, or because nothing here ever named it.
+    ///
+    /// Every resource of this service hangs off exactly one `AppInstance`, and a user,
+    /// bot or endpoint ARN carries its instance's ARN as its prefix, so one lookup over
+    /// the deleted instances answers for the instance itself and for everything the
+    /// delete cascaded away with it.
+    pub fn unresolved_arn(&self, arn: &str) -> UnresolvedArn {
+        if self
+            .deleted_app_instances
+            .keys()
+            .any(|deleted| arn_is_at_or_under(arn, deleted))
+        {
+            return UnresolvedArn::DeletedAppInstance;
+        }
+        UnresolvedArn::NeverExisted
     }
 
     /// True when `arn` still names a live resource of this service.
@@ -468,34 +588,62 @@ impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
         )
     }
 
-    /// The ARN a previous call of `operation` already minted for `token`, if that
-    /// resource is still live.
+    /// What the `ClientRequestToken` `token` means for this `operation` presented with
+    /// the request `request_fingerprint` stands for.
     ///
     /// A token whose resource has since been deleted is forgotten here, so the token
     /// can mint a new resource rather than replaying an ARN that resolves to nothing.
-    pub fn idempotent_arn(&mut self, operation: &str, token: &str) -> Option<String> {
+    ///
+    /// The comparison is against the request the token MADE ([`IdempotentCreate`]'s
+    /// fingerprint), not against what the resource holds now: an update or a tagging
+    /// call that changed the resource afterwards must not turn an honest retry of the
+    /// original create into a conflict.
+    pub fn token_replay(
+        &mut self,
+        operation: &str,
+        token: &str,
+        request_fingerprint: &str,
+    ) -> TokenReplay {
         let key = idempotency_key(operation, token);
-        let recorded = self.idempotency.get(&key)?.clone();
-        if self.resource_exists(&recorded) {
-            return Some(recorded);
+        let Some(recorded) = self.idempotency.get(&key).cloned() else {
+            return TokenReplay::Fresh;
+        };
+        if !self.resource_exists(&recorded.arn) {
+            self.idempotency.remove(&key);
+            return TokenReplay::Fresh;
         }
-        self.idempotency.remove(&key);
-        None
+        if recorded.request_fingerprint == request_fingerprint {
+            return TokenReplay::Replays(recorded.arn);
+        }
+        TokenReplay::Mismatch
     }
 
-    /// Record that `operation` minted `arn` for `token`.
+    /// Record that `operation` minted `arn` for `token`, for the request
+    /// `request_fingerprint` stands for.
     ///
     /// Answers `false`, recording nothing, once the map holds
     /// [`MAX_IDEMPOTENCY_TOKENS`] entries: the resource caps bind first, so this is
     /// unreachable through the operations as written, and it is here so the map stays
     /// bounded whatever a caller does. The resource itself is created either way; only
     /// the token's replay is given up.
-    pub fn record_idempotency(&mut self, operation: &str, token: &str, arn: &str) -> bool {
+    pub fn record_idempotency(
+        &mut self,
+        operation: &str,
+        token: &str,
+        arn: &str,
+        request_fingerprint: &str,
+    ) -> bool {
         let key = idempotency_key(operation, token);
         if self.idempotency.len() >= MAX_IDEMPOTENCY_TOKENS && !self.idempotency.contains_key(&key) {
             return false;
         }
-        self.idempotency.insert(key, arn.to_string());
+        self.idempotency.insert(
+            key,
+            IdempotentCreate {
+                arn: arn.to_string(),
+                request_fingerprint: request_fingerprint.to_string(),
+            },
+        );
         true
     }
 }
@@ -622,6 +770,19 @@ pub fn names_identity_resource(arn: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether `arn` is `prefix` itself or names a resource UNDER it.
+///
+/// A child ARN of this family is its parent's ARN plus a `/`-separated segment pair
+/// (`…/user/<id>`, `…/bot/<id>`), so a prefix match is only a containment when the next
+/// character is the separator: without that check an instance whose uuid merely starts
+/// with another's would read as its child.
+fn arn_is_at_or_under(arn: &str, prefix: &str) -> bool {
+    arn == prefix
+        || (arn.len() > prefix.len()
+            && arn.starts_with(prefix)
+            && arn.as_bytes()[prefix.len()] == b'/')
 }
 
 /// The region to mint an ARN in: the one the caller signed for, else
@@ -768,13 +929,32 @@ fn names_pinpoint_application_id(application_id: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// The fingerprint of the register request an endpoint was minted by.
+/// The fingerprint of a create request: a sha256 over LENGTH-PREFIXED fields, so no
+/// value containing a separator can impersonate a different split of the same bytes, and
+/// an absent optional member is distinct from an empty one.
 ///
-/// A `ClientRequestToken` stands for ONE request, so a token presented again has to be
-/// compared against the request it first carried. Every member the register call
-/// persists goes into a sha256 over LENGTH-PREFIXED fields, so no value containing a
-/// separator can impersonate a different split of the same bytes, and an absent
-/// optional member is distinct from an empty one.
+/// `fields` is every member of the request the create persists, in one fixed order — a
+/// `ClientRequestToken` stands for ONE request, so a token presented again is compared
+/// against the fingerprint of the request it first carried.
+pub fn request_fingerprint(fields: &[Option<&str>]) -> String {
+    use sha2::Digest as _;
+
+    let mut hasher = sha2::Sha256::new();
+    for field in fields {
+        match field {
+            Some(value) => {
+                hasher.update(b"s");
+                hasher.update(value.len().to_be_bytes());
+                hasher.update(value.as_bytes());
+            }
+            None => hasher.update(b"n"),
+        }
+    }
+    ::hex::encode(hasher.finalize())
+}
+
+/// The fingerprint of the register request an endpoint was minted by: every member the
+/// register call persists, through [`request_fingerprint`].
 pub fn endpoint_request_fingerprint(
     endpoint_type: &str,
     resource_arn: &str,
@@ -782,24 +962,14 @@ pub fn endpoint_request_fingerprint(
     name: Option<&str>,
     allow_messages: Option<&str>,
 ) -> String {
-    use sha2::Digest as _;
-
-    let mut hasher = sha2::Sha256::new();
-    let mut field = |value: Option<&str>| match value {
-        Some(value) => {
-            hasher.update(b"s");
-            hasher.update(value.len().to_be_bytes());
-            hasher.update(value.as_bytes());
-        }
-        None => hasher.update(b"n"),
-    };
-    field(Some(endpoint_type));
-    field(Some(resource_arn));
-    field(Some(attributes.device_token.as_str()));
-    field(attributes.voip_device_token.as_deref());
-    field(name);
-    field(allow_messages);
-    ::hex::encode(hasher.finalize())
+    request_fingerprint(&[
+        Some(endpoint_type),
+        Some(resource_arn),
+        Some(attributes.device_token.as_str()),
+        attributes.voip_device_token.as_deref(),
+        name,
+        allow_messages,
+    ])
 }
 
 /// The number of days a retention-settings structure puts in effect, or `None` when it

@@ -169,20 +169,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
+        // Which refusal an unresolvable ARN earns is decided from the store BEFORE the
+        // record is taken for writing, so the decision is one read rather than a second
+        // borrow inside the refusal.
+        let unresolved = state.unresolved_arn(&input.app_instance_user_arn);
         let Some(record) = state.user_mut(&input.app_instance_user_arn) else {
-            // This operation models no 404 shape, so an unknown ARN is refused with the
-            // modelled `BadRequestException` carrying the `NotFound` error code — the
-            // same refusal `DescribeAppInstanceUser` states for an absent user.
-            return Err(UpdateAppInstanceUserErrorModeled::BadRequestException(
-                BadRequestException {
-                    code: Some("NotFound".to_string()),
-                    message: Some(format!(
-                        "AppInstanceUser {} does not exist",
-                        input.app_instance_user_arn
-                    )),
-                },
-            )
-            .into());
+            return Err(match unresolved {
+                // The AppInstance this user hung off has been deleted, taking the user
+                // with it, so nothing is left to write: the answer is the modelled
+                // permanent refusal.
+                crate::state::UnresolvedArn::DeletedAppInstance => {
+                    UpdateAppInstanceUserErrorModeled::ForbiddenException(ForbiddenException {
+                        code: Some("Forbidden".to_string()),
+                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                    })
+                    .into()
+                }
+                // This operation models no 404 shape, so an ARN that never named a user
+                // is refused with the modelled `BadRequestException` carrying the
+                // `NotFound` error code — the same refusal `DescribeAppInstanceUser`
+                // states for an absent user.
+                crate::state::UnresolvedArn::NeverExisted => {
+                    UpdateAppInstanceUserErrorModeled::BadRequestException(BadRequestException {
+                        code: Some("NotFound".to_string()),
+                        message: Some(format!(
+                            "AppInstanceUser {} does not exist",
+                            input.app_instance_user_arn
+                        )),
+                    })
+                    .into()
+                }
+            });
         };
 
         // `Name` and `Metadata` are both `required`, so an update REPLACES the stored

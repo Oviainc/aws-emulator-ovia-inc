@@ -191,26 +191,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn =
             crate::state::app_instance_user_arn(&input.app_instance_arn, &input.app_instance_user_id);
 
-        // Idempotency (`@idempotencyToken` on `ClientRequestToken`): a retry with the
-        // same token answers with the user ARN the first call minted. Because that ARN
-        // is derived from the request, a token replayed for a DIFFERENT user is a
-        // mismatched reuse rather than a retry, and is refused with the modelled
-        // conflict instead of answering about a resource the caller did not ask for.
-        if let Some(existing) = state.idempotent_arn(Self::NAME, &input.client_request_token) {
-            if existing == arn {
+        // `TagList` is `@length(min: 1)`, so the member is either absent or non-empty.
+        // Sorted for the FINGERPRINT below, because a tag set is unordered: the same tags
+        // in another order are the same request. The order is not observable — the shared
+        // tag directory holds a resource's tags keyed by tag key and reports them in key
+        // order — so sorting here changes nothing a caller can read back.
+        let mut tags: Vec<(String, String)> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        tags.sort();
+
+        // The request this token stands for: every member the create persists, in one
+        // fixed order. The expiration settings are a structure, so each of its two
+        // members goes in on its own.
+        let expiration_days = input
+            .expiration_settings
+            .as_ref()
+            .map(|settings| settings.expiration_days.to_string());
+        let fingerprint = {
+            let mut fields: Vec<Option<&str>> = vec![
+                Some(input.app_instance_arn.as_str()),
+                Some(input.app_instance_user_id.as_str()),
+                Some(input.name.as_str()),
+                input.metadata.as_deref(),
+                expiration_days.as_deref(),
+                input
+                    .expiration_settings
+                    .as_ref()
+                    .map(|settings| settings.expiration_criterion.as_str()),
+            ];
+            for (key, value) in &tags {
+                fields.push(Some(key.as_str()));
+                fields.push(Some(value.as_str()));
+            }
+            crate::state::request_fingerprint(&fields)
+        };
+
+        // Idempotency (`@idempotencyToken` on `ClientRequestToken`): one token names one
+        // user, so a RETRY — the same token presented with the same request — answers
+        // with the ARN the first call minted and creates nothing new. A token already
+        // associated with a user but presented with a DIFFERENT request is not a retry of
+        // anything, and is refused with the modelled conflict rather than answering about
+        // a resource the caller did not ask for.
+        match state.token_replay(Self::NAME, &input.client_request_token, &fingerprint) {
+            crate::state::TokenReplay::Fresh => {}
+            crate::state::TokenReplay::Replays(existing) => {
                 return Ok(CreateAppInstanceUserOutput {
                     app_instance_user_arn: Some(existing),
                 });
             }
-            return Err(CreateAppInstanceUserErrorModeled::ConflictException(
-                ConflictException {
-                    code: Some("Conflict".to_string()),
-                    message: Some(format!(
-                        "ClientRequestToken was already used to create AppInstanceUser {existing}"
-                    )),
-                },
-            )
-            .into());
+            crate::state::TokenReplay::Mismatch => {
+                return Err(CreateAppInstanceUserErrorModeled::ConflictException(
+                    ConflictException {
+                        code: Some("Conflict".to_string()),
+                        message: Some(crate::state::TOKEN_ALREADY_ASSOCIATED_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
         }
 
         // A user only exists under an AppInstance, its id is unique within that
@@ -218,13 +259,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lookup and reports which of the three modelled refusals applies. In every
         // refusal nothing is written.
         let now = ::std::time::SystemTime::now();
-        // `TagList` is `@length(min: 1)`, so the member is either absent or non-empty.
-        let tags: Vec<(String, String)> = input
-            .tags
-            .unwrap_or_default()
-            .into_iter()
-            .map(|tag| (tag.key, tag.value))
-            .collect();
         let record = crate::state::AppInstanceUserRecord {
             arn: arn.clone(),
             app_instance_arn: input.app_instance_arn.clone(),
@@ -241,19 +275,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         match state.insert_user(record) {
             crate::state::InsertUser::Stored => {}
-            // This operation models no 404 shape, so an unknown parent is refused with
-            // the modelled `BadRequestException` carrying the `NotFound` error code.
+            // A parent whose own AppInstance was deleted can no longer take a user; any
+            // other unknown parent is refused with the modelled `BadRequestException`
+            // carrying the `NotFound` error code, this operation modelling no 404 shape.
             crate::state::InsertUser::NoSuchAppInstance => {
-                return Err(CreateAppInstanceUserErrorModeled::BadRequestException(
-                    BadRequestException {
-                        code: Some("NotFound".to_string()),
-                        message: Some(format!(
-                            "AppInstance {} does not exist",
-                            input.app_instance_arn
-                        )),
-                    },
-                )
-                .into());
+                return Err(match state.unresolved_arn(&input.app_instance_arn) {
+                    crate::state::UnresolvedArn::DeletedAppInstance => {
+                        CreateAppInstanceUserErrorModeled::ForbiddenException(ForbiddenException {
+                            code: Some("Forbidden".to_string()),
+                            message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                        })
+                        .into()
+                    }
+                    crate::state::UnresolvedArn::NeverExisted => {
+                        CreateAppInstanceUserErrorModeled::BadRequestException(
+                            BadRequestException {
+                                code: Some("NotFound".to_string()),
+                                message: Some(format!(
+                                    "AppInstance {} does not exist",
+                                    input.app_instance_arn
+                                )),
+                            },
+                        )
+                        .into()
+                    }
+                });
             }
             // The id is the caller's choice and is unique within its instance, so a
             // second create of the same id under a NEW token is a conflict, not a
@@ -262,10 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(CreateAppInstanceUserErrorModeled::ConflictException(
                     ConflictException {
                         code: Some("Conflict".to_string()),
-                        message: Some(format!(
-                            "AppInstanceUserId {} already exists in AppInstance {}",
-                            input.app_instance_user_id, input.app_instance_arn
-                        )),
+                        message: Some(crate::state::RESOURCE_ALREADY_EXISTS_MESSAGE.to_string()),
                     },
                 )
                 .into());
@@ -289,7 +332,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The user is stored either way; at the structural token ceiling the token is
         // simply not recorded, so the map cannot grow past it.
-        let _recorded = state.record_idempotency(Self::NAME, &input.client_request_token, &arn);
+        let _recorded = state.record_idempotency(
+            Self::NAME,
+            &input.client_request_token,
+            &arn,
+            &fingerprint,
+        );
         name_directory.lock().register(&arn, &input.name);
         if !tags.is_empty() {
             tag_directory.lock().tag(&arn, tags);

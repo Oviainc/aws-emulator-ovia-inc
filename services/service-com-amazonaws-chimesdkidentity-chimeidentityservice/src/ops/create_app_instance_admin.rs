@@ -183,12 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = {
             let store = state.lock();
             if !store.app_instances.contains_key(&input.app_instance_arn) {
-                // This operation models no 404 shape, so an unknown ARN is refused with
-                // the modelled `BadRequestException` carrying the `NotFound` error code.
-                return Err(not_found(format!(
-                    "AppInstance {} does not exist",
-                    input.app_instance_arn
-                )));
+                return Err(unresolved(
+                    store.unresolved_arn(&input.app_instance_arn),
+                    format!("AppInstance {} does not exist", input.app_instance_arn),
+                ));
             }
             if !input.app_instance_admin_arn.starts_with(&child_prefix) {
                 return Err(CreateAppInstanceAdminErrorModeled::BadRequestException(
@@ -212,10 +210,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     input.app_instance_arn
                 )) =>
                 {
-                    return Err(not_found(format!(
-                        "AppInstanceUser {} does not exist",
-                        input.app_instance_admin_arn
-                    )));
+                    return Err(unresolved(
+                        store.unresolved_arn(&input.app_instance_admin_arn),
+                        format!(
+                            "AppInstanceUser {} does not exist",
+                            input.app_instance_admin_arn
+                        ),
+                    ));
                 }
                 None => store.identity_name(&input.app_instance_admin_arn),
             }
@@ -237,6 +238,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             app_instance_arn: Some(input.app_instance_arn),
         })
+    }
+}
+
+/// Refuse the request for an ARN this service holds no resource for.
+///
+/// An ARN whose `AppInstance` has been DELETED is refused as a request this caller may no
+/// longer make: the instance that would have authorized the promotion is gone, and that is
+/// a different answer from the one an ARN that never named a resource earns.
+fn unresolved(
+    unresolved: crate::state::UnresolvedArn,
+    absent: String,
+) -> CreateAppInstanceAdminError {
+    match unresolved {
+        crate::state::UnresolvedArn::DeletedAppInstance => {
+            CreateAppInstanceAdminErrorModeled::ForbiddenException(ForbiddenException {
+                code: Some("Forbidden".to_string()),
+                message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+            })
+            .into()
+        }
+        crate::state::UnresolvedArn::NeverExisted => not_found(absent),
     }
 }
 

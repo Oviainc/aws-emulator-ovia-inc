@@ -1000,9 +1000,12 @@ async fn deleting_an_app_instance_cascades_to_its_bots() {
         "expected DeleteAppInstance to answer 204, got {status} {body:?}"
     );
 
+    // The deleted AppInstance can no longer serve a listing of the bots it held, so the
+    // refusal is the modelled permanent one rather than the unknown-ARN report.
     let (status, body) = list_bots_raw(&emulator, &doomed, "").await;
     assert_eq!(
-        status, 400,
+        (status, body["Code"].as_str()),
+        (403, Some("Forbidden")),
         "expected the deleted instance's bot listing to be refused, got {status} {body:?}"
     );
 

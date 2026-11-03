@@ -164,9 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DescribeAppInstanceUserEndpointErrorModeled::ForbiddenException(
                     ForbiddenException {
                         code: Some("Forbidden".to_string()),
-                        message: Some(
-                            "You are not allowed to make this request.".to_string(),
-                        ),
+                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
                     },
                 )
                 .into(),

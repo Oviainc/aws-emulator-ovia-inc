@@ -1024,7 +1024,8 @@ async fn delete_removes_the_resource_and_cascades_to_its_users() {
         );
         let (status, body) = emulator.describe_app_instance(&doomed).await;
         assert_eq!(
-            status, 400,
+            (status, body["Code"].as_str()),
+            (403, Some("Forbidden")),
             "case {case:?}: a deleted instance must not describe, got {status} {body:?}"
         );
         let instances = emulator.list_app_instances().await;
@@ -1035,7 +1036,8 @@ async fn delete_removes_the_resource_and_cascades_to_its_users() {
         for user in &users {
             let (status, body) = emulator.describe_user(user).await;
             assert_eq!(
-                status, 400,
+                (status, body["Code"].as_str()),
+                (403, Some("Forbidden")),
                 "case {case:?}: deleting the instance must cascade to {user:?}, got {status} {body:?}"
             );
         }

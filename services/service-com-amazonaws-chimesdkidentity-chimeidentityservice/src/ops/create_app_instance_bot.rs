@@ -186,8 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // `TagList` is `@length(min: 1)`, so the member is either absent or non-empty.
-        // Sorted, because a tag set is unordered: the same tags in another order are the
-        // same request.
+        // Sorted for the FINGERPRINT below, because a tag set is unordered: the same tags
+        // in another order are the same request. The order is not observable — the shared
+        // tag directory holds a resource's tags keyed by tag key and reports them in key
+        // order — so sorting here changes nothing a caller can read back.
         let mut tags: Vec<(String, String)> = input
             .tags
             .clone()
@@ -197,36 +199,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         tags.sort();
 
+        // The request this token stands for: every member the create persists, in one
+        // fixed order. `Configuration` is a structure of scalars, so each of its members
+        // goes in on its own.
+        let fingerprint = {
+            let lex = &input.configuration.lex;
+            let mut fields: Vec<Option<&str>> = vec![
+                Some(input.app_instance_arn.as_str()),
+                input.name.as_deref(),
+                input.metadata.as_deref(),
+                Some(lex.lex_bot_alias_arn.as_str()),
+                Some(lex.locale_id.as_str()),
+                lex.responds_to.as_deref(),
+                lex.welcome_intent.as_deref(),
+                lex.invoked_by
+                    .as_ref()
+                    .map(|invoked_by| invoked_by.standard_messages.as_str()),
+                lex.invoked_by
+                    .as_ref()
+                    .map(|invoked_by| invoked_by.targeted_messages.as_str()),
+            ];
+            for (key, value) in &tags {
+                fields.push(Some(key.as_str()));
+                fields.push(Some(value.as_str()));
+            }
+            crate::state::request_fingerprint(&fields)
+        };
+
         // Idempotency (`@idempotencyToken` on `ClientRequestToken`): one token names one
         // bot, so a RETRY — the same token presented with the same request — answers with
         // the ARN the first call minted and creates nothing new. A token already
         // associated with a bot but presented with a DIFFERENT request is not a retry of
         // anything, and is refused with the modelled conflict rather than silently
         // answering about a resource the caller did not ask for.
-        if let Some(existing) = state.idempotent_arn(Self::NAME, &input.client_request_token) {
-            let replays = state.bot(&existing).is_some_and(|bot| {
-                bot.app_instance_arn == input.app_instance_arn
-                    && bot.name == input.name
-                    && bot.metadata == input.metadata
-                    && same_configuration(&bot.configuration, &input.configuration)
-                    && tag_directory.lock().tags_of(&existing) == tags
-            });
-            if replays {
+        match state.token_replay(Self::NAME, &input.client_request_token, &fingerprint) {
+            crate::state::TokenReplay::Fresh => {}
+            crate::state::TokenReplay::Replays(existing) => {
                 return Ok(CreateAppInstanceBotOutput {
                     app_instance_bot_arn: Some(existing),
                 });
             }
-            return Err(CreateAppInstanceBotErrorModeled::ConflictException(
-                ConflictException {
-                    code: Some("Conflict".to_string()),
-                    message: Some(
-                        "The provided ClientRequestToken is already associated with an existing \
-                         resource."
-                            .to_string(),
-                    ),
-                },
-            )
-            .into());
+            crate::state::TokenReplay::Mismatch => {
+                return Err(CreateAppInstanceBotErrorModeled::ConflictException(
+                    ConflictException {
+                        code: Some("Conflict".to_string()),
+                        message: Some(crate::state::TOKEN_ALREADY_ASSOCIATED_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
         }
 
         // A bot exists only under an AppInstance, and the store is bounded —
@@ -249,19 +270,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         match state.insert_bot(record) {
             crate::state::InsertBot::Stored => {}
-            // This operation models no 404 shape, so an unknown parent is refused with
-            // the modelled `BadRequestException` carrying the `NotFound` error code.
+            // A parent whose own AppInstance was deleted can no longer take a bot; any
+            // other unknown parent is refused with the modelled `BadRequestException`
+            // carrying the `NotFound` error code, this operation modelling no 404 shape.
             crate::state::InsertBot::NoSuchAppInstance => {
-                return Err(CreateAppInstanceBotErrorModeled::BadRequestException(
-                    BadRequestException {
-                        code: Some("NotFound".to_string()),
-                        message: Some(format!(
-                            "AppInstance {} does not exist",
-                            input.app_instance_arn
-                        )),
-                    },
-                )
-                .into());
+                return Err(match state.unresolved_arn(&input.app_instance_arn) {
+                    crate::state::UnresolvedArn::DeletedAppInstance => {
+                        CreateAppInstanceBotErrorModeled::ForbiddenException(ForbiddenException {
+                            code: Some("Forbidden".to_string()),
+                            message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                        })
+                        .into()
+                    }
+                    crate::state::UnresolvedArn::NeverExisted => {
+                        CreateAppInstanceBotErrorModeled::BadRequestException(
+                            BadRequestException {
+                                code: Some("NotFound".to_string()),
+                                message: Some(format!(
+                                    "AppInstance {} does not exist",
+                                    input.app_instance_arn
+                                )),
+                            },
+                        )
+                        .into()
+                    }
+                });
             }
             crate::state::InsertBot::AtCapacity => {
                 return Err(
@@ -282,7 +315,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The bot is stored either way; at the structural token ceiling the token is
         // simply not recorded, so the map cannot grow past it.
-        let _recorded = state.record_idempotency(Self::NAME, &input.client_request_token, &arn);
+        let _recorded = state.record_idempotency(
+            Self::NAME,
+            &input.client_request_token,
+            &arn,
+            &fingerprint,
+        );
         // `Name` is optional on a bot, and a bot created without one has no name to
         // publish: the directory holds what was registered, never a placeholder.
         if let Some(name) = &input.name {
@@ -296,25 +334,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             app_instance_bot_arn: Some(arn),
         })
     }
-}
-
-/// Whether two bot configurations ask for the same thing, member by member.
-///
-/// This is what decides a replay from a mismatched token reuse: `Configuration` is a
-/// structure of plain scalars (`LexConfiguration` plus its optional `InvokedBy`), so
-/// equality is member-wise over every one of them.
-fn same_configuration(stored: &Configuration, requested: &Configuration) -> bool {
-    let (stored, requested) = (&stored.lex, &requested.lex);
-    stored.lex_bot_alias_arn == requested.lex_bot_alias_arn
-        && stored.locale_id == requested.locale_id
-        && stored.responds_to == requested.responds_to
-        && stored.welcome_intent == requested.welcome_intent
-        && match (&stored.invoked_by, &requested.invoked_by) {
-            (Some(stored), Some(requested)) => {
-                stored.standard_messages == requested.standard_messages
-                    && stored.targeted_messages == requested.targeted_messages
-            }
-            (None, None) => true,
-            _ => false,
-        }
 }

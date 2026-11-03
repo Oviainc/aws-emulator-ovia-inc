@@ -191,16 +191,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         if state.remove_user(&input.app_instance_user_arn).is_none() {
-            return Err(DeleteAppInstanceUserErrorModeled::BadRequestException(
-                BadRequestException {
-                    code: Some("NotFound".to_string()),
-                    message: Some(format!(
-                        "AppInstanceUser {} does not exist",
-                        input.app_instance_user_arn
-                    )),
-                },
-            )
-            .into());
+            return Err(match state.unresolved_arn(&input.app_instance_user_arn) {
+                // The AppInstance this user hung off has been deleted, taking the user
+                // with it, so there is nothing left to delete: the answer is the modelled
+                // permanent refusal.
+                crate::state::UnresolvedArn::DeletedAppInstance => {
+                    DeleteAppInstanceUserErrorModeled::ForbiddenException(ForbiddenException {
+                        code: Some("Forbidden".to_string()),
+                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                    })
+                    .into()
+                }
+                // This operation models no 404 shape, so an ARN that never named a user
+                // is refused with the modelled `BadRequestException` carrying the
+                // `NotFound` error code.
+                crate::state::UnresolvedArn::NeverExisted => {
+                    DeleteAppInstanceUserErrorModeled::BadRequestException(BadRequestException {
+                        code: Some("NotFound".to_string()),
+                        message: Some(format!(
+                            "AppInstanceUser {} does not exist",
+                            input.app_instance_user_arn
+                        )),
+                    })
+                    .into()
+                }
+            });
         }
 
         tag_directory.lock().forget(&input.app_instance_user_arn);

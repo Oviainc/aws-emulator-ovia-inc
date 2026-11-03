@@ -157,20 +157,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
+        // Which refusal an unresolvable ARN earns is decided from the store BEFORE the
+        // record is taken for writing, so the decision is one read rather than a second
+        // borrow inside the refusal.
+        let unresolved = state.unresolved_arn(&input.app_instance_arn);
         let Some(record) = state.app_instances.get_mut(&input.app_instance_arn) else {
-            // This operation models no 404 shape, so an unknown ARN is refused with the
-            // modelled `BadRequestException` carrying the `NotFound` error code — the
-            // same refusal `DescribeAppInstance` states for an absent instance.
-            return Err(UpdateAppInstanceErrorModeled::BadRequestException(
-                BadRequestException {
-                    code: Some("NotFound".to_string()),
-                    message: Some(format!(
-                        "AppInstance {} does not exist",
-                        input.app_instance_arn
-                    )),
-                },
-            )
-            .into());
+            return Err(match unresolved {
+                // The AppInstance this ARN names has been deleted, so there is nothing
+                // left to update: the answer is the modelled permanent refusal.
+                crate::state::UnresolvedArn::DeletedAppInstance => {
+                    UpdateAppInstanceErrorModeled::ForbiddenException(ForbiddenException {
+                        code: Some("Forbidden".to_string()),
+                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                    })
+                    .into()
+                }
+                // This operation models no 404 shape, so an ARN that never named an
+                // instance is refused with the modelled `BadRequestException` carrying
+                // the `NotFound` error code — the same refusal `DescribeAppInstance`
+                // states for an absent instance.
+                crate::state::UnresolvedArn::NeverExisted => {
+                    UpdateAppInstanceErrorModeled::BadRequestException(BadRequestException {
+                        code: Some("NotFound".to_string()),
+                        message: Some(format!(
+                            "AppInstance {} does not exist",
+                            input.app_instance_arn
+                        )),
+                    })
+                    .into()
+                }
+            });
         };
 
         // `Name` and `Metadata` are both `required`, so an update REPLACES the stored

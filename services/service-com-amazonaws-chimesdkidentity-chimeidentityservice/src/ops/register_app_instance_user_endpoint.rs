@@ -207,11 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 RegisterAppInstanceUserEndpointErrorModeled::ConflictException(ConflictException {
                     code: Some("Conflict".to_string()),
-                    message: Some(
-                        "The provided ClientRequestToken is already associated with an existing \
-                         resource."
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::TOKEN_ALREADY_ASSOCIATED_MESSAGE.to_string()),
                 })
                 .into(),
             );
@@ -278,21 +274,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusals applies. In either refusal nothing is written.
         match state.insert_endpoint(record) {
             crate::state::InsertEndpoint::Stored => {}
-            // This operation models no 404 shape, so an unknown user is refused with
-            // the modelled `BadRequestException` carrying the `NotFound` error code.
+            // A user whose own AppInstance was deleted can no longer take an endpoint; any
+            // other unknown user is refused with the modelled `BadRequestException`
+            // carrying the `NotFound` error code, this operation modelling no 404 shape.
             crate::state::InsertEndpoint::NoSuchAppInstanceUser => {
-                return Err(
-                    RegisterAppInstanceUserEndpointErrorModeled::BadRequestException(
-                        BadRequestException {
-                            code: Some("NotFound".to_string()),
-                            message: Some(format!(
-                                "AppInstanceUser {} does not exist",
-                                input.app_instance_user_arn
-                            )),
-                        },
-                    )
-                    .into(),
-                );
+                return Err(match state.unresolved_arn(&input.app_instance_user_arn) {
+                    crate::state::UnresolvedArn::DeletedAppInstance => {
+                        RegisterAppInstanceUserEndpointErrorModeled::ForbiddenException(
+                            ForbiddenException {
+                                code: Some("Forbidden".to_string()),
+                                message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                            },
+                        )
+                        .into()
+                    }
+                    crate::state::UnresolvedArn::NeverExisted => {
+                        RegisterAppInstanceUserEndpointErrorModeled::BadRequestException(
+                            BadRequestException {
+                                code: Some("NotFound".to_string()),
+                                message: Some(format!(
+                                    "AppInstanceUser {} does not exist",
+                                    input.app_instance_user_arn
+                                )),
+                            },
+                        )
+                        .into()
+                    }
+                });
             }
             crate::state::InsertEndpoint::AtCapacity => {
                 return Err(

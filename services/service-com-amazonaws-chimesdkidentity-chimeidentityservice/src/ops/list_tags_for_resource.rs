@@ -154,16 +154,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the AppInstance store is unavailable".to_string()),
             })
         })?;
-        if !state.lock().taggable(&input.resource_arn) {
-            // This operation models no 404 shape, so an absent resource is refused with
-            // the modelled `BadRequestException` carrying the `NotFound` error code.
-            return Err(ListTagsForResourceErrorModeled::BadRequestException(
-                BadRequestException {
-                    code: Some("NotFound".to_string()),
-                    message: Some(format!("resource {} does not exist", input.resource_arn)),
-                },
-            )
-            .into());
+        // `None` when the ARN names a resource a tagging call may address; otherwise WHY
+        // it does not, which is what decides the refusal.
+        let unresolved = {
+            let store = state.lock();
+            (!store.taggable(&input.resource_arn))
+                .then(|| store.unresolved_arn(&input.resource_arn))
+        };
+        if let Some(unresolved) = unresolved {
+            return Err(match unresolved {
+                // The AppInstance this ARN belongs to has been deleted, so it can no
+                // longer serve a read of its own tags or of a cascaded-away child's: the
+                // answer is the modelled permanent refusal.
+                crate::state::UnresolvedArn::DeletedAppInstance => {
+                    ListTagsForResourceErrorModeled::ForbiddenException(ForbiddenException {
+                        code: Some("Forbidden".to_string()),
+                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                    })
+                    .into()
+                }
+                // This operation models no 404 shape, so an ARN that names no resource
+                // this service serves tagging for is refused with the modelled
+                // `BadRequestException` carrying the `NotFound` error code.
+                crate::state::UnresolvedArn::NeverExisted => {
+                    ListTagsForResourceErrorModeled::BadRequestException(BadRequestException {
+                        code: Some("NotFound".to_string()),
+                        message: Some(format!("resource {} does not exist", input.resource_arn)),
+                    })
+                    .into()
+                }
+            });
         }
 
         let tags: Vec<Tag> = directory

@@ -31,6 +31,8 @@ mod resource_update;
 mod signing_name_route_claim;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/token_reuse_and_deleted_refusals.rs"]
+mod token_reuse_and_deleted_refusals;
 #[path = "all/user_endpoint_registration.rs"]
 mod user_endpoint_registration;
 #[path = "all/user_expiration_settings.rs"]
