@@ -15,7 +15,7 @@
 //!    fixed and names no environment. Rows vary the name (length, case, the `-`/`_`
 //!    characters `EnvironmentName`'s pattern allows) and the operation; the wording rule
 //!    itself has its own suite (`tests/all/env_endpoint_not_found_wording.rs`), the BODY
-//!    SHAPE the front door's refusal arrives in has another
+//!    SHAPE each refusal arrives in has another
 //!    (`tests/all/env_endpoint_front_door.rs`), and the envelope every other refusal
 //!    travels in a third (`tests/all/env_endpoint_payload.rs`).
 //! 2. The `/tags/{ResourceArn}` operations refuse a well-formed ARN that resolves to no
@@ -26,7 +26,9 @@
 //!    spells it with, and leaves every other violation class worded as the framework words
 //!    it. Rows vary the operation, the member, where the member is bound (body, nested
 //!    structure, URI label) and which anchors the pattern carries (both, leading only,
-//!    none); each row's pattern is quoted from the shape named in its comment.
+//!    none); each row's pattern is quoted from the shape named in its comment. The ONE
+//!    member outside this rule is the tagging surface's `ResourceArn`, which that surface
+//!    words itself (`tests/all/tagging_resource_arn_refusal.rs`).
 //! 4. `CreateWebLoginToken` and `CreateCliToken` mint a token for an environment that
 //!    EXISTS and report it with the web-server host that environment's own stored
 //!    `WebserverUrl` carries; two calls mint two different tokens. Rows vary the
@@ -88,8 +90,8 @@ impl Answer {
     }
 
     /// The body as a JSON document when it is one, and `Value::Null` when it is not — the
-    /// refusals the environment data endpoint's front door answers carry the sentence as
-    /// plain text rather than a document.
+    /// refusal the proxied operation relays carries the sentence as plain text rather than
+    /// a document.
     fn document(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
@@ -473,7 +475,11 @@ fn create_body_with(member: &str, value: &str) -> Value {
 /// The table. Every `modelled` string below is the `smithy.api#pattern` of the shape named
 /// in the row's comment, from
 /// `smithy_query(query="shape", shape="<Shape>", model_path="services/service-com-amazonaws-mwaa-amazonmwaa/smithy-model/com-amazonaws-mwaa-amazonmwaa.json")`.
-/// None of them is the member the issue cited.
+/// None of them is the member the issue cited. `EnvironmentArn` — the only input member
+/// whose pattern is anchored at the START only — is absent on purpose: the tagging surface
+/// words a value that member cannot be itself, so no constraint clause is rendered for it
+/// (that refusal has its own suite, and the anchoring of a start-only expression is
+/// asserted by the unit test beside `constraint_clause`).
 fn pattern_cases() -> Vec<PatternCase> {
     vec![
         // `S3BucketArn`: anchored at both ends, in a top-level body member.
@@ -536,17 +542,6 @@ fn pattern_cases() -> Vec<PatternCase> {
             path: "name",
             modelled: r"^[a-zA-Z][0-9a-zA-Z-_]*$",
             advertised: r"[a-zA-Z][0-9a-zA-Z-_]*",
-        },
-        // `EnvironmentArn`: anchored at the START only, so only the leading `^` goes.
-        PatternCase {
-            label: "TagResource.ResourceArn",
-            method: "POST",
-            uri: "/tags/not-an-environment-arn".to_string(),
-            body: Some(json!({"Tags": {"k": "v"}})),
-            value: "not-an-environment-arn",
-            path: "resourceArn",
-            modelled: r"^arn:aws(-[a-z]+)?:airflow:[a-z0-9\-]+:\d{12}:environment/\w+",
-            advertised: r"arn:aws(-[a-z]+)?:airflow:[a-z0-9\-]+:\d{12}:environment/\w+",
         },
     ]
 }

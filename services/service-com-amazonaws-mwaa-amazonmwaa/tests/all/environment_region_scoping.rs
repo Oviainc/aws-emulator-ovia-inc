@@ -67,8 +67,8 @@ impl Answer {
     }
 
     /// The body as a JSON document when it is one, and `Value::Null` when it is not — the
-    /// refusals the environment data endpoint's front door answers carry the sentence as
-    /// plain text rather than a document.
+    /// refusal the proxied operation relays carries the sentence as plain text rather than
+    /// a document.
     fn document(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }

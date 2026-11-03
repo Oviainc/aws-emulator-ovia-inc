@@ -21,12 +21,12 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — EDITED HERE: not a re-route. The key and the handler stay the
-//!   generated ones; an operation the model hosts on the ENVIRONMENT data endpoint is
-//!   served wrapped in that endpoint's front door ([`env_endpoint`]), which answers the one
-//!   refusal that front door owns — a name it cannot resolve — the way it answers it.
-//! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   generated ones; the one operation that PROXIES the environment's own Apache Airflow
+//!   REST API is served wrapped in that proxy ([`env_endpoint`]), which relays the refusal
+//!   the endpoint it called answered.
+//! - `override_refusal` — EDITED HERE: how this service words a request the framework
+//!   refused before any handler ran. See the inline note on that method for the two
+//!   rewordings it applies.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -49,6 +49,8 @@ use std::sync::Arc;
 /// WHICH endpoint the model hosts each operation of this service on — the fact the
 /// refusal wording of a name this service cannot resolve depends on.
 pub mod endpoints;
+/// The refusal contract of the ENVIRONMENT data endpoint: who words it, and the shape it
+/// travels in on each of the operations hosted there.
 pub mod env_endpoint;
 
 /// The error code this service answers an input-constraint violation with: the modeled
@@ -99,6 +101,36 @@ fn unanchored(pattern: &str) -> &str {
     }
 }
 
+/// The dotted path the validating walk names the tagging surface's ARN member with: the
+/// lowerCamel spelling of `ResourceArn`, the member `TagResource`, `UntagResource` and
+/// `ListTagsForResource` each bind to the `/tags/{ResourceArn}` URI label and the only
+/// member of that name in this service's model.
+const RESOURCE_ARN_PATH: &str = "resourceArn";
+
+/// How the `/tags/{ResourceArn}` operations refuse a value their ARN member cannot be,
+/// or `None` when this refusal is not that one.
+///
+/// A tagging request addresses its resource by an ARN, which that surface PARSES before
+/// anything resolves it: a value whose SYNTAX is not that of one of this service's
+/// resource ARNs is refused as a malformed resource ARN, with the wire error code that
+/// surface publishes ([`crate::scaffolded::BAD_REQUEST_EXCEPTION`]) and its own one-line
+/// reason ([`crate::state::INVALID_RESOURCE_ARN_MESSAGE`]) — never with the member path,
+/// the submitted value or the model's expression, none of which that refusal states.
+///
+/// Keyed on the MEMBER, so all three operations that carry it are worded alike, and on the
+/// `@pattern` violation alone, which is the parse this surface performs: a value that
+/// satisfies the ARN grammar but breaks another of the member's bounds is a different
+/// class of refusal and keeps the framework's wording, as does an absent member.
+fn resource_arn_refusal(violations: &[Violation]) -> Option<Refused> {
+    violations.iter().find(|violation| {
+        violation.path == RESOURCE_ARN_PATH && matches!(violation.kind, ViolationKind::Pattern(_))
+    })?;
+    Some(Refused {
+        code: crate::scaffolded::BAD_REQUEST_EXCEPTION.to_string(),
+        message: crate::state::INVALID_RESOURCE_ARN_MESSAGE.to_string(),
+    })
+}
+
 /// The `ValidationException` message for a refusal: the AWS envelope
 /// (`N validation error(s) detected: `) over one clause per violation, in the order the
 /// framework accumulated them.
@@ -121,10 +153,10 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The environment data endpoint's front door, which `override_operation` hands back
-    /// for the operations the model hosts on it. Built once, because that seam returns a
+    /// The Apache Airflow proxy, which `override_operation` hands back for the one
+    /// operation that relays another API's answer. Built once, because that seam returns a
     /// reference to it.
-    environment_data: env_endpoint::EnvironmentDataEndpoint,
+    airflow_proxy: env_endpoint::AirflowProxy,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -134,7 +166,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
-            environment_data: env_endpoint::EnvironmentDataEndpoint,
+            airflow_proxy: env_endpoint::AirflowProxy,
         }
     }
 }
@@ -161,14 +193,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // An operation the model hosts on the ENVIRONMENT data endpoint (`@endpoint` host
-        // prefix `env.`) is served through that endpoint's front door: the generated
-        // routing table still names the operation and the framework still owns its whole
-        // walk, and the wrapper answers the one refusal the front door itself owns — a
-        // name it cannot resolve to an environment — the way that front door answers it
-        // (see [`env_endpoint`]). Every other request, the control-plane lookups included,
-        // resolves through the generated routing table untouched.
-        env_endpoint::routes(&self.entry, req).then_some(&self.environment_data as _)
+        // The operation that PROXIES the environment's own Apache Airflow REST API is
+        // served through that proxy: the generated routing table still names the operation
+        // and the framework still owns its whole walk, and the wrapper relays the one
+        // refusal the endpoint it called answers — a name that front door cannot resolve —
+        // the way that endpoint sent it (see [`env_endpoint`]). Every other request, the
+        // token operations and the control-plane lookups included, resolves through the
+        // generated routing table untouched and keeps the protocol's error document.
+        env_endpoint::routes(&self.entry, req).then_some(&self.airflow_proxy as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -176,15 +208,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this
         // service reword it.
         //
-        // Only ONE thing is reworded here, and the code is restated unchanged: a
-        // `@pattern` requirement quotes the expression without the model's `^` / `$`
-        // anchors, which is how AWS advertises it. See [`constraint_clause`]. An
+        // Two things are reworded here. A value whose syntax is not that of one of this
+        // service's resource ARNs, on the `/tags/{ResourceArn}` surface, is refused the way
+        // that surface refuses it — its own code and its own one-line reason, stating
+        // nothing of the request (see [`resource_arn_refusal`]). Every other violation keeps
+        // the framework's own rendering and the modeled `ValidationException` code, with one
+        // change: a `@pattern` requirement quotes the expression without the model's `^` /
+        // `$` anchors, which is how AWS advertises it. See [`constraint_clause`]. An
         // authentication refusal keeps the framework's wording: it is not an
         // input-constraint failure.
         match refusal {
-            Refusal::Invalid(violations) => Some(Refused {
-                code: VALIDATION_EXCEPTION.to_string(),
-                message: constraint_envelope(violations)?,
+            Refusal::Invalid(violations) => resource_arn_refusal(violations).or_else(|| {
+                Some(Refused {
+                    code: VALIDATION_EXCEPTION.to_string(),
+                    message: constraint_envelope(violations)?,
+                })
             }),
             _ => None,
         }
@@ -216,5 +254,105 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One violation of `path`, outside `pattern`, holding `value`.
+    fn pattern_violation(path: &str, pattern: &str, value: &str) -> Violation {
+        Violation {
+            path: path.to_string(),
+            kind: ViolationKind::Pattern(pattern.to_string()),
+            value: Some(value.to_string()),
+            sensitive: false,
+        }
+    }
+
+    /// A `@pattern` clause quotes the expression without the anchors the model spells it
+    /// with, whichever anchors those are — including an expression anchored at ONE end
+    /// only, and one whose trailing `$` is escaped and therefore part of the expression.
+    #[test]
+    fn a_pattern_clause_drops_only_the_anchors_the_model_carries() {
+        for (case, modelled, advertised) in [
+            ("both ends", r"^[a-z]+$", r"[a-z]+"),
+            (
+                "the start only",
+                r"^arn:aws(-[a-z]+)?:airflow:[a-z0-9\-]+:\d{12}:environment/\w+",
+                r"arn:aws(-[a-z]+)?:airflow:[a-z0-9\-]+:\d{12}:environment/\w+",
+            ),
+            ("the end only", r"[a-z]+$", r"[a-z]+"),
+            ("neither end", r"(MON|TUE):(00|30)", r"(MON|TUE):(00|30)"),
+            ("an escaped dollar", r"^[a-z]+\$", r"[a-z]+\$"),
+        ] {
+            let clause = constraint_clause(&pattern_violation("member", modelled, "rejected"));
+            let expected = format!(
+                "Value 'rejected' at 'member' failed to satisfy constraint: Member must \
+                 satisfy regular expression pattern: {advertised}"
+            );
+            assert_eq!(
+                clause, expected,
+                "case {case:?}: expected {expected:?}, got {clause:?}"
+            );
+        }
+    }
+
+    /// The tagging surface's ARN member is refused by that surface when the value's SYNTAX
+    /// is not an ARN's — and a violation of another member, of another class, or of an
+    /// absent member is not.
+    #[test]
+    fn only_a_syntax_violation_of_the_tagging_arn_member_is_refused_by_that_surface() {
+        let refused = resource_arn_refusal(&[pattern_violation(
+            RESOURCE_ARN_PATH,
+            r"^arn:",
+            "not-an-mwaa-arn",
+        )])
+        .expect("the ARN member is refused by the tagging surface");
+        assert_eq!(
+            refused.code,
+            crate::scaffolded::BAD_REQUEST_EXCEPTION,
+            "expected the published code, got {:?}",
+            refused.code
+        );
+        assert_eq!(
+            refused.message,
+            crate::state::INVALID_RESOURCE_ARN_MESSAGE,
+            "expected the surface's own reason, got {:?}",
+            refused.message
+        );
+
+        for (case, path) in [
+            ("a name label", "name"),
+            ("a body member", "sourceBucketArn"),
+            ("a member whose name merely contains it", "myResourceArn"),
+        ] {
+            let answered = resource_arn_refusal(&[pattern_violation(path, r"^arn:", "rejected")]);
+            assert!(
+                answered.is_none(),
+                "case {case:?}: must keep the framework's envelope, got {answered:?}"
+            );
+        }
+
+        // Every other violation class of that same member is a different refusal: the
+        // value satisfied the ARN grammar, so the surface read it and some OTHER bound
+        // rejected it.
+        for (case, kind) in [
+            ("an absent member", ViolationKind::MissingRequiredMember),
+            ("past the member's maximum", ViolationKind::MaxLength(1224)),
+            ("short of its minimum", ViolationKind::MinLength(1)),
+        ] {
+            let answered = resource_arn_refusal(&[Violation {
+                path: RESOURCE_ARN_PATH.to_string(),
+                kind,
+                value: Some("a value".to_string()),
+                sensitive: false,
+            }]);
+            assert!(
+                answered.is_none(),
+                "case {case:?}: must keep the framework's envelope, got {answered:?}"
+            );
+        }
     }
 }

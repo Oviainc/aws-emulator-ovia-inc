@@ -236,6 +236,20 @@ impl SerializableStruct for NotFoundException {
     }
 }
 
+/// The wire error code the `/tags/{ResourceArn}` operations publish for a `ResourceArn`
+/// they cannot parse as one of this service's resource ARNs.
+///
+/// The same seam as [`Scaffolded::not_found`], for the refusal that precedes it: the
+/// tagging surface parses the ARN before it resolves anything, and the code it publishes
+/// for a value it cannot parse is not the name of any shape this service's model declares
+/// (the model offers only `ValidationException` there). Error dispatch in every AWS SDK is
+/// by WIRE CODE, so a client telling a malformed-ARN programming error from an absent
+/// resource must see the two codes the service really publishes. This refusal is raised
+/// ahead of the handler, by the service's refusal seam
+/// (`crate::service::EmulatedService::override_refusal`), because the modelled `@pattern`
+/// on that member is enforced at the boundary.
+pub const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]

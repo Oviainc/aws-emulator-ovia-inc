@@ -4,27 +4,31 @@
 //! end over HTTP through the router this service mounts in production.
 //!
 //! The rule: the operations the model hosts on that endpoint (`@endpoint` host prefix
-//! `env.`) are addressed to a per-environment front door, which resolves the request to one
-//! environment before any of this service's own code runs, so a name that resolves to
-//! nothing is refused BY THAT FRONT DOOR — ahead of the layer that owns the modelled errors
-//! and their serialization. Its 404 therefore carries the failure SENTENCE as its whole
-//! body: no JSON envelope around it and no error-code discriminator inside it. The code
-//! still travels in the `x-amzn-errortype` header, which is where restJson1 resolves an
-//! error shape from, so a client reading the body as the human-readable reason gets that
-//! text and a client branching on the code still gets `ResourceNotFoundException`.
+//! `env.`) are addressed to a per-environment front door, which decides the SENTENCE of a
+//! name it cannot resolve — its own fixed one, naming no environment — while WHO answers
+//! the client decides the shape that sentence travels in. The operations this service
+//! SERVES itself (the two that mint a token for the environment's web server) answer
+//! through its own modelled error channel, so their 404 is the protocol's error DOCUMENT: a
+//! JSON object carrying the sentence in `message`, which is where an SDK reads it. The
+//! operation that PROXIES the environment's own Apache Airflow REST API relays what the
+//! endpoint it called answered, and there is no Apache Airflow API to call for a name that
+//! resolves to nothing — so what it relays is that front door's own refusal, whose body is
+//! the sentence and nothing else. Both carry the modelled code in `x-amzn-errortype`, which
+//! is where restJson1 resolves an error shape from, so a client branching on the code reads
+//! `ResourceNotFoundException` either way.
 //!
-//! Everything the layers BEHIND that front door refuse keeps the protocol's own error
-//! document — a request outside a modelled constraint, an Apache Airflow call the
-//! environment's own API refused, a control-plane lookup of an unknown name — which the
-//! second test asserts over the same operations, so the rule is the front door's refusal
-//! and not "every 4xx of this endpoint". The envelope those refusals travel in has its own
+//! Everything the layers BEHIND the front door refuse arrives in the protocol's document —
+//! a request outside a modelled constraint, an Apache Airflow call the environment's own API
+//! refused, a control-plane lookup of an unknown name — which the second test asserts over
+//! the same operations, so the one body outside the document is the relayed refusal and not
+//! "every 4xx of this endpoint". That document across every other operation has its own
 //! suite (`tests/all/env_endpoint_payload.rs`), and WHICH sentence each condition is worded
 //! with a third (`tests/all/env_endpoint_not_found_wording.rs`).
 //!
 //! Each row of the first table varies what the rule generalises over: the operation (every
-//! one the model hosts on that endpoint), the environment name (every form
-//! `EnvironmentName`'s own constraints allow), and — for the proxied operation — the Apache
-//! Airflow method, path and payload the call names.
+//! one the model hosts on that endpoint, on both sides of the split), the environment name
+//! (every form `EnvironmentName`'s own constraints allow), and — for the proxied operation —
+//! the Apache Airflow method, path and payload the call names.
 
 use std::sync::Arc;
 
@@ -52,9 +56,12 @@ const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 /// endpoint really answers with and not whatever the implementation currently holds.
 const ENDPOINT_NOT_FOUND_SENTENCE: &str = "Environment not found";
 
-/// The members a JSON error document can carry an error code in — none of which the front
-/// door's refusal has anywhere to put, since its body is not a document at all.
+/// The members a JSON error document can carry an error code in, in the order an SDK's
+/// restJson1 parser consults them when the header is absent.
 const DISCRIMINATOR_MEMBERS: [&str; 3] = ["__type", "code", "Code"];
+
+/// The members it can carry the sentence in.
+const MESSAGE_MEMBERS: [&str; 2] = ["message", "Message"];
 
 /// One HTTP answer, reduced to what these tests assert on.
 struct Answer {
@@ -196,14 +203,21 @@ fn unknown_names() -> Vec<String> {
 }
 
 /// One call of an operation the environment data endpoint hosts:
-/// `(label, method, uri template whose `{}` takes the name, body)`.
-type Call = (&'static str, &'static str, &'static str, Option<Value>);
+/// `(label, method, uri template whose `{}` takes the name, body, whether the operation
+/// RELAYS another API's answer rather than serving the caller itself)`.
+type Call = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<Value>,
+    bool,
+);
 
 /// Every operation the model hosts on the environment data endpoint, each called the way
-/// its HTTP binding says. The proxied operation appears several times, differing along
-/// `RestApiMethod`'s own value list (DELETE | GET | PATCH | POST | PUT), the `RestApiPath`
-/// `@length(1, 64)` bounds (one character, and 64) and whether `Body` / `QueryParameters`
-/// are carried at all.
+/// its HTTP binding says, with the side of the split it falls on. The proxied operation
+/// appears several times, differing along `RestApiMethod`'s own value list (DELETE | GET |
+/// PATCH | POST | PUT), the `RestApiPath` `@length(1, 64)` bounds (one character, and 64)
+/// and whether `Body` / `QueryParameters` are carried at all.
 ///
 /// Source for both value lists: this service's Smithy model —
 /// `smithy_query(query="shape",shape="RestApiMethod,RestApiPath",model_path="services/service-com-amazonaws-mwaa-amazonmwaa/smithy-model/com-amazonaws-mwaa-amazonmwaa.json")`.
@@ -213,19 +227,21 @@ type Call = (&'static str, &'static str, &'static str, Option<Value>);
 /// leaves one of them out.
 fn environment_data_calls() -> Vec<Call> {
     vec![
-        ("CreateCliToken", "POST", "/clitoken/{}", None),
-        ("CreateWebLoginToken", "POST", "/webtoken/{}", None),
+        ("CreateCliToken", "POST", "/clitoken/{}", None, false),
+        ("CreateWebLoginToken", "POST", "/webtoken/{}", None, false),
         (
             "InvokeRestApi, a bare GET",
             "POST",
             "/restapi/{}",
             Some(json!({"Path": "/dags", "Method": "GET"})),
+            true,
         ),
         (
             "InvokeRestApi, a POST carrying a body",
             "POST",
             "/restapi/{}",
             Some(json!({"Path": "/dags/x/dagRuns", "Method": "POST", "Body": {"conf": {}}})),
+            true,
         ),
         (
             "InvokeRestApi, a PATCH carrying query parameters",
@@ -236,24 +252,27 @@ fn environment_data_calls() -> Vec<Call> {
                 "Method": "PATCH",
                 "QueryParameters": {"update_mask": "is_paused"},
             })),
+            true,
         ),
         (
             "InvokeRestApi, a DELETE at the one-character path minimum",
             "POST",
             "/restapi/{}",
             Some(json!({"Path": "/", "Method": "DELETE"})),
+            true,
         ),
         (
             "InvokeRestApi, a PUT at the 64-character path maximum",
             "POST",
             "/restapi/{}",
             Some(json!({"Path": format!("/{}", "p".repeat(63)), "Method": "PUT"})),
+            true,
         ),
     ]
 }
 
 #[tokio::test]
-async fn the_front_door_refuses_an_unresolvable_name_with_the_sentence_as_the_whole_body() {
+async fn the_refusal_of_an_unresolvable_name_arrives_in_the_shape_its_answerer_sends() {
     let harness = Harness::new();
     // One environment exists, so a refusal below is the name lookup failing and not an
     // empty store answering.
@@ -279,7 +298,7 @@ async fn the_front_door_refuses_an_unresolvable_name_with_the_sentence_as_the_wh
     }
 
     for name in unknown_names() {
-        for (operation, method, uri, body) in environment_data_calls() {
+        for (operation, method, uri, body, relays) in environment_data_calls() {
             let case = format!("{operation} / {name}");
             let answer = harness
                 .send(method, &uri.replace("{}", &name), body.clone())
@@ -296,29 +315,56 @@ async fn the_front_door_refuses_an_unresolvable_name_with_the_sentence_as_the_wh
                 "case {case:?}: the code travels in {ERROR_TYPE_HEADER}, got {:?}",
                 answer.error_type_header
             );
-            // The whole of the rule: the body is the sentence, byte for byte.
-            assert_eq!(
-                answer.text(),
-                ENDPOINT_NOT_FOUND_SENTENCE,
-                "case {case:?}: expected the sentence as the whole body, got {:?}",
-                answer.text()
-            );
-            // Which it cannot be while also being an error document: nothing wraps it, so
-            // there is nowhere in the body for a discriminator to sit.
-            assert!(
-                !answer.document().is_object(),
-                "case {case:?}: the body must not be a JSON document, got {:?}",
-                answer.text()
-            );
-            for member in DISCRIMINATOR_MEMBERS {
+            if relays {
+                // The operation relays what the endpoint it called answered, so the body is
+                // that front door's own: the sentence, byte for byte.
+                assert_eq!(
+                    answer.text(),
+                    ENDPOINT_NOT_FOUND_SENTENCE,
+                    "case {case:?}: expected the relayed sentence as the whole body, got {:?}",
+                    answer.text()
+                );
+                // Which it cannot be while also being an error document: nothing wraps it,
+                // so there is nowhere in the body for a discriminator to sit.
                 assert!(
-                    !answer.text().contains(member),
-                    "case {case:?}: the body must carry no {member} discriminator, got {:?}",
+                    !answer.document().is_object(),
+                    "case {case:?}: the relayed body must not be a JSON document, got {:?}",
+                    answer.text()
+                );
+                for member in DISCRIMINATOR_MEMBERS {
+                    assert!(
+                        !answer.text().contains(member),
+                        "case {case:?}: the relayed body must carry no {member} discriminator, \
+                         got {:?}",
+                        answer.text()
+                    );
+                }
+            } else {
+                // The operation answers through this service's own modelled error channel,
+                // so the body is the protocol's error document and the sentence is a MEMBER
+                // of it — which is the only place an SDK looks.
+                let document = answer.document();
+                let object = document.as_object().unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: expected a JSON object error document, got {:?}",
+                        answer.text()
+                    )
+                });
+                let carried = MESSAGE_MEMBERS
+                    .iter()
+                    .find_map(|member| object.get(*member).and_then(Value::as_str));
+                assert_eq!(
+                    carried,
+                    Some(ENDPOINT_NOT_FOUND_SENTENCE),
+                    "case {case:?}: expected the sentence in the document's message member, \
+                     got {:?}",
                     answer.text()
                 );
             }
-            // What an SDK's error parser still hands its caller: the modelled code from the
-            // header, and the sentence from the body it could not parse as a document.
+            // What an SDK's error parser hands its caller, on both sides of the split: the
+            // modelled code from the header, and the sentence — out of the document where
+            // there is one, out of the body it could not parse as a document where there is
+            // not.
             let (code, message) = answer.parsed_error();
             assert_eq!(
                 code, "ResourceNotFoundException",
@@ -336,11 +382,9 @@ async fn the_front_door_refuses_an_unresolvable_name_with_the_sentence_as_the_wh
                 answer.text()
             );
             assert_eq!(
-                answer.text(),
-                state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE,
-                "case {case:?}: the body is the sentence this service words the condition \
-                 with, got {:?}",
-                answer.text()
+                message, state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE,
+                "case {case:?}: the sentence is the one this service words the condition \
+                 with, got {message:?}"
             );
         }
     }

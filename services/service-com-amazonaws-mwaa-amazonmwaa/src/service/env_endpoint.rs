@@ -1,16 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! How the ENVIRONMENT data endpoint answers a request that names an environment it does
-//! not front.
+//! What the ENVIRONMENT data endpoint answers for a request that names an environment it
+//! does not front.
 //!
 //! # The rule
 //!
 //! The operations the model hosts on that endpoint (`@endpoint` host prefix `env.`) are
-//! addressed to a per-environment front door, which has to resolve the request to one
-//! environment's Apache Airflow web server before any of this service's own code runs. A
-//! name that resolves to nothing is therefore refused BY THAT FRONT DOOR, ahead of the
-//! layer that owns the modelled errors and their serialization — so the 404 it answers
-//! carries the failure SENTENCE as its whole body, as the recorded wire shows:
+//! addressed to a per-environment front door, which resolves the request to one
+//! environment's Apache Airflow web server. A name that resolves to nothing is refused
+//! with that endpoint's OWN fixed sentence
+//! ([`crate::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE`]), which names no environment —
+//! unlike a control-plane lookup, which words the condition from the name the request asked
+//! for.
+//!
+//! WHO answers the client decides the shape that sentence travels in, and the operations
+//! hosted here split in two:
+//!
+//! * the operations this service SERVES itself — the ones that mint a token for the
+//!   environment's web server — answer through its own modelled error channel, so their
+//!   refusal is the protocol's error DOCUMENT: a JSON object carrying the sentence in its
+//!   `message` member, with the shape named in `x-amzn-errortype`. An SDK reads `message`
+//!   out of that object, so nothing may replace the document with the sentence alone.
+//! * the operation that PROXIES the environment's own Apache Airflow REST API
+//!   ([`PROXIED_OPERATION`]) relays what the endpoint it called answered. There is no
+//!   Apache Airflow API to call for a name that resolves to nothing, so what it relays is
+//!   the front door's own refusal, whose body is the SENTENCE and nothing else:
 //!
 //! ```text
 //! HTTP/1.1 404 Not Found
@@ -19,20 +33,18 @@
 //! Environment not found
 //! ```
 //!
-//! No JSON envelope around it and no discriminator member inside it: the body is the
-//! sentence and nothing else. The error CODE still travels in the `x-amzn-errortype`
-//! header, which is where restJson1 resolves an error shape from, so a client still reads
-//! the modelled code — and a client that reads the body as the human-readable reason gets
-//! that text rather than a serialized object. An SDK's JSON error parser, finding a body
-//! that is not JSON, reports the body itself as the message, so both the code and the
-//! sentence still reach the caller.
+//! No JSON envelope around it and no discriminator member inside it. The error CODE still
+//! travels in the `x-amzn-errortype` header, which is where restJson1 resolves an error
+//! shape from, so a client still reads the modelled code — and an SDK's JSON error parser,
+//! finding a body that is not a document, reports the body itself as the message, so both
+//! the code and the sentence still reach the caller.
 //!
 //! Every OTHER refusal of this service keeps the protocol's own error document: the
-//! refusals raised on the service's other endpoints ([`super::endpoints`]), which word the
-//! condition from the request, and every refusal the application layer behind this front
-//! door raises — a request outside a modelled constraint, an Apache Airflow call the
-//! environment's own API refused — are answered by the layer that models them, not by the
-//! front door.
+//! refusals raised on its other endpoints ([`super::endpoints`]), the token operations'
+//! refusal of a name the front door could not resolve, and every refusal the application
+//! layer behind the proxy raises — a request outside a modelled constraint, an Apache
+//! Airflow call the environment's own API refused, which the proxy reports through its own
+//! modelled members.
 //!
 //! Only the body is the front door's: the status, the `x-amzn-errortype` header and the
 //! media type the protocol announces are left where their renderer put them, because what
@@ -42,28 +54,30 @@
 //!
 //! # Where it is applied
 //!
-//! [`EnvironmentDataEndpoint`] is the wrapper the service hands back from its
-//! `override_operation` seam for exactly the operations hosted on that endpoint
-//! ([`routes`]). It serves the operation the generated routing table names — the framework
-//! keeps the whole deserialize → validate → handle → serialize walk, and the handler keeps
-//! raising its modelled `ResourceNotFoundException`, so the status, the code and the
-//! sentence are all still decided there — and then answers that one refusal the way the
-//! front door answers it. Nothing else is touched: every other status, header and body
-//! byte is left exactly as its renderer wrote it.
+//! [`AirflowProxy`] is the wrapper the service hands back from its `override_operation`
+//! seam for exactly the proxied operation ([`routes`]). It serves the operation the
+//! generated routing table names — the framework keeps the whole deserialize → validate →
+//! handle → serialize walk, and the handler keeps raising its modelled
+//! `ResourceNotFoundException`, so the status, the code and the sentence are all still
+//! decided there — and then relays that one refusal the way the proxied endpoint's front
+//! door sent it. Nothing else is touched: every other status, header and body byte is left
+//! exactly as its renderer wrote it.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_types::body::SdkBody;
 use serde_json::Value;
 use smithy_server_runtime::{BoxFuture, ErasedOperation, OperationContext, Service};
 
-use super::endpoints::{self, Endpoint};
+/// The one operation of this service that PROXIES another HTTP API rather than serving the
+/// caller itself: it reports the status and the document the environment's own Apache
+/// Airflow REST API answered (`RestApiStatusCode` / `RestApiResponse`), so what reaches the
+/// client is what that endpoint sent. Named by the routing key the protocol resolves for it,
+/// which is the operation's shape name.
+pub const PROXIED_OPERATION: &str = "InvokeRestApi";
 
-/// Whether the model hosts the operation this routing key names on the environment data
-/// endpoint — read from the crate's endpoint census ([`super::endpoints`]), which records
-/// the host prefix the model declares for EVERY operation of this service, so membership
-/// here is the `env.` class itself and not the complement of another one.
-fn hosted_here(key: &str) -> bool {
-    endpoints::hosted_on(key, Endpoint::EnvironmentData)
+/// Whether this routing key names the proxied operation.
+fn proxies(key: &str) -> bool {
+    key == PROXIED_OPERATION
 }
 
 /// The response header restJson1 resolves an error shape from.
@@ -126,8 +140,8 @@ fn front_door_sentence(status: u16, code: Option<&str>, body: &[u8]) -> Option<S
         .map(str::to_string)
 }
 
-/// `resp` as the environment data endpoint's front door answers it: a refusal of a name it
-/// cannot resolve carries the sentence alone, and everything else is returned untouched.
+/// `resp` as the proxied operation relays it: a refusal of a name the front door cannot
+/// resolve carries the sentence alone, and everything else is returned untouched.
 ///
 /// The status, the `x-amzn-errortype` header and every other header are left where their
 /// renderer put them — only the body bytes are the front door's own — and a renderer that
@@ -153,26 +167,26 @@ pub fn fronted(mut resp: RtResponse) -> RtResponse {
     resp
 }
 
-/// The operation the generated routing table names for this request, when it is one the
-/// environment data endpoint hosts.
-fn environment_data_operation<'s>(
+/// The operation the generated routing table names for this request, when it is the proxied
+/// one.
+fn proxied_operation<'s>(
     svc: &'s dyn Service,
     req: &'s RtRequest,
 ) -> Option<&'s dyn ErasedOperation> {
     let definition = svc.definition();
     let key = definition.protocol().routing_key(req).ok()?;
-    if !hosted_here(key) {
+    if !proxies(key) {
         return None;
     }
     definition.routing_table().get(key)
 }
 
-/// Whether this request names an operation the environment data endpoint hosts — the
-/// condition under which the service claims it for [`EnvironmentDataEndpoint`].
+/// Whether this request names the proxied operation — the condition under which the service
+/// claims it for [`AirflowProxy`].
 ///
 /// Every other request is declined here and resolves through the generated routing table
-/// untouched, so this front door cannot change how a control-plane lookup or an unroutable
-/// request is answered.
+/// untouched, so this wrapper cannot change how a token operation, a control-plane lookup or
+/// an unroutable request is answered.
 pub fn routes<Eng: Send + Sync + 'static>(
     entry: &crate::ServiceDefinition<Eng>,
     req: &RtRequest,
@@ -181,22 +195,22 @@ pub fn routes<Eng: Send + Sync + 'static>(
         .protocol()
         .routing_key(req)
         .ok()
-        .filter(|key| hosted_here(key))
+        .filter(|key| proxies(key))
         .and_then(|key| entry.routing_table().get(key))
         .is_some()
 }
 
-/// Serves one operation of the environment data endpoint exactly as the generated routing
-/// table would, then answers the front door's own refusal of an unresolvable name the way
-/// the front door answers it ([`fronted`]).
+/// Serves the proxied operation exactly as the generated routing table would, then relays
+/// the front door's own refusal of an unresolvable name the way that front door sent it
+/// ([`fronted`]).
 ///
 /// It holds no operation of its own: the one it delegates to is the one the routing table
 /// names for the request, resolved from the `svc` the framework passes into
 /// [`ErasedOperation::run`].
 #[derive(Debug, Clone, Copy)]
-pub struct EnvironmentDataEndpoint;
+pub struct AirflowProxy;
 
-impl ErasedOperation for EnvironmentDataEndpoint {
+impl ErasedOperation for AirflowProxy {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -204,12 +218,12 @@ impl ErasedOperation for EnvironmentDataEndpoint {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            match environment_data_operation(svc, req) {
+            match proxied_operation(svc, req) {
                 Some(op) => fronted(op.run(svc, req, ctx).await),
                 // Unreachable through `Service::override_operation`, which claims a request
-                // only when the routing table holds the key of an operation this endpoint
-                // hosts ([`routes`]); answered as the framework answers an unroutable
-                // request rather than guessed at.
+                // only when the routing table holds the proxied operation's key
+                // ([`routes`]); answered as the framework answers an unroutable request
+                // rather than guessed at.
                 None => svc.definition().routing_error_response(req),
             }
         })
@@ -226,6 +240,7 @@ impl ErasedOperation for EnvironmentDataEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::endpoints::{self, Endpoint};
 
     /// A rendered response carrying `body`, at `status`, with the error-type header when
     /// `code` is `Some`.
@@ -246,8 +261,28 @@ mod tests {
         String::from_utf8_lossy(resp.body().bytes().expect("in-memory bytes")).to_string()
     }
 
-    /// The front door's refusal becomes the sentence alone — whichever member the renderer
-    /// put the code and the sentence in, and whatever the sentence says.
+    /// The operation this wrapper claims is one the model hosts on the environment data
+    /// endpoint, read from the crate's census rather than restated — and it is the ONLY one
+    /// this wrapper claims, so the other operations hosted there keep their own rendering.
+    #[test]
+    fn only_the_proxied_operation_of_the_data_endpoint_is_claimed() {
+        assert!(
+            endpoints::hosted_on(PROXIED_OPERATION, Endpoint::EnvironmentData),
+            "the proxied operation must be one the data endpoint hosts, got {:?}",
+            endpoints::endpoint_of(PROXIED_OPERATION)
+        );
+        for (operation, _) in endpoints::OPERATION_ENDPOINTS {
+            assert_eq!(
+                proxies(operation),
+                operation == PROXIED_OPERATION,
+                "case {operation:?}: only {PROXIED_OPERATION} proxies another API, got {}",
+                proxies(operation)
+            );
+        }
+    }
+
+    /// The relayed refusal becomes the sentence alone — whichever member the renderer put
+    /// the code and the sentence in, and whatever the sentence says.
     #[test]
     fn the_refusal_of_an_unresolvable_name_carries_the_sentence_alone() {
         for discriminator in DISCRIMINATOR_MEMBERS {
@@ -368,7 +403,7 @@ mod tests {
         assert_eq!(
             text(&answered),
             "Environment not found",
-            "the front door's refusal must carry the sentence alone, got {}",
+            "the relayed refusal must carry the sentence alone, got {}",
             text(&answered)
         );
         assert_eq!(

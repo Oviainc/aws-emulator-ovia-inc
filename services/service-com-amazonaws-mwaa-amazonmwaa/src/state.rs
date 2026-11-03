@@ -1642,9 +1642,10 @@ pub fn environment_not_found_message(name: &str) -> String {
 /// nothing is refused by that front door, so the sentence is the endpoint's own and is
 /// FIXED: it states the condition and names no environment, ahead of the request-derived
 /// builder above. Every one of them raises it as the `message` of its modelled
-/// `ResourceNotFoundException`, and the front door answers that one refusal with the
-/// sentence as the whole body, the code travelling in the `x-amzn-errortype` header
-/// restJson1 resolves an error shape from (`crate::service::env_endpoint`).
+/// `ResourceNotFoundException`; the shape it then travels in depends on who answers the
+/// client — this service's own error channel renders the protocol's error document, while
+/// the proxied operation relays the front door's own body, the sentence alone
+/// (`crate::service::env_endpoint`).
 ///
 /// The text itself is only an example; what a client branches on is the 404 and the
 /// `x-amzn-errortype` code beside it. What is NOT an example is that the sentence is fixed:
@@ -1659,6 +1660,21 @@ pub const ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE: &str = "Environment not found"
 /// and the `NotFoundException` wire code these operations answer with (see
 /// [`crate::scaffolded::Scaffolded::not_found`]), not this prose.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The message the `/tags/{ResourceArn}` operations' malformed-ARN refusal carries.
+///
+/// A tagging operation addresses its resource by an ARN, which that surface PARSES before
+/// anything resolves it, and it states the parse failure rather than the request that
+/// caused it: the caller's value, the member it was bound to and the expression it had to
+/// satisfy are named by none of it, so the sentence has no variable part to fill. A value
+/// that is not an ARN of one of this service's resources has no syntax the surface could
+/// read an ARN out of, which is what the reason clause says.
+///
+/// Carried by the wire error code that surface publishes for this class,
+/// [`crate::scaffolded::BAD_REQUEST_EXCEPTION`] (HTTP 400), ahead of the
+/// [`RESOURCE_NOT_FOUND_MESSAGE`] refusal the lookup answers for an ARN the surface COULD
+/// read and nothing resolves.
+pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn: bad syntax";
 
 /// `AirflowIdentity`'s own `@length(1, 64)` maximum, which
 /// [`airflow_identity`] keeps the reported identity inside.

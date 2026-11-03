@@ -73,6 +73,8 @@ mod reserved_tag_keys;
 mod server_fault_error_channel;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging_resource_arn_refusal.rs"]
+mod tagging_resource_arn_refusal;
 #[path = "all/tags_member_single_rule.rs"]
 mod tags_member_single_rule;
 #[path = "all/web_login_token_caller_identity.rs"]

@@ -8,11 +8,12 @@
 //! every operation, whichever endpoint the model hosts it on (`@endpoint` host prefix `api.`
 //! or `env.`) and whichever status and code the condition answers with. That envelope is
 //! what a restJson1 client's error parser reads a code and a message out of: it looks both
-//! up as MEMBERS of the parsed body. The ONE refusal outside this rule is the environment
-//! data endpoint's own: a name its front door cannot resolve is refused ahead of the layer
-//! that models the errors, with the sentence as the whole body, which has its own suite
-//! (`tests/all/env_endpoint_front_door.rs`). WHICH sentence a body carries is a separate
-//! rule with a third (`tests/all/env_endpoint_not_found_wording.rs`).
+//! up as MEMBERS of the parsed body. The ONE refusal outside this rule is the one this
+//! service does not answer itself: the proxied operation RELAYS what the endpoint it called
+//! sent, which for a name the front door cannot resolve is the sentence as the whole body
+//! — that split has its own suite (`tests/all/env_endpoint_front_door.rs`). WHICH sentence
+//! a body carries is a separate rule with a third
+//! (`tests/all/env_endpoint_not_found_wording.rs`).
 //!
 //! Each table row varies what the rule generalises over: the operation and the endpoint
 //! hosting it, the status and the error code (404 `ResourceNotFoundException`, 400
@@ -190,9 +191,11 @@ type Refusal = (
 /// A refusal of every operation this service answers one for through a layer that models
 /// it, spanning both endpoints and every status and wire code it refuses with — so the
 /// envelope is pinned as the rule it is rather than as one operation's quirk. The
-/// `env.`-hosted token operations appear through their SERVED path only: a name their front
-/// door cannot resolve is refused ahead of this envelope, by
-/// `tests/all/env_endpoint_front_door.rs`'s rule.
+/// `env.`-hosted TOKEN operations appear through their unresolvable-name path as well: that
+/// refusal is worded by their endpoint's front door and answered by this service, so it
+/// travels in this same envelope. The proxied operation appears through its SERVED path
+/// only: the refusal it relays is the one body outside this rule, by
+/// `tests/all/env_endpoint_front_door.rs`'s split.
 fn other_refusals(unknown: &str, stored: &str) -> Vec<Refusal> {
     // `ResourceArn` is bound to a URI label, so its ARN's separators travel percent-encoded.
     let unresolvable_arn = format!("arn:aws:airflow:{REGION}:{ACCOUNT}:environment/NeverCreated")
@@ -225,6 +228,24 @@ fn other_refusals(unknown: &str, stored: &str) -> Vec<Refusal> {
             404,
             "ResourceNotFoundException",
             Sentence::Exactly(state::environment_not_found_message(unknown)),
+        ),
+        (
+            "CreateCliToken on an unknown name",
+            "POST",
+            format!("/clitoken/{unknown}"),
+            None,
+            404,
+            "ResourceNotFoundException",
+            Sentence::Exactly(state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE.to_string()),
+        ),
+        (
+            "CreateWebLoginToken on an unknown name",
+            "POST",
+            format!("/webtoken/{unknown}"),
+            None,
+            404,
+            "ResourceNotFoundException",
+            Sentence::Exactly(state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE.to_string()),
         ),
         (
             "ListTagsForResource on an ARN that resolves to nothing",

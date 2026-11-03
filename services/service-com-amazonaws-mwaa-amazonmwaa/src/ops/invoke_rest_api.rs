@@ -9,9 +9,10 @@
 //! resolves to nothing is refused with HTTP 404 and this operation's modelled
 //! `ResourceNotFoundException`, worded by the environment-scoped data endpoint that fronts
 //! it (`@endpoint` host prefix `env.`):
-//! [`crate::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE`] — and answered on the wire the
-//! way that front door answers it, with the sentence as the whole body and the code in the
-//! `x-amzn-errortype` header (`crate::service::env_endpoint`).
+//! [`crate::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE`] — and relayed to the client the
+//! way that front door sent it, with the sentence as the whole body and the code in the
+//! `x-amzn-errortype` header, because this operation reports what the endpoint it called
+//! answered (`crate::service::env_endpoint`).
 //!
 //! `Method`, `Path`, `QueryParameters` and `Body` are all acted on: the path selects the
 //! Apache Airflow resource, the method what is done to it, the query parameters page a
@@ -242,7 +243,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the modeled `ResourceNotFoundException` code, and the endpoint's own fixed
         // wording, which names no environment. The status, the code and the sentence are
         // decided here; the SHAPE that refusal travels in on the wire is the front door's
-        // (`crate::service::env_endpoint`), which carries the sentence as the whole body.
+        // (`crate::service::env_endpoint`), which this operation relays — the sentence as
+        // the whole body.
         let Some(environment) = store.environment_mut(&region, &input.name) else {
             return Err(InvokeRestApiErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

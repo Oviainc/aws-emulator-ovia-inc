@@ -81,8 +81,9 @@ impl Answer {
 
     /// The sentence the refusal carries, the way an SDK's JSON error parser reads it: the
     /// `message` member of a document body, and the body itself when the body is not a
-    /// document — which is how the environment data endpoint's front door answers (its
-    /// shape is pinned by `tests/all/env_endpoint_front_door.rs`).
+    /// document — which is how the proxied operation relays the data endpoint's own refusal
+    /// (the shape each refusal travels in is pinned by
+    /// `tests/all/env_endpoint_front_door.rs`).
     fn refusal_message(&self) -> String {
         match serde_json::from_slice(&self.body).unwrap_or(Value::Null) {
             Value::Object(object) => object

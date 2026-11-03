@@ -16,14 +16,17 @@
 //! * `ops.` — the internal operations endpoint, which hosts the one operation the model
 //!   marks internal.
 //!
-//! Which class an operation belongs to decides what answers a request this service cannot
-//! serve: a request to the per-environment endpoint naming an environment that resolves to
-//! nothing is refused by that front door, ahead of the layer that owns the modelled errors,
-//! while on EVERY other endpoint the refusal is raised by this service's own layer, in the
-//! error shape the model declares for the operation and worded by that layer (see
-//! [`crate::state::environment_not_found_message`]). So this classification is a fact a
-//! refusal depends on, and it is held here once instead of being restated — or assumed — at
-//! each place that needs it.
+//! Which class an operation belongs to decides HOW a request this service cannot serve is
+//! WORDED: a request to the per-environment endpoint naming an environment that resolves to
+//! nothing is refused with that front door's own fixed sentence, which names no
+//! environment, while on EVERY other endpoint the refusal is worded by this service's own
+//! layer from the name the request asked for (see
+//! [`crate::state::environment_not_found_message`]). The shape that sentence travels in
+//! then depends on who answers the client: this service's own modelled error channel
+//! renders the protocol's error document, while the operation that PROXIES the
+//! environment's Apache Airflow REST API relays the body the endpoint it called sent (see
+//! [`super::env_endpoint`]). So this classification is a fact a refusal depends on, and it
+//! is held here once instead of being restated — or assumed — at each place that needs it.
 //!
 //! The table below is checked against the shipped model by
 //! `tests/all/endpoint_host_prefix_census.rs`, so it cannot drift from what the model
