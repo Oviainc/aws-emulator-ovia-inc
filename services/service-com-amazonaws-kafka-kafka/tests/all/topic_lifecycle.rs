@@ -276,10 +276,9 @@ async fn a_created_topic_reads_back_from_the_record() {
 
 /// RULE: deleting a topic the cluster holds answers the non-terminal `DELETING`
 /// status and leaves that topic readable in `DELETING` until the clock owes its
-/// removal; afterwards every reader reports it gone (`DescribeTopic` with its
-/// modelled `NotFoundException`, `DeleteTopic` with its modelled
-/// `UnknownTopicOrPartitionException`), its name is free again, and no sibling
-/// topic of the cluster is touched.
+/// removal; afterwards every reader reports it gone with the one modelled
+/// `NotFoundException` (`DescribeTopic` and `DeleteTopic` alike), its name is
+/// free again, and no sibling topic of the cluster is touched.
 #[tokio::test]
 async fn delete_moves_the_topic_to_deleting_and_then_removes_it() {
     // Exhaustive over which topic of the set is deleted rather than sampled: the
@@ -365,8 +364,8 @@ async fn delete_moves_the_topic_to_deleting_and_then_removes_it() {
         let deleted_again = emulator.delete_topic(&cluster, target).await;
         assert_eq!(
             (deleted_again.status, deleted_again.error_code()),
-            (404, "UnknownTopicOrPartitionException"),
-            "case topic={target:?}: expected a removed topic to be a 404 UnknownTopicOrPartitionException from DeleteTopic, got {} {}",
+            (404, "NotFoundException"),
+            "case topic={target:?}: expected a removed topic to be a 404 NotFoundException from DeleteTopic, got {} {}",
             deleted_again.status,
             deleted_again.body
         );
@@ -402,8 +401,8 @@ async fn delete_moves_the_topic_to_deleting_and_then_removes_it() {
 /// `ClusterArn` that is not an MSK cluster ARN is a `BadRequestException`, a
 /// well-formed one this endpoint's region holds no cluster for is a
 /// `NotFoundException`, and a legal topic name an existing cluster holds no topic
-/// for is an `UnknownTopicOrPartitionException` — and a refusal leaves the
-/// registry exactly as it was.
+/// for is a `NotFoundException` — and a refusal leaves the registry exactly as
+/// it was.
 #[tokio::test]
 async fn delete_rejects_an_unknown_cluster_or_topic() {
     let emulator = Emulator::new();
@@ -451,18 +450,8 @@ async fn delete_rejects_an_unknown_cluster_or_topic() {
         ),
         (absent.clone(), "kept", 404, "NotFoundException"),
         (other_region, "kept", 404, "NotFoundException"),
-        (
-            cluster.clone(),
-            "absent-topic",
-            404,
-            "UnknownTopicOrPartitionException",
-        ),
-        (
-            cluster.clone(),
-            "absent.topic-2",
-            404,
-            "UnknownTopicOrPartitionException",
-        ),
+        (cluster.clone(), "absent-topic", 404, "NotFoundException"),
+        (cluster.clone(), "absent.topic-2", 404, "NotFoundException"),
     ];
 
     for (arn, topic, status, code) in &rows {

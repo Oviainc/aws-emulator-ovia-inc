@@ -17,9 +17,14 @@
 //! * a cluster this endpoint DOES hold whose `ClusterType` is serverless is refused
 //!   with [`crate::state::serverless_topic_apis_unsupported`], before the topic is
 //!   looked up: the Topic Management surface is not offered for that cluster kind;
-//! * a legal name the cluster holds no topic for is an
-//!   `UnknownTopicOrPartitionException`, the modelled 404 for the topic rather
-//!   than for the cluster.
+//! * a legal name the cluster holds no topic for — never created, or already
+//!   deleted — is a `NotFoundException`, the 404 this control plane answers for
+//!   every resource it cannot resolve, the cluster and the topic alike. The
+//!   model also declares `UnknownTopicOrPartitionException` with the same
+//!   status, but that error stands for the Apache Kafka broker-protocol
+//!   condition of the same name, not for a control-plane lookup miss, so a
+//!   client dispatching on the error code sees the same code here as from
+//!   `DescribeTopic`.
 //!
 //! Deleting a topic the cluster does hold moves it to `DELETING` and records the
 //! instant the clock owes its removal ([`crate::state::TOPIC_DELETION_DELAY`]),
@@ -237,18 +242,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::serverless_topic_apis_unsupported());
         }
 
+        // A name this cluster holds no topic for is the missing resource, reported
+        // with the same 404 `NotFoundException` the cluster miss above and every
+        // other topic operation answer: the topic is simply not there, which is a
+        // control-plane lookup miss and not the broker-protocol condition
+        // `UnknownTopicOrPartitionException` names. Whether the name was never
+        // created or its topic's removal has already fallen due makes no
+        // difference -- the registry answers both the same way.
         let Some(topic) = state.begin_topic_deletion(
             &input.cluster_arn,
             &input.topic_name,
             std::time::SystemTime::now(),
         ) else {
-            return Err(DeleteTopicErrorModeled::UnknownTopicOrPartitionException(
-                UnknownTopicOrPartitionException {
+            return Err(
+                DeleteTopicErrorModeled::NotFoundException(NotFoundException {
                     invalid_parameter: Some("TopicName".to_string()),
                     message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-            .into());
+                })
+                .into(),
+            );
         };
         Ok(DeleteTopicOutput {
             topic_arn: Some(topic.arn.clone()),

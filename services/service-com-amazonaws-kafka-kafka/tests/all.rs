@@ -111,6 +111,8 @@ mod storage_updates;
 mod topic_apis_serverless_gate;
 #[path = "all/topic_lifecycle.rs"]
 mod topic_lifecycle;
+#[path = "all/topic_lookup_miss_refusal.rs"]
+mod topic_lookup_miss_refusal;
 #[path = "all/topic_replication.rs"]
 mod topic_replication;
 #[path = "all/version_catalog_consistency.rs"]
