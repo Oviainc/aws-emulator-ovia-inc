@@ -353,9 +353,13 @@ async fn every_listed_entry_matches_the_catalogue_and_its_describe() {
 }
 
 /// RULE — `DisplayData` is reported COMPLETE for every provider: the record's display
-/// name and description, and an `https` icon URL, each inside the member's modelled
-/// length (`DisplayName` 1..100, `Description` 1..128, `IconUrl` 1..768 matching
-/// `^(http|https)://.*$`).
+/// name, its display name as an application as the description, and the provider's static
+/// portal icon URL, each inside the member's modelled length (`DisplayName` 1..100,
+/// `Description` 1..128, `IconUrl` 1..768 matching `^(http|https)://.*$`).
+///
+/// The description rule holds for EVERY entry, whichever of the two id forms it carries:
+/// `application_provider_display_data.rs` owns the suite that states it and the
+/// whole-provider structure the describe reports it in.
 pub(crate) fn assert_display_data(
     display_data: &Value,
     provider: &state::BuiltInApplicationProvider,
@@ -385,16 +389,13 @@ pub(crate) fn assert_display_data(
         (1..=128).contains(&description.chars().count()),
         "case {id:?}: Description is 1..128 characters, got {description:?}"
     );
-    // A catalogue application's portal description is its display name as an
-    // application; an AWS managed provider carries wording of its own.
-    if id.starts_with("catalog/") {
-        assert_eq!(
-            description,
-            format!("{} Application", provider.display_name),
-            "case {id:?}: a catalogue application's Description is its display name as an \
-             application, got {description:?}"
-        );
-    }
+    // Every provider's portal description is its display name as an application.
+    assert_eq!(
+        description,
+        format!("{} Application", provider.display_name),
+        "case {id:?}: a provider's Description is its display name as an application, got \
+         {description:?}"
+    );
 
     let icon_url = display_data["IconUrl"].as_str().unwrap_or_else(|| {
         panic!("case {id:?}: a provider must carry an IconUrl, got {display_data}")
@@ -411,6 +412,25 @@ pub(crate) fn assert_display_data(
         icon_url,
         provider.icon_url(),
         "case {id:?}: expected the record's IconUrl, got {icon_url:?}"
+    );
+    // The provider's static portal icon path: its own `app-<id>` under the portal's
+    // default icon file.
+    let path = icon_url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(_host, path)| path)
+        .unwrap_or_else(|| panic!("case {id:?}: expected a path in the IconUrl, got {icon_url:?}"));
+    let segment = path
+        .split('/')
+        .next()
+        .unwrap_or_else(|| panic!("case {id:?}: expected an app segment, got {icon_url:?}"));
+    assert!(
+        segment.starts_with("app-") && segment.len() > "app-".len(),
+        "case {id:?}: expected the provider's app-<id> segment, got {icon_url:?}"
+    );
+    assert!(
+        path.ends_with("/icons/default.png"),
+        "case {id:?}: expected the portal's default icon file, got {icon_url:?}"
     );
 }
 

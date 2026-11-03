@@ -17,12 +17,190 @@ pub struct DescribeApplicationProviderInput {
     pub application_provider_arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ssoadmin#DescribeApplicationProviderResponse")]
+/// What `DescribeApplicationProvider` reports: the four members the modelled
+/// `DescribeApplicationProviderResponse` declares, plus `ApplicationProvider`.
+///
+/// Member set, order and requiredness from
+/// `smithy_query(query="operation", operation="DescribeApplicationProvider")`, plus
+/// `ApplicationProvider` — the whole entry as the modelled `ApplicationProvider`
+/// structure (the same projection `ListApplicationProviders` reports), which is
+/// RECORDED BEHAVIOUR rather than modelled: the service answers this read with that
+/// structure BESIDE the flat members, and the on-disk model declares no such member.
+///
+/// `#[smithy_macros::smithy(shape = …)]` admits exactly the model's member list — a
+/// Rust field with no member behind it is a compile error — so the schema, the
+/// serializer and the deserializer the derive would emit are written out below
+/// instead, with the modelled members keeping the model's own indices and order and
+/// the unmodelled one appended LAST. A later model refresh that declares the member
+/// only has to move it into place and put the derive back.
+///
+/// Deliberately absent, because the derive's own output would be inert here too:
+/// constraint traits (the validating walk that enforces them runs on operation INPUTS
+/// only), the `@http` chain (baked on only for an INPUT shape) and `@xmlName` (this
+/// service speaks `awsJson1_1`, and each member's wire name IS its Smithy member
+/// name).
 #[derive(Debug, Clone, Default)]
 pub struct DescribeApplicationProviderOutput {
     pub application_provider_arn: String,
     pub federation_protocol: Option<String>,
     pub display_data: Option<DisplayData>,
     pub resource_server_config: Option<ResourceServerConfig>,
+    pub application_provider: Option<ApplicationProvider>,
 }
 
+impl DescribeApplicationProviderOutput {
+    pub const M_APPLICATION_PROVIDER_ARN: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ssoadmin#DescribeApplicationProviderResponse$ApplicationProviderArn",
+                "com.amazonaws.ssoadmin",
+                "ApplicationProviderArn",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "ApplicationProviderArn",
+            0,
+        );
+
+    pub const M_FEDERATION_PROTOCOL: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ssoadmin#DescribeApplicationProviderResponse$FederationProtocol",
+                "com.amazonaws.ssoadmin",
+                "FederationProtocol",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "FederationProtocol",
+            1,
+        );
+
+    pub const M_DISPLAY_DATA: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ssoadmin#DescribeApplicationProviderResponse$DisplayData",
+                "com.amazonaws.ssoadmin",
+                "DisplayData",
+            ),
+            ::aws_smithy_schema::ShapeType::Structure,
+            "DisplayData",
+            2,
+        );
+
+    pub const M_RESOURCE_SERVER_CONFIG: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ssoadmin#DescribeApplicationProviderResponse$ResourceServerConfig",
+                "com.amazonaws.ssoadmin",
+                "ResourceServerConfig",
+            ),
+            ::aws_smithy_schema::ShapeType::Structure,
+            "ResourceServerConfig",
+            3,
+        );
+
+    /// The unmodelled member, appended after the model's own.
+    pub const M_APPLICATION_PROVIDER: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ssoadmin#DescribeApplicationProviderResponse$ApplicationProvider",
+                "com.amazonaws.ssoadmin",
+                "ApplicationProvider",
+            ),
+            ::aws_smithy_schema::ShapeType::Structure,
+            "ApplicationProvider",
+            4,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.ssoadmin#DescribeApplicationProviderResponse",
+            "com.amazonaws.ssoadmin",
+            "DescribeApplicationProviderResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_APPLICATION_PROVIDER_ARN,
+            &Self::M_FEDERATION_PROTOCOL,
+            &Self::M_DISPLAY_DATA,
+            &Self::M_RESOURCE_SERVER_CONFIG,
+            &Self::M_APPLICATION_PROVIDER,
+        ],
+    );
+}
+
+pub static DESCRIBE_APPLICATION_PROVIDER_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &DescribeApplicationProviderOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for DescribeApplicationProviderOutput {
+    fn serialize_members(
+        &self,
+        __s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // `ApplicationProviderArn` is `@required`: it is written whatever else is.
+        __s.write_string(
+            &Self::M_APPLICATION_PROVIDER_ARN,
+            self.application_provider_arn.as_str(),
+        )?;
+        if let ::std::option::Option::Some(__v) = self.federation_protocol.as_ref() {
+            __s.write_string(&Self::M_FEDERATION_PROTOCOL, __v.as_str())?;
+        }
+        if let ::std::option::Option::Some(__v) = self.display_data.as_ref() {
+            __s.write_struct(&Self::M_DISPLAY_DATA, __v)?;
+        }
+        if let ::std::option::Option::Some(__v) = self.resource_server_config.as_ref() {
+            __s.write_struct(&Self::M_RESOURCE_SERVER_CONFIG, __v)?;
+        }
+        if let ::std::option::Option::Some(__v) = self.application_provider.as_ref() {
+            __s.write_struct(&Self::M_APPLICATION_PROVIDER, __v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for DescribeApplicationProviderOutput {
+    fn deserialize(
+        __d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut __application_provider_arn: ::std::option::Option<::std::string::String> =
+            ::std::option::Option::None;
+        let mut __federation_protocol: ::std::option::Option<::std::string::String> =
+            ::std::option::Option::None;
+        let mut __display_data: ::std::option::Option<DisplayData> = ::std::option::Option::None;
+        let mut __resource_server_config: ::std::option::Option<ResourceServerConfig> =
+            ::std::option::Option::None;
+        let mut __application_provider: ::std::option::Option<ApplicationProvider> =
+            ::std::option::Option::None;
+        __d.read_struct(&Self::SCHEMA, &mut |__member, __d| {
+            match __member.member_index() {
+                ::std::option::Option::Some(0) => {
+                    __application_provider_arn = ::std::option::Option::Some(
+                        __d.read_string(&Self::M_APPLICATION_PROVIDER_ARN)?,
+                    );
+                }
+                ::std::option::Option::Some(1) => {
+                    __federation_protocol =
+                        ::std::option::Option::Some(__d.read_string(&Self::M_FEDERATION_PROTOCOL)?);
+                }
+                ::std::option::Option::Some(2) => {
+                    __display_data = ::std::option::Option::Some(<DisplayData as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(__d)?);
+                }
+                ::std::option::Option::Some(3) => {
+                    __resource_server_config = ::std::option::Option::Some(<ResourceServerConfig as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(__d)?);
+                }
+                ::std::option::Option::Some(4) => {
+                    __application_provider = ::std::option::Option::Some(<ApplicationProvider as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(__d)?);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            application_provider_arn: __application_provider_arn.ok_or_else(|| {
+                ::aws_smithy_schema_server::missing_member("ApplicationProviderArn")
+            })?,
+            federation_protocol: __federation_protocol,
+            display_data: __display_data,
+            resource_server_config: __resource_server_config,
+            application_provider: __application_provider,
+        })
+    }
+}

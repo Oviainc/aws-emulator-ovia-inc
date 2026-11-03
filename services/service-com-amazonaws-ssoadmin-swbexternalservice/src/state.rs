@@ -4119,11 +4119,6 @@ pub struct BuiltInApplicationProvider {
     /// `DisplayData$DisplayName` — "The name of the application provider that appears in
     /// the portal" (`Name`, 1..100).
     pub display_name: &'static str,
-    /// `DisplayData$Description` — "The description of the application provider that
-    /// appears in the portal" (1..128) — when the provider carries wording of its own.
-    /// `None` for a catalog application, whose portal description is DERIVED from its
-    /// display name (see [`BuiltInApplicationProvider::description`]).
-    pub description: Option<&'static str>,
     /// The access scopes `ApplicationProvider$ResourceServerConfig` reports for this
     /// provider — empty for a provider that exposes no resource server, which is then
     /// reported with no `ResourceServerConfig` at all rather than an empty one.
@@ -4164,14 +4159,17 @@ impl BuiltInAccessScope {
 /// id here (see [`BuiltInApplicationProvider::icon_url`]) rather than copied.
 const PROVIDER_ICON_HOST: &str = "static.global.sso.amazonaws.com";
 
-/// The portal description of a catalog application: its display name followed by this
+/// The portal description of an application provider: its display name followed by this
 /// word.
 ///
-/// SOURCE: recorded behavior — the catalog entry whose `DisplayName` is `Statuspage`
-/// carries `Description` `Statuspage Application`, i.e. a pre-integrated application's
-/// portal description is its name as an application. An AWS managed provider carries
-/// wording of its own instead ([`BuiltInApplicationProvider::description`]).
-const CATALOG_DESCRIPTION_SUFFIX: &str = "Application";
+/// SOURCE: recorded behavior — a provider's `DisplayData$Description` is its
+/// `DisplayName` as an application, for EVERY provider of the catalog and not only the
+/// pre-integrated ones: the entry whose display name is `Statuspage` carries
+/// `Statuspage Application`, and the custom provider's own description is its display
+/// name followed by the same word. The description is therefore composed from the
+/// display name ([`BuiltInApplicationProvider::description`]) rather than carried per
+/// entry.
+const PROVIDER_DESCRIPTION_SUFFIX: &str = "Application";
 
 /// `FederationProtocol::SAML`, the protocol of a pre-integrated catalog application: the
 /// IAM Identity Center application catalog is a catalog of SAML 2.0 applications.
@@ -4184,7 +4182,8 @@ const FEDERATION_OAUTH: &str = "OAUTH";
 impl BuiltInApplicationProvider {
     /// This provider's `DisplayData`, complete: every member the shape declares is
     /// reported, because every provider of the catalog HAS all three — the display name
-    /// and the description from the record, the icon URL derived from the provider id.
+    /// from the record, the description composed from it, the icon URL derived from the
+    /// provider id.
     pub fn display_data(&self) -> DisplayData {
         DisplayData {
             display_name: Some(self.display_name.to_string()),
@@ -4193,16 +4192,13 @@ impl BuiltInApplicationProvider {
         }
     }
 
-    /// This provider's `DisplayData$Description`: its own wording when it carries one,
-    /// else the catalog rule — the display name as an application
-    /// ([`CATALOG_DESCRIPTION_SUFFIX`]). Truncated on a character boundary to the
-    /// modelled `Description` ceiling of 128, so no entry can put an over-long value on
-    /// the wire.
+    /// This provider's `DisplayData$Description`: its display name as an application
+    /// ([`PROVIDER_DESCRIPTION_SUFFIX`]) — the one rule every entry of the catalog
+    /// follows, whichever of the two id forms it carries. Truncated on a character
+    /// boundary to the modelled `Description` ceiling of 128, so no display name the
+    /// modelled `Name` (1..100) admits can put an over-long value on the wire.
     pub fn description(&self) -> String {
-        let description = match self.description {
-            Some(description) => description.to_string(),
-            None => format!("{} {CATALOG_DESCRIPTION_SUFFIX}", self.display_name),
-        };
+        let description = format!("{} {PROVIDER_DESCRIPTION_SUFFIX}", self.display_name);
         truncate_chars(&description, 128)
     }
 
@@ -4267,10 +4263,22 @@ impl BuiltInApplicationProvider {
 
     /// This provider as the modeled `ApplicationProvider` shape — the member-for-member
     /// projection `ListApplicationProviders` reports, holding exactly what
-    /// `DescribeApplicationProvider` reports for the same entry.
+    /// `DescribeApplicationProvider` reports for the same entry, under this provider's ARN
+    /// in the `aws` partition.
     pub fn to_shape(&self) -> ApplicationProvider {
+        self.to_shape_under_arn(self.arn())
+    }
+
+    /// This provider as the modeled `ApplicationProvider` shape, reported under
+    /// `application_provider_arn`.
+    ///
+    /// The same provider exists in every partition the ARN pattern admits
+    /// ([`built_in_application_provider`] matches on the id alone), so a read that was
+    /// ASKED about one partition reports the entry under the ARN it was asked about; an
+    /// enumeration, which is asked about no ARN at all, reports [`Self::arn`].
+    pub fn to_shape_under_arn(&self, application_provider_arn: String) -> ApplicationProvider {
         ApplicationProvider {
-            application_provider_arn: self.arn(),
+            application_provider_arn,
             federation_protocol: Some(self.federation_protocol.to_string()),
             display_data: Some(self.display_data()),
             resource_server_config: self.resource_server_config(),
@@ -4285,15 +4293,13 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 /// One AWS MANAGED application provider: an Amazon Web Services application that receives
 /// a propagated identity from IAM Identity Center, so it federates over OAuth 2.0 and
-/// carries its own portal description and — where it publishes one — its resource server's
-/// access scopes.
+/// publishes — where it has one — its resource server's access scopes.
 ///
 /// The applications under such a provider are created by the Amazon Web Services service
 /// that owns it, not by the customer, so none of them is customer managed.
 const fn aws_managed_provider(
     id: &'static str,
     display_name: &'static str,
-    description: &'static str,
     scopes: &'static [BuiltInAccessScope],
 ) -> BuiltInApplicationProvider {
     BuiltInApplicationProvider {
@@ -4301,7 +4307,6 @@ const fn aws_managed_provider(
         federation_protocol: FEDERATION_OAUTH,
         customer_managed: false,
         display_name,
-        description: Some(description),
         scopes,
     }
 }
@@ -4312,7 +4317,6 @@ const fn aws_managed_provider(
 const fn customer_managed_provider(
     id: &'static str,
     display_name: &'static str,
-    description: &'static str,
     scopes: &'static [BuiltInAccessScope],
 ) -> BuiltInApplicationProvider {
     BuiltInApplicationProvider {
@@ -4320,15 +4324,14 @@ const fn customer_managed_provider(
         federation_protocol: FEDERATION_OAUTH,
         customer_managed: true,
         display_name,
-        description: Some(description),
         scopes,
     }
 }
 
 /// One PRE-INTEGRATED application of the IAM Identity Center application catalog: a SAML
-/// 2.0 application whose ARN id is `catalog/<Name>`, whose portal description follows the
-/// catalog rule ([`CATALOG_DESCRIPTION_SUFFIX`]) and which exposes no resource server of
-/// its own (the application is the relying party, not an API an identity propagates into).
+/// 2.0 application whose ARN id is `catalog/<Name>` and which exposes no resource server
+/// of its own (the application is the relying party, not an API an identity propagates
+/// into).
 const fn catalog_application(
     id: &'static str,
     display_name: &'static str,
@@ -4339,7 +4342,6 @@ const fn catalog_application(
         // A pre-integrated application is set up in the console, not through this API.
         customer_managed: false,
         display_name,
-        description: None,
         scopes: &[],
     }
 }
@@ -4364,44 +4366,26 @@ const fn catalog_application(
 ///   alongside service providers such as `glue`).
 ///
 /// The MEMBERSHIP is behavior, not model: AWS adds applications to its catalog over time,
-/// so this is the catalog the emulator publishes rather than a list any rule derives.
-/// What IS a rule — every entry carries a complete `DisplayData`, an id of one of the two
-/// forms above, and a `ResourceServerConfig` exactly when it publishes access scopes —
-/// holds for every entry here, and for any entry added to it.
+/// so this is the catalog the emulator publishes rather than a list any rule derives, and
+/// the ORDER is the order written here — a service-published catalog's order is its own
+/// data, which is why no read of it sorts.
+/// What IS a rule — every entry carries a complete `DisplayData` whose `Description` is
+/// its display name as an application ([`BuiltInApplicationProvider::description`]), an id
+/// of one of the two forms above, and a `ResourceServerConfig` exactly when it publishes
+/// access scopes — holds for every entry here, and for any entry added to it.
 ///
 /// A provider exists in every partition the ARN pattern admits, so the lookup
 /// ([`built_in_application_provider`]) matches on the id and not on the whole ARN.
 pub const BUILT_IN_APPLICATION_PROVIDERS: &[BuiltInApplicationProvider] = &[
     // ---- The custom (customer managed) provider ---------------------------------------
-    customer_managed_provider(
-        "custom",
-        "SSO Custom Application Provider",
-        "SSO Custom Application Provider",
-        &[],
-    ),
+    customer_managed_provider("custom", "SSO Custom Application Provider", &[]),
     // ---- AWS managed providers -------------------------------------------------------
-    aws_managed_provider(
-        "athena",
-        "Amazon Athena",
-        "Interactive query service for data in Amazon S3",
-        &[],
-    ),
-    aws_managed_provider(
-        "emr",
-        "Amazon EMR",
-        "Managed cluster platform for big data frameworks",
-        &[],
-    ),
-    aws_managed_provider(
-        "emr-serverless",
-        "Amazon EMR Serverless",
-        "Serverless runtime for big data frameworks",
-        &[],
-    ),
+    aws_managed_provider("athena", "Amazon Athena", &[]),
+    aws_managed_provider("emr", "Amazon EMR", &[]),
+    aws_managed_provider("emr-serverless", "Amazon EMR Serverless", &[]),
     aws_managed_provider(
         "glue",
         "AWS Glue",
-        "Serverless data integration service",
         &[BuiltInAccessScope {
             name: "glue:read_write",
             detailed_title: "Read and write AWS Glue data",
@@ -4411,23 +4395,16 @@ pub const BUILT_IN_APPLICATION_PROVIDERS: &[BuiltInApplicationProvider] = &[
     aws_managed_provider(
         "lakeformation",
         "AWS Lake Formation",
-        "Centrally governed permissions for a data lake",
         &[BuiltInAccessScope {
             name: "lakeformation:query",
             detailed_title: "Query Lake Formation data",
             long_description: "Grants access to query data governed by AWS Lake Formation",
         }],
     ),
-    aws_managed_provider(
-        "quicksight",
-        "Amazon QuickSight",
-        "Cloud-scale business intelligence service",
-        &[],
-    ),
+    aws_managed_provider("quicksight", "Amazon QuickSight", &[]),
     aws_managed_provider(
         "redshift",
         "Amazon Redshift",
-        "Cloud data warehouse",
         &[BuiltInAccessScope {
             name: "redshift:connect",
             detailed_title: "Connect to Amazon Redshift",
@@ -4437,7 +4414,6 @@ pub const BUILT_IN_APPLICATION_PROVIDERS: &[BuiltInApplicationProvider] = &[
     aws_managed_provider(
         "s3",
         "Amazon S3",
-        "Object storage for any amount of data",
         &[BuiltInAccessScope {
             name: "s3:access_grants:read_write",
             detailed_title: "Read and write Amazon S3 data",

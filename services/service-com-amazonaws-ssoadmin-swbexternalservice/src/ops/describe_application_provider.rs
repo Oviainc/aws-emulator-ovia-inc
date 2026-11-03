@@ -20,7 +20,9 @@
 //! why the same provider resolves in every partition the pattern admits, and the ARN
 //! reported back is the one asked for. Every member of the record is reported: the
 //! complete `DisplayData` and, where the provider publishes access scopes, its
-//! `ResourceServerConfig`.
+//! `ResourceServerConfig` — and, beside those flat members, the whole entry once more as
+//! an `ApplicationProvider` structure, which is RECORDED BEHAVIOUR the on-disk model does
+//! not declare (see [`DescribeApplicationProviderOutput`]).
 //!
 //! ## Shape of an operation
 //!
@@ -189,17 +191,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        let provider_shape = provider.to_shape_under_arn(input.application_provider_arn);
         Ok(DescribeApplicationProviderOutput {
-            // The ARN as ASKED FOR: the catalogue is keyed by provider id, so the
-            // partition the caller named is the partition reported back.
-            application_provider_arn: input.application_provider_arn,
-            federation_protocol: Some(provider.federation_protocol.to_string()),
-            display_data: Some(provider.display_data()),
-            // `ResourceServerConfig` describes "the application provider's resource
-            // server" and its access scopes: the catalogue record's own scopes, and
-            // ABSENT for a provider that publishes none (an empty `Scopes` map would
-            // claim a resource server that exposes nothing).
-            resource_server_config: provider.resource_server_config(),
+            // The entry as the modelled `ApplicationProvider`, under the ARN as ASKED
+            // FOR: the catalog is keyed by provider id, so the partition the caller
+            // named is the partition reported back. `ResourceServerConfig` describes
+            // "the application provider's resource server" and its access scopes: the
+            // catalog record's own scopes, and ABSENT for a provider that publishes none
+            // (an empty `Scopes` map would claim a resource server that exposes
+            // nothing).
+            application_provider_arn: provider_shape.application_provider_arn.clone(),
+            federation_protocol: provider_shape.federation_protocol.clone(),
+            display_data: provider_shape.display_data.clone(),
+            resource_server_config: provider_shape.resource_server_config.clone(),
+            // The same entry once more as a whole structure, which is what the service
+            // answers this read with beside the flat members — see
+            // `DescribeApplicationProviderOutput` for why the member is hand-written.
+            // Built from ONE value, so the envelope and the flat members cannot drift.
+            application_provider: Some(provider_shape),
         })
     }
 }

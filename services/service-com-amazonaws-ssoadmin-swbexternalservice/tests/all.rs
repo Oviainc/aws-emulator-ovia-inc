@@ -77,6 +77,8 @@ mod application_grants_list;
 mod application_list;
 #[path = "all/application_provider_describe.rs"]
 mod application_provider_describe;
+#[path = "all/application_provider_display_data.rs"]
+mod application_provider_display_data;
 #[path = "all/application_provider_resolution.rs"]
 mod application_provider_resolution;
 #[path = "all/application_refusal_wording.rs"]
