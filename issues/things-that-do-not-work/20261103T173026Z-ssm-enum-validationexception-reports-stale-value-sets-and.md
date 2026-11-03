@@ -1,0 +1,46 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: ssm-cloudconnector-list-empty-filter
+Issue-Step: task#2
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: ssm-cloudconnector-list-empty-filter ssm-describe-ops-items-filter-paths ssm-list-command-invocations-invalid-filter-key ssm-sshp-traj-session-manager-ssh-document-and-state-mistakes ssm-w22n-traj-instance-properties-route ssm-w22n-traj-inventory-filter-mistakes ssm-public-parameter-ami-lookup-and-errors
+Issue-Shape-Id: com.amazonaws.ssm#AmazonSSM
+Issue-Key: ssm|ListCloudConnectors|4xx->4xx|$.message
+Issue-Key: ssm|DescribeOpsItems|4xx->4xx|$.message
+Issue-Key: ssm|ListCommandInvocations|4xx->4xx|$.message
+Issue-Key: ssm|DescribeSessions|4xx->4xx|$.message
+Issue-Key: ssm|DescribeInstanceProperties|4xx->4xx|$.message
+Issue-Key: ssm|GetInventory|4xx->4xx|$.message
+Issue-Key: ssm|GetParameters|4xx->4xx|$.message
+Issue-Commit: 133bbb645e9618d24e6206d20cee2b832cb9c7e9
+
+# SSM enum ValidationException reports stale value sets and echoes the offending value
+
+> _Note: this issue was identified against the code base at commit `133bbb645e9618d24e6206d20cee2b832cb9c7e9`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+ListCloudConnectors
+
+## Description
+When an ssm request carries a value outside a modelled enum (or a list longer than the modelled maximum), the emulator answers with the right status (400) and error class but builds the message from the checked-in Smithy enum definition in declaration order and always echoes the rejected value. AWS's live services enumerate a LARGER accepted set for several of these enums, render the set in a different order, and for some members do not echo the value at all; for GetParameters it renders the whole rejected list rather than a count. 7 CAUSES. Message rule: fixed text is "1 validation error detected: Value <'value' or nothing> at '<path>' failed to satisfy constraint: Member must satisfy enum value set: [<accepted values>]"; the variable parts are the rejected value (when AWS echoes it), the member path, and the accepted-value list, which must be the set the live service accepts, not the set this checkout's model happens to declare.
+
+Cause 1 of 7 - ListCloudConnectors filterKey set is stale. AWS: 400, "1 validation error detected: Value 'NotARealFilterKey' at 'filters.1.member.filterKey' failed to satisfy constraint: Member must satisfy enum value set: [TenantId, OrganizationId, ProjectId, SubscriptionId]" (recorded behavior only - Smithy CloudConnectorFilterKey in this checkout declares only [SubscriptionId, TenantId], so the model is behind the service). Emulator: the same sentence with '[SubscriptionId, TenantId]'. Why: a client discovering the legal filter keys from the rejection message is told OrganizationId and ProjectId are illegal when the service accepts them. Fix: ListCloudConnectors filter validation + the accepted-value table it prints from. Traces: ssm-cloudconnector-list-empty-filter#task#2.
+
+Cause 2 of 7 - DescribeOpsItems filter key set is stale and mis-ordered. AWS: 400, enum value set of 42 keys which includes IdcInstanceArn, OrganizationId, OrganizationalUnitId, AssigneeType and AssigneeId, in a non-declaration order (recorded behavior only; Smithy OpsItemFilterKey declares 37 values and omits those five). Emulator: the 37 modelled values in declaration order. Why: five filter keys the service supports are reported illegal. Fix: DescribeOpsItems filter-key validation table. Traces: ssm-describe-ops-items-filter-paths#task#2.
+
+Cause 3 of 7 - ListCommandInvocations filter key set omits CommandId and InstanceId. AWS: 400, "... Member must satisfy enum value set: [CommandId, DocumentName, ExecutionStage, InvokedBefore, InstanceId, InvokedAfter, Status]" (recorded behavior only; Smithy CommandFilterKey declares [InvokedAfter, InvokedBefore, Status, ExecutionStage, DocumentName]). Emulator: the five modelled values. Why: CommandId and InstanceId are the two keys callers most often use and the message denies them. Fix: ListCommandInvocations filter-key validation table. Traces: ssm-list-command-invocations-invalid-filter-key#task#1.
+
+Cause 4 of 7 - DescribeSessions echoes the rejected State value. AWS: 400, "1 validation error detected: Value at 'state' failed to satisfy constraint: Member must satisfy enum value set: [Active, History]" - no value echoed for this member (Smithy: SessionState enum [Active, History]; the value-omission is recorded behavior only). Emulator: "Value 'active' at 'state' ...". Why: message-matching clients and users see text AWS does not produce. Fix: DescribeSessions input validation / the enum branch of the message formatter. Traces: ssm-sshp-traj-session-manager-ssh-document-and-state-mistakes#task#3, ssm-sshp-traj-session-manager-ssh-document-and-state-mistakes#task#4.
+
+Cause 5 of 7 - DescribeInstanceProperties echoes the rejected operator and reorders the set. AWS: 400, "1 validation error detected: Value at 'filtersWithOperator.1.member.operator' failed to satisfy constraint: Member must satisfy enum value set: [NotEqual, BeginWith, Equal, LessThan, GreaterThan]" - value omitted, set led by NotEqual (Smithy: InstancePropertyFilterOperator [Equal, NotEqual, BeginWith, LessThan, GreaterThan]). Emulator: "Value 'Contains' at ... [Equal, NotEqual, BeginWith, LessThan, GreaterThan]". Fix: as cause 4, in DescribeInstanceProperties validation. Traces: ssm-w22n-traj-instance-properties-route#task#1, ssm-w22n-traj-instance-properties-route#task#6, ssm-w22n-traj-instance-properties-route#task#7.
+
+Cause 6 of 7 - GetInventory renders the operator set in the wrong order. AWS: 400, "1 validation error detected: Value 'Contains' at 'filters.1.member.type' failed to satisfy constraint: Member must satisfy enum value set: [NotEqual, BeginWith, Equal, LessThan, GreaterThan, Exists]" (recorded ordering; Smithy InventoryQueryOperatorType declares [Equal, NotEqual, BeginWith, LessThan, GreaterThan, Exists]). Emulator: same set in declaration order. The set contents and the echoed value agree here; only the rendered order diverges, which is fixed text of the message and stable across the recordings. Fix: the accepted-value ordering used by GetInventory's filter validation. Traces: ssm-w22n-traj-inventory-filter-mistakes#task#1, ssm-w22n-traj-inventory-filter-mistakes#task#2.
+
+Cause 7 of 7 - GetParameters over-length Names list is summarised instead of rendered. AWS: 400, "1 validation error detected: Value '[<name1>, <name2>, ... <nameN>]' at 'names' failed to satisfy constraint: Member must have length less than or equal to 10" - the whole submitted list is rendered in brackets (Smithy: GetParameters.Names @length min 1 max 10). Emulator: "Value '11 items' at 'names' failed to satisfy constraint: Member must have length less than or equal to 10" - an invented placeholder in place of the value. Why: the caller cannot see which names it submitted, and no AWS message ever contains the text '<N> items'. Fix: the list-value rendering in the ssm validation message formatter. Traces: ssm-public-parameter-ami-lookup-and-errors#task#6.
+
+## Evidence
+Replay of simparity-wire-aws-v1. Representative cluster (ssm-cloudconnector-list-empty-filter#task#2, ListCloudConnectors): expected 400 / actual 400; $.message value_mismatch - expected "... Member must satisfy enum value set: [TenantId, OrganizationId, ProjectId, SubscriptionId]", got "... [SubscriptionId, TenantId]". DescribeOpsItems (ssm-describe-ops-items-filter-paths#task#2): expected 42-value set including IdcInstanceArn/OrganizationId/OrganizationalUnitId/AssigneeType/AssigneeId, got the 37-value modelled set. ListCommandInvocations (ssm-list-command-invocations-invalid-filter-key#task#1): expected set includes CommandId and InstanceId, got neither. DescribeSessions (ssm-sshp-traj-session-manager-ssh-document-and-state-mistakes#task#3) and DescribeInstanceProperties (ssm-w22n-traj-instance-properties-route#task#1): expected "Value at '<path>'", got "Value 'active'/'Contains' at '<path>'". GetInventory (ssm-w22n-traj-inventory-filter-mistakes#task#1): set order differs. GetParameters (ssm-public-parameter-ami-lookup-and-errors#task#6): expected the 11 names rendered in brackets, got "'11 items'". Smithy model consulted: services/service-com-amazonaws-ssm-amazonssm/smithy-model/com-amazonaws-ssm-amazonssm.json (CloudConnectorFilterKey, OpsItemFilterKey, CommandFilterKey, SessionState, InstancePropertyFilterOperator, InventoryQueryOperatorType, GetParameters.Names).
+
+## Steps to Reproduce
+1. Boot the emulator from this checkout and replay simparity-wire-aws-v1. 2. Representative: fixture ssm-cloudconnector-list-empty-filter, step task#2 - ListCloudConnectors with filters[0].filterKey='NotARealFilterKey'; compare $.message. 3. Then: DescribeOpsItems with opsItemFilters[0].key='NotARealFilterKey'; ListCommandInvocations with filters[0].key='NotARealCommandFilterKey'; DescribeSessions with State='active'; DescribeInstanceProperties with FiltersWithOperator[0].Operator='Contains'; GetInventory with Filters[0].Type='Contains'; GetParameters with 11 names.
