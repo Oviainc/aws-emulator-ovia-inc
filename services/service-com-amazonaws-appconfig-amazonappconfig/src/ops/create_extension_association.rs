@@ -278,6 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: crate::state::extension_association_arn(&region, &id),
             id: id.clone(),
             extension_id,
+            // The identifier this request named the extension by, kept as it was supplied:
+            // a deployment reports it as the association's `ProvidedIdentifier`, and which
+            // of the three accepted forms the caller used is the caller's.
+            provided_identifier: input.extension_identifier.clone(),
             extension_arn,
             extension_version_number,
             resource_arn,

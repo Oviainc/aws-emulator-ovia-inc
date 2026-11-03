@@ -150,12 +150,14 @@ struct Fixtures {
 }
 
 /// The AWS-authored extension the rows associate: the one that declares a parameter, so a
-/// row exercises a required value, and the one that declares none.
+/// row exercises a required value, and the one that declares none. Each is answered as the
+/// published ID a caller passes as an `ExtensionIdentifier`, which is also the id an
+/// applied extension reports.
 fn authored_with_parameter() -> &'static str {
     AWS_AUTHORED_EXTENSIONS
         .iter()
         .find(|authored| !authored.parameters.is_empty())
-        .map(|authored| authored.name)
+        .map(|authored| authored.id)
         .expect("the published catalogue declares at least one extension with a parameter")
 }
 
@@ -176,7 +178,7 @@ pub(crate) fn authored_without_parameter() -> &'static str {
     AWS_AUTHORED_EXTENSIONS
         .iter()
         .find(|authored| authored.parameters.is_empty())
-        .map(|authored| authored.name)
+        .map(|authored| authored.id)
         .expect("the published catalogue declares at least one extension with no parameter")
 }
 

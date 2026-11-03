@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfigurationProfile
-//! IMPLEMENTED: creates a configuration profile under an application and persists it.
+//! IMPLEMENTED: creates a configuration profile under an application and persists it,
+//! associating AppConfig's feature-flag helper extension to it when the profile's `Type`
+//! names that helper.
 //!
 //! ## Shape of an operation
 //!
@@ -210,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateConfigurationProfileErrorModeled::InternalServerException(
@@ -237,6 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
         // The model's `Type` documentation names the values this member accepts: "When
@@ -366,12 +369,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-
-        // Answered from the stored record. `KmsKeyArn` is deliberately left unset, not
-        // overlooked: it is the ARN of the key `KmsKeyIdentifier` resolves to, and this
-        // emulator resolves no KMS key, so there is no ARN to report that would not be
-        // fabricated. `KmsKeyIdentifier` itself is persisted and answered.
-        Ok(CreateConfigurationProfileOutput {
+        let stored_id = stored.id.clone();
+        let stored_type = stored.profile_type.clone();
+        let output = CreateConfigurationProfileOutput {
             application_id: Some(stored.application_id.clone()),
             id: Some(stored.id.clone()),
             name: Some(stored.name.clone()),
@@ -382,6 +382,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             r#type: Some(stored.profile_type.clone()),
             kms_key_arn: None,
             kms_key_identifier: stored.kms_key_identifier.clone(),
-        })
+        };
+
+        // A feature-flag profile is handled by AppConfig's own feature-flag helper
+        // extension, so creating one is what associates that extension to it: the
+        // association is AppConfig's, not something the caller has to make, and it is what
+        // a deployment of this profile reports as applied. A profile of any other kind is
+        // handled by nothing in particular and gets no association.
+        if stored_type == crate::state::FEATURE_FLAGS_PROFILE_TYPE {
+            match store.associate_feature_flags_extension(
+                &input.application_id,
+                &stored_id,
+                &region,
+            ) {
+                // An attribution record for the association this call wrote, so the state
+                // change the caller did not ask for is observable beside the profile's own.
+                Some(association) => tracing::debug!(
+                    operation = "CreateConfigurationProfile",
+                    outcome = "associated",
+                    application_id = input.application_id.as_str(),
+                    configuration_profile_id = stored_id.as_str(),
+                    extension_id = crate::state::FEATURE_FLAGS_EXTENSION_ID,
+                    extension_association_id = association.as_str(),
+                    "associated the feature-flag helper extension with a configuration profile"
+                ),
+                // Nothing was associated because this account already holds every
+                // association `state::MAX_EXTENSION_ASSOCIATIONS` allows. The profile
+                // itself is stored and reported — the create the caller made succeeded —
+                // so the unmade association is recorded here rather than discarded.
+                None => tracing::warn!(
+                    operation = "CreateConfigurationProfile",
+                    outcome = "not_associated",
+                    application_id = input.application_id.as_str(),
+                    configuration_profile_id = stored_id.as_str(),
+                    extension_id = crate::state::FEATURE_FLAGS_EXTENSION_ID,
+                    held = crate::state::MAX_EXTENSION_ASSOCIATIONS,
+                    "the feature-flag helper extension could not be associated: the \
+                     extension-association limit is already held"
+                ),
+            }
+        }
+
+        // Answered from the stored record. `KmsKeyArn` is deliberately left unset, not
+        // overlooked: it is the ARN of the key `KmsKeyIdentifier` resolves to, and this
+        // emulator resolves no KMS key, so there is no ARN to report that would not be
+        // fabricated. `KmsKeyIdentifier` itself is persisted and answered.
+        Ok(output)
     }
 }

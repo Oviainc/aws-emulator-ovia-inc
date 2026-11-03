@@ -53,3 +53,21 @@ Smithy support: ListExtensions GET /extensions, 200, output Extensions{Items: Ex
 2. Replay fixture appconfig-experiment-run-full-lifecycle, step setup#6: create an application, environment and a configuration profile of type AWS.AppConfig.FeatureFlags, add a hosted configuration version, then StartDeployment.
 3. Inspect the 201 body's AppliedExtensions: AWS contains one entry for AWS.AppConfig.FeatureFlags (VersionNumber 1, ProvidedIdentifier AWS.AppConfig.FeatureFlags, Parameters {}); the emulator contains none.
 4. Re-replay both bundled fixture#step bindings listed under Traces to confirm the fix.
+
+## Resolution
+
+Both causes are implemented in `services/service-com-amazonaws-appconfig-amazonappconfig`:
+the published AWS-authored catalogue now holds every entry named above (each with its own
+published id, prose name, version 1 and service-owned ARN) and `ListExtensions` reports it
+beside the account's own extensions; and a configuration profile whose `Type` names the
+feature-flag helper is associated with that extension when it is created, so
+`StartDeployment`, `GetDeployment` and `StopDeployment` report the association in
+`AppliedExtensions` (with the `ProvidedIdentifier` the association was created with).
+
+Residue, left deliberately: the recorded `ListExtensions` item check still differs on
+per-entry PROSE the recording withholds and this report clips — the feature-flag helper's
+`Description` beyond "… against a JSON schema" and the EventBridge entry's `Name` and
+`Description`, which this report does not state at all. Every id, name, version and ARN
+quoted above is reported exactly (pinned by `tests/all/aws_authored_extensions.rs`), and
+the catalogue's own documentation marks which of its columns are inferred rather than
+published, so a later reading of one of those entries can correct them.

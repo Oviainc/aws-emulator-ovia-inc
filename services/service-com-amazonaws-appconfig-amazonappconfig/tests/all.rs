@@ -75,6 +75,8 @@ mod extensions;
 mod feature_flag_attribute_constraints;
 #[path = "all/feature_flag_metadata.rs"]
 mod feature_flag_metadata;
+#[path = "all/feature_flags_extension_association.rs"]
+mod feature_flags_extension_association;
 #[path = "all/get_configuration.rs"]
 mod get_configuration;
 #[path = "all/json_schema_validator_gate.rs"]

@@ -90,6 +90,9 @@ macro_rules! ac_shape_type {
     (struct_of) => {
         ::aws_smithy_schema::ShapeType::Structure
     };
+    (map_of_string) => {
+        ::aws_smithy_schema::ShapeType::Map
+    };
 }
 
 /// One member's schema, as the vendored codegen would emit it, plus the
@@ -139,6 +142,17 @@ macro_rules! ac_write_member {
         $s.write_list($m, &|__sl| {
             for __it in $v.iter() {
                 __sl.write_struct(&<$inner>::SCHEMA, __it)?;
+            }
+            Ok(())
+        })?;
+    };
+    // A map member writes each key and each value against the MAP member's own schema,
+    // which is what the vendored codegen's `emit_write` does for `ShapeKind::Map`.
+    ($s:ident, $m:expr, $v:expr, map_of_string) => {
+        $s.write_map($m, &|__sm| {
+            for (__k, __mv) in $v.iter() {
+                __sm.write_string($m, __k.as_str())?;
+                __sm.write_string($m, __mv.as_str())?;
             }
             Ok(())
         })?;

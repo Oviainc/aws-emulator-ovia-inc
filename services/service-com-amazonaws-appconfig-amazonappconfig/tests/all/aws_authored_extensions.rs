@@ -43,26 +43,69 @@ use crate::resource_tags::{arn, pct};
 /// pattern makes that field optional. Built from the suite's own ARN helper, so the
 /// partition, the service namespace and the Region are the ones every other AppConfig ARN
 /// in these tests carries.
-fn authored_arn(name: &str) -> String {
+fn authored_arn(extension_id: &str) -> String {
     let owned = arn(&format!(
-        "extension/{name}/{AWS_AUTHORED_EXTENSION_VERSION}"
+        "extension/{extension_id}/{AWS_AUTHORED_EXTENSION_VERSION}"
     ));
     owned.replacen(&format!(":{}:", account()), "::", 1)
 }
 
+/// What AppConfig's catalogue publishes for the extensions a caller discovers there, as
+/// `(id, name)`: the id a caller passes as an `ExtensionIdentifier` and the prose name
+/// published beside it.
+///
+/// Hand-written here rather than read from `crate::state::AWS_AUTHORED_EXTENSIONS`, so a
+/// row of that constant that drifted from the published id or the published name fails
+/// here instead of agreeing with itself. Source: the catalogue a `ListExtensions` call
+/// against AppConfig reports, as the issue this suite grew from quotes it — which is why
+/// the entries whose published name it does not quote are pinned by
+/// [`PUBLISHED_NOTIFICATION_EXTENSIONS`] instead, beside the parameters they declare.
+const PUBLISHED_EXTENSIONS: &[(&str, &str)] = &[
+    (
+        "AWS.AppConfig.FeatureFlags",
+        "AppConfig Feature Flags Helper",
+    ),
+    (
+        "AWS.AppConfig.JiraIntegration",
+        "AppConfig integration with Atlassian Jira",
+    ),
+    (
+        "AWS.Evidently.ProjectImporter",
+        "Amazon CloudWatch Evidently Project importer",
+    ),
+];
+
+/// How the published description of the feature-flag helper opens, hand-written from the
+/// same source as [`PUBLISHED_EXTENSIONS`]: enough of the sentence to fail a catalogue that
+/// describes that extension as something else.
+const PUBLISHED_FEATURE_FLAGS_DESCRIPTION_OPENING: &str =
+    "Validates AppConfig feature flag data automatically against a JSON schema";
+
 /// One published identifier a caller passes as `ExtensionIdentifier` to associate a
-/// deployment-event notification extension, beside the parameter name that association
-/// supplies a value for.
+/// deployment-event notification extension, beside the name the catalogue publishes for it
+/// and the parameter name that association supplies a value for.
 ///
 /// Hand-written from the AWS AppConfig User Guide's predefined notification extensions —
 /// the same source `crate::state::AWS_AUTHORED_EXTENSIONS` is built from — so a catalogue
 /// that stopped publishing one of these, or renamed its parameter, fails here rather than
 /// only in a replay. The EventBridge row declares no parameter, because that extension
 /// publishes to the account's default event bus.
-const PUBLISHED_NOTIFICATION_EXTENSIONS: &[(&str, &[&str])] = &[
-    ("AWS.AppConfig.DeploymentEventsToEventBridge", &[]),
-    ("AWS.AppConfig.DeploymentEventsToSns", &["topicArn"]),
-    ("AWS.AppConfig.DeploymentEventsToSqs", &["queueArn"]),
+const PUBLISHED_NOTIFICATION_EXTENSIONS: &[(&str, &str, &[&str])] = &[
+    (
+        "AWS.AppConfig.DeploymentNotificationsToEventBridge",
+        "AppConfig deployment events to Amazon EventBridge",
+        &[],
+    ),
+    (
+        "AWS.AppConfig.DeploymentEventsToSns",
+        "AppConfig deployment events to Amazon SNS",
+        &["topicArn"],
+    ),
+    (
+        "AWS.AppConfig.DeploymentEventsToSqs",
+        "AppConfig deployment events to Amazon SQS",
+        &["queueArn"],
+    ),
 ];
 
 /// `DELETE /extensions/{ExtensionIdentifier}`. The identifier is bound to a NON-greedy
@@ -120,26 +163,27 @@ async fn every_aws_authored_extension_is_listed_and_reads_back_the_same_record()
     let walked = walk(&router, "a fresh account, one entry per page", Some(1)).await;
 
     for authored in AWS_AUTHORED_EXTENSIONS {
-        let case = authored.name;
+        let case = authored.id;
         let summary = walked
             .iter()
-            .find(|item| item.get("Name").and_then(Value::as_str) == Some(authored.name))
+            .find(|item| item.get("Id").and_then(Value::as_str) == Some(authored.id))
             .unwrap_or_else(|| {
                 panic!("case {case:?}: the listing must report this extension, got {walked:?}")
             });
 
-        // An authored extension's id IS its published name: nothing minted one for it.
+        // The catalogue publishes an id a caller types and a name a caller reads, so the
+        // summary carries both as published.
         assert_eq!(
-            summary.get("Id").and_then(Value::as_str),
+            summary.get("Name").and_then(Value::as_str),
             Some(authored.name),
-            "case {case:?}: expected the published name as the Id, got {summary}"
+            "case {case:?}: expected the published name, got {summary}"
         );
         assert_eq!(
             summary.get("VersionNumber").and_then(Value::as_i64),
             Some(i64::from(AWS_AUTHORED_EXTENSION_VERSION)),
             "case {case:?}: expected version {AWS_AUTHORED_EXTENSION_VERSION}, got {summary}"
         );
-        let expected_arn = authored_arn(authored.name);
+        let expected_arn = authored_arn(authored.id);
         assert_eq!(
             summary.get("Arn").and_then(Value::as_str),
             Some(expected_arn.as_str()),
@@ -162,15 +206,17 @@ async fn every_aws_authored_extension_is_listed_and_reads_back_the_same_record()
                 "",
                 format!(
                     "extension/{}/{AWS_AUTHORED_EXTENSION_VERSION}",
-                    authored.name
+                    authored.id
                 )
                 .as_str()
             ),
             "case {case:?}: expected an appconfig ARN owned by no account, got {expected_arn}"
         );
+        // A description is reported only when the catalogue publishes one for this
+        // extension; `Description` is optional on an `ExtensionSummary`.
         assert_eq!(
             summary.get("Description").and_then(Value::as_str),
-            Some(authored.description),
+            authored.description,
             "case {case:?}: expected the published description, got {summary}"
         );
 
@@ -179,7 +225,7 @@ async fn every_aws_authored_extension_is_listed_and_reads_back_the_same_record()
         // version pinned explicitly, all report ONE record.
         let by_name = body_of(case, &get_extension(&router, authored.name, None).await);
         for (form, identifier, version) in [
-            ("by id", authored.name.to_string(), None),
+            ("by id", authored.id.to_string(), None),
             ("by ARN", expected_arn.clone(), None),
             (
                 "by name at its version",
@@ -302,7 +348,7 @@ async fn every_aws_authored_extension_is_listed_and_reads_back_the_same_record()
         // Only the version it is published at exists.
         let missing = get_extension(
             &router,
-            authored.name,
+            authored.id,
             Some(AWS_AUTHORED_EXTENSION_VERSION + 1),
         )
         .await;
@@ -316,6 +362,74 @@ async fn every_aws_authored_extension_is_listed_and_reads_back_the_same_record()
     }
 }
 
+/// The catalogue publishes each extension under its own id AND its own prose name, and a
+/// caller who knows either reads the same record — asserted against values written here
+/// rather than against the service's own catalogue constant.
+///
+/// Rows: every published entry whose name this suite pins ([`PUBLISHED_EXTENSIONS`]), which
+/// differ along whether the name resembles the id at all, whether the entry carries a
+/// description, and which product the entry integrates.
+#[tokio::test]
+async fn the_published_entries_are_listed_under_their_published_ids_and_names() {
+    let router = router();
+    let walked = walk(&router, "the published catalogue", None).await;
+
+    for (id, published_name) in PUBLISHED_EXTENSIONS {
+        let summary = walked
+            .iter()
+            .find(|item| item.get("Id").and_then(Value::as_str) == Some(*id))
+            .unwrap_or_else(|| {
+                panic!("case {id:?}: the listing must report this extension, got {walked:?}")
+            });
+        assert_eq!(
+            summary.get("Name").and_then(Value::as_str),
+            Some(*published_name),
+            "case {id:?}: expected the published name, got {summary}"
+        );
+        assert_eq!(
+            summary.get("VersionNumber").and_then(Value::as_i64),
+            Some(i64::from(AWS_AUTHORED_EXTENSION_VERSION)),
+            "case {id:?}: expected the published version, got {summary}"
+        );
+        assert_eq!(
+            summary.get("Arn").and_then(Value::as_str),
+            Some(authored_arn(id).as_str()),
+            "case {id:?}: expected the ARN of that version, owned by no account, got {summary}"
+        );
+
+        // The id and the name are BOTH identifiers of the same record: a reader handed
+        // either reports the other.
+        let by_id = body_of(id, &get_extension(&router, id, None).await);
+        let by_name = body_of(id, &get_extension(&router, published_name, None).await);
+        assert_eq!(
+            facts(&by_id),
+            facts(&by_name),
+            "case {id:?}: the published name must read the record the id reads, got {by_name}"
+        );
+        assert_eq!(
+            by_id.get("Id").and_then(Value::as_str),
+            Some(*id),
+            "case {id:?}: expected the published id, got {by_id}"
+        );
+    }
+
+    // The one published description this suite pins: an entry described as something else
+    // fails here rather than only in a replay.
+    let helper = body_of(
+        "AWS.AppConfig.FeatureFlags",
+        &get_extension(&router, "AWS.AppConfig.FeatureFlags", None).await,
+    );
+    let described = helper
+        .get("Description")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        described.starts_with(PUBLISHED_FEATURE_FLAGS_DESCRIPTION_OPENING),
+        "case \"AWS.AppConfig.FeatureFlags\": expected a description opening \
+         {PUBLISHED_FEATURE_FLAGS_DESCRIPTION_OPENING:?}, got {described:?}"
+    );
+}
+
 /// The deployment-event notification extensions the AppConfig User Guide publishes are in
 /// the catalogue under the identifiers it tells a caller to pass, each declaring the
 /// parameter its association supplies.
@@ -325,12 +439,17 @@ async fn every_aws_authored_extension_is_listed_and_reads_back_the_same_record()
 #[tokio::test]
 async fn the_published_notification_extensions_resolve_under_their_documented_identifiers() {
     let router = router();
-    for (identifier, parameters) in PUBLISHED_NOTIFICATION_EXTENSIONS {
+    for (identifier, published_name, parameters) in PUBLISHED_NOTIFICATION_EXTENSIONS {
         let read = body_of(identifier, &get_extension(&router, identifier, None).await);
         assert_eq!(
-            read.get("Name").and_then(Value::as_str),
+            read.get("Id").and_then(Value::as_str),
             Some(*identifier),
-            "case {identifier:?}: expected the published identifier as the Name, got {read}"
+            "case {identifier:?}: expected the published identifier as the Id, got {read}"
+        );
+        assert_eq!(
+            read.get("Name").and_then(Value::as_str),
+            Some(*published_name),
+            "case {identifier:?}: expected the published name, got {read}"
         );
         let declared = read
             .get("Parameters")
@@ -361,10 +480,11 @@ async fn an_aws_authored_extension_is_not_this_accounts_to_create_or_delete() {
     let before = walk(&router, "before the refusals", None).await;
 
     for authored in AWS_AUTHORED_EXTENSIONS {
-        let case = authored.name;
+        let case = authored.id;
         let identifiers = [
+            ("by id", authored.id.to_string()),
             ("by name", authored.name.to_string()),
-            ("by ARN", authored_arn(authored.name)),
+            ("by ARN", authored_arn(authored.id)),
         ];
         for (form, identifier) in identifiers {
             let answer = delete_extension(&router, &identifier).await;
@@ -388,29 +508,37 @@ async fn an_aws_authored_extension_is_not_this_accounts_to_create_or_delete() {
             );
         }
 
-        let created = create_extension(
-            &router,
-            &json!({
-                "Name": authored.name,
-                "Actions": actions(&[ACTION_POINT_VALUES[0]]),
-            }),
-            None,
-        )
-        .await;
-        assert_eq!(
-            created.status,
-            400,
-            "case {case:?}: expected 400 for a create under an authored name, got {} / {}",
-            created.status,
-            String::from_utf8_lossy(&created.body)
-        );
+        // Both published forms are taken in every account, so neither is a name a create
+        // may take over.
+        for (form, taken) in [
+            ("its published name", authored.name),
+            ("its published id", authored.id),
+        ] {
+            let created = create_extension(
+                &router,
+                &json!({
+                    "Name": taken,
+                    "Actions": actions(&[ACTION_POINT_VALUES[0]]),
+                }),
+                None,
+            )
+            .await;
+            assert_eq!(
+                created.status,
+                400,
+                "case {case:?} {form}: expected 400 for a create under an authored name, got {} \
+                 / {}",
+                created.status,
+                String::from_utf8_lossy(&created.body)
+            );
+        }
 
         // The record a reader answers for it is still the published one, so neither refusal
         // left a half-written extension behind.
-        let read = body_of(case, &get_extension(&router, authored.name, None).await);
+        let read = body_of(case, &get_extension(&router, authored.id, None).await);
         assert_eq!(
             read.get("Description").and_then(Value::as_str),
-            Some(authored.description),
+            authored.description,
             "case {case:?}: expected the published record after the refusals, got {read}"
         );
     }

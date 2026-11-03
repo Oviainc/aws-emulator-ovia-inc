@@ -130,9 +130,11 @@ fn declaration(required: &[&str], optional: &[&str]) -> Value {
     Value::Object(map)
 }
 
-/// The AWS-authored extension that declares a required parameter, and that parameter's
-/// name, read from the published catalogue rather than written out here.
-fn authored_with_required_parameter() -> (&'static str, &'static str) {
+/// The AWS-authored extension that declares a required parameter — its published id, its
+/// published name and that parameter's name — read from the published catalogue rather
+/// than written out here. The id and the name are BOTH needed: the per-parameter refusal
+/// names the extension by id, and the one about the whole request names it by name.
+fn authored_with_required_parameter() -> (&'static str, &'static str, &'static str) {
     AWS_AUTHORED_EXTENSIONS
         .iter()
         .find_map(|authored| {
@@ -140,7 +142,7 @@ fn authored_with_required_parameter() -> (&'static str, &'static str) {
                 .parameters
                 .iter()
                 .find(|parameter| parameter.required)
-                .map(|parameter| (authored.name, parameter.name))
+                .map(|parameter| (authored.id, authored.name, parameter.name))
         })
         .expect("the published catalogue declares at least one required parameter")
 }
@@ -352,7 +354,7 @@ async fn a_missing_required_value_is_refused_naming_the_extension_by_id() {
         None,
     )
     .await;
-    let (authored_name, authored_parameter) = authored_with_required_parameter();
+    let (authored_id, authored_name, authored_parameter) = authored_with_required_parameter();
 
     let table: Vec<Omission> = vec![
         Omission {
@@ -403,10 +405,10 @@ async fn a_missing_required_value_is_refused_naming_the_extension_by_id() {
             missing: "alpha".to_string(),
         },
         Omission {
-            // An AWS-authored extension: its id IS its published name, so the message
-            // carries that one token for both.
+            // An AWS-authored extension: the catalogue publishes its id and its name
+            // separately, and this sentence names the extension by its id.
             case: format!("the published extension {authored_name}"),
-            extension_id: authored_name.to_string(),
+            extension_id: authored_id.to_string(),
             extension_name: authored_name.to_string(),
             version: 1,
             valid: json!({ authored_parameter: arn("queue/lifecycle-events") }),
@@ -610,7 +612,7 @@ async fn a_create_supplying_no_parameters_is_refused_naming_the_extension_and_ve
         versioned, versioned_again,
         "a second version keeps the extension's id, got {versioned_again:?}"
     );
-    let (authored_name, authored_parameter) = authored_with_required_parameter();
+    let (authored_id, authored_name, authored_parameter) = authored_with_required_parameter();
 
     let table: Vec<NothingSupplied> = vec![
         NothingSupplied {
@@ -718,7 +720,7 @@ async fn a_create_supplying_no_parameters_is_refused_naming_the_extension_and_ve
         (
             "an empty map against the published extension",
             authored_name.to_string(),
-            authored_name.to_string(),
+            authored_id.to_string(),
             authored_parameter,
         ),
     ] {

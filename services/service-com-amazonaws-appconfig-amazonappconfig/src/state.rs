@@ -385,6 +385,28 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// The resource portion of a configuration profile's ARN:
+/// `application/<application id>/configurationprofile/<profile id>`, the form
+/// [`parse_resource_arn`] reads back. A profile exists only under an application, so its
+/// portion is rooted at that application.
+fn configuration_profile_arn_portion(application_id: &str, configuration_profile_id: &str) -> String {
+    format!("application/{application_id}/configurationprofile/{configuration_profile_id}")
+}
+
+/// The ARN of one configuration profile, as an extension association bound to it reports
+/// the resource it binds.
+pub fn configuration_profile_arn(
+    region: &str,
+    application_id: &str,
+    configuration_profile_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        SERVICE_NAMESPACE,
+        region,
+        &configuration_profile_arn_portion(application_id, configuration_profile_id),
+    )
+}
+
 /// The ARN of one version of one extension: `extension/<extension id>/<version number>`,
 /// the resource portion [`parse_resource_arn`] reads back.
 pub fn extension_arn(region: &str, extension_id: &str, version_number: i32) -> String {
@@ -406,8 +428,8 @@ pub fn extension_arn(region: &str, extension_id: &str, version_number: i32) -> S
 /// the one helper that builds every ARN here, so the partition, the service namespace and
 /// the Region come from the same place as every other ARN; only the field an unowned
 /// resource has no value for is cleared.
-fn aws_authored_extension_arn(region: &str, name: &str, version_number: i32) -> String {
-    let owned = extension_arn(region, name, version_number);
+fn aws_authored_extension_arn(region: &str, extension_id: &str, version_number: i32) -> String {
+    let owned = extension_arn(region, extension_id, version_number);
     // `arn:<partition>:<service>:<region>:<account>:<resource>` — the account is the
     // fifth field, and the resource portion is left whole (it carries `/`, not `:`).
     let mut fields: Vec<&str> = owned.splitn(6, ':').collect();
@@ -1980,12 +2002,20 @@ impl ConfigurationProfile {
 /// listing is part of the operation's contract rather than something only a create fills.
 #[derive(Debug, Clone, Copy)]
 pub struct AwsAuthoredExtension {
-    /// The extension's published name, which is also its id: an authored extension is
-    /// AppConfig's rather than any account's, so nothing mints an `Id` for it and a
-    /// caller names it in an `ExtensionIdentifier` exactly as it is published.
+    /// The extension's published id: an authored extension is AppConfig's rather than any
+    /// account's, so nothing mints an `Id` for it and the id is the published
+    /// `AWS.<service>.<extension>` identifier a caller passes as an
+    /// `ExtensionIdentifier`. It is also the id that names the extension's version in its
+    /// ARN ([`aws_authored_extension_arn`]).
+    pub id: &'static str,
+    /// The extension's published name, which is PROSE and distinct from the id: the
+    /// catalogue publishes an id a caller types and a name a caller reads.
     pub name: &'static str,
-    /// What the published catalogue says the extension does.
-    pub description: &'static str,
+    /// What the published catalogue says the extension does, or `None` for one the
+    /// catalogue publishes without a description: `Description` is optional on every
+    /// reader of an extension, and text written for an extension that publishes none would
+    /// be a description AppConfig does not give.
+    pub description: Option<&'static str>,
     /// The action points the extension binds an action to, each a member of
     /// `ACTION_POINT_VALUES` in `crate::ops::types` (the model's `ActionPoint` enum).
     pub action_points: &'static [&'static str],
@@ -2026,28 +2056,81 @@ const DEPLOYMENT_EVENT_ACTION_POINTS: &[&str] = &[
     "ON_DEPLOYMENT_ROLLED_BACK",
 ];
 
-/// AppConfig's AWS-authored extensions, from the AWS AppConfig User Guide's predefined
-/// notification extensions: the deployment-event extensions a caller associates to a
-/// resource to have AppConfig report that resource's deployment lifecycle to an Amazon
-/// SQS queue, an Amazon SNS topic or the default Amazon EventBridge event bus.
+/// AppConfig's AWS-authored extensions, as the service publishes them to every account:
+/// the feature-flag helper that checks and transforms a feature-flag document, the
+/// integrations that carry flag data to Atlassian Jira and bring it in from an Amazon
+/// CloudWatch Evidently project, and the deployment-event extensions a caller associates
+/// to a resource to have AppConfig report that resource's deployment lifecycle to the
+/// default Amazon EventBridge event bus, an Amazon SNS topic or an Amazon SQS queue.
 ///
-/// Every column is a published AWS fact rather than a value this emulator may choose: the
-/// `name` is the identifier the guide tells a caller to pass as `ExtensionIdentifier`, the
-/// action points are the deployment lifecycle ([`DEPLOYMENT_EVENT_ACTION_POINTS`]), and a
-/// parameter is named as the guide's own association example spells it — a queue or topic
-/// ARN for the two extensions that need one, and none at all for the EventBridge
-/// extension, which publishes to the account's default event bus.
+/// This is the whole catalogue every account reads without creating anything, so it is the
+/// authored half of what `ListExtensions` reports and what an `ExtensionIdentifier`
+/// resolves against.
+///
+/// Every row carries what the published catalogue reports for one extension. The `id` is
+/// the identifier a caller passes as an `ExtensionIdentifier` and the `name` is the prose
+/// name published beside it — the two are DISTINCT for an authored extension, which is why
+/// the row carries both — and a `description` is reported only where the catalogue
+/// publishes one, text invented for an entry published without one being a description
+/// AppConfig does not give. A parameter is named as the AWS AppConfig User Guide's own
+/// association example spells it: a topic or queue ARN for the two notification extensions
+/// that need one, and none at all for the rest, the EventBridge one publishing to the
+/// account's default event bus.
+///
+/// What is INFERRED rather than published, and so may be corrected by any later reading of
+/// one of these extensions: the prose `name` of the three notification rows, and every
+/// row's `action_points`, which are read off what the extension's own description says it
+/// does (see each row's comment) because the catalogue listing does not report an
+/// extension's actions at all. Each is a value a reader of this catalogue should treat as
+/// this emulator's best reading, not as a recorded fact.
 pub const AWS_AUTHORED_EXTENSIONS: &[AwsAuthoredExtension] = &[
     AwsAuthoredExtension {
-        name: "AWS.AppConfig.DeploymentEventsToEventBridge",
-        description: "Sends AppConfig deployment events to the default Amazon EventBridge \
-                      event bus",
+        id: FEATURE_FLAGS_EXTENSION_ID,
+        name: "AppConfig Feature Flags Helper",
+        description: Some(
+            "Validates AppConfig feature flag data automatically against a JSON schema that \
+             includes the feature flag data format. Also transforms feature flag data prior \
+             to sending to the client.",
+        ),
+        // The helper's published work on a feature-flag document happens as that document
+        // is WRITTEN — which is the point this service already checks one at
+        // (`crate::state::feature_flags`) — and the transform it also does has no action
+        // point of its own: it is how a flag document is SERVED.
+        action_points: &["PRE_CREATE_HOSTED_CONFIGURATION_VERSION"],
+        parameters: &[],
+    },
+    AwsAuthoredExtension {
+        id: "AWS.AppConfig.JiraIntegration",
+        name: "AppConfig integration with Atlassian Jira",
+        // The catalogue publishes this one with no description, so none is reported for it.
+        description: None,
+        // Flag data reaches Jira as it is WRITTEN, which is the one point of AppConfig's
+        // workflow a configuration document passes through before it is deployed.
+        action_points: &["PRE_CREATE_HOSTED_CONFIGURATION_VERSION"],
+        parameters: &[],
+    },
+    AwsAuthoredExtension {
+        id: "AWS.Evidently.ProjectImporter",
+        name: "Amazon CloudWatch Evidently Project importer",
+        description: None,
+        // An import writes the project's flags as a configuration version, so the same
+        // point carries its work.
+        action_points: &["PRE_CREATE_HOSTED_CONFIGURATION_VERSION"],
+        parameters: &[],
+    },
+    AwsAuthoredExtension {
+        id: "AWS.AppConfig.DeploymentNotificationsToEventBridge",
+        name: "AppConfig deployment events to Amazon EventBridge",
+        description: Some(
+            "Sends AppConfig deployment events to the default Amazon EventBridge event bus",
+        ),
         action_points: DEPLOYMENT_EVENT_ACTION_POINTS,
         parameters: &[],
     },
     AwsAuthoredExtension {
-        name: "AWS.AppConfig.DeploymentEventsToSns",
-        description: "Sends AppConfig deployment events to an Amazon SNS topic",
+        id: "AWS.AppConfig.DeploymentEventsToSns",
+        name: "AppConfig deployment events to Amazon SNS",
+        description: Some("Sends AppConfig deployment events to an Amazon SNS topic"),
         action_points: DEPLOYMENT_EVENT_ACTION_POINTS,
         parameters: &[AwsAuthoredParameter {
             name: "topicArn",
@@ -2056,8 +2139,9 @@ pub const AWS_AUTHORED_EXTENSIONS: &[AwsAuthoredExtension] = &[
         }],
     },
     AwsAuthoredExtension {
-        name: "AWS.AppConfig.DeploymentEventsToSqs",
-        description: "Sends AppConfig deployment events to an Amazon SQS queue",
+        id: "AWS.AppConfig.DeploymentEventsToSqs",
+        name: "AppConfig deployment events to Amazon SQS",
+        description: Some("Sends AppConfig deployment events to an Amazon SQS queue"),
         action_points: DEPLOYMENT_EVENT_ACTION_POINTS,
         parameters: &[AwsAuthoredParameter {
             name: "queueArn",
@@ -2067,21 +2151,28 @@ pub const AWS_AUTHORED_EXTENSIONS: &[AwsAuthoredExtension] = &[
     },
 ];
 
+/// The id of the AWS-authored extension AppConfig associates to a configuration profile
+/// of type [`FEATURE_FLAGS_PROFILE_TYPE`]: the feature-flag helper, which is what checks a
+/// feature-flag document as it is written and transforms it as it is served. Defined AS
+/// that profile type rather than beside it, because the two published strings are one: the
+/// type a profile declares names the extension that handles such a profile.
+pub const FEATURE_FLAGS_EXTENSION_ID: &str = FEATURE_FLAGS_PROFILE_TYPE;
+
 /// The AWS-authored extension published under `name`, or `None` when the name is not one
 /// of AppConfig's own.
 ///
-/// An authored extension's name is also its id, so this answers an `ExtensionIdentifier`
-/// in either of those two forms; [`aws_authored_extension`] adds the ARN form and builds
-/// the record.
-pub fn aws_authored_extension_named(name: &str) -> Option<&'static AwsAuthoredExtension> {
+/// An `ExtensionIdentifier` is "the name, the ID, or the Amazon Resource Name (ARN) of the
+/// extension", so both published forms a bare identifier can carry — the id and the name —
+/// answer here; [`aws_authored_extension`] adds the ARN form and builds the record.
+pub fn aws_authored_extension_named(identifier: &str) -> Option<&'static AwsAuthoredExtension> {
     AWS_AUTHORED_EXTENSIONS
         .iter()
-        .find(|authored| authored.name == name)
+        .find(|authored| authored.id == identifier || authored.name == identifier)
 }
 
-/// The AWS-authored extension `identifier` addresses — by name, by id (which for an
-/// authored extension is its name) or by the ARN of one of its versions — as the record
-/// every reader of an extension reports, together with the version an ARN pins.
+/// The AWS-authored extension `identifier` addresses — by its published id, by its
+/// published name or by the ARN of one of its versions — as the record every reader of an
+/// extension reports, together with the version an ARN pins.
 ///
 /// The ARN is built in `region` rather than stored, because an authored extension belongs
 /// to AppConfig in every Region: the record a reader answers carries the ARN for the
@@ -2147,10 +2238,10 @@ impl Extension {
     ///
     /// An authored extension is the same resource an account's own extension is — one
     /// name, one id and a version carrying the definition — so every reader reports it
-    /// through the one record type rather than a second shape of its own. Its id is its
-    /// published name, nothing having minted one for it, it holds the single version it is
-    /// published at ([`AWS_AUTHORED_EXTENSION_VERSION`]), and that version's ARN names no
-    /// account ([`aws_authored_extension_arn`]), because no account owns it.
+    /// through the one record type rather than a second shape of its own. Its id is the
+    /// one the catalogue publishes, nothing having minted one for it, it holds the single
+    /// version it is published at ([`AWS_AUTHORED_EXTENSION_VERSION`]), and that version's
+    /// ARN names no account ([`aws_authored_extension_arn`]), because no account owns it.
     ///
     /// Each action carries the point it runs at and no `Uri`: that member names where the
     /// action sends what it produces, and for a notification extension the destination is
@@ -2160,8 +2251,8 @@ impl Extension {
     pub fn aws_authored(authored: &AwsAuthoredExtension, region: &str) -> Self {
         let version = ExtensionVersion {
             version_number: AWS_AUTHORED_EXTENSION_VERSION,
-            arn: aws_authored_extension_arn(region, authored.name, AWS_AUTHORED_EXTENSION_VERSION),
-            description: Some(authored.description.to_string()),
+            arn: aws_authored_extension_arn(region, authored.id, AWS_AUTHORED_EXTENSION_VERSION),
+            description: authored.description.map(str::to_string),
             actions: authored
                 .action_points
                 .iter()
@@ -2199,7 +2290,7 @@ impl Extension {
             // asked to assign it metadata and it carries none.
             tags: HashMap::new(),
         };
-        Self::new(authored.name.to_string(), authored.name.to_string(), version)
+        Self::new(authored.id.to_string(), authored.name.to_string(), version)
     }
 }
 
@@ -2237,6 +2328,14 @@ pub struct ExtensionAssociation {
     /// account created, the published name for an AWS-authored one — kept beside the ARN
     /// so a reader can resolve the extension itself rather than re-parse the ARN.
     pub extension_id: String,
+    /// The `ExtensionIdentifier` the create that made this association named the extension
+    /// by, kept exactly as it was supplied: "the name, the ID, or the Amazon Resource Name
+    /// (ARN) of the extension"
+    /// (`smithy_query(query="shape",shape="CreateExtensionAssociationRequest")`), which is
+    /// the `ProvidedIdentifier` a deployment reports for the association among its applied
+    /// extensions. Two associations of the same extension can carry different values here,
+    /// so it is a property of the association rather than of the extension.
+    pub provided_identifier: String,
     /// The ARN of the extension VERSION this association binds, which is the version's own
     /// ARN rather than one rebuilt here.
     pub extension_arn: String,
@@ -3925,10 +4024,7 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
                     .get(application_id)?
                     .profiles
                     .get(configuration_profile_id)?;
-                format!(
-                    "application/{application_id}/configurationprofile/{}",
-                    profile.id
-                )
+                configuration_profile_arn_portion(application_id, &profile.id)
             }
             // Every other AppConfig resource — a deployment, a deployment strategy, an
             // extension, another association — is not one of the three an extension
@@ -4006,6 +4102,7 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
                     extension_association_id: Some(association.id.clone()),
                     version_number: association.extension_version_number,
                     parameters: Some(association.parameters.clone()),
+                    provided_identifier: Some(association.provided_identifier.clone()),
                 },
             );
         }
@@ -4029,6 +4126,55 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
             association.extension_id == extension_id
                 && association.extension_version_number == version_number
         })
+    }
+
+    /// Materialise the extension association AppConfig itself makes for a configuration
+    /// profile of type [`FEATURE_FLAGS_PROFILE_TYPE`], and answer the association's id.
+    ///
+    /// The feature-flag helper ([`FEATURE_FLAGS_EXTENSION_ID`]) is what checks a
+    /// feature-flag document as it is written and transforms it as it is served, so
+    /// AppConfig associates it to such a profile as the profile is created rather than
+    /// leaving it to a `CreateExtensionAssociation` call of the account's. What it
+    /// materialises is an association record like any other — the extension's only
+    /// published version, bound to the profile's own ARN, with no parameter values because
+    /// the helper declares no parameter — so every reader of an association reports it, and
+    /// a deployment of that profile reports it among its `AppliedExtensions`.
+    ///
+    /// IDEMPOTENT: an association already binding that extension to that profile IS this
+    /// association, so its id is answered and nothing is written. `None` means nothing is
+    /// associated: this account already holds [`MAX_EXTENSION_ASSOCIATIONS`] associations.
+    pub fn associate_feature_flags_extension(
+        &mut self,
+        application_id: &str,
+        configuration_profile_id: &str,
+        region: &str,
+    ) -> Option<String> {
+        let authored = aws_authored_extension_named(FEATURE_FLAGS_EXTENSION_ID)?;
+        let extension = Extension::aws_authored(authored, region);
+        let version = extension.latest_version()?;
+        let resource_arn =
+            configuration_profile_arn(region, application_id, configuration_profile_id);
+        if let Some(existing) = self.extension_associations.values().find(|association| {
+            association.extension_id == extension.id && association.resource_arn == resource_arn
+        }) {
+            return Some(existing.id.clone());
+        }
+        let id = self.mint_id();
+        let association = ExtensionAssociation {
+            arn: extension_association_arn(region, &id),
+            id: id.clone(),
+            extension_id: extension.id.clone(),
+            // AppConfig makes this association itself and names the extension by its
+            // published id, so that is the identifier it provided.
+            provided_identifier: extension.id.clone(),
+            extension_arn: version.arn.clone(),
+            extension_version_number: version.version_number,
+            resource_arn,
+            parameters: HashMap::new(),
+            tags: HashMap::new(),
+        };
+        self.try_insert_extension_association(association)
+            .then_some(id)
     }
 
     /// Store an extension association this account created.

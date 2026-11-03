@@ -318,14 +318,51 @@ pub struct ActionInvocation {
     pub invocation_id: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appconfig#AppliedExtension")]
+/// An extension that was invoked during a deployment, as the `Deployment` document reports
+/// it in `AppliedExtensions`.
+///
+/// Built with the hand-written schema macros rather than
+/// `#[smithy_macros::smithy(shape = ...)]` for the same reason the `Deployment` shape is
+/// (see `deployment_wire`): one member the ON-DISK model does not declare on this shape is
+/// one the recorded service answers. `ProvidedIdentifier` is the identifier the extension
+/// association supplied for the extension — the `ExtensionIdentifier` its create named, in
+/// whichever of the forms that member accepts — so it is read off the association record
+/// like every other member here, and it is written after the model's own members.
 #[derive(Debug, Clone, Default)]
 pub struct AppliedExtension {
     pub extension_id: Option<String>,
     pub extension_association_id: Option<String>,
     pub version_number: i32,
     pub parameters: Option<std::collections::HashMap<String, String>>,
+    pub provided_identifier: Option<String>,
 }
+
+ac_schema_and_codec!(
+    AppliedExtension,
+    APPLIED_EXTENSION_SCHEMA,
+    "com.amazonaws.appconfig#AppliedExtension",
+    "com.amazonaws.appconfig",
+    "AppliedExtension",
+    (M_EXTENSION_ID, extension_id, "ExtensionId", 0, opt, string),
+    (
+        M_EXTENSION_ASSOCIATION_ID,
+        extension_association_id,
+        "ExtensionAssociationId",
+        1,
+        opt,
+        string
+    ),
+    (M_VERSION_NUMBER, version_number, "VersionNumber", 2, def, integer),
+    (M_PARAMETERS, parameters, "Parameters", 3, opt, map_of_string),
+    (
+        M_PROVIDED_IDENTIFIER,
+        provided_identifier,
+        "ProvidedIdentifier",
+        4,
+        opt,
+        string
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.appconfig#ExperimentRun")]
 #[derive(Debug, Clone, Default)]
