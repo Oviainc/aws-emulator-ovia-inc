@@ -6,9 +6,9 @@
 //! policies AWS created, which every account holds under the identifiers AWS publishes
 //! ([`crate::state::MANAGED_RESPONSE_HEADERS_POLICIES`]), together with the ones this
 //! account created. The page is cut at `MaxItems` (bounded by this emulator's own ceiling),
-//! the order is one total order over policy ids across both sources, and `Marker` names the
-//! policy the previous page ended at, so walking the pages enumerates every policy exactly
-//! once.
+//! the order is the published catalog's own order followed by the account's policies by id
+//! ([`crate::state::policy_listing_key`]), and `Marker` names the policy the previous page
+//! ended at, so walking the pages enumerates every policy exactly once.
 //!
 //! `Type` filters the page by which of the two created a policy: a request naming one kind
 //! is served that kind alone, and one naming none is served both.
@@ -221,9 +221,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The policies this request is about, in ONE total order over ids: the published
-        // catalog and the account's own records are two sources of the same resource kind,
-        // so they are ordered together rather than concatenated — which is what lets
+        // The policies this request is about, in ONE total order: the published catalog in
+        // the order Amazon publishes it, then the account's own records by id
+        // ([`crate::state::policy_listing_key`]) — the two sources are the same resource
+        // kind, so they are ordered together rather than concatenated, which is what lets
         // `Marker` resume at an id whichever source it came from.
         let mut candidates: Vec<ResponseHeadersPolicySummary> = Vec::new();
         if serves_managed {
@@ -245,21 +246,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }));
         }
-        candidates.sort_by(|left, right| {
-            left.response_headers_policy
-                .id
-                .cmp(&right.response_headers_policy.id)
-        });
+        let listing_key = |id: &str| {
+            crate::state::policy_listing_key(
+                crate::state::managed_response_headers_policy_rank(id),
+                id,
+            )
+        };
+        candidates.sort_by_key(|summary| listing_key(&summary.response_headers_policy.id));
 
-        // `Marker` names where the previous page ENDED, so this page starts after it:
-        // walking the pages enumerates every policy exactly once.
+        // `Marker` names where the previous page ENDED, so this page starts after it in that
+        // one order: walking the pages enumerates every policy exactly once.
+        let resume = input.marker.as_deref().map(listing_key);
         let mut items: Vec<ResponseHeadersPolicySummary> = Vec::new();
         let mut more_remain = false;
         for summary in candidates {
-            if input
-                .marker
-                .as_deref()
-                .is_some_and(|marker| summary.response_headers_policy.id.as_str() <= marker)
+            if resume
+                .as_ref()
+                .is_some_and(|bound| listing_key(&summary.response_headers_policy.id) <= *bound)
             {
                 continue;
             }

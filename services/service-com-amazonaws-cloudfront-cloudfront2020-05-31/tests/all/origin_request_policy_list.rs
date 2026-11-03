@@ -391,14 +391,13 @@ async fn the_type_filter_selects_the_kind_of_policy_it_names() {
         .into_iter()
         .map(|(_, id)| id)
         .collect();
-    // The published catalog, in the one id order both sources are listed in.
-    let mut published: Vec<String> = MANAGED_ORIGIN_REQUEST_POLICIES
+    // The published catalog, in the order Amazon publishes it — the order a listing serves
+    // it in, ahead of the policies this account created.
+    let published: Vec<String> = MANAGED_ORIGIN_REQUEST_POLICIES
         .iter()
         .map(|managed| managed.id.to_string())
         .collect();
-    published.sort();
-    let mut both: Vec<String> = published.iter().chain(order.iter()).cloned().collect();
-    both.sort();
+    let both: Vec<String> = published.iter().chain(order.iter()).cloned().collect();
 
     // Rows: no filter at all, the kind this account created, and the kind AWS creates —
     // each at a page size that cuts the collection and one that does not.

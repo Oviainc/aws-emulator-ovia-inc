@@ -153,13 +153,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "MaxItems: the maximum number of origin access controls that you want in the
         // response" — a page holds at least one item, so a non-positive size names no
-        // page at all. The size served is bounded above by this emulator's own page
-        // ceiling, so one request cannot serve the whole store in a single response. A
-        // value the parameter cannot take is refused with the one sentence this service
-        // states the constraint in, whether it is out of range here or unreadable as an
-        // integer at the request boundary (see `crate::service::envelope`).
-        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
-        let Some(page_size) = crate::state::page_size(input.max_items) else {
+        // page at all. A request that names no size is served this listing's OWN default
+        // page size, which is also the ceiling it serves at, so one request cannot serve
+        // the whole store in a single response. A value the parameter cannot take is
+        // refused with the one sentence this service states the constraint in, whether it
+        // is out of range here or unreadable as an integer at the request boundary (see
+        // `crate::service::envelope`).
+        let max_items = input
+            .max_items
+            .unwrap_or(crate::state::MAX_ITEMS_ORIGIN_ACCESS_CONTROLS);
+        let Some(page_size) = crate::state::page_size_at(
+            input.max_items,
+            crate::state::MAX_ITEMS_ORIGIN_ACCESS_CONTROLS,
+        ) else {
             return Err(ListOriginAccessControlsErrorModeled::InvalidArgument(
                 crate::state::invalid_max_items(),
             )

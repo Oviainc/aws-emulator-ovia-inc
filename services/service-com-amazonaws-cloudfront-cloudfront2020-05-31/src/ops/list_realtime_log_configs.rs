@@ -6,7 +6,9 @@
 //! Every configuration a caller can see was stored by `CreateRealtimeLogConfig`, so the
 //! page is read from this service's records; a configuration is identified by its `Name`,
 //! which is the key the store orders them by and therefore the resume point `Marker` and
-//! `NextMarker` carry.
+//! `NextMarker` carry. A request that names no `MaxItems` is served this listing's own
+//! default page size ([`crate::state::MAX_ITEMS_REALTIME_LOG_CONFIGS`]), and every page
+//! states its `Items` wrapper, empty when the page lists nothing.
 //!
 //! A reporting operation: it reads the stored records and writes nothing.
 //!
@@ -156,14 +158,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You can optionally specify the maximum number of items to receive in the
         // response" — a page holds at least one item, so a non-positive size names no page
-        // at all. The size served is bounded above by this emulator's own page ceiling, the
-        // same one every listing of this service is bounded by, so one request cannot serve
-        // the whole store in a single response. A value the parameter cannot take is refused
+        // at all. A request that names no size is served this listing's OWN default page
+        // size, which is also the ceiling it serves at, so one request cannot serve the
+        // whole store in a single response. A value the parameter cannot take is refused
         // with the one sentence this service states the constraint in, whether it is out of
         // range here or unreadable as an integer at the request boundary (see
         // `crate::service::envelope`).
-        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
-        let Some(page_size) = crate::state::page_size(input.max_items) else {
+        let max_items = input
+            .max_items
+            .unwrap_or(crate::state::MAX_ITEMS_REALTIME_LOG_CONFIGS);
+        let Some(page_size) = crate::state::page_size_at(
+            input.max_items,
+            crate::state::MAX_ITEMS_REALTIME_LOG_CONFIGS,
+        ) else {
             return Err(ListRealtimeLogConfigsErrorModeled::InvalidArgument(
                 crate::state::invalid_max_items(),
             )
@@ -240,9 +247,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "A flag that indicates whether there are more real-time log configurations
                 // than are contained in this list."
                 is_truncated,
-                // A page that lists nothing carries no `Items` element at all, rather than an
-                // empty one — as every other listing of this service answers.
-                items: if items.is_empty() { None } else { Some(items) },
+                // "Contains the list of real-time log configurations": this listing states
+                // its collection whether or not the collection holds anything, so a page
+                // that lists nothing carries the `Items` element EMPTY rather than leaving
+                // it out — a client that reads the wrapper to walk the page finds it on
+                // every page.
+                items: Some(items),
             }),
         })
     }

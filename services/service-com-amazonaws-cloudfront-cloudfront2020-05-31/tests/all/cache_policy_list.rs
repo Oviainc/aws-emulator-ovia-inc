@@ -162,18 +162,17 @@ const PUBLISHED_POLICIES: &[(&str, &str, i64, i64, i64)] = &[
 ];
 
 /// The summary every published policy is expected under: AWS created it, so its `Type` is
-/// the managed one.
+/// the managed one. The order is the PUBLISHED catalogue's own, which is the order a
+/// listing serves it in.
 fn managed_summaries() -> Vec<Summary> {
-    let mut summaries: Vec<Summary> = MANAGED_CACHE_POLICIES
+    MANAGED_CACHE_POLICIES
         .iter()
         .map(|managed: &ManagedCachePolicy| Summary {
             kind: CACHE_POLICY_TYPE_MANAGED.to_string(),
             id: managed.id.to_string(),
             name: managed.name.to_string(),
         })
-        .collect();
-    summaries.sort_by(|left, right| left.id.cmp(&right.id));
-    summaries
+        .collect()
 }
 
 /// Create every configuration the cache policy table describes and report the summary each
@@ -307,7 +306,8 @@ async fn an_account_that_created_nothing_lists_the_published_policies() {
     assert_eq!(
         page_summaries(&listed),
         managed_summaries(),
-        "case fresh account: expected every published policy once, in id order, got {}",
+        "case fresh account: expected every published policy once, in the published order, \
+         got {}",
         listed.raw
     );
     assert_eq!(
@@ -419,8 +419,9 @@ async fn a_listing_reports_every_policy_of_the_kind_asked_for_and_pages_through_
     let router = emulator();
     let custom = create_custom_policies(&router).await;
     let managed = managed_summaries();
-    let mut both: Vec<Summary> = managed.iter().chain(custom.iter()).cloned().collect();
-    both.sort_by(|left, right| left.id.cmp(&right.id));
+    // One total order over both sources: the published catalogue in its own order, then the
+    // policies this account created, by id.
+    let both: Vec<Summary> = managed.iter().chain(custom.iter()).cloned().collect();
 
     // (the case, the filter as the request carries it, the summaries it must report)
     let rows: [(&str, &str, &Vec<Summary>); 3] = [
@@ -451,7 +452,8 @@ async fn a_listing_reports_every_policy_of_the_kind_asked_for_and_pages_through_
         assert_eq!(
             &page_summaries(&listed),
             expected,
-            "case {case}: expected every policy of that kind once, in id order, got {}",
+            "case {case}: expected every policy of that kind once, in the listing order, \
+             got {}",
             listed.raw
         );
 
@@ -634,11 +636,13 @@ async fn a_page_size_or_marker_that_names_no_resume_point_is_refused() {
             "case resume at {marker}: expected HTTP 200, got {} with {}",
             page.status, page.raw
         );
-        let expected: Vec<String> = before
+        // The resume point names where the previous page ended, so the page it names holds
+        // the policies that come AFTER it in the listing's one order.
+        let position = before
             .iter()
-            .filter(|id| id.as_str() > marker.as_str())
-            .cloned()
-            .collect();
+            .position(|id| *id == marker)
+            .expect("the listing holds the resume point");
+        let expected: Vec<String> = before[position + 1..].to_vec();
         assert_eq!(
             page_ids(&page),
             expected,

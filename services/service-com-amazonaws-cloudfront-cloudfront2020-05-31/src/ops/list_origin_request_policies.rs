@@ -3,16 +3,17 @@
 //! @op ListOriginRequestPolicies
 //!
 //! Enumerates the origin request policies this account holds, one page at a time: the page
-//! is cut at `MaxItems` (bounded by this emulator's own ceiling), the order is the stored
-//! total order over policy ids, and `Marker` names the policy the previous page ended at,
-//! so walking the pages enumerates every policy exactly once.
+//! is cut at `MaxItems` (bounded by this listing's own default page size), the order is the
+//! published catalog's own order followed by the account's policies by id
+//! ([`crate::state::policy_listing_key`]), and `Marker` names the policy the previous page
+//! ended at, so walking the pages enumerates every policy exactly once.
 //!
 //! `Type` filters the page by where a policy came from: a policy this store holds was put
 //! there by a `CreateOriginRequestPolicy` call in this account, so it is a `custom` policy,
 //! while the policies Amazon Web Services itself creates are reference data every account
 //! holds ([`crate::state::MANAGED_ORIGIN_REQUEST_POLICIES`]) and are listed as `managed`. A
 //! request naming one kind is served that kind alone; one naming none is served both, in
-//! one total order over ids.
+//! that one order.
 //!
 //! A reporting operation: it reads the stored records and writes nothing beyond what the
 //! clock already owed the rest of this service's state.
@@ -236,9 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let serves_managed = kind != Some(TYPE_CUSTOM);
         let serves_custom = kind != Some(TYPE_MANAGED);
 
-        // The policies this request is about, in ONE total order over ids: the published
-        // catalog and the account's own records are two sources of the same resource kind,
-        // so they are ordered together rather than concatenated — which is what lets
+        // The policies this request is about, in ONE total order: the published catalog in
+        // the order Amazon publishes it, then the account's own records by id
+        // ([`crate::state::policy_listing_key`]) — the two sources are the same resource
+        // kind, so they are ordered together rather than concatenated, which is what lets
         // `Marker` resume at an id whichever source it came from.
         let mut candidates: Vec<OriginRequestPolicySummary> = Vec::new();
         if serves_managed {
@@ -260,21 +262,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }));
         }
-        candidates.sort_by(|left, right| {
-            left.origin_request_policy
-                .id
-                .cmp(&right.origin_request_policy.id)
-        });
+        let listing_key = |id: &str| {
+            crate::state::policy_listing_key(
+                crate::state::managed_origin_request_policy_rank(id),
+                id,
+            )
+        };
+        candidates.sort_by_key(|summary| listing_key(&summary.origin_request_policy.id));
 
-        // `Marker` names where the previous page ENDED, so this page starts after it:
-        // walking the pages enumerates every policy exactly once.
+        // `Marker` names where the previous page ENDED, so this page starts after it in that
+        // one order: walking the pages enumerates every policy exactly once.
+        let resume = input.marker.as_deref().map(listing_key);
         let mut items: Vec<OriginRequestPolicySummary> = Vec::new();
         let mut more_remain = false;
         for summary in candidates {
-            if input
-                .marker
-                .as_deref()
-                .is_some_and(|marker| summary.origin_request_policy.id.as_str() <= marker)
+            if resume
+                .as_ref()
+                .is_some_and(|bound| listing_key(&summary.origin_request_policy.id) <= *bound)
             {
                 continue;
             }

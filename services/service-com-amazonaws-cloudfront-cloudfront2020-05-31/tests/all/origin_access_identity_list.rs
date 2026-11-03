@@ -32,7 +32,8 @@
 use std::collections::BTreeSet;
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    INVALID_ORIGIN_ACCESS_IDENTITY_MARKER_MESSAGE, MAX_ITEMS, MAX_ITEMS_INVALID_MESSAGE,
+    INVALID_ORIGIN_ACCESS_IDENTITY_MARKER_MESSAGE, MAX_ITEMS,
+    MAX_ITEMS_CLOUD_FRONT_ORIGIN_ACCESS_IDENTITIES, MAX_ITEMS_INVALID_MESSAGE,
     MAX_ORIGIN_ACCESS_IDENTITY_COMMENT,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -261,8 +262,9 @@ async fn an_account_using_no_identities_lists_no_items() {
     );
     assert_eq!(
         listed.root().text_at("MaxItems"),
-        Some(MAX_ITEMS.to_string().as_str()),
-        "case {case}: expected the default MaxItems {MAX_ITEMS}, got {}",
+        Some(MAX_ITEMS_CLOUD_FRONT_ORIGIN_ACCESS_IDENTITIES.to_string().as_str()),
+        "case {case}: expected the default MaxItems \
+         {MAX_ITEMS_CLOUD_FRONT_ORIGIN_ACCESS_IDENTITIES}, got {}",
         listed.raw
     );
     assert_eq!(

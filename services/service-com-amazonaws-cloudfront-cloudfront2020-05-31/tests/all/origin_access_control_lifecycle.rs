@@ -54,7 +54,8 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::{
     ORIGIN_ACCESS_CONTROL_SIGNING_PROTOCOLS_VALUES,
 };
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    MAX_ITEMS, MAX_ORIGIN_ACCESS_CONTROLS, MAX_ORIGIN_ACCESS_CONTROL_NAME,
+    MAX_ITEMS, MAX_ITEMS_ORIGIN_ACCESS_CONTROLS, MAX_ORIGIN_ACCESS_CONTROLS,
+    MAX_ORIGIN_ACCESS_CONTROL_NAME,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -521,8 +522,9 @@ async fn an_account_using_no_origin_access_controls_lists_no_items() {
     );
     assert_eq!(
         listed.root().text_at("MaxItems"),
-        Some(MAX_ITEMS.to_string().as_str()),
-        "case empty account: expected the default MaxItems {MAX_ITEMS}, got {}",
+        Some(MAX_ITEMS_ORIGIN_ACCESS_CONTROLS.to_string().as_str()),
+        "case empty account: expected the default MaxItems {MAX_ITEMS_ORIGIN_ACCESS_CONTROLS}, \
+         got {}",
         listed.raw
     );
     assert_eq!(

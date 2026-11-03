@@ -7,8 +7,9 @@
 //! under the identifiers AWS publishes ([`crate::state::MANAGED_CACHE_POLICIES`]), and the
 //! ones this account created with `CreateCachePolicy`, which are read from the store.
 //! `Type` filters the answer down to one kind; without it both are reported, in one stable
-//! total order over ids that `Marker` indexes into, so walking the pages enumerates every
-//! policy exactly once.
+//! order that `Marker` indexes into — the published catalog in the order Amazon publishes
+//! it, then the account's own policies by id ([`crate::state::policy_listing_key`]) — so
+//! walking the pages enumerates every policy exactly once.
 //!
 //! A reporting operation: it reads the stored records and the published catalog, and writes
 //! nothing.
@@ -207,10 +208,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The policies this request is about, in ONE total order over ids: the published
-        // managed catalog and the account's own records are two sources of the same resource
-        // kind, so they are ordered together rather than concatenated — which is what lets
-        // `Marker` resume at an id whichever source it came from.
+        // The policies this request is about, in ONE total order: the published managed
+        // catalog in the order Amazon publishes it, then the account's own records by id
+        // ([`crate::state::policy_listing_key`]). The published catalog and the account's
+        // records are two sources of the same resource kind, so they are ordered together
+        // rather than concatenated — which is what lets `Marker` resume at an id whichever
+        // source it came from.
         let mut candidates: Vec<CachePolicySummary> = Vec::new();
         if serves_managed {
             candidates.extend(
@@ -233,17 +236,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }),
             );
         }
-        candidates.sort_by(|left, right| left.cache_policy.id.cmp(&right.cache_policy.id));
+        let listing_key = |id: &str| {
+            crate::state::policy_listing_key(crate::state::managed_cache_policy_rank(id), id)
+        };
+        candidates.sort_by_key(|summary| listing_key(&summary.cache_policy.id));
 
-        // `Marker` names where the previous page ENDED, so this page starts after it:
-        // walking the pages enumerates every policy exactly once.
+        // `Marker` names where the previous page ENDED, so this page starts after it in that
+        // one order: walking the pages enumerates every policy exactly once.
+        let resume = input.marker.as_deref().map(listing_key);
         let mut items: Vec<CachePolicySummary> = Vec::new();
         let mut more_remain = false;
         for summary in candidates {
-            if input
-                .marker
-                .as_deref()
-                .is_some_and(|marker| summary.cache_policy.id.as_str() <= marker)
+            if resume
+                .as_ref()
+                .is_some_and(|bound| listing_key(&summary.cache_policy.id) <= *bound)
             {
                 continue;
             }

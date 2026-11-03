@@ -305,10 +305,25 @@ impl Family {
 // The published entries, written out from Amazon's own lists
 // ---------------------------------------------------------------------------
 
-/// Origin request policies Amazon publishes: `(Id, Name, HeaderBehavior)`. EVERY entry of
-/// the published list, so an extra, missing or renamed catalogue entry fails this suite;
-/// several of them are entries no issue cited.
+/// Origin request policies Amazon publishes: `(Id, Name, HeaderBehavior)`, in the order
+/// Amazon lists them. EVERY entry of the published list, so an extra, missing or renamed
+/// catalogue entry fails this suite; several of them are entries no issue cited.
 const PUBLISHED_ORIGIN_REQUEST_POLICIES: &[(&str, &str, &str)] = &[
+    (
+        "acba4595-bd28-49b8-b9fe-13317c0390fa",
+        "Managed-UserAgentRefererHeaders",
+        "whitelist",
+    ),
+    (
+        "59781a5b-3903-41f3-afcb-af62929ccde1",
+        "Managed-CORS-CustomOrigin",
+        "whitelist",
+    ),
+    (
+        "88a5eaf4-2fd4-4709-b370-b4c650ea3fcf",
+        "Managed-CORS-S3Origin",
+        "whitelist",
+    ),
     (
         "216adef6-5c7f-47e4-b989-5492eafa07d3",
         "Managed-AllViewer",
@@ -320,23 +335,8 @@ const PUBLISHED_ORIGIN_REQUEST_POLICIES: &[(&str, &str, &str)] = &[
         "allViewerAndWhitelistCloudFront",
     ),
     (
-        "59781a5b-3903-41f3-afcb-af62929ccde1",
-        "Managed-CORS-CustomOrigin",
-        "whitelist",
-    ),
-    (
         "775133bc-15f2-49f9-abea-afb2e0bf67d2",
         "Managed-Elemental-MediaTailor-PersonalizedManifests",
-        "whitelist",
-    ),
-    (
-        "88a5eaf4-2fd4-4709-b370-b4c650ea3fcf",
-        "Managed-CORS-S3Origin",
-        "whitelist",
-    ),
-    (
-        "acba4595-bd28-49b8-b9fe-13317c0390fa",
-        "Managed-UserAgentRefererHeaders",
         "whitelist",
     ),
     (
@@ -347,14 +347,9 @@ const PUBLISHED_ORIGIN_REQUEST_POLICIES: &[(&str, &str, &str)] = &[
 ];
 
 /// Response headers policies Amazon publishes: `(Id, Name, carries a CorsConfig, carries a
-/// SecurityHeadersConfig)`. EVERY entry of the published list, for the same reason.
+/// SecurityHeadersConfig)`, in the order Amazon lists them. EVERY entry of the published
+/// list, for the same reason.
 const PUBLISHED_RESPONSE_HEADERS_POLICIES: &[(&str, &str, bool, bool)] = &[
-    (
-        "5cc3b908-e619-4b99-88e5-2cf7f45965bd",
-        "Managed-CORS-With-Preflight",
-        true,
-        false,
-    ),
     (
         "60669652-455b-4ae9-85a4-c4c02393f86c",
         "Managed-SimpleCORS",
@@ -362,9 +357,15 @@ const PUBLISHED_RESPONSE_HEADERS_POLICIES: &[(&str, &str, bool, bool)] = &[
         false,
     ),
     (
-        "67f7725c-6f97-4210-82d7-5512b31e9d03",
-        "Managed-SecurityHeadersPolicy",
+        "5cc3b908-e619-4b99-88e5-2cf7f45965bd",
+        "Managed-CORS-With-Preflight",
+        true,
         false,
+    ),
+    (
+        "eaab4381-ed33-4a86-88ca-d9558dc6cd63",
+        "Managed-CORS-with-preflight-and-SecurityHeadersPolicy",
+        true,
         true,
     ),
     (
@@ -374,9 +375,9 @@ const PUBLISHED_RESPONSE_HEADERS_POLICIES: &[(&str, &str, bool, bool)] = &[
         true,
     ),
     (
-        "eaab4381-ed33-4a86-88ca-d9558dc6cd63",
-        "Managed-CORS-with-preflight-and-SecurityHeadersPolicy",
-        true,
+        "67f7725c-6f97-4210-82d7-5512b31e9d03",
+        "Managed-SecurityHeadersPolicy",
+        false,
         true,
     ),
 ];
@@ -455,14 +456,15 @@ async fn an_account_that_created_nothing_is_served_the_published_catalogues() {
                  {walked:?}"
             );
             let mut ids: Vec<String> = walked.iter().map(|(_, id, _)| id.clone()).collect();
-            let sorted = {
-                let mut copy = ids.clone();
-                copy.sort();
-                copy
-            };
+            let published_order: Vec<String> = family
+                .catalogue
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect();
             assert_eq!(
-                ids, sorted,
-                "case {case} (page size {size}): expected one total order over ids, got {ids:?}"
+                ids, published_order,
+                "case {case} (page size {size}): expected the published catalogue's own \
+                 order, got {ids:?}"
             );
             ids.dedup();
             assert_eq!(
@@ -509,7 +511,7 @@ async fn the_published_entries_are_the_ones_amazon_publishes() {
             .map(|(id, name, _)| ((*id).to_string(), (*name).to_string()))
             .collect::<Vec<(String, String)>>(),
         "case origin request policies: expected the catalogue to be exactly Amazon's \
-         published list, in id order, got {:?}",
+         published list, in the published order, got {:?}",
         origin_request.catalogue
     );
     for (id, name, header_behavior) in PUBLISHED_ORIGIN_REQUEST_POLICIES {
@@ -540,7 +542,7 @@ async fn the_published_entries_are_the_ones_amazon_publishes() {
             .map(|(id, name, _, _)| ((*id).to_string(), (*name).to_string()))
             .collect::<Vec<(String, String)>>(),
         "case response headers policies: expected the catalogue to be exactly Amazon's \
-         published list, in id order, got {:?}",
+         published list, in the published order, got {:?}",
         response_headers.catalogue
     );
     for (id, name, has_cors, has_security) in PUBLISHED_RESPONSE_HEADERS_POLICIES {
@@ -651,15 +653,19 @@ async fn the_published_and_account_partitions_stay_disjoint() {
              kind, got {managed_page:?}"
         );
 
-        // No filter: both partitions, each id once, in one order over ids.
+        // No filter: both partitions, each id once, in ONE order — the published catalogue
+        // in its own order, then the policies this account created.
         let both = family.walk(&router, "", 100, published.len() + 1).await;
         let ids: Vec<String> = both.iter().map(|(_, id, _)| id.clone()).collect();
-        let mut expected: Vec<String> = published.iter().cloned().collect();
+        let mut expected: Vec<String> = family
+            .catalogue
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
         expected.push(own_id.clone());
-        expected.sort();
         assert_eq!(
             ids, expected,
-            "case {case}: expected both partitions in one id order, got {both:?}"
+            "case {case}: expected both partitions in one order, got {both:?}"
         );
         assert!(
             both.iter().all(|(kind, id, _)| if *id == own_id {

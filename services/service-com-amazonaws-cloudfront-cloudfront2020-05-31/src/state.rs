@@ -174,6 +174,30 @@ pub const PROPAGATION_DELAY: Duration = Duration::from_millis(500);
 /// lock.
 pub const MAX_ITEMS: i32 = 100;
 
+/// The number of origin access controls `ListOriginAccessControls` serves when a request
+/// names no `MaxItems`, and the ceiling it serves that listing at.
+///
+/// A listing answers with the default page size of ITS OWN operation rather than one
+/// number shared by the whole service: `MaxItems` is an optional query parameter on every
+/// listing ([`page_size_at`]), so the service supplies the value a request leaves out, and
+/// the value it supplies is the one that operation pages at. A client that pages by the
+/// `MaxItems` the response echoes reads this number, so a listing that reports another
+/// operation's default hands it the wrong page size. This is the number the origin access
+/// control listing pages at.
+pub const MAX_ITEMS_ORIGIN_ACCESS_CONTROLS: i32 = 200;
+
+/// The number of origin access identities `ListCloudFrontOriginAccessIdentities` serves
+/// when a request names no `MaxItems`, and the ceiling it serves that listing at — the
+/// origin access identity listing's own default, by the rule
+/// [`MAX_ITEMS_ORIGIN_ACCESS_CONTROLS`] states.
+pub const MAX_ITEMS_CLOUD_FRONT_ORIGIN_ACCESS_IDENTITIES: i32 = 200;
+
+/// The number of real-time log configurations `ListRealtimeLogConfigs` serves when a
+/// request names no `MaxItems`, and the ceiling it serves that listing at — the real-time
+/// log configuration listing's own default, by the rule
+/// [`MAX_ITEMS_ORIGIN_ACCESS_CONTROLS`] states.
+pub const MAX_ITEMS_REALTIME_LOG_CONFIGS: i32 = 150;
+
 /// The most distributions this emulator holds.
 ///
 /// The store lives for the process's lifetime and grows only on a create, and a
@@ -3120,13 +3144,63 @@ pub fn managed_policy_etag(id: &str) -> String {
 /// `2020-05-31T00:00:00Z` in seconds since the Unix epoch.
 const MANAGED_POLICY_LAST_MODIFIED_UNIX_SECONDS: u64 = 1_590_883_200;
 
-/// The AWS-managed cache policies, in the order their ids sort in — the same total order
-/// every listing of this service pages through, so the catalog can be merged with the
-/// account's own policies without re-sorting it.
+/// The AWS-managed cache policies, in the order Amazon PUBLISHES them rather than the
+/// order their ids sort in — the order every listing of this service serves them in, ahead
+/// of the policies this account created ([`policy_listing_key`]), so the first policy of a
+/// managed page is the first policy Amazon lists.
 ///
-/// Each entry's identifier, name and settings are the ones Amazon publishes for it (see
-/// [`ManagedCachePolicy`] for the source).
+/// Each entry's identifier, name and settings are the ones Amazon publishes for it, and the
+/// entries stand in the order that same list presents them (see [`ManagedCachePolicy`] for
+/// the source).
 pub const MANAGED_CACHE_POLICIES: &[ManagedCachePolicy] = &[
+    ManagedCachePolicy {
+        id: "658327ea-f89d-4fab-a63d-7e88639e58f6",
+        name: "Managed-CachingOptimized",
+        comment: "Policy with caching enabled. Supports Gzip and Brotli compression.",
+        min_ttl: 1,
+        default_ttl: 86_400,
+        max_ttl: 31_536_000,
+        gzip: true,
+        brotli: true,
+        header_behavior: "none",
+        headers: &[],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "none",
+        query_strings: &[],
+    },
+    ManagedCachePolicy {
+        id: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+        name: "Managed-CachingDisabled",
+        comment: "Policy with caching disabled",
+        min_ttl: 0,
+        default_ttl: 0,
+        max_ttl: 0,
+        gzip: false,
+        brotli: false,
+        header_behavior: "none",
+        headers: &[],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "none",
+        query_strings: &[],
+    },
+    ManagedCachePolicy {
+        id: "b2884449-e4de-46a7-ac36-70bc7f1ddd6d",
+        name: "Managed-CachingOptimizedForUncompressedObjects",
+        comment: "Policy with caching enabled that does not support compression",
+        min_ttl: 1,
+        default_ttl: 86_400,
+        max_ttl: 31_536_000,
+        gzip: false,
+        brotli: false,
+        header_behavior: "none",
+        headers: &[],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "none",
+        query_strings: &[],
+    },
     ManagedCachePolicy {
         id: "08627262-05a9-4f76-9ded-b50ca2e3a84f",
         name: "Managed-Elemental-MediaPackage",
@@ -3160,16 +3234,20 @@ pub const MANAGED_CACHE_POLICIES: &[ManagedCachePolicy] = &[
         query_strings: &[],
     },
     ManagedCachePolicy {
-        id: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
-        name: "Managed-CachingDisabled",
-        comment: "Policy with caching disabled",
+        id: "83da9c7e-98b4-4e11-a168-04f0df8e2c65",
+        name: "Managed-UseOriginCacheControlHeaders",
+        comment: "Policy for an origin that returns Cache-Control headers",
         min_ttl: 0,
         default_ttl: 0,
-        max_ttl: 0,
-        gzip: false,
-        brotli: false,
-        header_behavior: "none",
-        headers: &[],
+        max_ttl: 31_536_000,
+        gzip: true,
+        brotli: true,
+        header_behavior: "whitelist",
+        headers: &[
+            "Origin",
+            "Access-Control-Request-Headers",
+            "Access-Control-Request-Method",
+        ],
         cookie_behavior: "none",
         cookies: &[],
         query_string_behavior: "none",
@@ -3196,58 +3274,6 @@ pub const MANAGED_CACHE_POLICIES: &[ManagedCachePolicy] = &[
         query_string_behavior: "all",
         query_strings: &[],
     },
-    ManagedCachePolicy {
-        id: "658327ea-f89d-4fab-a63d-7e88639e58f6",
-        name: "Managed-CachingOptimized",
-        comment: "Policy with caching enabled. Supports Gzip and Brotli compression.",
-        min_ttl: 1,
-        default_ttl: 86_400,
-        max_ttl: 31_536_000,
-        gzip: true,
-        brotli: true,
-        header_behavior: "none",
-        headers: &[],
-        cookie_behavior: "none",
-        cookies: &[],
-        query_string_behavior: "none",
-        query_strings: &[],
-    },
-    ManagedCachePolicy {
-        id: "83da9c7e-98b4-4e11-a168-04f0df8e2c65",
-        name: "Managed-UseOriginCacheControlHeaders",
-        comment: "Policy for an origin that returns Cache-Control headers",
-        min_ttl: 0,
-        default_ttl: 0,
-        max_ttl: 31_536_000,
-        gzip: true,
-        brotli: true,
-        header_behavior: "whitelist",
-        headers: &[
-            "Origin",
-            "Access-Control-Request-Headers",
-            "Access-Control-Request-Method",
-        ],
-        cookie_behavior: "none",
-        cookies: &[],
-        query_string_behavior: "none",
-        query_strings: &[],
-    },
-    ManagedCachePolicy {
-        id: "b2884449-e4de-46a7-ac36-70bc7f1ddd6d",
-        name: "Managed-CachingOptimizedForUncompressedObjects",
-        comment: "Policy with caching enabled that does not support compression",
-        min_ttl: 1,
-        default_ttl: 86_400,
-        max_ttl: 31_536_000,
-        gzip: false,
-        brotli: false,
-        header_behavior: "none",
-        headers: &[],
-        cookie_behavior: "none",
-        cookies: &[],
-        query_string_behavior: "none",
-        query_strings: &[],
-    },
 ];
 
 /// The managed cache policy `id` names, or `None` when the catalog holds none — what tells
@@ -3256,6 +3282,30 @@ pub fn managed_cache_policy(id: &str) -> Option<&'static ManagedCachePolicy> {
     MANAGED_CACHE_POLICIES
         .iter()
         .find(|managed| managed.id == id)
+}
+
+/// Where [`MANAGED_CACHE_POLICIES`] lists the policy `id`, or `None` for an id the
+/// catalog does not hold — the rank a listing orders a published cache policy by
+/// ([`policy_listing_key`]).
+pub fn managed_cache_policy_rank(id: &str) -> Option<usize> {
+    MANAGED_CACHE_POLICIES
+        .iter()
+        .position(|managed| managed.id == id)
+}
+
+/// The key a listing of a policy family orders ONE policy by, given where the published
+/// catalog lists it (`rank`, `None` for a policy this account created) and its id.
+///
+/// A policy AWS published sorts where the published catalog lists it, and ahead of every
+/// policy this account created; the account's own policies sort among themselves by id.
+/// That is ONE total order over both sources rather than two concatenated lists, so
+/// `Marker` resumes at an id whichever source it came from, and every page of a walk serves
+/// each policy exactly once.
+pub fn policy_listing_key(rank: Option<usize>, id: &str) -> (usize, String) {
+    match rank {
+        Some(rank) => (rank, String::new()),
+        None => (usize::MAX, id.to_string()),
+    }
 }
 
 /// The `OriginRequestPolicyType` a policy this ACCOUNT created carries — "custom – Returns
@@ -3353,13 +3403,52 @@ impl ManagedOriginRequestPolicy {
     }
 }
 
-/// The AWS-managed origin request policies, in the order their ids sort in — the same total
-/// order every listing of this service pages through, so the catalog can be merged with the
-/// account's own policies without re-sorting it.
+/// The AWS-managed origin request policies, in the order Amazon PUBLISHES them rather than
+/// the order their ids sort in — the order every listing of this service serves them in,
+/// ahead of the policies this account created ([`policy_listing_key`]).
 ///
-/// Each entry's identifier, name and settings are the ones Amazon publishes for it (see
+/// Each entry's identifier, name and settings are the ones Amazon publishes for it, and the
+/// entries stand in the order that same list presents them (see
 /// [`ManagedOriginRequestPolicy`] for the source).
 pub const MANAGED_ORIGIN_REQUEST_POLICIES: &[ManagedOriginRequestPolicy] = &[
+    ManagedOriginRequestPolicy {
+        id: "acba4595-bd28-49b8-b9fe-13317c0390fa",
+        name: "Managed-UserAgentRefererHeaders",
+        comment: "Policy to forward user-agent and referer headers to origin",
+        header_behavior: "whitelist",
+        headers: &["referer", "user-agent"],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "none",
+        query_strings: &[],
+    },
+    ManagedOriginRequestPolicy {
+        id: "59781a5b-3903-41f3-afcb-af62929ccde1",
+        name: "Managed-CORS-CustomOrigin",
+        comment: "Policy to forward the Origin header, for CORS requests to a custom origin",
+        header_behavior: "whitelist",
+        headers: &["Origin"],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "none",
+        query_strings: &[],
+    },
+    ManagedOriginRequestPolicy {
+        id: "88a5eaf4-2fd4-4709-b370-b4c650ea3fcf",
+        name: "Managed-CORS-S3Origin",
+        comment: "Policy to forward the CORS request headers, for CORS requests to an \
+                  Amazon S3 origin",
+        header_behavior: "whitelist",
+        headers: &[
+            "Origin",
+            "Access-Control-Request-Headers",
+            "Access-Control-Request-Method",
+        ],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "none",
+        query_strings: &[],
+    },
     ManagedOriginRequestPolicy {
         id: "216adef6-5c7f-47e4-b989-5492eafa07d3",
         name: "Managed-AllViewer",
@@ -3406,17 +3495,6 @@ pub const MANAGED_ORIGIN_REQUEST_POLICIES: &[ManagedOriginRequestPolicy] = &[
         query_strings: &[],
     },
     ManagedOriginRequestPolicy {
-        id: "59781a5b-3903-41f3-afcb-af62929ccde1",
-        name: "Managed-CORS-CustomOrigin",
-        comment: "Policy to forward the Origin header, for CORS requests to a custom origin",
-        header_behavior: "whitelist",
-        headers: &["Origin"],
-        cookie_behavior: "none",
-        cookies: &[],
-        query_string_behavior: "none",
-        query_strings: &[],
-    },
-    ManagedOriginRequestPolicy {
         id: "775133bc-15f2-49f9-abea-afb2e0bf67d2",
         name: "Managed-Elemental-MediaTailor-PersonalizedManifests",
         comment: "Policy for an AWS Elemental MediaTailor origin serving personalized \
@@ -3432,33 +3510,6 @@ pub const MANAGED_ORIGIN_REQUEST_POLICIES: &[ManagedOriginRequestPolicy] = &[
         cookie_behavior: "none",
         cookies: &[],
         query_string_behavior: "all",
-        query_strings: &[],
-    },
-    ManagedOriginRequestPolicy {
-        id: "88a5eaf4-2fd4-4709-b370-b4c650ea3fcf",
-        name: "Managed-CORS-S3Origin",
-        comment: "Policy to forward the CORS request headers, for CORS requests to an \
-                  Amazon S3 origin",
-        header_behavior: "whitelist",
-        headers: &[
-            "Origin",
-            "Access-Control-Request-Headers",
-            "Access-Control-Request-Method",
-        ],
-        cookie_behavior: "none",
-        cookies: &[],
-        query_string_behavior: "none",
-        query_strings: &[],
-    },
-    ManagedOriginRequestPolicy {
-        id: "acba4595-bd28-49b8-b9fe-13317c0390fa",
-        name: "Managed-UserAgentRefererHeaders",
-        comment: "Policy to forward the User-Agent and Referer headers",
-        header_behavior: "whitelist",
-        headers: &["User-Agent", "Referer"],
-        cookie_behavior: "none",
-        cookies: &[],
-        query_string_behavior: "none",
         query_strings: &[],
     },
     ManagedOriginRequestPolicy {
@@ -3483,6 +3534,15 @@ pub fn managed_origin_request_policy(id: &str) -> Option<&'static ManagedOriginR
         .find(|managed| managed.id == id)
 }
 
+/// Where [`MANAGED_ORIGIN_REQUEST_POLICIES`] lists the policy `id`, or `None` for an id the
+/// catalog does not hold — the rank a listing orders a published origin request policy by
+/// ([`policy_listing_key`]).
+pub fn managed_origin_request_policy_rank(id: &str) -> Option<usize> {
+    MANAGED_ORIGIN_REQUEST_POLICIES
+        .iter()
+        .position(|managed| managed.id == id)
+}
+
 /// The `ResponseHeadersPolicyType` a policy this ACCOUNT created carries — the custom
 /// policies "created in your Amazon Web Services account". One of the two values the
 /// model's `ResponseHeadersPolicyType` enum admits.
@@ -3505,6 +3565,11 @@ pub struct ManagedCorsSettings {
     /// `AccessControlAllowMethods$Items` — the methods the policy allows, each a value of
     /// `ResponseHeadersPolicyAccessControlAllowMethodsValues`.
     pub allow_methods: &'static [&'static str],
+    /// `AccessControlExposeHeaders$Items` — the response headers the policy exposes to
+    /// script. A published CORS policy carries the element whether or not it names a header,
+    /// so an empty list here is an element with `Quantity` 0 and an empty `Items` rather
+    /// than no element at all.
+    pub expose_headers: &'static [&'static str],
     /// `AccessControlAllowCredentials`.
     pub allow_credentials: bool,
     /// `AccessControlMaxAgeSec`, in seconds, for a policy that answers preflight requests.
@@ -3599,9 +3664,21 @@ impl ManagedResponseHeadersPolicy {
                                 .collect(),
                         },
                     access_control_allow_credentials: cors.allow_credentials,
-                    // A policy that exposes no response header to script carries no
-                    // `AccessControlExposeHeaders` element at all, rather than an empty one.
-                    access_control_expose_headers: None,
+                    // A published CORS policy states its exposed-header list even when the
+                    // list is empty, so the element is always serialized and carries the
+                    // list's own length beside the list itself.
+                    access_control_expose_headers: Some(
+                        crate::ops::types::ResponseHeadersPolicyAccessControlExposeHeaders {
+                            quantity: i32::try_from(cors.expose_headers.len())
+                                .unwrap_or(i32::MAX),
+                            items: Some(
+                                cors.expose_headers
+                                    .iter()
+                                    .map(|header| (*header).to_string())
+                                    .collect(),
+                            ),
+                        },
+                    ),
                     access_control_max_age_sec: cors.max_age_seconds,
                     origin_override: cors.origin_override,
                 }
@@ -3640,8 +3717,9 @@ pub fn managed_security_headers_config() -> crate::ops::types::ResponseHeadersPo
             r#override: false,
             referrer_policy: "strict-origin-when-cross-origin".to_string(),
         }),
-        // The published policy states no Content-Security-Policy: the directives belong to
-        // the application, so AWS leaves that header to a policy the account writes.
+        // The published policy states no Content-Security-Policy of its own: the directives
+        // belong to the application, so AWS leaves that header to a policy the account
+        // writes.
         content_security_policy: None,
         content_type_options: Some(crate::ops::types::ResponseHeadersPolicyContentTypeOptions {
             r#override: false,
@@ -3666,68 +3744,82 @@ const MANAGED_STRICT_TRANSPORT_SECURITY_MAX_AGE_SECONDS: i32 = 31_536_000;
 const MANAGED_CORS_PREFLIGHT_MAX_AGE_SECONDS: i32 = 600;
 
 /// The CORS settings the published policies that allow a SIMPLE cross-origin request carry:
-/// any origin, any request header, and the methods a simple request uses.
+/// every origin, and no list of its own for the request headers, the methods or the exposed
+/// headers — the behaviour those lists would narrow is the published policy's own, so each
+/// list is served empty, and a published policy leaves a header the origin already set
+/// alone.
 const MANAGED_SIMPLE_CORS: ManagedCorsSettings = ManagedCorsSettings {
     allow_origins: &["*"],
-    allow_headers: &["*"],
-    allow_methods: &["GET", "HEAD", "POST"],
+    allow_headers: &[],
+    allow_methods: &[],
+    expose_headers: &[],
     allow_credentials: false,
     max_age_seconds: None,
-    origin_override: true,
+    origin_override: false,
 };
 
-/// The CORS settings the published policies that also answer PREFLIGHT requests carry: any
-/// origin, any request header, every method, and the published `Access-Control-Max-Age`.
+/// The CORS settings the published policies that also answer PREFLIGHT requests carry: the
+/// simple settings plus what a preflight answer adds — the methods it names, every exposed
+/// response header, and the published `Access-Control-Max-Age`.
+///
+/// The methods are every value `AccessControlAllowMethods$Items` admits beside the `ALL`
+/// shorthand (`smithy_query(query="shape",
+/// shape="ResponseHeadersPolicyAccessControlAllowMethodsValues")`), in the order the
+/// published policy states them — a published policy states the methods themselves rather
+/// than the shorthand.
 const MANAGED_PREFLIGHT_CORS: ManagedCorsSettings = ManagedCorsSettings {
     allow_origins: &["*"],
-    allow_headers: &["*"],
-    allow_methods: &["ALL"],
+    allow_headers: &[],
+    allow_methods: &["GET", "HEAD", "PUT", "POST", "PATCH", "DELETE", "OPTIONS"],
+    expose_headers: &["*"],
     allow_credentials: false,
     max_age_seconds: Some(MANAGED_CORS_PREFLIGHT_MAX_AGE_SECONDS),
-    origin_override: true,
+    origin_override: false,
 };
 
-/// The AWS-managed response headers policies, in the order their ids sort in — the same
-/// total order every listing of this service pages through.
+/// The AWS-managed response headers policies, in the order Amazon PUBLISHES them rather
+/// than the order their ids sort in — the order every listing of this service serves them
+/// in, ahead of the policies this account created ([`policy_listing_key`]).
 ///
-/// Each entry's identifier, name and settings are the ones Amazon publishes for it (see
+/// Each entry's identifier, name and settings are the ones Amazon publishes for it, and the
+/// entries stand in the order that same list presents them (see
 /// [`ManagedResponseHeadersPolicy`] for the source).
 pub const MANAGED_RESPONSE_HEADERS_POLICIES: &[ManagedResponseHeadersPolicy] = &[
     ManagedResponseHeadersPolicy {
+        id: "60669652-455b-4ae9-85a4-c4c02393f86c",
+        name: "Managed-SimpleCORS",
+        comment: "Allows all origins for simple CORS requests",
+        cors: Some(MANAGED_SIMPLE_CORS),
+        security_headers: false,
+    },
+    ManagedResponseHeadersPolicy {
         id: "5cc3b908-e619-4b99-88e5-2cf7f45965bd",
         name: "Managed-CORS-With-Preflight",
-        comment: "Allows CORS requests from any origin, including preflight requests",
+        comment: "Allows all origins for CORS requests, including preflight requests",
         cors: Some(MANAGED_PREFLIGHT_CORS),
         security_headers: false,
     },
     ManagedResponseHeadersPolicy {
-        id: "60669652-455b-4ae9-85a4-c4c02393f86c",
-        name: "Managed-SimpleCORS",
-        comment: "Allows simple CORS requests from any origin",
+        id: "eaab4381-ed33-4a86-88ca-d9558dc6cd63",
+        name: "Managed-CORS-with-preflight-and-SecurityHeadersPolicy",
+        comment: "Allows all origins for CORS requests, including preflight requests, and \
+                  adds a set of security headers to every response",
+        cors: Some(MANAGED_PREFLIGHT_CORS),
+        security_headers: true,
+    },
+    ManagedResponseHeadersPolicy {
+        id: "e61eb345-f6c1-4b97-f0d2-0bdcb2b0b6d3",
+        name: "Managed-CORS-and-SecurityHeadersPolicy",
+        comment: "Allows all origins for simple CORS requests, and adds a set of security \
+                  headers to every response",
         cors: Some(MANAGED_SIMPLE_CORS),
-        security_headers: false,
+        security_headers: true,
     },
     ManagedResponseHeadersPolicy {
         id: "67f7725c-6f97-4210-82d7-5512b31e9d03",
         name: "Managed-SecurityHeadersPolicy",
         comment: "Adds a set of security headers to every response",
         cors: None,
-        security_headers: true,
-    },
-    ManagedResponseHeadersPolicy {
-        id: "e61eb345-f6c1-4b97-f0d2-0bdcb2b0b6d3",
-        name: "Managed-CORS-and-SecurityHeadersPolicy",
-        comment: "Allows simple CORS requests from any origin and adds a set of security \
-                  headers to every response",
-        cors: Some(MANAGED_SIMPLE_CORS),
-        security_headers: true,
-    },
-    ManagedResponseHeadersPolicy {
-        id: "eaab4381-ed33-4a86-88ca-d9558dc6cd63",
-        name: "Managed-CORS-with-preflight-and-SecurityHeadersPolicy",
-        comment: "Allows CORS requests from any origin, including preflight requests, and \
-                  adds a set of security headers to every response",
-        cors: Some(MANAGED_PREFLIGHT_CORS),
         security_headers: true,
     },
 ];
@@ -3740,6 +3832,15 @@ pub fn managed_response_headers_policy(
     MANAGED_RESPONSE_HEADERS_POLICIES
         .iter()
         .find(|managed| managed.id == id)
+}
+
+/// Where [`MANAGED_RESPONSE_HEADERS_POLICIES`] lists the policy `id`, or `None` for an id
+/// the catalog does not hold — the rank a listing orders a published response headers
+/// policy by ([`policy_listing_key`]).
+pub fn managed_response_headers_policy_rank(id: &str) -> Option<usize> {
+    MANAGED_RESPONSE_HEADERS_POLICIES
+        .iter()
+        .position(|managed| managed.id == id)
 }
 
 /// One CloudFront public key, as this emulator persists it.
@@ -6970,11 +7071,22 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// `None` when the request named a size that is no page at all (zero or negative), which
 /// the caller answers with the modelled `InvalidArgument`.
 pub fn page_size(max_items: Option<i32>) -> Option<usize> {
-    let requested = max_items.unwrap_or(MAX_ITEMS);
+    page_size_at(max_items, MAX_ITEMS)
+}
+
+/// The number of items one page of a listing whose own default page size is `default`
+/// serves: the `MaxItems` the request named, or `default` when it named none, bounded above
+/// by that same default — the default and the ceiling are one number per listing, so the
+/// size served can never drift past the size the response echoes.
+///
+/// `None` when the request named a size that is no page at all (zero or negative), which
+/// the caller answers with the modelled `InvalidArgument`.
+pub fn page_size_at(max_items: Option<i32>, default: i32) -> Option<usize> {
+    let requested = max_items.unwrap_or(default);
     if requested < 1 {
         return None;
     }
-    usize::try_from(requested.min(MAX_ITEMS)).ok()
+    usize::try_from(requested.min(default)).ok()
 }
 
 /// The ARN of a distribution. CloudFront is a GLOBAL service (`arnNamespace`

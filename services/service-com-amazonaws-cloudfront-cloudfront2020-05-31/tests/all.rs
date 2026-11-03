@@ -177,6 +177,8 @@ mod lambda_edge_config_round_trip;
 mod managed_cache_policy_catalog;
 #[path = "all/managed_cache_policy_delete_gate.rs"]
 mod managed_cache_policy_delete_gate;
+#[path = "all/managed_catalogue_order_and_list_defaults.rs"]
+mod managed_catalogue_order_and_list_defaults;
 #[path = "all/managed_certificate_details.rs"]
 mod managed_certificate_details;
 #[path = "all/managed_certificate_domain_ownership.rs"]

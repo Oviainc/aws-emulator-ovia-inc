@@ -31,8 +31,8 @@
 //! distribution lifecycle suite's wire harness.
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    MAX_ITEMS, MAX_ITEMS_INVALID_MESSAGE, NO_SUCH_REALTIME_LOG_CONFIG_MESSAGE,
-    REALTIME_LOG_CONFIG_MARKER_INVALID_MESSAGE,
+    MAX_ITEMS, MAX_ITEMS_INVALID_MESSAGE, MAX_ITEMS_REALTIME_LOG_CONFIGS,
+    NO_SUCH_REALTIME_LOG_CONFIG_MESSAGE, REALTIME_LOG_CONFIG_MARKER_INVALID_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -115,7 +115,7 @@ fn in_name_order(rows: &[Submitted]) -> Vec<Submitted> {
 // ---------------------------------------------------------------------------
 
 /// An account holding no real-time log configurations lists none: a page with nothing in
-/// it, carrying no `Items` element at all, the default page size, the empty marker the
+/// it, carrying an EMPTY `Items` element, the default page size, the empty marker the
 /// request named and nothing that says more remain.
 #[tokio::test]
 async fn an_account_holding_no_configurations_lists_no_items() {
@@ -131,8 +131,8 @@ async fn an_account_holding_no_configurations_lists_no_items() {
     let page = listed_answer.root();
     assert_eq!(
         page.text_at("MaxItems"),
-        Some(MAX_ITEMS.to_string().as_str()),
-        "case {case}: expected the default MaxItems {MAX_ITEMS}, got {}",
+        Some(MAX_ITEMS_REALTIME_LOG_CONFIGS.to_string().as_str()),
+        "case {case}: expected the default MaxItems {MAX_ITEMS_REALTIME_LOG_CONFIGS}, got {}",
         listed_answer.raw
     );
     assert_eq!(
@@ -147,9 +147,12 @@ async fn an_account_holding_no_configurations_lists_no_items() {
         "case {case}: a first page names no marker, got {}",
         listed_answer.raw
     );
+    let items = page
+        .child("Items")
+        .unwrap_or_else(|| panic!("case {case}: expected an Items element, got {}", listed_answer.raw));
     assert!(
-        page.child("Items").is_none(),
-        "case {case}: a page that lists nothing carries no Items element, got {}",
+        items.children_named("RealtimeLogConfig").is_empty(),
+        "case {case}: a page that lists nothing carries an empty Items element, got {}",
         listed_answer.raw
     );
     assert!(
