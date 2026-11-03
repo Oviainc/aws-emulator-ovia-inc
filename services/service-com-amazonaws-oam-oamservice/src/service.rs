@@ -144,18 +144,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Everything else is the SERVICE's own wording, and OAM models its own two
         // client-input errors for it: a member the request left out is
         // `MissingRequiredParameterException` ("A required parameter is missing from
-        // the request") and a value outside a declared bound, enum or uniqueness rule
-        // is `InvalidParameterException` ("A parameter is specified incorrectly").
-        // Both are HTTP 400, which is the status this refusal already carries, so only
-        // the code and the message change.
+        // the request") and a value outside a declared bound or uniqueness rule is
+        // `InvalidParameterException` ("A parameter is specified incorrectly"). Both
+        // are HTTP 400, which is the status this refusal already carries, so only the
+        // code and the message change. A value outside a declared `@pattern` or enum
+        // belongs to the front end above instead: both are rules of the body itself.
         //
         // The three tagging operations are the exception: `ListTagsForResource`,
         // `TagResource` and `UntagResource` model `ValidationException` and neither of
         // the two codes above, and they are the only operations that bind
         // `ResourceArn` and `TagKeys` — which are an `@httpLabel` and an `@httpQuery`,
         // so they are not part of a request BODY and the body validator above never
-        // judges them. A violation on one of those members therefore keeps the
-        // `ValidationException` the default already names.
+        // judges them. The tagging path has its own refusal for a `ResourceArn` whose
+        // SYNTAX is not one of this service's ARNs (`BadRequestException` with the one
+        // sentence it states for that, which echoes nothing); a violation on any other
+        // of those members keeps the `ValidationException` the default already names.
         let violations = match refusal {
             Refusal::Invalid(violations) => violations,
             // An authentication refusal is the framework's 403 to word, not ours.
@@ -163,6 +166,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         };
         if violations.is_empty() {
             return None;
+        }
+        // A `ResourceArn` the modelled ARN pattern does not admit is the TAGGING front
+        // end's own refusal, and it is about the ARN's syntax rather than about the
+        // value: that layer judges the ARN before the service sees the request, with
+        // its own code and its own fixed sentence.
+        if violations.iter().any(|violation| {
+            violation.path.split('.').next() == Some("resourceArn")
+                && matches!(violation.kind, ViolationKind::Pattern(_))
+        }) {
+            return Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: crate::state::INVALID_TAGGING_ARN_MESSAGE.to_string(),
+            });
         }
         if violations.iter().any(|violation| {
             // `Violation::path` is DOTTED (`tagKeys.1.member` for a list element),
@@ -181,8 +197,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if !pattern_clauses.is_empty() {
             return Some(Refused {
                 code: "BadRequestException".to_string(),
-                message: format!("Invalid request body: [{}]", pattern_clauses.join(", ")),
+                message: crate::state::invalid_request_body_message(&pattern_clauses),
             });
+        }
+        // So is an element outside a modelled enum — membership of an enum is a rule of
+        // the request body, not a bound the service checks — but only when that is the
+        // whole of what the body got wrong: a body that also breaks a rule the SERVICE
+        // reports (a list's own length, its uniqueness, an absent member) keeps that
+        // refusal, so one input can never earn two codes depending on which clause is
+        // noticed first.
+        if violations.iter().all(|violation| {
+            matches!(violation.kind, ViolationKind::EnumValue(_))
+        }) {
+            if let Some(refused) = crate::state::unmodelled_enum_rejection(violations) {
+                return Some(Refused {
+                    code: "BadRequestException".to_string(),
+                    message: refused.message,
+                });
+            }
         }
         // One absent member makes the whole request a missing-parameter refusal; the
         // caller has to supply it before any other complaint matters.

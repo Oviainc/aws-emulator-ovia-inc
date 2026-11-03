@@ -199,7 +199,7 @@ impl<Eng> ListAttachedLinks<Eng> {
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListAttachedLinks<Eng>
 {
-    type Input = ListAttachedLinksInput;
+    type Input = ListAttachedLinksRequest;
     type Output = ListAttachedLinksOutput;
     type Error = ListAttachedLinksError;
 
@@ -213,19 +213,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `SinkIdentifier`'s presence and pattern and `MaxResults`' 1..1000 range are
-        // modelled constraints, already refused by the centralized walk before this
-        // body runs. This operation is `@readonly`: it enumerates stored links and
-        // writes nothing.
+        // `MaxResults`' 1..1000 range is a modelled constraint, already refused by the
+        // centralized walk before this body runs. This operation is `@readonly`: it
+        // enumerates stored links and writes nothing.
         //
-        // An identifier naming the OTHER resource kind cannot be authorized for this
-        // action, and that decision is taken before the sink table is consulted, so
-        // the refusal says nothing about what is stored.
+        // THE AUTHORIZATION DECISION COMES FIRST, before the identifier the request
+        // carries is judged at all: the permission to read a sink's links is granted on
+        // the SINK resource, so the decision is taken on the resource the request names
+        // and nothing else about the request takes part (see
+        // `super::types::ListAttachedLinksRequest`). An identifier that cannot name a
+        // sink of this account and Region therefore earns that decision and not a
+        // complaint about its shape:
+        //
+        // * an ARN of the OTHER resource kind names a resource this action never
+        //   applies to, and the refusal reports that ARN — the resource the decision
+        //   was taken on;
+        // * a value the modelled `ResourceIdentifier` does not admit names no resource
+        //   at all, so there is no ARN to report and the decision is reported on the
+        //   sink kind of this Region, the scope it was taken in.
+        //
+        // Neither says anything about what is stored: both are answered before the sink
+        // table is consulted.
+        let region = crate::state::request_region(ctx.parts());
         crate::state::require_resource_kind(
             Self::NAME,
             &input.sink_identifier,
             crate::state::ResourceKind::Sink,
         )?;
+        if !crate::state::member_admits(
+            Self::INPUT_SCHEMA,
+            "SinkIdentifier",
+            &input.sink_identifier,
+        ) {
+            return Err(crate::state::explicit_deny(
+                Self::NAME,
+                &crate::state::resource_kind_wildcard(&region, crate::state::ResourceKind::Sink),
+            )
+            .into());
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListAttachedLinksErrorModeled::InternalServiceFault(InternalServiceFault {
@@ -234,7 +259,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let region = crate::state::request_region(ctx.parts());
         // The page size is the server's own decision: clamped into 1..=MAX_PAGE_SIZE
         // whatever the request asked for, so no allocation below is sized by input.
         let page_size = input.max_results.map_or(MAX_PAGE_SIZE, |requested| {

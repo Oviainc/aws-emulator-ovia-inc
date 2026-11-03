@@ -6,7 +6,7 @@
 //! the resource its `ResourceArn` names — a sink or a link, since "both sinks and
 //! links support tagging" — reading it off that resource's one stored record, and an
 //! ARN that names no stored resource of the Region the request was signed for is the
-//! modelled `ResourceNotFoundException` rather than an empty tag list.
+//! tagging path's own `NotFoundException` rather than an empty tag list.
 //!
 //! Every case drives the real wire path (the production `MultiServiceRouter`, the
 //! restJson1 REST binding this operation's `GET /tags/{ResourceArn}` route uses, the
@@ -17,6 +17,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_oam_oamservice::state::{
+    INVALID_TAGGING_ARN_MESSAGE, TAGGED_RESOURCE_NOT_FOUND_MESSAGE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::sinks_and_links::{
@@ -27,11 +30,6 @@ use super::sinks_and_links::{
 /// belongs to the source account its request speaks for, and a source account may
 /// hold only one link per sink.
 const OTHER_AKID: &str = "AKIDOAMTEST2";
-
-/// The message every not-found refusal this service answers carries, as
-/// `state::RESOURCE_NOT_FOUND_MESSAGE` states it: a fixed string that names nothing
-/// from the request.
-const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found.";
 
 /// `value` as ONE URI path segment: every byte outside RFC 3986's unreserved set
 /// (`A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, `~`) percent-encoded.
@@ -104,7 +102,7 @@ async fn list_tags_as(
 }
 
 /// A tag map as the wire carries it.
-fn tags_json(tags: &BTreeMap<String, String>) -> Value {
+pub(crate) fn tags_json(tags: &BTreeMap<String, String>) -> Value {
     Value::Object(
         tags.iter()
             .map(|(key, value)| (key.clone(), Value::String(value.clone())))
@@ -113,7 +111,7 @@ fn tags_json(tags: &BTreeMap<String, String>) -> Value {
 }
 
 /// A tag map from `(key, value)` pairs.
-fn tag_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(crate) fn tag_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -238,10 +236,9 @@ async fn list_tags_for_resource_reports_the_tags_stored_on_a_sink_or_a_link() {
         }
 
         // The same stored record is what the two readers of this slice report, so
-        // `GetSink`/`GetLink` with `IncludeTags` agree with it. They omit an EMPTY tag
-        // map (`Tags` is optional there and the caller asked for tags a resource has
-        // none of), which is why the empty row expects no member from them.
-        let include_tags = (!tags.is_empty()).then_some(&expected);
+        // `GetSink`/`GetLink` with `IncludeTags` agree with it — down to the EMPTY tag
+        // set, which every read that reports the set at all reports as an empty map.
+        let include_tags = expected.clone();
         for (operation, identifier) in [("/GetSink", &sink_arn), ("/GetLink", &link_arn)] {
             let (status, got) = call(
                 &router,
@@ -256,7 +253,7 @@ async fn list_tags_for_resource_reports_the_tags_stored_on_a_sink_or_a_link() {
             );
             assert_eq!(
                 got.get("Tags"),
-                include_tags,
+                Some(&include_tags),
                 "case {case:?} ({operation}): expected the same stored tags the tag list \
                  reported, got {got:?}"
             );
@@ -416,13 +413,13 @@ async fn list_tags_for_resource_refuses_an_arn_naming_no_stored_resource() {
         );
         assert_eq!(
             error_code(&refused),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {refused:?}"
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException, got {refused:?}"
         );
         assert_eq!(
             refused.get("Message").and_then(Value::as_str),
-            Some(RESOURCE_NOT_FOUND_MESSAGE),
-            "case {case:?}: expected the constant not-found message, got {refused:?}"
+            Some(TAGGED_RESOURCE_NOT_FOUND_MESSAGE),
+            "case {case:?}: expected the tagging path's not-found message, got {refused:?}"
         );
         assert_eq!(
             refused.get("Tags"),
@@ -451,9 +448,9 @@ async fn list_tags_for_resource_refuses_a_resource_arn_the_model_does_not_admit(
 
     // `ResourceArn` targets `Arn`, `@pattern ^arn:(\w|-)+:oam:.+:.+:.+`
     // (`smithy_query(query="shape",shape="Arn")`). Rows differ along WHICH part of
-    // that pattern the value misses, and the refusal is the `ValidationException`
-    // these three tagging operations model — not the `InvalidParameterException`
-    // every other operation of this service declares.
+    // that pattern the value misses, and every one of them earns the tagging path's
+    // own syntax refusal: one code and one fixed sentence, echoing nothing of the ARN
+    // that was sent.
     let cases: &[(&str, &str)] = &[
         ("not an ARN at all", "demo-sink"),
         ("another service's ARN", "arn:aws:s3:::my-bucket"),
@@ -469,8 +466,13 @@ async fn list_tags_for_resource_refuses_a_resource_arn_the_model_does_not_admit(
         );
         assert_eq!(
             error_code(&refused),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got {refused:?}"
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException, got {refused:?}"
+        );
+        assert_eq!(
+            refused.get("message").and_then(Value::as_str),
+            Some(INVALID_TAGGING_ARN_MESSAGE),
+            "case {case:?}: expected the ARN-syntax message, got {refused:?}"
         );
     }
 

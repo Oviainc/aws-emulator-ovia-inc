@@ -14,11 +14,12 @@
 //!   a key it does not hold is appended, a key it holds has its value replaced, a key the
 //!   request does not mention is left alone — and the result is what every later read of
 //!   that one record reports (`GetSink`/`GetLink` with `IncludeTags`);
-//! * a resource can hold no more than [`MAX_TAGS_PER_RESOURCE`] tags; a call that would
-//!   leave it holding more is refused with `TooManyTagsException` (400) and writes
-//!   nothing;
-//! * an ARN that names no stored sink or link of this account and Region is the modelled
-//!   `ResourceNotFoundException` (404) — nothing is created for it.
+//! * a resource can hold no more than [`MAX_TAGS_PER_RESOURCE`] user tags; a call that
+//!   would leave it holding more is refused with the tagging path's
+//!   `BadRequestException` (400) and writes nothing;
+//! * an ARN that names no stored sink or link of this account and Region is that same
+//!   path's `NotFoundException` (404) — nothing is created for it, and an ARN that is
+//!   not one of this service's at all is refused for its syntax instead.
 //!
 //! Both of this service's taggable resources (a sink and a link) are driven through the
 //! same table, because the rule is about the resource the ARN names and not about which
@@ -28,7 +29,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_oam_oamservice::state::MAX_TAGS_PER_RESOURCE;
+use service_com_amazonaws_oam_oamservice::state::{
+    INVALID_TAGGING_ARN_MESSAGE, MAX_TAGS_PER_RESOURCE, TAGGED_RESOURCE_NOT_FOUND_MESSAGE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN carries.
@@ -396,11 +399,11 @@ async fn tag_resource_merges_its_tags_into_the_resources_stored_set() {
             case: "punctuation, spaces and non-ASCII in keys and values",
             calls: vec![map(&[
                 ("cost:centre/eu", "équipe ops +1"),
-                ("aws:not-reserved_here.1", "a=b,c=d"),
+                ("awsome:not-reserved_here.1", "a=b,c=d"),
             ])],
             expected: map(&[
                 ("cost:centre/eu", "équipe ops +1"),
-                ("aws:not-reserved_here.1", "a=b,c=d"),
+                ("awsome:not-reserved_here.1", "a=b,c=d"),
             ]),
         },
         Merge {
@@ -448,9 +451,9 @@ struct Cap {
 }
 
 /// The cap is on what the RESOURCE ends up holding, counted over distinct keys: at the
-/// published bound a call still succeeds, one tag past it is refused with
-/// `TooManyTagsException` (400) and writes nothing, and a call that only replaces values
-/// is never refused however full the resource is.
+/// published bound a call still succeeds, one tag past it is refused with the tagging
+/// path's `BadRequestException` (400) and writes nothing, and a call that only replaces
+/// values is never refused however full the resource is.
 #[tokio::test]
 async fn a_resource_holds_at_most_fifty_tags_and_a_refused_call_writes_nothing() {
     // Rows: how many tags the resource already holds, the call made next, and what the
@@ -537,8 +540,19 @@ async fn a_resource_holds_at_most_fifty_tags_and_a_refused_call_writes_nothing()
                 let code = error_code(&body);
                 assert_eq!(
                     (status, code.as_str()),
-                    (400, "TooManyTagsException"),
-                    "case {case:?}: expected 400 TooManyTagsException, got {status} {code} {body:?}"
+                    (400, "BadRequestException"),
+                    "case {case:?}: expected 400 BadRequestException, got {status} {code} {body:?}"
+                );
+                assert_eq!(
+                    body.get("message").and_then(Value::as_str),
+                    Some(
+                        format!(
+                            "The resultant tag set must not have more than \
+                             {MAX_TAGS_PER_RESOURCE} user tags."
+                        )
+                        .as_str()
+                    ),
+                    "case {case:?}: expected the tag-ceiling message, got {body:?}"
                 );
             }
 
@@ -559,16 +573,16 @@ async fn a_resource_holds_at_most_fifty_tags_and_a_refused_call_writes_nothing()
     }
 }
 
-/// An ARN that names no stored resource of this account and Region is the modelled
-/// refusal, and tagging it creates nothing: a later read of the ARN the case mangled
-/// still reports only what was really stored.
+/// An ARN that names no stored resource of this account and Region is the tagging
+/// path's own refusal, and tagging it creates nothing: a later read of the ARN the case
+/// mangled still reports only what was really stored.
 ///
 /// The rows span the ways an ARN can fail to name a stored resource — an id nothing was
 /// stored under, a field (partition, account, region) that does not match the stored
 /// record, a resource kind this service does not tag, a resource since deleted — plus the
 /// two forms the modelled `Arn` pattern `^arn:(\w|-)+:oam:.+:.+:.+`
-/// (`smithy_query(query="shape",shape="Arn")`) refuses outright, which the centralized
-/// walk answers before the handler runs.
+/// (`smithy_query(query="shape",shape="Arn")`) refuses outright, which that path answers
+/// before the handler runs.
 #[tokio::test]
 async fn an_arn_naming_no_stored_resource_is_refused_and_stores_nothing() {
     let router = emulator();
@@ -594,64 +608,64 @@ async fn an_arn_naming_no_stored_resource_is_refused_and_stores_nothing() {
             "a sink id nothing was stored under",
             format!("arn:aws:oam:{REGION}:{ACCOUNT}:sink/{unknown}"),
             404,
-            "ResourceNotFoundException",
+            "NotFoundException",
         ),
         (
             "a link id nothing was stored under",
             format!("arn:aws:oam:{REGION}:{ACCOUNT}:link/{unknown}"),
             404,
-            "ResourceNotFoundException",
+            "NotFoundException",
         ),
         (
             "the stored sink id under another Region",
             format!("arn:aws:oam:eu-west-1:{ACCOUNT}:sink/{sink_id}"),
             404,
-            "ResourceNotFoundException",
+            "NotFoundException",
         ),
         (
             "the stored link id under another Region",
             format!("arn:aws:oam:eu-west-1:{ACCOUNT}:link/{link_id}"),
             404,
-            "ResourceNotFoundException",
+            "NotFoundException",
         ),
         (
             "the stored sink id under another account",
             format!("arn:aws:oam:{REGION}:000000000001:sink/{sink_id}"),
             404,
-            "ResourceNotFoundException",
+            "NotFoundException",
         ),
         (
             "the stored sink id in another partition",
             format!("arn:aws-cn:oam:{REGION}:{ACCOUNT}:sink/{sink_id}"),
             404,
-            "ResourceNotFoundException",
+            "NotFoundException",
         ),
         (
             "an oam resource kind that is neither a sink nor a link",
             format!("arn:aws:oam:{REGION}:{ACCOUNT}:policy/{sink_id}"),
             404,
-            "ResourceNotFoundException",
+            "NotFoundException",
         ),
         (
             "a sink ARN with an empty id segment",
             format!("arn:aws:oam:{REGION}:{ACCOUNT}:sink/"),
             404,
-            "ResourceNotFoundException",
+            "NotFoundException",
         ),
         (
-            // Refused by the modelled `Arn` pattern, before the handler: the member is
-            // bound only by the tagging operations, so it keeps the `ValidationException`
-            // those three declare (see `crate::service`).
+            // Refused for its SYNTAX, before the handler: the ARN is not one of this
+            // service's at all, which the tagging path answers with its own code and
+            // its own fixed sentence (see `crate::service`).
             "the sink's bare id, which is not an ARN at all",
             sink_id.clone(),
             400,
-            "ValidationException",
+            "BadRequestException",
         ),
         (
             "an ARN of another service's namespace",
             format!("arn:aws:logs:{REGION}:{ACCOUNT}:sink/{sink_id}"),
             400,
-            "ValidationException",
+            "BadRequestException",
         ),
     ];
 
@@ -663,6 +677,20 @@ async fn an_arn_naming_no_stored_resource_is_refused_and_stores_nothing() {
             (expected_status, expected_code),
             "case {case:?} ({resource_arn}): expected {expected_status} {expected_code}, \
              got {status} {code} {body:?}"
+        );
+        let message = body
+            .get("Message")
+            .or_else(|| body.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let expected_message = if expected_status == 404 {
+            TAGGED_RESOURCE_NOT_FOUND_MESSAGE
+        } else {
+            INVALID_TAGGING_ARN_MESSAGE
+        };
+        assert_eq!(
+            message, expected_message,
+            "case {case:?} ({resource_arn}): expected the tagging path's message, got {body:?}"
         );
     }
 
@@ -693,8 +721,8 @@ async fn an_arn_naming_no_stored_resource_is_refused_and_stores_nothing() {
     let code = error_code(&body);
     assert_eq!(
         (status, code.as_str()),
-        (404, "ResourceNotFoundException"),
-        "a deleted link: expected 404 ResourceNotFoundException, got {status} {code} {body:?}"
+        (404, "NotFoundException"),
+        "a deleted link: expected 404 NotFoundException, got {status} {code} {body:?}"
     );
 }
 

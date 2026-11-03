@@ -15,9 +15,10 @@
 //!   a caller probing permissions learns the authorization outcome and nothing about
 //!   what is stored.
 //! * On a link the caller DOES own, the modelled bounds of `ResourceTypes` are then
-//!   reported: an absent member as `MissingRequiredParameterException`, a value
-//!   outside `@length(1..50)` / `@uniqueItems` / the `ResourceType` enum as
-//!   `InvalidParameterException` — and a refused update changes nothing.
+//!   reported: an absent member as `MissingRequiredParameterException`, a value outside
+//!   `@length(1..50)` / `@uniqueItems` as `InvalidParameterException`, and an element
+//!   outside the `ResourceType` enum as the request front end's `BadRequestException`
+//!   — and a refused update changes nothing.
 //!
 //! Every case drives the real wire path (the production `MultiServiceRouter`, restJson1
 //! serialization, the modelled-constraint walk and the handlers), so what is asserted
@@ -254,15 +255,23 @@ async fn update_link_replaces_what_the_link_shares_and_get_link_reads_it_back() 
         "without filters: GetLink must read none back, got {status} {got:?}"
     );
 
-    // `IncludeTags` defaults to false and is the only thing that reports the link's
-    // tags; an untagged link has none to report even when asked.
+    // `IncludeTags` suppresses the link's tags rather than asking for them, and an
+    // untagged link reports the EMPTY set it holds — the same set the tag list answers
+    // for it — rather than leaving the member out.
     let mut with_tags = update_body(&link_arn, &[RESOURCE_TYPES[0]]);
     with_tags["IncludeTags"] = Value::Bool(true);
     let (status, updated) = update(&router, &with_tags, AKID, REGION).await;
     assert_eq!(
         (status, updated.get("Tags")),
+        (200, Some(&json!({}))),
+        "an untagged link reports its empty tag set when asked, got {status} {updated:?}"
+    );
+    with_tags["IncludeTags"] = Value::Bool(false);
+    let (status, updated) = update(&router, &with_tags, AKID, REGION).await;
+    assert_eq!(
+        (status, updated.get("Tags")),
         (200, None),
-        "an untagged link has no tags to report even when asked, got {status} {updated:?}"
+        "IncludeTags false leaves the member out, got {status} {updated:?}"
     );
 
     // Every identifier form the modelled `ResourceIdentifier` admits for a link — its
@@ -427,7 +436,10 @@ async fn update_link_reports_the_modelled_bounds_on_a_link_the_caller_owns() {
     // Rows differ along which modelled rule of `ResourceTypes` the request misses:
     // its presence, each end of `@length(1..50)`, `@uniqueItems`, and the
     // `ResourceType` enum its elements target — one row per rule, plus a value the
-    // issue did not cite for the enum and the exact bound for the length.
+    // issue did not cite for the enum and the exact bound for the length. Enum
+    // MEMBERSHIP is a rule of the request body, so it is the front end's
+    // `BadRequestException`; the rest are this operation's own modelled parameter
+    // errors.
     let too_many: Vec<String> = (0..=MAX_RESOURCE_TYPES)
         .map(|index| format!("{}{index}", RESOURCE_TYPES[0]))
         .collect();
@@ -454,13 +466,13 @@ async fn update_link_reports_the_modelled_bounds_on_a_link_the_caller_owns() {
             "a resource type the model does not declare",
             update_body(&link_arn, &["AWS::Logs::LogStream"]),
             400,
-            "InvalidParameterException",
+            "BadRequestException",
         ),
         (
             "a modelled resource type in the wrong case",
             update_body(&link_arn, &["aws::logs::loggroup"]),
             400,
-            "InvalidParameterException",
+            "BadRequestException",
         ),
         (
             "more resource types than the list admits",

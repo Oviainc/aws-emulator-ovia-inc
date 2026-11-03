@@ -192,9 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             label_template: Some(link.label_template.clone()),
             resource_types: Some(link.resource_types.clone()),
             sink_arn: Some(link.sink_arn.clone()),
-            // `IncludeTags` defaults to false, so tags are reported only when the
-            // caller asked for them.
-            tags: link.tags_output(input.include_tags.unwrap_or(false)),
+            // `IncludeTags` suppresses the tag projection rather than requesting it:
+            // only an explicit `false` leaves `Tags` out (see
+            // `crate::state::report_tags`).
+            tags: link.tags_output(crate::state::report_tags(input.include_tags)),
             link_configuration: link.link_configuration.clone(),
         })
     }

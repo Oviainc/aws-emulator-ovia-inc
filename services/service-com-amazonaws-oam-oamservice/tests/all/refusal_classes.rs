@@ -17,6 +17,9 @@
 //!    that validates the request body — HTTP 400 `BadRequestException`, naming the
 //!    regular expression and the value — while a value outside any other modelled
 //!    bound, and an absent member, are the service's own modelled parameter errors.
+//!    `ListAttachedLinks` is the exception: its authorization decision is taken on the
+//!    sink the request names BEFORE the identifier is judged, so a value no resource
+//!    identifier could be earns that decision instead (rule 4).
 //! 4. An identifier that names the OTHER of this service's two resource kinds cannot
 //!    be authorized for the action asked for, so it is refused by the authorization
 //!    decision (HTTP 403 `AccessDeniedException`) before any lookup — identically
@@ -398,13 +401,6 @@ async fn a_value_outside_a_modelled_pattern_is_refused_by_the_body_validator() {
             "PutSinkPolicy SinkIdentifier with a space",
             "/PutSinkPolicy",
             json!({ "SinkIdentifier": "sink name", "Policy": accepted_policy() }),
-            RESOURCE_IDENTIFIER_PATTERN,
-            "sink name".to_string(),
-        ),
-        (
-            "ListAttachedLinks SinkIdentifier with a space",
-            "/ListAttachedLinks",
-            json!({ "SinkIdentifier": "sink name" }),
             RESOURCE_IDENTIFIER_PATTERN,
             "sink name".to_string(),
         ),

@@ -7,9 +7,13 @@
 //! The rule, from this operation's own documentation: the tags in the request are
 //! MERGED into the tag set the resource already carries — a key the resource does not
 //! hold is appended, a key it does hold has its value replaced — and a resource may
-//! end up holding no more than [`crate::state::MAX_TAGS_PER_RESOURCE`] tags, past
-//! which the call is refused with `TooManyTagsException` and NOTHING is written. An
-//! ARN naming no stored resource of this account and Region is the modelled 404.
+//! end up holding no more than [`crate::state::MAX_TAGS_PER_RESOURCE`] user tags, past
+//! which the call is refused and NOTHING is written. A key in the namespace AWS
+//! reserves for its own tags is refused as well, before anything is resolved. Both
+//! refusals are the tagging front end's `BadRequestException` (400), and an ARN naming
+//! no stored resource of this account and Region is that same path's `NotFoundException`
+//! (404) — neither code is one this operation's model declares, because neither is the
+//! control plane answering.
 //!
 //! ## Shape of an operation
 //!
@@ -156,8 +160,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceArn`'s presence and its `^arn:(\w|-)+:oam:.+:.+:.+` pattern, every
         // tag key's and value's length, and `Tags`' own 0..50 entry count are modelled
         // constraints: the centralized walk has already refused anything outside them
-        // before this body runs. What is left for this handler is the rule the model
-        // cannot state — the cap on what the RESOURCE ends up holding.
+        // before this body runs. What is left for this handler is the rules the model
+        // cannot state — the namespace a tag key may not be in, and the cap on what
+        // the RESOURCE ends up holding.
+        //
+        // A tag key in the namespace AWS reserves for its own tags is not a key a
+        // customer may set, and that is a fact of the REQUEST: it is judged before the
+        // ARN is resolved, so a refused key is never written and the refusal says
+        // nothing about what is stored.
+        if let Some(refused) = crate::state::reserved_tag_key_rejection(
+            crate::state::TagKeyWrite::Set,
+            input.tags.keys().map(String::as_str),
+        ) {
+            return Err(refused.into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // This operation models no server fault, so a store it cannot reach is
             // reported through the modelled client-input error it does declare —
@@ -172,14 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let tags = store
             .resource_tags_mut(&region, &input.resource_arn)
-            .ok_or_else(|| {
-                TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    // The service-wide constant: OAM's not-found text names no
-                    // identifier, so this refusal echoes nothing the caller sent.
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                    ..Default::default()
-                })
-            })?;
+            // The TAGGING path's own not-found refusal, which is not the control
+            // plane's: a distinct error code and a distinct fixed message, neither of
+            // them naming the ARN the request asked about.
+            .ok_or_else(crate::state::tagged_resource_not_found)?;
 
         // Only a key the resource does not already hold grows its tag set, so
         // replacing an existing key's value can never exceed the cap however full the
@@ -190,18 +203,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .keys()
             .filter(|key| !tags.contains_key(*key))
             .count();
-        let resulting = tags.len() + appended;
-        if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(TagResourceErrorModeled::TooManyTagsException(
-                TooManyTagsException {
-                    message: Some(format!(
-                        "these tags would leave the resource holding {resulting} tags, and a \
-                         resource can have no more than {} tags",
-                        crate::state::MAX_TAGS_PER_RESOURCE
-                    )),
-                },
-            )
-            .into());
+        if tags.len() + appended > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(crate::state::too_many_user_tags().into());
         }
 
         // Checked before anything is stored, so a refused call leaves the resource's

@@ -245,6 +245,137 @@ impl SerializableStruct for AccessDeniedException {
     }
 }
 
+/// The `message` member of the synthetic `BadRequestException` error shape.
+///
+/// Spelled lowercase, like the member the pre-handler body-validation envelope carries
+/// (`{"__type":"BadRequestException","message":"…"}`): this error is that same front
+/// end's refusal, answered from a handler for the rules the centralized walk cannot
+/// see, so it has to read identically to a caller.
+static BAD_REQUEST_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#BadRequestException$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message")
+.with_json_name("message");
+
+/// Schema for the synthetic `BadRequestException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the
+/// request front end in front of this service answers this error type on operations
+/// whose model does not declare it, so there is no modeled shape to use and the
+/// synthetic one must not collide with a modeled name.
+pub static BAD_REQUEST_EXCEPTION_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#BadRequestException",
+        "smithy.framework",
+        "BadRequestException",
+    ),
+    ShapeType::Structure,
+    &[&BAD_REQUEST_MESSAGE],
+);
+
+/// The payload of a `BadRequestException`: why the request itself was refused.
+#[derive(Debug, Clone)]
+pub struct BadRequestException {
+    pub message: String,
+}
+
+impl BadRequestException {
+    /// A front-end refusal carrying `message`.
+    ///
+    /// The wording belongs to the service — see `crate::state`, which is the one place
+    /// this service builds each of these messages.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for BadRequestException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BadRequestException: {}", self.message)
+    }
+}
+
+impl std::error::Error for BadRequestException {}
+
+impl SerializableStruct for BadRequestException {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&BAD_REQUEST_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
+/// The `Message` member of the synthetic `NotFoundException` error shape.
+///
+/// Spelled `Message`, the casing every not-found refusal of this service uses
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), so the tagging
+/// path's not-found reads the same way to a client as the control plane's does.
+static NOT_FOUND_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#NotFoundException$Message",
+        "smithy.framework",
+        "Message",
+    ),
+    ShapeType::String,
+    "Message",
+    0,
+)
+.with_xml_name("Message")
+.with_json_name("Message");
+
+/// Schema for the synthetic `NotFoundException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the
+/// tagging front end answers this error type, which no operation of this service
+/// models, so there is no modeled shape to use.
+pub static NOT_FOUND_EXCEPTION_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#NotFoundException",
+        "smithy.framework",
+        "NotFoundException",
+    ),
+    ShapeType::Structure,
+    &[&NOT_FOUND_MESSAGE],
+);
+
+/// The payload of a `NotFoundException`: the resource asked about is not there.
+#[derive(Debug, Clone)]
+pub struct NotFoundException {
+    pub message: String,
+}
+
+impl NotFoundException {
+    /// A not-found refusal carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for NotFoundException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NotFoundException: {}", self.message)
+    }
+}
+
+impl std::error::Error for NotFoundException {}
+
+impl SerializableStruct for NotFoundException {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&NOT_FOUND_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -261,6 +392,20 @@ pub enum Scaffolded<E> {
     /// `AccessDeniedException` at all, yet the authorization layer in front of it
     /// answers one.
     AccessDenied(AccessDeniedException),
+    /// The request itself was refused by the front end in front of this service.
+    /// Renders as HTTP 400 with the error code `BadRequestException`.
+    ///
+    /// That front end judges the request before the service's own rules apply, and
+    /// answers a code no operation of this service declares — so, like
+    /// `AccessDenied`, it cannot be reached through a modeled error list.
+    BadRequest(BadRequestException),
+    /// The resource the request names is not there, as the TAGGING path reports it.
+    /// Renders as HTTP 404 with the error code `NotFoundException`.
+    ///
+    /// The control-plane operations answer their own modeled
+    /// `ResourceNotFoundException` instead; neither code is declared by the other's
+    /// operations.
+    NotFound(NotFoundException),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -307,12 +452,30 @@ impl<E> From<AccessDeniedException> for Scaffolded<E> {
     }
 }
 
+/// Lets `?` lift a front-end refusal — built in [`crate::state`], which names no
+/// operation — into ANY operation's error channel.
+impl<E> From<BadRequestException> for Scaffolded<E> {
+    fn from(refused: BadRequestException) -> Self {
+        Self::BadRequest(refused)
+    }
+}
+
+/// Lets `?` lift the tagging path's not-found refusal into ANY operation's error
+/// channel.
+impl<E> From<NotFoundException> for Scaffolded<E> {
+    fn from(absent: NotFoundException) -> Self {
+        Self::NotFound(absent)
+    }
+}
+
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::AccessDenied(e) => write!(f, "{e}"),
+            Self::BadRequest(e) => write!(f, "{e}"),
+            Self::NotFound(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -326,6 +489,8 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::AccessDenied(e) => e.source(),
+            Self::BadRequest(e) => e.source(),
+            Self::NotFound(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -341,6 +506,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::AccessDenied(e) => e,
+            Self::BadRequest(e) => e,
+            Self::NotFound(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -350,6 +517,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::AccessDenied(_) => &ACCESS_DENIED_EXCEPTION_SCHEMA,
+            Self::BadRequest(_) => &BAD_REQUEST_EXCEPTION_SCHEMA,
+            Self::NotFound(_) => &NOT_FOUND_EXCEPTION_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -363,6 +532,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::AccessDenied(_) => "AccessDeniedException",
+            Self::BadRequest(_) => "BadRequestException",
+            Self::NotFound(_) => "NotFoundException",
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -378,6 +549,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // The status an authorization refusal carries: the caller is
             // authenticated, and refused on what it asked for.
             Self::AccessDenied(_) => 403,
+            // The status the front end's own refusal carries, and the one the
+            // tagging path answers for a resource that is not there.
+            Self::BadRequest(_) => 400,
+            Self::NotFound(_) => 404,
             Self::ValidationException(_) => 400,
         }
     }
@@ -391,6 +566,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shapes carry no `awsQueryError` trait.
             Self::AccessDenied(_) => None,
+            Self::BadRequest(_) => None,
+            Self::NotFound(_) => None,
             Self::ValidationException(_) => None,
         }
     }

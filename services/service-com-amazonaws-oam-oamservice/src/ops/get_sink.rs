@@ -181,9 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: Some(sink.arn.clone()),
             id: Some(sink.id.clone()),
             name: Some(sink.name.clone()),
-            // `IncludeTags`: "Specifies whether to include the tags associated with
-            // the sink in the response." Absent is false.
-            tags: sink.tags_output(input.include_tags.unwrap_or(false)),
+            // `IncludeTags` suppresses the tag projection rather than requesting it:
+            // only an explicit `false` leaves `Tags` out (see
+            // `crate::state::report_tags`).
+            tags: sink.tags_output(crate::state::report_tags(input.include_tags)),
         })
     }
 }

@@ -210,11 +210,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // Only now is the rest of the request judged. `ResourceTypes` is `@required`
-        // with `@length(1..50)` and `@uniqueItems`, and this operation enforces all of
-        // them HERE rather than in the centralized pre-handler walk, because the
-        // decision above comes first (see `super::types::UpdateLinkRequest`). An absent
-        // member is worded exactly as that walk words one. The resource-type catalog is
-        // checked too, so no update ever stores a type the model does not declare.
+        // with `@length(1..50)` and `@uniqueItems` over elements targeting the
+        // `ResourceType` enum, and this operation enforces all of them HERE rather than
+        // in the centralized pre-handler walk, because the decision above comes first
+        // (see `super::types::UpdateLinkRequest`). An absent member is worded exactly as
+        // that walk words one, a value outside the list's own bounds as this operation's
+        // modelled parameter error, and an element outside the enum exactly as the
+        // request front end words one — judged by the MODEL's own constraints, so no
+        // update ever stores a type it does not declare.
         let resource_types = input.resource_types.ok_or_else(|| {
             UpdateLinkErrorModeled::MissingRequiredParameterException(
                 MissingRequiredParameterException {
@@ -231,6 +234,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+        if let Some(refused) =
+            crate::state::unmodelled_enum_rejection(&crate::state::list_member_violations(
+                Self::INPUT_SCHEMA,
+                "ResourceTypes",
+                &resource_types,
+            ))
+        {
+            return Err(refused.into());
         }
 
         let link = store.links.get_mut(&id).ok_or_else(|| {
@@ -262,9 +274,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             label_template: Some(link.label_template.clone()),
             resource_types: Some(link.resource_types.clone()),
             sink_arn: Some(link.sink_arn.clone()),
-            // "Specifies whether to include the tags associated with the link in the
-            // response after the update operation" — absent is false.
-            tags: link.tags_output(input.include_tags.unwrap_or(false)),
+            // `IncludeTags` suppresses the tag projection rather than requesting it:
+            // only an explicit `false` leaves `Tags` out (see
+            // `crate::state::report_tags`).
+            tags: link.tags_output(crate::state::report_tags(input.include_tags)),
             link_configuration: link.link_configuration.clone(),
         })
     }

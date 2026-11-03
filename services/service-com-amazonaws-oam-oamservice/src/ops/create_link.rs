@@ -184,10 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceType` values), `SinkIdentifier` (presence, pattern) and `Tags`
         // (0..50) are all modelled constraints, so the centralized walk has already
         // refused anything outside them before this body runs — as this service's
-        // `MissingRequiredParameterException` / `InvalidParameterException`, which
-        // `crate::service` words it as. The resource-type catalog is checked again
-        // here so this handler never stores a type the model does not declare,
-        // whatever refused it first.
+        // `MissingRequiredParameterException` / `InvalidParameterException`, or, for a
+        // value outside a modelled `@pattern` or enum, as the request front end's own
+        // refusal, which `crate::service` words.
         //
         // A `SinkIdentifier` naming the OTHER resource kind cannot be authorized for
         // this action — the permission to attach a link is granted by the SINK's own
@@ -199,20 +198,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::ResourceKind::Sink,
         )?;
 
-        if let Some(unmodelled) = crate::state::unmodelled_resource_type(&input.resource_types) {
-            // The offending value is caller-controlled text, so only its first
-            // characters are echoed back.
-            let shown: String = unmodelled.chars().take(64).collect();
-            return Err(CreateLinkErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(format!(
-                        "ResourceTypes contains '{shown}', which is not one of [{}]",
-                        crate::ops::types::RESOURCE_TYPE_VALUES.join(", ")
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
+        // A `ResourceTypes` element outside the modelled `ResourceType` enum is a rule
+        // of the request BODY: the layer that validates the body judges it before this
+        // handler runs — as `crate::service` words it — so nothing here can store a
+        // type the model does not declare.
+        //
+        // A tag key in the namespace AWS reserves for its own tags is not a key a
+        // customer may set, through this create or through `TagResource`.
+        if let Some(refused) = crate::state::reserved_tag_key_rejection(
+            crate::state::TagKeyWrite::Set,
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.keys())
+                .map(String::as_str),
+        ) {
+            return Err(refused.into());
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

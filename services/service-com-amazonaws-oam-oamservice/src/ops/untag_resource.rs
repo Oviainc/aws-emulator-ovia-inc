@@ -7,10 +7,12 @@
 //! The rule, from this operation's own documentation: exactly the keys the request
 //! names are removed from the tag set the resource already carries, every other tag it
 //! holds is left alone, and a key the resource does not hold removes nothing — so the
-//! same call repeated answers the same way and leaves the same state. An ARN naming no
-//! stored resource of this account and Region is the modelled 404, which is the same
-//! resolution `TagResource` and `ListTagsForResource` take, through the resource's one
-//! stored tag map.
+//! same call repeated answers the same way and leaves the same state. A key in the
+//! namespace AWS reserves for its own tags is not one a customer may remove, which is
+//! the tagging front end's `BadRequestException` (400) with its own sentence, and an ARN
+//! naming no stored resource of this account and Region is that path's
+//! `NotFoundException` (404) — the same resolution `TagResource` and
+//! `ListTagsForResource` take, through the resource's one stored tag map.
 //!
 //! ## Shape of an operation
 //!
@@ -156,8 +158,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceArn`'s presence and its `^arn:(\w|-)+:oam:.+:.+:.+` pattern, and
         // every `TagKeys` entry's own `@length(1..128)`, are modelled constraints: the
         // centralized walk has already refused anything outside them before this body
-        // runs. What is left for this handler is which stored resource the ARN names and
-        // what removing those keys from it leaves behind.
+        // runs, an ARN whose syntax is not one of this service's as the tagging path's
+        // own refusal (see `crate::service`). What is left for this handler is the rule
+        // the model cannot state — the namespace a tag key may not be in — and which
+        // stored resource the ARN names.
+        //
+        // A key in the namespace AWS reserves for its own tags is not a key a customer
+        // may remove, and that is a fact of the REQUEST: it is judged before the ARN is
+        // resolved, so nothing is removed and the refusal says nothing about what is
+        // stored.
+        if let Some(refused) = crate::state::reserved_tag_key_rejection(
+            crate::state::TagKeyWrite::Remove,
+            input.tag_keys.iter().map(String::as_str),
+        ) {
+            return Err(refused.into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UntagResourceErrorModeled::InternalServiceFault(InternalServiceFault {
                 message: Some("the sink and link store is unavailable".to_string()),
@@ -171,19 +187,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Both sinks and links support tagging": the ARN resolves against what is
         // STORED, in either collection, through the resource's own tag map — the very
         // one `TagResource` wrote and `ListTagsForResource` and `Get{Sink,Link}` report.
-        // An ARN naming no stored resource of this region is the modelled 404, never a
-        // silent success: a caller has to be able to tell "those tags are gone" from
-        // "there is no such resource".
+        // An ARN naming no stored resource of this region is a 404, never a silent
+        // success: a caller has to be able to tell "those tags are gone" from "there is
+        // no such resource".
         let tags = store
             .resource_tags_mut(&region, &input.resource_arn)
-            .ok_or_else(|| {
-                UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    // The service-wide constant: OAM's not-found text names no
-                    // identifier, so this refusal echoes nothing the caller sent.
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                    ..Default::default()
-                })
-            })?;
+            // The TAGGING path's own not-found refusal, which is not the control
+            // plane's: a distinct error code and a distinct fixed message, neither of
+            // them naming the ARN the request asked about.
+            .ok_or_else(crate::state::tagged_resource_not_found)?;
 
         // Remove exactly the keys the request names, and nothing else: a key the
         // resource does not carry leaves its tag set as it was (so a repeated call is

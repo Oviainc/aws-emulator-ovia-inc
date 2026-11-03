@@ -164,6 +164,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // A tag key in the namespace AWS reserves for its own tags is not a key a
+        // customer may set, through this create or through `TagResource`.
+        if let Some(refused) = crate::state::reserved_tag_key_rejection(
+            crate::state::TagKeyWrite::Set,
+            input.tags.iter().flat_map(|tags| tags.keys()).map(String::as_str),
+        ) {
+            return Err(refused.into());
+        }
+
         let region = crate::state::request_region(ctx.parts());
         // A sink belongs to the monitoring account that creates it, which is read from
         // the request's credential exactly as a link's source account is. Storing it

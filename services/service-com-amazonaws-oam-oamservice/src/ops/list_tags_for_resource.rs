@@ -166,19 +166,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Both sinks and links support tagging": the ARN resolves against what is
         // STORED, in either collection. An ARN naming no stored resource of this
-        // region is the modelled 404, never an empty tag list synthesized from the
-        // request — a caller has to be able to tell "this resource carries no tags"
-        // from "there is no such resource".
+        // region is a 404, never an empty tag list synthesized from the request — a
+        // caller has to be able to tell "this resource carries no tags" from "there is
+        // no such resource".
         let tags = store
             .resource_tags(&region, &input.resource_arn)
-            .ok_or_else(|| {
-                ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                        ..Default::default()
-                    },
-                )
-            })?;
+            // The TAGGING path's own not-found refusal, which is not the control
+            // plane's: a distinct error code and a distinct fixed message, neither of
+            // them naming the ARN the request asked about.
+            .ok_or_else(crate::state::tagged_resource_not_found)?;
 
         // `Tags` is this operation's whole output, so it is always reported — an empty
         // map for a resource carrying no tags, which is the answer to "what tags does

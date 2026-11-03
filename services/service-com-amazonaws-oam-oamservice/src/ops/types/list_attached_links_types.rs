@@ -9,14 +9,117 @@
 
 use super::*;
 
+use ::aws_smithy_schema::serde::SerdeError;
+
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-oam-oamservice.json");
 
+/// `ListAttachedLinks`'s input, exactly as the model declares it: the shape the
+/// generated `LIST_ATTACHED_LINKS_INPUT_SCHEMA` describes, which is what routes the
+/// request, reads its body and carries every member's constraint traits.
+///
+/// The handler is given [`ListAttachedLinksRequest`] rather than this, for the reason
+/// stated there.
 #[smithy_macros::smithy(shape = "com.amazonaws.oam#ListAttachedLinksInput")]
 #[derive(Debug, Clone, Default)]
 pub struct ListAttachedLinksInput {
     pub max_results: Option<i32>,
     pub next_token: Option<String>,
     pub sink_identifier: String,
+}
+
+/// How `ListAttachedLinks` RECEIVES its request: [`ListAttachedLinksInput`]'s members,
+/// with `SinkIdentifier`'s own modelled `@pattern` left for the handler to judge.
+///
+/// This operation is authorized against the SINK the request names before anything
+/// the request carries is judged (see [`crate::ops::list_attached_links`]), and the
+/// framework's centralized walk cannot express that order: a value outside a member's
+/// `@pattern` is refused by that walk before any handler runs. This is what lets such
+/// a value reach the handler, and it is the ONLY difference from the generated input:
+/// every member is read from, and written back through, the generated member schemas
+/// of `ListAttachedLinksInput::SCHEMA`, so the wire form and every other member's
+/// constraints are exactly what the model declares.
+///
+/// `SinkIdentifier` is therefore the one member the pre-handler walk does not judge,
+/// and the handler asks the model itself whether the value is one it admits
+/// (`crate::state::member_admits`) after the authorization decision — while
+/// `MaxResults`' modelled `@range` is still refused by the walk, as on every other
+/// operation.
+#[derive(Debug, Clone, Default)]
+pub struct ListAttachedLinksRequest {
+    pub max_results: Option<i32>,
+    pub next_token: Option<String>,
+    pub sink_identifier: String,
+}
+
+impl ListAttachedLinksRequest {
+    /// The member of the generated input schema named `name`.
+    ///
+    /// Read from the schema rather than kept as a second copy of it, so a member's
+    /// wire name, its `@jsonName` and its constraint traits stay single-homed in the
+    /// model-derived schema.
+    fn member(name: &str) -> Result<&'static ::aws_smithy_schema::Schema, SerdeError> {
+        LIST_ATTACHED_LINKS_INPUT_SCHEMA
+            .members()
+            .iter()
+            .copied()
+            .find(|member| member.member_name() == Some(name))
+            .ok_or_else(|| {
+                SerdeError::custom(format!(
+                    "ListAttachedLinksInput declares no member '{name}'"
+                ))
+            })
+    }
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ListAttachedLinksRequest {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), SerdeError> {
+        // What this writes is what the constraint walk validates. `MaxResults`'
+        // `@range` and `NextToken` are written, and so refused before the handler as on
+        // every other operation; `SinkIdentifier` is deliberately not, because its
+        // `@pattern` is the handler's to report after it has decided whether the caller
+        // may read the sink at all.
+        if let Some(max_results) = self.max_results {
+            s.write_integer(Self::member("MaxResults")?, max_results)?;
+        }
+        if let Some(next_token) = &self.next_token {
+            s.write_string(Self::member("NextToken")?, next_token.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ListAttachedLinksRequest {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> Result<Self, SerdeError> {
+        let mut max_results: Option<i32> = None;
+        let mut next_token: Option<String> = None;
+        let mut sink_identifier: Option<String> = None;
+        // Driven by the generated schema, so the member a body key resolves to is
+        // decided by the model and not by this reader.
+        d.read_struct(LIST_ATTACHED_LINKS_INPUT_SCHEMA, &mut |member, d| {
+            match member.member_name() {
+                Some("MaxResults") => max_results = Some(d.read_integer(member)?),
+                Some("NextToken") => next_token = Some(d.read_string(member)?),
+                Some("SinkIdentifier") => sink_identifier = Some(d.read_string(member)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            max_results,
+            next_token,
+            // `SinkIdentifier` is `@required` and there is no sink for the
+            // authorization decision to be taken on without it, so an absent one is
+            // the framework's refusal, worded by `crate::service` as every other
+            // absent member of this service is.
+            sink_identifier: sink_identifier
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("SinkIdentifier"))?,
+        })
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.oam#ListAttachedLinksOutput")]

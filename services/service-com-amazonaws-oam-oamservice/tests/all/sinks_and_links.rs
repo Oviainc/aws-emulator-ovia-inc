@@ -343,7 +343,7 @@ async fn create_sink_stores_the_sink_and_get_sink_reads_it_back() {
         );
         assert_eq!(
             created.get("Tags"),
-            (!tag_map.is_empty()).then_some(tags),
+            Some(tags),
             "case {case:?}: expected the stored tags, got {created:?}"
         );
 
@@ -372,25 +372,37 @@ async fn create_sink_stores_the_sink_and_get_sink_reads_it_back() {
             );
             assert_eq!(
                 got.get("Tags"),
-                (!tag_map.is_empty()).then_some(tags),
+                Some(tags),
                 "case {case:?} via {identifier:?}: expected the stored tags, got {got:?}"
             );
         }
 
-        // `IncludeTags` defaults to false: the tags are not reported unless asked for.
-        let (status, got) = call(
-            &router,
-            "/GetSink",
-            &json!({ "Identifier": arn.clone() }),
-            region,
-        )
-        .await;
-        assert_eq!(status, 200, "case {case:?}: expected 200, got {got:?}");
-        assert_eq!(
-            got.get("Tags"),
-            None,
-            "case {case:?}: expected no Tags without IncludeTags, got {got:?}"
-        );
+        // `IncludeTags` SUPPRESSES the projection rather than asking for it: a read
+        // that leaves it out reports the sink's stored tag set, and only an explicit
+        // `false` leaves `Tags` out.
+        for (case_suffix, body, expected) in [
+            (
+                "with IncludeTags omitted",
+                json!({ "Identifier": arn.clone() }),
+                Some(tags.clone()),
+            ),
+            (
+                "with IncludeTags false",
+                json!({ "Identifier": arn.clone(), "IncludeTags": false }),
+                None,
+            ),
+        ] {
+            let (status, got) = call(&router, "/GetSink", &body, region).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} {case_suffix}: expected 200, got {got:?}"
+            );
+            assert_eq!(
+                got.get("Tags"),
+                expected.as_ref(),
+                "case {case:?} {case_suffix}: expected {expected:?}, got {got:?}"
+            );
+        }
     }
 }
 
@@ -651,20 +663,32 @@ async fn create_link_resolves_the_label_and_get_link_reads_the_link_back() {
             );
         }
 
-        // And without `IncludeTags`, the tags are not reported.
-        let (status, got) = call(
-            &router,
-            "/GetLink",
-            &json!({ "Identifier": arn.clone() }),
-            region,
-        )
-        .await;
-        assert_eq!(status, 200, "case {case:?}: expected 200, got {got:?}");
-        assert_eq!(
-            got.get("Tags"),
-            None,
-            "case {case:?}: expected no Tags without IncludeTags, got {got:?}"
-        );
+        // `IncludeTags` SUPPRESSES the projection rather than asking for it: omitted,
+        // the link's stored tags are reported; only an explicit `false` leaves them
+        // out.
+        for (case_suffix, body, expected) in [
+            (
+                "with IncludeTags omitted",
+                json!({ "Identifier": arn.clone() }),
+                Some(json!({ "team": "observability" })),
+            ),
+            (
+                "with IncludeTags false",
+                json!({ "Identifier": arn.clone(), "IncludeTags": false }),
+                None,
+            ),
+        ] {
+            let (status, got) = call(&router, "/GetLink", &body, region).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} {case_suffix}: expected 200, got {got:?}"
+            );
+            assert_eq!(
+                got.get("Tags"),
+                expected.as_ref(),
+                "case {case:?} {case_suffix}: expected {expected:?}, got {got:?}"
+            );
+        }
     }
 }
 
@@ -676,7 +700,8 @@ async fn create_link_refuses_a_request_it_cannot_store() {
     let unknown_sink = "22222222-3333-4444-5555-666666666666";
 
     // Each row is a request the service cannot store, with the code it is refused
-    // with: the two modelled 400s this operation declares.
+    // with: the two modelled 400s this operation declares, and the request front
+    // end's own code for an element outside the modelled `ResourceType` enum.
     let cases: &[(&str, Value, &str)] = &[
         (
             "a resource type the model does not declare",
@@ -685,7 +710,7 @@ async fn create_link_refuses_a_request_it_cannot_store() {
                 "ResourceTypes": ["AWS::Logs::LogStream"],
                 "SinkIdentifier": sink_arn.clone(),
             }),
-            "InvalidParameterException",
+            "BadRequestException",
         ),
         (
             "a modelled resource type in the wrong case",
@@ -694,7 +719,7 @@ async fn create_link_refuses_a_request_it_cannot_store() {
                 "ResourceTypes": ["aws::logs::loggroup"],
                 "SinkIdentifier": sink_arn.clone(),
             }),
-            "InvalidParameterException",
+            "BadRequestException",
         ),
         (
             "a SinkIdentifier naming no stored sink",

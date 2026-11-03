@@ -149,12 +149,15 @@ pub struct Link {
 
 /// The tag map a response carries, as the wire shape wants it.
 ///
-/// `include` is false for an operation whose caller did not ask for tags
-/// (`IncludeTags` absent or false). An empty map is omitted rather than reported as
-/// `{}`: a resource carrying no tags has none to report, and `Tags` is an optional
-/// output member precisely so it can be left out.
+/// `include` is false for an operation whose caller asked for the tags NOT to be
+/// reported (`IncludeTags` explicitly false — see [`report_tags`]); that is the one
+/// thing that leaves `Tags` out of a response. When the tags ARE reported, the map is
+/// reported whatever it holds: an empty map is the answer to "what tags does this
+/// resource have" for a resource carrying none, and it is the same answer
+/// `ListTagsForResource` gives for that ARN — one stored tag set, reported identically
+/// however it is read.
 fn tags_output(tags: &BTreeMap<String, String>, include: bool) -> Option<HashMap<String, String>> {
-    (include && !tags.is_empty()).then(|| {
+    include.then(|| {
         tags.iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect()
@@ -173,6 +176,21 @@ impl Link {
     pub fn tags_output(&self, include: bool) -> Option<HashMap<String, String>> {
         tags_output(&self.tags, include)
     }
+}
+
+/// Whether a response reports the resource's tags, for what the request carried in
+/// `IncludeTags`.
+///
+/// The member SUPPRESSES the tag projection rather than requesting it: a read that
+/// leaves it out reports the resource's stored tag set, the same set
+/// `ListTagsForResource` answers for that ARN, and only an explicit `false` leaves
+/// `Tags` out of the response. The member's own documentation states a default of
+/// false (`smithy_query(query="doc",shape="GetSinkInput",member="IncludeTags")`),
+/// which the service's observed behaviour contradicts; the behaviour is what this
+/// follows. ONE rule for the one modelled `IncludeTags` shape, which `GetSink`,
+/// `GetLink` and `UpdateLink` all bind.
+pub fn report_tags(include_tags: Option<bool>) -> bool {
+    include_tags.unwrap_or(true)
 }
 
 /// Which of this service's two resources an ARN names, with the id its record is
@@ -559,19 +577,6 @@ pub fn resolve_label(label_template: &str) -> String {
         })
 }
 
-/// The first entry of `resource_types` the model's `ResourceType` enum does not
-/// declare, or `None` when every one of them is a modelled value.
-///
-/// The catalog is the generated [`crate::ops::types::RESOURCE_TYPE_VALUES`], which
-/// carries exactly the values
-/// `smithy_query(query="shape",shape="ResourceType")` reports.
-pub fn unmodelled_resource_type(resource_types: &[String]) -> Option<&str> {
-    resource_types
-        .iter()
-        .map(String::as_str)
-        .find(|supplied| !crate::ops::types::RESOURCE_TYPE_VALUES.contains(supplied))
-}
-
 /// The lower bound of the modelled `ResourceTypesInput` `@length`, which the list
 /// declares as 1..50 with `@uniqueItems` over elements targeting the `ResourceType`
 /// enum (`smithy_query(query="shape",shape="ResourceTypesInput")`).
@@ -583,12 +588,16 @@ pub const MAX_RESOURCE_TYPES: usize = 50;
 /// Why `resource_types` is not a `ResourceTypesInput` the model admits, or `None` when
 /// it is one.
 ///
-/// Every clause is a modelled constraint of that list, and the refusal names the
-/// member, the rule and what the request sent for it, so a caller can fix the request
-/// from the text alone. For an operation whose `ResourceTypes` the centralized
-/// pre-handler walk sees, this is a second check of what that walk already refuses;
-/// for `UpdateLink`, whose authorization decision comes first, it is the only one (see
-/// [`crate::ops::types::UpdateLinkRequest`]).
+/// Every clause is a modelled `@length`/`@uniqueItems` constraint of that list, and the
+/// refusal names the member, the rule and what the request sent for it, so a caller can
+/// fix the request from the text alone. For an operation whose `ResourceTypes` the
+/// centralized pre-handler walk sees, this is a second check of what that walk already
+/// refuses; for `UpdateLink`, whose authorization decision comes first, it is the only
+/// one (see [`crate::ops::types::UpdateLinkRequest`]).
+///
+/// Enum MEMBERSHIP is deliberately not one of the clauses: a value outside a modelled
+/// enum is the request front end's refusal rather than the service's, and is worded by
+/// [`unmodelled_enum_rejection`].
 pub fn resource_types_rejection(resource_types: &[String]) -> Option<String> {
     if resource_types.len() < MIN_RESOURCE_TYPES {
         return Some(format!(
@@ -608,15 +617,6 @@ pub fn resource_types_rejection(resource_types: &[String]) -> Option<String> {
         .any(|resource_type| !seen.insert(resource_type.as_str()))
     {
         return Some("ResourceTypes must not name one resource type twice".to_string());
-    }
-    if let Some(unmodelled) = unmodelled_resource_type(resource_types) {
-        // The offending value is caller-controlled text, so only its first characters
-        // are echoed back.
-        let shown: String = unmodelled.chars().take(64).collect();
-        return Some(format!(
-            "ResourceTypes contains '{shown}', which is not one of [{}]",
-            crate::ops::types::RESOURCE_TYPE_VALUES.join(", ")
-        ));
     }
     None
 }
@@ -653,6 +653,47 @@ pub const POLICY_EFFECTS: &[&str] = &["Allow", "Deny"];
 /// behavioural recording of this service covers answers this one constant string. A
 /// not-found refusal therefore never embeds the identifier the request asked about.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found.";
+
+/// The message the TAGGING path's not-found refusal carries.
+///
+/// The three tagging operations answer a resource that is not there with their own
+/// refusal — the error code `NotFoundException`, which no operation of this service
+/// models, and this one fixed string — rather than with the control plane's modelled
+/// `ResourceNotFoundException` / [`RESOURCE_NOT_FOUND_MESSAGE`]. Like that one it names
+/// no identifier, so the refusal echoes nothing the caller sent.
+pub const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The message a tagging request whose `ResourceArn` is not an ARN of this service at
+/// all is refused with.
+///
+/// The tagging path judges that ARN's SYNTAX before the service sees the request, and
+/// the refusal says only that: the offending value is not echoed, so nothing of the
+/// request reaches the message.
+pub const INVALID_TAGGING_ARN_MESSAGE: &str = "Invalid input resource arn: bad syntax";
+
+/// The tag-key namespace Amazon Web Services keeps for its own tags.
+///
+/// A customer may neither set nor remove a key in it, and the prefix is matched
+/// CASE-INSENSITIVELY, so no spelling of it is settable
+/// ([`is_reserved_tag_key`]).
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// The message a request that tries to SET a tag key in [`RESERVED_TAG_KEY_PREFIX`] is
+/// refused with.
+///
+/// Entirely fixed text: the rule is about the namespace rather than about the key that
+/// named it, so the offending key is not echoed.
+pub const RESERVED_TAG_KEY_SET_MESSAGE: &str =
+    "Invalid tag key. Customers cannot set tag keys starting with aws: (case insensitive)";
+
+/// The message a request that tries to REMOVE a tag key in
+/// [`RESERVED_TAG_KEY_PREFIX`] is refused with.
+///
+/// Its own sentence: setting and removing are two things a customer may not do to a
+/// reserved key, and the service says which one was asked for. Fixed text, for the same
+/// reason as [`RESERVED_TAG_KEY_SET_MESSAGE`].
+pub const RESERVED_TAG_KEY_REMOVE_MESSAGE: &str =
+    "Invalid tag key. Customers cannot remove tag keys starting with aws: (case insensitive)";
 
 /// The message a `CreateLink` naming a sink the calling account itself owns is refused
 /// with.
@@ -800,6 +841,230 @@ pub fn require_resource_kind(
         return Err(explicit_deny(operation, identifier));
     }
     Ok(())
+}
+
+/// How much of a caller-supplied enum value a refusal echoes.
+///
+/// The value lands in a response message, so only its leading characters are reported:
+/// a request can never be amplified into an arbitrarily long refusal.
+const MAX_ECHOED_ENUM_VALUE: usize = 64;
+
+/// The request front end's envelope for a body it would not accept: one clause per
+/// rule the body broke.
+///
+/// The SAME envelope `crate::service` renders for the violations the centralized walk
+/// finds, so a rule a handler has to judge for itself reads to a caller exactly like
+/// one that walk refused.
+pub fn invalid_request_body_message(clauses: &[String]) -> String {
+    format!("Invalid request body: [{}]", clauses.join(", "))
+}
+
+/// That front end's refusal, carrying [`invalid_request_body_message`].
+pub fn invalid_request_body(clauses: &[String]) -> crate::scaffolded::BadRequestException {
+    crate::scaffolded::BadRequestException::new(invalid_request_body_message(clauses))
+}
+
+/// The clause the request front end states for a value outside a modelled enum: the
+/// value the request sent, and the values the enum declares.
+///
+/// `permitted` comes from the model — the enum's own value set, in the order the model
+/// declares it, as the constraint walk reports it on the violation — so the list grows
+/// with the model and is never a second copy of it. The value is caller-controlled
+/// text, so only its leading characters are echoed.
+pub fn enum_membership_clause(value: &str, permitted: &[String]) -> String {
+    let shown: String = value.chars().take(MAX_ECHOED_ENUM_VALUE).collect();
+    let values: Vec<String> = permitted.iter().map(|value| format!("\"{value}\"")).collect();
+    format!(
+        "instance value (\"{shown}\") not found in enum (possible values: [{}])",
+        values.join(",")
+    )
+}
+
+/// The front end's refusal for the enum-membership violations among `violations`, or
+/// `None` when none of them is one.
+///
+/// Membership of a modelled enum is a rule of the request BODY, judged by the layer in
+/// front of the service, so it is reported with that layer's code and clauses rather
+/// than as a parameter the service found fault with.
+pub fn unmodelled_enum_rejection(
+    violations: &[::aws_smithy_schema_server::constraints::Violation],
+) -> Option<crate::scaffolded::BadRequestException> {
+    let clauses: Vec<String> = violations
+        .iter()
+        .filter_map(enum_membership_violation_clause)
+        .collect();
+    (!clauses.is_empty()).then(|| invalid_request_body(&clauses))
+}
+
+/// That clause for ONE violation, or `None` when the violation is not an
+/// enum-membership one.
+pub fn enum_membership_violation_clause(
+    violation: &::aws_smithy_schema_server::constraints::Violation,
+) -> Option<String> {
+    let ::aws_smithy_schema_server::constraints::ViolationKind::EnumValue(permitted) =
+        &violation.kind
+    else {
+        return None;
+    };
+    Some(enum_membership_clause(
+        violation.value.as_deref().unwrap_or_default(),
+        permitted,
+    ))
+}
+
+/// The violations the model's own constraints record for the LIST member `member` of
+/// `schema` holding `values`.
+///
+/// The judgement is the MODEL's, by the very walk that refuses a request before a
+/// handler runs (see [`member_admits`]), so an operation that has to judge one of its
+/// members itself reports exactly what that walk would have reported for it.
+pub fn list_member_violations(
+    schema: &'static ::aws_smithy_schema::Schema,
+    member: &str,
+    values: &[String],
+) -> Vec<::aws_smithy_schema_server::constraints::Violation> {
+    /// One list member of `schema`, written so the constraint walk judges that member
+    /// and nothing else.
+    struct OneListMember<'a> {
+        member: &'static ::aws_smithy_schema::Schema,
+        values: &'a [String],
+    }
+
+    impl ::aws_smithy_schema::serde::SerializableStruct for OneListMember<'_> {
+        fn serialize_members(
+            &self,
+            s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+        ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+            s.write_list(self.member, &|elements| {
+                for value in self.values {
+                    elements.write_string(self.member, value.as_str())?;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    let Some(member) = member_schema(schema, member) else {
+        // A member this schema does not declare carries no constraints to record.
+        return Vec::new();
+    };
+    ::aws_smithy_schema_server::constraints::validate(&OneListMember { member, values }, schema)
+}
+
+/// Whether `key` names the reserved tag namespace, whatever case it spells the prefix
+/// in.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// Which change to a resource's tag set a request is making.
+///
+/// A customer may neither SET a key in the reserved namespace nor REMOVE one, and the
+/// service words the two refusals differently, so the rule is asked for one or the
+/// other ([`reserved_tag_key_rejection`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagKeyWrite {
+    /// The request would write the keys it names (`TagResource`, and a create that
+    /// seeds a resource's tags).
+    Set,
+    /// The request would remove the keys it names (`UntagResource`).
+    Remove,
+}
+
+impl TagKeyWrite {
+    /// The message a reserved key earns for this kind of write.
+    pub fn reserved_key_message(self) -> &'static str {
+        match self {
+            Self::Set => RESERVED_TAG_KEY_SET_MESSAGE,
+            Self::Remove => RESERVED_TAG_KEY_REMOVE_MESSAGE,
+        }
+    }
+}
+
+/// The refusal a request that would write or remove a key in the reserved namespace
+/// earns, or `None` when every key it names is a customer key.
+///
+/// Reached by every operation that changes a resource's tags — the two creates,
+/// `TagResource` and `UntagResource` — so one reserved key can never be set through one
+/// of them and read back through another.
+pub fn reserved_tag_key_rejection<'a, I: IntoIterator<Item = &'a str>>(
+    write: TagKeyWrite,
+    keys: I,
+) -> Option<crate::scaffolded::BadRequestException> {
+    keys.into_iter()
+        .any(is_reserved_tag_key)
+        .then(|| crate::scaffolded::BadRequestException::new(write.reserved_key_message()))
+}
+
+/// The refusal a tag write that would leave a resource holding more than
+/// [`MAX_TAGS_PER_RESOURCE`] user tags earns.
+///
+/// The ceiling is the whole of what the message states — neither the count the request
+/// would have reached nor the resource it was asked about reaches it — and the limit
+/// is rendered from the one constant this service keeps it in.
+pub fn too_many_user_tags() -> crate::scaffolded::BadRequestException {
+    crate::scaffolded::BadRequestException::new(format!(
+        "The resultant tag set must not have more than {MAX_TAGS_PER_RESOURCE} user tags."
+    ))
+}
+
+/// The tagging path's refusal for an ARN that names no stored resource.
+pub fn tagged_resource_not_found() -> crate::scaffolded::NotFoundException {
+    crate::scaffolded::NotFoundException::new(TAGGED_RESOURCE_NOT_FOUND_MESSAGE)
+}
+
+/// The member of `schema` named `member`, or `None` when it declares none.
+///
+/// Read from the generated schema rather than kept as a second copy of it, so a
+/// member's constraint traits stay single-homed in the model-derived schema.
+fn member_schema(
+    schema: &'static ::aws_smithy_schema::Schema,
+    member: &str,
+) -> Option<&'static ::aws_smithy_schema::Schema> {
+    schema
+        .members()
+        .iter()
+        .copied()
+        .find(|candidate| candidate.member_name() == Some(member))
+}
+
+/// Whether `value` satisfies the modelled constraints of the member `member` of
+/// `schema`.
+///
+/// The judgement is the MODEL's: the member's constraint traits are read off the
+/// generated schema and evaluated by the very walk that refuses a request before a
+/// handler runs, so this service never carries a second copy of a modelled pattern.
+/// An operation that takes its authorization decision BEFORE the request is judged
+/// (see [`crate::ops::types::ListAttachedLinksRequest`]) asks this to find out whether
+/// the identifier it was handed is one the model admits at all.
+pub fn member_admits(
+    schema: &'static ::aws_smithy_schema::Schema,
+    member: &str,
+    value: &str,
+) -> bool {
+    /// One member of `schema`, written so the constraint walk judges that member and
+    /// nothing else.
+    struct OneMember<'a> {
+        member: &'static ::aws_smithy_schema::Schema,
+        value: &'a str,
+    }
+
+    impl ::aws_smithy_schema::serde::SerializableStruct for OneMember<'_> {
+        fn serialize_members(
+            &self,
+            s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+        ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+            s.write_string(self.member, self.value)
+        }
+    }
+
+    let Some(member) = member_schema(schema, member) else {
+        // A member this schema does not declare carries no constraints to satisfy.
+        return true;
+    };
+    ::aws_smithy_schema_server::constraints::validate(&OneMember { member, value }, schema)
+        .is_empty()
 }
 
 /// Why `policy` is not a sink policy document this service will attach, or `None`
