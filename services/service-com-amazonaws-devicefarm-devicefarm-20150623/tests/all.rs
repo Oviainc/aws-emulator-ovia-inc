@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/network_profiles.rs"]
 mod network_profiles;
+#[path = "all/not_found_wording.rs"]
+mod not_found_wording;
 #[path = "all/projects.rs"]
 mod projects;
 #[path = "all/state_roundtrip.rs"]

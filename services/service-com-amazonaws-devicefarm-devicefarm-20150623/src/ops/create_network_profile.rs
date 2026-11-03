@@ -191,7 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.projects.contains_key(&input.project_arn) {
             return Err(CreateNetworkProfileErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!("No project found for arn {}", input.project_arn)),
+                    message: Some(crate::state::arn_not_found_message(
+                        crate::state::PROJECT_ENTITY,
+                        &input.project_arn,
+                    )),
                 },
             )
             .into());

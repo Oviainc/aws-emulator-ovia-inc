@@ -294,6 +294,24 @@ pub fn is_devicefarm_arn_of_type(arn: &str, resource_type: &str) -> bool {
     devicefarm_resource_id(arn, resource_type).is_some()
 }
 
+/// How a project is named in the prose of a message about one.
+pub const PROJECT_ENTITY: &str = "project";
+
+/// How a network profile is named in the prose of a message about one.
+pub const NETWORK_PROFILE_ENTITY: &str = "network profile";
+
+/// The message a Device Farm `NotFoundException` carries when the ARN a request supplied
+/// resolves to no resource of the type that member names.
+///
+/// Device Farm words that absence `No <entity> was found for arn <arn>`: the text around
+/// the two variable parts is fixed, `entity` is the resource named in words (see
+/// [`PROJECT_ENTITY`] and [`NETWORK_PROFILE_ENTITY`]), and `arn` is echoed verbatim from
+/// the request's own ARN member rather than re-derived from the store. Every handler that
+/// reports a missing resource goes through here, so the whole service words it one way.
+pub fn arn_not_found_message(entity: &str, arn: &str) -> String {
+    format!("No {entity} was found for arn {arn}")
+}
+
 /// Whether `arn` names a project.
 pub fn is_project_arn(arn: &str) -> bool {
     is_devicefarm_arn_of_type(arn, PROJECT_RESOURCE_TYPE)

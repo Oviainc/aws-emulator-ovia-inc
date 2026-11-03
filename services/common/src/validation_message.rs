@@ -227,7 +227,9 @@ pub fn quoting_the_submitted_collection(
 /// the submitted value — identical, or its prefix plus the marker naming its byte count — so
 /// a clause the framework wrote from something else (a collection's size summary, which
 /// [`quoting_the_submitted_collection`] answers) keeps the framework's own text, and so does
-/// a value the echo bounds declined to render.
+/// a value the echo bounds declined to render. A violation whose value the boundary walk
+/// WITHHELD is returned untouched, whatever the echo holds: what that clause states is the
+/// constraint and no value, and no caller of this entry point can opt out of it.
 #[must_use]
 pub fn quoting_the_whole_submitted_value(
     violation: Violation,

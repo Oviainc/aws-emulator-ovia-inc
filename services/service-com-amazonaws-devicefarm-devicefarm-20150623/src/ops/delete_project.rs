@@ -153,7 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         if store.projects.remove(&input.arn).is_none() {
             return Err(DeleteProjectErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("No project found for arn {}", input.arn)),
+                message: Some(crate::state::arn_not_found_message(
+                    crate::state::PROJECT_ENTITY,
+                    &input.arn,
+                )),
             })
             .into());
         }

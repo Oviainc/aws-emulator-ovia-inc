@@ -164,7 +164,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             None => Err(GetNetworkProfileErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!("No network profile found for arn {}", input.arn)),
+                    message: Some(crate::state::arn_not_found_message(
+                        crate::state::NETWORK_PROFILE_ENTITY,
+                        &input.arn,
+                    )),
                 },
             )
             .into()),
