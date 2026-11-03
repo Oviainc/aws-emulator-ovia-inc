@@ -157,8 +157,24 @@ pub const QUERY_ERROR_HEADER: &str = "x-amzn-query-error";
 
 /// One request as this service's wire protocol carries it: `awsJson1_0` over `POST /`
 /// with the target header, and — for `query_mode` — the header a query-compatible SDK
-/// sends on every call it makes to this service.
+/// sends on every call it makes to this service. It arrives on `region`'s own endpoint,
+/// which is where a client configured for that region addresses it.
 fn request_for(
+    region: &str,
+    operation: &str,
+    body: Vec<u8>,
+    query_mode: bool,
+) -> http::Request<Bytes> {
+    request_arriving_on(&host_in(region), region, operation, body, query_mode)
+}
+
+/// The same request, arriving on `address` — the `Host` header it carries.
+///
+/// The address a request arrives on is a different thing from the region it was made in,
+/// which its SigV4 credential scope names: a client reaches this emulator at whatever
+/// address it was pointed at, and this is the seam a suite drives that difference through.
+fn request_arriving_on(
+    address: &str,
     region: &str,
     operation: &str,
     body: Vec<u8>,
@@ -167,7 +183,7 @@ fn request_for(
     let mut builder = http::Request::builder()
         .method("POST")
         .uri("/")
-        .header("host", host_in(region))
+        .header("host", address)
         .header("content-type", "application/x-amz-json-1.0")
         .header("x-amz-target", format!("AmazonSQS.{operation}"))
         .header("authorization", authorization_in(region));
@@ -177,6 +193,45 @@ fn request_for(
     builder
         .body(Bytes::from(body))
         .expect("a well-formed request")
+}
+
+/// Send `operation` as a call made in `region` whose request ARRIVES on `address`, and
+/// answer its HTTP status and parsed body.
+pub async fn call_on_host(
+    router: &MultiServiceRouter,
+    address: &str,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
+    let request = request_arriving_on(
+        address,
+        region,
+        operation,
+        serde_json::to_vec(body).expect("the request body serializes"),
+        false,
+    );
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let parsed = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+/// The same call, which must succeed.
+pub async fn ok_on_host(
+    router: &MultiServiceRouter,
+    address: &str,
+    region: &str,
+    operation: &str,
+    body: Value,
+) -> Value {
+    let (status, parsed) = call_on_host(router, address, region, operation, &body).await;
+    assert_eq!(
+        status, 200,
+        "case {operation} in {region} arriving on {address}: expected HTTP 200, got {status} \
+         with {parsed}"
+    );
+    parsed
 }
 
 /// Send one operation and answer its HTTP status, its response HEADERS and its parsed

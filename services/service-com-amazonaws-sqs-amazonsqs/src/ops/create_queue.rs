@@ -409,7 +409,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let url = state::queue_url(ctx.parts(), &region, &input.queue_name);
+        let url = state::queue_url(&region, &input.queue_name);
         let queue = state::Queue {
             name: input.queue_name.clone(),
             region: region.clone(),

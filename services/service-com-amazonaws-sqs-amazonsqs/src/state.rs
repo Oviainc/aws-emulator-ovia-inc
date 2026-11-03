@@ -3859,31 +3859,38 @@ pub fn queue_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, name)
 }
 
-/// The url of the queue named `name`, as a client should address it:
-/// `<endpoint>/<accountId>/<QueueName>`.
-///
-/// The endpoint is the emulator's OWN — the authority this request arrived on —
-/// because the url has to be reachable: a client that re-targets its SQS calls at the
-/// queue url must land back on this emulator rather than on the real AWS endpoint.
-pub fn queue_url(parts: &::http::request::Parts, region: &str, name: &str) -> String {
-    let endpoint = request_endpoint(parts, region);
-    format!("{endpoint}/{}/{name}", ::engine::emulator_account_id())
-}
+/// The DNS suffix AWS publishes its commercial-partition service endpoints under: the tail
+/// of the authority a queue url names. Named rather than spelled inline, as the other
+/// crates in this tree that report an endpoint host do.
+const ENDPOINT_DNS_SUFFIX: &str = "amazonaws.com";
 
-/// The emulator endpoint this request arrived on, falling back to the public SQS
-/// endpoint for `region` when the request names no authority at all.
-fn request_endpoint(parts: &::http::request::Parts, region: &str) -> String {
-    let authority = parts
-        .headers
-        .get(::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .filter(|host| !host.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| parts.uri.authority().map(ToString::to_string));
-    match authority {
-        Some(authority) => format!("https://{authority}"),
-        None => format!("https://sqs.{region}.amazonaws.com"),
-    }
+/// The url of the queue named `name` in `region`, as Amazon SQS names it:
+/// `https://<endpoint prefix>.<region>.<dns suffix>/<accountId>/<QueueName>`.
+///
+/// The authority is the service's REGIONAL endpoint — the endpoint prefix the model
+/// publishes ([`ARN_SERVICE`], which is also this service's signing name and
+/// `arnNamespace`) under the region the call was made in — and never the socket a request
+/// happened to arrive on, because this value is what a client stores, derives the queue
+/// ARN from, embeds in a policy document and reads the region and the account back out of:
+/// it has to be ONE string for one queue, whatever address its caller reached this
+/// emulator at and across restarts. The account segment is this emulator's own
+/// ([`::engine::emulator_account_id`]) — the account every resource it mints belongs to —
+/// rather than anything the request carried.
+///
+/// What that authority is NOT is an address anything here connects to. This service opens
+/// no client, no socket and no resolver: it answers the requests that arrive and makes
+/// none of its own. Nor does the authority decide anything, even for the urls this service
+/// is HANDED back: a `QueueUrl` resolves to its queue by its `/<accountId>/<QueueName>`
+/// path alone ([`queue_name_from_url`]). So a caller holding one of these keeps reaching
+/// its queue here — it is already talking to this emulator, which is how it was handed the
+/// url — and one that instead took the authority for an endpoint would be asking a public
+/// endpoint about a queue of the emulator's own account, which holds nothing of that
+/// caller's to read or to change.
+pub fn queue_url(region: &str, name: &str) -> String {
+    format!(
+        "https://{ARN_SERVICE}.{region}.{ENDPOINT_DNS_SUFFIX}/{}/{name}",
+        ::engine::emulator_account_id()
+    )
 }
 
 /// The `QueueName` a `QueueUrl` addresses, or `None` for a value that is not a queue

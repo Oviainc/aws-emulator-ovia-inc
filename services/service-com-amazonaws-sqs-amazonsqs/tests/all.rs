@@ -71,6 +71,8 @@ mod queue_policy_authorization;
 mod queue_policy_condition_keys;
 #[path = "all/queue_tags.rs"]
 mod queue_tags;
+#[path = "all/queue_url_endpoint_form.rs"]
+mod queue_url_endpoint_form;
 #[path = "all/query_compatible_error_envelope.rs"]
 mod query_compatible_error_envelope;
 #[path = "all/receipt_handle_leases.rs"]
