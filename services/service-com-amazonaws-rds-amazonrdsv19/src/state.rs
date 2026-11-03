@@ -3574,6 +3574,44 @@ pub fn validate_db_parameter_setting(
     validate_known_setting(published_db_parameters(family), name, value)
 }
 
+/// The cluster parameters the DB CLUSTER parameter group family `family` publishes, or
+/// `None` when this emulator publishes none for it.
+///
+/// This is the catalog `DescribeEngineDefaultClusterParameters` reports for the family and
+/// the one a GROUP of that family reports its parameters' metadata from, so what a value is
+/// validated against and what a describe publishes as that parameter's `AllowedValues` can
+/// never disagree. It is a SAMPLE of the engine's published list rather than the whole of it,
+/// which is why [`validate_cluster_parameter_setting`] checks the value of a parameter the
+/// catalog carries and admits any name it does not.
+///
+/// The instance-level counterpart is [`published_db_parameters`].
+pub fn published_cluster_parameters(family: &str) -> Option<&'static [ClusterParameterSpec]> {
+    crate::ops::describe_engine_default_cluster_parameters::cluster_parameter_catalog(family)
+}
+
+/// Refuse a setting a DB CLUSTER parameter group of `family` cannot carry: a parameter the
+/// family publishes that the engine does not let a caller modify, or a value outside the ones
+/// that parameter admits — the `AllowedValues` its own published catalog entry carries,
+/// whichever engine's family it is.
+///
+/// Two catalogs answer for a family and both are consulted, because each is the whole of what
+/// it publishes: the shared one of [`validate_parameter_setting`], which IS its families'
+/// complete parameter list and so refuses a name outside it, and the family's own published
+/// cluster catalog ([`published_cluster_parameters`]), a sample in which an unpublished name
+/// is admitted and a published one's value is checked ([`validate_known_setting`] carries
+/// that rule).
+///
+/// `Err` carries the message to answer with, built from the request and from that parameter's
+/// catalog entry; the instance-level rule is [`validate_db_parameter_setting`].
+pub fn validate_cluster_parameter_setting(
+    family: &str,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    validate_parameter_setting(family, name, value)?;
+    validate_known_setting(published_cluster_parameters(family), name, value)
+}
+
 /// The apply method a change to a DB (instance) parameter gets when the caller asks for
 /// none: the one the parameter's own apply type implies; see
 /// [`service_common::rds_cluster_parameters::default_apply_method`] for the documented rule.

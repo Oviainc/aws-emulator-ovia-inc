@@ -19,6 +19,8 @@ mod already_exists_refusal_sentences;
 mod certificate_override;
 #[path = "all/cluster_parameter_groups.rs"]
 mod cluster_parameter_groups;
+#[path = "all/cluster_parameter_value_range.rs"]
+mod cluster_parameter_value_range;
 #[path = "all/control_plane_operations.rs"]
 mod control_plane_operations;
 #[path = "all/custom_db_engine_versions.rs"]

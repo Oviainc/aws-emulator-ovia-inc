@@ -406,6 +406,19 @@ pub(crate) const NEPTUNE_CLUSTER_PARAMETERS: &[crate::state::ClusterParameterSpe
         "",
         "Enables the change-log stream of the cluster's graph.",
     ),
+    parameter(
+        "neptune_streams_expiry_days",
+        // The retention of a stream record is a property of the stream the engine is
+        // already serving, so a change to it needs no reboot; the guide publishes its
+        // valid range as 1 to 90 days, with 7 the engine's own default.
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1-90",
+        "7",
+        true,
+        "",
+        "The number of days the cluster keeps the change-log records of its graph.",
+    ),
 ];
 
 /// The cluster parameters the DB CLUSTER parameter group family `family` publishes.

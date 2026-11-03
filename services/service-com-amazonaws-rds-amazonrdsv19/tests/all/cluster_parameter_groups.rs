@@ -427,7 +427,11 @@ async fn the_cluster_parameter_group_lifecycle_is_computed_from_persisted_state(
 /// A value a parameter admits, and one it does not, derived from the parameter's OWN
 /// published `AllowedValues` — an enumeration is split, a range is taken at each published
 /// bound and one step past it.
-fn admitted_and_refused(spec: &ClusterParameterSpec) -> (Vec<String>, Vec<String>) {
+///
+/// `pub(crate)` so the sibling suite that drives this same rule over the OTHER cluster
+/// engines' catalogs derives its values the same way rather than growing a second copy of
+/// the derivation.
+pub(crate) fn admitted_and_refused(spec: &ClusterParameterSpec) -> (Vec<String>, Vec<String>) {
     if spec.allowed_values.contains(',') {
         let admitted: Vec<String> = spec
             .allowed_values
@@ -436,9 +440,11 @@ fn admitted_and_refused(spec: &ClusterParameterSpec) -> (Vec<String>, Vec<String
             .collect();
         return (admitted, vec!["not-a-published-value".to_string()]);
     }
+    // Split through the spec's OWN range reader, which keeps a negative low bound
+    // (`-1-2147483647`) intact: the derivation here and the parsing the service
+    // validates with then read one published range the same way.
     let (low, high) = spec
-        .allowed_values
-        .split_once('-')
+        .range()
         .expect("a non-enumerated AllowedValues is a <low>-<high> range");
     match spec.data_type {
         "integer" => {

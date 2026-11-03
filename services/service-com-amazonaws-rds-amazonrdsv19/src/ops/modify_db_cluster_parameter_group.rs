@@ -216,10 +216,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(ModifyDBClusterParameterGroupError::validation)?;
             crate::state::check_free_form("ParameterValue", value)
                 .map_err(ModifyDBClusterParameterGroupError::validation)?;
-            // The parameter must be one the group's family publishes, and the value one
-            // that parameter admits: anything else is the AWS Query `InvalidParameterValue`,
-            // whose message names the parameter and what it admits.
-            crate::state::validate_parameter_setting(&family, name, value)
+            // The value must be one the parameter admits — the `AllowedValues` the group's
+            // family publishes for it in the very catalog `DescribeDBClusterParameters`
+            // reports, whichever engine's family it is — and the parameter one the engine
+            // lets a caller modify: anything else is the AWS Query `InvalidParameterValue`,
+            // whose message names the rejected value, what the parameter admits and the
+            // parameter itself. Checked here, before anything is written, so a request
+            // carrying one out-of-range value leaves the group exactly as it was.
+            crate::state::validate_cluster_parameter_setting(&family, name, value)
                 .map_err(ModifyDBClusterParameterGroupError::invalid_parameter_value)?;
             let apply_method = match parameter.apply_method.as_deref() {
                 // The model types `ApplyMethod` as an enum, so a value outside
