@@ -486,7 +486,7 @@ const DOMAIN_ROWS: &[DomainRow] = &[
         cluster_level: true,
         family: "docdb5.0",
         parameter: "tls",
-        domain: "enabled,disabled,fips-140-3,tls1.2+,tls1.3+",
+        domain: "disabled,enabled,fips-140-3,tls1.2+,tls1.3+",
         refused: "maybe",
     },
     DomainRow {

@@ -88,7 +88,8 @@ use crate::ops::types::{
 // reads them as `crate::state::<name>`.
 pub use service_common::rds_cluster_parameters::{
     change_is_pending, change_is_pending_for, default_apply_method, default_apply_method_for,
-    parameter_source_filter, published_parameter, published_parameters, spec_in_catalog,
+    minimum_engine_version_in_family, parameter_source_filter, published_parameter,
+    published_parameters, spec_in_catalog,
     validate_known_setting, validate_parameter_group_family, validate_parameter_group_name,
     validate_parameter_name, validate_parameter_setting, validate_setting_in_catalog,
     ClusterParameterSpec,
@@ -3411,7 +3412,10 @@ impl DbClusterParameterGroupRecord {
             data_type: spec.map(|spec| spec.data_type.to_string()),
             allowed_values: spec.map(|spec| spec.allowed_values.to_string()),
             is_modifiable: spec.map(|spec| spec.is_modifiable),
-            minimum_engine_version: spec.map(|spec| spec.minimum_engine_version.to_string()),
+            // Answered about THIS group's family; see
+            // [`cluster_engine_default_parameter_to_wire`].
+            minimum_engine_version: spec
+                .map(|spec| minimum_engine_version_in_family(&self.family, spec)),
             apply_method: setting.map(|setting| setting.apply_method.clone()),
             supported_engine_modes: Some(
                 crate::ops::describe_engine_default_cluster_parameters::family_engine_modes(
@@ -3647,6 +3651,13 @@ pub fn engine_default_parameter_to_wire(spec: &ClusterParameterSpec) -> Paramete
 /// A CLUSTER parameter the family `family` publishes, as the modelled `Parameter`: what
 /// [`engine_default_parameter_to_wire`] reports plus `SupportedEngineModes`, "the valid DB
 /// engine modes", which a cluster parameter has and an instance parameter does not.
+///
+/// `MinimumEngineVersion` is answered about the FAMILY the report is for, not about the
+/// engine as a whole: the earliest version the parameter can apply at inside that family is
+/// the later of the version it was introduced in and the family's own first release
+/// (`service_common::rds_cluster_parameters::minimum_engine_version_in_family`). A family
+/// whose first release this front door does not publish keeps the introduction version
+/// unchanged.
 pub fn cluster_engine_default_parameter_to_wire(
     family: &str,
     spec: &ClusterParameterSpec,
@@ -3655,6 +3666,8 @@ pub fn cluster_engine_default_parameter_to_wire(
         supported_engine_modes: Some(
             crate::ops::describe_engine_default_cluster_parameters::family_engine_modes(family),
         ),
+        minimum_engine_version: (!spec.minimum_engine_version.is_empty())
+            .then(|| minimum_engine_version_in_family(family, spec)),
         ..engine_default_parameter_to_wire(spec)
     }
 }

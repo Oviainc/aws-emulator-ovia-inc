@@ -382,7 +382,7 @@ const PUBLISHED: [Published; 12] = [
         "tls",
         APPLY_TYPE_STATIC,
         "string",
-        "enabled,disabled,fips-140-3,tls1.2+,tls1.3+",
+        "disabled,enabled,fips-140-3,tls1.2+,tls1.3+",
         "enabled",
         true,
     ),

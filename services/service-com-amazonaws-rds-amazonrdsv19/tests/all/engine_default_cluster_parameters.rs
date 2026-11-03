@@ -317,7 +317,7 @@ const PUBLISHED: [Published; 9] = [
         "tls",
         APPLY_TYPE_STATIC,
         "string",
-        "enabled,disabled,fips-140-3,tls1.2+,tls1.3+",
+        "disabled,enabled,fips-140-3,tls1.2+,tls1.3+",
         "enabled",
         true,
     ),
@@ -407,8 +407,9 @@ async fn a_cluster_family_reports_its_engines_published_cluster_parameters() {
         "aurora-mysql8.0 against aurora-postgresql15"
     );
 
-    // A cluster parameter of a family whose engine publishes it reports the engine version it
-    // was introduced in where the catalog publishes one, and nothing where it does not.
+    // A cluster parameter of a family whose engine publishes it reports the earliest engine
+    // version it can apply at INSIDE that family: the later of the version it was introduced
+    // in and the family's own first release, which for the 5.0 family is 5.0.0.
     let docdb = cluster_defaults_of(&router, "docdb5.0", "docdb5.0").await;
     let tls = docdb
         .iter()
@@ -416,8 +417,9 @@ async fn a_cluster_family_reports_its_engines_published_cluster_parameters() {
         .expect("docdb5.0 publishes tls");
     assert_eq!(
         tls.minimum_engine_version.as_deref(),
-        Some("3.6.0"),
-        "case {:?}: expected the engine version tls was introduced in, got {:?}",
+        Some("5.0.0"),
+        "case {:?}: expected the earliest engine version of the group's family that supports \
+         tls, got {:?}",
         "docdb5.0 tls",
         tls.minimum_engine_version
     );

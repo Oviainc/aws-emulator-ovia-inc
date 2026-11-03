@@ -1149,7 +1149,11 @@ async fn a_reported_parameter_carries_the_metadata_its_family_publishes() {
             ("IsModifiable", spec.is_modifiable.to_string()),
             (
                 "MinimumEngineVersion",
-                spec.minimum_engine_version.to_string(),
+                // The earliest version the parameter can apply at inside THIS group's
+                // family, which is what the member answers about (see
+                // `service_common::rds_cluster_parameters::minimum_engine_version_in_family`)
+                // — not the version the parameter first appeared in anywhere.
+                state::minimum_engine_version_in_family(DOCDB_FAMILY, spec),
             ),
             ("Source", state::PARAMETER_SOURCE_USER.to_string()),
         ];
@@ -1244,7 +1248,7 @@ async fn a_reported_parameter_carries_the_metadata_its_family_publishes() {
             "MinimumEngineVersion",
             published
                 .iter()
-                .map(|spec| spec.minimum_engine_version.to_string())
+                .map(|spec| state::minimum_engine_version_in_family(DOCDB_FAMILY, spec))
                 .collect(),
         ),
         (

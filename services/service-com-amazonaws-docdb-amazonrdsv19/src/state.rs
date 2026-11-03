@@ -20,10 +20,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    DBCluster, DBClusterMember, DBClusterParameterGroup, DBClusterSnapshot,
-    DBClusterSnapshotAttribute, DBClusterSnapshotAttributesResult, DBInstance, DBSubnetGroup,
-    Endpoint, Parameter, ServerlessV2ScalingConfigurationInfo, Subnet, Tag,
-    VpcSecurityGroupMembership,
+    AvailabilityZone, Certificate, DBCluster, DBClusterMember, DBClusterParameterGroup,
+    DBClusterSnapshot, DBClusterSnapshotAttribute, DBClusterSnapshotAttributesResult,
+    DBEngineVersion, DBInstance, DBSubnetGroup, Endpoint, EventCategoriesMap,
+    OrderableDBInstanceOption, Parameter, ServerlessV2ScalingConfigurationInfo, Subnet, Tag,
+    UpgradeTarget, VpcSecurityGroupMembership,
 };
 
 /// The ARN namespace and sigv4 signing name DocumentDB shares with RDS, so a cluster ARN
@@ -1393,6 +1394,35 @@ pub fn paginate(
     (page, next)
 }
 
+/// One page of a PUBLISHED CATALOGUE, plus the `Marker` to report.
+///
+/// A catalogue is published in an order of its own — the strongest certificate authority
+/// first, the engine's versions oldest first — which is not the order of any value in the
+/// record, so the token this hands back names the POSITION the next page starts after
+/// rather than a value out of the record. It is zero-padded so positions order the way
+/// [`paginate`] compares its keys, and it is the same round trip `Marker` documents: "the
+/// response includes only records beyond the marker".
+pub fn paginate_catalog<T: Clone>(
+    items: &[T],
+    marker: Option<&str>,
+    page_size: usize,
+) -> (Vec<T>, Option<String>) {
+    let keys: Vec<String> = (0..items.len()).map(catalog_page_key).collect();
+    let (page_keys, next) = paginate(&keys, marker, page_size);
+    let page = page_keys
+        .iter()
+        .filter_map(|key| key.parse::<usize>().ok())
+        .filter_map(|position| items.get(position).cloned())
+        .collect();
+    (page, next)
+}
+
+/// The pagination token of the record at `position` in a published catalogue; see
+/// [`paginate_catalog`].
+fn catalog_page_key(position: usize) -> String {
+    format!("{position:08}")
+}
+
 /// The major-version component of an engine version: everything before the first `.`, or
 /// the whole string when it carries none. `ModifyDBCluster`'s `AllowMajorVersionUpgrade`
 /// is what makes this a rule the service enforces.
@@ -1583,7 +1613,9 @@ pub fn instance_to_shape(
 // `service_common::rds_cluster_parameters` and are re-exported here: a handler reads them
 // as `crate::state::<name>` exactly as before.
 pub use service_common::rds_cluster_parameters::{
-    change_is_pending, default_apply_method, parameter_source_filter, published_parameter,
+    change_is_pending, default_apply_method, engine_version_precedes,
+    family_earliest_engine_version, minimum_engine_version_in_family, parameter_source_filter,
+    published_parameter,
     published_parameters, validate_parameter_group_family, validate_parameter_group_name,
     validate_parameter_name, validate_parameter_setting, ClusterParameterSpec,
     ParameterSourceFilter, APPLY_METHOD_IMMEDIATE, APPLY_METHOD_PENDING_REBOOT,
@@ -1678,7 +1710,11 @@ impl DbClusterParameterGroupRecord {
             data_type: spec.map(|spec| spec.data_type.to_string()),
             allowed_values: spec.map(|spec| spec.allowed_values.to_string()),
             is_modifiable: spec.map(|spec| spec.is_modifiable),
-            minimum_engine_version: spec.map(|spec| spec.minimum_engine_version.to_string()),
+            // The earliest version the parameter can apply at inside THIS group's family,
+            // which is what the member answers about; see
+            // `service_common::rds_cluster_parameters::minimum_engine_version_in_family`.
+            minimum_engine_version: spec
+                .map(|spec| minimum_engine_version_in_family(&self.family, spec)),
             apply_method: setting.map(|setting| setting.apply_method.clone()),
         }
     }
@@ -1687,7 +1723,11 @@ impl DbClusterParameterGroupRecord {
 /// A parameter the engine publishes for `family`, as the modelled `Parameter` with its
 /// default value and `Source` [`PARAMETER_SOURCE_ENGINE_DEFAULT`]: what a describe reports
 /// when the caller asks for the engine's own parameters rather than the group's.
-pub fn engine_default_parameter_to_shape(spec: &ClusterParameterSpec) -> Parameter {
+///
+/// `family` is carried because `MinimumEngineVersion` is answered about the family the
+/// group belongs to and not about the engine as a whole; see
+/// [`minimum_engine_version_in_family`].
+pub fn engine_default_parameter_to_shape(family: &str, spec: &ClusterParameterSpec) -> Parameter {
     Parameter {
         parameter_name: Some(spec.name.to_string()),
         parameter_value: Some(spec.default_value.to_string()),
@@ -1697,7 +1737,480 @@ pub fn engine_default_parameter_to_shape(spec: &ClusterParameterSpec) -> Paramet
         data_type: Some(spec.data_type.to_string()),
         allowed_values: Some(spec.allowed_values.to_string()),
         is_modifiable: Some(spec.is_modifiable),
-        minimum_engine_version: Some(spec.minimum_engine_version.to_string()),
+        minimum_engine_version: Some(minimum_engine_version_in_family(family, spec)),
         apply_method: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Published reference catalogs
+//
+// The read-only tables the catalog operations report: the certificate authorities
+// `DescribeCertificates` publishes, the engine versions `DescribeDBEngineVersions`
+// publishes, the event source types `DescribeEventCategories` publishes and the instance
+// classes `DescribeOrderableDBInstanceOptions` offers. They are reference data — the same
+// for every caller, and no request changes any of them — so they live here beside the
+// records rather than inside one handler, and each report is PROJECTED from one of them:
+// the certificate identifiers an engine version offers are read from the one certificate
+// catalogue, and an option is offered for an engine version the engine-version report
+// publishes, so no two reports can disagree about the same fact.
+// ---------------------------------------------------------------------------
+
+/// `Certificate$CertificateType` — "The type of the certificate. Example: CA". Every
+/// authority this service publishes is a certificate authority.
+pub const CA_CERTIFICATE_TYPE: &str = "CA";
+
+/// The public-key algorithm a published certificate authority signs with.
+///
+/// It is a property of the authority that a second report reads: a DocumentDB cluster's
+/// endpoint serves an RSA server certificate, so the authorities an engine version can be
+/// launched under ([`supported_ca_certificate_identifiers`]) are the RSA ones, longest key
+/// first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertificateKey {
+    /// An ECDSA authority, over a curve of this many bits.
+    EllipticCurve(u32),
+    /// An RSA authority, with a modulus of this many bits.
+    Rsa(u32),
+}
+
+/// One certificate authority this service publishes for a cluster's TLS endpoint.
+///
+/// Source: the certificate authorities AWS publishes for this front door ("Updating your
+/// Amazon DocumentDB TLS certificates", Amazon DocumentDB Developer Guide, and the
+/// certificate-authority table of "Using SSL/TLS to encrypt a connection to a DB
+/// instance"), with the validity instants that table states — to the second where it
+/// states a time, and at midnight UTC where it publishes only the date.
+#[derive(Debug, Clone, Copy)]
+pub struct CaCertificate {
+    /// `Certificate$CertificateIdentifier` — "The unique key that identifies a
+    /// certificate."
+    pub identifier: &'static str,
+    /// `Certificate$ValidFrom` — "The starting date-time from which the certificate is
+    /// valid", as an ISO-8601 instant.
+    pub valid_from: &'static str,
+    /// `Certificate$ValidTill` — "The date-time after which the certificate is no longer
+    /// valid", as an ISO-8601 instant.
+    pub valid_till: &'static str,
+    /// `Certificate$Thumbprint` — "The thumbprint of the certificate", the fingerprint of
+    /// the published authority's certificate. EMPTY for an authority whose fingerprint
+    /// this emulator does not hold: a fingerprint is a digest OF certificate bytes, so one
+    /// that is not published is reported as no `Thumbprint` member at all rather than as
+    /// an invented digest.
+    pub thumbprint: &'static str,
+    /// The key this authority signs with, which its identifier itself names
+    /// (`rds-ca-rsa2048-g1`, `rds-ca-ecc384-g1`).
+    pub key: CertificateKey,
+}
+
+/// Every certificate authority `DescribeCertificates` reports, in the order this front
+/// door publishes them: the strongest authority first — every elliptic-curve authority
+/// before every RSA one, and within a kind the longest key first — and an authority whose
+/// validity has passed after the ones a cluster can still be launched with. The retired
+/// `rds-ca-2019` is published because AWS still reports it, and a cluster cannot be
+/// launched under it ([`supported_ca_certificate_identifiers`]).
+pub const CA_CERTIFICATES: &[CaCertificate] = &[
+    CaCertificate {
+        identifier: "rds-ca-ecc384-g1",
+        valid_from: "2021-05-24T22:06:59Z",
+        valid_till: "2121-05-24T23:06:59Z",
+        thumbprint: "2ee3dcc06e50192559b13929e73484354f23387d",
+        key: CertificateKey::EllipticCurve(384),
+    },
+    CaCertificate {
+        identifier: "rds-ca-rsa4096-g1",
+        valid_from: "2021-05-24T00:00:00Z",
+        valid_till: "2121-05-24T00:00:00Z",
+        thumbprint: "",
+        key: CertificateKey::Rsa(4096),
+    },
+    CaCertificate {
+        identifier: "rds-ca-rsa2048-g1",
+        valid_from: "2021-05-24T00:00:00Z",
+        valid_till: "2061-05-24T00:00:00Z",
+        thumbprint: "",
+        key: CertificateKey::Rsa(2048),
+    },
+    CaCertificate {
+        identifier: "rds-ca-2019",
+        valid_from: "2019-08-22T00:00:00Z",
+        valid_till: "2024-08-22T00:00:00Z",
+        thumbprint: "",
+        key: CertificateKey::Rsa(2048),
+    },
+];
+
+impl CaCertificate {
+    /// This catalogue entry as the modelled `Certificate`, with its ARN scoped to the
+    /// region the request was signed for.
+    pub fn to_shape(&self, region: &str) -> Certificate {
+        Certificate {
+            certificate_identifier: Some(self.identifier.to_string()),
+            certificate_type: Some(CA_CERTIFICATE_TYPE.to_string()),
+            // A fingerprint the catalogue does not carry is reported as an ABSENT member,
+            // never as an empty string: a client pinning a thumbprint has to be able to
+            // tell "not published" from a digest.
+            thumbprint: (!self.thumbprint.is_empty()).then(|| self.thumbprint.to_string()),
+            valid_from: Some(catalog_timestamp(self.valid_from)),
+            valid_till: Some(catalog_timestamp(self.valid_till)),
+            certificate_arn: Some(ca_certificate_arn(region, self.identifier)),
+        }
+    }
+
+    /// Whether this authority is still valid at `instant`, which is what decides whether a
+    /// cluster can still be launched under it.
+    pub fn is_valid_at(&self, instant: &::aws_smithy_types::DateTime) -> bool {
+        catalog_timestamp(self.valid_till).secs() > instant.secs()
+    }
+
+    /// The order an engine version publishes its supported authorities in: every
+    /// elliptic-curve authority before every RSA one, and within a kind the longest key
+    /// first, which is the order [`CA_CERTIFICATES`] itself is held in.
+    pub fn publication_rank(&self) -> (u8, std::cmp::Reverse<u32>) {
+        match self.key {
+            CertificateKey::EllipticCurve(bits) => (0, std::cmp::Reverse(bits)),
+            CertificateKey::Rsa(bits) => (1, std::cmp::Reverse(bits)),
+        }
+    }
+}
+
+/// The published authority `identifier` names, or `None` when none carries it.
+///
+/// `DescribeCertificatesMessage$CertificateIdentifier`: "This parameter is not case
+/// sensitive", so the match ignores case.
+pub fn ca_certificate(identifier: &str) -> Option<&'static CaCertificate> {
+    CA_CERTIFICATES
+        .iter()
+        .find(|certificate| certificate.identifier.eq_ignore_ascii_case(identifier))
+}
+
+/// The ARN of a published CA certificate, in the form `Certificate$CertificateArn`
+/// documents: "Example: `arn:aws:rds:us-east-1::cert:rds-ca-2019`".
+///
+/// The ACCOUNT field is empty, unlike every other ARN this service builds: a certificate
+/// authority is published BY the service rather than created by an account, so there is no
+/// owning account to name. It is still region-scoped, because the authority a cluster is
+/// launched under is reported per Region.
+pub fn ca_certificate_arn(region: &str, identifier: &str) -> String {
+    format!("arn:aws:{ARN_NAMESPACE}:{region}::cert:{identifier}")
+}
+
+/// One of the catalogues' fixed ISO-8601 instants as the modelled timestamp type.
+///
+/// The input is a literal in a catalogue above, never caller data, so a value that is not
+/// an instant is a typo in that catalogue: it panics at the first read rather than
+/// silently dropping a timestamp member from a response.
+pub fn catalog_timestamp(iso: &str) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from_str(iso, ::aws_smithy_types::date_time::Format::DateTime)
+        .expect("every catalogue instant in this service is an ISO-8601 literal")
+}
+
+/// `DBEngineVersion$SupportedCACertificateIdentifiers` — "A list of the supported CA
+/// certificate identifiers."
+///
+/// Read from the ONE certificate catalogue this service reports through
+/// `DescribeCertificates` ([`CA_CERTIFICATES`]), so the two reports cannot name different
+/// authorities, narrowed twice: an authority whose `ValidTill` has passed is not one a
+/// cluster can be launched under, and a DocumentDB cluster endpoint serves an RSA server
+/// certificate, so the elliptic-curve authority this door also publishes is not offered to
+/// this engine. The order is the one an engine version publishes its authorities in
+/// ([`CaCertificate::publication_rank`]).
+pub fn supported_ca_certificate_identifiers() -> Vec<String> {
+    let now = now();
+    let mut offered: Vec<&CaCertificate> = CA_CERTIFICATES
+        .iter()
+        .filter(|certificate| {
+            certificate.is_valid_at(&now) && matches!(certificate.key, CertificateKey::Rsa(_))
+        })
+        .collect();
+    offered.sort_by_key(|certificate| certificate.publication_rank());
+    offered
+        .into_iter()
+        .map(|certificate| certificate.identifier.to_string())
+        .collect()
+}
+
+/// `DBEngineVersion$DBEngineDescription` — "The description of the database engine", which
+/// is the product's own full name.
+pub const DOCDB_ENGINE_DESCRIPTION: &str = "Amazon DocumentDB (with MongoDB compatibility)";
+
+/// How a version description names the product: `DBEngineVersionDescription` states the
+/// product and the version it describes (`Amazon DocumentDB 5.0.0`).
+pub const DOCDB_PRODUCT: &str = "Amazon DocumentDB";
+
+/// The CloudWatch log types a cluster can export, each with the cluster parameter that
+/// enables it.
+///
+/// `CreateDBClusterMessage$EnableCloudwatchLogsExports`: "A list of log types that need to
+/// be enabled for exporting to Amazon CloudWatch Logs. You can enable audit logs or
+/// profiler logs" — the audit log is what the `audit_logs` parameter turns on and the
+/// profiler log what the `profiler` parameter does ([`DOCDB_CLUSTER_PARAMETERS`]), so a
+/// version exports a log type exactly when the parameter that enables it applies at that
+/// version. One table rather than a per-version list, so a log type cannot be reported
+/// exportable by a version whose parameter catalogue cannot switch it on.
+pub const EXPORTABLE_LOG_TYPES: [(&str, &str); 2] = [("audit", "audit_logs"), ("profiler", "profiler")];
+
+/// `DBEngineVersion$ExportableLogTypes` for `version`: the log types of
+/// [`EXPORTABLE_LOG_TYPES`] whose enabling parameter the version's family publishes and
+/// whose own earliest engine version the version is not older than.
+pub fn exportable_log_types(version: &str) -> Vec<String> {
+    let family = parameter_group_family(version);
+    EXPORTABLE_LOG_TYPES
+        .iter()
+        .filter(|(_, parameter)| {
+            published_parameter(&family, parameter).is_some_and(|spec| {
+                !engine_version_precedes(version, spec.minimum_engine_version)
+            })
+        })
+        .map(|(log_type, _)| (*log_type).to_string())
+        .collect()
+}
+
+/// The versions `version` can be upgraded to: the LATER versions this engine publishes,
+/// which is what `DBEngineVersion$ValidUpgradeTarget` reports ("A list of engine versions
+/// that this database engine version can be upgraded to").
+///
+/// Every published DocumentDB version opens a new major line ([`DOCDB_ENGINE_VERSIONS`]),
+/// so every target is a MAJOR version upgrade — which is also why none of them is taken
+/// automatically: `UpgradeTarget$AutoUpgrade` is whether the target is applied to a
+/// resource with `AutoMinorVersionUpgrade` set, and a major upgrade never is.
+pub fn valid_upgrade_targets(version: &str) -> Vec<UpgradeTarget> {
+    DOCDB_ENGINE_VERSIONS
+        .iter()
+        .filter(|published| engine_version_precedes(version, published))
+        .map(|published| {
+            let major_upgrade = engine_major_version(published) != engine_major_version(version);
+            UpgradeTarget {
+                engine: Some(DOCDB_ENGINE.to_string()),
+                engine_version: Some((*published).to_string()),
+                description: Some(engine_version_description(published)),
+                auto_upgrade: Some(false),
+                is_major_version_upgrade: Some(major_upgrade),
+            }
+        })
+        .collect()
+}
+
+/// `DBEngineVersion$DBEngineVersionDescription` for `version`.
+pub fn engine_version_description(version: &str) -> String {
+    format!("{DOCDB_PRODUCT} {version}")
+}
+
+/// One published engine version as the modelled `DBEngineVersion`.
+///
+/// Every member is DERIVED: the parameter-group family from the version
+/// ([`parameter_group_family`]), the exportable log types from the parameter catalogue
+/// ([`exportable_log_types`]), the supported authorities from the certificate catalogue
+/// ([`supported_ca_certificate_identifiers`]) and the upgrade targets from the published
+/// version list ([`valid_upgrade_targets`]).
+///
+/// `ServerlessV2FeaturesSupport` reports "any Amazon DocumentDB Serverless properties or
+/// limits that differ between Amazon DocumentDB engine versions"; this emulator publishes
+/// no serverless capacity limits, so the member is left absent rather than invented.
+pub fn engine_version_to_shape(version: &str) -> DBEngineVersion {
+    let exportable = exportable_log_types(version);
+    DBEngineVersion {
+        engine: Some(DOCDB_ENGINE.to_string()),
+        engine_version: Some(version.to_string()),
+        db_parameter_group_family: Some(parameter_group_family(version)),
+        db_engine_description: Some(DOCDB_ENGINE_DESCRIPTION.to_string()),
+        db_engine_version_description: Some(engine_version_description(version)),
+        valid_upgrade_target: Some(valid_upgrade_targets(version)),
+        supports_log_exports_to_cloudwatch_logs: Some(!exportable.is_empty()),
+        exportable_log_types: Some(exportable),
+        supported_ca_certificate_identifiers: Some(supported_ca_certificate_identifiers()),
+        // "Indicates whether the engine version supports rotating the server certificate
+        // without rebooting the DB instance": Amazon DocumentDB rotates a cluster's server
+        // certificate without a restart of its instances for every version it publishes
+        // ("Updating your Amazon DocumentDB TLS certificates").
+        supports_certificate_rotation_without_restart: Some(true),
+        serverless_v2_features_support: None,
+    }
+}
+
+/// The event source types this service publishes, each with the event categories of that
+/// source type, in the order this front door NAMES them when it refuses a source type that
+/// is none of them (`'db-instance', 'db-security-group', 'db-parameter-group',
+/// 'db-snapshot', 'db-cluster', 'db-cluster-snapshot'`) — the one order the service itself
+/// publishes for these names, and the one
+/// [`invalid_event_source_type_message`] states, so the refusal and the report cannot name
+/// them in two orders. Every name is a value the model's `SourceType` declares
+/// (`smithy_query(query="shape",shape="SourceType")`).
+///
+/// The categories of each are the ones published for this front door's event source types
+/// ("Amazon RDS event categories and event messages", whose tables cover the cluster,
+/// instance, parameter-group, security-group and snapshot source types this one endpoint
+/// serves), in the order that table lists them, which is alphabetical: the wire order of
+/// `EventCategories` is documented neither in the model nor in the API reference, so the
+/// ONE order this catalogue can state a source for is the published table's.
+///
+/// `db-cluster` carries the two categories only a CLUSTER has — it is migrated onto the
+/// service (`migration`) and it runs serverless capacity (`serverless`) — beside the
+/// categories a cluster shares with the other source types: both are rows of the published
+/// cluster event table, and a client builds a `CreateEventSubscription` `EventCategories`
+/// argument out of this map, so a category the service accepts has to be in it.
+pub const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
+    (
+        "db-instance",
+        &[
+            "availability",
+            "backup",
+            "configuration change",
+            "creation",
+            "deletion",
+            "failover",
+            "failure",
+            "low storage",
+            "maintenance",
+            "notification",
+            "read replica",
+            "recovery",
+            "restoration",
+            "security patching",
+        ],
+    ),
+    ("db-security-group", &["configuration change", "failure"]),
+    ("db-parameter-group", &["configuration change"]),
+    (
+        "db-snapshot",
+        &["creation", "deletion", "notification", "restoration"],
+    ),
+    (
+        "db-cluster",
+        &[
+            "configuration change",
+            "creation",
+            "deletion",
+            "failover",
+            "failure",
+            "global-failover",
+            "maintenance",
+            "migration",
+            "notification",
+            "serverless",
+        ],
+    ),
+    ("db-cluster-snapshot", &["backup", "notification"]),
+];
+
+/// The event categories of `source_type`, or `None` when it names no published source
+/// type. Matching is exact: the documented source types are all lowercase.
+pub fn event_categories_of(source_type: &str) -> Option<&'static [&'static str]> {
+    EVENT_CATEGORIES
+        .iter()
+        .find(|(published, _)| *published == source_type)
+        .map(|(_, categories)| *categories)
+}
+
+/// One source type's categories as the modelled `EventCategoriesMap`.
+pub fn event_categories_to_shape(source_type: &str, categories: &[&str]) -> EventCategoriesMap {
+    EventCategoriesMap {
+        source_type: Some(source_type.to_string()),
+        event_categories: Some(
+            categories
+                .iter()
+                .map(|category| (*category).to_string())
+                .collect(),
+        ),
+    }
+}
+
+/// The message the refusal of a `SourceType` that names no published event source type
+/// carries.
+///
+/// The sentence is a statement about the PARAMETER rather than about the value: it says
+/// the source type is not valid and that the feature may be disabled, then names the
+/// types that ARE valid — it echoes no part of the offending value, so neither does this.
+/// Each type is named in single quotes, the way the service writes a list of literal
+/// values inside a sentence, and in the order [`EVENT_CATEGORIES`] publishes them, so the
+/// refusal and the report cannot name different source types.
+pub fn invalid_event_source_type_message() -> String {
+    let quoted: Vec<String> = EVENT_CATEGORIES
+        .iter()
+        .map(|(source_type, _)| format!("'{source_type}'"))
+        .collect();
+    format!(
+        "Invalid event source type. Feature may be disabled. Valid types are {}",
+        quoted.join(", ")
+    )
+}
+
+/// The sizes the memory-optimised `r5` family is published in, smallest first.
+const R5_SIZES: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge",
+];
+
+/// The sizes the Graviton memory-optimised families (`r6g`, `r7g`) are published in.
+const GRAVITON_SIZES: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge",
+];
+
+/// The one size a burstable family is published in for this engine: a cluster member is
+/// offered on `db.t3.medium` and `db.t4g.medium` and on no smaller burstable size.
+const BURSTABLE_SIZES: &[&str] = &["medium"];
+
+/// The instance families a cluster member can be ordered in, and the sizes each is
+/// published in.
+///
+/// Source: the "Amazon DocumentDB instance classes" section of the Amazon DocumentDB
+/// Developer Guide — the two burstable classes and the memory-optimised families, read as
+/// the family-by-size matrix a `DBInstanceClass` (`db.<family>.<size>`,
+/// `CreateDBInstanceMessage$DBInstanceClass`: "for example, `db.r5.large`") is named from,
+/// so the classes this service offers are each family crossed with its own sizes rather
+/// than a hand-listed set of names.
+pub const DOCDB_INSTANCE_FAMILIES: &[(&str, &[&str])] = &[
+    ("t3", BURSTABLE_SIZES),
+    ("t4g", BURSTABLE_SIZES),
+    ("r5", R5_SIZES),
+    ("r6g", GRAVITON_SIZES),
+    ("r7g", GRAVITON_SIZES),
+];
+
+/// Every `DBInstanceClass` this service offers, in the order
+/// [`DOCDB_INSTANCE_FAMILIES`] publishes them.
+pub fn instance_classes() -> Vec<String> {
+    DOCDB_INSTANCE_FAMILIES
+        .iter()
+        .flat_map(|(family, sizes)| {
+            sizes
+                .iter()
+                .map(move |size| format!("db.{family}.{size}"))
+        })
+        .collect()
+}
+
+/// `OrderableDBInstanceOption$LicenseModel` for this engine.
+///
+/// The licence setting does not apply to Amazon DocumentDB — the model declares no
+/// `LicenseModel` on `CreateDBInstance` at all — and an option of an engine AWS licenses
+/// itself carries `na`.
+pub const DOCDB_LICENSE_MODEL: &str = "na";
+
+/// One (engine version, instance class) pair as the modelled `OrderableDBInstanceOption`.
+///
+/// The zones are the ones of the request's Region this service places a resource in
+/// ([`default_availability_zones`]), so a caller that picks a zone out of an option can
+/// create a cluster in it; `Vpc` is true because every endpoint this emulator serves is
+/// reached inside a VPC; and the storage type is the one a cluster member reports
+/// ([`DEFAULT_STORAGE_TYPE`]), since a DocumentDB cluster — not its instance — owns the
+/// storage.
+pub fn orderable_option_to_shape(
+    version: &str,
+    instance_class: &str,
+    region: &str,
+) -> OrderableDBInstanceOption {
+    OrderableDBInstanceOption {
+        engine: Some(DOCDB_ENGINE.to_string()),
+        engine_version: Some(version.to_string()),
+        db_instance_class: Some(instance_class.to_string()),
+        license_model: Some(DOCDB_LICENSE_MODEL.to_string()),
+        availability_zones: Some(
+            default_availability_zones(region)
+                .into_iter()
+                .map(|zone| AvailabilityZone { name: Some(zone) })
+                .collect(),
+        ),
+        vpc: Some(true),
+        storage_type: Some(DEFAULT_STORAGE_TYPE.to_string()),
     }
 }

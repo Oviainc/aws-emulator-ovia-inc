@@ -67,6 +67,9 @@ struct Call {
     /// Elements the answer must carry, for a row that pins WHAT the owning service
     /// reported rather than only its status.
     expected_body_contains: &'static [&'static str],
+    /// Elements the answer must NOT carry, for a row whose discriminator is what the
+    /// owning service leaves OUT: a peer serving the same action would report them.
+    expected_body_excludes: &'static [&'static str],
 }
 
 #[test]
@@ -92,8 +95,11 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
             // created through the `rds` key is reported there and nowhere else — the same
             // Action under three keys reports three different things, which only happens if
             // each request reached exactly one, correct service.
-            // `DescribeDBEngineVersions` is another kind of discriminator: RDS implements it
-            // and DocumentDB does not (501). `DescribeOptionGroups` is a third: ONLY the RDS
+            // `DescribeDBEngineVersions` is another kind of discriminator: each model
+            // publishes its OWN engine catalogue, so the shared `rds` key reports every
+            // engine that front door serves while DocumentDB's key reports the one engine
+            // its model declares and none of the others. `DescribeOptionGroups` is a third:
+            // ONLY the RDS
             // model declares that action, so the shared name answers it (its modelled
             // `OptionGroupNotFoundFault` for a group nothing holds) while each peer's own key
             // answers its own `InvalidAction`.
@@ -114,6 +120,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(200),
                     expected_code: None,
                     expected_body_contains: &[],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     case: "rds DescribeDBInstances",
@@ -123,6 +130,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(200),
                     expected_code: None,
                     expected_body_contains: &[],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     // Amazon RDS owns the shared name, so its OWN handler serves this —
@@ -141,6 +149,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                         "<DBClusterIdentifier>router-cluster-rds</DBClusterIdentifier>",
                         "<Engine>aurora-postgresql</Engine>",
                     ],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     case: "rds DescribeDBClusters reads the created cluster back",
@@ -152,6 +161,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_body_contains: &[
                         "<DBClusterIdentifier>router-cluster-rds</DBClusterIdentifier>",
                     ],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     // DocumentDB reads its own cluster store, which that create did not
@@ -164,6 +174,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(200),
                     expected_code: None,
                     expected_body_contains: &["<DBClusters></DBClusters>"],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     case: "neptune DescribeDBClusters reports its own empty store",
@@ -173,17 +184,29 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(200),
                     expected_code: None,
                     expected_body_contains: &["<DBClusters></DBClusters>"],
+                    expected_body_excludes: &[],
                 },
                 Call {
-                    // DocumentDB's own scaffold, which proves this request did NOT land
-                    // on Amazon RDS (where the operation is implemented).
+                    // DocumentDB's OWN engine-version catalogue: it publishes the one
+                    // engine its model declares, so the answer naming `docdb` and no other
+                    // engine is what proves this request did not land on Amazon RDS, whose
+                    // answer to the very same action (the first row) carries the other
+                    // engines of the shared front door as well.
                     case: "docdb DescribeDBEngineVersions",
                     addressed: Addressed::Signed("docdb"),
                     action: "DescribeDBEngineVersions",
                     params: &[],
-                    expected_status: Some(501),
-                    expected_code: Some("NotImplemented"),
-                    expected_body_contains: &[],
+                    expected_status: Some(200),
+                    expected_code: None,
+                    expected_body_contains: &[
+                        "<Engine>docdb</Engine>",
+                        "<DBParameterGroupFamily>docdb5.0</DBParameterGroupFamily>",
+                    ],
+                    expected_body_excludes: &[
+                        "<Engine>mysql</Engine>",
+                        "<Engine>postgres</Engine>",
+                        "<Engine>neptune</Engine>",
+                    ],
                 },
                 Call {
                     // An anonymous request addressed at the RDS endpoint host: the
@@ -196,6 +219,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(200),
                     expected_code: None,
                     expected_body_contains: &[],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     // The wire step the DescribeOptionGroups issue was filed on: a
@@ -208,6 +232,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(404),
                     expected_code: Some("OptionGroupNotFoundFault"),
                     expected_body_contains: &["<ErrorResponse", "no-such-option-group"],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     // DocumentDB's model declares no `DescribeOptionGroups`, so its own
@@ -220,6 +245,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(400),
                     expected_code: Some("InvalidAction"),
                     expected_body_contains: &[],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     case: "neptune does not declare DescribeOptionGroups",
@@ -229,6 +255,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(400),
                     expected_code: Some("InvalidAction"),
                     expected_body_contains: &[],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     // The round trip through the shared front door, in two ordered rows
@@ -245,6 +272,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(200),
                     expected_code: None,
                     expected_body_contains: &["<OptionGroupName>router-optiongroup</OptionGroupName>"],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     // …and the read back, which reports the members the create persisted.
@@ -259,6 +287,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                         "<EngineName>mysql</EngineName>",
                         "<MajorEngineVersion>8.0</MajorEngineVersion>",
                     ],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     case: "rds DescribeDBInstances for a missing instance",
@@ -268,6 +297,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(404),
                     expected_code: Some("DBInstanceNotFound"),
                     expected_body_contains: &["<ErrorResponse", "<RequestId>"],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     case: "rds DeleteDBInstance for a missing instance",
@@ -280,6 +310,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(404),
                     expected_code: Some("DBInstanceNotFound"),
                     expected_body_contains: &["<ErrorResponse", "<RequestId>"],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     case: "rds RebootDBInstance for a missing instance",
@@ -289,6 +320,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(404),
                     expected_code: Some("DBInstanceNotFound"),
                     expected_body_contains: &["<ErrorResponse", "<RequestId>"],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     // The failure is attributed to the CLUSTER, not to the instance being
@@ -305,6 +337,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(404),
                     expected_code: Some("DBClusterNotFoundFault"),
                     expected_body_contains: &["<ErrorResponse", "<RequestId>"],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     case: "rds ApplyPendingMaintenanceAction on a missing resource ARN",
@@ -321,6 +354,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(404),
                     expected_code: Some("ResourceNotFoundFault"),
                     expected_body_contains: &["<ErrorResponse", "<RequestId>"],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     case: "rds DescribeGlobalClusters for a missing global cluster",
@@ -330,6 +364,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(404),
                     expected_code: Some("GlobalClusterNotFoundFault"),
                     expected_body_contains: &["<ErrorResponse", "<RequestId>"],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     case: "rds DescribeEventSubscriptions for a missing subscription",
@@ -339,6 +374,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(404),
                     expected_code: Some("SubscriptionNotFound"),
                     expected_body_contains: &["<ErrorResponse", "<RequestId>"],
+                    expected_body_excludes: &[],
                 },
                 Call {
                     // The same operation answers 200 for an unfiltered call (the rows
@@ -350,6 +386,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_status: Some(404),
                     expected_code: Some("CertificateNotFound"),
                     expected_body_contains: &["<ErrorResponse", "<RequestId>"],
+                    expected_body_excludes: &[],
                 },
             ];
 
@@ -422,6 +459,13 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                         rendered.contains(expected),
                         "case {case:?}: expected {expected:?} in the owning service's \
                          answer, got {status} with {rendered}"
+                    );
+                }
+                for unexpected in call.expected_body_excludes {
+                    assert!(
+                        !rendered.contains(unexpected),
+                        "case {case:?}: {unexpected:?} belongs to another service's answer \
+                         and must not be in this one, got {status} with {rendered}"
                     );
                 }
             }

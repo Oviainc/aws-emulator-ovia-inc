@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeOrderableDBInstanceOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeOrderableDBInstanceOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeOrderableDBInstanceOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Serves this service's published option catalogue: every engine version
+//! `DescribeDBEngineVersions` publishes, crossed with every instance class a cluster
+//! member can be ordered in (`crate::state::DOCDB_INSTANCE_FAMILIES`), projected by
+//! `crate::state::orderable_option_to_shape`. Reference data: nothing here is written.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +146,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeOrderableDBInstanceOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeOrderableDBInstanceOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeOrderableDBInstanceOptions"))
+        use crate::state as docdb;
+
+        // The options are reference data, so this operation holds no records of its own and
+        // writes nothing; the engine is bound so the generated signature stays as it is.
+        // The REGION does come from the request: an option's Availability Zones are the
+        // zones of the region the request is signed for.
+        let _ = &self.engine;
+        let region = docdb::request_region(ctx);
+        let page_size =
+            docdb::page_size(input.max_records).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // `Filters`: "This parameter is not currently supported", so a request carrying one
+        // is refused rather than served as though the filter had been applied.
+        if input.filters.iter().flatten().next().is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Filters is not currently supported by DescribeOrderableDBInstanceOptions",
+            ));
+        }
+
+        // `Engine` is required and names "the engine to retrieve instance options for": it
+        // RESOLVES which catalogue is reported rather than filtering one, so a value that
+        // names no engine this model publishes is refused instead of answered with an empty
+        // catalogue — the same rule every other `Engine` member of this model is read by
+        // (`crate::state::validate_engine`).
+        docdb::validate_engine(&input.engine).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // "The virtual private cloud (VPC) filter value. Specify this parameter to show
+        // only the available VPC or non-VPC offerings." Every endpoint this service serves
+        // is reached inside a VPC, so a request for non-VPC offerings selects none of them.
+        if input.vpc == Some(false) {
+            return Ok(DescribeOrderableDBInstanceOptionsOutput {
+                orderable_db_instance_options: Some(Vec::new()),
+                marker: None,
+            });
+        }
+
+        // An option is offered for an engine version this service REPORTS, read from the
+        // one published version list, so this report and `DescribeDBEngineVersions` cannot
+        // disagree about which versions exist. `EngineVersion`, `DBInstanceClass` and
+        // `LicenseModel` are each a filter value ("specify this parameter to show only the
+        // available offerings that match ..."), so a value matching nothing selects no
+        // option rather than refusing the call.
+        let classes = docdb::instance_classes();
+        let mut options: Vec<OrderableDBInstanceOption> = Vec::new();
+        for version in docdb::DOCDB_ENGINE_VERSIONS {
+            if input
+                .engine_version
+                .as_ref()
+                .is_some_and(|wanted| !version.eq_ignore_ascii_case(wanted))
+            {
+                continue;
+            }
+            if input
+                .license_model
+                .as_ref()
+                .is_some_and(|wanted| !docdb::DOCDB_LICENSE_MODEL.eq_ignore_ascii_case(wanted))
+            {
+                continue;
+            }
+            for class in &classes {
+                if input
+                    .db_instance_class
+                    .as_ref()
+                    .is_some_and(|wanted| !class.eq_ignore_ascii_case(wanted))
+                {
+                    continue;
+                }
+                options.push(docdb::orderable_option_to_shape(version, class, &region));
+            }
+        }
+
+        let (orderable_db_instance_options, marker) =
+            docdb::paginate_catalog(&options, input.marker.as_deref(), page_size);
+        Ok(DescribeOrderableDBInstanceOptionsOutput {
+            orderable_db_instance_options: Some(orderable_db_instance_options),
+            marker,
+        })
     }
 }

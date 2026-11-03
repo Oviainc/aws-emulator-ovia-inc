@@ -21,5 +21,7 @@ mod cluster_parameter_groups;
 mod cluster_snapshot_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/static_reference_catalogs.rs"]
+mod static_reference_catalogs;
 #[path = "all/subnet_and_parameter_groups.rs"]
 mod subnet_and_parameter_groups;

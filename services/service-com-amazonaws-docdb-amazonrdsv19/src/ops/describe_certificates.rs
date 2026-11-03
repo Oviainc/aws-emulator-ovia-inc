@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCertificates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCertificates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCertificates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Serves this service's published certificate-authority catalogue
+//! (`crate::state::CA_CERTIFICATES`): the authorities a cluster's TLS endpoint can be
+//! launched under, which are reference data — the same for every caller, and no request
+//! changes them — so this operation reads the catalogue and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +149,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCertificates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCertificatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCertificates"))
+        use crate::state as docdb;
+
+        // The published authorities are reference data, so this operation holds no records
+        // of its own and writes nothing; the engine is bound so the generated signature
+        // stays as it is. The REGION does come from the request: a certificate's ARN is
+        // region-scoped (`Certificate$CertificateArn`).
+        let _ = &self.engine;
+        let region = docdb::request_region(ctx);
+        let page_size =
+            docdb::page_size(input.max_records).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // `Filters`: "This parameter is not currently supported", so a request carrying one
+        // is refused rather than served as though the filter had been applied — serving the
+        // unfiltered catalogue would report certificates the caller asked to exclude.
+        if input.filters.iter().flatten().next().is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Filters is not currently supported by DescribeCertificates",
+            ));
+        }
+
+        // "If this parameter is specified, information for only the specified certificate
+        // is returned ... Must match an existing CertificateIdentifier", so an identifier
+        // matching no published authority is the modelled 404 rather than an empty page.
+        let selected: Vec<Certificate> = match &input.certificate_identifier {
+            Some(requested) => {
+                let Some(certificate) = docdb::ca_certificate(requested) else {
+                    return Err(
+                        DescribeCertificatesErrorModeled::CertificateNotFoundFault(
+                            CertificateNotFoundFault {
+                                message: Some(format!("Certificate {requested} not found")),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                vec![certificate.to_shape(&region)]
+            }
+            None => docdb::CA_CERTIFICATES
+                .iter()
+                .map(|certificate| certificate.to_shape(&region))
+                .collect(),
+        };
+
+        let (certificates, marker) =
+            docdb::paginate_catalog(&selected, input.marker.as_deref(), page_size);
+        Ok(DescribeCertificatesOutput {
+            certificates: Some(certificates),
+            marker,
+        })
     }
 }

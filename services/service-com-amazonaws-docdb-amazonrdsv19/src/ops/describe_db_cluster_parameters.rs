@@ -230,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter_map(|name| {
                 if as_engine_defaults {
                     return docdb::published_parameter(&family, name)
-                        .map(docdb::engine_default_parameter_to_shape);
+                        .map(|spec| docdb::engine_default_parameter_to_shape(&family, spec));
                 }
                 stored.map(|group| group.parameter_to_shape(name))
             })

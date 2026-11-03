@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBEngineVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBEngineVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBEngineVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Serves this service's published engine-version catalogue: one record per engine version
+//! Amazon DocumentDB publishes (`crate::state::DOCDB_ENGINE_VERSIONS`), projected by
+//! `crate::state::engine_version_to_shape`, which derives every member of it — the
+//! parameter-group family, the exportable log types, the supported certificate authorities
+//! and the upgrade targets — from the catalogues the other reports read, so no two reports
+//! can disagree. Reference data: nothing here is written.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +151,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBEngineVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBEngineVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as docdb;
+
+        // The engine catalogue is reference data, so this operation holds no records of its
+        // own and writes nothing, and nothing in a `DBEngineVersion` is region-scoped: the
+        // engine and the request context are bound so the generated signature stays as it
+        // is.
+        let _ = (ctx, &self.engine);
+        let page_size =
+            docdb::page_size(input.max_records).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // `Filters`: "This parameter is not currently supported", so a request carrying one
+        // is refused rather than served as though the filter had been applied.
+        if input.filters.iter().flatten().next().is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Filters is not currently supported by DescribeDBEngineVersions",
+            ));
+        }
+
+        // Each of `Engine`, `EngineVersion` and `DBParameterGroupFamily` is a FILTER over
+        // the published catalogue rather than a constraint on the request, so a value that
+        // names nothing this model publishes selects no version instead of refusing the
+        // call: this one endpoint serves three control planes, and a request for another
+        // engine's versions is not a malformed request.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBEngineVersions"))
+        // `ListSupportedCharacterSets` and `ListSupportedTimezones` ask for a list of
+        // character sets or time zones "for each engine version" — members this model's
+        // `DBEngineVersion` does not declare at all
+        // (`smithy_query(query="shape",shape="DBEngineVersion")`), and a document database
+        // takes neither a `CharacterSetName` nor a `TimeZone` on a create, so neither flag
+        // adds anything to report.
+        let selected: Vec<&'static str> = docdb::DOCDB_ENGINE_VERSIONS
+            .iter()
+            .copied()
+            .filter(|version| {
+                input
+                    .engine
+                    .as_ref()
+                    .is_none_or(|wanted| wanted.eq_ignore_ascii_case(docdb::DOCDB_ENGINE))
+                    && input
+                        .engine_version
+                        .as_ref()
+                        .is_none_or(|wanted| names_version(version, wanted))
+                    && input.db_parameter_group_family.as_ref().is_none_or(|wanted| {
+                        docdb::parameter_group_family(version).eq_ignore_ascii_case(wanted)
+                    })
+            })
+            .collect();
+
+        // "Indicates that only the default version of the specified engine or engine and
+        // major version combination is returned." The default is the latest version of
+        // what the filters selected, which is the rule
+        // `CreateDBClusterMessage$EngineVersion` states for a create that names none ("the
+        // --engine-version will default to the latest major engine version"), and the
+        // catalogue is held oldest first.
+        let selected = match input.default_only {
+            Some(true) => selected.last().copied().into_iter().collect(),
+            _ => selected,
+        };
+
+        let versions: Vec<DBEngineVersion> = selected
+            .iter()
+            .map(|version| docdb::engine_version_to_shape(version))
+            .collect();
+        let (db_engine_versions, marker) =
+            docdb::paginate_catalog(&versions, input.marker.as_deref(), page_size);
+        Ok(DescribeDBEngineVersionsOutput {
+            db_engine_versions: Some(db_engine_versions),
+            marker,
+        })
     }
+}
+
+/// Whether a published `version` is the one a request's `EngineVersion` names.
+///
+/// The member is "the database engine version to return. Example: 3.6.0", and a caller may
+/// name it as precisely as it likes: an exact published version, or a leading component of
+/// one at a dot boundary (`5.0`, `5`), which is how it asks for a major line. Matching is
+/// case-insensitive, as every version member of this model is; it is the same reading
+/// `crate::state::resolve_engine_version` gives a create's `EngineVersion`, which keeps
+/// the versions a describe reports and the ones a create accepts the same set.
+fn names_version(version: &str, wanted: &str) -> bool {
+    version.eq_ignore_ascii_case(wanted)
+        || version
+            .to_ascii_lowercase()
+            .strip_prefix(&wanted.to_ascii_lowercase())
+            .is_some_and(|rest| rest.starts_with('.'))
 }

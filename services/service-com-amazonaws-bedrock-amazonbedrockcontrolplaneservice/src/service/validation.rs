@@ -648,8 +648,6 @@ impl Clause {
         } else if self.values.is_empty() {
             "Value null".to_string()
         } else if !self.quotes_value {
-            // A member the service read anywhere but the request URI: the position and the
-            // requirement are the whole sentence, whatever the request held.
             "Value".to_string()
         } else if self.depth == 0 {
             format!(

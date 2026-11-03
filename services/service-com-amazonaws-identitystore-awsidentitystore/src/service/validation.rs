@@ -285,8 +285,10 @@ fn value_fragment(path: &str, value: Option<&str>, withheld: bool) -> String {
         // A sensitive member's value reaches here as `None`, so the two are told apart by
         // the flag rather than by the absence: only an absent member states `null`.
         None if withheld => "Value".to_string(),
+        // A violation this service built itself carries the value it was about, and a
+        // `@sensitive` member's is still never stated: the path is read for the trait.
+        _ if is_sensitive(path) => "Value".to_string(),
         None => "Value null".to_string(),
-        Some(_) if is_sensitive(path) => "Value".to_string(),
         Some(shown) => format!("Value '{shown}'"),
     }
 }

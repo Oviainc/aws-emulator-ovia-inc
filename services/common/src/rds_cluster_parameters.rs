@@ -203,7 +203,7 @@ pub const DOCDB_PARAMETER_GROUP_FAMILIES: [&str; 3] = ["docdb3.6", "docdb4.0", "
 ///
 /// `description` is the text the API itself reports for the parameter, as the guide's
 /// `describe-db-cluster-parameters` / `describe-engine-default-cluster-parameters` output
-/// prints it ("Enables auditing on cluster.", "Config to enable/disable TLS", …) — a
+/// prints it ("Enables auditing on cluster.", "TLS Settings", …) — a
 /// paraphrase would report a `Parameter$Description` the service never reports.
 ///
 /// The catalog is not narrowed per family or Region: the model documents the value set
@@ -266,11 +266,17 @@ pub const DOCDB_CLUSTER_PARAMETERS: &[ClusterParameterSpec] = &[
         name: "tls",
         apply_type: APPLY_TYPE_STATIC,
         data_type: "string",
-        allowed_values: "enabled,disabled,fips-140-3,tls1.2+,tls1.3+",
+        // The enumeration as the API REPORTS it, which is the order the guide's
+        // `describe-db-cluster-parameters` output prints for this parameter — `disabled`
+        // before `enabled` — and not the order the model's prose happens to introduce the
+        // values in. The reported string is also the one a refusal of a value outside it
+        // quotes ([`validate_known_setting`]), so the report and the refusal cannot
+        // disagree about either the set or its order.
+        allowed_values: "disabled,enabled,fips-140-3,tls1.2+,tls1.3+",
         default_value: "enabled",
         is_modifiable: true,
         minimum_engine_version: "3.6.0",
-        description: "Config to enable/disable TLS",
+        description: "TLS Settings",
     },
     ClusterParameterSpec {
         name: "ttl_monitor",
@@ -283,6 +289,58 @@ pub const DOCDB_CLUSTER_PARAMETERS: &[ClusterParameterSpec] = &[
         description: "Enables TTL Monitoring",
     },
 ];
+
+/// The earliest engine version `family` publishes, or `None` for a family this catalog
+/// does not cover.
+///
+/// A DocumentDB cluster parameter group family is named after the engine's MAJOR version
+/// (`docdb5.0` for the 5.0 engine), so the earliest engine version in it is that major
+/// line's first release — `<major>.0` — which is also the version
+/// [`DOCDB_PARAMETER_GROUP_FAMILIES`] is derived from.
+pub fn family_earliest_engine_version(family: &str) -> Option<String> {
+    let lowered = family.to_ascii_lowercase();
+    if !DOCDB_PARAMETER_GROUP_FAMILIES.contains(&lowered.as_str()) {
+        return None;
+    }
+    lowered
+        .strip_prefix(DOCDB_PARAMETER_GROUP_FAMILY_PREFIX)
+        .map(|major_line| format!("{major_line}.0"))
+}
+
+/// `Parameter$MinimumEngineVersion` — "the earliest engine version to which the parameter
+/// can apply" — for `spec` as a group of `family` reports it.
+///
+/// The member is answered about the GROUP's family, not about the engine as a whole: a
+/// group is scoped to one family ([`family_earliest_engine_version`]), so the earliest
+/// version the parameter can apply at inside that group is the later of the version the
+/// parameter first appeared in and the family's own first release. A family this catalog
+/// does not cover has no first release to compare against, so the parameter's own version
+/// is reported unchanged.
+pub fn minimum_engine_version_in_family(family: &str, spec: &ClusterParameterSpec) -> String {
+    let introduced = spec.minimum_engine_version;
+    match family_earliest_engine_version(family) {
+        Some(earliest) if engine_version_precedes(introduced, &earliest) => earliest,
+        _ => introduced.to_string(),
+    }
+}
+
+/// Whether engine version `left` is EARLIER than `right`, comparing the dot-separated
+/// components numerically (so `4.0.0` precedes `5.0.0`, and `10.0.0` does not precede
+/// `9.0.0` the way a string comparison would). A component that is not a number compares
+/// as `0`, which is the only reading that keeps the order total.
+///
+/// `pub` because a version-scoped capability is the same comparison wherever it is
+/// answered: a service reporting which log types an engine version can export asks whether
+/// that version predates the one the feature arrived in.
+pub fn engine_version_precedes(left: &str, right: &str) -> bool {
+    let components = |version: &str| -> Vec<u64> {
+        version
+            .split('.')
+            .map(|part| part.parse::<u64>().unwrap_or_default())
+            .collect()
+    };
+    components(left) < components(right)
+}
 
 /// The parameters this emulator publishes for `family`, or `None` when it publishes none.
 ///
