@@ -661,10 +661,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
                 // explicitly is not something this method can do — the same 405
                 // `GetObject` answers a read of one with.
                 if held.as_delete_marker().is_some() {
-                    return Err(crate::scaffolded::Scaffolded::unmodeled(
-                        crate::state::METHOD_NOT_ALLOWED_CODE,
-                        crate::state::METHOD_NOT_ALLOWED_STATUS,
-                        crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+                    return Err(crate::scaffolded::Scaffolded::method_not_allowed(
+                        COPY_METHOD,
+                        crate::state::DELETE_MARKER_RESOURCE_TYPE,
                     ));
                 }
                 held.as_object().cloned()
@@ -706,16 +705,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         }
 
         // The copy-source preconditions, judged against the version actually found, through
-        // the one rule every copy in this service judges them by.
+        // the one rule every copy in this service judges them by. The refusal carries the
+        // code's own FIXED sentence and names the header that did not hold in its
+        // `<Condition>`, which is where S3 states which condition failed.
         if let Some(unmet) = crate::state::unmet_copy_source_precondition(
             &copy_source_conditions(&input),
             &source_object,
         ) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::PRECONDITION_FAILED_CODE,
-                crate::state::PRECONDITION_FAILED_STATUS,
-                format!("{}: {unmet}", crate::state::PRECONDITION_FAILED_MESSAGE),
-            ));
+            return Err(crate::scaffolded::Scaffolded::precondition_failed(unmet));
         }
 
         // S3 refuses a copy of an object onto ITSELF that would change nothing about it:
@@ -1059,6 +1056,12 @@ const DIRECTIVE_REPLACE: &str = "REPLACE";
 /// (`CopyObjectRequest$AnnotationDirective`), so this is the only value that changes what
 /// the copy carries over.
 const DIRECTIVE_EXCLUDE: &str = "EXCLUDE";
+
+/// The HTTP method this operation is bound to — "PUT"
+/// (`smithy_query(query="operation",operation="CopyObject")` reports
+/// `http {method: "PUT", uri: "/{Bucket}/{Key+}?x-id=CopyObject"}`) — which is what a
+/// `MethodNotAllowed` document reports as the `<Method>` it refused.
+const COPY_METHOD: &str = "PUT";
 
 /// The four copy-source conditional members this request carried, for the one rule every
 /// copy in this service judges them by

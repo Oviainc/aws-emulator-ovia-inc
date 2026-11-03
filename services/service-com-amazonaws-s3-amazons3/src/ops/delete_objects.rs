@@ -365,7 +365,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
             // The conditional members of THIS identifier, judged against the version it
             // addresses before anything is taken away, through the one rule every
             // conditional delete in this service is judged by
-            // ([`crate::state::delete_precondition_fails`]): "an entity tag (ETag) …
+            // ([`crate::state::unmet_delete_precondition`]): "an entity tag (ETag) …
             // makes the request method conditional on `ETags`"
             // (`ObjectIdentifier$ETag`), beside the modification time and size a directory
             // bucket's identifier may add. A condition that does not hold is THIS key's
@@ -384,7 +384,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
                             .stored_version(key, version_id)
                             .and_then(crate::state::StoredVersion::as_object),
                     };
-                    crate::state::delete_precondition_fails(
+                    crate::state::unmet_delete_precondition(
                         addressed,
                         identifier.e_tag.as_deref(),
                         identifier
@@ -393,6 +393,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
                             .and_then(crate::state::instant_of),
                         identifier.size,
                     )
+                    .is_some()
                 });
                 if unmet {
                     errors.push(Error {

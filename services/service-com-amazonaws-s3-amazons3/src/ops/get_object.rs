@@ -470,10 +470,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // holds no bytes, so a read of it is not something this method can do —
                 // and `MethodNotAllowed` is not a shape in this model either.
                 if held.as_delete_marker().is_some() {
-                    return Err(crate::scaffolded::Scaffolded::unmodeled(
-                        crate::state::METHOD_NOT_ALLOWED_CODE,
-                        405,
-                        crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+                    return Err(crate::scaffolded::Scaffolded::method_not_allowed(
+                        GET_METHOD,
+                        crate::state::DELETE_MARKER_RESOURCE_TYPE,
                     ));
                 }
                 held.as_object()
@@ -488,19 +487,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The preconditions this read is subject to, judged against the version it
         // resolved: a read whose `If-Match` or `If-Unmodified-Since` does not hold is
         // refused with 412 and the documented sentence
-        // ([`crate::state::read_precondition_fails`] carries the rule and the precedence
-        // between the two), and nothing about the object is reported.
-        if crate::state::read_precondition_fails(
+        // ([`crate::state::unmet_read_precondition`] carries the rule and the precedence
+        // between the two), naming the header that did not hold, and nothing about the
+        // object is reported.
+        if let Some(condition) = crate::state::unmet_read_precondition(
             &object.etag,
             object.last_modified,
             input.if_match.as_deref(),
             input.if_unmodified_since.as_ref().and_then(crate::state::instant_of),
         ) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::PRECONDITION_FAILED_CODE,
-                crate::state::PRECONDITION_FAILED_STATUS,
-                crate::state::PRECONDITION_FAILED_MESSAGE,
-            ));
+            return Err(crate::scaffolded::Scaffolded::precondition_failed(condition));
         }
 
         // "Before you can retrieve the object you must first restore a copy using
@@ -551,10 +547,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (None, Some(header)) => match crate::state::requested_range(header, total) {
                 crate::state::RangeRequest::Span(span) => Some(span),
                 crate::state::RangeRequest::Unsatisfiable => {
-                    return Err(crate::scaffolded::Scaffolded::unmodeled(
-                        crate::state::INVALID_RANGE_CODE,
-                        crate::state::INVALID_RANGE_STATUS,
-                        crate::state::INVALID_RANGE_MESSAGE,
+                    return Err(crate::scaffolded::Scaffolded::invalid_range(
+                        header,
+                        i64::try_from(total).unwrap_or(i64::MAX),
                     ))
                 }
                 // A header this emulator serves no single span for is ignored, which RFC
@@ -726,4 +721,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The HTTP method this operation is bound to — "GET"
+/// (`smithy_query(query="operation",operation="GetObject")` reports
+/// `http {method: "GET", uri: "/{Bucket}/{Key+}?x-id=GetObject"}`) — which is what a
+/// `MethodNotAllowed` document reports as the `<Method>` it refused.
+const GET_METHOD: &str = "GET";
 

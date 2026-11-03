@@ -9,7 +9,9 @@
 //! The same note carries the OBJECT the request addresses — its key, and the version id the
 //! request named — for the same reason: an object-scoped not-found document names the key
 //! (and the version) that was not there, and no error shape of this model declares a member
-//! to carry either.
+//! to carry either. And the multipart UPLOAD it addresses, for the `UploadId` an
+//! upload-scoped document names the upload that was not there by
+//! ([`crate::scaffolded::UPLOAD_SCOPED_ERROR_CODES`]).
 //!
 //! Not state: a request-scoped note, needed because a refusal and the REQUEST that provoked
 //! it are handed to two different seams. The serializer that writes the error document is
@@ -50,6 +52,8 @@ thread_local! {
     static ADDRESSED: RefCell<Option<String>> = const { RefCell::new(None) };
     /// The OBJECT that same request addresses, for the length of that one request.
     static ADDRESSED_OBJECT: RefCell<Option<AddressedObject>> = const { RefCell::new(None) };
+    /// The multipart UPLOAD that same request addresses, for the length of that one request.
+    static ADDRESSED_UPLOAD: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// The object a request addresses: the key, and the version id the request named.
@@ -75,6 +79,23 @@ pub(crate) fn remember_object(object: Option<AddressedObject>) {
 /// [`addressed`].
 pub(crate) fn addressed_object() -> Option<AddressedObject> {
     ADDRESSED_OBJECT.with(|note| note.borrow_mut().take())
+}
+
+/// Record the multipart UPLOAD the request this thread is serving addresses — the `uploadId`
+/// it named — `None` for a request that addresses none.
+///
+/// Called for EVERY request, under the same discipline as [`remember`].
+pub(crate) fn remember_upload(upload_id: Option<&str>) {
+    let recorded = upload_id.map(str::to_string);
+    ADDRESSED_UPLOAD.with(|note| {
+        *note.borrow_mut() = recorded;
+    });
+}
+
+/// The upload recorded for the request now being answered, TAKEN rather than read — see
+/// [`addressed`].
+pub(crate) fn addressed_upload() -> Option<String> {
+    ADDRESSED_UPLOAD.with(|note| note.borrow_mut().take())
 }
 
 /// Record `bucket` as the bucket the request this thread is serving addresses, `None` for a
@@ -163,6 +184,34 @@ mod tests {
             None,
             "a request addressing no object must not read the previous one's note, got {:?}",
             addressed_object()
+        );
+    }
+
+    #[test]
+    fn a_recorded_upload_is_answered_once_and_then_gone() {
+        remember_upload(Some("note-upload-id"));
+        assert_eq!(
+            addressed_upload().as_deref(),
+            Some("note-upload-id"),
+            "the recorded upload must be the one answered"
+        );
+        assert_eq!(
+            addressed_upload(),
+            None,
+            "a note is spent by the response it was recorded for, got {:?}",
+            addressed_upload()
+        );
+    }
+
+    #[test]
+    fn a_request_that_addresses_no_upload_clears_the_slot() {
+        remember_upload(Some("note-previous-upload"));
+        remember_upload(None);
+        assert_eq!(
+            addressed_upload(),
+            None,
+            "a request addressing no upload must not read the previous one's note, got {:?}",
+            addressed_upload()
         );
     }
 }

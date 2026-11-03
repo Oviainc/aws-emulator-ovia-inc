@@ -1271,6 +1271,12 @@ fn addressed_object(
 /// `VersionId: {httpQuery: "versionId"}`).
 const VERSION_ID_PARAMETER: &str = "versionId";
 
+/// The query parameter a request names the multipart upload it addresses by — the
+/// `@httpQuery` every operation that takes one binds it from
+/// (`smithy_query(query="operation",operation="CompleteMultipartUpload")` reports
+/// `UploadId: {httpQuery: "uploadId"}`).
+const UPLOAD_ID_PARAMETER: &str = "uploadId";
+
 /// `response` describing its body as the JSON document it is — see
 /// [`JSON_PAYLOAD_OUTPUT_OPERATIONS`]. Only the header changes; the body the handler
 /// answered with is untouched.
@@ -1372,6 +1378,17 @@ impl ServerProtocol for UnwrappedXmlRestXml {
             &path_style,
             request_query(request.uri()),
         ));
+        // And the multipart UPLOAD it addresses, for the `<UploadId>` an upload-scoped error
+        // document names the upload that was not there by — the `uploadId` query parameter
+        // every operation that addresses an upload binds that member from
+        // (`smithy_query(query="operation",operation="CompleteMultipartUpload")` reports
+        // `UploadId: {httpQuery: "uploadId"}`, as do `UploadPart`, `UploadPartCopy`,
+        // `ListParts` and `AbortMultipartUpload`). Recorded under the same discipline: a
+        // request that addresses no upload records nothing.
+        crate::state::addressed_bucket::remember_upload(
+            super::sigv4::query_parameter(request_query(request.uri()), UPLOAD_ID_PARAMETER)
+                .as_deref(),
+        );
         // And the DOCUMENT it carried, for a refusal that has to echo a value AS THE REQUEST
         // SPELLED IT once the codec has parsed it ([`spelled_in_request`]). Only a request
         // whose body IS an XML document carries one; every other request records nothing,

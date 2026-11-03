@@ -225,10 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .stored_version(&input.key, named)
                 .is_some_and(|stored| stored.as_delete_marker().is_some())
         }) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::METHOD_NOT_ALLOWED_CODE,
-                crate::state::METHOD_NOT_ALLOWED_STATUS,
-                crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+            return Err(crate::scaffolded::Scaffolded::method_not_allowed(
+                OBJECT_ACL_READ_METHOD,
+                crate::state::DELETE_MARKER_RESOURCE_TYPE,
             ));
         }
         // "By default, GET returns ACL information about the current version of an object.
@@ -305,3 +304,9 @@ const ACCESS_DENIED_CODE: &str = "AccessDenied";
 const ACCESS_DENIED_STATUS: u16 = 403;
 /// See [`ACCESS_DENIED_CODE`].
 const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// The HTTP method this operation is bound to — "GET"
+/// (`smithy_query(query="operation",operation="GetObjectAcl")` reports
+/// `http {method: "GET", uri: "/{Bucket}/{Key+}?acl"}`) — what a `MethodNotAllowed`
+/// document reports as the `<Method>` it refused.
+const OBJECT_ACL_READ_METHOD: &str = "GET";

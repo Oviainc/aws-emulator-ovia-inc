@@ -415,10 +415,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Bucket::object` reports no current object behind a marker.
         if input.version_id.is_some() && held.is_some_and(|held| held.as_delete_marker().is_some())
         {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::METHOD_NOT_ALLOWED_CODE,
-                405,
-                crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+            return Err(crate::scaffolded::Scaffolded::method_not_allowed(
+                HEAD_METHOD,
+                crate::state::DELETE_MARKER_RESOURCE_TYPE,
             ));
         }
         let object = held.and_then(crate::state::StoredVersion::as_object);
@@ -479,9 +478,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The preconditions this read is subject to, judged against the version it
         // resolved, through the one rule `GetObject` judges its own by
-        // ([`crate::state::read_precondition_fails`]) — so a GET and a HEAD of the same
-        // object cannot disagree about whether they hold.
-        if crate::state::read_precondition_fails(
+        // ([`crate::state::unmet_read_precondition`]) — so a GET and a HEAD of the same
+        // object cannot disagree about whether they hold or about which header a refusal
+        // names.
+        if let Some(condition) = crate::state::unmet_read_precondition(
             &object.etag,
             object.last_modified,
             input.if_match.as_deref(),
@@ -490,11 +490,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .and_then(crate::state::instant_of),
         ) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::PRECONDITION_FAILED_CODE,
-                crate::state::PRECONDITION_FAILED_STATUS,
-                crate::state::PRECONDITION_FAILED_MESSAGE,
-            ));
+            return Err(crate::scaffolded::Scaffolded::precondition_failed(condition));
         }
 
         // WHICH SPAN of the object this HEAD describes: "a HEAD request has the same options
@@ -518,10 +514,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (None, Some(header)) => match crate::state::requested_range(header, total) {
                 crate::state::RangeRequest::Span(span) => Some(span),
                 crate::state::RangeRequest::Unsatisfiable => {
-                    return Err(crate::scaffolded::Scaffolded::unmodeled(
-                        crate::state::INVALID_RANGE_CODE,
-                        crate::state::INVALID_RANGE_STATUS,
-                        crate::state::INVALID_RANGE_MESSAGE,
+                    return Err(crate::scaffolded::Scaffolded::invalid_range(
+                        header,
+                        i64::try_from(total).unwrap_or(i64::MAX),
                     ))
                 }
                 crate::state::RangeRequest::Ignored => None,
@@ -683,3 +678,9 @@ fn unserved_feature(input: &HeadObjectInput) -> Option<&'static str> {
     .into_iter()
     .find_map(|(asked, name)| asked.then_some(name))
 }
+
+/// The HTTP method this operation is bound to — "HEAD"
+/// (`smithy_query(query="operation",operation="HeadObject")` reports
+/// `http {method: "HEAD", uri: "/{Bucket}/{Key+}"}`) — which is what a `MethodNotAllowed`
+/// document reports as the `<Method>` it refused.
+const HEAD_METHOD: &str = "HEAD";

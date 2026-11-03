@@ -212,10 +212,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and not about the object — so nothing reads the object, and `Body` ("a Bencoded
         // dictionary as defined by the BitTorrent specification") is never answered, in
         // place of an empty one a client would read as a torrent with no peers.
-        Err(crate::scaffolded::Scaffolded::unmodeled(
-            crate::state::METHOD_NOT_ALLOWED_CODE,
-            crate::state::METHOD_NOT_ALLOWED_STATUS,
-            crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+        Err(crate::scaffolded::Scaffolded::method_not_allowed(
+            TORRENT_METHOD,
+            crate::state::TORRENT_RESOURCE_TYPE,
         ))
     }
 }
@@ -228,3 +227,10 @@ const ACCESS_DENIED_CODE: &str = "AccessDenied";
 const ACCESS_DENIED_STATUS: u16 = 403;
 /// See [`ACCESS_DENIED_CODE`] — the text that same published list carries for it.
 const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// The HTTP method this operation is bound to — "GET"
+/// (`smithy_query(query="operation",operation="GetObjectTorrent")` reports
+/// `http {method: "GET", uri: "/{Bucket}/{Key+}?torrent"}`) — which is what the
+/// `MethodNotAllowed` document reports as the `<Method>` it refused, beside the
+/// `<ResourceType>` of the `?torrent` subresource that method addressed.
+const TORRENT_METHOD: &str = "GET";

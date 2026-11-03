@@ -687,21 +687,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The conditional members, judged against what the key holds NOW — the write is what
         // they make conditional, so they are judged here, immediately before it, through the
         // one rule every conditional write in this service is judged by
-        // ([`crate::state::write_precondition_fails`]). A refused write stores nothing, so
+        // ([`crate::state::unmet_write_precondition`]). A refused write stores nothing, so
         // the object the key holds is left exactly as it was and the caller can read its tag
-        // and retry.
-        if crate::state::write_precondition_fails(
+        // and retry — and the refusal names the header that did not hold, which is what tells
+        // the caller which of the two to change.
+        if let Some(condition) = crate::state::unmet_write_precondition(
             bucket_record
                 .object(&input.key)
                 .map(|object| object.etag.as_str()),
             input.if_match.as_deref(),
             input.if_none_match.as_deref(),
         ) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::PRECONDITION_FAILED_CODE,
-                crate::state::PRECONDITION_FAILED_STATUS,
-                crate::state::PRECONDITION_FAILED_MESSAGE,
-            ));
+            return Err(crate::scaffolded::Scaffolded::precondition_failed(condition));
         }
 
         let etag = crate::state::object_etag(&body);

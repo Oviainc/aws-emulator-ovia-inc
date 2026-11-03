@@ -97,6 +97,30 @@
 //! `<Message>` states the rule the value broke and not which value broke it. A handler
 //! refusing a field answers through [`Scaffolded::invalid_argument`], which attaches the
 //! pair the same way.
+//!
+//! ## Every refusal carries the members of ITS class
+//!
+//! The naming member is one case of the general shape of an S3 error document: beside the
+//! fixed `<Code>` and `<Message>` of the error class, it carries that class's own
+//! contextual members, each filled from the REQUEST or from the emulator's STATE, because
+//! the `<Message>` is the same sentence for every request the class refuses and the members
+//! are the only machine-readable part that says which one this was. The classes this
+//! service answers, and what each one's document carries ([`ErrorDetail`] holds each group,
+//! and the constructors below are the one place each is attached):
+//!
+//! * an upload-scoped refusal — the `<UploadId>` the request addressed, written from the
+//!   request's own address for [`UPLOAD_SCOPED_ERROR_CODES`] the way `<BucketName>` is;
+//! * a refusal about one PART of an upload — the `<UploadId>`, the `<PartNumber>` and the
+//!   `<ETag>` that name the part the caller must re-upload, and for one refused on its SIZE
+//!   the `<ProposedSize>` it has and the `<MinSizeAllowed>` it was judged against;
+//! * a method refused against a resource TYPE — the `<Method>` the request used and the
+//!   `<ResourceType>` it was refused against;
+//! * an unsatisfiable range — the `<RangeRequested>` as the request spelled it and the
+//!   `<ActualObjectSize>` it was judged against, which is what a client clamps the next
+//!   range to;
+//! * a precondition that did not hold — the `<Condition>` naming the conditional HEADER
+//!   that failed, which is the only thing that tells a conditional-retry loop which of
+//!   several headers it carried to change.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -463,7 +487,7 @@ pub fn documented_error_message(code: &str) -> Option<&'static str> {
 /// model_path="services/service-com-amazonaws-s3-amazons3/smithy-model/com-amazonaws-s3-amazons3.json")`
 /// reports `members: {}` for each), which is the same reason the `<Message>` above is a
 /// catalog here rather than a member a handler fills — and why the name is attached to the
-/// refusal itself ([`RefusedResource`]) instead.
+/// refusal itself ([`ErrorDetail`]) instead.
 ///
 /// Three families are deliberately NOT here, because the condition each states is not a
 /// bucket's:
@@ -627,6 +651,169 @@ static OBJECT_VERSION_ID: Schema = Schema::new_member(
 )
 .with_xml_name("VersionId");
 
+/// The `<UploadId>` of an S3 error document: the multipart upload the refusal is about. See
+/// [`BUCKET_NAME`] and [`UPLOAD_SCOPED_ERROR_CODES`].
+static UPLOAD_ID: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#AddressedUpload$uploadId",
+        "smithy.framework",
+        "uploadId",
+    ),
+    ShapeType::String,
+    "uploadId",
+    8,
+)
+.with_xml_name("UploadId");
+
+/// The `<PartNumber>` of an S3 error document: the part of an upload the refusal is about.
+static PART_NUMBER: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedPart$partNumber",
+        "smithy.framework",
+        "partNumber",
+    ),
+    ShapeType::Integer,
+    "partNumber",
+    9,
+)
+.with_xml_name("PartNumber");
+
+/// The `<ETag>` of an S3 error document: the entity tag of the part the refusal is about,
+/// which is the other half of the address a caller re-uploads that part under.
+static PART_ETAG: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedPart$eTag",
+        "smithy.framework",
+        "eTag",
+    ),
+    ShapeType::String,
+    "eTag",
+    10,
+)
+.with_xml_name("ETag");
+
+/// The `<MinSizeAllowed>` of an S3 error document: the floor a part refused for being too
+/// small was judged against, in bytes.
+static MIN_SIZE_ALLOWED: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedPart$minSizeAllowed",
+        "smithy.framework",
+        "minSizeAllowed",
+    ),
+    ShapeType::Long,
+    "minSizeAllowed",
+    11,
+)
+.with_xml_name("MinSizeAllowed");
+
+/// The `<ProposedSize>` of an S3 error document: the size that part actually has, in bytes —
+/// written beside [`MIN_SIZE_ALLOWED`], which is what makes the pair actionable.
+static PROPOSED_SIZE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedPart$proposedSize",
+        "smithy.framework",
+        "proposedSize",
+    ),
+    ShapeType::Long,
+    "proposedSize",
+    12,
+)
+.with_xml_name("ProposedSize");
+
+/// The `<Method>` of an S3 error document: the HTTP method a refusal about the resource TYPE
+/// it was used against reports.
+static REFUSED_METHOD: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedMethod$method",
+        "smithy.framework",
+        "method",
+    ),
+    ShapeType::String,
+    "method",
+    13,
+)
+.with_xml_name("Method");
+
+/// The `<ResourceType>` of an S3 error document: the kind of resource that method was
+/// refused against, written after [`REFUSED_METHOD`].
+static REFUSED_RESOURCE_TYPE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedMethod$resourceType",
+        "smithy.framework",
+        "resourceType",
+    ),
+    ShapeType::String,
+    "resourceType",
+    14,
+)
+.with_xml_name("ResourceType");
+
+/// The `<RangeRequested>` of an S3 error document: the `Range` the request carried, as it
+/// spelled it.
+static RANGE_REQUESTED: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#UnsatisfiableRange$rangeRequested",
+        "smithy.framework",
+        "rangeRequested",
+    ),
+    ShapeType::String,
+    "rangeRequested",
+    15,
+)
+.with_xml_name("RangeRequested");
+
+/// The `<ActualObjectSize>` of an S3 error document: the size, in bytes, the refused range
+/// was judged against — written after [`RANGE_REQUESTED`].
+static ACTUAL_OBJECT_SIZE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#UnsatisfiableRange$actualObjectSize",
+        "smithy.framework",
+        "actualObjectSize",
+    ),
+    ShapeType::Long,
+    "actualObjectSize",
+    16,
+)
+.with_xml_name("ActualObjectSize");
+
+/// The `<Condition>` of an S3 error document: the conditional HEADER of the request that did
+/// not hold.
+static UNMET_CONDITION: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#UnmetCondition$condition",
+        "smithy.framework",
+        "condition",
+    ),
+    ShapeType::String,
+    "condition",
+    17,
+)
+.with_xml_name("Condition");
+
+/// The wire error codes whose document is about one multipart UPLOAD, and so names the
+/// `uploadId` the request addressed.
+///
+/// `NoSuchUpload` states a condition of that id and of nothing else — "the upload ID may be
+/// invalid, or the upload may have been aborted or completed" — and every operation that
+/// answers it addresses the upload by a `uploadId` query parameter
+/// (`smithy_query(query="operation",operation="CompleteMultipartUpload")` reports
+/// `UploadId: {httpQuery: "uploadId"}`, as do `UploadPart`, `UploadPartCopy`, `ListParts`
+/// and `AbortMultipartUpload`), so the member is written from the request's own address
+/// ([`crate::state::addressed_bucket::addressed_upload`]) and the rule holds for every one
+/// of them rather than for the handlers that spell it out.
+///
+/// Source: the elements S3's own error document carries for this condition, as
+/// [`OBJECT_SCOPED_ERROR_CODES`] cites for its own; the model cannot supply it, since
+/// `NoSuchUpload` declares no members
+/// (`smithy_query(query="shape",shape="NoSuchUpload")` reports `members: {}`).
+pub const UPLOAD_SCOPED_ERROR_CODES: &[&str] = &["NoSuchUpload"];
+
+/// Whether an error document carrying `code` is about the upload the request addressed — see
+/// [`UPLOAD_SCOPED_ERROR_CODES`].
+pub fn names_its_upload(code: &str) -> bool {
+    UPLOAD_SCOPED_ERROR_CODES.contains(&code)
+}
+
 /// The wire error codes whose document is about one OBJECT, and so names the key the request
 /// addressed — and, when the request named one, the version it addressed.
 ///
@@ -655,21 +842,21 @@ pub fn names_its_object(code: &str) -> bool {
     OBJECT_SCOPED_ERROR_CODES.contains(&code)
 }
 
-/// The resource a refusal is ABOUT, and therefore which member of the error document names
-/// it.
+/// What a refusal is ABOUT, and therefore which members of the error document carry it.
 ///
-/// S3's error document for a resource-scoped refusal is
-/// `<Error><Code/><Message/><resource-naming member/><RequestId/><HostId/></Error>`: the
-/// code and the message are the fixed text of the error class, and the naming member is a
-/// variable part copied from the request, because the envelope is the only place the refusal
-/// says WHICH resource it is about. No error shape in this service's model declares such a
+/// S3's error document is
+/// `<Error><Code/><Message/><the class's own members/><RequestId/><HostId/></Error>`: the
+/// code and the message are the fixed text of the error class, and the members between them
+/// are its variable parts, filled from the request or from the emulator's state, because the
+/// envelope is the only place the refusal says WHICH resource, part, range or condition it
+/// is about. No error shape in this service's model declares such a
 /// member (`smithy_query(query="shape",shape="NoSuchBucket,NoSuchAnnotation",
 /// model_path="services/service-com-amazonaws-s3-amazons3/smithy-model/com-amazonaws-s3-amazons3.json")`
 /// reports no members at all), and the codes the model does not declare have no shape to
-/// carry one either — so the member lives on the error CHANNEL, here, once, rather than in
+/// carry one either — so the members live on the error CHANNEL, here, once, rather than in
 /// each handler's serializer.
 #[derive(Debug, Clone)]
-pub enum RefusedResource {
+pub enum ErrorDetail {
     /// A bucket-scoped refusal, named by `<BucketName>`: the bucket the request addressed.
     Bucket(String),
     /// An annotation-scoped refusal, named by `<AnnotationName>`: the annotation name the
@@ -699,11 +886,58 @@ pub enum RefusedResource {
         /// The value that field carried, as the request spelled it.
         value: String,
     },
+    /// A refusal about one multipart UPLOAD, named by `<UploadId>`: the upload the refusal is
+    /// about, where it is not simply the one the request addressed (which
+    /// [`UPLOAD_SCOPED_ERROR_CODES`] names from the request itself).
+    Upload(String),
+    /// A refusal about one PART of an upload, named by the `<UploadId>` / `<PartNumber>` /
+    /// `<ETag>` group: the three values a caller re-uploads that part under, which is what
+    /// the refusal asks it to do.
+    Part {
+        /// The upload the part belongs to, as the request addressed it.
+        upload_id: String,
+        /// The part number the request named.
+        part_number: i32,
+        /// The entity tag the request named for that part.
+        etag: String,
+    },
+    /// A refusal of one part for its SIZE, named by the `<ETag>` / `<MinSizeAllowed>` /
+    /// `<ProposedSize>` / `<PartNumber>` group: which part, how big it is and the floor it
+    /// was judged against, which together are what a caller resizes it by.
+    PartSize {
+        /// The part number the request named.
+        part_number: i32,
+        /// The entity tag of that part.
+        etag: String,
+        /// The size that part actually has, in bytes.
+        proposed_size: i64,
+        /// The floor it was judged against, in bytes.
+        min_size_allowed: i64,
+    },
+    /// A method refused against a kind of resource, named by the `<Method>` /
+    /// `<ResourceType>` pair: the HTTP method the request used, and what it was used against.
+    Method {
+        /// The HTTP method, as the operation is bound to it.
+        method: String,
+        /// The kind of resource that method is not allowed against.
+        resource_type: String,
+    },
+    /// An unsatisfiable range, named by the `<RangeRequested>` / `<ActualObjectSize>` pair:
+    /// the range the request asked for and the size it was judged against.
+    Range {
+        /// The `Range` header, as the request spelled it.
+        requested: String,
+        /// The size of the representation it was judged against, in bytes.
+        actual_object_size: i64,
+    },
+    /// A precondition that did not hold, named by `<Condition>`: the conditional HEADER of
+    /// the request that failed.
+    Condition(String),
 }
 
-impl RefusedResource {
-    /// Write the member — or, for an argument or a versioned object, the PAIR of members —
-    /// S3's error document names this resource by, in the order the document carries them in.
+impl ErrorDetail {
+    /// Write the member — or, for a group, the members — S3's error document carries for this
+    /// class, in the order the document carries them in.
     fn serialize_into(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
         match self {
             Self::Bucket(name) => s.write_string(&BUCKET_NAME, name),
@@ -720,17 +954,76 @@ impl RefusedResource {
                 s.write_string(&ARGUMENT_NAME, name)?;
                 s.write_string(&ARGUMENT_VALUE, value)
             }
+            Self::Upload(upload_id) => s.write_string(&UPLOAD_ID, upload_id),
+            Self::Part {
+                upload_id,
+                part_number,
+                etag,
+            } => {
+                s.write_string(&UPLOAD_ID, upload_id)?;
+                s.write_integer(&PART_NUMBER, *part_number)?;
+                s.write_string(&PART_ETAG, etag)
+            }
+            Self::PartSize {
+                part_number,
+                etag,
+                proposed_size,
+                min_size_allowed,
+            } => {
+                s.write_string(&PART_ETAG, etag)?;
+                s.write_long(&MIN_SIZE_ALLOWED, *min_size_allowed)?;
+                s.write_long(&PROPOSED_SIZE, *proposed_size)?;
+                s.write_integer(&PART_NUMBER, *part_number)
+            }
+            Self::Method {
+                method,
+                resource_type,
+            } => {
+                s.write_string(&REFUSED_METHOD, method)?;
+                s.write_string(&REFUSED_RESOURCE_TYPE, resource_type)
+            }
+            Self::Range {
+                requested,
+                actual_object_size,
+            } => {
+                s.write_string(&RANGE_REQUESTED, requested)?;
+                s.write_long(&ACTUAL_OBJECT_SIZE, *actual_object_size)
+            }
+            Self::Condition(condition) => s.write_string(&UNMET_CONDITION, condition),
         }
     }
 
-    /// The name itself, exactly as the request spelled it.
-    fn name(&self) -> &str {
+    /// What this detail says the refusal is about, for the one-line [`Display`] an operator
+    /// reads in a log.
+    ///
+    /// [`Display`]: std::fmt::Display
+    fn described(&self) -> String {
         match self {
             Self::Bucket(name)
             | Self::Annotation(name)
             | Self::TagKey(name)
             | Self::Object { key: name, .. }
-            | Self::Argument { name, .. } => name.as_str(),
+            | Self::Argument { name, .. }
+            | Self::Upload(name)
+            | Self::Condition(name) => name.clone(),
+            Self::Part {
+                upload_id,
+                part_number,
+                ..
+            } => format!("{upload_id} part {part_number}"),
+            Self::PartSize {
+                part_number,
+                proposed_size,
+                ..
+            } => format!("part {part_number} of {proposed_size} bytes"),
+            Self::Method {
+                method,
+                resource_type,
+            } => format!("{method} against {resource_type}"),
+            Self::Range {
+                requested,
+                actual_object_size,
+            } => format!("{requested} of {actual_object_size} bytes"),
         }
     }
 }
@@ -757,10 +1050,10 @@ pub enum Scaffolded<E> {
     /// A rejection whose code the model does not declare, rendered with the code and
     /// status S3 actually sends. See [`Unmodeled`].
     Unmodeled(Unmodeled),
-    /// Any of the refusals above, ABOUT a named resource: the refusal is rendered exactly
-    /// as it would be on its own, plus the member S3's error document names that resource
-    /// by. See [`RefusedResource`] and [`Scaffolded::naming`].
-    Naming(Box<Scaffolded<E>>, RefusedResource),
+    /// Any of the refusals above, with the DETAIL members its error class carries: the
+    /// refusal is rendered exactly as it would be on its own, plus the members S3's error
+    /// document carries for that class. See [`ErrorDetail`] and [`Scaffolded::naming`].
+    Naming(Box<Scaffolded<E>>, ErrorDetail),
 }
 
 impl<E> Scaffolded<E> {
@@ -803,40 +1096,136 @@ impl<E> Scaffolded<E> {
         })
     }
 
-    /// This refusal, with the member S3's error document names `resource` by.
+    /// This refusal, with the members S3's error document carries for `detail`.
     ///
-    /// Reach for it wherever a request is refused BECAUSE of the resource it addresses —
-    /// the resource, or a configuration of it, not being there, or already being there —
-    /// since the envelope is the only place such a refusal says which resource it is
-    /// about: a client driving several buckets or annotations through one code path cannot
-    /// attribute the failure without it, and an SDK error shape that exposes the member
-    /// hands back nothing. The code, the status and the message are untouched.
+    /// Reach for it wherever a request is refused BECAUSE of something the envelope is the
+    /// only place to state — the resource it addresses not being there or already being
+    /// there, the part it named, the range it asked for, the condition it carried — since a
+    /// client driving several of them through one code path cannot attribute the failure
+    /// without it, and an SDK error shape that exposes those members hands back nothing. The
+    /// code, the status and the message are untouched.
     ///
-    /// Naming a resource twice REPLACES the name rather than writing the member twice.
-    pub fn naming(self, resource: RefusedResource) -> Self {
+    /// Attaching a detail twice REPLACES it rather than writing the members twice.
+    pub fn naming(self, detail: ErrorDetail) -> Self {
         match self {
-            Self::Naming(refusal, _) => Self::Naming(refusal, resource),
-            refusal => Self::Naming(Box::new(refusal), resource),
+            Self::Naming(refusal, _) => Self::Naming(refusal, detail),
+            refusal => Self::Naming(Box::new(refusal), detail),
         }
     }
 
     /// [`Scaffolded::naming`] for the bucket a bucket-scoped refusal is about.
     pub fn naming_bucket(self, bucket: &str) -> Self {
-        self.naming(RefusedResource::Bucket(bucket.to_string()))
+        self.naming(ErrorDetail::Bucket(bucket.to_string()))
     }
 
     /// [`Scaffolded::naming`] for the annotation an annotation-scoped refusal is about.
     pub fn naming_annotation(self, annotation: &str) -> Self {
-        self.naming(RefusedResource::Annotation(annotation.to_string()))
+        self.naming(ErrorDetail::Annotation(annotation.to_string()))
     }
 
     /// [`Scaffolded::naming`] for the OBJECT an object-scoped refusal is about, where that is
     /// not the object the request addressed: a copy's SOURCE, whose key the destination's
     /// address would otherwise be written in place of.
     pub fn naming_object(self, key: &str, version_id: Option<&str>) -> Self {
-        self.naming(RefusedResource::Object {
+        self.naming(ErrorDetail::Object {
             key: key.to_string(),
             version_id: version_id.map(str::to_string),
+        })
+    }
+
+    /// [`Scaffolded::naming`] for the multipart UPLOAD a refusal is about, where that is not
+    /// simply the one the request addressed — which [`UPLOAD_SCOPED_ERROR_CODES`] names from
+    /// the request itself.
+    pub fn naming_upload(self, upload_id: &str) -> Self {
+        self.naming(ErrorDetail::Upload(upload_id.to_string()))
+    }
+
+    /// [`Scaffolded::naming`] for the PART a refusal is about: the upload it belongs to, the
+    /// number the request named it by and the entity tag it named it with — the three values
+    /// a caller re-uploads that part under.
+    pub fn naming_part(self, upload_id: &str, part_number: i32, etag: &str) -> Self {
+        self.naming(ErrorDetail::Part {
+            upload_id: upload_id.to_string(),
+            part_number,
+            etag: etag.to_string(),
+        })
+    }
+
+    /// [`Scaffolded::naming`] for a part refused on its SIZE: which part, the size it has and
+    /// the floor it was judged against — what a caller resizes it by.
+    pub fn naming_part_size(
+        self,
+        part_number: i32,
+        etag: &str,
+        proposed_size: i64,
+        min_size_allowed: i64,
+    ) -> Self {
+        self.naming(ErrorDetail::PartSize {
+            part_number,
+            etag: etag.to_string(),
+            proposed_size,
+            min_size_allowed,
+        })
+    }
+
+    /// The refusal S3 answers a request whose conditional header did not hold with:
+    /// `PreconditionFailed` at [`crate::state::PRECONDITION_FAILED_STATUS`], the FIXED
+    /// sentence that code publishes, and the `<Condition>` naming the header that failed.
+    ///
+    /// The sentence is the same for every condition that fails, so the member is the only
+    /// part of the refusal that says which of several conditional headers a request carried
+    /// must change — which is exactly what a conditional-write retry loop keys on.
+    /// `condition` is the header as the model binds it
+    /// (`crate::state`'s `*_CONDITION` constants), so nothing is invented here.
+    ///
+    /// The ONE place a precondition refusal is built, so every conditional read, write,
+    /// delete and copy in this service refuses with the same status, code, sentence and
+    /// member.
+    pub fn precondition_failed(condition: &str) -> Self {
+        Self::unmodeled(
+            crate::state::PRECONDITION_FAILED_CODE,
+            crate::state::PRECONDITION_FAILED_STATUS,
+            crate::state::PRECONDITION_FAILED_MESSAGE,
+        )
+        .naming(ErrorDetail::Condition(condition.to_string()))
+    }
+
+    /// The refusal S3 answers a read whose `Range` asks for bytes the representation does not
+    /// have with: `InvalidRange` at [`crate::state::INVALID_RANGE_STATUS`], the fixed
+    /// sentence that code publishes, and the `<RangeRequested>` / `<ActualObjectSize>` pair
+    /// — the range as the request spelled it and the size it was judged against, which is
+    /// what a client clamps its next range to.
+    ///
+    /// The ONE place that pair is attached, so every ranged read in this service refuses the
+    /// same way.
+    pub fn invalid_range(requested: &str, actual_object_size: i64) -> Self {
+        Self::unmodeled(
+            crate::state::INVALID_RANGE_CODE,
+            crate::state::INVALID_RANGE_STATUS,
+            crate::state::INVALID_RANGE_MESSAGE,
+        )
+        .naming(ErrorDetail::Range {
+            requested: requested.to_string(),
+            actual_object_size,
+        })
+    }
+
+    /// The refusal S3 answers a method used against a kind of resource that does not allow it
+    /// with: `MethodNotAllowed` at [`crate::state::METHOD_NOT_ALLOWED_STATUS`], the fixed
+    /// sentence that code publishes, and the `<Method>` / `<ResourceType>` pair — the method
+    /// the request used and what it was refused against, since the sentence names neither.
+    ///
+    /// `method` is the HTTP method the operation is bound to and `resource_type` one of
+    /// `crate::state`'s `*_RESOURCE_TYPE` constants.
+    pub fn method_not_allowed(method: &str, resource_type: &str) -> Self {
+        Self::unmodeled(
+            crate::state::METHOD_NOT_ALLOWED_CODE,
+            crate::state::METHOD_NOT_ALLOWED_STATUS,
+            crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+        )
+        .naming(ErrorDetail::Method {
+            method: method.to_string(),
+            resource_type: resource_type.to_string(),
         })
     }
 
@@ -861,7 +1250,7 @@ impl<E> Scaffolded<E> {
             crate::state::INVALID_ARGUMENT_STATUS,
             message,
         )
-        .naming(RefusedResource::Argument {
+        .naming(ErrorDetail::Argument {
             name: argument.to_string(),
             value: value.to_string(),
         })
@@ -912,7 +1301,7 @@ impl<E> Scaffolded<E> {
             rejection.to_string(),
         );
         match rejection.tag_key() {
-            Some(key) => refusal.naming(RefusedResource::TagKey(key.to_string())),
+            Some(key) => refusal.naming(ErrorDetail::TagKey(key.to_string())),
             None => refusal,
         }
     }
@@ -925,9 +1314,9 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::Unmodeled(e) => write!(f, "{e}"),
-            // The refusal as it reads on its own, plus the resource it is about, so an
+            // The refusal as it reads on its own, plus what it is about, so an
             // operator reading a log sees which one it was refused for.
-            Self::Naming(refusal, resource) => write!(f, "{refusal} ({})", resource.name()),
+            Self::Naming(refusal, detail) => write!(f, "{refusal} ({})", detail.described()),
         }
     }
 }
@@ -976,7 +1365,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
 ///   thread and so cannot read the request-scoped note
 ///   (`ops/put_bucket_notification_configuration.rs`).
 ///
-/// It is also what names a resource that is not a bucket at all ([`RefusedResource`]).
+/// It is also what names a resource that is not a bucket at all ([`ErrorDetail`]).
 impl<E: OperationError> SerializableStruct for Scaffolded<E> {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
         // The request-scoped notes are spent HERE, at the top, whether or not this refusal
@@ -987,6 +1376,7 @@ impl<E: OperationError> SerializableStruct for Scaffolded<E> {
         // gone by the time the wrapped refusal is serialized.
         let addressed = crate::state::addressed_bucket::addressed();
         let addressed_object = crate::state::addressed_bucket::addressed_object();
+        let addressed_upload = crate::state::addressed_bucket::addressed_upload();
         match self {
             Self::NotImplemented(e) => e.serialize_members(s)?,
             Self::ValidationException(e) => e.serialize_members(s)?,
@@ -999,9 +1389,9 @@ impl<E: OperationError> SerializableStruct for Scaffolded<E> {
                 }
                 e.as_serializable().serialize_members(s)?;
             }
-            Self::Naming(refusal, resource) => {
+            Self::Naming(refusal, detail) => {
                 refusal.serialize_members(s)?;
-                resource.serialize_into(s)?;
+                detail.serialize_into(s)?;
                 return Ok(());
             }
         }
@@ -1013,6 +1403,9 @@ impl<E: OperationError> SerializableStruct for Scaffolded<E> {
             if let Some(version_id) = object.version_id.as_deref() {
                 s.write_string(&OBJECT_VERSION_ID, version_id)?;
             }
+        }
+        if let Some(upload_id) = addressed_upload.filter(|_| names_its_upload(self.shape_name())) {
+            s.write_string(&UPLOAD_ID, upload_id.as_str())?;
         }
         Ok(())
     }

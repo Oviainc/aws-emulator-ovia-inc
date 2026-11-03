@@ -1609,6 +1609,21 @@ pub const METHOD_NOT_ALLOWED_MESSAGE: &str =
 /// (Method Not Allowed) error").
 pub const METHOD_NOT_ALLOWED_STATUS: u16 = 405;
 
+/// The `<ResourceType>` S3's `MethodNotAllowed` document names a request for an object's
+/// BitTorrent file by: the `?torrent` subresource the method was refused against.
+///
+/// The code's message is fixed ("the specified method is not allowed against this
+/// resource"), so the `<Method>` / `<ResourceType>` pair is the only part of the document
+/// that says which method and which resource type it was \u2014 see
+/// [`crate::scaffolded::Scaffolded::method_not_allowed`].
+pub const TORRENT_RESOURCE_TYPE: &str = "TORRENT";
+
+/// The `<ResourceType>` of the same document for a call addressed at a version that is a
+/// DELETE MARKER: "if the specified version is a delete marker, the response returns a 405
+/// Method Not Allowed error" (`GetObject`'s own documentation, whose options `HeadObject`
+/// shares), so the resource the method was refused against is the marker.
+pub const DELETE_MARKER_RESOURCE_TYPE: &str = "DeleteMarker";
+
 /// The `ObjectOwnership` value that DISABLES ACLs on a bucket: "ACLs are disabled and no
 /// longer affect permissions" (`PutBucketAcl`'s documentation), so a request to set one is
 /// refused with [`ACL_NOT_SUPPORTED_CODE`] while a request to read one still answers.
@@ -8346,9 +8361,9 @@ pub fn etag_value(etag: &str) -> &str {
     etag.trim_matches('"')
 }
 
-/// Whether a conditional WRITE at a key whose current object carries `held_etag` (`None`
-/// for a key holding nothing) must be refused, given the `If-Match` and `If-None-Match` the
-/// request carried.
+/// The conditional WRITE member a request carries that does NOT hold at a key whose current
+/// object carries `held_etag` (`None` for a key holding nothing), named by its header, or
+/// `None` when every one of them holds.
 ///
 /// The two documented conditions, each quoted from the member that carries it:
 ///
@@ -8366,17 +8381,20 @@ pub fn etag_value(etag: &str) -> &str {
 /// object.
 ///
 /// ONE place for the rule, so every conditional write in this service — the one-shot write
-/// and the completion of a multipart upload — refuses exactly the same requests.
-pub fn write_precondition_fails(
+/// and the completion of a multipart upload — refuses exactly the same requests and names
+/// the same header in the refusal's `<Condition>`.
+pub fn unmet_write_precondition(
     held_etag: Option<&str>,
     if_match: Option<&str>,
     if_none_match: Option<&str>,
-) -> bool {
-    let none_match_fails = if_none_match.is_some() && held_etag.is_some();
+) -> Option<&'static str> {
+    if if_none_match.is_some() && held_etag.is_some() {
+        return Some(IF_NONE_MATCH_CONDITION);
+    }
     let match_fails = if_match.is_some_and(|expected| {
         held_etag.is_none_or(|held| etag_value(held) != etag_value(expected))
     });
-    none_match_fails || match_fails
+    match_fails.then_some(IF_MATCH_CONDITION)
 }
 
 /// The `If-Match` value that matches whatever entity tag the addressed object carries:
@@ -8384,9 +8402,9 @@ pub fn write_precondition_fails(
 /// of any ETag" (`DeleteObjectRequest$IfMatch`).
 pub const ANY_ENTITY_TAG: &str = "*";
 
-/// Whether a conditional DELETE of the object version a request addresses must be refused,
-/// given the three conditional members it carried — `held` being that version, or `None`
-/// when the request addresses nothing the store holds.
+/// The conditional DELETE member a request carries that does NOT hold against the object
+/// version it addresses, named by its header, or `None` when every one of them holds —
+/// `held` being that version, or `None` when the request addresses nothing the store holds.
 ///
 /// The three conditions, each quoted from the member that carries it:
 ///
@@ -8407,36 +8425,42 @@ pub const ANY_ENTITY_TAG: &str = "*";
 /// "You can use the `If-Match`, `x-amz-if-match-last-modified-time` and
 /// `x-amz-if-match-size` conditional headers in conjunction with each-other or individually"
 /// (`$IfMatchSize`): every member the request carries has to hold, so one failing condition
-/// refuses the delete.
+/// refuses the delete and is the one the refusal's `<Condition>` names.
 ///
 /// The `If-Match` value is judged by the one rule every entity-tag precondition in this
 /// module is judged by ([`entity_tag_matches`]): by VALUE, with the wildcard, the weak marker
 /// and the comma-separated list RFC 7232 §3.1 admits.
-pub fn delete_precondition_fails(
+pub fn unmet_delete_precondition(
     held: Option<&Object>,
     if_match: Option<&str>,
     if_match_last_modified_time: Option<SystemTime>,
     if_match_size: Option<i64>,
-) -> bool {
+) -> Option<&'static str> {
     let match_fails = if_match.is_some_and(|expected| {
         held.is_none_or(|object| !entity_tag_matches(expected, &object.etag))
     });
+    if match_fails {
+        return Some(IF_MATCH_CONDITION);
+    }
     let time_fails = if_match_last_modified_time.is_some_and(|expected| {
         held.is_some_and(|object| {
             whole_seconds(object.last_modified) != whole_seconds(expected)
         })
     });
+    if time_fails {
+        return Some(IF_MATCH_LAST_MODIFIED_TIME_CONDITION);
+    }
     let size_fails = if_match_size.is_some_and(|expected| {
         held.is_some_and(|object| {
             i64::try_from(object.body.len()).unwrap_or(i64::MAX) != expected
         })
     });
-    match_fails || time_fails || size_fails
+    size_fails.then_some(IF_MATCH_SIZE_CONDITION)
 }
 
-/// Whether a conditional READ of an object whose entity tag is `etag` and which was last
-/// modified at `last_modified` must be refused, given the `If-Match` and
-/// `If-Unmodified-Since` the request carried.
+/// The conditional READ member a request carries that does NOT hold against an object whose
+/// entity tag is `etag` and which was last modified at `last_modified`, named by its header,
+/// or `None` when every one of them holds.
 ///
 /// The two conditions a read is REFUSED for, as `GetObjectRequest` documents them: "Return
 /// the object only if its entity tag (ETag) is the same as the one specified in this header;
@@ -8452,17 +8476,19 @@ pub fn delete_precondition_fails(
 /// counts as unmodified since it.
 ///
 /// ONE place for the rule, so a GET and a HEAD of the same object cannot disagree about
-/// whether its preconditions hold.
-pub fn read_precondition_fails(
+/// whether its preconditions hold or about which header a refusal names.
+pub fn unmet_read_precondition(
     etag: &str,
     last_modified: SystemTime,
     if_match: Option<&str>,
     if_unmodified_since: Option<SystemTime>,
-) -> bool {
+) -> Option<&'static str> {
     if let Some(expected) = if_match {
-        return etag_value(etag) != etag_value(expected);
+        return (etag_value(etag) != etag_value(expected)).then_some(IF_MATCH_CONDITION);
     }
-    if_unmodified_since.is_some_and(|since| whole_seconds(last_modified) > whole_seconds(since))
+    if_unmodified_since
+        .is_some_and(|since| whole_seconds(last_modified) > whole_seconds(since))
+        .then_some(IF_UNMODIFIED_SINCE_CONDITION)
 }
 
 /// `instant` truncated to whole seconds since the epoch, the resolution an HTTP date carries
@@ -8613,22 +8639,22 @@ pub fn unmet_copy_source_precondition(
         .unwrap_or(i64::MAX);
     if let Some(header) = conditions.if_match {
         if !entity_tag_matches(header, &source.etag) {
-            return Some("x-amz-copy-source-if-match");
+            return Some(COPY_SOURCE_IF_MATCH_CONDITION);
         }
     } else if let Some(since) = conditions.if_unmodified_since {
         // "Copies the object if it hasn't been modified since the specified time."
         if modified_at > since {
-            return Some("x-amz-copy-source-if-unmodified-since");
+            return Some(COPY_SOURCE_IF_UNMODIFIED_SINCE_CONDITION);
         }
     }
     if let Some(header) = conditions.if_none_match {
         if entity_tag_matches(header, &source.etag) {
-            return Some("x-amz-copy-source-if-none-match");
+            return Some(COPY_SOURCE_IF_NONE_MATCH_CONDITION);
         }
     } else if let Some(since) = conditions.if_modified_since {
         // "Copies the object if it has been modified since the specified time."
         if modified_at <= since {
-            return Some("x-amz-copy-source-if-modified-since");
+            return Some(COPY_SOURCE_IF_MODIFIED_SINCE_CONDITION);
         }
     }
     None
@@ -11362,6 +11388,47 @@ pub const PRECONDITION_FAILED_MESSAGE: &str =
 /// The HTTP status [`PRECONDITION_FAILED_CODE`] is rendered with: 412, from the same
 /// list ("412 Precondition Failed").
 pub const PRECONDITION_FAILED_STATUS: u16 = 412;
+
+/// The `<Condition>` S3's `PreconditionFailed` document names the conditional header that
+/// did not hold by, for each conditional member this service judges.
+///
+/// The message that code carries is FIXED ([`PRECONDITION_FAILED_MESSAGE`]) and states that
+/// "at least one" condition failed, so the member is what says WHICH one — and its value is
+/// the request HEADER the failing member is bound to, as the model binds it
+/// (`smithy_query(query="operation",operation="GetObject,PutObject,DeleteObject,CopyObject")`
+/// reports `IfMatch: {httpHeader: "If-Match"}`, `IfNoneMatch: {httpHeader: "If-None-Match"}`,
+/// `IfUnmodifiedSince: {httpHeader: "If-Unmodified-Since"}`,
+/// `IfMatchLastModifiedTime: {httpHeader: "x-amz-if-match-last-modified-time"}`,
+/// `IfMatchSize: {httpHeader: "x-amz-if-match-size"}` and the four `CopySourceIf*` members),
+/// which is the name the client wrote on the request it has to change.
+///
+/// The copy-source conditions carry S3's `x-amz-copy-source-` prefix in front of the
+/// standard HTTP condition's own canonical spelling, which is how S3's document words them;
+/// a header S3 defines itself ([`IF_MATCH_LAST_MODIFIED_TIME_CONDITION`] and
+/// [`IF_MATCH_SIZE_CONDITION`], and the annotation operations'
+/// [`OBJECT_IF_MATCH_CONDITION`]) has no canonical HTTP spelling and is named as the model
+/// publishes it.
+pub const IF_MATCH_CONDITION: &str = "If-Match";
+/// See [`IF_MATCH_CONDITION`].
+pub const IF_NONE_MATCH_CONDITION: &str = "If-None-Match";
+/// See [`IF_MATCH_CONDITION`].
+pub const IF_UNMODIFIED_SINCE_CONDITION: &str = "If-Unmodified-Since";
+/// See [`IF_MATCH_CONDITION`].
+pub const IF_MATCH_LAST_MODIFIED_TIME_CONDITION: &str = "x-amz-if-match-last-modified-time";
+/// See [`IF_MATCH_CONDITION`].
+pub const IF_MATCH_SIZE_CONDITION: &str = "x-amz-if-match-size";
+/// See [`IF_MATCH_CONDITION`].
+pub const COPY_SOURCE_IF_MATCH_CONDITION: &str = "x-amz-copy-source-If-Match";
+/// See [`IF_MATCH_CONDITION`].
+pub const COPY_SOURCE_IF_NONE_MATCH_CONDITION: &str = "x-amz-copy-source-If-None-Match";
+/// See [`IF_MATCH_CONDITION`].
+pub const COPY_SOURCE_IF_MODIFIED_SINCE_CONDITION: &str = "x-amz-copy-source-If-Modified-Since";
+/// See [`IF_MATCH_CONDITION`].
+pub const COPY_SOURCE_IF_UNMODIFIED_SINCE_CONDITION: &str =
+    "x-amz-copy-source-If-Unmodified-Since";
+/// See [`IF_MATCH_CONDITION`] — the header the annotation operations bind their own
+/// conditional member from (`PutObjectAnnotationRequest$ObjectIfMatch`).
+pub const OBJECT_IF_MATCH_CONDITION: &str = "x-amz-object-if-match";
 /// The code S3 answers a read of a bucket that has no ownership controls associated with
 /// it, with HTTP 404 — the case `GetBucketOwnershipControls`'s own documentation describes
 /// ("A bucket doesn't have OwnershipControls settings in the following cases: … You've

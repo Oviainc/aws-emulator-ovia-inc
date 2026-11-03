@@ -309,16 +309,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // judged against the entity tag of the version just addressed, and BEFORE anything
         // is removed, so a request whose precondition does not hold leaves the object's
         // annotations exactly as they were. S3 answers a precondition that does not hold
-        // `PreconditionFailed` (412), a code this model carries no shape for.
+        // `PreconditionFailed` (412), a code this model carries no shape for, naming the
+        // header that did not hold in its `<Condition>`.
         if input
             .object_if_match
             .as_deref()
             .is_some_and(|expected| expected != object.etag)
         {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::PRECONDITION_FAILED_CODE,
-                crate::state::PRECONDITION_FAILED_STATUS,
-                crate::state::PRECONDITION_FAILED_MESSAGE,
+            return Err(crate::scaffolded::Scaffolded::precondition_failed(
+                crate::state::OBJECT_IF_MATCH_CONDITION,
             ));
         }
 

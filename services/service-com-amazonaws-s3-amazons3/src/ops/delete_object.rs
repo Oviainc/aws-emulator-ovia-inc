@@ -14,7 +14,7 @@
 //! `x-amz-if-match-size` is CONDITIONAL on the version it addresses still being the one
 //! those members describe: it is carried out when every condition holds and refused with
 //! HTTP 412 `PreconditionFailed` when one does not
-//! ([`crate::state::delete_precondition_fails`] carries the rule), taking nothing away.
+//! ([`crate::state::unmet_delete_precondition`] carries the rule), taking nothing away.
 //!
 //! A delete that really would remove a stored version is subject to S3 OBJECT LOCK: while a
 //! legal hold is on that version, or its retention period is still running, the delete is
@@ -371,7 +371,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
         // The conditional members, judged against the version this delete ADDRESSES — the
         // delete is what they make conditional, so they are judged here, before anything is
         // taken away, through the one rule every conditional delete in this service is
-        // judged by ([`crate::state::delete_precondition_fails`]). A refused delete removes
+        // judged by ([`crate::state::unmet_delete_precondition`]). A refused delete removes
         // nothing and lays no marker, so the version stays exactly as it was and the caller
         // can read its tag, its size and its last-modified time and retry: this is the
         // compare-and-delete half of the compare-and-write pair `PutObject`'s own
@@ -408,7 +408,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
                     .stored_version(&input.key, version_id)
                     .and_then(|held| held.as_object()),
             };
-            if crate::state::delete_precondition_fails(
+            if let Some(condition) = crate::state::unmet_delete_precondition(
                 addressed,
                 input.if_match.as_deref(),
                 input
@@ -417,11 +417,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
                     .and_then(crate::state::instant_of),
                 input.if_match_size,
             ) {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::PRECONDITION_FAILED_CODE,
-                    crate::state::PRECONDITION_FAILED_STATUS,
-                    crate::state::PRECONDITION_FAILED_MESSAGE,
-                ));
+                return Err(crate::scaffolded::Scaffolded::precondition_failed(condition));
             }
         }
 

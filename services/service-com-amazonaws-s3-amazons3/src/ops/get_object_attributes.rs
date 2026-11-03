@@ -309,10 +309,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Not Allowed error" (`GetObject`, whose options this read shares): a marker holds
         // no attributes to report.
         if version_id.is_some() && held.is_some_and(|held| held.as_delete_marker().is_some()) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::METHOD_NOT_ALLOWED_CODE,
-                405,
-                crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+            return Err(crate::scaffolded::Scaffolded::method_not_allowed(
+                ATTRIBUTES_METHOD,
+                crate::state::DELETE_MARKER_RESOURCE_TYPE,
             ));
         }
         let Some(object) = held.and_then(crate::state::StoredVersion::as_object) else {
@@ -551,6 +550,12 @@ const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
 /// The status every not-found this read answers carries, the one `NoSuchKey` declares in
 /// the model.
 const NOT_FOUND_STATUS: u16 = 404;
+
+/// The HTTP method this operation is bound to — "GET"
+/// (`smithy_query(query="operation",operation="GetObjectAttributes")` reports
+/// `http {method: "GET", uri: "/{Bucket}/{Key+}?attributes"}`) — what a `MethodNotAllowed`
+/// document reports as the `<Method>` it refused.
+const ATTRIBUTES_METHOD: &str = "GET";
 
 /// The most parts one page of an object's parts may carry: the same 1,000 a page of an
 /// upload's parts carries ("The ListParts request returns a maximum of 1,000 uploaded parts.

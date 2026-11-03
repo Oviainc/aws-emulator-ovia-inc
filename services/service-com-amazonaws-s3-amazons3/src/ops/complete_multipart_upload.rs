@@ -417,7 +417,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
         // The parts are assembled "in ascending order by part number", so the list has to
         // BE in that order: a number that does not rise above the one before it — a
         // descending pair or the same number twice — is `InvalidPartOrder` (400). Judged
-        // before the upload is looked at, because it is a property of the request alone.
+        // before the upload is looked at, because it is a property of the request alone. The
+        // refusal is about the upload the request addressed, so its document names that
+        // upload the way every upload-scoped refusal here does.
         let mut previous: Option<i32> = None;
         for named in named_parts {
             let number = named.part_number.unwrap_or_default();
@@ -426,7 +428,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
                     INVALID_PART_ORDER_CODE,
                     INVALID_PART_ORDER_STATUS,
                     INVALID_PART_ORDER_MESSAGE,
-                ));
+                )
+                .naming_upload(&input.upload_id));
             }
             previous = Some(number);
         }
@@ -467,23 +470,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
         // The entity tags are compared by VALUE: a client may send the tag back with or
         // without the double quotes HTTP's quoted-string syntax wraps it in, and both name
         // the same part.
+        //
+        // Either refusal is about ONE part, so its document names that part — the upload, the
+        // number and the tag the request named it by, which are the three values a caller
+        // re-uploads it under. The tag goes out as its own VALUE
+        // ([`crate::state::etag_value`], the form the comparison below is made on and the
+        // form every document that carries the tag as a value rather than as the `ETag`
+        // header carries it in), so what the envelope reports does not depend on whether the
+        // client wrapped the tag it sent in HTTP's quoted-string syntax.
         let mut assembled: Vec<&[u8]> = Vec::with_capacity(named_parts.len());
         for (position, named) in named_parts.iter().enumerate() {
             let number = named.part_number.unwrap_or_default();
-            let Some(held) = upload.part(number) else {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
+            let named_etag = crate::state::etag_value(named.e_tag.as_deref().unwrap_or_default());
+            let invalid_part = || {
+                crate::scaffolded::Scaffolded::unmodeled(
                     INVALID_PART_CODE,
                     INVALID_PART_STATUS,
                     INVALID_PART_MESSAGE,
-                ));
+                )
+                .naming_part(&input.upload_id, number, named_etag)
             };
-            let named_etag = named.e_tag.as_deref().unwrap_or_default();
-            if crate::state::etag_value(named_etag) != crate::state::etag_value(&held.etag) {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    INVALID_PART_CODE,
-                    INVALID_PART_STATUS,
-                    INVALID_PART_MESSAGE,
-                ));
+            let Some(held) = upload.part(number) else {
+                return Err(invalid_part());
+            };
+            if named_etag != crate::state::etag_value(&held.etag) {
+                return Err(invalid_part());
             }
             // "Part size: 5 MiB to 5 GiB. There is no minimum size limit on the last part of
             // your multipart upload" (Amazon S3 User Guide, Amazon S3 multipart upload
@@ -491,12 +502,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
             // the one that is exempt. A smaller part anywhere else is `EntityTooSmall` (400),
             // which is why a part is judged against this ceiling at completion rather than
             // when it was uploaded: nothing knows which part is last until this list says so.
+            //
+            // The refusal's document carries the two sizes the caller has to reconcile — the
+            // part's own, and the floor it was judged against — beside the number and tag
+            // that say WHICH part to resize, because the message states neither.
             let last = position + 1 == named_parts.len();
             if !last && held.body.len() < crate::state::MIN_MULTIPART_PART_BYTES {
                 return Err(crate::scaffolded::Scaffolded::unmodeled(
                     ENTITY_TOO_SMALL_CODE,
                     ENTITY_TOO_SMALL_STATUS,
                     ENTITY_TOO_SMALL_MESSAGE,
+                )
+                .naming_part_size(
+                    number,
+                    named_etag,
+                    i64::try_from(held.body.len()).unwrap_or(i64::MAX),
+                    i64::try_from(crate::state::MIN_MULTIPART_PART_BYTES).unwrap_or(i64::MAX),
                 ));
             }
             assembled.push(&held.body);
@@ -580,24 +601,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
         // they make conditional, so they are judged here, immediately before it, rather than
         // on anything the parts were uploaded against, and through the one rule every
         // conditional write in this service is judged by
-        // ([`crate::state::write_precondition_fails`], which carries each member's own
-        // documentation of the condition and of the 412 it answers).
+        // ([`crate::state::unmet_write_precondition`], which carries each member's own
+        // documentation of the condition and of the 412 it answers, and names the header that
+        // did not hold).
         //
         // A refused completion leaves the upload in progress with every part it held, so the
         // caller can read the object's tag and retry.
         let held_etag = bucket_record
             .object(&input.key)
             .map(|object| object.etag.clone());
-        if crate::state::write_precondition_fails(
+        if let Some(condition) = crate::state::unmet_write_precondition(
             held_etag.as_deref(),
             input.if_match.as_deref(),
             input.if_none_match.as_deref(),
         ) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::PRECONDITION_FAILED_CODE,
-                crate::state::PRECONDITION_FAILED_STATUS,
-                crate::state::PRECONDITION_FAILED_MESSAGE,
-            ));
+            return Err(crate::scaffolded::Scaffolded::precondition_failed(condition));
         }
 
         // Everything else about the object is what the INITIATING request settled — "when
@@ -797,9 +815,11 @@ const ENTITY_TOO_SMALL_CODE: &str = "EntityTooSmall";
 /// See [`ENTITY_TOO_SMALL_CODE`].
 const ENTITY_TOO_SMALL_STATUS: u16 = 400;
 /// The `<Message>` S3 sends with that code — the FIXED text it carries whichever part of
-/// the list was too small, and whatever the minimum it was judged against is (the sizes S3
+/// the list was too small, and whatever the minimum it was judged against is; the sizes S3
 /// reports beside it travel in the `MinSizeAllowed`, `ProposedSize`, `PartNumber` and `ETag`
-/// members of the error document, which this service's model declares no shape for).
+/// members of the error document, which the error channel attaches
+/// ([`crate::scaffolded::Scaffolded::naming_part_size`]) because no shape in this model
+/// declares them.
 const ENTITY_TOO_SMALL_MESSAGE: &str = "Your proposed upload is smaller than the minimum allowed size";
 
 /// The feature `input` asks for that this emulator does not serve, if any — named for the

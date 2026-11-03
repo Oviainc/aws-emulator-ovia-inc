@@ -249,6 +249,8 @@ mod public_access_guardrails;
 mod refusal_class_fidelity;
 #[path = "all/refusal_codes.rs"]
 mod refusal_codes;
+#[path = "all/refusal_detail_members.rs"]
+mod refusal_detail_members;
 #[path = "all/request_integrity_headers.rs"]
 mod request_integrity_headers;
 #[path = "all/refusal_messages_published.rs"]

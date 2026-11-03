@@ -25,7 +25,8 @@
 //! the copy rather than a member being dropped:
 //!
 //! * the four `x-amz-copy-source-if-*` preconditions are judged against the stored source
-//!   version, and one that does not hold answers HTTP 412 `PreconditionFailed` and writes
+//!   version, and one that does not hold answers HTTP 412 `PreconditionFailed`, names the
+//!   member that did not hold in its `<Condition>` and writes
 //!   nothing — including the two combinations the members document, where the entity-tag
 //!   member decides and the date member beside it is ignored;
 //! * a source whose storage class is `GLACIER` or `DEEP_ARCHIVE` has to be restored first
@@ -929,10 +930,22 @@ async fn a_copy_source_precondition_that_does_not_hold_answers_412_and_writes_no
                 "case {case:?}: expected the PreconditionFailed code, got {:?}",
                 copied.error_code()
             );
-            assert!(
-                copied.error_message().contains("x-amz-copy-source-if"),
-                "case {case:?}: the refusal must name the member it refused, got {:?}",
+            assert_eq!(
+                copied.error_message(),
+                "At least one of the pre-conditions you specified did not hold",
+                "case {case:?}: expected the fixed sentence the code publishes, got {:?}",
                 copied.error_message()
+            );
+            // WHICH member did not hold is the envelope's `<Condition>`, where S3 states it
+            // — the sentence above is the same for every condition that fails.
+            assert!(
+                copied
+                    .element("Condition")
+                    .is_some_and(|condition| condition.starts_with("x-amz-copy-source-If")),
+                "case {case:?}: the refusal must name the member it refused in its \
+                 <Condition>, got {:?} in {:?}",
+                copied.element("Condition"),
+                text(&copied)
             );
             let absent = get_object(&router, "copy-precondition-target", &key, "", &[]).await;
             assert_eq!(

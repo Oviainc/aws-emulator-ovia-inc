@@ -357,10 +357,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObjectAcl<Eng>
                 .stored_version(&input.key, named)
                 .is_some_and(|stored| stored.as_delete_marker().is_some())
         }) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::METHOD_NOT_ALLOWED_CODE,
-                crate::state::METHOD_NOT_ALLOWED_STATUS,
-                crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+            return Err(crate::scaffolded::Scaffolded::method_not_allowed(
+                OBJECT_ACL_WRITE_METHOD,
+                crate::state::DELETE_MARKER_RESOURCE_TYPE,
             ));
         }
         // "Version ID used to reference a specific version of the object"
@@ -650,6 +649,12 @@ const ACCESS_DENIED_CODE: &str = "AccessDenied";
 const ACCESS_DENIED_STATUS: u16 = 403;
 /// See [`ACCESS_DENIED_CODE`].
 const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// The HTTP method this operation is bound to — "PUT"
+/// (`smithy_query(query="operation",operation="PutObjectAcl")` reports
+/// `http {method: "PUT", uri: "/{Bucket}/{Key+}?acl"}`) — what a `MethodNotAllowed`
+/// document reports as the `<Method>` it refused.
+const OBJECT_ACL_WRITE_METHOD: &str = "PUT";
 
 /// The IAM action this operation is performed under — `s3:<OperationName>`, as the IAM
 /// Service Authorization Reference names the actions of Amazon S3 — which is what a refusal
