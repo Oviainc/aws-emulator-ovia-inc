@@ -57,6 +57,8 @@ mod poll_for_activity_task;
 mod poll_for_decision_task;
 #[path = "all/poller_cap_limit_message.rs"]
 mod poller_cap_limit_message;
+#[path = "all/record_activity_task_heartbeat.rs"]
+mod record_activity_task_heartbeat;
 #[path = "all/request_cancel_workflow_execution.rs"]
 mod request_cancel_workflow_execution;
 #[path = "all/respond_decision_task_completed.rs"]

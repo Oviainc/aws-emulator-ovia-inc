@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RecordActivityTaskHeartbeat
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RecordActivityTaskHeartbeat`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RecordActivityTaskHeartbeat::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An activity worker's progress report on the task its `taskToken` is the handle on:
+//! the call "resets the taskHeartbeatTimeout clock", so the task's own
+//! `heartbeatTimeout` runs from this instant and the `details` reported here is what the
+//! `ActivityTaskTimedOut` event carries if the task does later time out, and it "doesn't
+//! in itself create an event in the workflow execution history", so the run's history
+//! and its open-task counts are left exactly as they were.
+//!
+//! The answer is read from the same stored history: `cancelRequested` is "set to true if
+//! cancellation of the task is requested", which is the `ActivityTaskCancelRequested`
+//! event a `RequestCancelActivityTask` decision recorded against this task — a task a
+//! worker already holds is told through its heartbeat rather than cancelled outright. A
+//! handle on a task that is no longer open — closed by its worker, timed out, or
+//! belonging to a run that has closed — answers the modelled `UnknownResourceFault`, as
+//! the terminal responses do. The report itself lives in
+//! [`crate::state::ComAmazonawsSwfSimpleworkflowserviceState::record_activity_task_heartbeat`].
 //!
 //! ## Shape of an operation
 //!
@@ -169,20 +176,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RecordActivityTaskHeartbeat` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RecordActivityTaskHeartbeatErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RecordActivityTaskHeartbeat"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // The model declares no server fault for this operation, and
+            // `OperationNotPermittedFault` is this service's common error: the request
+            // cannot be served, and saying so with a modelled code beats a 501, which
+            // would claim the operation is unwritten.
+            RecordActivityTaskHeartbeatErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the SWF domain store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let reported_at = crate::state::now();
+        let mut guard = state.lock();
+        // The report: it resolves the token against the stored history, refuses a handle
+        // on a task that is no longer open, resets that task's heartbeat clock to this
+        // instant along with the progress the worker described, and appends no event.
+        let cancel_requested = guard
+            .record_activity_task_heartbeat(
+                &input.task_token,
+                // "If specified, contains details about the progress of the task."
+                input.details,
+                reported_at,
+            )
+            .map_err(|message| {
+                RecordActivityTaskHeartbeatErrorModeled::UnknownResourceFault(
+                    UnknownResourceFault {
+                        message: Some(message),
+                    },
+                )
+            })?;
+
+        Ok(RecordActivityTaskHeartbeatOutput {
+            // "Set to true if cancellation of the task is requested." A worker that can
+            // cancel the activity then responds with `RespondActivityTaskCanceled`.
+            cancel_requested,
+        })
     }
 }

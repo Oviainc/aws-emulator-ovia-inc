@@ -1343,6 +1343,27 @@ pub struct Execution {
     /// (`RespondDecisionTaskCompleted`'s `taskListScheduleToStartTimeout`); `None` when
     /// the run's task list is simply the one it runs under.
     pub task_list_override: Option<TaskListOverride>,
+    /// The LAST progress report a worker made about one activity task of this run,
+    /// keyed by the `eventId` of the `ActivityTaskStarted` event the task's token is
+    /// derived from. Written by `RecordActivityTaskHeartbeat`, which "resets the
+    /// taskHeartbeatTimeout clock" and "doesn't in itself create an event in the
+    /// workflow execution history" — so the report lives here rather than in `history`,
+    /// and the entry of a task that has closed is dropped with it.
+    pub activity_task_heartbeats: HashMap<i64, ActivityTaskHeartbeat>,
+}
+
+/// One `RecordActivityTaskHeartbeat` call's lasting effect on the activity task it
+/// reported progress for.
+#[derive(Debug, Clone)]
+pub struct ActivityTaskHeartbeat {
+    /// When the report was made — the instant the task's `heartbeatTimeout` is measured
+    /// from from then on, because the call "resets the taskHeartbeatTimeout clock".
+    pub at: DateTime,
+    /// The `details` the worker reported ("If specified, contains details about the
+    /// progress of the task"), which `ActivityTaskTimedOut` carries if the task does
+    /// time out: its own `details` is "the content of the details parameter for the last
+    /// call made by the activity to RecordActivityTaskHeartbeat".
+    pub details: Option<String>,
 }
 
 /// A `taskList` override a decider asked for WITH a
@@ -1512,6 +1533,9 @@ impl Execution {
         // still outstanding at the instant the run closes, so it stays counted.
         let child_policy = self.effective_config.child_policy.clone();
         self.append_event(at, close.event(child_policy));
+        // No task of a closed run can time out or report again, so the progress reports
+        // kept only to measure a live task's heartbeat clock are dropped with the run.
+        self.activity_task_heartbeats.clear();
     }
 
     /// Whether this run's history can take `events` more events and still hold the one
@@ -1759,16 +1783,19 @@ impl Execution {
     /// Each of the four modelled `ActivityTaskTimeoutType`s is the task's OWN duration,
     /// resolved when it was scheduled, measured from the instant that duration started
     /// running: `scheduleToStartTimeout` and `scheduleToCloseTimeout` from the
-    /// `ActivityTaskScheduled` event, `startToCloseTimeout` and `heartbeatTimeout` from
-    /// the `ActivityTaskStarted` event that handed the task to a worker — so a task is
-    /// timed out at the instant its earliest due deadline ran out, whether or not anybody
-    /// polls, and the `ActivityTaskTimedOut` event is stamped there. The decider is told
-    /// by the decision task that event schedules.
+    /// `ActivityTaskScheduled` event, `startToCloseTimeout` from the `ActivityTaskStarted`
+    /// event that handed the task to a worker, and `heartbeatTimeout` from that worker's
+    /// last progress report ([`Execution::activity_task_heartbeats`]), or from the same
+    /// started event while it has made none, because a heartbeat "resets the
+    /// taskHeartbeatTimeout clock" — so a task is timed out at the instant its earliest
+    /// due deadline ran out, whether or not anybody polls, and the `ActivityTaskTimedOut`
+    /// event is stamped there. The decider is told by the decision task that event
+    /// schedules.
     pub fn expire_due_activity_tasks(&mut self, now: DateTime) -> usize {
         if !self.is_open() {
             return 0;
         }
-        let mut due: Vec<(DateTime, &'static str, i64, i64)> = Vec::new();
+        let mut due: Vec<(DateTime, &'static str, i64, i64, Option<String>)> = Vec::new();
         for event in self.waiting_activity_tasks() {
             let Some(scheduled) = self.scheduled_activity_task(event.event_id) else {
                 continue;
@@ -1787,7 +1814,9 @@ impl Execution {
             ];
             if let Some((at, timeout_type)) = earliest_due(event.event_timestamp, &deadlines, now)
             {
-                due.push((at, timeout_type, event.event_id, 0));
+                // A task still waiting in its list has no worker, so no worker has
+                // reported progress on it either.
+                due.push((at, timeout_type, event.event_id, 0, None));
             }
         }
         for (scheduled_event_id, started_event_id, started_at) in self.outstanding_activity_tasks()
@@ -1801,36 +1830,54 @@ impl Execution {
                 .find(|event| event.event_id == scheduled_event_id)
                 .map_or(started_at, |event| event.event_timestamp);
             // The schedule-to-close budget covers the whole task, so it keeps running
-            // after a worker takes it; the other two start when the worker does.
+            // after a worker takes it; start-to-close starts when the worker does.
             let from_schedule = [(
                 ACTIVITY_TASK_TIMEOUT_SCHEDULE_TO_CLOSE,
                 scheduled.schedule_to_close_timeout.as_deref(),
             )];
-            let from_start = [
-                (
-                    ACTIVITY_TASK_TIMEOUT_START_TO_CLOSE,
-                    scheduled.start_to_close_timeout.as_deref(),
-                ),
-                (
-                    ACTIVITY_TASK_TIMEOUT_HEARTBEAT,
-                    scheduled.heartbeat_timeout.as_deref(),
-                ),
-            ];
+            let from_start = [(
+                ACTIVITY_TASK_TIMEOUT_START_TO_CLOSE,
+                scheduled.start_to_close_timeout.as_deref(),
+            )];
+            // The heartbeat budget is the only one a worker can push back: each
+            // `RecordActivityTaskHeartbeat` call "resets the taskHeartbeatTimeout
+            // clock", so it runs from the last report the worker made, and from the
+            // instant it was handed the task while it has made none.
+            let heartbeat = self
+                .activity_task_heartbeats
+                .get(&started_event_id)
+                .map(|reported| (reported.at, reported.details.clone()))
+                .unwrap_or((started_at, None));
+            let from_heartbeat = [(
+                ACTIVITY_TASK_TIMEOUT_HEARTBEAT,
+                scheduled.heartbeat_timeout.as_deref(),
+            )];
             let earliest = [
                 earliest_due(scheduled_at, &from_schedule, now),
                 earliest_due(started_at, &from_start, now),
+                earliest_due(heartbeat.0, &from_heartbeat, now),
             ]
             .into_iter()
             .flatten()
             .min_by_key(|(at, _)| instant_key(*at));
             if let Some((at, timeout_type)) = earliest {
-                due.push((at, timeout_type, scheduled_event_id, started_event_id));
+                // Whatever the task timed out under, the event reports the progress its
+                // worker last reported.
+                due.push((
+                    at,
+                    timeout_type,
+                    scheduled_event_id,
+                    started_event_id,
+                    heartbeat.1,
+                ));
             }
         }
-        due.sort_by_key(|(at, _, scheduled_event_id, _)| (instant_key(*at), *scheduled_event_id));
+        due.sort_by_key(|(at, _, scheduled_event_id, _, _)| {
+            (instant_key(*at), *scheduled_event_id)
+        });
 
         let recorded = due.len();
-        for (at, timeout_type, scheduled_event_id, started_event_id) in due {
+        for (at, timeout_type, scheduled_event_id, started_event_id, details) in due {
             // The timeout and the decision task telling the decider about it are two
             // events, and a run with no room for them has reached the history quota: it
             // is left for the writer that finds it to close rather than grown past the
@@ -1847,9 +1894,12 @@ impl Execution {
                     // `details` carries "the content of the details parameter for the
                     // last call made by the activity to RecordActivityTaskHeartbeat",
                     // so a task whose worker reported no progress carries none.
-                    details: None,
+                    details,
                 }),
             );
+            // The task is closed, so the progress report kept for its heartbeat clock
+            // has nothing left to time out.
+            self.activity_task_heartbeats.remove(&started_event_id);
             self.open_activity_tasks = self.open_activity_tasks.saturating_sub(1);
             self.schedule_decision_task_if_idle(at);
         }
@@ -2623,6 +2673,7 @@ impl Domain {
             parent,
             parent_initiated_event_id,
             task_list_override: None,
+            activity_task_heartbeats: HashMap::new(),
         };
 
         execution.append_event(
@@ -3094,10 +3145,68 @@ impl ComAmazonawsSwfSimpleworkflowserviceState {
         // `openActivityTasks` is "The count of activity tasks whose status is OPEN", and
         // this report is what took this one out of flight.
         execution.open_activity_tasks = execution.open_activity_tasks.saturating_sub(1);
+        // The task is closed, so the progress its worker reported through its heartbeat
+        // has no clock left to reset.
+        execution
+            .activity_task_heartbeats
+            .remove(&handle.started_event_id);
         // The decider has to act on the result, and the decision task scheduled here is
         // what carries it to one.
         execution.schedule_decision_task_if_idle(at);
         Ok(())
+    }
+
+    /// Record a worker's PROGRESS report about the activity task `token` is the handle
+    /// on, as of `at`, and answer whether a cancellation is being attempted for that
+    /// task.
+    ///
+    /// `RecordActivityTaskHeartbeat`'s two documented effects, and nothing else: the
+    /// call "resets the taskHeartbeatTimeout clock", so the task's `heartbeatTimeout`
+    /// runs from `at` from now on and the `details` reported here is what an
+    /// `ActivityTaskTimedOut` event would carry; and it "doesn't in itself create an
+    /// event in the workflow execution history", so no event is appended, the task stays
+    /// open and the decider is told nothing. `Ok` carries `cancelRequested`, "set to true
+    /// if cancellation of the task is requested" — which is what a
+    /// `RequestCancelActivityTask` decision recorded against this task asked for, since a
+    /// task a worker already holds "is told through its heartbeat" rather than cancelled
+    /// outright.
+    ///
+    /// `Err` carries the `UnknownResourceFault` message for a token that addresses no
+    /// OPEN activity task, exactly as [`Self::close_activity_task`] does: the two calls
+    /// resolve the same kind of handle against the same stored history, so a handle that
+    /// is stale for one is stale for the other. Nothing is written in that case.
+    pub fn record_activity_task_heartbeat(
+        &mut self,
+        token: &str,
+        details: Option<String>,
+        at: DateTime,
+    ) -> Result<bool, String> {
+        let Some(handle) = activity_task_by_token(self, token) else {
+            // The token names no `ActivityTaskStarted` event of any stored run, so there
+            // is no scheduling event of this service's state behind it either.
+            return Err(unknown_activity_message(0));
+        };
+        let unknown = unknown_activity_message(handle.scheduled_event_id);
+        // The service's own sweeps first: a task the clock timed out, or a run it closed,
+        // was over at its own instant whether or not this worker called, so a heartbeat
+        // that lost that race is refused instead of reviving a task that is gone.
+        self.materialise_due_timeouts_in(&handle.domain, at);
+        let Some(domain) = self.domains.get_mut(&handle.domain) else {
+            return Err(unknown);
+        };
+        let key = (handle.workflow_id.clone(), handle.run_id.clone());
+        let Some(execution) = domain.executions.get_mut(&key) else {
+            return Err(unknown);
+        };
+        if !execution.is_open() || !execution.activity_task_is_outstanding(handle.started_event_id)
+        {
+            return Err(unknown);
+        }
+        execution.activity_task_heartbeats.insert(
+            handle.started_event_id,
+            ActivityTaskHeartbeat { at, details },
+        );
+        Ok(execution.latest_cancel_requested_event_id(handle.scheduled_event_id) != 0)
     }
 }
 
