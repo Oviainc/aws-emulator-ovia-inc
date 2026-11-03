@@ -15,9 +15,9 @@
 //!    version cannot be reused — that is the modelled `ConflictException`. Rows differ
 //!    along the shape of the replacement document.
 //! 3. A lens that cannot carry a version refuses the publish and records nothing: an
-//!    Amazon Web Services official lens is a 400, a `LensAlias` naming no stored custom
-//!    lens is a 404, and so is a lens whose first import has not landed yet. The
-//!    modelled `LensVersion` length bounds are refused at the boundary.
+//!    Amazon Web Services official lens is a 400 and a `LensAlias` naming no stored
+//!    custom lens is a 404. The modelled `LensVersion` length bounds are refused at the
+//!    boundary.
 //! 4. The publish is idempotent per `ClientRequestToken`: the same token with the same
 //!    parameters reports the version the original request published, and with different
 //!    parameters is a 409 that publishes nothing.
@@ -64,8 +64,7 @@ pub(crate) async fn create_version(
         .await
 }
 
-/// Import `document` as a fresh custom lens and answer its ARN. The caller waits for the
-/// import to land itself, so a table can import every row's lens before waiting once.
+/// Import `document` as a fresh custom lens and answer its ARN.
 async fn import_lens(client: &Client, case: &str, document: &str) -> String {
     let answer = import(client, document, None, &format!("import-{case}"), None).await;
     imported_arn(&answer, case)
@@ -73,8 +72,8 @@ async fn import_lens(client: &Client, case: &str, document: &str) -> String {
 
 /// The versions a stored lens holds, by name, straight from the shared state — the lens
 /// record is where a published version lives, and nothing over the wire enumerates every
-/// version of a lens yet (`GetLens` reports the version its CURRENT content is published
-/// as, and `ListLensVersions` is not an operation of this service).
+/// version of a lens yet (`GetLens` reports ONE version of it, and `ListLensVersions` is
+/// not an operation of this service).
 fn stored_versions(client: &Client, alias: &str) -> Vec<String> {
     let store = client.store();
     let store = store.lock();
@@ -393,11 +392,11 @@ async fn publishing_is_refused_for_a_lens_that_cannot_carry_a_version() {
     let client = Client::new();
     let document = lens_document("Refusal lens", None, &[("governance", 1, 2)]).to_string();
 
-    // A lens whose FIRST import is still in flight: there is no landed draft to publish.
-    let in_flight = import_lens(&client, "in-flight", &document).await;
+    // A lens this account really holds, which every refusal below must leave alone.
+    let stored = import_lens(&client, "stored", &document).await;
     // A custom ARN that agrees on the lens id and disagrees on the owning account names
     // a different lens, so it resolves to nothing.
-    let other_account = in_flight.replacen(
+    let other_account = stored.replacen(
         &format!(":{}:", engine::emulator_account_id()),
         ":210987654321:",
         1,
@@ -429,12 +428,6 @@ async fn publishing_is_refused_for_a_lens_that_cannot_carry_a_version() {
             404,
             "ResourceNotFoundException",
         ),
-        (
-            "import-still-in-flight",
-            in_flight.clone(),
-            404,
-            "ResourceNotFoundException",
-        ),
     ];
 
     for (case, alias, status, error_code) in &cases {
@@ -450,33 +443,24 @@ async fn publishing_is_refused_for_a_lens_that_cannot_carry_a_version() {
         );
     }
 
-    // The refused publishes recorded nothing: once the import lands, the lens still has
-    // no version, and the token a refused request carried is free to publish.
-    wait_for_the_import_to_land();
+    // The refused publishes recorded nothing: the lens this account holds still has no
+    // version, and a request naming IT publishes.
     assert!(
-        stored_versions(&client, &in_flight).is_empty(),
+        stored_versions(&client, &stored).is_empty(),
         "a refused publish must record no version, got {:?}",
-        stored_versions(&client, &in_flight)
+        stored_versions(&client, &stored)
     );
-    let accepted = create_version(
-        &client,
-        &in_flight,
-        "1.0",
-        Some(true),
-        "pub-import-still-in-flight",
-    )
-    .await;
+    let accepted = create_version(&client, &stored, "1.0", Some(true), "pub-stored").await;
     assert_eq!(
         accepted.status, 200,
-        "once the import has landed the same request must publish, got {accepted:?}"
+        "the lens this account holds must publish, got {accepted:?}"
     );
 
     // The modelled `LensVersion` bounds — `@length(min: 1, max: 32)` — are refused at the
     // boundary, before the handler: one character past the ceiling, and the empty name.
     let too_long = "9".repeat(33);
     for (case, version) in [("one-past-the-ceiling", too_long.as_str()), ("empty", "")] {
-        let answer =
-            create_version(&client, &in_flight, version, None, &format!("len-{case}")).await;
+        let answer = create_version(&client, &stored, version, None, &format!("len-{case}")).await;
         assert_eq!(
             answer.status, 400,
             "case {case:?}: a LensVersion outside 1..32 must be refused, got {answer:?}"

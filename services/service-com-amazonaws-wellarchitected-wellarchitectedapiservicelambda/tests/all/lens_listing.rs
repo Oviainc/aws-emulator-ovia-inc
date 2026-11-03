@@ -23,8 +23,8 @@
 //!    and the last page carries no token. A token this service did not issue is a 400
 //!    `ValidationException` classified `CANNOT_PARSE`.
 //! 4. A lens is listed from the moment its import is ACCEPTED, and the content the
-//!    listing describes it by is the content that has landed — an update keeps reporting
-//!    the landed document until the new import lands. Listing never changes what the next
+//!    listing describes it by is the content the last ACCEPTED import carried. Listing
+//!    never changes what the next
 //!    caller sees.
 //!
 //! Requests go through the real `MultiServiceRouter`, so routing, restJson1
@@ -137,7 +137,7 @@ fn record_shared_lens(client: &Client, owner: &str, document: &Value) -> String 
                 definition,
                 imported_at: SystemTime::now(),
             }),
-            pending: None,
+            import_completes_at: None,
             versions: BTreeMap::new(),
         },
     );
@@ -843,12 +843,13 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
 }
 
 /// Rule 4. A lens is listed from the moment `ImportLens` accepts it — that call answers
-/// its ARN, so the lens exists — and what the import's instant gates is the CONTENT the
-/// listing describes it by: an UPDATE keeps reporting the landed document until the new
-/// import lands. The handler writes nothing to make that happen; it compares the stored
-/// instant with the clock on every read.
+/// its ARN and records the document it carried, so the lens exists and the listing
+/// describes it by that document at once, while the import's own job still reports
+/// `IN_PROGRESS`. An UPDATE moves the content the listing describes the lens by, and moves
+/// `UpdatedAt` with it while leaving `CreatedAt` where it was. The handler writes nothing
+/// to make the status move; it compares the stored instant with the clock on every read.
 #[tokio::test]
-async fn a_lens_is_listed_from_acceptance_and_described_by_its_landed_content() {
+async fn a_lens_is_listed_from_acceptance_and_described_by_its_imported_content() {
     let client = Client::new();
     let document = lens_document("Landing lens", None, &[("governance", 1, 2)]);
     let answer = import(&client, &document.to_string(), None, "landing", None).await;
@@ -859,8 +860,8 @@ async fn a_lens_is_listed_from_acceptance_and_described_by_its_landed_content() 
         "case \"landing\": an accepted import is IN_PROGRESS, got {answer:?}"
     );
 
-    // While that first import is in flight the lens is already a lens the account has, and
-    // nothing has been published from it, so it is a DRAFT one.
+    // While that first import's job is still in progress the lens is already a lens the
+    // account has, and nothing has been published from it, so it is a DRAFT one.
     for (case, query, expected) in [
         ("in-flight-all", "LensStatus=ALL", true),
         ("in-flight-draft", "LensStatus=DRAFT", true),
@@ -886,32 +887,48 @@ async fn a_lens_is_listed_from_acceptance_and_described_by_its_landed_content() 
         "case \"in-flight-official\": the shipped lens is listed regardless, got {listed:?}"
     );
 
-    wait_for_the_import_to_land();
-    let listed = list(&client, "LensStatus=DRAFT").await;
-    let summary = summary_of(&listed, &lens_arn, "landed");
+    let accepted = summary_of(
+        &list(&client, "LensStatus=DRAFT").await,
+        &lens_arn,
+        "accepted",
+    );
     assert_eq!(
-        member(&summary, "LensName"),
+        member(&accepted, "LensName"),
         document["name"].as_str().unwrap_or_default(),
-        "case \"landed\": the name comes from the imported document, got {summary:?}"
+        "case \"accepted\": the name comes from the imported document, got {accepted:?}"
     );
     assert_eq!(
-        member(&summary, "LensType"),
+        member(&accepted, "LensType"),
         state::LENS_TYPE_CUSTOM_SELF,
-        "case \"landed\": a lens this account imported is CUSTOM_SELF, got {summary:?}"
+        "case \"accepted\": a lens this account imported is CUSTOM_SELF, got {accepted:?}"
     );
     assert_eq!(
-        member(&summary, "LensStatus"),
+        member(&accepted, "LensStatus"),
         state::LENS_STATUS_DRAFT,
-        "case \"landed\": a lens only imported is DRAFT, got {summary:?}"
+        "case \"accepted\": a lens only imported is DRAFT, got {accepted:?}"
     );
     assert_eq!(
-        member(&summary, "LensVersion"),
+        member(&accepted, "LensVersion"),
         state::LENS_VERSION_DRAFT,
-        "case \"landed\": a lens only imported reports its draft as its version, got {summary:?}"
+        "case \"accepted\": a lens only imported reports its draft as its version, got \
+         {accepted:?}"
     );
 
-    // An import OVER that lens: until it lands, the listing still describes the lens by
-    // the content that did land.
+    // The import's job finishing is a status of the IMPORT, so it moves nothing the
+    // listing reports about the lens.
+    wait_for_the_import_to_land();
+    let complete = summary_of(
+        &list(&client, "LensStatus=DRAFT").await,
+        &lens_arn,
+        "import-complete",
+    );
+    assert_eq!(
+        complete, accepted,
+        "case \"import-complete\": the import's own status must not move the listing, got \
+         {complete:?}"
+    );
+
+    // An import OVER that lens: the listing describes the lens by the document it carried.
     let newer = lens_document(
         "Relanded lens",
         Some("the document the second import carries"),
@@ -925,44 +942,31 @@ async fn a_lens_is_listed_from_acceptance_and_described_by_its_landed_content() 
         None,
     )
     .await;
-    let in_flight = summary_of(
+    let updated = summary_of(
         &list(&client, "LensStatus=ALL").await,
         &lens_arn,
-        "update-in-flight",
+        "updated",
     );
     assert_eq!(
-        member(&in_flight, "LensName"),
-        document["name"].as_str().unwrap_or_default(),
-        "case \"update-in-flight\": an import that has not landed does not change the lens's \
-         reported content, got {in_flight:?}"
-    );
-
-    wait_for_the_import_to_land();
-    let landed = summary_of(
-        &list(&client, "LensStatus=ALL").await,
-        &lens_arn,
-        "update-landed",
-    );
-    assert_eq!(
-        member(&landed, "LensName"),
+        member(&updated, "LensName"),
         newer["name"].as_str().unwrap_or_default(),
-        "case \"update-landed\": a landed import is what the lens is described by, got \
-         {landed:?}"
+        "case \"updated\": the accepted import is what the lens is described by, got \
+         {updated:?}"
     );
     assert_eq!(
-        landed.get("Description").and_then(Value::as_str),
+        updated.get("Description").and_then(Value::as_str),
         newer.get("description").and_then(Value::as_str),
-        "case \"update-landed\": the description comes from the landed document, got {landed:?}"
+        "case \"updated\": the description comes from the imported document, got {updated:?}"
     );
     assert!(
-        timestamp(&landed, "UpdatedAt") > timestamp(&in_flight, "UpdatedAt"),
-        "case \"update-landed\": UpdatedAt moves with the content, got {landed:?} after \
-         {in_flight:?}"
+        timestamp(&updated, "UpdatedAt") > timestamp(&accepted, "UpdatedAt"),
+        "case \"updated\": UpdatedAt moves with the content, got {updated:?} after \
+         {accepted:?}"
     );
     assert_eq!(
-        timestamp(&landed, "CreatedAt"),
-        timestamp(&in_flight, "CreatedAt"),
-        "case \"update-landed\": CreatedAt is when the lens was created, got {landed:?} after \
-         {in_flight:?}"
+        timestamp(&updated, "CreatedAt"),
+        timestamp(&accepted, "CreatedAt"),
+        "case \"updated\": CreatedAt is when the lens was created, got {updated:?} after \
+         {accepted:?}"
     );
 }

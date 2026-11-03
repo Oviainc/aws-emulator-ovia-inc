@@ -208,10 +208,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }));
 
         let now = std::time::SystemTime::now();
-        // The import is a job rather than an edit — the operation answers an
-        // `ImportLensStatus` — so the content it carries lands at an instant the clock
-        // owes, and until that instant the lens reports `IN_PROGRESS` and has nothing to
-        // read. Nothing sleeps for it: the instant is stored and compared on read.
+        // "Import a new custom lens or update an existing custom lens": the document is
+        // validated and recorded by THIS call, so it is the lens's content from here on and
+        // every read and publish of the lens resolves it at once. What the import still owes
+        // the clock is its reported `ImportLensStatus`, which the operation answers: until
+        // `completes_at` the import reports `IN_PROGRESS`. Nothing sleeps for it — the
+        // instant is stored and compared with the clock on every read of the status.
         let content = crate::state::LensContent {
             json: input.json_string,
             definition,
@@ -277,13 +279,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &crate::state::tag_ceiling_constraint("the lens"),
                     ));
                 }
-                // An import that already landed becomes the lens's draft content before
-                // this one takes its place as the import in flight.
-                record.settle(now);
-                record.pending = Some(crate::state::PendingLensImport {
-                    content,
-                    completes_at,
-                });
+                // The document this request carries takes the lens's content over, and the
+                // import it starts is the one whose status the lens now reports.
+                record.draft = Some(content);
+                record.import_completes_at = Some(completes_at);
                 // "Tags to associate to a lens": the tags a request names are associated
                 // with the lens, which keeps the ones it already carries.
                 record.tags.extend(tags);
@@ -325,11 +324,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         owner: ::engine::emulator_account_id().to_string(),
                         created_at: now,
                         tags,
-                        draft: None,
-                        pending: Some(crate::state::PendingLensImport {
-                            content,
-                            completes_at,
-                        }),
+                        draft: Some(content),
+                        import_completes_at: Some(completes_at),
                         // "The new or updated lens will have a status of DRAFT": nothing
                         // is published from it until `CreateLensVersion` publishes a
                         // version.

@@ -250,7 +250,8 @@ fn submitted_document(body: &[u8]) -> Result<(), String> {
                 i64::try_from(MAX_SOURCE_FILE_BYTES).unwrap_or(i64::MAX),
             ),
             // The value is the document itself: a sensitive blob, which no message
-            // echoes.
+            // echoes. The clause states no value either way — the member is absent
+            // here — so this keeps the framework's own wording for an absent member.
             value: None,
             sensitive: true,
         }]));

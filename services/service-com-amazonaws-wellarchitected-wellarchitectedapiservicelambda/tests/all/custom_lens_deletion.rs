@@ -123,7 +123,7 @@ async fn listed_arns(client: &Client, status: &str, case: &str) -> Vec<String> {
         .collect()
 }
 
-/// The `LensVersion` a `GetLens` reports for the lens's current content.
+/// The `LensVersion` a `GetLens` reports the lens at — its latest published version.
 fn reported_version(answer: &Answer, case: &str) -> String {
     assert_eq!(
         answer.status, 200,
@@ -314,12 +314,22 @@ async fn deleting_all_of_a_lens_removes_the_lens_itself() {
         let client = Client::new();
         let lens = prepare(&client, case, shape).await;
 
-        // Before the delete the lens is readable and listed.
-        let before = get_lens(&client, &lens.arn, None).await;
+        // Before the delete the lens's content is readable and the lens is listed. The read
+        // that proves it is `ExportLens`, which answers the content of a lens in EVERY
+        // publication state; `GetLens` answers only a published one, so it is asked here
+        // for the shapes that have published a version.
+        let before = export(&client, &lens.arn, None).await;
         assert_eq!(
             before.status, 200,
-            "case {case:?}: the prepared lens must be readable, got {before:?}"
+            "case {case:?}: the prepared lens's content must be readable, got {before:?}"
         );
+        if !lens.versions.is_empty() {
+            let read = get_lens(&client, &lens.arn, None).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?}: a published lens must be retrievable, got {read:?}"
+            );
+        }
         assert!(
             listed_arns(&client, state::LENS_STATUS_TYPE_ALL, case)
                 .await
@@ -457,7 +467,7 @@ async fn deleting_the_draft_leaves_the_lens_at_its_latest_published_version() {
 }
 
 /// Rule 1, `PUBLISHED`: only the versions published from the lens go. The lens stands,
-/// carrying the content it had as a draft again — so it reports the draft version, no
+/// carrying the content it had as a draft again — so a `GetLens` no longer retrieves it, no
 /// version of it resolves any more, and the status filter finds it under `DRAFT`. The rows
 /// are how many versions the lens had published, and whether its content was one of them.
 #[tokio::test]
@@ -482,10 +492,14 @@ async fn deleting_the_published_versions_leaves_the_lens_as_a_draft() {
         .await;
         assert_deleted(&deleted, case);
 
+        // The lens stands as a draft, so it is no longer retrievable by `GetLens` — a lens
+        // "cannot be applied to workloads or shared … until it's published with
+        // CreateLensVersion" (`ImportLens` doc) — while `ExportLens` still answers the
+        // content it kept.
         let read = get_lens(&client, &lens.arn, None).await;
         assert_eq!(
-            reported_version(&read, case),
-            state::LENS_VERSION_DRAFT,
+            (read.status, read.error_code.as_str()),
+            (404, "ResourceNotFoundException"),
             "case {case:?}: a lens with no published version left is a draft, got {read:?}"
         );
         let current = export(&client, &lens.arn, None).await;

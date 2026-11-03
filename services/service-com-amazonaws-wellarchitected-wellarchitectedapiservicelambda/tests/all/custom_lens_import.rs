@@ -7,10 +7,10 @@
 //!
 //! 1. `ImportLens` RECORDS the lens document it is given, under a minted lens ARN, and
 //!    answers the import's `ImportLensStatus`; `ExportLens` answers that same document
-//!    back once the import has landed. Rows differ along the SHAPE of the document — how
-//!    many pillars, questions, choices and risk rules it defines, and whether it carries
-//!    a description — because the document is the resource, so every shape of it must
-//!    round-trip.
+//!    back from the moment the import is ACCEPTED. Rows differ along the SHAPE of the
+//!    document — how many pillars, questions, choices and risk rules it defines, and
+//!    whether it carries a description — because the document is the resource, so every
+//!    shape of it must round-trip.
 //! 2. A payload that is not a lens imports NOTHING and is refused 400
 //!    `ValidationException`, with `CANNOT_PARSE` when it is not JSON at all and
 //!    `FIELD_VALIDATION_FAILED` when it is JSON that breaks a rule of the lens JSON
@@ -156,9 +156,11 @@ pub(crate) fn imported_arn(answer: &Answer, case: &str) -> String {
     arn
 }
 
-/// Wait for an accepted import to land. The span is the service's own
-/// ([`state::LENS_IMPORT_DURATION`]) plus a margin, and it is non-zero on purpose: that
-/// is what makes the `IN_PROGRESS` status observable to a caller.
+/// Wait for an accepted import's job to report `COMPLETE`. The span is the service's own
+/// ([`state::LENS_IMPORT_DURATION`]), plus a margin, and it is non-zero on purpose: that
+/// is what makes the `IN_PROGRESS` status observable to a caller. The lens's CONTENT does
+/// not wait for it — the accepting call recorded the document — so this is only ever
+/// needed before a read of the import's status.
 pub(crate) fn wait_for_the_import_to_land() {
     assert!(
         !state::LENS_IMPORT_DURATION.is_zero(),
@@ -171,8 +173,8 @@ pub(crate) fn wait_for_the_import_to_land() {
 }
 
 /// Rule 1. Every shape of lens document is recorded under its own ARN and exported back
-/// VERBATIM once the import lands; until then the import reports `IN_PROGRESS` and there
-/// is no lens content to export.
+/// VERBATIM from the moment the import is accepted, while the import's own job reports
+/// `IN_PROGRESS` until its span has passed.
 #[tokio::test]
 async fn an_imported_lens_document_is_recorded_and_exported_back_verbatim() {
     let cases: Vec<(&str, Value)> = vec![
@@ -220,20 +222,17 @@ async fn an_imported_lens_document_is_recorded_and_exported_back_verbatim() {
             "case {case:?}: an accepted import is still in progress, got {answer:?}"
         );
 
-        // The import has not landed yet, so there is no lens to export.
+        // The import's job is still in progress, and the document it carried is already
+        // the lens's content: "Import a new custom lens" is what the accepting call did.
         let early = export(&client, &arn, None).await;
         assert_eq!(
-            early.status, 404,
-            "case {case:?}: an import in flight has no lens to export, got {early:?}"
+            early.status, 200,
+            "case {case:?}: an accepted import is exportable at once, got {early:?}"
         );
         assert_eq!(
-            early.error_code, "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {early:?}"
-        );
-        assert_eq!(
-            member(&early, "ResourceType"),
-            "LENS",
-            "case {case:?}: expected ResourceType LENS, got {early:?}"
+            member(&early, "LensJSON"),
+            document.as_str(),
+            "case {case:?}: ExportLens must answer the document as imported, got {early:?}"
         );
         imported.push((case, arn, document));
     }
@@ -259,8 +258,8 @@ async fn an_imported_lens_document_is_recorded_and_exported_back_verbatim() {
             "case {case:?}: ExportLens must answer the document as imported, got {exported:?}"
         );
 
-        // The same token with the same parameters replays the original import, which has
-        // now landed, so the status it reports has moved on.
+        // The same token with the same parameters replays the original import, whose job
+        // has now finished, so the status it reports has moved on.
         let replay = import(&client, document, None, &format!("tok-{case}"), None).await;
         assert_eq!(
             member(&replay, "LensArn"),
@@ -512,10 +511,10 @@ async fn a_payload_that_is_not_a_lens_is_refused_and_imports_nothing() {
     }
 }
 
-/// Rule 3. An ARN in `LensAlias` updates THAT lens — the lens keeps its ARN, its
-/// previously landed content stays readable while the new import is in flight, and the
-/// new content takes over once it lands. A request with no ARN mints another lens
-/// instead. Rows differ along the shape of the replacement document.
+/// Rule 3. An ARN in `LensAlias` updates THAT lens — the lens keeps its ARN and the
+/// document the update carried becomes its content, while the import's own job reports
+/// `IN_PROGRESS` for its span. A request with no ARN mints another lens instead. Rows
+/// differ along the shape of the replacement document.
 #[tokio::test]
 async fn importing_with_a_lens_arn_updates_that_lens_and_without_one_mints_another() {
     let cases: Vec<(&str, Value)> = vec![
@@ -567,12 +566,13 @@ async fn importing_with_a_lens_arn_updates_that_lens_and_without_one_mints_anoth
             "case {case:?}: the replacement import is still in progress, got {updated:?}"
         );
 
-        // While the replacement is in flight the lens still exports what landed before.
+        // The replacement is the lens's content from the moment it was accepted, while
+        // the import that carried it is still reporting IN_PROGRESS.
         let during = export(&client, &arn, None).await;
         assert_eq!(
             member(&during, "LensJSON"),
-            first.as_str(),
-            "case {case:?}: an import in flight must not replace the readable lens, got {during:?}"
+            replacement.as_str(),
+            "case {case:?}: an accepted update must replace the readable lens, got {during:?}"
         );
 
         wait_for_the_import_to_land();
@@ -580,7 +580,7 @@ async fn importing_with_a_lens_arn_updates_that_lens_and_without_one_mints_anoth
         assert_eq!(
             member(&after, "LensJSON"),
             replacement.as_str(),
-            "case {case:?}: once the import lands the lens exports the new document, got {after:?}"
+            "case {case:?}: the lens keeps exporting the new document, got {after:?}"
         );
 
         // No ARN: another lens, with its own ARN, leaving the first one alone.

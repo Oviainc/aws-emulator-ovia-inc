@@ -1608,20 +1608,21 @@ pub fn answer_projection(
 /// (`smithy_query(query="shape", shape="ShareResourceType")` publishes `LENS`).
 pub const LENS_RESOURCE_TYPE: &str = "LENS";
 
-/// `ImportLensStatus$IN_PROGRESS`: an import that has been accepted and is still being
-/// processed, so the lens it imports is not readable yet
-/// (`smithy_query(query="shape", shape="ImportLensStatus")`).
+/// `ImportLensStatus$IN_PROGRESS`: an import that has been accepted and whose processing
+/// has not finished (`smithy_query(query="shape", shape="ImportLensStatus")`).
 pub const IMPORT_LENS_IN_PROGRESS: &str = "IN_PROGRESS";
 
-/// `ImportLensStatus$COMPLETE`: the import landed and the lens it carried is readable.
+/// `ImportLensStatus$COMPLETE`: the import finished.
 pub const IMPORT_LENS_COMPLETE: &str = "COMPLETE";
 
-/// How long after `ImportLens` accepts a lens document the import lands.
+/// How long after `ImportLens` accepts a lens document its import reports `COMPLETE`.
 ///
-/// The operation answers with an `ImportLensStatus`, so the import is a job rather than
-/// an edit, and AWS publishes no duration for it: this is the emulator's own span, long
-/// enough that a caller acting straight after the call still observes `IN_PROGRESS` and
-/// the lens not yet readable, short enough not to hold a workflow up.
+/// The operation answers with an `ImportLensStatus`, so the import is a job rather than an
+/// edit, and AWS publishes no duration for it: this is the emulator's own span, non-zero so
+/// that a caller acting straight after the call still observes `IN_PROGRESS`. It gates the
+/// STATUS only — "Import a new custom lens or update an existing custom lens" is what the
+/// accepting call itself does, so the document it validated is the lens's content from that
+/// moment on and every read and publish of the lens resolves it at once.
 pub const LENS_IMPORT_DURATION: Duration = Duration::from_millis(500);
 
 /// The `schemaVersion` a custom lens document must declare — the version of the lens
@@ -3606,18 +3607,6 @@ pub struct LensContent {
     pub imported_at: SystemTime,
 }
 
-/// An import that has been accepted and lands at `completes_at`.
-///
-/// `ImportLens` answers an `ImportLensStatus`, so the import is a job: until the instant
-/// the clock owes it passes, the status is `IN_PROGRESS` and the content is not the
-/// lens's content yet. Nothing sleeps for it — [`LensRecord::settled_content`] compares
-/// the stored instant with the clock on every read.
-#[derive(Debug, Clone)]
-pub struct PendingLensImport {
-    pub content: LensContent,
-    pub completes_at: SystemTime,
-}
-
 /// One PUBLISHED version of a custom lens: the lens's content as it stood when
 /// `CreateLensVersion` published that version, plus what the publishing request said
 /// about it.
@@ -3651,43 +3640,34 @@ pub struct LensRecord {
     pub owner: String,
     pub created_at: SystemTime,
     pub tags: BTreeMap<String, String>,
-    /// The draft content of the last import that LANDED.
+    /// The lens's content: the document of the last import `ImportLens` accepted, which
+    /// is a DRAFT until a version is published from it. `None` only for a lens whose
+    /// content a delete took away.
     pub draft: Option<LensContent>,
-    /// The import still in flight, if one is.
-    pub pending: Option<PendingLensImport>,
+    /// The instant the latest import's `ImportLensStatus` turns `COMPLETE`, if one has
+    /// been accepted ([`LENS_IMPORT_DURATION`]). The import's STATUS is all it gates.
+    pub import_completes_at: Option<SystemTime>,
     /// The published versions of this lens, by `LensVersion`.
     pub versions: BTreeMap<String, PublishedLensVersion>,
 }
 
 impl LensRecord {
-    /// The lens's content as of `now`: the pending import's once its instant has
-    /// passed, otherwise the last landed draft. `None` while the FIRST import of a lens
-    /// is still in flight — there is no lens to read yet.
-    pub fn settled_content(&self, now: SystemTime) -> Option<&LensContent> {
-        match &self.pending {
-            Some(pending) if pending.completes_at <= now => Some(&pending.content),
-            _ => self.draft.as_ref(),
-        }
+    /// The lens's content — the document of the last import of it.
+    ///
+    /// Readable from the instant `ImportLens` ACCEPTS the document: "Import a new custom
+    /// lens or update an existing custom lens" is what that call does, so the document it
+    /// validated and recorded is the lens's content from then on, whatever its import job
+    /// still reports as its [`Self::import_status`]. `None` only for a lens a delete left
+    /// no content on.
+    pub fn content(&self) -> Option<&LensContent> {
+        self.draft.as_ref()
     }
 
     /// The `ImportLensStatus` of this lens's latest import as of `now`.
     pub fn import_status(&self, now: SystemTime) -> &'static str {
-        match &self.pending {
-            Some(pending) if pending.completes_at > now => IMPORT_LENS_IN_PROGRESS,
+        match self.import_completes_at {
+            Some(completes_at) if completes_at > now => IMPORT_LENS_IN_PROGRESS,
             _ => IMPORT_LENS_COMPLETE,
-        }
-    }
-
-    /// Fold an import whose instant has passed into the draft content. Called before a
-    /// WRITE to this record, so a second import never discards a landed one; no read
-    /// needs it, because [`Self::settled_content`] already reports the landed content.
-    pub fn settle(&mut self, now: SystemTime) {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.completes_at <= now)
-        {
-            self.draft = self.pending.take().map(|pending| pending.content);
         }
     }
 
@@ -3702,12 +3682,9 @@ impl LensRecord {
     /// published no earlier than that content was imported (publishing copies the content
     /// current at that instant) AND carries that same document. The instant is what makes
     /// an UPDATE a draft again even when the document it imports is byte-identical to a
-    /// published one; the document is what keeps a version published before a still
-    /// in-flight import landed from being read as this content's. An import still in flight
-    /// counts as the draft, since `ImportLens` has already accepted the document and
-    /// answered the lens's ARN.
-    pub fn published_version(&self, now: SystemTime) -> Option<(&str, &PublishedLensVersion)> {
-        let content = self.summary_content(now)?;
+    /// published one.
+    pub fn published_version(&self) -> Option<(&str, &PublishedLensVersion)> {
+        let content = self.content()?;
         self.versions
             .iter()
             .filter(|(_, published)| {
@@ -3783,8 +3760,7 @@ impl LensRecord {
 
     /// Drop the content of this lens that no version has been published from, leaving it
     /// at its latest published version: the content the lens reports becomes that
-    /// version's, and an import still in flight goes too, since the document it carries
-    /// has not been published either.
+    /// version's.
     ///
     /// `false` when no version has been published from this lens, so there is nothing to
     /// fall back to and no content of the lens would be left at all — the caller removes
@@ -3801,7 +3777,9 @@ impl LensRecord {
         else {
             return false;
         };
-        self.pending = None;
+        // The import that carried the discarded document is over as far as this lens is
+        // concerned, so its job has no status left to report.
+        self.import_completes_at = None;
         self.draft = Some(published);
         true
     }
@@ -3821,27 +3799,13 @@ impl LensRecord {
         }
     }
 
-    /// The content a SUMMARY of this lens describes it by: its settled content when it has
-    /// any, and otherwise the document of the import still in flight.
-    ///
-    /// A lens EXISTS from the moment `ImportLens` accepts it — the operation answers its
-    /// ARN there and then — so a listing of the account's lenses reports it immediately,
-    /// named by the document that import carried. The import's instant gates the lens's
-    /// readable CONTENT ([`Self::settled_content`], what `ExportLens` returns), so an
-    /// UPDATE to a lens that already has content keeps describing the landed content until
-    /// the new import lands.
-    pub fn summary_content(&self, now: SystemTime) -> Option<&LensContent> {
-        self.settled_content(now)
-            .or(self.pending.as_ref().map(|pending| &pending.content))
-    }
-
-    /// The `LensSummary` projection of this lens as of `now`, or `None` for a record that
-    /// carries no content at all — which no import leaves behind.
-    pub fn to_summary(&self, now: SystemTime) -> Option<LensSummary> {
-        let content = self.summary_content(now)?;
+    /// The `LensSummary` projection of this lens, or `None` for a record that carries no
+    /// content at all — which no import leaves behind.
+    pub fn to_summary(&self) -> Option<LensSummary> {
+        let content = self.content()?;
         // The version the content this summary describes is published as, if it is: both
         // `LensVersion` and `LensStatus` speak about THAT content, so they cannot disagree.
-        let published = self.published_version(now);
+        let published = self.published_version();
         Some(LensSummary {
             lens_arn: Some(self.lens_arn.clone()),
             // "For custom lenses, this is the lens ARN" (`LensAlias` doc), so the alias a
@@ -7428,8 +7392,8 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         Some(published.content.definition.name.as_str())
     }
 
-    /// The `LensVersion` a review of `lens` created at `now` is against: the version the
-    /// lens's content is published AS at that instant.
+    /// The `LensVersion` a review of `lens` is against: the version the lens's content is
+    /// published AS.
     ///
     /// A lens review is a review against ONE version of the lens, so applying a lens pins
     /// the version its content is published as right then
@@ -7440,18 +7404,18 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// applies, since a custom lens "cannot be applied to workloads … until it's published
     /// with CreateLensVersion" (`ImportLens` doc) is what
     /// [`Self::unapplicable_lenses_refusal`] enforces.
-    pub fn applied_lens_version(&self, lens: &str, now: SystemTime) -> Option<String> {
+    pub fn applied_lens_version(&self, lens: &str) -> Option<String> {
         if is_aws_official_lens(lens) {
             return lens_metadata(lens).map(|metadata| metadata.version.to_string());
         }
         self.lens_by_alias(lens)?
-            .published_version(now)
+            .published_version()
             .map(|(version, _)| version.to_string())
     }
 
     /// The lens reviews a review template applying `lenses` carries the moment it is
-    /// created: one per applied lens, keyed by lens ALIAS, each against the version of
-    /// that lens's content as of `now` ([`Self::applied_lens_version`]) and with nothing
+    /// created: one per applied lens, keyed by lens ALIAS, each against the version that
+    /// lens's content is published as ([`Self::applied_lens_version`]) and with nothing
     /// written to it yet.
     ///
     /// A lens review exists as soon as the lens is applied
@@ -7471,7 +7435,7 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                         notes: None,
                         pillar_notes: BTreeMap::new(),
                         updated_at: now,
-                        lens_version: self.applied_lens_version(lens, now),
+                        lens_version: self.applied_lens_version(lens),
                     },
                 )
             })
@@ -7479,8 +7443,8 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     }
 
     /// The lens reviews a workload associating `lenses` carries the moment it is created:
-    /// one per associated lens, keyed by lens ALIAS, each against the version of that
-    /// lens's content as of `now` ([`Self::applied_lens_version`]) and with nothing
+    /// one per associated lens, keyed by lens ALIAS, each against the version that lens's
+    /// content is published as ([`Self::applied_lens_version`]) and with nothing
     /// written to it yet.
     ///
     /// The mirror of [`Self::applied_lens_reviews`], which does the same for a review
@@ -7490,7 +7454,6 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     pub fn applied_workload_lens_reviews(
         &self,
         lenses: &[String],
-        now: SystemTime,
     ) -> BTreeMap<String, LensReviewRecord> {
         lenses
             .iter()
@@ -7505,7 +7468,7 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                         // service until a sync records one
                         // ([`Self::sync_workload_integration`]).
                         jira_question_syncs: BTreeMap::new(),
-                        lens_version: self.applied_lens_version(lens, now),
+                        lens_version: self.applied_lens_version(lens),
                     },
                 )
             })
@@ -7650,12 +7613,12 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         Some(record)
     }
 
-    /// The lens a `LensAlias` names, as of `now`: the whole catalog a lens name resolves
+    /// The lens a `LensAlias` names: the whole catalog a lens name resolves
     /// against — the lenses Amazon Web Services publishes
     /// ([`AWS_OFFICIAL_LENS_ALIASES`]) and the custom lenses this account holds
     /// ([`Self::lens_by_alias`]), the latter applicable only once a version has been
     /// published from their content.
-    pub fn resolve_lens(&self, lens: &str, now: SystemTime) -> LensResolution {
+    pub fn resolve_lens(&self, lens: &str) -> LensResolution {
         // "For custom lenses, this is the lens ARN" (`LensAlias` doc), so a name that
         // carries no owner account can only be an official lens, and one that carries one
         // can only be a custom lens: the two halves of the catalog never overlap.
@@ -7668,7 +7631,7 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         }
         match self.lens_by_alias(lens) {
             None => LensResolution::Unknown,
-            Some(record) if record.published_version(now).is_some() => {
+            Some(record) if record.published_version().is_some() => {
                 LensResolution::PublishedCustom
             }
             Some(_) => LensResolution::DraftCustom,
@@ -7676,7 +7639,7 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     }
 
     /// How a list of lenses a request asks to APPLY is refused, or `None` when every entry
-    /// names a lens that can be applied as of `now`.
+    /// names a lens that can be applied.
     ///
     /// A lens is applied by name, and the name has to resolve: "Each lens is identified by
     /// its `LensSummary$LensAlias`" (`WorkloadLenses` doc), and a custom lens "cannot be
@@ -7694,10 +7657,9 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         &self,
         lenses: &[String],
         member: &str,
-        now: SystemTime,
     ) -> Option<LensesRefusal> {
         for lens in lenses {
-            match self.resolve_lens(lens, now) {
+            match self.resolve_lens(lens) {
                 // An entry naming NO lens is answered as a lookup miss, and one naming a
                 // lens that exists and is merely unpublished as a bad member value: told
                 // its lens is a draft, a caller would publish a lens this service never
@@ -8108,7 +8070,6 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .collect();
         // A lens share raises an invitation of its own kind, reported through the same
         // enumeration so one order and one `PENDING` rule cover every shared resource.
-        let now = SystemTime::now();
         invitations.extend(
             self.lens_shares
                 .values()
@@ -8122,7 +8083,7 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                     let lens_name = self
                         .lenses
                         .get(&share.lens_id)
-                        .and_then(|lens| lens.summary_content(now))
+                        .and_then(|lens| lens.content())
                         .map(|content| content.definition.name.as_str());
                     share.to_invitation_summary(lens_name)
                 }),
@@ -9965,8 +9926,7 @@ pub fn review_template_answer_not_found(
     )
 }
 
-/// [`resource_not_found`] for a `LensAlias` that names no readable custom lens — none
-/// is stored under it, or the import that would produce it has not landed yet.
+/// [`resource_not_found`] for a `LensAlias` that names no stored custom lens.
 ///
 /// The `ResourceId` is the alias AS SENT, which is how the request named the lens.
 pub fn lens_not_found(alias: &str) -> ResourceNotFoundException {
@@ -10015,6 +9975,26 @@ pub fn lens_version_not_found(alias: &str, version: &str) -> ResourceNotFoundExc
     )
 }
 
+/// The modelled `ResourceNotFoundException` (HTTP 404) for a custom lens that has been
+/// imported but not published, as AWS words that refusal: a lens "cannot be applied to
+/// workloads or shared with other Amazon Web Services accounts until it's published with
+/// CreateLensVersion" (`ImportLens` doc), and the lens-by-id read is one of the things it
+/// is not yet reachable through.
+///
+/// The lens is identified by its ID here — the 32-hex resource part of its ARN,
+/// [`LensRecord::lens_id`] — in both the `ResourceId` and the message, whichever spelling
+/// of the name the request used, because that is the identity of the lens that is missing.
+pub fn lens_not_published(lens_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: tagged_message(
+            "ResourceNotFound",
+            &format!("{LENS_RESOURCE_TYPE} with id {lens_id} not found. Lens is not published."),
+        ),
+        resource_id: lens_id.to_string(),
+        resource_type: LENS_RESOURCE_TYPE.to_string(),
+    }
+}
+
 /// [`resource_not_found`] for a lens no version has been published from, which therefore
 /// has no version a caller could read or compare: "The lens cannot be applied to
 /// workloads or shared with other Amazon Web Services accounts until it's published with
@@ -10031,13 +10011,16 @@ pub fn lens_without_published_version(alias: &str) -> ResourceNotFoundException 
 /// [`conflict`] for a `LensVersion` the lens has already published: a published version
 /// is immutable, so a second publish under the same name collides with it rather than
 /// replacing it — the modelled `ConflictException`'s own "The resource has already been
-/// processed" case. The `ResourceId` is the alias AS SENT, as the lookup failures above
-/// report it.
-pub fn lens_version_conflict(alias: &str, version: &str) -> ConflictException {
+/// processed" case.
+///
+/// `lens_arn` is the lens's own ARN ([`LensRecord::lens_arn`]) rather than the spelling the
+/// request named it by, as the [`conflict`] envelope words every collision: what the caller
+/// needs named is the lens that already carries the version.
+pub fn lens_version_conflict(lens_arn: &str, version: &str) -> ConflictException {
     conflict(
         LENS_RESOURCE_TYPE,
-        alias.to_string(),
-        &format!("Version {version} of the lens with alias {alias} has already been published."),
+        lens_arn.to_string(),
+        &format!("A lens {lens_arn} with version name {version} already exists."),
     )
 }
 

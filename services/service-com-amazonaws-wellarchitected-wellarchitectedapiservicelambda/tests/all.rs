@@ -484,6 +484,11 @@ mod workload_lens_list_projections;
 #[path = "all/unique_name_token_identity.rs"]
 mod unique_name_token_identity;
 
+// Appended at the end of this list for the same reason as the declaration above: modules
+// are appended here so a new suite does not collide with another insertion.
+#[path = "all/custom_lens_publish_chain.rs"]
+mod custom_lens_publish_chain;
+
 // Appended at the end of this list for the same reason as the declaration above: the sorted
 // position for a workload suite falls in a crowded run of this list.
 #[path = "all/workload_pillar_identity.rs"]

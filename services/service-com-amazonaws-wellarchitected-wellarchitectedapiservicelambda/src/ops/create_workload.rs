@@ -431,7 +431,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with the original request's result, and over a list the lens quota above has
         // already bounded, so the work it costs is bounded too.
         let now = std::time::SystemTime::now();
-        match store.unapplicable_lenses_refusal(&lenses, crate::state::LENSES_MEMBER, now) {
+        match store.unapplicable_lenses_refusal(&lenses, crate::state::LENSES_MEMBER) {
             Some(crate::state::LensesRefusal::NotFound(exception)) => {
                 return Err(
                     CreateWorkloadErrorModeled::ResourceNotFoundException(exception).into(),
@@ -550,7 +550,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from the one place that rule lives
         // (`crate::state::applied_workload_lens_reviews`), as of the same instant the
         // lenses were resolved against the catalog above.
-        let mut lens_reviews = store.applied_workload_lens_reviews(&lenses, now);
+        let mut lens_reviews = store.applied_workload_lens_reviews(&lenses);
         // The answers and the per-lens notes an applied review template pre-populated the
         // workload's reviews with, written onto the reviews just created.
         let answers = crate::state::apply_carried_review_content(carried, &mut lens_reviews);

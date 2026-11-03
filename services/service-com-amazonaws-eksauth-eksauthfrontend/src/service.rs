@@ -89,7 +89,11 @@ const SENSITIVE_INPUT_PATHS: &[&str] = &["token"];
 ///   null the request did not send — becomes "Value at '<member>'". An absent member has
 ///   no value to withhold and keeps the framework's own wording.
 fn stated(violation: &Violation) -> String {
-    let withheld = violation.value.is_some() && is_sensitive(&violation.path);
+    // The walk reports a `@sensitive` member with its value already withheld, and this
+    // service withholds the value of every member it classes as one, so either side of
+    // that is the same clause: the value half is dropped and the subject names the member
+    // alone.
+    let withheld = violation.sensitive || (violation.value.is_some() && is_sensitive(&violation.path));
     let restated = Violation {
         path: violation.path.clone(),
         kind: match &violation.kind {
@@ -109,8 +113,8 @@ fn stated(violation: &Violation) -> String {
     }
     match clause.strip_prefix(VALUE_NULL_AT) {
         Some(rest) => format!("{VALUE_AT}{rest}"),
-        // The framework worded a value-less clause some other way; it cannot carry the
-        // withheld value (none was attached), so it stands as it is.
+        // Already the withheld subject, which is what the framework words a withheld
+        // violation with; it carries no value (none was attached), so it stands as it is.
         None => clause,
     }
 }

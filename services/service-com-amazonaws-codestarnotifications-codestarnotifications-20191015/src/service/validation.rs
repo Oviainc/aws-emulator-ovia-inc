@@ -107,7 +107,8 @@ const WITHHELD_SUBJECT: &str = "Value at '";
 /// ([`Violation::message`]), so this service cannot drift from them; what this chooses is
 /// the expression a `@pattern` advertises and whether the value is quoted.
 fn clause(violation: &Violation) -> String {
-    let withhold = violation.value.is_some() && names_a_sensitive_member(&violation.path);
+    let withhold = (violation.value.is_some() || violation.sensitive)
+        && names_a_sensitive_member(&violation.path);
     let restated = Violation {
         path: violation.path.clone(),
         kind: match &violation.kind {

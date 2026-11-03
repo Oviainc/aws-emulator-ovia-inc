@@ -4,8 +4,9 @@
 //! IMPLEMENTED: reports ONE lens of the same catalog `ListLenses` enumerates — the
 //! AWS-official lenses this emulator knows, plus the custom lenses
 //! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lenses`]
-//! holds — at the version the request names, or at the lens's current content when it
-//! names none. A pure read: it writes nothing.
+//! holds — at the version the request names, or at the lens's latest PUBLISHED version
+//! when it names none; a custom lens no version has been published from is not retrievable
+//! here. A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -160,7 +161,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        let now = std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(|| {
             GetLensErrorModeled::InternalServerException(InternalServerException {
                 message: "the Well-Architected Tool lens store is unavailable".to_string(),
@@ -173,12 +173,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // "The lens version to be retrieved": a custom lens's version exists only once
-        // `CreateLensVersion` has published it, and a published version is immutable, so
-        // a request naming one is answered from that version's own content. Without a
-        // version, the lens's current content — the same content, and the same
-        // `LensVersion`, `ListLenses` describes the lens by, so a read of one lens and a
-        // listing of every lens cannot disagree about it.
+        // What this read answers is a PUBLISHED version of the lens: "The new or updated
+        // lens will have a status of DRAFT. The lens cannot be applied to workloads or
+        // shared with other Amazon Web Services accounts until it's published with
+        // CreateLensVersion" (`ImportLens` doc), and a lens that is not published yet is
+        // not retrievable here either — it is the content of its draft, which `ExportLens`
+        // is the read of. A published version is immutable, so a request naming one is
+        // answered from that version's own content; a request naming none is answered from
+        // the lens's latest published version, the same version `ListLenses` describes the
+        // lens by once its content is published, so a read of one lens and a listing of
+        // every lens cannot disagree about it.
         let (lens_version, content) = match input.lens_version.as_deref() {
             Some(requested) => {
                 let published = record.versions.get(requested).ok_or_else(|| {
@@ -189,15 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (requested.to_string(), &published.content)
             }
             None => {
-                let content = record.summary_content(now).ok_or_else(|| {
-                    GetLensErrorModeled::ResourceNotFoundException(crate::state::lens_not_found(
-                        &input.lens_alias,
-                    ))
+                let (version, published) = record.latest_version().ok_or_else(|| {
+                    GetLensErrorModeled::ResourceNotFoundException(
+                        crate::state::lens_not_published(&record.lens_id),
+                    )
                 })?;
-                let version = record
-                    .published_version(now)
-                    .map_or(crate::state::LENS_VERSION_DRAFT, |(version, _)| version);
-                (version.to_string(), content)
+                (version.to_string(), &published.content)
             }
         };
 
@@ -210,13 +211,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 name: Some(content.definition.name.clone()),
                 description: content.definition.description.clone(),
                 owner: Some(record.owner.clone()),
-                // "The ID assigned to the share invitation": only a lens the caller
-                // reached THROUGH a share invitation carries one, which is a lens another
-                // account shared in. Every request this emulator serves is attributed to
-                // its one account, and `CreateLensShare` refuses a `SharedWith` naming the
-                // sharer, so no lens here was reached through an invitation the caller
-                // accepted.
-                share_invitation_id: None,
+                // "The ID assigned to the share invitation": the member is reported for
+                // every lens this read answers, and carries an id only for a lens the
+                // caller reached THROUGH a share invitation — a lens another account shared
+                // in. Every request this emulator serves is attributed to its one account,
+                // and `CreateLensShare` refuses a `SharedWith` naming the sharer, so no lens
+                // here was reached through an invitation the caller accepted.
+                share_invitation_id: Some(NO_SHARE_INVITATION.to_string()),
                 // The tag map the lens carries, empty when it carries none: the
                 // `@length(min: 1)` on `TagMap` constrains the tags a REQUEST supplies,
                 // not what a projection of the stored lens reports. Tags belong to the
@@ -233,6 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// `Lens$ShareInvitationId` for a lens the caller did NOT reach through a share
+/// invitation: the member is reported either way, carrying no id.
+const NO_SHARE_INVITATION: &str = "";
 
 /// The `Lens` an AWS-OFFICIAL lens is reported by, or the modelled failure for a name or
 /// version that resolves to none.
@@ -290,8 +295,9 @@ fn official_catalog_lens(input: &GetLensInput, region: &str) -> Result<Lens, Get
         // than an account owning it — and `Owner` is modelled an account id, which no
         // placeholder would satisfy honestly.
         owner: None,
-        // As above: an official lens is not reached through a share invitation.
-        share_invitation_id: None,
+        // As above: an official lens is not reached through a share invitation, and the
+        // member is reported for it either way.
+        share_invitation_id: Some(NO_SHARE_INVITATION.to_string()),
         // Tags are assigned to a lens this account holds; AWS's own lenses carry none
         // here, so there is no tag map to report rather than an empty one.
         tags: None,

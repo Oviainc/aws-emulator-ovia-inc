@@ -85,7 +85,10 @@ fn member_of(path: &str) -> &str {
 /// Whether `violation` is a value the caller SENT (rather than a member it left out)
 /// outside `member`'s constraints.
 fn submitted_value_of(violation: &Violation, member: &str) -> bool {
-    violation.value.is_some()
+    // A value the walk withheld (a `@sensitive` member's) was still SENT: the violation
+    // carries no copy of it, which is what `sensitive` says, not that the member was
+    // absent.
+    (violation.value.is_some() || violation.sensitive)
         && violation.kind != ViolationKind::MissingRequiredMember
         && member_of(&violation.path).eq_ignore_ascii_case(member)
 }
@@ -110,7 +113,7 @@ fn code_for(violations: &[Violation]) -> &'static str {
 /// ([`Violation::message`]), so this service cannot drift from them; what this chooses is
 /// that the submitted value is withheld.
 fn clause(violation: &Violation) -> String {
-    let withhold = violation.value.is_some();
+    let withhold = violation.value.is_some() || violation.sensitive;
     let restated = Violation {
         path: violation.path.clone(),
         kind: violation.kind.clone(),

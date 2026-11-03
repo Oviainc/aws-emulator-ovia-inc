@@ -237,7 +237,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "LensStatus": &input.lens_status,
         }));
 
-        let now = std::time::SystemTime::now();
         let mut store = state.lock();
 
         // Read before the alias is resolved: the original request may have removed the
@@ -278,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // its version map is not empty. A lens can be in both at once — a draft imported
         // over a lens that has already published a version — which is why the two
         // questions are separate.
-        let carries_draft = record.published_version(now).is_none();
+        let carries_draft = record.published_version().is_none();
         let carries_published_versions = !record.versions.is_empty();
 
         match deleted {

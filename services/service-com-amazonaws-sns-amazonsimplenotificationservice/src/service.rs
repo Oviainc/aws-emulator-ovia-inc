@@ -140,7 +140,7 @@ fn without_sensitive_values(violations: &[Violation]) -> Option<Refused> {
         .any(|v| matches!(v.kind, ViolationKind::MissingRequiredMember));
     let echoes_sensitive = violations
         .iter()
-        .any(|v| v.value.is_some() && is_sensitive_path(&v.path));
+        .any(|v| (v.value.is_some() || v.sensitive) && is_sensitive_path(&v.path));
     if absent_member || !echoes_sensitive {
         return None;
     }

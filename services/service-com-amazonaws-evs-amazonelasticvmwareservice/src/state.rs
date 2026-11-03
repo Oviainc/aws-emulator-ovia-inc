@@ -3811,9 +3811,10 @@ fn clause(violation: &Violation) -> (String, String) {
         ),
         None => (violation.path.clone(), requirement),
     };
-    // A present-but-invalid value is NOT quoted back at the caller; an absent member
-    // keeps the framework's `Value null at …`, because absence IS what it states.
-    let subject = if violation.value.is_some() {
+    // A present-but-invalid value is NOT quoted back at the caller — including one the
+    // walk withheld, which was still sent; an absent member keeps the framework's
+    // `Value null at …`, because absence IS what it states.
+    let subject = if violation.value.is_some() || violation.sensitive {
         "Value at"
     } else {
         "Value null at"

@@ -5,17 +5,23 @@
 //!
 //! The rules pinned here, each over a table of inputs rather than one recorded request:
 //!
-//! 1. A custom lens is reported from its OWN record: the ARN its import minted, the name
-//!    and description of the lens DOCUMENT it carries, the account that imported it and
-//!    the tags assigned to it, with `LensVersion` naming the version that content is
-//!    published as — the lens's draft until a version has been published from it. Rows
-//!    differ along the shape of the imported document (its name, whether it carries a
-//!    description, how many pillars and questions it defines) and along the tags the
-//!    import assigned, because every lens has to be reported from the lens itself.
+//! 1. A custom lens is retrievable through this read only once a version has been
+//!    PUBLISHED from it — "The new or updated lens will have a status of DRAFT. The lens
+//!    cannot be applied to workloads or shared with other Amazon Web Services accounts
+//!    until it's published with CreateLensVersion" (`ImportLens` doc) — so an imported
+//!    lens no `CreateLensVersion` has published is a 404 `ResourceNotFoundException`
+//!    naming the LENS and the lens's own id, and once a version is published the lens is
+//!    reported from its own record at that version: the ARN its import minted, the name
+//!    and description of the published DOCUMENT, the account that imported it, the tags
+//!    assigned to it and a `ShareInvitationId` carrying no id. Rows differ along the shape
+//!    of the imported document (its name, whether it carries a description, how many
+//!    pillars and questions it defines) and along the tags the import assigned, because
+//!    every lens has to be reported from the lens itself.
 //! 2. A request naming a `LensVersion` is answered from THAT version's content, which a
 //!    later import of the lens does not change, while a request naming none is answered
-//!    from the lens's current content. Rows differ along the shape of the replacement
-//!    document.
+//!    from the lens's LATEST published version — so a draft imported over a published lens
+//!    moves neither until it is published in turn. Rows differ along the shape of the
+//!    replacement document.
 //! 3. A lens Amazon Web Services publishes is read by its alias or by its account-less
 //!    ARN, and is described by ITS OWN entry in the official lens catalog — the same
 //!    entry `ListLenses` reports it from — with the content members omitted only for a
@@ -26,8 +32,7 @@
 //!    lens is stored under, an ARN naming another account's lens, a version never
 //!    published — and the modelled length bounds are refused at the boundary.
 //! 5. Reading a lens changes nothing a later caller sees: repeated reads answer the same
-//!    body and the listing of the catalog is unmoved. A lens is readable from the moment
-//!    its import is ACCEPTED, as the listing reports it from then on.
+//!    body and the listing of the catalog is unmoved.
 //!
 //! Requests go through the real `MultiServiceRouter`, so routing, restJson1
 //! (de)serialization, boundary constraint validation and the handler all run as they do
@@ -47,6 +52,10 @@ use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state
 
 /// The Region these tests sign for (the harness's SigV4 credential scope).
 const REGION: &str = "us-west-2";
+
+/// `Lens$ShareInvitationId` for a lens the caller did not reach through a share
+/// invitation: the member is reported, carrying no id.
+const NO_SHARE_INVITATION: &str = "";
 
 /// `GET /lenses/{LensAlias}`, the wire form of `GetLens`, with the optional `LensVersion`
 /// bound to the query string. The alias is percent-encoded because a custom lens is named
@@ -86,10 +95,46 @@ fn text(lens: &Value, name: &str) -> String {
         .to_string()
 }
 
-/// Rule 1. Every shape of imported lens is read back from its own record, and the version
-/// it reports is the draft until a version is published from that content.
+/// Every assertion the refusal of a read of a lens no version has been published from
+/// owes: the 404 `ResourceNotFoundException` naming the LENS resource type and the lens's
+/// own id — the id its ARN ends in, read off the ARN through the crate's own reduction of
+/// a lens name rather than spelled again here — with the message that failure is worded
+/// by.
+fn assert_not_published(case: &str, answer: &Answer, arn: &str) {
+    let lens_id = state::lens_alias(arn);
+    assert_eq!(
+        (answer.status, answer.error_code.as_str()),
+        (404, "ResourceNotFoundException"),
+        "case {case:?}: a lens no version was published from must not be retrievable, got \
+         {answer:?}"
+    );
+    assert_eq!(
+        answer.body.get("ResourceType").and_then(Value::as_str),
+        Some(state::LENS_RESOURCE_TYPE),
+        "case {case:?}: the refusal must name the LENS resource type, got {answer:?}"
+    );
+    assert_eq!(
+        answer.body.get("ResourceId").and_then(Value::as_str),
+        Some(lens_id),
+        "case {case:?}: the refusal must name the lens by its id, got {answer:?}"
+    );
+    assert_eq!(
+        answer.body.get("Message").and_then(Value::as_str),
+        Some(
+            format!(
+                "[ResourceNotFound] {} with id {lens_id} not found. Lens is not published.",
+                state::LENS_RESOURCE_TYPE
+            )
+            .as_str()
+        ),
+        "case {case:?}: the refusal must say the lens is not published, got {answer:?}"
+    );
+}
+
+/// Rule 1. An imported lens is not retrievable until a version is published from it, and
+/// then every shape of it is read back from its own record at that version.
 #[tokio::test]
-async fn a_custom_lens_is_read_back_from_its_own_record() {
+async fn a_custom_lens_is_read_back_from_the_version_published_from_it() {
     // (case, document, tags the import assigns)
     let cases: Vec<(&str, Value, Option<Value>)> = vec![
         (
@@ -133,11 +178,26 @@ async fn a_custom_lens_is_read_back_from_its_own_record() {
             tags.clone(),
         )
         .await;
-        imported.push((case, document.clone(), tags.clone(), imported_arn(&answer, case)));
+        let arn = imported_arn(&answer, case);
+        // Imported and not published: the lens exists — the import answered its ARN, and
+        // `ExportLens` answers its document — and this read is still refused.
+        assert_not_published(case, &get_lens(&client, &arn, None).await, &arn);
+        imported.push((case, document.clone(), tags.clone(), arn));
     }
+    // The import's own span is not what gates this read: once it has elapsed the lens is
+    // still unpublished, so the read is still refused.
     wait_for_the_import_to_land();
 
     for (case, document, tags, arn) in &imported {
+        assert_not_published(case, &get_lens(&client, arn, None).await, arn);
+
+        let published =
+            create_version(&client, arn, "1.0", Some(true), &format!("pub-{case}")).await;
+        assert_eq!(
+            published.status, 200,
+            "case {case:?}: the publish must succeed, got {published:?}"
+        );
+
         let answer = get_lens(&client, arn, None).await;
         let read = lens(&answer, case);
         assert_eq!(
@@ -148,12 +208,12 @@ async fn a_custom_lens_is_read_back_from_its_own_record() {
         assert_eq!(
             text(&read, "Name"),
             document["name"].as_str().unwrap_or_default(),
-            "case {case:?}: the name comes from the imported document, got {read:?}"
+            "case {case:?}: the name comes from the published document, got {read:?}"
         );
         assert_eq!(
             read.get("Description").and_then(Value::as_str),
             document.get("description").and_then(Value::as_str),
-            "case {case:?}: the description comes from the imported document, got {read:?}"
+            "case {case:?}: the description comes from the published document, got {read:?}"
         );
         assert_eq!(
             text(&read, "Owner"),
@@ -162,44 +222,26 @@ async fn a_custom_lens_is_read_back_from_its_own_record() {
         );
         assert_eq!(
             text(&read, "LensVersion"),
-            state::LENS_VERSION_DRAFT,
-            "case {case:?}: a lens no version was published from reports its draft, got {read:?}"
+            "1.0",
+            "case {case:?}: the lens reports the version it was published as, got {read:?}"
         );
         assert_eq!(
             read.get("Tags"),
             Some(&tags.clone().unwrap_or_else(|| json!({}))),
             "case {case:?}: the tags the import assigned must be reported, got {read:?}"
         );
-        assert!(
-            read.get("ShareInvitationId").is_none(),
+        assert_eq!(
+            read.get("ShareInvitationId").and_then(Value::as_str),
+            Some(NO_SHARE_INVITATION),
             "case {case:?}: a lens this account imported was not reached through a share \
-             invitation, got {read:?}"
-        );
-
-        // Publishing a version of that same content moves what the read reports as the
-        // lens's version, and nothing else about the lens.
-        let published = create_version(&client, arn, "1.0", Some(true), &format!("pub-{case}")).await;
-        assert_eq!(
-            published.status, 200,
-            "case {case:?}: the publish must succeed, got {published:?}"
-        );
-        let after = lens(&get_lens(&client, arn, None).await, case);
-        assert_eq!(
-            text(&after, "LensVersion"),
-            "1.0",
-            "case {case:?}: the lens reports the version its content is published as, got \
-             {after:?}"
-        );
-        assert_eq!(
-            text(&after, "Name"),
-            text(&read, "Name"),
-            "case {case:?}: publishing does not rename the lens, got {after:?}"
+             invitation, so the member carries no id, got {read:?}"
         );
     }
 }
 
-/// Rule 2. A version-pinned read answers the content that version captured; the
-/// unpinned read follows the lens's current content.
+/// Rule 2. A version-pinned read answers the content that version captured; the unpinned
+/// read follows the lens's latest PUBLISHED version, which an unpublished import does not
+/// move.
 #[tokio::test]
 async fn a_version_pinned_read_answers_the_content_that_version_captured() {
     let cases: Vec<(&str, Value)> = vec![
@@ -239,7 +281,6 @@ async fn a_version_pinned_read_answers_the_content_that_version_captured() {
             .await,
             case,
         );
-        wait_for_the_import_to_land();
         let published = create_version(&client, &arn, "1.0", Some(true), &format!("v1-{case}")).await;
         assert_eq!(
             published.status, 200,
@@ -258,7 +299,6 @@ async fn a_version_pinned_read_answers_the_content_that_version_captured() {
             update.status, 200,
             "case {case:?}: the update import must be accepted, got {update:?}"
         );
-        wait_for_the_import_to_land();
 
         let pinned = lens(&get_lens(&client, &arn, Some("1.0")).await, case);
         assert_eq!(
@@ -277,16 +317,12 @@ async fn a_version_pinned_read_answers_the_content_that_version_captured() {
             "case {case:?}: a pinned read reports the version it was asked for, got {pinned:?}"
         );
 
+        // The replacement is a DRAFT until it is published, so the unpinned read is still
+        // the lens's published version.
         let current = lens(&get_lens(&client, &arn, None).await, case);
         assert_eq!(
-            text(&current, "Name"),
-            replacement["name"].as_str().unwrap_or_default(),
-            "case {case:?}: the lens's current content is the new draft, got {current:?}"
-        );
-        assert_eq!(
-            text(&current, "LensVersion"),
-            state::LENS_VERSION_DRAFT,
-            "case {case:?}: content no version was published from is a draft, got {current:?}"
+            current, pinned,
+            "case {case:?}: an unpublished import must not move the read, got {current:?}"
         );
 
         // Publishing the replacement makes the unpinned read report that version, and
@@ -301,6 +337,11 @@ async fn a_version_pinned_read_answers_the_content_that_version_captured() {
             text(&republished, "LensVersion"),
             "2.0",
             "case {case:?}: the lens now reports the version just published, got {republished:?}"
+        );
+        assert_eq!(
+            text(&republished, "Name"),
+            replacement["name"].as_str().unwrap_or_default(),
+            "case {case:?}: the lens reports the published document's name, got {republished:?}"
         );
         let unchanged = lens(&get_lens(&client, &arn, Some("1.0")).await, case);
         assert_eq!(
@@ -345,10 +386,11 @@ async fn an_official_lens_is_read_from_the_shipped_catalog() {
             read.get("Tags").is_none(),
             "case {alias:?}: an official lens carries no tags here, got {read:?}"
         );
-        assert!(
-            read.get("ShareInvitationId").is_none(),
-            "case {alias:?}: an official lens is not reached through a share invitation, got \
-             {read:?}"
+        assert_eq!(
+            read.get("ShareInvitationId").and_then(Value::as_str),
+            Some(NO_SHARE_INVITATION),
+            "case {alias:?}: an official lens is not reached through a share invitation, so \
+             the member carries no id, got {read:?}"
         );
 
         if let Some(official) = state::official_lens(alias) {
@@ -445,7 +487,6 @@ async fn a_name_or_version_that_resolves_to_no_lens_is_refused() {
         &import(&client, &document, None, "tok-refusals", None).await,
         "refusals",
     );
-    wait_for_the_import_to_land();
     // A custom ARN that agrees on the lens id and disagrees on the owning account names a
     // different lens, so it resolves to nothing.
     let other_account = arn.replacen(
@@ -513,8 +554,7 @@ async fn a_name_or_version_that_resolves_to_no_lens_is_refused() {
     );
 }
 
-/// Rule 5. A lens is readable from the moment its import is accepted, and reading it
-/// changes nothing a later caller sees.
+/// Rule 5. Reading a lens changes nothing a later caller sees.
 #[tokio::test]
 async fn reading_a_lens_changes_nothing_a_later_caller_sees() {
     let client = Client::new();
@@ -527,19 +567,20 @@ async fn reading_a_lens_changes_nothing_a_later_caller_sees() {
         &import(&client, &document.to_string(), None, "tok-read-only", None).await,
         "read-only",
     );
-
-    // Straight after the import is accepted, before it has landed: the lens exists — the
-    // import answered its ARN — so the read reports it, exactly as the listing does.
-    let in_flight = lens(&get_lens(&client, &arn, None).await, "in-flight");
+    let published = create_version(&client, &arn, "1.0", Some(true), "tok-read-only-publish").await;
     assert_eq!(
-        text(&in_flight, "Name"),
-        document["name"].as_str().unwrap_or_default(),
-        "case \"in-flight\": an accepted import is readable, got {in_flight:?}"
+        published.status, 200,
+        "case \"published\": the publish must succeed, got {published:?}"
     );
 
     let before = list_lenses(&client).await;
     let first = get_lens(&client, &arn, None).await;
     let second = get_lens(&client, &arn, None).await;
+    assert_eq!(
+        text(&lens(&first, "repeated"), "Name"),
+        document["name"].as_str().unwrap_or_default(),
+        "case \"repeated\": the published lens must read back, got {first:?}"
+    );
     assert_eq!(
         first.body, second.body,
         "case \"repeated\": two reads of one lens must answer the same lens, got {second:?}"
@@ -550,11 +591,17 @@ async fn reading_a_lens_changes_nothing_a_later_caller_sees() {
         "case \"repeated\": reading a lens must not move the catalog, got {after:?}"
     );
 
-    wait_for_the_import_to_land();
-    let landed = lens(&get_lens(&client, &arn, None).await, "landed");
+    // And the refused read of an unpublished lens moves nothing either: the lens is still
+    // there to publish afterwards.
+    let draft_arn = imported_arn(
+        &import(&client, &document.to_string(), None, "tok-read-only-draft", None).await,
+        "draft",
+    );
+    assert_not_published("draft", &get_lens(&client, &draft_arn, None).await, &draft_arn);
+    let draft_published =
+        create_version(&client, &draft_arn, "1.0", Some(true), "tok-draft-publish").await;
     assert_eq!(
-        landed,
-        lens(&first, "repeated"),
-        "case \"landed\": the landed import carries the document already reported, got {landed:?}"
+        draft_published.status, 200,
+        "case \"draft\": a refused read must leave the lens publishable, got {draft_published:?}"
     );
 }

@@ -284,8 +284,13 @@ fn clause(violation: &Violation) -> String {
         _ => requirement.to_string(),
     };
     // An absent member has no value to name, and the clause says so; a value that is
-    // present is not named at all.
-    let held = if violation.value.is_some() { "" } else { " null" };
+    // present — including one the walk withheld, which was still sent — is not named at
+    // all.
+    let held = if violation.value.is_some() || violation.sensitive {
+        ""
+    } else {
+        " null"
+    };
     format!(
         "Value{held} at '{}'{CONSTRAINT_PREAMBLE}{requirement}",
         violation.path

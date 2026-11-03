@@ -127,7 +127,7 @@ fn stated_refusal(refusal: &Refusal) -> Option<Refused> {
             });
             continue;
         }
-        if violation.value.is_some() {
+        if violation.value.is_some() || violation.sensitive {
             withheld.insert(violation.path.clone());
         }
         stated.push(violation.clone());

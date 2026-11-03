@@ -210,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // half landed. It is the same resolution a create that applies lenses runs, so this
         // operation cannot record a lens another operation would then report a review of
         // and find nothing for.
-        match store.unapplicable_lenses_refusal(&named, crate::state::LENS_ALIASES_MEMBER, now) {
+        match store.unapplicable_lenses_refusal(&named, crate::state::LENS_ALIASES_MEMBER) {
             Some(crate::state::LensesRefusal::NotFound(exception)) => {
                 return Err(
                     AssociateLensesErrorModeled::ResourceNotFoundException(exception).into(),
@@ -254,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // pins the version its content is published as right now — the same pin a create
         // that applies lenses records, resolved from the one place that rule lives and
         // BEFORE the workload is taken for writing.
-        let reviews = store.applied_workload_lens_reviews(&fresh, now);
+        let reviews = store.applied_workload_lens_reviews(&fresh);
 
         let workload = store.workloads.get_mut(&input.workload_id).ok_or_else(|| {
             AssociateLensesErrorModeled::ResourceNotFoundException(

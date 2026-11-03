@@ -22,9 +22,8 @@
 //! * The page is cut to `MaxResults` and resumed from `NextToken`, the opaque cursor
 //!   `crate::state::encode_lens_next_token` issues.
 //!
-//! This is a REPORTING operation: it writes nothing. Where the clock decides something —
-//! which content an imported lens is described by, once an import in flight lands — the
-//! stored instant is compared with the clock on every read instead.
+//! This is a REPORTING operation: it writes nothing. A lens is described by the document
+//! of the last import `ImportLens` accepted for it, which that call recorded.
 //!
 //! Deliberately NOT emulated here, so the silence is not read as an enforced allow:
 //!
@@ -210,14 +209,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
-        let now = std::time::SystemTime::now();
         let store = state.lock();
 
         // The lenses available to the caller: every AWS-official lens this emulator
         // publishes content for, plus every custom lens the store holds. A lens exists from
-        // the moment `ImportLens` accepts it — that call answers its ARN — so it is listed
-        // from then on, described by the document that import carried; what the import's
-        // instant gates is the CONTENT a read of the lens returns.
+        // the moment `ImportLens` accepts it — that call answers its ARN and records the
+        // document it carried — so it is listed from then on, described by that document.
         let mut catalog: Vec<CatalogEntry> =
             Vec::with_capacity(store.lenses.len() + crate::state::OFFICIAL_LENS_CATALOG.len());
         for official in crate::state::OFFICIAL_LENS_CATALOG {
@@ -230,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
         for record in store.lenses.values() {
-            if let Some(summary) = record.to_summary(now) {
+            if let Some(summary) = record.to_summary() {
                 catalog.push(CatalogEntry {
                     key: crate::state::lens_catalog_key(record.lens_type(), &record.lens_id),
                     summary,

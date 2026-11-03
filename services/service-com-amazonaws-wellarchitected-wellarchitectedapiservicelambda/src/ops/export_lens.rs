@@ -3,8 +3,8 @@
 //! @op ExportLens
 //! IMPLEMENTED: reads back the lens document `ImportLens` recorded in
 //! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lenses`].
-//! A pure read: it writes nothing, and reports a lens whose import has not landed yet as
-//! not found.
+//! A pure read: it writes nothing, and answers the document from the moment `ImportLens`
+//! accepted it.
 //!
 //! ## Shape of an operation
 //!
@@ -175,7 +175,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let now = std::time::SystemTime::now();
         let store = state.lock();
         let record = store.lens_by_alias(&input.lens_alias).ok_or_else(|| {
             ExportLensErrorModeled::ResourceNotFoundException(crate::state::lens_not_found(
@@ -198,10 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::lens_version_not_found(&input.lens_alias, version),
                     )
                 })?,
-            // Without a version, the lens's current content: the latest import that has
-            // landed. While the first import of a lens is still in flight there is no
-            // lens content to export yet.
-            None => record.settled_content(now).ok_or_else(|| {
+            // Without a version, the lens's current content: the document of the last
+            // import of it, which `ImportLens` recorded when it accepted it.
+            None => record.content().ok_or_else(|| {
                 ExportLensErrorModeled::ResourceNotFoundException(crate::state::lens_not_found(
                     &input.lens_alias,
                 ))

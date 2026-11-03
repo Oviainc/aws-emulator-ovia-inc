@@ -8,8 +8,8 @@
 //! What this handler enforces, and why:
 //!
 //! * The lens is resolved by `LensAlias` through the store's own lookup, so an alias
-//!   naming no stored custom lens — or one whose first import has not landed yet, which
-//!   has no content to publish — is the lookup's 404.
+//!   naming no stored custom lens is the lookup's 404 — and the lens resolves BEFORE the
+//!   version name is judged, so a lens that exists is never answered as a missing one.
 //! * An Amazon Web Services official lens is refused 400: AWS publishes its own lenses,
 //!   so a caller cannot publish a version of one.
 //! * A `LensVersion` the lens already published is a 409: a published version is
@@ -236,25 +236,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::lens_not_found(&input.lens_alias),
             )
         })?;
-        // This request writes to the lens, so an import the clock already owed becomes
-        // the lens's draft content first: what is published is the draft as of now.
-        record.settle(now);
 
         // "Use this operation to publish a new lens version after you have imported a
-        // lens": the draft content is what a version is published FROM, so a lens whose
-        // first import has not landed yet has nothing to publish and is not readable —
-        // the same 404 `ExportLens` answers for it.
-        let content = record.settled_content(now).cloned().ok_or_else(|| {
+        // lens": the lens's content is what a version is published FROM, so a lens a
+        // delete left no content on has nothing to publish — the same 404 `ExportLens`
+        // answers for it.
+        let content = record.content().cloned().ok_or_else(|| {
             CreateLensVersionErrorModeled::ResourceNotFoundException(
                 crate::state::lens_not_found(&input.lens_alias),
             )
         })?;
 
         // A published version is immutable, so a second publish under a name the lens
-        // already carries collides with it rather than replacing its content.
+        // already carries collides with it rather than replacing its content. Judged after
+        // the lens itself resolved, so "no such lens" and "already published" are never
+        // collapsed into one answer.
         if record.versions.contains_key(&input.lens_version) {
             return Err(CreateLensVersionErrorModeled::ConflictException(
-                crate::state::lens_version_conflict(&input.lens_alias, &input.lens_version),
+                crate::state::lens_version_conflict(&record.lens_arn, &input.lens_version),
             )
             .into());
         }

@@ -300,8 +300,11 @@ fn violation_clause(violation: &Violation) -> String {
     let rendered = advertised.message();
     match rendered.rsplit_once(CONSTRAINT_SEPARATOR) {
         // A member that was ABSENT has no value to omit, and the framework's own clause
-        // already says exactly that (`Value null at '<member>' …`), so it stands.
-        Some((_, requirement)) if violation.value.is_some() => clause(&violation.path, requirement),
+        // already says exactly that (`Value null at '<member>' …`), so it stands. A value
+        // the walk withheld was still sent, so its clause states no value either.
+        Some((_, requirement)) if violation.value.is_some() || violation.sensitive => {
+            clause(&violation.path, requirement)
+        }
         _ => rendered,
     }
 }

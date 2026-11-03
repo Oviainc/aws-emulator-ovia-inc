@@ -268,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for. It runs over the whole list the request named rather than only the fresh
         // ones, so a name that resolves to nothing is refused whether or not the template
         // already applies that lens.
-        match store.unapplicable_lenses_refusal(&to_associate, LENSES_TO_ASSOCIATE_MEMBER, now) {
+        match store.unapplicable_lenses_refusal(&to_associate, LENSES_TO_ASSOCIATE_MEMBER) {
             Some(crate::state::LensesRefusal::NotFound(exception)) => {
                 return Err(
                     UpdateReviewTemplateErrorModeled::ResourceNotFoundException(exception).into(),

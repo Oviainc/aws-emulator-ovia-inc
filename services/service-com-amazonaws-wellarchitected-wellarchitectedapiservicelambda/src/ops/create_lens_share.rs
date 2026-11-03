@@ -212,7 +212,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "SharedWith": &input.shared_with,
         }));
 
-        let now = std::time::SystemTime::now();
         let mut store = state.lock();
 
         // `@idempotencyToken` replay: the same token with the same parameters returns the
@@ -249,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let published = record.published_version(now).is_some();
+        let published = record.published_version().is_some();
         let lens_id = record.lens_id.clone();
         let lens_arn = record.lens_arn.clone();
         let shared_by = record.owner.clone();
@@ -258,8 +257,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to workloads or shared with other Amazon Web Services accounts until it's
         // published with CreateLensVersion" (`ImportLens` doc). Whether the content the
         // lens now carries has been published is the lens's own question
-        // (`crate::state::LensRecord::published_version`), so an import that has not landed
-        // yet and a draft nothing was published from are refused by the same rule.
+        // (`crate::state::LensRecord::published_version`), so a draft nothing was published
+        // from is refused whichever import left it behind.
         if !published {
             return Err(field_validation(
                 LENS_ALIAS_MEMBER,
