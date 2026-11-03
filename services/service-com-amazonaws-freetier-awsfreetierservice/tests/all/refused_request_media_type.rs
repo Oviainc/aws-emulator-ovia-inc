@@ -269,9 +269,12 @@ async fn every_refused_request_is_answered_in_the_services_media_type() {
             expected_code: "ResourceNotFoundException",
         },
         Case {
+            // The FREE plan, because the PAID one is open only to an account
+            // whose payment instrument has been vetted (`paid_plan_vetting.rs`)
+            // and this row is about the media type of a success.
             name: "a handler's success",
             target: Some("AWSFreeTierService.UpgradeAccountPlan"),
-            body: r#"{"accountPlanType":"PAID"}"#,
+            body: r#"{"accountPlanType":"FREE"}"#,
             expected_status: 200,
             expected_code: "",
         },

@@ -31,11 +31,12 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_freetier_awsfreetierservice::ops::types::{
-    ACTIVITY_STATUS_VALUES, LANGUAGE_CODE_VALUES,
+    ACCOUNT_PLAN_TYPE_VALUES, ACTIVITY_STATUS_VALUES, LANGUAGE_CODE_VALUES, MATCH_OPTION_VALUES,
 };
 use service_com_amazonaws_freetier_awsfreetierservice::state::{
-    stated_validation, ACTIVITIES_INVALID_NEXT_TOKEN, ACTIVITIES_MAX_RESULTS_CEILING,
-    ACTIVITY_STATUS_VALUE_SET, INVALID_NEXT_TOKEN, LANGUAGE_CODE_VALUE_SET,
+    stated_enum_value_set, stated_validation, ACCOUNT_PLAN_TYPE_VALUE_SET,
+    ACTIVITIES_INVALID_NEXT_TOKEN, ACTIVITIES_MAX_RESULTS_CEILING, ACTIVITY_STATUS_VALUE_SET,
+    INVALID_NEXT_TOKEN, LANGUAGE_CODE_VALUE_SET,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -337,6 +338,11 @@ async fn an_enum_value_set_is_stated_in_the_order_the_service_states_it() {
             ACTIVITY_STATUS_VALUE_SET.to_vec(),
             ACTIVITY_STATUS_VALUES.to_vec(),
         ),
+        (
+            "AccountPlanType",
+            ACCOUNT_PLAN_TYPE_VALUE_SET.to_vec(),
+            ACCOUNT_PLAN_TYPE_VALUES.to_vec(),
+        ),
     ] {
         let mut sorted_published = published.clone();
         sorted_published.sort_unstable();
@@ -407,9 +413,11 @@ async fn an_enum_value_set_is_stated_in_the_order_the_service_states_it() {
         );
     }
 
-    // The control: an enum this service publishes no order for keeps the order
-    // the set reaches the clause in, so the published orders are the only thing
-    // that moved.
+    // The same rule on a THIRD enum, carried by another operation's member, so
+    // the order is a property of the enum and not of the operation that states
+    // it. The set `accountPlanType` is stated in is pinned over a wider table of
+    // submitted values in `paid_plan_vetting.rs`.
+    let plan_type_set = ACCOUNT_PLAN_TYPE_VALUE_SET.join(", ");
     let actual = refusal_message(
         &router,
         "accountPlanType outside its enum",
@@ -420,10 +428,26 @@ async fn an_enum_value_set_is_stated_in_the_order_the_service_states_it() {
     .await;
     assert_eq!(
         actual,
-        "1 validation error detected: Value 'GOLD' at 'accountPlanType' failed to satisfy \
-         constraint: Member must satisfy enum value set: [FREE, PAID]",
-        "case accountPlanType outside its enum: an unpublished set keeps its presented order, \
-         got {actual:?}"
+        format!(
+            "1 validation error detected: Value 'GOLD' at 'accountPlanType' failed to satisfy \
+             constraint: Member must satisfy enum value set: [{plan_type_set}]"
+        ),
+        "case accountPlanType outside its enum: the set must be stated in the order the \
+         service states that enum in, got {actual:?}"
+    );
+
+    // The control: an enum this service publishes no order for keeps the order
+    // the set reaches the clause in, so the published orders are the only thing
+    // that moved.
+    let presented: Vec<String> = MATCH_OPTION_VALUES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+    assert_eq!(
+        stated_enum_value_set(&presented),
+        presented,
+        "case MatchOption: an unpublished set keeps its presented order, got {:?}",
+        stated_enum_value_set(&presented)
     );
 }
 

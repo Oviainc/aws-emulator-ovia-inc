@@ -19,12 +19,17 @@
 //!   activity always agree.
 //! * `usages` — the Free Tier usage records `GetFreeTierUsage` pages and
 //!   filters, also insertion-ordered.
+//! * `vetted_payment_instruments` — the accounts whose payment instrument has
+//!   been vetted, which is the precondition `UpgradeAccountPlan` checks before
+//!   it moves an account onto the paid plan
+//!   ([`ComAmazonawsFreetierAwsfreetierserviceState::payment_instrument_vetted`]).
+//!   It starts EMPTY, like `plans`.
 //!
 //! `activities` and `usages` are part of the store's initial value
 //! ([`Default`]), so a reporting operation serves a read without writing
 //! anything.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ::aws_smithy_types::DateTime;
 
@@ -377,6 +382,14 @@ pub struct ComAmazonawsFreetierAwsfreetierserviceState {
     pub activities: HashMap<String, Vec<Activity>>,
     /// Account id -> its Free Tier usage records, in report order.
     pub usages: HashMap<String, Vec<UsageRecord>>,
+    /// The accounts whose payment instrument has been vetted, read through
+    /// [`ComAmazonawsFreetierAwsfreetierserviceState::payment_instrument_vetted`].
+    ///
+    /// A payment instrument is established outside this service — Free Tier
+    /// models no operation that adds one, and none of its three other
+    /// operations reads this — so an account is in here only once something put
+    /// it here, and the emulator's own account is not.
+    pub vetted_payment_instruments: HashSet<String>,
 }
 
 impl Default for ComAmazonawsFreetierAwsfreetierserviceState {
@@ -398,6 +411,7 @@ impl Default for ComAmazonawsFreetierAwsfreetierserviceState {
             plans: HashMap::new(),
             activities: HashMap::from([(account_id.clone(), seed_activities(now))]),
             usages: HashMap::from([(account_id, seed_usages())]),
+            vetted_payment_instruments: HashSet::new(),
         }
     }
 }
@@ -426,6 +440,27 @@ impl ComAmazonawsFreetierAwsfreetierserviceState {
         self.plans
             .entry(account_id.to_string())
             .or_insert_with(|| AccountPlan::free(account_id, now()))
+    }
+
+    /// Whether the account holds a payment instrument that has been vetted.
+    ///
+    /// The precondition of the move onto the paid plan: that plan is billed, so
+    /// an account the bill cannot be charged to is not moved onto it (see
+    /// [`PAYMENT_INSTRUMENT_VET_FAILURE`]). A property of the ACCOUNT and not of
+    /// the call, so it answers the same whatever plan the account holds and
+    /// however often it is asked, which is what makes the refusal idempotent.
+    pub fn payment_instrument_vetted(&self, account_id: &str) -> bool {
+        self.vetted_payment_instruments.contains(account_id)
+    }
+
+    /// Record that the account's payment instrument has been vetted, so the
+    /// move onto the paid plan is open to it.
+    ///
+    /// This is what a vetting outside this service leaves behind; nothing in
+    /// Free Tier's own surface establishes a payment instrument.
+    pub fn vet_payment_instrument(&mut self, account_id: &str) {
+        self.vetted_payment_instruments
+            .insert(account_id.to_string());
     }
 
     /// The account's activity catalog, in catalog order; empty for an account
@@ -659,6 +694,18 @@ pub fn stated_validation(sentence: &str) -> String {
     format!("[Message = {sentence}]")
 }
 
+/// What `UpgradeAccountPlan` states when it refuses to move an account onto the
+/// paid plan because the account holds no vetted payment instrument
+/// ([`ComAmazonawsFreetierAwsfreetierserviceState::payment_instrument_vetted`]).
+///
+/// Stated VERBATIM, like [`ACTIVITIES_INVALID_NEXT_TOKEN`] and unlike the
+/// sentences [`stated_validation`] wraps: it is the whole `message` of the
+/// `ValidationException` (HTTP 400) the refusal carries. It is FIXED text —
+/// nothing of the request and nothing in the store varies it — so a caller sees
+/// the same words whichever account asked and however often, which is what makes
+/// the refusal idempotent.
+pub const PAYMENT_INSTRUMENT_VET_FAILURE: &str = "Account plan upgrade failed PI vet failure";
+
 /// The order this service STATES the `LanguageCode` value set in when it refuses
 /// a value outside it.
 ///
@@ -690,13 +737,24 @@ pub const LANGUAGE_CODE_VALUE_SET: [&str; 13] = [
 pub const ACTIVITY_STATUS_VALUE_SET: [&str; 4] =
     ["IN_PROGRESS", "COMPLETED", "NOT_STARTED", "EXPIRING"];
 
+/// The order this service STATES the `AccountPlanType` value set in, which the
+/// model declares `FREE, PAID`
+/// (`smithy_query(query="shape",shape="AccountPlanType")`).
+///
+/// The sibling of [`LANGUAGE_CODE_VALUE_SET`]; see it for why a published order
+/// exists at all.
+pub const ACCOUNT_PLAN_TYPE_VALUE_SET: [&str; 2] = ["PAID", "FREE"];
+
 /// Every enum value set this service publishes an order for.
 ///
 /// One row per enum whose stated order differs from its declaration order; a
 /// value set absent from this table is stated as it was presented, because this
 /// service has shown no other order for it.
-const PUBLISHED_ENUM_VALUE_SETS: &[&[&str]] =
-    &[&LANGUAGE_CODE_VALUE_SET, &ACTIVITY_STATUS_VALUE_SET];
+const PUBLISHED_ENUM_VALUE_SETS: &[&[&str]] = &[
+    &LANGUAGE_CODE_VALUE_SET,
+    &ACTIVITY_STATUS_VALUE_SET,
+    &ACCOUNT_PLAN_TYPE_VALUE_SET,
+];
 
 /// `values` in the order this service states that enum's value set in: the
 /// published order when `values` is a set it publishes one for

@@ -131,6 +131,16 @@ impl Emulator {
             .plans
             .contains_key(account_id)
     }
+
+    /// Record that the account's payment instrument has been vetted, which is
+    /// what the move onto the paid plan is conditional on (that gate's own rule
+    /// is pinned in `paid_plan_vetting.rs`).
+    fn vet_payment_instrument(&self) {
+        self.engine
+            .state::<ComAmazonawsFreetierAwsfreetierserviceState>()
+            .lock()
+            .vet_payment_instrument(engine::emulator_account_id());
+    }
 }
 
 /// The wire error code (`__type`) of an error body, without its namespace.
@@ -257,7 +267,7 @@ async fn every_response_announces_the_services_media_type() {
         MediaTypeCase {
             name: "UpgradeAccountPlan success",
             target: "AWSFreeTierService.UpgradeAccountPlan",
-            body: json!({"accountPlanType": PLAN_TYPE_PAID}),
+            body: json!({"accountPlanType": PLAN_TYPE_FREE}),
             request_media_type: Some(SERVICE_MEDIA_TYPE),
             establish_plan: false,
             expected_status: 200,
@@ -385,6 +395,10 @@ async fn an_established_plan_is_reported_by_the_same_read_that_was_refused() {
     // establishing the record from nothing.
     for requested in [PLAN_TYPE_FREE, PLAN_TYPE_PAID] {
         let emulator = Emulator::new();
+        // The paid plan is open only to an account whose payment instrument has
+        // been vetted; this suite is about what the read reports once the record
+        // exists, so both rows establish that precondition.
+        emulator.vet_payment_instrument();
         let (status, _, payload) = emulator.call("GetAccountPlanState", &json!({})).await;
         assert_eq!(
             status, 400,

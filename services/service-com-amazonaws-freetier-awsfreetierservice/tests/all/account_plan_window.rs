@@ -70,6 +70,11 @@ fn store_plan(row: &Row) -> Mounted {
     {
         let state = engine.state::<ComAmazonawsFreetierAwsfreetierserviceState>();
         let mut store = state.lock();
+        // This suite is about the free plan's one-off window, so its account
+        // carries a vetted payment instrument: the paid plan's own precondition
+        // is pinned in `paid_plan_vetting.rs` and is not what these rows
+        // exercise.
+        store.vet_payment_instrument(engine::emulator_account_id());
         let plan = store.plan_mut(engine::emulator_account_id());
         plan.plan_type = row.stored_type.to_string();
         // Stored ACTIVE on purpose: the status the service reports has to follow

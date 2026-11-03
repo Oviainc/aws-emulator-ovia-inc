@@ -55,6 +55,21 @@ fn router() -> MultiServiceRouter {
     harness().0
 }
 
+/// A router whose account carries a vetted payment instrument — the precondition
+/// `UpgradeAccountPlan` checks before it moves an account onto the paid plan.
+///
+/// A suite that is about what the upgrade STORES rather than about that gate
+/// (whose own rule is pinned in `paid_plan_vetting.rs`) establishes the
+/// precondition here instead of at every call.
+pub(crate) fn vetted_router() -> MultiServiceRouter {
+    let (router, engine) = harness();
+    engine
+        .state::<ComAmazonawsFreetierAwsfreetierserviceState>()
+        .lock()
+        .vet_payment_instrument(engine::emulator_account_id());
+    router
+}
+
 /// Call one operation and return its HTTP status and JSON body.
 pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     let request = http::Request::builder()
@@ -270,7 +285,7 @@ async fn upgrade_account_plan_persists_the_target_plan() {
     ];
 
     for (requested, expected_type, expects_expiry) in cases {
-        let router = router();
+        let router = vetted_router();
 
         let upgraded = ok(
             &router,
@@ -364,7 +379,7 @@ async fn upgrade_account_plan_refuses_a_plan_type_outside_the_enum() {
 /// the free plan, and the refusal leaves it on the paid plan.
 #[tokio::test]
 async fn upgrade_account_plan_refuses_a_move_back_to_the_free_plan() {
-    let router = router();
+    let router = vetted_router();
     ok(
         &router,
         "UpgradeAccountPlan",

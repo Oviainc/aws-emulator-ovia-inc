@@ -27,6 +27,8 @@ mod free_tier;
 mod language_code_subtag_rule;
 #[path = "all/match_option_cardinality.rs"]
 mod match_option_cardinality;
+#[path = "all/paid_plan_vetting.rs"]
+mod paid_plan_vetting;
 #[path = "all/refused_request_media_type.rs"]
 mod refused_request_media_type;
 #[path = "all/resource_not_found_status.rs"]

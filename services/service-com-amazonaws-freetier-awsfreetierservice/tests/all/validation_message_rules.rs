@@ -33,7 +33,8 @@ use service_com_amazonaws_freetier_awsfreetierservice::ops::types::{
     ACTIVITY_STATUS_VALUES, MATCH_OPTION_VALUES,
 };
 use service_com_amazonaws_freetier_awsfreetierservice::state::{
-    stated_validation, ACTIVITIES_INVALID_NEXT_TOKEN, INVALID_NEXT_TOKEN,
+    stated_validation, ACCOUNT_PLAN_TYPE_VALUE_SET, ACTIVITIES_INVALID_NEXT_TOKEN,
+    INVALID_NEXT_TOKEN,
 };
 
 use crate::free_tier::{call, error_code, harness, ok};
@@ -591,9 +592,11 @@ async fn a_members_own_constraint_is_stated_with_its_value_path_and_requirement(
             "a value outside an enumerated member",
             "UpgradeAccountPlan",
             json!({"accountPlanType": "GOLD"}),
-            "1 validation error detected: Value 'GOLD' at 'accountPlanType' failed to satisfy \
-             constraint: Member must satisfy enum value set: [FREE, PAID]"
-                .to_string(),
+            format!(
+                "1 validation error detected: Value 'GOLD' at 'accountPlanType' failed to \
+                 satisfy constraint: Member must satisfy enum value set: [{}]",
+                ACCOUNT_PLAN_TYPE_VALUE_SET.join(", ")
+            ),
         ),
         (
             "a LIST's own @length, stated with no value",

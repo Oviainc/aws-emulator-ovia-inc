@@ -6,6 +6,12 @@
 //! `accountPlanType` and reports what was stored, so a following
 //! `GetAccountPlanState` reports the same plan.
 //!
+//! The move onto the PAID plan is conditional: that plan is billed, so an
+//! account whose payment instrument has not been vetted
+//! ([`crate::state::ComAmazonawsFreetierAwsfreetierserviceState::payment_instrument_vetted`])
+//! is refused with the modelled `ValidationException` and its plan record is
+//! left exactly as it was — not even established.
+//!
 //! This is the service's ONLY plan-writing operation, so it is also what
 //! establishes the record for an account that holds no account-plan data yet
 //! ([`crate::state::ComAmazonawsFreetierAwsfreetierserviceState::plan_mut`]);
@@ -182,6 +188,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account_id = crate::state::caller_account_id();
         let now = crate::state::now();
         let mut store = state.lock();
+
+        // The paid plan is billed, so moving an account onto it is conditional
+        // on the account holding a payment instrument that has been vetted: an
+        // account with none is refused and nothing of its plan record is read
+        // or written, so the refusal answers the same way however often it is
+        // made. Free Tier models no operation that establishes an instrument,
+        // so the vetting is state this service only reads.
+        if target == crate::state::PLAN_TYPE_PAID && !store.payment_instrument_vetted(account_id) {
+            return Err(stated_verbatim(
+                crate::state::PAYMENT_INSTRUMENT_VET_FAILURE,
+            ));
+        }
+
         // The plan this call writes, established on the free plan when the
         // account holds none: moving an account onto a plan is the mutation the
         // caller asked for, and this is the one operation allowed to make it.
@@ -220,6 +239,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn validation(message: impl AsRef<str>) -> UpgradeAccountPlanError {
     UpgradeAccountPlanErrorModeled::ValidationException(ValidationException {
         message: crate::state::stated_validation(message.as_ref()),
+    })
+    .into()
+}
+
+/// Refuse the request with this operation's own modelled `ValidationException`
+/// (HTTP 400) whose `message` is `message` and nothing else.
+///
+/// The counterpart of [`validation`] for a refusal this service states in fixed
+/// words of its own rather than inside that envelope — see
+/// [`crate::state::PAYMENT_INSTRUMENT_VET_FAILURE`].
+fn stated_verbatim(message: &str) -> UpgradeAccountPlanError {
+    UpgradeAccountPlanErrorModeled::ValidationException(ValidationException {
+        message: message.to_string(),
     })
     .into()
 }
