@@ -196,13 +196,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // An ARN is a WHOLE identifier, account included, so the account segment of every
-        // identifier the request carries is checked before any of them is resolved
-        // ([`crate::state::foreign_account_violation`]).
+        // An ARN is a WHOLE identifier, Region and account included, so both segments of
+        // every identifier the request carries are checked before any of them is resolved
+        // ([`crate::state::request_arn_violation`]) — the attachments the report names
+        // included, each of which names a resource by ARN.
         let references = [input.cluster.as_deref(), input.task.as_deref()];
-        if let Some(message) =
-            crate::state::foreign_account_violation(references.into_iter().flatten())
-        {
+        let attachment_arns = input
+            .attachments
+            .iter()
+            .flatten()
+            .map(|change| change.attachment_arn.as_str());
+        if let Some(message) = crate::state::request_arn_violation(
+            ctx,
+            references.into_iter().flatten().chain(attachment_arns),
+        ) {
             return Err(
                 SubmitTaskStateChangeErrorModeled::InvalidParameterException(
                     InvalidParameterException {

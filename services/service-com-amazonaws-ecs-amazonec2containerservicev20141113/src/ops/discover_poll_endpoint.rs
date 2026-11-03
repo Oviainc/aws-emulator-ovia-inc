@@ -159,15 +159,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx);
-        // An ARN is a WHOLE identifier, account included, so its account segment is
-        // checked before the identifier is resolved
-        // ([`crate::state::foreign_account_violation`]).
-        if let Some(message) = crate::state::foreign_account_violation(input.cluster.as_deref()) {
-            return Err(DiscoverPollEndpointErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(message.to_string()),
-                },
-            )
+        // An ARN is a WHOLE identifier, Region and account included, so both segments of
+        // every identifier the request carries are decided before any of them is resolved
+        // ([`crate::state::foreign_arn_segment`], which decides the Region first) and
+        // before the FORM of the id an ARN carries is checked: an ARN of another Region
+        // names no cluster and no instance this endpoint holds, so the refusal is about the
+        // ARN. This operation answers that condition in the client-error class the corpus
+        // records for it, and another account's ARN as the invalid parameter it is.
+        let references = [
+            input.cluster.as_deref(),
+            input.container_instance.as_deref(),
+        ];
+        if let Some(segment) =
+            crate::state::foreign_arn_segment(ctx, references.into_iter().flatten())
+        {
+            let message = Some(segment.message().to_string());
+            return Err(match segment {
+                crate::state::ForeignArnSegment::Region => {
+                    DiscoverPollEndpointErrorModeled::ClientException(ClientException { message })
+                }
+                crate::state::ForeignArnSegment::Account => {
+                    DiscoverPollEndpointErrorModeled::InvalidParameterException(
+                        InvalidParameterException { message },
+                    )
+                }
+            }
             .into());
         }
 

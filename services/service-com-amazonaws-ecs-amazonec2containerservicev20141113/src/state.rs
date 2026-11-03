@@ -105,12 +105,13 @@ pub use cluster_refusal::{
     CLUSTER_INACTIVE_FOR_TAGGING_MESSAGE, CLUSTER_INACTIVE_MESSAGE,
 };
 
-/// How an ARN a REQUEST supplies is read, and what it is refused for: the account segment
-/// checked before the identifier is resolved.
+/// How an ARN a REQUEST supplies is read, and what it is refused for: the Region and the
+/// account segments checked before the identifier is resolved.
 mod request_arn;
 pub use request_arn::{
-    foreign_account_resource_arn_violation, foreign_account_violation, is_cluster_arn,
-    names_another_account, ACCOUNT_IDS_MISMATCH_MESSAGE, INVALID_ARN_MESSAGE,
+    foreign_arn_segment, is_cluster_arn, names_another_account, names_another_region,
+    request_arn_resource_violation, request_arn_violation, ForeignArnSegment,
+    ACCOUNT_IDS_MISMATCH_MESSAGE, INVALID_ARN_MESSAGE, INVALID_REGION_IN_ARN_MESSAGE,
 };
 
 /// The region an ARN carries when the request is unsigned (so it has no SigV4

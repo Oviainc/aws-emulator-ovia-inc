@@ -230,15 +230,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // An ARN is a WHOLE identifier, account included, so the account segment of every
-        // identifier the request carries is checked before any of them is resolved
-        // ([`crate::state::foreign_account_violation`]).
-        let foreign = input
+        // An ARN is a WHOLE identifier, Region and account included, so both segments of
+        // every identifier the request carries are checked before any of them is resolved
+        // ([`crate::state::request_arn_violation`]).
+        let supplied = input
             .cluster
             .as_deref()
             .into_iter()
             .chain(input.container_instances.iter().map(String::as_str));
-        if let Some(message) = crate::state::foreign_account_violation(foreign) {
+        if let Some(message) = crate::state::request_arn_violation(ctx, supplied) {
             return Err(
                 UpdateContainerInstancesStateErrorModeled::InvalidParameterException(
                     InvalidParameterException {

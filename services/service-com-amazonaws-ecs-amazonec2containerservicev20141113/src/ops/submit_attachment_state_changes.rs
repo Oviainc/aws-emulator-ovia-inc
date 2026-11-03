@@ -154,12 +154,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the ECS store is unavailable".to_string()),
             })
         })?;
-        let _ = ctx;
 
-        // An ARN is a WHOLE identifier, account included, so its account segment is
-        // checked before the identifier is resolved
-        // ([`crate::state::foreign_account_violation`]).
-        if let Some(message) = crate::state::foreign_account_violation(input.cluster.as_deref()) {
+        // An ARN is a WHOLE identifier, Region and account included, so both segments of
+        // every identifier the request carries are checked before any of them is resolved
+        // ([`crate::state::request_arn_violation`]) — the attachments the report names
+        // included, each of which names a resource by ARN.
+        let attachment_arns = input
+            .attachments
+            .iter()
+            .map(|change| change.attachment_arn.as_str());
+        if let Some(message) = crate::state::request_arn_violation(
+            ctx,
+            input.cluster.as_deref().into_iter().chain(attachment_arns),
+        ) {
             return Err(
                 SubmitAttachmentStateChangesErrorModeled::InvalidParameterException(
                     InvalidParameterException {

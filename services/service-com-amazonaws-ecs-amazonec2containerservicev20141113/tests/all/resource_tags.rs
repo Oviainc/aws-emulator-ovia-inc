@@ -503,9 +503,11 @@ async fn an_arn_that_names_no_held_resource_is_refused_by_its_kind() {
             "InvalidParameterException",
         ),
         (
+            // Another partition's ARN carries another Region too, and this endpoint
+            // resolves only its own Region's resources, so the ARN is what is refused.
             "an ECS ARN of another partition, for a cluster nothing created",
             format!("arn:aws-cn:ecs:cn-north-1:{ACCOUNT}:cluster/{CLUSTER}"),
-            "ClusterNotFoundException",
+            "InvalidParameterException",
         ),
         (
             "a value that is no ARN at all",

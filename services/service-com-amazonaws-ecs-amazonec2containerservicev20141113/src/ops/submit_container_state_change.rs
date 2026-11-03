@@ -164,21 +164,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // An ARN is a WHOLE identifier, account included, so the account segment of every
-        // identifier the request carries is checked before any of them is resolved
-        // ([`crate::state::foreign_account_violation`]).
+        // An ARN is a WHOLE identifier, Region and account included, so both segments of
+        // every identifier the request carries are decided before any of them is resolved
+        // ([`crate::state::foreign_arn_segment`], which decides the Region first). This
+        // operation answers an ARN of another Region in the client-error class the corpus
+        // records for it, and one of another account as the invalid parameter it is.
         let references = [input.cluster.as_deref(), input.task.as_deref()];
-        if let Some(message) =
-            crate::state::foreign_account_violation(references.into_iter().flatten())
+        if let Some(segment) =
+            crate::state::foreign_arn_segment(ctx, references.into_iter().flatten())
         {
-            return Err(
-                SubmitContainerStateChangeErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message.to_string()),
-                    },
-                )
-                .into(),
-            );
+            let message = Some(segment.message().to_string());
+            return Err(match segment {
+                crate::state::ForeignArnSegment::Region => {
+                    SubmitContainerStateChangeErrorModeled::ClientException(ClientException {
+                        message,
+                    })
+                }
+                crate::state::ForeignArnSegment::Account => {
+                    SubmitContainerStateChangeErrorModeled::InvalidParameterException(
+                        InvalidParameterException { message },
+                    )
+                }
+            }
+            .into());
         }
 
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());

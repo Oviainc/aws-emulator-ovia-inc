@@ -178,13 +178,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // An ARN is a WHOLE identifier, account included, so the account segment of every
-        // identifier the request carries is checked before any of them is resolved
-        // ([`crate::state::foreign_account_violation`]). The scan is over the list the
-        // bound above has already clamped.
-        let foreign = ::std::iter::once(input.cluster.as_str())
+        // An ARN is a WHOLE identifier, Region and account included, so both segments of
+        // every identifier the request carries are checked before any of them is resolved
+        // ([`crate::state::request_arn_violation`]). The scan is over the list the bound
+        // above has already clamped.
+        let supplied = ::std::iter::once(input.cluster.as_str())
             .chain(input.tasks.iter().flatten().map(String::as_str));
-        if let Some(message) = crate::state::foreign_account_violation(foreign) {
+        if let Some(message) = crate::state::request_arn_violation(ctx, supplied) {
             return Err(GetTaskProtectionErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message.to_string()),
@@ -251,7 +251,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     detail: None,
                 }),
                 Some(task) => protected_tasks.push(task.protection_view()),
-                None => failures.push(crate::state::missing_failure(&task_arn)),
+                // An entry that resolves to no task is reported under the identifier the
+                // request sent, NOT under the cluster-qualified ARN a stored task of that
+                // id would carry, so a caller can match the entry back to what it asked
+                // about ([`crate::state::unresolved_failure`]).
+                None => failures.push(crate::state::unresolved_failure(
+                    &region,
+                    crate::state::TASK_RESOURCE_TYPE,
+                    reference,
+                )),
             }
         }
 

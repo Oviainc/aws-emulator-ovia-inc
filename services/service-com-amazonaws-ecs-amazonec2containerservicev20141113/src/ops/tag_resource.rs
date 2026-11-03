@@ -185,18 +185,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the ECS store is unavailable".to_string()),
             })
         })?;
-        let _ = ctx;
 
         // "The Amazon Resource Name (ARN) of the resource to add tags to": a full ARN, of
         // one of the kinds that carry a tag set. A value that is none of them names no
         // resource whose tags could be written, so it is refused as the bad parameter it
         // is rather than reported as an absent resource.
-        // An ARN is a WHOLE identifier, account included: a `resourceArn` whose account
-        // is not the caller's names another account's resource, which is refused as the
-        // invalid ARN it is rather than resolved against this account's records
-        // ([`crate::state::foreign_account_resource_arn_violation`]).
+        // An ARN is a WHOLE identifier, Region and account included: a `resourceArn` of
+        // another Region or another account names a resource this endpoint does not hold,
+        // which is refused on the ARN rather than resolved against this endpoint's records
+        // ([`crate::state::request_arn_resource_violation`]).
         let resource_arn = input.resource_arn.as_str();
-        if let Some(message) = crate::state::foreign_account_resource_arn_violation(resource_arn) {
+        if let Some(message) = crate::state::request_arn_resource_violation(ctx, resource_arn) {
             return Err(TagResourceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message.to_string()),

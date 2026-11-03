@@ -515,10 +515,6 @@ async fn list_daemons_answers_an_empty_page_for_a_cluster_arn_that_names_no_clus
             ecs_arn(ACCOUNT, &format!("cluster/{}", "d".repeat(255))),
         ),
         ("a cluster that was deleted", deleted),
-        (
-            "a cluster ARN in another Region of this account",
-            format!("arn:aws:ecs:eu-west-1:{ACCOUNT}:cluster/elsewhere"),
-        ),
     ];
     for (case, arn) in arns {
         let body = ok(&router, "ListDaemons", json!({ "clusterArn": arn }), case).await;
@@ -532,6 +528,23 @@ async fn list_daemons_answers_an_empty_page_for_a_cluster_arn_that_names_no_clus
             "case {case:?}: expected no nextToken for {arn}, got {body}"
         );
     }
+
+    // A cluster ARN of ANOTHER Region names no cluster this endpoint could hold — Amazon
+    // ECS resources are Region specific — so it is refused on the ARN rather than filtered
+    // with, which is the refusal every operation answers such an ARN with.
+    let case = "a cluster ARN in another Region of this account";
+    let (code, message) = refusal(
+        &router,
+        "ListDaemons",
+        json!({ "clusterArn": format!("arn:aws:ecs:eu-west-1:{ACCOUNT}:cluster/elsewhere") }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        ("InvalidParameterException", "Invalid Region in ARN"),
+        "case {case:?}: expected the ARN-Region refusal, got {code} with {message:?}"
+    );
 
     // A reference that is a cluster NAME nothing holds names a cluster this account could
     // have, so it keeps the cluster-resolution refusal.

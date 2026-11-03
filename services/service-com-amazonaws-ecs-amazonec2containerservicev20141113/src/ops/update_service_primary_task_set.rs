@@ -165,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateServicePrimaryTaskSetErrorModeled::ServerException(ServerException {
@@ -173,10 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // An ARN is a WHOLE identifier, account included, so its account segment is
+        // An ARN is a WHOLE identifier, Region and account included, so both segments are
         // checked before the identifier is resolved
-        // ([`crate::state::foreign_account_violation`]).
-        if let Some(message) = crate::state::foreign_account_violation(Some(input.cluster.as_str()))
+        // ([`crate::state::request_arn_violation`]).
+        if let Some(message) =
+            crate::state::request_arn_violation(ctx, Some(input.cluster.as_str()))
         {
             return Err(
                 UpdateServicePrimaryTaskSetErrorModeled::InvalidParameterException(
