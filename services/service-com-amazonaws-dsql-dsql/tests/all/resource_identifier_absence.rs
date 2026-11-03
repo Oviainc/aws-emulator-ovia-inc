@@ -3,25 +3,27 @@
 //! What an identifier-addressed operation answers for an identifier the account
 //! does not hold, and what it answers for a value that is no identifier at all.
 //!
-//! RULE under test: the FORM of a cluster or stream identifier is exactly the
-//! `^[a-z0-9]{26}$` that `ClusterId` and `StreamId` declare
-//! (`smithy_query(query="shape", shape="ClusterId,StreamId")`), so every value
-//! that pattern admits is resolved AGAINST THE STORE — an identifier the account
-//! does not hold is the modelled `ResourceNotFoundException`, HTTP 404 with the
-//! wire code `ResourceNotFoundException` and all three of its `@required` members
-//! filled: `message` naming the ARN the call addressed, `resourceId` the
-//! identifier the request carried, and `resourceType` the type of the resource
-//! the lookup stopped at. Nothing narrower than the pattern may be refused,
-//! because a 26-character lowercase-alphanumeric value is well formed whether or
-//! not this service's own minting scheme would have produced it; a value OUTSIDE
-//! the pattern is no identifier at all and is refused as input, which
-//! `tests/all/malformed_resource_identifier.rs` pins over this suite's route
-//! table.
+//! RULE under test: an identifier of this service is the 26-character base32
+//! rendering of a 128-bit value, the form every cluster and stream identifier is
+//! issued in, and every value of that form is resolved AGAINST THE STORE — an
+//! identifier the account does not hold is the modelled
+//! `ResourceNotFoundException`, HTTP 404 with the wire code
+//! `ResourceNotFoundException` and all three of its `@required` members filled:
+//! `message` naming the ARN the call addressed, `resourceId` the identifier the
+//! request carried, and `resourceType` the type of the resource the lookup stopped
+//! at. Nothing about which value the store holds may be refused, because a value
+//! of that form is well formed whether or not this service ever issued that
+//! particular one. The two complements are pinned beside this suite, over this
+//! suite's route table: a value outside `ClusterId`'s and `StreamId`'s
+//! `^[a-z0-9]{26}$` (`smithy_query(query="shape", shape="ClusterId,StreamId")`) is
+//! refused at the boundary (`tests/all/malformed_resource_identifier.rs`), and one
+//! inside that pattern which the encoding does not render is refused as input
+//! (`tests/all/identifier_format_refusal.rs`).
 //!
-//! The identifier table spans what the pattern generalises over — which symbols
-//! the value uses and where, including every form a 26-character
-//! lowercase-alphanumeric string can take that no minting scheme of this service
-//! produces — and the route table spans every operation that carries such an
+//! The identifier table spans what the form generalises over — which symbols the
+//! value uses and where, from the smallest value the encoding renders to the
+//! largest, including the renderings this service's own minting scheme would never
+//! have produced — and the route table spans every operation that carries such an
 //! identifier in its URI, so the rule is asserted on the member each one binds
 //! rather than on one reader, and on the nested stream route as well as the
 //! cluster ones.
@@ -36,6 +38,17 @@ use crate::harness::{absent_identifier, expected_arn, expected_stream_arn, Dsql}
 /// The length `ClusterId` and `StreamId` fix (`smithy_query(query="shape",
 /// shape="ClusterId,StreamId")`: `^[a-z0-9]{26}$`).
 pub const IDENTIFIER_LEN: usize = 26;
+
+/// The symbols an identifier of this service is rendered with, lowercased: the
+/// digits and the letters with `i`, `l`, `o` and `u` left out. Source: the
+/// rendering `state::new_resource_identifier` writes an identifier with (its
+/// `CROCKFORD_SYMBOLS`).
+pub const IDENTIFIER_SYMBOLS: &str = "0123456789abcdefghjkmnpqrstvwxyz";
+
+/// The largest leading symbol a rendering of a 128-bit value can carry:
+/// [`IDENTIFIER_LEN`] symbols carry 130 bits, so the leading one spells only the
+/// value's top 3 bits and the eight symbols up to this are the whole range.
+pub const LEADING_SYMBOL_MAX: char = '7';
 
 /// The resource types a refusal of this service names, as the service spells them
 /// in an ARN's resource field (`state::RESOURCE_TYPE_CLUSTER` /
@@ -246,56 +259,58 @@ pub struct IdCase {
     pub value: String,
 }
 
-/// Identifiers INSIDE `^[a-z0-9]{26}$` that no call ever created: every row is 26
-/// characters drawn from `[a-z0-9]`, so the model admits all of them, and the
-/// rows differ in which symbols they use and where — including the forms this
-/// service's own minting scheme never produces, which the pattern admits all the
-/// same.
+/// Identifiers of this service's own FORM that no call ever created: every row is
+/// 26 symbols of the identifier alphabet whose leading symbol keeps the value
+/// inside 128 bits, so every row is a value the encoding renders, and the rows
+/// differ in which symbols they use and where — from the smallest value the
+/// encoding renders to the largest, including the renderings this service's own
+/// minting scheme would never have produced.
 fn well_formed_absent_identifiers() -> Vec<IdCase> {
     let mut cases = vec![
         IdCase {
-            name: "every symbol the same letter".to_string(),
-            value: "a".repeat(IDENTIFIER_LEN),
-        },
-        IdCase {
-            name: "every symbol a zero".to_string(),
+            name: "the smallest value the encoding renders".to_string(),
             value: "0".repeat(IDENTIFIER_LEN),
         },
         IdCase {
-            name: "every symbol a nine".to_string(),
-            value: "9".repeat(IDENTIFIER_LEN),
+            name: "the largest value the encoding renders".to_string(),
+            value: format!("{LEADING_SYMBOL_MAX}{}", "z".repeat(IDENTIFIER_LEN - 1)),
         },
         IdCase {
-            name: "the last letter of the alphabet throughout".to_string(),
-            value: "z".repeat(IDENTIFIER_LEN),
+            name: "digits after the leading symbol".to_string(),
+            value: format!("1{}", "9".repeat(IDENTIFIER_LEN - 1)),
+        },
+        IdCase {
+            name: "letters after the leading symbol".to_string(),
+            value: "2aaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         },
         IdCase {
             name: "letters and digits mixed".to_string(),
-            value: "a1b2c3d4e5f6g7h8i9j0klmnop".to_string(),
+            value: "3a1b2c3d4e5f6g7h8j9k0m1n2p".to_string(),
         },
     ];
 
-    // The leading symbol, across the digit range: a value this service would not
-    // mint is still a value the pattern admits.
-    for leading in ['8', '9'] {
+    // The leading symbol, across the range the 128-bit ceiling admits: a value
+    // this service would not have minted is an identifier all the same.
+    for leading in ['4', '5', '6'] {
         cases.push(IdCase {
             name: format!("a leading {leading:?}"),
             value: format!("{leading}{}", "z".repeat(IDENTIFIER_LEN - 1)),
         });
     }
 
-    // The four letters `[a-z0-9]` carries that this service's identifier renderer
-    // never emits, each at the front, in the middle and at the end.
-    for letter in ['i', 'l', 'o', 'u'] {
+    // Each symbol of the alphabet, at the front of the value's body, in the
+    // middle and at the end: the form is about the alphabet rather than about
+    // which of its symbols a value happens to use.
+    for symbol in IDENTIFIER_SYMBOLS.chars() {
         for (position, where_it_is) in [
-            (0, "first"),
+            (1, "first"),
             (IDENTIFIER_LEN / 2, "middle"),
             (IDENTIFIER_LEN - 1, "last"),
         ] {
             let mut value: Vec<char> = "0".repeat(IDENTIFIER_LEN).chars().collect();
-            value[position] = letter;
+            value[position] = symbol;
             cases.push(IdCase {
-                name: format!("{letter:?} as the {where_it_is} symbol"),
+                name: format!("{symbol:?} as the {where_it_is} symbol of the body"),
                 value: value.into_iter().collect(),
             });
         }
@@ -312,8 +327,18 @@ fn well_formed_absent_identifiers() -> Vec<IdCase> {
         assert!(
             case.value
                 .chars()
-                .all(|symbol| symbol.is_ascii_lowercase() || symbol.is_ascii_digit()),
-            "case {:?}: every row must be inside [a-z0-9], got {:?}",
+                .all(|symbol| IDENTIFIER_SYMBOLS.contains(symbol)),
+            "case {:?}: every row must be drawn from the identifier alphabet, got {:?}",
+            case.name,
+            case.value
+        );
+        assert!(
+            case.value
+                .chars()
+                .next()
+                .is_some_and(|leading| leading <= LEADING_SYMBOL_MAX),
+            "case {:?}: every row's leading symbol must keep the value inside 128 bits, \
+             got {:?}",
             case.name,
             case.value
         );
@@ -321,11 +346,11 @@ fn well_formed_absent_identifiers() -> Vec<IdCase> {
     cases
 }
 
-/// RULE: every value `ClusterId`'s and `StreamId`'s `^[a-z0-9]{26}$` admits is
-/// resolved against the store, so an identifier the account does not hold answers
-/// 404 `ResourceNotFoundException` with the ARN-naming message, the identifier the
-/// request carried as `resourceId`, and the addressed resource's own type as
-/// `resourceType` — on every route that carries such an identifier.
+/// RULE: every value of the identifier form is resolved against the store, so an
+/// identifier the account does not hold answers 404 `ResourceNotFoundException`
+/// with the ARN-naming message, the identifier the request carried as
+/// `resourceId`, and the addressed resource's own type as `resourceType` — on
+/// every route that carries such an identifier.
 #[tokio::test]
 async fn a_well_formed_identifier_the_account_does_not_hold_is_not_found() {
     let dsql = Dsql::new();
@@ -342,7 +367,7 @@ async fn a_well_formed_identifier_the_account_does_not_hold_is_not_found() {
 
             assert_eq!(
                 answer.status, 404,
-                "case {name}: an identifier inside the modelled pattern that names \
+                "case {name}: an identifier of this service's own form that names \
                  nothing must answer 404, got {} {:?}",
                 answer.status, answer.body
             );
@@ -404,8 +429,8 @@ async fn a_well_formed_identifier_the_account_does_not_hold_is_not_found() {
     );
 }
 
-/// RULE, the other way round: an identifier this service MINTS is inside the
-/// pattern and resolves to the resource it names, so neither this suite nor the
+/// RULE, the other way round: an identifier this service MINTS is of that form
+/// and resolves to the resource it names, so neither this suite nor either
 /// complement refuses anything the service itself handed out — asserted by
 /// reading each minted cluster and each minted stream back through its reader.
 #[tokio::test]
@@ -425,8 +450,16 @@ async fn every_minted_identifier_resolves_to_its_resource() {
         assert!(
             cluster
                 .chars()
-                .all(|symbol| symbol.is_ascii_lowercase() || symbol.is_ascii_digit()),
-            "case {cluster:?}: a minted identifier is inside [a-z0-9]"
+                .all(|symbol| IDENTIFIER_SYMBOLS.contains(symbol)),
+            "case {cluster:?}: a minted identifier is drawn from the identifier alphabet"
+        );
+        assert!(
+            cluster
+                .chars()
+                .next()
+                .is_some_and(|leading| leading <= LEADING_SYMBOL_MAX),
+            "case {cluster:?}: a minted identifier renders a 128-bit value, so its leading \
+             symbol is at most {LEADING_SYMBOL_MAX:?}"
         );
         let read = dsql.get(cluster).await;
         assert_eq!(
@@ -446,8 +479,12 @@ async fn every_minted_identifier_resolves_to_its_resource() {
             stream.len() == IDENTIFIER_LEN
                 && stream
                     .chars()
-                    .all(|symbol| symbol.is_ascii_lowercase() || symbol.is_ascii_digit()),
-            "case {stream:?}: a minted stream identifier must be inside the pattern"
+                    .all(|symbol| IDENTIFIER_SYMBOLS.contains(symbol))
+                && stream
+                    .chars()
+                    .next()
+                    .is_some_and(|leading| leading <= LEADING_SYMBOL_MAX),
+            "case {stream:?}: a minted stream identifier must be of the identifier form"
         );
         let read_stream = dsql.get_stream(cluster, &stream).await;
         assert_eq!(

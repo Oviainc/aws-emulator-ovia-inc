@@ -41,6 +41,8 @@ mod encryption_key_selection;
 mod error_contract;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/identifier_format_refusal.rs"]
+mod identifier_format_refusal;
 #[path = "all/idempotent_replay_result.rs"]
 mod idempotent_replay_result;
 #[path = "all/incomplete_replay_record.rs"]

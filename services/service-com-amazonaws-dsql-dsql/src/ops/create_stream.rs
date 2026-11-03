@@ -203,9 +203,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The cluster identifier's FORM is `ClusterId`'s `^[a-z0-9]{26}$`, already
-        // decided by the boundary constraint walk, so the request goes to the
-        // store and a cluster this account does not hold is reported as absent.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateStreamErrorModeled::InternalServerException(
                 InternalServerException {
@@ -227,6 +224,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that the cluster it named is missing.
         if let Some(denial) = cross_account_denial(&input.target_definition) {
             return Err(CreateStreamErrorModeled::AccessDeniedException(denial).into());
+        }
+
+        // The cluster identifier's outer FORM is `ClusterId`'s `^[a-z0-9]{26}$`,
+        // already decided by the boundary constraint walk, but that pattern is
+        // wider than the encoding an identifier of this service is written in: a
+        // value that is no base32 rendering of a 128-bit value names no cluster
+        // and is refused as input, with the rest of the request's values and
+        // before anything is read or minted.
+        if let Err(invalid) = crate::state::validate_cluster_identifier(
+            crate::state::CLUSTER_IDENTIFIER_MEMBER,
+            &input.cluster_identifier,
+        ) {
+            return Err(CreateStreamErrorModeled::ValidationException(invalid).into());
         }
 
         // The `tags` a create carries are written exactly as `TagResource` writes

@@ -46,7 +46,11 @@
 //! ([`validate_cluster_policy`]) — it has to parse, and unless the caller bypasses
 //! the safety check it may not leave nobody able to replace it — are one
 //! implementation both of them call, as the witness-Region, peer-list and tag-key
-//! checks already are.
+//! checks already are. The check that a cluster or stream identifier is an
+//! identifier of this service at all ([`is_resource_identifier`], refused by
+//! [`validate_cluster_identifier`] / [`validate_stream_identifier`]) lives here on
+//! the same terms: eleven routes carry such an identifier, and all of them have to
+//! refuse one value the same way.
 //!
 //! The tagging operations address a resource by a caller-supplied `resourceArn`
 //! rather than by identifier, so the read of that ARN ([`parse_resource_arn`]), the
@@ -1755,19 +1759,42 @@ fn kms_key_arn(region: &str, kms_encryption_key: &str) -> String {
 /// (`smithy_query(query="shape", shape="ClusterId,StreamId")`).
 pub const RESOURCE_ID_LEN: usize = 26;
 
-/// Whether `value` is a value `ClusterId`'s and `StreamId`'s shared
-/// `^[a-z0-9]{26}$` accepts.
+/// Whether `value` is an identifier of this service at all: the 26-character
+/// base32 rendering of a 128-bit value, which is the form every cluster and
+/// stream identifier Aurora DSQL issues takes ([`new_resource_identifier`]).
 ///
-/// That pattern IS the whole form of a cluster or stream identifier, and the
+/// `ClusterId`'s and `StreamId`'s `^[a-z0-9]{26}$` is the OUTER form — the
 /// boundary constraint walk refuses every value outside it before a handler runs
-/// (`crate::service::validation`), so no handler decides the form a second time:
-/// a value the pattern admits is an identifier this account may simply not hold,
-/// which the lookup reports as [`cluster_not_found`] or [`stream_not_found`].
+/// (`crate::service::validation`) — but it is wider than the encoding: it admits
+/// symbols the base32 alphabet leaves out ([`CROCKFORD_SYMBOLS`]) and leading
+/// symbols that would carry the value past 128 bits. A value inside the pattern
+/// that is no rendering of a 128-bit value names no resource of this service and
+/// is refused as INPUT ([`validate_cluster_identifier`] /
+/// [`validate_stream_identifier`]); one that IS such a rendering is an identifier
+/// this account may simply not hold, which the lookup reports as
+/// [`cluster_not_found`] or [`stream_not_found`].
+///
+/// Decided by the ROUND TRIP through the renderer this service mints with, so the
+/// encoding is spelled in exactly one place: a value is an identifier when it
+/// decodes to a 128-bit value that renders back to that same value.
 pub fn is_resource_identifier(value: &str) -> bool {
-    value.len() == RESOURCE_ID_LEN
-        && value
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    decode_resource_identifier(value).is_some_and(|bits| crockford_base32(bits) == value)
+}
+
+/// The 128-bit value `value`'s symbols spell, or `None` when `value` is not 26
+/// symbols of [`CROCKFORD_SYMBOLS`] at all.
+///
+/// 26 symbols carry 130 bits, so the two bits above the 128th are dropped here
+/// and the leading symbol of the re-rendering differs from the one that was read:
+/// the round trip in [`is_resource_identifier`] is what rejects such a value.
+fn decode_resource_identifier(value: &str) -> Option<u128> {
+    if value.len() != RESOURCE_ID_LEN {
+        return None;
+    }
+    value.bytes().try_fold(0u128, |bits, symbol| {
+        let index = CROCKFORD_SYMBOLS.iter().position(|known| *known == symbol)?;
+        Some((bits << 5) | index as u128)
+    })
 }
 
 /// The page walk a cursor belongs to: the operation that issued it, together with
@@ -2185,6 +2212,76 @@ pub fn invalid_resource_arn(member: &str, value: &str) -> ValidationException {
         ),
         value,
     )
+}
+
+/// The member a cluster identifier arrives in on the operations addressed at a
+/// cluster (`smithy_query(query="operation", operation="GetCluster,DeleteCluster,
+/// UpdateCluster,GetClusterPolicy,PutClusterPolicy,DeleteClusterPolicy,
+/// GetVpcEndpointServiceName")`: `identifier`).
+pub const IDENTIFIER_MEMBER: &str = "identifier";
+
+/// The member a cluster identifier arrives in on the operations addressed at a
+/// cluster's STREAMS, which carry the stream's own identifier beside it
+/// (`smithy_query(query="operation", operation="CreateStream,ListStreams,GetStream,
+/// DeleteStream")`: `clusterIdentifier`).
+pub const CLUSTER_IDENTIFIER_MEMBER: &str = "clusterIdentifier";
+
+/// The member a stream identifier arrives in (`smithy_query(query="operation",
+/// operation="GetStream,DeleteStream")`: `streamIdentifier`).
+pub const STREAM_IDENTIFIER_MEMBER: &str = "streamIdentifier";
+
+/// The form an identifier of this service has to be in, as a refusal of a value
+/// that is not in it states it: the 26-character base32 rendering of a 128-bit
+/// value ([`is_resource_identifier`]).
+const IDENTIFIER_FORMAT: &str = "a valid base32-encoded 26-character string";
+
+/// Check a CLUSTER identifier a request carried, before anything is looked up.
+///
+/// `member` is the input member the value arrived in ([`IDENTIFIER_MEMBER`] on the
+/// cluster-addressed operations, [`CLUSTER_IDENTIFIER_MEMBER`] on the
+/// stream-addressed ones), so the refusal names what the caller has to fix and
+/// quotes the value it rejected, which is how a caller tells a malformed
+/// identifier from a cluster that is gone.
+///
+/// Every operation that carries a cluster identifier calls this, so one value is
+/// refused identically whichever route it arrives on.
+pub fn validate_cluster_identifier(member: &str, value: &str) -> Result<(), ValidationException> {
+    if is_resource_identifier(value) {
+        return Ok(());
+    }
+    Err(ValidationException {
+        message: format!(
+            "Invalid input '{member}: {value}'. The cluster identifier format is invalid. \
+             Provide a valid cluster identifier and try again."
+        ),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: format!("Member must be {IDENTIFIER_FORMAT}"),
+        }]),
+    })
+}
+
+/// Check a STREAM identifier a request carried, before anything is looked up, on
+/// the same terms as [`validate_cluster_identifier`].
+///
+/// The sentence Aurora DSQL words this case with names the offending member and
+/// the form it had to be in, and does not echo the rejected value.
+pub fn validate_stream_identifier(member: &str, value: &str) -> Result<(), ValidationException> {
+    if is_resource_identifier(value) {
+        return Ok(());
+    }
+    Err(ValidationException {
+        message: format!(
+            "Aurora DSQL can't process the request because the {member} that you specified \
+             isn't valid. Provide the {member} in the format '{IDENTIFIER_FORMAT}' and try again."
+        ),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: format!("Member must be {IDENTIFIER_FORMAT}"),
+        }]),
+    })
 }
 
 /// The prefix that marks a tag key as belonging to AWS rather than to the caller.

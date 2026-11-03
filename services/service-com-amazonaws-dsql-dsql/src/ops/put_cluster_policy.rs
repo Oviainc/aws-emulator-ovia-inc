@@ -158,10 +158,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The identifier's FORM is `ClusterId`'s `^[a-z0-9]{26}$`, already decided
-        // by the boundary constraint walk, so the request goes to the store and a
-        // cluster this account does not hold is reported as absent, ahead of the
-        // document check and the idempotency ledger alike.
+        // The identifier's outer FORM is `ClusterId`'s `^[a-z0-9]{26}$`, already
+        // decided by the boundary constraint walk, but that pattern is wider than
+        // the encoding an identifier of this service is written in: a value that
+        // is no base32 rendering of a 128-bit value names no cluster and is
+        // refused as input ahead of the lookup, the document check and the
+        // idempotency ledger alike.
+        if let Err(invalid) = crate::state::validate_cluster_identifier(
+            crate::state::IDENTIFIER_MEMBER,
+            &input.identifier,
+        ) {
+            return Err(PutClusterPolicyErrorModeled::ValidationException(invalid).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutClusterPolicyErrorModeled::InternalServerException(
                 InternalServerException {

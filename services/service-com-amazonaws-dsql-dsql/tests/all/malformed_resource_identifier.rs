@@ -3,14 +3,17 @@
 //! What an identifier-addressed operation answers for a value that is no
 //! identifier at all.
 //!
-//! RULE under test (the complement of `tests/all/resource_identifier_absence.rs`,
-//! which pins what a WELL-FORMED identifier gets): the form an identifier has to
-//! be in is exactly `ClusterId`'s and `StreamId`'s `^[a-z0-9]{26}$`
+//! RULE under test (one of two complements of
+//! `tests/all/resource_identifier_absence.rs`, which pins what an identifier of
+//! this service's own form gets): the OUTER form an identifier has to be in is
+//! `ClusterId`'s and `StreamId`'s `^[a-z0-9]{26}$`
 //! (`smithy_query(query="shape", shape="ClusterId,StreamId")`), so a value
 //! outside that pattern names no resource and is refused as INPUT — HTTP 400 with
 //! the service's own modelled `ValidationException`, whose `@required` `reason` is
 //! filled and whose `fieldList` names the member the value arrived in — before any
-//! state is read, and never as a report that some resource is absent.
+//! state is read, and never as a report that some resource is absent. A value
+//! INSIDE the pattern that the identifier encoding does not render is refused the
+//! same way, which `tests/all/identifier_format_refusal.rs` pins.
 //!
 //! The value table spans the ways a URI label can fall outside the pattern: the
 //! wrong case, the wrong length (under, over, and far under) and a character the
