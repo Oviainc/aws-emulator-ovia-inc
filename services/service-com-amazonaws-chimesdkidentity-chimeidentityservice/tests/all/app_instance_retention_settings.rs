@@ -24,15 +24,35 @@ use crate::app_instance_lifecycle::{uri_encode, Emulator};
 /// Source: `smithy_query(query="shape",shape="RetentionDays")` — an integer with
 /// `range { min: 1, max: 5475 }`, the same range the model repeats on
 /// `ChannelRetentionSettings$RetentionDays`.
-const MIN_RETENTION_DAYS: i64 = 1;
-const MAX_RETENTION_DAYS: i64 = 5475;
+pub(crate) const MIN_RETENTION_DAYS: i64 = 1;
+pub(crate) const MAX_RETENTION_DAYS: i64 = 5475;
 
 /// `PUT` the retention-settings route of one app instance.
 ///
 /// Source: `smithy_query(query="operation",operation="PutAppInstanceRetentionSettings")`
 /// — `PUT /app-instances/{AppInstanceArn}/retention-settings`, answering 200, with the
 /// `AppInstanceRetentionSettings` member required in the body.
-async fn put_retention(emulator: &Emulator, instance_arn: &str, settings: Value) -> (u16, Value) {
+pub(crate) async fn put_retention(
+    emulator: &Emulator,
+    instance_arn: &str,
+    settings: Value,
+) -> (u16, Value) {
+    put_retention_body(
+        emulator,
+        instance_arn,
+        json!({ "AppInstanceRetentionSettings": settings }),
+    )
+    .await
+}
+
+/// `PUT` the retention-settings route of one app instance with the given body VERBATIM,
+/// so a suite can send a body that carries no `AppInstanceRetentionSettings` member at
+/// all. The route itself is stated once, here.
+pub(crate) async fn put_retention_body(
+    emulator: &Emulator,
+    instance_arn: &str,
+    body: Value,
+) -> (u16, Value) {
     emulator
         .call(
             "PUT",
@@ -40,7 +60,7 @@ async fn put_retention(emulator: &Emulator, instance_arn: &str, settings: Value)
                 "/app-instances/{}/retention-settings",
                 uri_encode(instance_arn)
             ),
-            Some(json!({ "AppInstanceRetentionSettings": settings })),
+            Some(body),
         )
         .await
 }
@@ -49,7 +69,7 @@ async fn put_retention(emulator: &Emulator, instance_arn: &str, settings: Value)
 ///
 /// Source: `smithy_query(query="operation",operation="GetAppInstanceRetentionSettings")`
 /// — `GET /app-instances/{AppInstanceArn}/retention-settings`, answering 200.
-async fn get_retention(emulator: &Emulator, instance_arn: &str) -> (u16, Value) {
+pub(crate) async fn get_retention(emulator: &Emulator, instance_arn: &str) -> (u16, Value) {
     emulator
         .call(
             "GET",
@@ -64,14 +84,20 @@ async fn get_retention(emulator: &Emulator, instance_arn: &str) -> (u16, Value) 
 
 /// The `AppInstanceRetentionSettings` member of a response, or `Value::Null` when it
 /// carries none.
-fn reported_settings(body: &Value) -> Value {
+pub(crate) fn reported_settings(body: &Value) -> Value {
     body.get("AppInstanceRetentionSettings")
         .cloned()
         .unwrap_or(Value::Null)
 }
 
+/// The `InitiateDeletionTimestamp` member of a response, or `None` when it carries none.
+/// Stated once here so both retention suites name the member in one place.
+pub(crate) fn reported_instant(body: &Value) -> Option<f64> {
+    body.get("InitiateDeletionTimestamp").and_then(Value::as_f64)
+}
+
 /// `AppInstanceRetentionSettings` naming `days` days of channel retention.
-fn settings(days: i64) -> Value {
+pub(crate) fn settings(days: i64) -> Value {
     json!({ "ChannelRetentionSettings": { "RetentionDays": days } })
 }
 
@@ -147,7 +173,7 @@ async fn a_put_replaces_the_retention_settings_and_a_get_reports_them() {
         "expected a fresh instance to report no retention settings, got {status} {body:?}"
     );
     assert!(
-        body.get("InitiateDeletionTimestamp").is_none(),
+        reported_instant(&body).is_none(),
         "expected a fresh instance to report no deletion instant, got {body:?}"
     );
 
@@ -166,7 +192,7 @@ async fn a_put_replaces_the_retention_settings_and_a_get_reports_them() {
             "case {label:?}: expected the put to answer with {:?}, got {put_body:?}",
             case.written
         );
-        let put_instant = put_body.get("InitiateDeletionTimestamp").and_then(Value::as_f64);
+        let put_instant = reported_instant(&put_body);
         assert_eq!(
             put_instant.is_some(),
             case.retention_in_effect,
@@ -182,7 +208,7 @@ async fn a_put_replaces_the_retention_settings_and_a_get_reports_them() {
             "case {label:?}: expected a get to report {:?}, got {status} {get_body:?}",
             case.written
         );
-        let get_instant = get_body.get("InitiateDeletionTimestamp").and_then(Value::as_f64);
+        let get_instant = reported_instant(&get_body);
         assert_eq!(
             get_instant, put_instant,
             "case {label:?}: expected the get to report the put's deletion instant \
@@ -243,9 +269,7 @@ async fn a_number_of_days_outside_the_published_range_is_refused() {
     let surviving = settings(365);
     let (status, body) = put_retention(&emulator, &instance, surviving.clone()).await;
     assert_eq!(status, 200, "the surviving put answered: {status} {body:?}");
-    let surviving_instant = body
-        .get("InitiateDeletionTimestamp")
-        .and_then(Value::as_f64)
+    let surviving_instant = reported_instant(&body)
         .unwrap_or_else(|| panic!("expected the put to report a deletion instant: {body:?}"));
 
     // One step past each published bound, a negative count, and zero.
@@ -280,7 +304,7 @@ async fn a_number_of_days_outside_the_published_range_is_refused() {
              {status} {body:?}"
         );
         assert_eq!(
-            body.get("InitiateDeletionTimestamp").and_then(Value::as_f64),
+            reported_instant(&body),
             Some(surviving_instant),
             "case {label:?}: a refused put must leave the deletion instant \
              {surviving_instant:?} in place, got {body:?}"

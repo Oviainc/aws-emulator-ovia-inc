@@ -27,6 +27,8 @@ mod app_instance_retention_settings;
 mod resource_tagging;
 #[path = "all/resource_update.rs"]
 mod resource_update;
+#[path = "all/retention_settings_effect_instant.rs"]
+mod retention_settings_effect_instant;
 #[path = "all/signing_name_route_claim.rs"]
 mod signing_name_route_claim;
 #[path = "all/state_roundtrip.rs"]
