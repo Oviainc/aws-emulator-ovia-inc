@@ -20,9 +20,11 @@
 //!   after `FromInclusive` and before `ToExclusive`;
 //! * `AttackVolume` reports, per unit, the maximum the counted attacks observed
 //!   (`AttackVolumeStatistics$Max`: "The maximum attack volume observed for the given
-//!   unit"), a unit no counted attack reported is left unset, and the whole object is
-//!   unset when none is set — "If the accompanying `AttackCount` in the statistics
-//!   object is zero, this setting might be empty";
+//!   unit"); the block itself belongs to every data record, so it is always present, and
+//!   it is its three unit members that say what was observed — a unit no counted attack
+//!   reported is left unset, and a window with no reported unit at all is an empty
+//!   `AttackVolume`: "If the accompanying `AttackCount` in the statistics object is
+//!   zero, this setting might be empty";
 //! * the operation reports, so repeating it answers the same thing and leaves the
 //!   account's attack log as it was.
 
@@ -244,15 +246,33 @@ fn unit_max(item: &Value, unit: &str) -> Option<f64> {
     item.get("AttackVolume")?.get(unit)?.get("Max")?.as_f64()
 }
 
+/// The three units an `AttackVolume` reports, from the modelled shape
+/// (`com.amazonaws.shield#AttackVolume`: `BitsPerSecond`, `PacketsPerSecond`,
+/// `RequestsPerSecond`, each an optional `AttackVolumeStatistics`).
+const VOLUME_UNITS: [&str; 3] = ["BitsPerSecond", "PacketsPerSecond", "RequestsPerSecond"];
+
 #[tokio::test]
 async fn attack_statistics_aggregate_the_account_attacks_of_the_reported_window() {
     // Every row differs in how many attacks the account saw, where in the window they
     // started, and which units they reported.
     const CASES: &[Case] = &[
         Case {
-            name: "no attacks at all: a zero count carries no volume",
+            name: "no attacks at all: a zero count carries an empty volume",
             attacks: &[],
             attack_count: 0,
+            bits_per_second: None,
+            packets_per_second: None,
+            requests_per_second: None,
+        },
+        Case {
+            name: "a counted attack that reported no unit at all carries an empty volume",
+            attacks: &[Seed {
+                at: At::MidWindow,
+                bits_per_second: None,
+                packets_per_second: None,
+                requests_per_second: None,
+            }],
+            attack_count: 1,
             bits_per_second: None,
             packets_per_second: None,
             requests_per_second: None,
@@ -414,24 +434,40 @@ async fn run_case(case: &Case) -> bool {
         "case {name}: expected AttackCount {}, got {item:?}",
         case.attack_count
     );
-    for (unit, expected) in [
-        ("BitsPerSecond", case.bits_per_second),
-        ("PacketsPerSecond", case.packets_per_second),
-        ("RequestsPerSecond", case.requests_per_second),
-    ] {
+    let expected_units = [
+        case.bits_per_second,
+        case.packets_per_second,
+        case.requests_per_second,
+    ];
+    for (unit, expected) in VOLUME_UNITS.into_iter().zip(expected_units) {
         assert_eq!(
             unit_max(item, unit),
             expected,
             "case {name}: expected {unit} max {expected:?}, got {item:?}"
         );
     }
-    let reports_a_unit = case.bits_per_second.is_some()
-        || case.packets_per_second.is_some()
-        || case.requests_per_second.is_some();
+
+    // The volume block belongs to the data record whatever the attacks were, so it is
+    // present — as an object — even when not one of its units was reported, and it then
+    // carries none of them.
+    let volume = item
+        .get("AttackVolume")
+        .unwrap_or_else(|| panic!("case {name}: no AttackVolume in {item:?}"));
+    let reported = volume
+        .as_object()
+        .unwrap_or_else(|| panic!("case {name}: expected AttackVolume to be an object, got {volume:?}"));
+    let mut expected_members: Vec<&str> = VOLUME_UNITS
+        .into_iter()
+        .zip(expected_units)
+        .filter_map(|(unit, expected)| expected.map(|_| unit))
+        .collect();
+    expected_members.sort_unstable();
+    let mut present_members: Vec<&str> = reported.keys().map(String::as_str).collect();
+    present_members.sort_unstable();
     assert_eq!(
-        item.get("AttackVolume").is_some(),
-        reports_a_unit,
-        "case {name}: AttackVolume must be present only when a unit has a value, got {item:?}"
+        present_members, expected_members,
+        "case {name}: expected AttackVolume to carry exactly the reported units \
+         {expected_members:?}, got {volume:?}"
     );
     true
 }

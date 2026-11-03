@@ -610,9 +610,13 @@ impl ComAmazonawsShieldAwsshield20160616State {
     /// along with a time range indicating the time period that the attack statistics
     /// apply to"): `AttackCount` is how many stored attacks started inside the window,
     /// and the volume statistics are the maxima the counted attacks reported, per unit.
-    /// A unit no counted attack reported is left unset, and the whole `AttackVolume` is
-    /// unset when no unit has a value — `AttackVolume`: "If the accompanying
-    /// `AttackCount` in the statistics object is zero, this setting might be empty."
+    ///
+    /// The `AttackVolume` block is part of the record the window always summarises, so it
+    /// is reported for every data item; it is its three unit members that carry whether
+    /// anything was observed, each set only when a counted attack reported that unit. A
+    /// window in which no counted attack reported any unit is therefore an `AttackVolume`
+    /// with no member set — `AttackVolume`: "If the accompanying `AttackCount` in the
+    /// statistics object is zero, this setting might be empty."
     pub fn attack_statistics_in(
         &self,
         from_inclusive: SystemTime,
@@ -638,13 +642,10 @@ impl ComAmazonawsShieldAwsshield20160616State {
             packets_per_second: peak(|attack| attack.max_packets_per_second),
             requests_per_second: peak(|attack| attack.max_requests_per_second),
         };
-        let reported_any_unit = volume.bits_per_second.is_some()
-            || volume.packets_per_second.is_some()
-            || volume.requests_per_second.is_some();
 
         vec![AttackStatisticsDataItem {
             attack_count: counted.len() as i64,
-            attack_volume: reported_any_unit.then_some(volume),
+            attack_volume: Some(volume),
         }]
     }
 
