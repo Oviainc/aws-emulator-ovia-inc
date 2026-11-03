@@ -142,6 +142,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // written, so a later caller sees exactly what this one saw.
         let state = state.lock();
         let Some(record) = state.schemas.get(&input.schema_arn) else {
+            // This goes out with the status this service puts on a client error, not the
+            // shape's modeled `@httpError` — see `crate::scaffolded::wire_status`.
             return Err(DescribeSchemaErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::schema_not_found_message(&input.schema_arn)),

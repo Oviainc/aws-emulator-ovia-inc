@@ -183,7 +183,8 @@ impl SerializableStruct for ValidationException {
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the status [`wire_status`]
+    /// gives it, which is this service's own status for that class.
     Modeled(E),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -220,6 +221,37 @@ impl<E> Scaffolded<E> {
     /// SERVICE models that this OPERATION does not list.
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
+    }
+}
+
+/// The status this service puts on every CLIENT error: the `awsJson1_1` client-error
+/// status, with the error shape named in the body's `__type` rather than in the status
+/// line.
+const CLIENT_ERROR_STATUS: u16 = 400;
+
+/// The HTTP status THIS service answers with for a modeled error whose status in the
+/// model is `modeled`.
+///
+/// Amazon Personalize speaks `awsJson1_1` (`smithy_query(query="service_info")`) and on
+/// the wire answers every client error with that protocol's client status, 400, carrying
+/// the error shape's name in the body's `__type`. The per-shape `@httpError` values the
+/// model records for its client errors — 404 on `ResourceNotFoundException`, 403 on
+/// `ResourceAlreadyExistsException`, 409 on `ResourceInUseException` and
+/// `LimitExceededException` — are not what the service emits: the Amazon Personalize API
+/// Reference lists "HTTP Status Code: 400" for each of them. A client that classifies by
+/// status would otherwise read a plain client fault as a missing route, an authorization
+/// failure or a conflict to retry.
+///
+/// A SERVER error would keep the status the model gives it, so a 5xx stays the 5xx an SDK
+/// must see to retry; this service's model declares none today.
+///
+/// Deliberately the whole service's mapping in one place: a per-operation copy of it is
+/// what lets two operations disagree about one error shape's status.
+pub fn wire_status(modeled: u16) -> u16 {
+    if (400..500).contains(&modeled) {
+        CLIENT_ERROR_STATUS
+    } else {
+        modeled
     }
 }
 
@@ -278,15 +310,17 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         }
     }
 
-    /// 501 for the scaffold signal.
+    /// 501 for the scaffold signal, [`wire_status`] for a modeled error.
     ///
-    /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
-    /// retryable, so a client would retry an operation that can never succeed.
+    /// Keep the 501 and not a 5xx server fault: SDK retry classifiers treat those as
+    /// retryable, so a client would retry an operation that can never succeed. The
+    /// scaffold signal and the synthetic `ValidationException` are not modeled Personalize
+    /// errors, so neither goes through [`wire_status`].
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
-            Self::ValidationException(_) => 400,
+            Self::Modeled(e) => wire_status(e.http_status()),
+            Self::ValidationException(_) => CLIENT_ERROR_STATUS,
         }
     }
 

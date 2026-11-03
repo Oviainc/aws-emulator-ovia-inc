@@ -319,8 +319,8 @@ async fn a_created_schema_is_described_back_exactly_as_created() {
             .call("CreateSchema", json!({"name": name, "schema": schema}))
             .await;
         assert_eq!(
-            status, 403,
-            "case {case:?}: expected a duplicate CreateSchema to answer HTTP 403, got \
+            status, 400,
+            "case {case:?}: expected a duplicate CreateSchema to answer HTTP 400, got \
              {status} {body:?}"
         );
         assert!(
@@ -334,7 +334,7 @@ async fn a_created_schema_is_described_back_exactly_as_created() {
         "DescribeSchema",
         "schemaArn",
         &format!("arn:aws:personalize:{REGION}:{ACCOUNT}:schema/never-created"),
-        404,
+        400,
         "ResourceNotFoundException",
         "unknown schema",
     )
@@ -390,7 +390,7 @@ async fn create_schema_refuses_a_document_that_is_not_an_avro_record() {
         "DescribeSchema",
         "schemaArn",
         &arn,
-        404,
+        400,
         "ResourceNotFoundException",
         "after every refusal",
     )
@@ -519,8 +519,8 @@ async fn a_schema_is_deleted_only_once_no_dataset_references_it() {
                 .call_with_arn("DeleteSchema", "schemaArn", &schema_arn)
                 .await;
             assert_eq!(
-                status, 409,
-                "case {case:?}: expected DeleteSchema to answer HTTP 409 while {} dataset(s) \
+                status, 400,
+                "case {case:?}: expected DeleteSchema to answer HTTP 400 while {} dataset(s) \
                  reference it, got {status} {body:?}",
                 outstanding.len() + 1
             );
@@ -548,14 +548,14 @@ async fn a_schema_is_deleted_only_once_no_dataset_references_it() {
         }
 
         // With the last reference gone the delete succeeds, and the schema is really gone:
-        // a read answers 404 and a second delete has nothing to find.
+        // a read is refused as not found and a second delete has nothing to find.
         assert_deleted(&emulator, "DeleteSchema", "schemaArn", &schema_arn, &case).await;
         assert_fails(
             &emulator,
             "DescribeSchema",
             "schemaArn",
             &schema_arn,
-            404,
+            400,
             "ResourceNotFoundException",
             &case,
         )
@@ -565,7 +565,7 @@ async fn a_schema_is_deleted_only_once_no_dataset_references_it() {
             "DeleteSchema",
             "schemaArn",
             &schema_arn,
-            404,
+            400,
             "ResourceNotFoundException",
             &case,
         )
@@ -593,7 +593,7 @@ async fn a_schema_is_deleted_only_once_no_dataset_references_it() {
         "DeleteSchema",
         "schemaArn",
         &referenced,
-        409,
+        400,
         "ResourceInUseException",
         case,
     )
@@ -605,7 +605,7 @@ async fn a_schema_is_deleted_only_once_no_dataset_references_it() {
         "DeleteSchema",
         "schemaArn",
         &format!("arn:aws:personalize:{REGION}:{ACCOUNT}:schema/never-created"),
-        404,
+        400,
         "ResourceNotFoundException",
         case,
     )
@@ -755,8 +755,8 @@ async fn a_dataset_group_is_created_pending_becomes_active_and_is_deleted() {
             .call("CreateDatasetGroup", group_request(row))
             .await;
         assert_eq!(
-            status, 403,
-            "case {case:?}: expected a duplicate create to answer HTTP 403, got {status} {body:?}"
+            status, 400,
+            "case {case:?}: expected a duplicate create to answer HTTP 400, got {status} {body:?}"
         );
         assert!(
             error_code(&body).contains("ResourceAlreadyExistsException"),
@@ -797,7 +797,7 @@ async fn a_dataset_group_is_created_pending_becomes_active_and_is_deleted() {
             "DescribeDatasetGroup",
             "datasetGroupArn",
             &arn,
-            404,
+            400,
             "ResourceNotFoundException",
             &case,
         )
@@ -807,7 +807,7 @@ async fn a_dataset_group_is_created_pending_becomes_active_and_is_deleted() {
             "DeleteDatasetGroup",
             "datasetGroupArn",
             &arn,
-            404,
+            400,
             "ResourceNotFoundException",
             &format!("{case} twice"),
         )
@@ -988,8 +988,8 @@ async fn a_dataset_of_every_documented_type_round_trips_through_its_group() {
             )
             .await;
         assert_eq!(
-            status, 403,
-            "case {case:?}: expected a second dataset of the type to answer HTTP 403, got \
+            status, 400,
+            "case {case:?}: expected a second dataset of the type to answer HTTP 400, got \
              {status} {body:?}"
         );
         assert!(
@@ -1004,8 +1004,8 @@ async fn a_dataset_of_every_documented_type_round_trips_through_its_group() {
         .call_with_arn("DeleteDatasetGroup", "datasetGroupArn", &group_arn)
         .await;
     assert_eq!(
-        status, 409,
-        "case \"delete a group that still holds datasets\": expected HTTP 409, got \
+        status, 400,
+        "case \"delete a group that still holds datasets\": expected HTTP 400, got \
          {status} {body:?}"
     );
     assert!(
@@ -1033,7 +1033,7 @@ async fn a_dataset_of_every_documented_type_round_trips_through_its_group() {
             "DescribeDataset",
             "datasetArn",
             &arn,
-            404,
+            400,
             "ResourceNotFoundException",
             &case,
         )
@@ -1043,7 +1043,7 @@ async fn a_dataset_of_every_documented_type_round_trips_through_its_group() {
             "DeleteDataset",
             "datasetArn",
             &arn,
-            404,
+            400,
             "ResourceNotFoundException",
             &format!("{case} twice"),
         )
@@ -1081,7 +1081,7 @@ async fn create_dataset_refuses_an_unknown_reference_an_unknown_type_and_a_pendi
                 "name": "ds", "datasetType": "Interactions",
                 "schemaArn": schema_arn, "datasetGroupArn": missing_group,
             }),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (
@@ -1090,7 +1090,7 @@ async fn create_dataset_refuses_an_unknown_reference_an_unknown_type_and_a_pendi
                 "name": "ds", "datasetType": "Interactions",
                 "schemaArn": missing_schema, "datasetGroupArn": group_arn,
             }),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (
@@ -1149,8 +1149,8 @@ async fn create_dataset_refuses_an_unknown_reference_an_unknown_type_and_a_pendi
         )
         .await;
     assert_eq!(
-        status, 409,
-        "case \"a pending group\": expected HTTP 409, got {status} {body:?}"
+        status, 400,
+        "case \"a pending group\": expected HTTP 400, got {status} {body:?}"
     );
     assert!(
         error_code(&body).contains("ResourceInUseException"),

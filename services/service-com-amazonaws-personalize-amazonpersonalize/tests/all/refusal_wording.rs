@@ -135,7 +135,7 @@ async fn an_in_use_refusal_reads_the_same_however_many_resources_hold_it() {
                 "DeleteSchema",
                 "schemaArn",
                 &schema_arn,
-                (409, "ResourceInUseException", SCHEMA_IN_USE_MESSAGE),
+                (400, "ResourceInUseException", SCHEMA_IN_USE_MESSAGE),
                 &case,
             )
             .await;
@@ -144,7 +144,7 @@ async fn an_in_use_refusal_reads_the_same_however_many_resources_hold_it() {
                 "DeleteDatasetGroup",
                 "datasetGroupArn",
                 &group_arn,
-                (409, "ResourceInUseException", DATASET_GROUP_IN_USE_MESSAGE),
+                (400, "ResourceInUseException", DATASET_GROUP_IN_USE_MESSAGE),
                 &case,
             )
             .await;
@@ -212,7 +212,7 @@ async fn a_schema_lookup_that_resolves_to_nothing_names_the_arn_it_was_asked_abo
                 operation,
                 "schemaArn",
                 arn,
-                (404, "ResourceNotFoundException", &expected),
+                (400, "ResourceNotFoundException", &expected),
                 case,
             )
             .await;
@@ -233,8 +233,8 @@ async fn a_schema_lookup_that_resolves_to_nothing_names_the_arn_it_was_asked_abo
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected CreateDataset against an absent schema to answer HTTP 404, \
+            status, 400,
+            "case {case:?}: expected CreateDataset against an absent schema to answer HTTP 400, \
              got {status} {body:?}"
         );
         assert_eq!(
@@ -270,7 +270,7 @@ async fn a_schema_lookup_that_resolves_to_nothing_names_the_arn_it_was_asked_abo
         "schemaArn",
         &schema_arn,
         (
-            404,
+            400,
             "ResourceNotFoundException",
             &schema_not_found_message(&schema_arn),
         ),
