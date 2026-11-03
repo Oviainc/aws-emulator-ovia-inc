@@ -176,11 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The ID of a running user import job" (`StopUserImportJob.JobId`):
         // only a job that is importing users can be stopped, so one that never
         // started or has already stopped keeps the status and the dates it has.
+        // The refusal reports the status the job IS in, read out of the store,
+        // and quotes no job id
+        // ([`crate::state::job_not_running_message`]).
         if !job.is_running(now) {
-            return Err(precondition_not_met(format!(
-                "User import job {} is in status {} and is not running.",
-                input.job_id,
-                job.status(now)
+            return Err(precondition_not_met(crate::state::job_not_running_message(
+                job.status(now),
             )));
         }
 
@@ -201,10 +202,13 @@ fn user_pool_not_found(user_pool_id: &str) -> StopUserImportJobError {
     .into()
 }
 
-/// This operation's `ResourceNotFoundException` for a job the pool does not hold.
+/// This operation's `ResourceNotFoundException` for a job the pool does not
+/// hold, carrying the sentence the operations addressed by the pair
+/// `UserPoolId` + `JobId` answer for an unresolved job
+/// ([`crate::state::import_job_not_found_message`]).
 fn job_not_found(job_id: &str) -> StopUserImportJobError {
     StopUserImportJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User import job {job_id} does not exist.")),
+        message: Some(crate::state::import_job_not_found_message(job_id)),
     })
     .into()
 }

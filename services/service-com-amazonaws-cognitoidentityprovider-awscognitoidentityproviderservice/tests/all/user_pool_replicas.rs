@@ -655,7 +655,9 @@ async fn a_replica_call_a_pool_does_not_admit_is_refused_and_persists_nothing() 
             body: |_| json!({ "UserPoolId": ABSENT_POOL, "RegionName": REGION }),
             status: 400,
             code: "ResourceNotFoundException",
-            message: Some("User pool us-east-1_absentpool does not exist."),
+            // This operation words its own pool lookup, joining `UserPool with
+            // ID: ` to `does not exist.` with no separator.
+            message: Some("UserPool with ID: us-east-1_absentpooldoes not exist."),
         },
         RefusalCase {
             case: "a create in the Region that already holds the primary replica",

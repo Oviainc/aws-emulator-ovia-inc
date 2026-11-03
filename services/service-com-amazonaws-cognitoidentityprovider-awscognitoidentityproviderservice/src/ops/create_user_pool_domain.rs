@@ -335,10 +335,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// This operation's `ResourceNotFoundException` for an absent user pool.
+/// This operation's `ResourceNotFoundException` for an absent user pool,
+/// carrying the sentence this operation words that lookup with
+/// ([`crate::state::user_pool_with_id_not_found_message`]), which joins
+/// `UserPool with ID: ` to `does not exist.` with no separator.
 fn user_pool_not_found(user_pool_id: &str) -> CreateUserPoolDomainError {
     CreateUserPoolDomainErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool {user_pool_id} does not exist.")),
+        message: Some(crate::state::user_pool_with_id_not_found_message(
+            user_pool_id,
+        )),
     })
     .into()
 }

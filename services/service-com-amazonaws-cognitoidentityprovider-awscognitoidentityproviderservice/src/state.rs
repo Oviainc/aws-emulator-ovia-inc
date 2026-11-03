@@ -1125,6 +1125,22 @@ pub const DOMAIN_STATUS_UPDATING: &str = "UPDATING";
 /// after creating it still sees `CREATING`.
 pub const DOMAIN_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
 
+/// The sentence a `ResourceNotFoundException` carries for a `UserPoolId` no
+/// stored pool answers to, in the operations that word that lookup `UserPool
+/// with ID: <UserPoolId>does not exist.` — `SetLogDeliveryConfiguration`,
+/// `CreateUserPoolDomain` and `CreateUserPoolReplica`.
+///
+/// The fixed text is `UserPool with ID: ` and `does not exist.`: Amazon Cognito
+/// joins the two halves with no separator, so the absent space before `does` is
+/// the service's own wording and not a typo to correct. The one variable part is
+/// the `UserPoolId` the REQUEST carried. A not-found sentence belongs to the
+/// operation that answers it rather than to the resource kind, which is why the
+/// operations that word the same lookup `User pool <UserPoolId> does not exist.`
+/// keep their own sentence instead of calling this.
+pub fn user_pool_with_id_not_found_message(user_pool_id: &str) -> String {
+    format!("UserPool with ID: {user_pool_id}does not exist.")
+}
+
 /// The message an operation that resolves a domain by the PAIR it is addressed
 /// by — a `UserPoolId` and a `Domain` — carries when that pair holds no domain.
 ///
@@ -1366,6 +1382,30 @@ pub const JOB_STOP_SPAN: Duration = Duration::from_millis(500);
 /// bound is 24 hours.
 pub const JOB_EXPIRY_SPAN: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The sentence the operations addressed by the pair `UserPoolId` + `JobId` —
+/// `DescribeUserImportJob`, `StartUserImportJob` and `StopUserImportJob` —
+/// answer for a `JobId` the named pool holds no user import job for.
+///
+/// The fixed text is `The import job ` and ` does not exist`, which carries NO
+/// trailing period, and the one variable part is the `JobId` the REQUEST
+/// carried. The three resolve the same job by the same pair, so they report an
+/// unresolved job with the same sentence.
+pub fn import_job_not_found_message(job_id: &str) -> String {
+    format!("The import job {job_id} does not exist")
+}
+
+/// The sentence `StopUserImportJob` answers for a job that is not running:
+/// "the ID of a running user import job" (`StopUserImportJob.JobId`), so a job
+/// in any other status has no import to stop.
+///
+/// The fixed text is `Job is not running. The specified job has a status of `,
+/// with no trailing period and no job id; the one variable part is the status
+/// the job is in as the STORE and the clock put it, never a value the request
+/// carried.
+pub fn job_not_running_message(status: &str) -> String {
+    format!("Job is not running. The specified job has a status of {status}")
+}
+
 /// How long a passkey registration challenge stays answerable, which is also the
 /// `timeout` its credential creation options advertise, so the window the caller
 /// was told about is the window the emulator holds: W3C Web Authentication Level
@@ -1582,12 +1622,14 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// `user_pool_id` that resolved nothing.
     ///
     /// A `ClientId` is minted per app client and lives in exactly one pool
-    /// ([`Self::pool_of_client`]), so such a lookup fails in two different ways
-    /// and Amazon Cognito words them differently: an id that names an app client
-    /// of ANOTHER pool is reported with both halves of what was asked for
-    /// ([`app_client_not_found_in_pool_message`]), while an id that names no app
-    /// client at all carries `unresolved` — the sentence the ASKING operation
-    /// answers for that case, which is
+    /// ([`Self::pool_of_client`]), so such a lookup fails in three different
+    /// ways and Amazon Cognito words them in two. An id that names an app client
+    /// of ANOTHER pool, and an id asked for in a pool this emulator does not
+    /// hold at all, are both reported with both halves of what was asked for
+    /// ([`app_client_not_found_in_pool_message`]) — in each case the pool the
+    /// request named is not one holding that app client. An id that names no app
+    /// client at all, asked for in a pool that IS stored, carries `unresolved`:
+    /// the sentence the ASKING operation answers for that case, which is
     /// [`APP_CLIENT_NOT_FOUND_MESSAGE`] for the operations that address the app
     /// client itself and [`app_client_not_found_message`] for the ones that
     /// quote the id.
@@ -1599,9 +1641,10 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         client_id: &str,
         unresolved: &str,
     ) -> String {
-        if self
-            .pool_of_client(client_id)
-            .is_some_and(|pool| pool.id != user_pool_id)
+        if self.pool(user_pool_id).is_none()
+            || self
+                .pool_of_client(client_id)
+                .is_some_and(|pool| pool.id != user_pool_id)
         {
             return app_client_not_found_in_pool_message(client_id, user_pool_id);
         }

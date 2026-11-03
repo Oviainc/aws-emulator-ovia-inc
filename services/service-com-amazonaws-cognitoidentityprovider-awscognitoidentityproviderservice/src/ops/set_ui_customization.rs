@@ -190,18 +190,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ClientId` names an app client of ANOTHER pool — a question about the
         // whole store, which cannot be asked while this pool is borrowed
         // mutably. The mutable borrow is taken once nothing can refuse.
-        let pool = guard
-            .pool(&input.user_pool_id)
-            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-
+        //
         // "The ID of the app client that you want to customize" (this
-        // operation's `ClientId`): branding named for an app client the pool
-        // does not hold customizes nothing. The pool-level default is a level
-        // of the pool itself rather than an app client, so it is always there
-        // to configure.
-        if client_id != crate::state::UI_CUSTOMIZATION_ALL_CLIENTS
-            && !pool.clients.contains_key(&client_id)
-        {
+        // operation's `ClientId`): branding named for an app client the request's
+        // pool does not hold customizes nothing. That is ONE lookup by the pair
+        // `UserPoolId` + `ClientId`, so a pool this emulator does not hold is
+        // not reported as a missing resource of its own — it fails the same
+        // app-client lookup, which
+        // [`crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::app_client_lookup_refusal`]
+        // words.
+        let pool = guard.pool(&input.user_pool_id);
+        if client_id == crate::state::UI_CUSTOMIZATION_ALL_CLIENTS {
+            // The pool-level default is a level of the POOL itself rather than
+            // an app client, so it is always there to configure and the pool is
+            // the only resource this request names.
+            if pool.is_none() {
+                return Err(user_pool_not_found(&input.user_pool_id));
+            }
+        } else if pool.is_none_or(|pool| !pool.clients.contains_key(&client_id)) {
             return Err(client_not_found(guard.app_client_lookup_refusal(
                 &input.user_pool_id,
                 &client_id,
@@ -234,12 +240,12 @@ fn user_pool_not_found(user_pool_id: &str) -> SetUICustomizationError {
     .into()
 }
 
-/// This operation's `ResourceNotFoundException` for an app client the named pool
-/// does not hold, carrying the sentence the store's shared app-client lookup
-/// refusal words for it: [`crate::state::app_client_not_found_message`] for a
-/// `ClientId` that names no app client at all, and
-/// [`crate::state::app_client_not_found_in_pool_message`] for one that names an
-/// app client of another pool.
+/// This operation's `ResourceNotFoundException` for an app client the request's
+/// pool does not hold, carrying the sentence the store's shared app-client
+/// lookup refusal words for it: [`crate::state::app_client_not_found_message`]
+/// for a `ClientId` that names no app client of a pool this emulator holds, and
+/// [`crate::state::app_client_not_found_in_pool_message`] for one asked for in a
+/// pool that is not the one holding it.
 fn client_not_found(message: String) -> SetUICustomizationError {
     SetUICustomizationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(message),

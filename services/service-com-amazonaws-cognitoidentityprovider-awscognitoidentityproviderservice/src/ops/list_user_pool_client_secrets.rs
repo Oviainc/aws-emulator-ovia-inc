@@ -165,19 +165,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let guard = state.lock();
 
-        // The request names both the pool and the app client of it whose secrets are
-        // listed, so a `ClientId` that names a client of ANOTHER pool names no app
-        // client of this pool to list secrets of.
-        let pool = guard
+        // This operation is addressed by the PAIR `UserPoolId` + `ClientId` and
+        // resolves ONE resource: the app client of that pool whose secrets are
+        // listed. So the pool is not reported as a missing resource of its own —
+        // a `ClientId` that names a client of ANOTHER pool, and a pool this
+        // emulator does not hold, both fail the same single lookup, which
+        // [`crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::app_client_lookup_refusal`]
+        // words.
+        let client = guard
             .pool(&input.user_pool_id)
-            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-        let client = pool.clients.get(&input.client_id).ok_or_else(|| {
-            client_not_found(guard.app_client_lookup_refusal(
-                &input.user_pool_id,
-                &input.client_id,
-                &crate::state::app_client_not_found_message(&input.client_id),
-            ))
-        })?;
+            .and_then(|pool| pool.clients.get(&input.client_id))
+            .ok_or_else(|| {
+                client_not_found(guard.app_client_lookup_refusal(
+                    &input.user_pool_id,
+                    &input.client_id,
+                    &crate::state::app_client_not_found_message(&input.client_id),
+                ))
+            })?;
 
         // Rendered from the STORED secrets, in the order the app client holds them
         // (oldest first): this read changes nothing. No descriptor carries a value —
@@ -202,20 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// This operation's `ResourceNotFoundException` for an absent user pool.
-fn user_pool_not_found(user_pool_id: &str) -> ListUserPoolClientSecretsError {
-    ListUserPoolClientSecretsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool {user_pool_id} does not exist.")),
-    })
-    .into()
-}
-
 /// This operation's `ResourceNotFoundException` for a `ClientId` the named pool
 /// holds no app client for, carrying the sentence the store's shared app-client
 /// lookup refusal words for it: [`crate::state::app_client_not_found_message`]
-/// for a `ClientId` that names no app client at all, and
-/// [`crate::state::app_client_not_found_in_pool_message`] for one that names an
-/// app client of another pool.
+/// for a `ClientId` that names no app client of a pool this emulator holds, and
+/// [`crate::state::app_client_not_found_in_pool_message`] for one asked for in a
+/// pool that is not the one holding it.
 fn client_not_found(message: String) -> ListUserPoolClientSecretsError {
     ListUserPoolClientSecretsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(message),

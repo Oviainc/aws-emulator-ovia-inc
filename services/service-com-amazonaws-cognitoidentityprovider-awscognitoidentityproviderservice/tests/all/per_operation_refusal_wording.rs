@@ -392,11 +392,26 @@ async fn a_pool_lookup_carries_the_sentence_its_own_operation_answers() {
                 }],
             }),
         ),
+        // Every operation that answers the same sentence as the one above:
+        // configuring a pool-level resource in another namespace — a hosted
+        // login domain, a cross-Region replica — words the pool lookup the same
+        // way, joined with no separator before `does`.
+        (
+            "CreateUserPoolDomain",
+            PoolRefusal::WithIdUnspaced,
+            json!({ "Domain": "domain-of-an-absent-pool" }),
+        ),
+        (
+            "CreateUserPoolReplica",
+            PoolRefusal::WithIdUnspaced,
+            json!({ "RegionName": "us-west-2" }),
+        ),
         // The controls: the operations whose own sentence names the pool keep it.
         ("DescribeUserPool", PoolRefusal::WithId, json!({})),
         ("ListUserPoolClients", PoolRefusal::WithId, json!({})),
         ("GetLogDeliveryConfiguration", PoolRefusal::WithId, json!({})),
         ("DeleteUserPool", PoolRefusal::WithId, json!({})),
+        ("ListUserPoolReplicas", PoolRefusal::WithId, json!({})),
     ];
 
     // Ids satisfying `UserPoolIdType`'s pattern `^[\w-]+_[0-9a-zA-Z]+$` that no

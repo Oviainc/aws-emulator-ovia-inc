@@ -151,6 +151,8 @@ mod managed_login_branding_updates;
 mod log_delivery_configuration;
 #[path = "all/message_delivery_and_live_codes.rs"]
 mod message_delivery_and_live_codes;
+#[path = "all/not_found_sentence_per_operation.rs"]
+mod not_found_sentence_per_operation;
 #[path = "all/per_operation_refusal_wording.rs"]
 mod per_operation_refusal_wording;
 #[path = "all/pool_configuration_refusal_wire.rs"]

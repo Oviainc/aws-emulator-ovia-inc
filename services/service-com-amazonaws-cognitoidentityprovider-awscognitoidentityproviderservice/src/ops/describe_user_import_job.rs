@@ -181,10 +181,13 @@ fn user_pool_not_found(user_pool_id: &str) -> DescribeUserImportJobError {
     .into()
 }
 
-/// This operation's `ResourceNotFoundException` for a job the pool does not hold.
+/// This operation's `ResourceNotFoundException` for a job the pool does not
+/// hold, carrying the sentence the operations addressed by the pair
+/// `UserPoolId` + `JobId` answer for an unresolved job
+/// ([`crate::state::import_job_not_found_message`]).
 fn job_not_found(job_id: &str) -> DescribeUserImportJobError {
     DescribeUserImportJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User import job {job_id} does not exist.")),
+        message: Some(crate::state::import_job_not_found_message(job_id)),
     })
     .into()
 }

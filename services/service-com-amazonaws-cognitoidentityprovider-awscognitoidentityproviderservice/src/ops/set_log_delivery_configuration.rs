@@ -435,23 +435,15 @@ fn invalid_parameter(message: String) -> SetLogDeliveryConfigurationError {
     .into()
 }
 
-/// The message this operation's `ResourceNotFoundException` carries for a
-/// `UserPoolId` no stored pool answers to.
-///
-/// The fixed text is `UserPool with ID: ` and `does not exist.` — Amazon
-/// Cognito's own sentence for this operation, which joins the two halves with no
-/// separator, so the missing space before `does` is the service's wording and
-/// not a typo to correct — and the one variable part is the `UserPoolId` the
-/// REQUEST carried. Each operation words its own pool lookup, so this one is not
-/// shared.
-fn user_pool_not_found_message(user_pool_id: &str) -> String {
-    format!("UserPool with ID: {user_pool_id}does not exist.")
-}
-
-/// This operation's `ResourceNotFoundException` for an absent user pool.
+/// This operation's `ResourceNotFoundException` for an absent user pool,
+/// carrying the sentence this operation words that lookup with
+/// ([`crate::state::user_pool_with_id_not_found_message`]), which joins
+/// `UserPool with ID: ` to `does not exist.` with no separator.
 fn user_pool_not_found(user_pool_id: &str) -> SetLogDeliveryConfigurationError {
     SetLogDeliveryConfigurationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(user_pool_not_found_message(user_pool_id)),
+        message: Some(crate::state::user_pool_with_id_not_found_message(
+            user_pool_id,
+        )),
     })
     .into()
 }

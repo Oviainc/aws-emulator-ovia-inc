@@ -568,10 +568,17 @@ async fn a_listing_for_a_resource_no_pool_holds_is_refused() {
         .await;
 
         let (user_pool_id, client_id, expected) = match absent {
+            // This operation resolves ONE resource, the app client of the pool it
+            // names, so a pool nothing minted fails that lookup rather than being
+            // reported as a missing resource of its own: the sentence names both
+            // ids the request carried.
             Absent::UserPool => (
                 UNKNOWN_POOL_ID.to_string(),
                 named.client_id.clone(),
-                format!("User pool {UNKNOWN_POOL_ID} does not exist."),
+                format!(
+                    "User pool client {} does not exist in user pool {}.",
+                    named.client_id, UNKNOWN_POOL_ID
+                ),
             ),
             Absent::AppClient => (
                 named.user_pool_id.clone(),
