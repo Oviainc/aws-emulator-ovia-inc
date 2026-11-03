@@ -26,3 +26,12 @@ handler returns an error, so it never has to construct a value.
 // SKIPPED: GetAccountSummary — unsupported shape construct: operation 'GetAccountSummary' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: GetCredentialReport — unsupported shape construct: operation 'GetCredentialReport' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: GetOutboundWebIdentityFederationInfo — unsupported shape construct: operation 'GetOutboundWebIdentityFederationInfo' has a Unit/absent input, which the generator does not emit yet
+
+## Since hand-authored
+
+`GenerateCredentialReport` is now hand-authored in
+`src/ops/generate_credential_report.rs`: its empty input is declared as
+`smithy.api#Unit` in `src/ops/types/generate_credential_report_types.rs`, and `build.rs`
+wires the operation in from that file's `//! @op GenerateCredentialReport` header like any
+other. The decline line above records only that the GENERATOR did not emit it, so the
+operation is no longer modeled-but-unwired.

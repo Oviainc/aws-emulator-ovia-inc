@@ -181,6 +181,15 @@ pub const UPDATE_DELEGATION_REQUEST: &str = "iam:UpdateDelegationRequest";
 /// `iam:AcceptDelegationRequest`.
 pub const ACCEPT_DELEGATION_REQUEST: &str = "iam:AcceptDelegationRequest";
 
+/// `iam:AssociateDelegationRequest`.
+pub const ASSOCIATE_DELEGATION_REQUEST: &str = "iam:AssociateDelegationRequest";
+
+/// `iam:AcquireRole`.
+pub const ACQUIRE_ROLE: &str = "iam:AcquireRole";
+
+/// `iam:GenerateCredentialReport`.
+pub const GENERATE_CREDENTIAL_REPORT: &str = "iam:GenerateCredentialReport";
+
 /// `iam:GenerateOrganizationsAccessReport`.
 pub const GENERATE_ORGANIZATIONS_ACCESS_REPORT: &str = "iam:GenerateOrganizationsAccessReport";
 

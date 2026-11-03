@@ -47,10 +47,14 @@ mod boundary_refusal_message_wording;
 mod change_password;
 #[path = "all/composed_condition_context.rs"]
 mod composed_condition_context;
+#[path = "all/credential_report_generation.rs"]
+mod credential_report_generation;
 #[path = "all/custom_policy_context_keys.rs"]
 mod custom_policy_context_keys;
 #[path = "all/delegation_request_acceptance.rs"]
 mod delegation_request_acceptance;
+#[path = "all/delegation_request_association.rs"]
+mod delegation_request_association;
 #[path = "all/delegation_request_filing.rs"]
 mod delegation_request_filing;
 #[path = "all/delegation_request_listing.rs"]
@@ -245,6 +249,8 @@ mod role_protection_and_refusal_messages;
 mod role_settings;
 #[path = "all/role_tag_listing.rs"]
 mod role_tag_listing;
+#[path = "all/role_template_acquisition.rs"]
+mod role_template_acquisition;
 #[path = "all/role_tag_removal.rs"]
 mod role_tag_removal;
 #[path = "all/role_tags.rs"]

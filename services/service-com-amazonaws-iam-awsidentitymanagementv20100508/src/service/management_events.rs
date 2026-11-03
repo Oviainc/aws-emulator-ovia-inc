@@ -349,6 +349,7 @@ pub fn audited_table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> Operation
         enable_mfa_device::EnableMFADevice => mutates,
         enable_organizations_root_credentials_management::EnableOrganizationsRootCredentialsManagement => mutates,
         enable_organizations_root_sessions::EnableOrganizationsRootSessions => mutates,
+        generate_credential_report::GenerateCredentialReport => mutates,
         generate_organizations_access_report::GenerateOrganizationsAccessReport => mutates,
         generate_service_last_accessed_details::GenerateServiceLastAccessedDetails => mutates,
         get_access_key_last_used::GetAccessKeyLastUsed => reports,

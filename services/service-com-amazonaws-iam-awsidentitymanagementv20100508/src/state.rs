@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
     AttachedPermissionsBoundary, DelegationRequest, Group, InstanceProfile, LoginProfile, Policy,
-    PolicyVersion, Role, SAMLPrivateKey, ServerCertificateMetadata,
+    PolicyVersion, Role, RoleTemplateVersion, SAMLPrivateKey, ServerCertificateMetadata,
     ServiceSpecificCredentialMetadata, SigningCertificate, Tag, User,
 };
 
@@ -1309,6 +1309,36 @@ pub struct ServiceLinkedRoleDeletionTask {
     pub completes: ::aws_smithy_types::DateTime,
 }
 
+/// The account's credential-report generation, as
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::credential_report`] holds it.
+///
+/// `GenerateCredentialReport` "generates a credential report for the Amazon Web Services
+/// account" and answers only the `State` of that generation, so what the account has to
+/// remember between two calls is WHEN the generation was asked for, WHEN it is due, and
+/// whether a caller has already been told it finished — the three facts the state a call
+/// reports is read off.
+#[derive(Debug, Clone)]
+pub struct CredentialReportGeneration {
+    /// The instant the generation was asked for, which is what the once-every-four-hours
+    /// rate ([`CREDENTIAL_REPORT_REGENERATION_SECONDS`]) is measured from.
+    pub requested: ::aws_smithy_types::DateTime,
+    /// The instant the generation is DUE: until it, a call reports the generation
+    /// `INPROGRESS`; from it, the report exists. Stored rather than slept for, so a caller
+    /// that calls again straight away still sees the generation in flight — the same clock
+    /// rule every asynchronous job of this service is read through
+    /// ([`report_job_status`]).
+    pub completes: ::aws_smithy_types::DateTime,
+    /// Whether a call has already reported this generation `COMPLETE`.
+    ///
+    /// The terminal state of a generation is reported ONCE, to the call that first finds it
+    /// due; from then on the account HAS that report and a further call is asking for a new
+    /// one, which the published rate is what decides. That ordering is what was measured: a
+    /// repeated request inside the window is refused for exceeding the rate rather than
+    /// answered `COMPLETE` for the rest of it, so the completion cannot be the window's
+    /// standing answer.
+    pub reported_complete: bool,
+}
+
 /// One persisted server certificate: the metadata every operation reports about it,
 /// beside the PEM material a read may hand back.
 ///
@@ -1734,6 +1764,32 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// character, the value is the partner's own handle rather than an IAM entity name,
     /// and AWS distinguishes such a handle by case, so there is no [`name_key`] to build.
     pub delegation_request_workflow_ids: BTreeMap<String, String>,
+    /// The role templates the account can create roles from, by the `TemplateArn` that
+    /// names one, each holding its minor versions by `MinorVersion`.
+    ///
+    /// A role template is published by a SERVICE — `managedByTypeType` declares the single
+    /// value `Service` (`smithy_query(query="shape", shape="managedByTypeType")`) — and
+    /// this API surface has no operation that creates one: `AcquireRole` creates a role
+    /// FROM a template and `GetRoleTemplateVersion` reports one, so the account holds a
+    /// template only where something recorded it. `AcquireRole` resolves the identifier its
+    /// request carries against this map and refuses one it holds nothing under, which is
+    /// what keeps the creation a function of what the account holds rather than of the ARN
+    /// the request spelled.
+    ///
+    /// The ARN is held VERBATIM: it is the handle the publishing service minted rather than
+    /// an IAM entity name, so there is no case to fold and no [`name_key`] to build. The
+    /// inner map is keyed by the minor version, so the version a request names is resolved
+    /// directly and the versions enumerate in numeric order.
+    pub role_templates: BTreeMap<String, BTreeMap<i32, RoleTemplateVersion>>,
+    /// The account's credential-report generation, or `None` while none has ever been
+    /// asked for.
+    ///
+    /// `GenerateCredentialReport` is what fills this field and what reports the state of
+    /// the generation it holds. An `Option` rather than a collection because an account has
+    /// ONE credential report: "generates a credential report for the Amazon Web Services
+    /// account", so a second request is a request to generate THAT report again rather than
+    /// another report beside it.
+    pub credential_report: Option<CredentialReportGeneration>,
     /// The organization this account belongs to, or `None` while it belongs to none.
     ///
     /// `None` is the standalone account this emulator presents until something records
@@ -1903,6 +1959,8 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             account_properties: BTreeMap::new(),
             delegation_requests: BTreeMap::new(),
             delegation_request_workflow_ids: BTreeMap::new(),
+            role_templates: BTreeMap::new(),
+            credential_report: None,
             organization: None,
             organizations_access_reports: BTreeMap::new(),
             service_last_accessed_reports: BTreeMap::new(),
@@ -2086,6 +2144,37 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             self.delegation_request_id_seq,
             DELEGATION_REQUEST_ID_CHARACTERS,
         )
+    }
+
+    /// The minor version of the role template `template_arn` that a request naming
+    /// `minor_version` addresses, or `None` when the account holds no such template or no
+    /// such version of it.
+    ///
+    /// "The minor version of the role template to use. If you do not specify a minor
+    /// version, the service uses the template's default minor version"
+    /// (`AcquireRole$TemplateMinorVersion`), which each held version records as
+    /// `RoleTemplateVersion$DefaultMinorVersion` — "the minor version that the service uses
+    /// by default when you create a role from this template without specifying a minor
+    /// version". A template whose versions declare no default has its HIGHEST held minor
+    /// version addressed, because that is the one version a template with a single minor
+    /// version has and the latest of several.
+    ///
+    /// The ONE resolution of that rule, so `AcquireRole` and `GetRoleTemplateVersion`
+    /// cannot address two different versions of one template.
+    pub fn role_template_version(
+        &self,
+        template_arn: &str,
+        minor_version: Option<i32>,
+    ) -> Option<&RoleTemplateVersion> {
+        let versions = self.role_templates.get(template_arn)?;
+        match minor_version {
+            Some(minor_version) => versions.get(&minor_version),
+            None => versions
+                .values()
+                .find_map(|version| version.default_minor_version)
+                .and_then(|default| versions.get(&default))
+                .or_else(|| versions.values().next_back()),
+        }
     }
 
     /// Mint the next SAML provider's `SAMLProviderUUID`.
@@ -5767,6 +5856,98 @@ pub fn access_report_job_status(
 /// same missing job differently.
 pub fn report_job_not_found(job_id: &str) -> String {
     format!("Job {job_id} does not exist.")
+}
+
+/// How long after the request the account's credential report is due.
+///
+/// AWS publishes no duration for it — the generation is asynchronous, which is why
+/// `GenerateCredentialReport` answers a `State` at all — so the span is the emulator's own,
+/// read through the same clock rule every asynchronous job of this service uses
+/// ([`report_job_status`]): short enough for a caller to poll through, and long enough that
+/// a caller calling again straight away still sees the generation in flight.
+pub const CREDENTIAL_REPORT_GENERATION_SECONDS: i64 = 3;
+
+/// How long after a credential report was ASKED FOR the account may ask for another.
+///
+/// "You can generate a credential report as often as once every four hours" ("Getting
+/// credential reports for your Amazon Web Services account", IAM User Guide) — a published
+/// rate, so it keeps its value: a request for a new report inside the window is past "the
+/// current Amazon Web Services account limits" and is refused with the modelled
+/// `LimitExceededException`, and from the window's end a new generation starts.
+pub const CREDENTIAL_REPORT_REGENERATION_SECONDS: i64 = 4 * 60 * 60;
+
+/// The message a request for a credential report the published rate does not yet allow is
+/// refused with — the `LimitExceededException` message, which "describes the limit
+/// exceeded" the way every quota refusal of this service words one: `Cannot exceed quota
+/// for `, the quota's name, and the figure it stands at.
+///
+/// Stated ONCE here, beside the rate it reports, so the refusal and the decision behind it
+/// cannot drift apart.
+pub fn credential_report_rate_exceeded() -> String {
+    format!(
+        "Cannot exceed quota for ReportGenerationLimit: 1 report every {} seconds",
+        CREDENTIAL_REPORT_REGENERATION_SECONDS
+    )
+}
+
+/// The message a call addressing a role template the account holds none of is refused with
+/// — the `NoSuchEntityException` message, whose fixed text is `Role template not found: `
+/// followed by the ARN the request supplied, with no trailing stop.
+///
+/// Measured wording: the `<Entity> not found: <identifier>` form the newer IAM API families
+/// word an absence with, which is also how the delegation-request family words its own
+/// ([`delegation_request_not_found_message`]) and not the `The <entity> with name <name>
+/// cannot be found.` form IAM words its user, role and group reads with.
+///
+/// It names the TEMPLATE and nothing else: the resource such a call addresses is the role
+/// template, which its ARN identifies — the minor version is a separate parameter of the
+/// request rather than part of what identifies the resource — so a minor version the
+/// account holds no such version of is described by this one sentence too. Stated ONCE here
+/// so `AcquireRole` and `GetRoleTemplateVersion` cannot describe the same missing template
+/// two ways.
+pub fn role_template_not_found(template_arn: &str) -> String {
+    format!("Role template not found: {template_arn}")
+}
+
+/// The `@{` ... `}` placeholder a role template's patterns carry, as
+/// `RoleTemplateVersion$RoleNamePattern` states it: "the pattern can include
+/// `@{parameter}` placeholders that are replaced with the values you supply in the
+/// `ReplacementValues` parameter of AcquireRole".
+const PARAMETER_PLACEHOLDER_OPEN: &str = "@{";
+
+/// The character that closes a placeholder opened by [`PARAMETER_PLACEHOLDER_OPEN`].
+const PARAMETER_PLACEHOLDER_CLOSE: char = '}';
+
+/// `pattern` with every `@{parameter}` placeholder replaced by the value `resolved` holds
+/// for that parameter.
+///
+/// The ONE substitution every templated member of a role template goes through — the name,
+/// the path, the description, the trust policy, each inline policy's name and document and
+/// each tag's key and value — so a role created from a template cannot have one member
+/// substituted by one rule and another by another.
+///
+/// A placeholder naming a parameter `resolved` holds nothing for is replaced by NOTHING: a
+/// parameter the template defines without a default and the request supplied no value for
+/// has no value, so the pattern's slot for it is empty rather than carrying the
+/// placeholder's own text. A `@{` that no `}` closes is not a placeholder and is left as
+/// the pattern has it.
+pub fn substitute_parameters(pattern: &str, resolved: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut rest = pattern;
+    while let Some(open) = rest.find(PARAMETER_PLACEHOLDER_OPEN) {
+        let after = &rest[open + PARAMETER_PLACEHOLDER_OPEN.len()..];
+        let Some(close) = after.find(PARAMETER_PLACEHOLDER_CLOSE) else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        let name = &after[..close];
+        if let Some(value) = resolved.get(name) {
+            out.push_str(value);
+        }
+        rest = &after[close + PARAMETER_PLACEHOLDER_CLOSE.len_utf8()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The `AccessAdvisorUsageGranularityType` value that asks for SERVICE data only: "if you

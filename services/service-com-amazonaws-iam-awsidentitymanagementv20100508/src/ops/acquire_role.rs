@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcquireRole
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcquireRole`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcquireRole::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation answers on the wire
+//!
+//! A mutation: it resolves the `TemplateArn` (and the minor version) the request carries
+//! against the role templates the account holds and CREATES a role from that template
+//! version — "creates an IAM role from the specified role template. The new role takes its
+//! configuration — including its name, path, trust policy, inline and managed policies,
+//! permissions boundary, tags, and maximum session duration — from the role template
+//! version that you specify" — so the role this call answers with is the one `GetRole`,
+//! `ListRolePolicies`, `ListAttachedRolePolicies` and `ListRoleTags` report afterwards.
+//! Every templated member is rendered through the ONE substitution
+//! ([`crate::state::substitute_parameters`]) the template's own documentation states: "the
+//! pattern can include `@{parameter}` placeholders that are replaced with the values you
+//! supply in the `ReplacementValues` parameter".
+//!
+//! The refusals, each the modelled one for what it refuses:
+//!
+//! * an ARN the account holds no role template under, or a minor version it holds no such
+//!   version of, references "a resource entity that does not exist": `404`
+//!   `<Code>NoSuchEntity</Code>` naming the template the request addressed
+//!   ([`crate::state::role_template_not_found`]). A role template is published by a
+//!   SERVICE — `managedByTypeType` declares the single value `Service` — and no operation
+//!   of this API creates one, so the account holds a template only where something
+//!   recorded it ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::role_templates`]).
+//! * a disabled template or a disabled minor version: "a disabled role template cannot be
+//!   used to create new roles", `400` `<Code>RoleTemplateDisabled</Code>`.
+//! * a value the template cannot be rendered with — an ARN that is no ARN, a required
+//!   parameter nothing supplied a value for, a replacement value for a parameter the
+//!   template does not define, or a rendered name or path outside what the role's own
+//!   members admit: `400` `<Code>InvalidInput</Code>`.
+//! * a rendered trust or inline policy that is no IAM policy document: `400`
+//!   `<Code>MalformedPolicyDocument</Code>`.
+//! * a rendered role name the account already holds a role under: "the resulting role name
+//!   conflicts with an existing role in the account", `409` `<Code>NameConflict</Code>`.
+//! * the account's role quota, or a template naming more managed policies than a role may
+//!   carry: `409` `<Code>LimitExceeded</Code>`.
+//!
+//! A caller whose identity-based policies do not permit the call is refused before the
+//! template is read, `403` `<Code>AccessDenied</Code>`
+//! ([`crate::state::authorization::authorize_named`]), so a request that was not allowed
+//! creates nothing and learns nothing about which templates the account holds.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +137,121 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The AWS service whose namespace a role template's ARN lives in: IAM's own, since a role
+/// template is an IAM resource (`AcquireRole$TemplateArn`, "the Amazon Resource Name (ARN)
+/// of the role template").
+const IAM_VENDOR: &str = "iam";
+
+/// The characters `roleNameType` admits — "upper and lowercase alphanumeric characters with
+/// no spaces. You can also include any of the following characters: `_+=,.@-`"
+/// (`CreateRole$RoleName`, the same type this operation's rendered name has to satisfy),
+/// which is the pattern `^[\w+=,.@-]+$` written out.
+const ROLE_NAME_PUNCTUATION: &str = "_+=,.@-";
+
+/// How a rendered role name or path that the role's own member does not admit is refused:
+/// the fixed halves around the value the rendering produced.
+///
+/// `InvalidInputException` is "an invalid or out-of-range value was supplied for an input
+/// parameter", and what was supplied here is the replacement values the rendering used, so
+/// the sentence names the member whose constraint the rendering broke and the value it
+/// rendered.
+fn rendered_value_refusal(member: &str, value: &str) -> String {
+    format!("The value rendered for {member} is not valid: {value}")
+}
+
+/// Whether `name` satisfies `roleNameType`: 1..64 characters, each one
+/// `roleNameType`'s pattern admits (see [`ROLE_NAME_PUNCTUATION`]).
+fn is_role_name(name: &str) -> bool {
+    let characters = name.chars().count();
+    (1..=crate::state::MAX_ROLE_NAME_CHARACTERS).contains(&characters)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ROLE_NAME_PUNCTUATION.contains(c))
+}
+
+/// Whether `path` satisfies `pathType`: "either a forward slash (/) by itself or a string
+/// that must begin and end with forward slashes", whose inner characters are the ASCII
+/// range `\u0021`..`\u007E` (`CreateRole$Path`), within length 1..512.
+fn is_entity_path(path: &str) -> bool {
+    if path == crate::state::DEFAULT_PATH {
+        return true;
+    }
+    let characters = path.chars().count();
+    // A path other than the root is two slashes around at least one inner character, so
+    // the shortest one `pathType` admits past the root is three characters long.
+    if !(3..=MAX_PATH_CHARACTERS).contains(&characters) {
+        return false;
+    }
+    let Some(inner) = path
+        .strip_prefix('/')
+        .and_then(|rest| rest.strip_suffix('/'))
+    else {
+        return false;
+    };
+    !inner.is_empty() && inner.chars().all(|c| ('\u{21}'..='\u{7E}').contains(&c))
+}
+
+/// The published maximum length of `pathType`: "len 1..512"
+/// (`smithy_query(query="operation", operation="AcquireRole,CreateRole")`).
+const MAX_PATH_CHARACTERS: usize = 512;
+
+/// The value each parameter the template version defines is rendered with, by parameter
+/// name — or the refusal for a request that cannot supply one.
+///
+/// "A map of values to substitute for the parameters that are defined in the role template
+/// version. Each key is a parameter name from the template, and each value is a structure
+/// that contains the replacement values for that parameter"
+/// (`AcquireRole$ReplacementValues`), against `ParameterDefinition`, which says per
+/// parameter whether "you must supply a value for the parameter when you create a role from
+/// the template" (`IsRequired`) and what "the service uses for the parameter when you do
+/// not supply one" (`DefaultValue`).
+///
+/// So: a parameter the request supplies values for is rendered with them, one it does not
+/// with its default, and a REQUIRED parameter with neither is refused — nothing is created
+/// for a request that cannot fill the template. A value supplied for a name the template
+/// defines no parameter under is refused too: it substitutes nowhere, so it is a value the
+/// template cannot be rendered with.
+///
+/// `ReplacementValueEntry$Values` is a LIST (length 1..20), which a pattern has one slot
+/// for, so several values render as the comma-separated list they are; AWS publishes no
+/// other rendering for a multi-valued parameter, and `parameterTypeType`'s list types
+/// (`StringList`, `NumberList`, `ArnList`) are the parameters that carry one.
+fn rendered_parameters(
+    definitions: &[ParameterDefinition],
+    supplied: Option<&std::collections::HashMap<String, ReplacementValueEntry>>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    if let Some(supplied) = supplied {
+        for name in supplied.keys() {
+            if !definitions.iter().any(|defined| &defined.name == name) {
+                return Err(format!(
+                    "The role template version defines no parameter named {name}"
+                ));
+            }
+        }
+    }
+    let mut rendered = std::collections::BTreeMap::new();
+    for definition in definitions {
+        let value = supplied
+            .and_then(|supplied| supplied.get(&definition.name))
+            .map(|entry| entry.values.join(","))
+            .or_else(|| definition.default_value.clone());
+        match value {
+            Some(value) => {
+                rendered.insert(definition.name.clone(), value);
+            }
+            None if definition.is_required => {
+                return Err(format!(
+                    "No replacement value was supplied for the required role template \
+                     parameter {}",
+                    definition.name
+                ));
+            }
+            None => {}
+        }
+    }
+    Ok(rendered)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -182,18 +329,397 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcquireRole` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcquireRoleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcquireRole"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AcquireRoleErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `arnType` asks only for a 20..2048 character string, so the value still has to
+        // BE an ARN, and an ARN in IAM's own namespace: anything else names no role
+        // template and is an "invalid … value … supplied for an input parameter". Decided
+        // before the store is touched at all, so a request IAM cannot read creates
+        // nothing. The two sentences are the ones this crate words both ARN defects with.
+        if ::service_common::arn::parse(&input.template_arn).is_none() {
+            return Err(AcquireRoleErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::ARN_UNPARSEABLE.to_string()),
+                },
+            )
+            .into());
+        }
+        if ::service_common::arn::parse_of(&input.template_arn, IAM_VENDOR).is_none() {
+            return Err(AcquireRoleErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::ARN_WRONG_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A mutation: the operation "creates an IAM role from the specified role
+        // template", so the lock is held for write across the template lookup, the
+        // conflict check and the insert — no role can be created under the rendered name
+        // between the check and the write.
+        let mut store = state.lock();
+
+        // The acting principal the audit records below are attributed to.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // IAM decides a call against the caller's policies before it touches the
+        // resource, so the decision is made first and on the ARN of the TEMPLATE the
+        // request names — the resource the request addresses, and the same ARN whether or
+        // not the account holds a template under it, which is what keeps a refused caller
+        // from learning which templates the account holds.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::ACQUIRE_ROLE,
+            &input.template_arn,
+            &format!("role template {}", input.template_arn),
+        )?;
+
+        // "The minor version of the role template to use. If you do not specify a minor
+        // version, the service uses the template's default minor version" — the one
+        // resolution of that rule this crate holds. Cloned out of the store so the render
+        // below reads a version while the store is written to.
+        let Some(version) = store
+            .role_template_version(&input.template_arn, input.template_minor_version)
+            .cloned()
+        else {
+            ::tracing::info!(
+                audit = true,
+                operation = "AcquireRole",
+                outcome = "refused_no_such_role_template",
+                caller_akid = %caller_akid,
+                template_arn = %input.template_arn,
+                "no role was created"
+            );
+            // An ARN the account holds no template under and a minor version it holds no
+            // such version of are the same missing resource — the role template the
+            // request addressed — so both carry the family's one sentence.
+            return Err(AcquireRoleErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(crate::state::role_template_not_found(&input.template_arn)),
+                },
+            )
+            .into());
+        };
+
+        // "Specifies whether the role template is enabled. When a template is disabled,
+        // you cannot create roles from it" (`RoleTemplateVersion$Enabled`), and
+        // `VersionEnabled` says the same of "this specific minor version of the role
+        // template" — either one disabled is a template this call cannot create from, and
+        // the modelled refusal says so: "a disabled role template cannot be used to create
+        // new roles. Contact your administrator to enable the role template, or use a
+        // different role template."
+        if !version.enabled || !version.version_enabled {
+            return Err(AcquireRoleErrorModeled::RoleTemplateDisabledException(
+                RoleTemplateDisabledException {
+                    message: Some(format!(
+                        "Role template {} is disabled and cannot be used to create new \
+                         roles.",
+                        input.template_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // What every templated member below is rendered with.
+        let rendered = match rendered_parameters(
+            version.parameters_definition.as_deref().unwrap_or_default(),
+            input.replacement_values.as_ref(),
+        ) {
+            Ok(rendered) => rendered,
+            Err(message) => {
+                return Err(AcquireRoleErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+        };
+        let render = |pattern: &str| crate::state::substitute_parameters(pattern, &rendered);
+
+        // "The pattern that is used to generate the name of a role that is created from
+        // this template" — rendered, then held to `roleNameType`, which is the member the
+        // role carries it on: a rendering outside what that member admits is no role name,
+        // and nothing is created for it.
+        let role_name = render(version.role_name_pattern.as_deref().unwrap_or_default());
+        if !is_role_name(&role_name) {
+            return Err(AcquireRoleErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(rendered_value_refusal("RoleName", &role_name)),
+                },
+            )
+            .into());
+        }
+        // "The pattern that is used to generate the path of a role that is created from
+        // this template"; a template that states none creates the role where every entity
+        // whose request omits `Path` goes — directly under the account root.
+        let path = match version.role_path_pattern.as_deref() {
+            Some(pattern) => render(pattern),
+            None => crate::state::DEFAULT_PATH.to_string(),
+        };
+        if !is_entity_path(&path) {
+            return Err(AcquireRoleErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(rendered_value_refusal("Path", &path)),
+                },
+            )
+            .into());
+        }
+        let description = version.role_description_pattern.as_deref().map(render);
+
+        // "The trust policy template that grants an entity permission to assume roles that
+        // you create from this template": rendered, then held to what a trust policy is —
+        // the shared rule every operation taking a policy document applies, worded with
+        // IAM's own trust-policy sentences, exactly as `CreateRole` words it.
+        let assume_role_policy_document = version
+            .assume_role_policy_document_template
+            .as_deref()
+            .map(render);
+        if let Some(defect) = assume_role_policy_document
+            .as_deref()
+            .and_then(crate::state::policy_document_defect)
+        {
+            return Err(AcquireRoleErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(defect.trust_policy_message().to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "A list of inline policy templates that the service embeds in roles that you
+        // create from this template": each one's name and document rendered, each document
+        // held to the identity-policy grammar, and the set held to the role inline-policy
+        // size quota — the same quota `PutRolePolicy` embeds against, so a role created
+        // from a template cannot carry more inline policy than one embedded into by hand.
+        let mut embedded: Vec<crate::state::InlinePolicy> = Vec::new();
+        let mut embedded_characters = 0usize;
+        for template in version.inline_policy_templates.iter().flatten() {
+            let policy_name = render(&template.policy_name);
+            if policy_name.is_empty() {
+                return Err(AcquireRoleErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(rendered_value_refusal("PolicyName", &policy_name)),
+                    },
+                )
+                .into());
+            }
+            let policy_document = render(&template.policy_document);
+            if let Some(defect) = crate::state::policy_document_defect(&policy_document) {
+                return Err(AcquireRoleErrorModeled::MalformedPolicyDocumentException(
+                    MalformedPolicyDocumentException {
+                        message: Some(defect.message().to_string()),
+                    },
+                )
+                .into());
+            }
+            embedded_characters += crate::state::policy_document_characters(&policy_document);
+            embedded.push(crate::state::InlinePolicy {
+                policy_name,
+                policy_document,
+            });
+        }
+        if embedded_characters > crate::state::MAX_ROLE_INLINE_POLICY_CHARACTERS {
+            return Err(AcquireRoleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::inline_policy_size_exceeded(
+                        crate::state::MAX_ROLE_INLINE_POLICY_CHARACTERS,
+                        "role",
+                        &role_name,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "A list of tags that are attached to the role" (`Role$Tags`), from the
+        // template's own tag templates, keys and values rendered. AWS reserves the `aws:`
+        // tag-key prefix, so a rendering producing one is an "invalid … value … for an
+        // input parameter", exactly as `CreateRole` refuses one the request carried.
+        let tags: Vec<Tag> = version
+            .role_tags_template
+            .iter()
+            .flatten()
+            .map(|template| Tag {
+                key: render(&template.key),
+                value: render(&template.value),
+            })
+            .collect();
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(tags.iter().map(|tag| tag.key.as_str()))
+        {
+            return Err(AcquireRoleErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Tag key {reserved} is reserved: keys must not begin with {}",
+                        crate::state::RESERVED_TAG_KEY_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "A list of managed policy ARNs" the template attaches. A managed policy is
+        // attachable only if it exists, read exactly as `AttachRolePolicy` reads it: an
+        // AWS-managed policy belongs to AWS rather than to this account and is taken as
+        // present, while a customer-managed one exists exactly when this account holds it.
+        let managed_policy_arns: Vec<String> = version
+            .managed_policy_arns
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        for policy_arn in &managed_policy_arns {
+            let Some(policy) = crate::state::parse_policy_arn(policy_arn) else {
+                return Err(AcquireRoleErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "ARN {policy_arn} is not valid: a managed policy ARN is required"
+                        )),
+                    },
+                )
+                .into());
+            };
+            let aws_managed = policy.account == crate::state::AWS_MANAGED_POLICY_ACCOUNT;
+            if !aws_managed && store.policy_by_arn(policy_arn).is_none() {
+                return Err(AcquireRoleErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(crate::state::policy_not_attachable(policy_arn)),
+                    },
+                )
+                .into());
+            }
+        }
+        // A role carries a bounded number of managed policies, so a template naming more
+        // than that creates no role rather than a role past the quota.
+        let attached: std::collections::BTreeSet<String> =
+            managed_policy_arns.iter().cloned().collect();
+        if attached.len() > crate::state::MAX_MANAGED_POLICIES_PER_ROLE {
+            return Err(AcquireRoleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for PoliciesPerRole: {}",
+                        crate::state::MAX_MANAGED_POLICIES_PER_ROLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // IAM entity names are unique within the account and "are not distinguished by
+        // case", so the case-folded rendered name is the identity — and a name the account
+        // already holds a role under is what this operation's own modelled conflict names:
+        // "the resulting role name conflicts with an existing role in the account".
+        let key = crate::state::name_key(&role_name);
+        if store.roles.contains_key(&key) {
+            return Err(AcquireRoleErrorModeled::NameConflictException(
+                NameConflictException {
+                    message: Some(format!(
+                        "Role with name {role_name} already exists in this account."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An account holds a bounded number of roles, so a caller cannot grow the account
+        // without limit; past the quota IAM refuses the create.
+        if store.roles.len() >= crate::state::MAX_ROLES_PER_ACCOUNT {
+            return Err(AcquireRoleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for RoleLimit: {}",
+                        crate::state::MAX_ROLES_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let role = Role {
+            arn: crate::state::role_arn(&path, &role_name),
+            path,
+            role_id: store.next_role_id(),
+            create_date: crate::state::now(),
+            assume_role_policy_document,
+            description,
+            // The template's own maximum session duration, and otherwise the value a role
+            // whose create names none carries: "if you do not specify a value for this
+            // setting, the default value of one hour is applied" (`CreateRole`).
+            max_session_duration: Some(
+                version
+                    .max_session_duration
+                    .unwrap_or(crate::state::DEFAULT_MAX_SESSION_DURATION_SECONDS),
+            ),
+            // "The ARN of the policy used to set the permissions boundary for the role",
+            // from the template's `PermissionBoundaryArn`.
+            permissions_boundary: version.permission_boundary_arn.clone().map(|arn| {
+                AttachedPermissionsBoundary {
+                    permissions_boundary_type: Some(
+                        crate::state::PERMISSIONS_BOUNDARY_TYPE.to_string(),
+                    ),
+                    permissions_boundary_arn: Some(arn),
+                }
+            }),
+            // An empty `Tags` list is the same as none, exactly as `CreateRole` reports it.
+            tags: (!tags.is_empty()).then_some(tags),
+            // `Role$RoleLastUsed` reports role USAGE, which this emulator does not record,
+            // so the member is absent rather than carrying an invented date.
+            role_last_used: None,
+            // "Contains information about the role template that this role was created
+            // from. This member is present only for roles created with AcquireRole" —
+            // which is this path, so the role carries the template it came from and the
+            // minor version that was RESOLVED rather than the one the request spelled.
+            source_role_template: Some(SourceRoleTemplate {
+                template_arn: input.template_arn.clone(),
+                template_minor_version: version
+                    .minor_version
+                    .or(input.template_minor_version)
+                    .unwrap_or_default(),
+            }),
+            role_name: role_name.clone(),
+        };
+
+        store.roles.insert(key.clone(), role.clone());
+        // The inline policies the template embeds and the managed policies it attaches,
+        // written into the SAME collections `PutRolePolicy` and `AttachRolePolicy` write,
+        // so the readers of a role's policies report them without knowing which path
+        // created the role.
+        if !embedded.is_empty() {
+            let policies = store.role_inline_policies.entry(key.clone()).or_default();
+            for policy in embedded {
+                policies.insert(crate::state::name_key(&policy.policy_name), policy);
+            }
+        }
+        if !attached.is_empty() {
+            store
+                .role_attached_policies
+                .entry(key)
+                .or_default()
+                .extend(attached);
+        }
+
+        ::tracing::info!(
+            audit = true,
+            operation = "AcquireRole",
+            outcome = "created",
+            caller_akid = %caller_akid,
+            template_arn = %input.template_arn,
+            role_name = %role_name,
+            "a role was created from a role template"
+        );
+
+        // The response is the record that was stored, so a caller sees exactly what a
+        // later `GetRole` reports.
+        Ok(AcquireRoleOutput { role })
     }
 }

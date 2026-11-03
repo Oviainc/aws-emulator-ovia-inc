@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateDelegationRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateDelegationRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateDelegationRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation answers on the wire
+//!
+//! A mutation: it resolves the `DelegationRequestId` the request carries against the
+//! delegation requests the account holds and, for one it holds, records the CALLING
+//! identity as the request's owner — "associates a delegation request with the current
+//! identity … the ARN of the current calling identity will be stored as the ownerId of the
+//! request", and, for a request filed with no target account, "the Amazon Web Services
+//! account ID of the current calling identity will be stored as the ownerAccount of the
+//! request". The output shape is `Unit`, so what the call did is observable only through
+//! `GetDelegationRequest` and `ListDelegationRequests`.
+//!
+//! An identifier the account holds NO delegation request under references "a resource
+//! entity that does not exist", so the call is refused with the modelled
+//! `NoSuchEntityException` (HTTP 404, awsQuery code `NoSuchEntity`) whose message
+//! describes the resource asked about
+//! ([`crate::state::delegation_request_write_not_found_message`]) and nothing is written
+//! for it — the identifier stays one the account holds nothing under.
+//!
+//! Who may call this is stated in the operation's own documentation as PERMISSION — a
+//! request filed with an owner account may be associated only by "an identity from that
+//! owner account", and one filed without one by "any caller from any account". This
+//! emulator serves ONE account (`engine::emulator_account_id`), so every caller is an
+//! identity within it: a request filed against ANOTHER account is one no caller here may
+//! associate, and — the restriction being one of visibility, as `GetDelegationRequest`
+//! states it for the same condition — it is refused as a request this caller has none of
+//! rather than under a code of its own. What is then left to decide is what the caller's
+//! own identity-based policies allow, which is the only place this crate decides a call: a
+//! caller whose policies do not permit it is refused before the lookup, `403`
+//! `<Code>AccessDenied</Code>` ([`crate::state::authorization::authorize_named`]), so a
+//! request that was not allowed changes nothing and learns nothing about which requests the
+//! account holds.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +103,20 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The `stateType` value of a delegation request an identity has been recorded as the
+/// owner of: `ASSIGNED`.
+///
+/// The association is what gives a request an owner account — "the Amazon Web Services
+/// account ID of the current calling identity will be stored as the ownerAccount of the
+/// request" — and a request WITH an owner account is the one `CreateDelegationRequest`
+/// already files in this state ("if the account ID passed, then the created delegation
+/// request can only be associated with an identity of that target account"). So the state
+/// reports whether the request has an owner account, and an associated request has one,
+/// whatever state it was in before — this operation models no refusal for the state a
+/// request is already in, exactly as the acceptance and the update model none. One of the
+/// seven values `stateType` declares ([`super::types::STATE_TYPE_VALUES`]).
+const STATE_ASSIGNED: &str = "ASSIGNED";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -171,18 +208,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateDelegationRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateDelegationRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateDelegationRequest"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AssociateDelegationRequestErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A mutation: the operation "associates a delegation request with the current
+        // identity", so the lock is held for write across the lookup and the write — a
+        // request the account does not hold cannot be written to between the two.
+        let mut store = state.lock();
+
+        // The acting principal: the identity the signing credential belongs to, resolved
+        // the way every operation of this service resolves its caller — through the access
+        // key the request was signed with.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // IAM decides a call against the caller's policies before it touches the
+        // resource, so the decision is made first and on the ARN the identifier names —
+        // the same ARN whether or not the account holds a request under it, which is what
+        // keeps a refused caller from learning which identifiers the account holds. A
+        // refusal names the request as the request named it.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::ASSOCIATE_DELEGATION_REQUEST,
+            &crate::state::delegation_request_arn(&input.delegation_request_id),
+            &format!("delegation request {}", input.delegation_request_id),
+        )?;
+
+        // "The ARN of the current calling identity will be stored as the ownerId of the
+        // request": the identity the signing credential belongs to. A credential this
+        // account holds no IAM user for names no identity to record, so nothing is
+        // recorded for it rather than an ARN nothing minted.
+        let owner_id = store
+            .access_keys
+            .get(&caller_akid)
+            .and_then(|record| store.users.get(&record.user_key))
+            .map(|user| user.arn.clone());
+        // "The Amazon Web Services account ID of the current calling identity", which for
+        // every caller of this emulator is the one account it serves.
+        let caller_account_id = ::engine::emulator_account_id().to_string();
+
+        // The identifier is the handle `CreateDelegationRequest` filed the request under,
+        // held verbatim, so it is looked up verbatim — exactly as `GetDelegationRequest`
+        // resolves it: `delegationRequestIdType` is a minted identifier rather than a
+        // friendly name, which is why it is not case-folded the way an IAM entity name
+        // is. An identifier the account holds nothing under is refused, and the refusal
+        // writes nothing: no record is filed under it, so the read that follows refuses
+        // it too.
+        let Some(held) = store
+            .delegation_requests
+            .get_mut(&input.delegation_request_id)
+        else {
+            ::tracing::info!(
+                audit = true,
+                operation = "AssociateDelegationRequest",
+                outcome = "refused_no_such_delegation_request",
+                caller_akid = %caller_akid,
+                delegation_request_id = %input.delegation_request_id,
+                "no delegation request was associated"
+            );
+            return Err(
+                AssociateDelegationRequestErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(
+                            crate::state::delegation_request_write_not_found_message(
+                                &input.delegation_request_id,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "If the partner that created the delegation request has specified the owner
+        // account during creation, only an identity from that owner account can call the
+        // AssociateDelegationRequest API for the specified delegation request": a request
+        // filed against an account OTHER than the one this emulator serves is one no
+        // identity of this account may associate. The restriction is one of VISIBILITY —
+        // `GetDelegationRequest` states the same restriction as who a request may be read
+        // by — so it is refused as a request this caller has none of rather than under a
+        // code of its own, and nothing is written for it.
+        if held
+            .owner_account_id
+            .as_deref()
+            .is_some_and(|owner| owner != caller_account_id)
+        {
+            ::tracing::info!(
+                audit = true,
+                operation = "AssociateDelegationRequest",
+                outcome = "refused_other_owner_account",
+                caller_akid = %caller_akid,
+                delegation_request_id = %input.delegation_request_id,
+                "no delegation request was associated"
+            );
+            return Err(
+                AssociateDelegationRequestErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(
+                            crate::state::delegation_request_write_not_found_message(
+                                &input.delegation_request_id,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Once the AssociateDelegationRequest API call is successful, the ARN of the
+        // current calling identity will be stored as the ownerId of the request." A call
+        // whose credential resolves to no IAM user records none, leaving the member as the
+        // account held it — the reading `AcceptDelegationRequest` already records the
+        // accepting identity by, so the two writers of an identity on this record resolve
+        // their caller alike.
+        if let Some(owner_id) = owner_id {
+            held.owner_id = Some(owner_id);
+        }
+        // "If the partner that created the delegation request has not specified the owner
+        // account during creation … the Amazon Web Services account ID of the current
+        // calling identity will be stored as the ownerAccount of the request" — so the
+        // account the filing targeted stands where the filing named one, and the caller's
+        // account is recorded where it did not.
+        if held.owner_account_id.is_none() {
+            held.owner_account_id = Some(caller_account_id);
+        }
+        // The request now has an owner account, which is what this state says (see
+        // [`STATE_ASSIGNED`]).
+        held.state = Some(STATE_ASSIGNED.to_string());
+        // "Last updated timestamp of the request" (`DelegationRequest$UpdatedTime`): the
+        // instant this call wrote the record.
+        held.updated_time = Some(crate::state::now());
+
+        ::tracing::info!(
+            audit = true,
+            operation = "AssociateDelegationRequest",
+            outcome = "associated",
+            caller_akid = %caller_akid,
+            delegation_request_id = %input.delegation_request_id,
+            state = %STATE_ASSIGNED,
+            "the delegation request was associated with the calling identity"
+        );
+
+        // The operation's output shape is `Unit`: what was written is reported by
+        // `GetDelegationRequest`, which reads the record this call just wrote.
+        Ok(AssociateDelegationRequestOutput)
     }
 }
