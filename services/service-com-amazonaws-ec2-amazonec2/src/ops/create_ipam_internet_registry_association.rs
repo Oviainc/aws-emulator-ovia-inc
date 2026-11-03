@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIpamInternetRegistryAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIpamInternetRegistryAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: associates an IPAM this account holds with a Regional Internet Registry and
+//! STORES the association — the IPAM is resolved in this service's state
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::ipams`]), the association is written
+//! through the one writer of that store in the transient `create-in-progress` state with the
+//! clock owing it `pending-enable`, and `DescribeIpamInternetRegistryAssociations`,
+//! `DeleteIpamInternetRegistryAssociation` and the routing policy registration operations
+//! resolve their `IpamInternetRegistryAssociationId` against it. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIpamInternetRegistryAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The refusals, in the order the service answers them: something that is not an `IpamId` at
+//! all is `InvalidIpamId.Malformed`, before there is anything to look up; a request whose
+//! `ClientToken` or tag payload is outside the bounds this crate holds every create to is
+//! `InvalidParameterValue`; a request naming no organization handle is `MissingParameter`; a
+//! `DryRun` request a caller holds the permissions for is `DryRunOperation` and writes
+//! nothing; then an IPAM this account holds none of is `InvalidIpamId.NotFound`, a
+//! `ClientToken` replayed with different parameters is `IdempotentParameterMismatch`, and a
+//! store already holding as much as it keeps is `ResourceLimitExceeded`.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +158,241 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIpamInternetRegistryAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIpamInternetRegistryAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIpamInternetRegistryAssociation"))
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — an
+        // association belongs to its IPAM, so "the Amazon Web Services Region of the IPAM"
+        // (`IpamInternetRegistryAssociation$IpamRegion`) comes from the stored IPAM rather
+        // than from the Region this call was signed for. The store is reached through the
+        // engine held on `self`.
+        let _ = ctx;
+
+        // The request's own FORM first, before anything is resolved and before the DryRun arm
+        // below: "not an IPAM id at all" is a malformed request rather than an IPAM that does
+        // not exist, which is the order every resource of this crate asks the two questions
+        // in (`crate::state::require_well_formed_id`).
+        let ipam_id = input.ipam_id.as_str();
+        state::require_well_formed_id(
+            state::IPAM_ID_PREFIX,
+            ipam_id,
+            state::INVALID_IPAM_ID_MALFORMED,
+        )?;
+
+        // "A unique, case-sensitive identifier to ensure that the operation completes no more
+        // than one time" (`CreateIpamInternetRegistryAssociationRequest$ClientToken`): the
+        // token map keeps whatever it is given for the process's lifetime, so its length is
+        // bounded the way every other create in this crate bounds it.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // "The organization handle at the internet registry (for example, a RIPE NCC
+        // organization ID or ARIN Org ID)"
+        // (`CreateIpamInternetRegistryAssociationRequest$OrganizationHandle`) is REQUIRED, and
+        // a required member present with an empty value names nothing at the registry — so it
+        // is refused the way this crate refuses every required value a request left empty.
+        if input.organization_handle.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter OrganizationHandle",
+            ));
+        }
+
+        // "The tags to assign to the internet registry association"
+        // (`CreateIpamInternetRegistryAssociationRequest$TagSpecifications`): the association
+        // is the only resource this call creates, so a specification naming any other
+        // resource type is refused rather than accepted and discarded — by the one helper
+        // every create in this crate bounds its tag payload with.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION,
+            Self::NAME,
+        )?;
+
+        // "A description for the internet registry association"
+        // (`CreateIpamInternetRegistryAssociationRequest$Description`) and the handle and
+        // token above are caller-chosen text this create would retain for the process's
+        // lifetime, so the BYTES they hold are asked of the store below: a record COUNT
+        // ceiling admits megabytes on its own.
+        let payload_bytes = state::STORED_RECORD_OVERHEAD_BYTES
+            + state::tag_list_bytes(&tags)
+            + input.description.as_deref().unwrap_or_default().len()
+            + input.organization_handle.len()
+            + input.client_token.as_deref().unwrap_or_default().len()
+            + state::IPAM_INTERNET_REGISTRY_ASSOCIATION_CREATE_IN_PROGRESS_MESSAGE.len();
+
+        // "Checks whether you have the required permissions for the operation, WITHOUT
+        // ACTUALLY MAKING THE REQUEST" (`DryRun`): a question about the CALLER, answered once
+        // the request's own form has been checked and before anything is resolved or written.
+        // Every caller of this emulator is permitted, and nothing is stored.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first, the way every other state-touching handler in this crate starts: an
+        // association whose `pending-enable` move has fallen due is already in that state, so
+        // a `ClientToken` replay below answers the association as it ACTUALLY stands rather
+        // than as the create left it.
+        store.materialize_due_transitions();
+
+        // "The ID of the IPAM to associate with the internet registry"
+        // (`CreateIpamInternetRegistryAssociationRequest$IpamId`): an IPAM this account holds
+        // none of is refused with the IPAM's own `NotFound` code, and the association's Region
+        // is then taken from that IPAM rather than from the request — an association cannot
+        // report an IPAM the store does not hold.
+        let ipam = store
+            .ipams
+            .get(ipam_id)
+            .cloned()
+            .ok_or_else(|| state::invalid_ipam_id_not_found(ipam_id))?;
+
+        // Idempotency: "if this token matches a previous request, the operation ignores the
+        // request, but does not return an error" — one token names the one association it
+        // minted, so a replay reports that association and creates nothing. Resolved before
+        // the ceilings below, because a replay stores nothing.
+        if let Some(association_id) = input.client_token.as_deref().and_then(|token| {
+            store
+                .ipam_internet_registry_association_client_tokens
+                .get(token)
+                .cloned()
+        }) {
+            let record = store
+                .ipam_internet_registry_association(&association_id)
+                .ok_or_else(|| {
+                    state::internal_error(format!(
+                        "a client token names {kind} '{association_id}', which is not stored",
+                        kind = state::RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION,
+                    ))
+                })?;
+            // A token is only idempotent for the REQUEST it was first given with: replayed
+            // with different parameters it names an association the caller did not ask for,
+            // which EC2 refuses rather than answers.
+            if !same_request(
+                &record.view,
+                ipam_id,
+                input.rir.as_str(),
+                input.organization_handle.as_str(),
+                input.description.as_deref(),
+                &tags,
+            ) {
+                return Err(state::idempotent_parameter_mismatch());
+            }
+            return Ok(CreateIpamInternetRegistryAssociationOutput {
+                ipam_internet_registry_association: Some(record.view.clone()),
+            });
+        }
+
+        // The store's ceilings, asked before the first write: nothing in this emulator reclaims
+        // an association, so both the COUNT of records and the caller-chosen BYTES they retain
+        // are bounded.
+        if !store.has_ipam_internet_registry_association_capacity() {
+            return Err(no_capacity_for_another_association());
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, so \
+                 it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        let view = IpamInternetRegistryAssociation {
+            // "The ID of the associated IPAM" (`IpamInternetRegistryAssociation$IpamId`) and
+            // "the Amazon Web Services Region of the IPAM"
+            // (`IpamInternetRegistryAssociation$IpamRegion`), taken from the IPAM resolved
+            // above: that Region is the IPAM's home Region, not the one this call was signed
+            // for.
+            ipam_id: ipam.ipam_id.clone(),
+            ipam_region: ipam.ipam_region.clone(),
+            // What the request decided: "the Regional Internet Registry to associate with"
+            // (the modelled `Rir` enum, so a spelling outside its catalog was refused before
+            // this handler ran), "the organization handle at the internet registry" and the
+            // association's description.
+            rir: Some(input.rir.clone()),
+            organization_handle: Some(input.organization_handle.clone()),
+            description: input.description.clone(),
+            tags: Some(tags),
+            // "The XML content for the child request to be submitted to the internet registry
+            // to complete the BPKI setup"
+            // (`IpamInternetRegistryAssociation$ChildRequestXml`): that document carries the
+            // child BPKI trust anchor AWS generates for the delegation, and this emulator
+            // issues no RPKI trust anchor material — so there is nothing to publish here, and
+            // a document made up to look like one would describe a key that does not exist.
+            child_request_xml: None,
+            // Derived by the store's one writer: the id, the ARN, the owning account, and the
+            // `create-in-progress` state and its message.
+            ipam_internet_registry_association_id: None,
+            ipam_internet_registry_association_arn: None,
+            owner_id: None,
+            state: None,
+            state_message: None,
+        };
+
+        let association_id = store
+            .insert_creating_ipam_internet_registry_association(input.client_token.as_deref(), view)
+            .ok_or_else(no_capacity_for_another_association)?;
+
+        // Read the answer back OUT of the store, so the caller sees the association a later
+        // reader will see rather than the request object.
+        store
+            .ipam_internet_registry_association(&association_id)
+            .map(|record| CreateIpamInternetRegistryAssociationOutput {
+                ipam_internet_registry_association: Some(record.view.clone()),
+            })
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the newly created {kind} '{association_id}' could not be read back",
+                    kind = state::RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION,
+                ))
+            })
     }
+}
+
+/// The refusal for a store that already holds as many internet registry associations as it
+/// keeps ([`crate::state::MAX_STORED_RECORDS_PER_STORE`]).
+///
+/// The ONE wording of that refusal, so the ceiling asked before the write and the `None` the
+/// store's writer answers when it is reached cannot drift apart.
+fn no_capacity_for_another_association() -> CreateIpamInternetRegistryAssociationError {
+    crate::state::resource_limit_exceeded(format!(
+        "This emulator holds {max} IPAM internet registry associations, which is as many as it \
+         stores",
+        max = crate::state::MAX_STORED_RECORDS_PER_STORE,
+    ))
+}
+
+/// Does `association` — the one a replayed `ClientToken` names — hold what THIS request asks
+/// for?
+///
+/// Every member the request decides is compared, so a token replayed with any different
+/// parameter is refused with `IdempotentParameterMismatch` rather than answered with an
+/// association the caller did not ask for; the same contract
+/// `create_ipam_prefix_list_resolver`'s `same_request` has for a resolver. The members this
+/// service derives (the id, the ARN, the owner, the Region, the state and its message) are not
+/// compared: they follow from the ones that are. The tags are read through the one tag
+/// comparison this crate keeps ([`crate::state::tag_pairs`]), so a replay that sends the same
+/// tags in another order is the same request here as everywhere else.
+fn same_request(
+    association: &IpamInternetRegistryAssociation,
+    ipam_id: &str,
+    rir: &str,
+    organization_handle: &str,
+    description: Option<&str>,
+    tags: &[Tag],
+) -> bool {
+    association.ipam_id.as_deref() == Some(ipam_id)
+        && association.rir.as_deref() == Some(rir)
+        && association.organization_handle.as_deref() == Some(organization_handle)
+        && association.description.as_deref() == description
+        && crate::state::tag_pairs(association.tags.as_deref().unwrap_or_default())
+            == crate::state::tag_pairs(tags)
 }

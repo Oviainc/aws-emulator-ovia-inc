@@ -777,6 +777,9 @@ mod ipam_lifecycle;
 // how `Filters` narrow it and how `MaxResults` pages it.
 #[path = "all/ipam_discovered_public_addresses.rs"]
 mod ipam_discovered_public_addresses;
+// Creating the association between an IPAM and a Regional Internet Registry.
+#[path = "all/ipam_internet_registry_association_creation.rs"]
+mod ipam_internet_registry_association_creation;
 // Deleting the association between an IPAM and a Regional Internet Registry.
 #[path = "all/ipam_internet_registry_associations.rs"]
 mod ipam_internet_registry_associations;

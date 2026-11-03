@@ -4437,6 +4437,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// the stable order every reader of them reports in.
     pub ipam_internet_registry_associations:
         BTreeMap<String, IpamInternetRegistryAssociationRecord>,
+    /// A `CreateIpamInternetRegistryAssociation` `ClientToken` and the
+    /// `IpamInternetRegistryAssociationId` that call minted, so a replay of the same request
+    /// answers with that association instead of creating a second one: "If this token matches
+    /// a previous request, the operation ignores the request, but does not return an error"
+    /// (`CreateIpamInternetRegistryAssociationRequest$ClientToken`).
+    pub ipam_internet_registry_association_client_tokens: HashMap<String, String>,
     /// Every routing policy registration delta the account's registrations have produced,
     /// by `DeltaId` — see [`IpamRoutingPolicyRegistrationDeltaRecord`]. A delta is the
     /// record of ONE change to one registration, so it outlives the call that made it and
@@ -4984,6 +4990,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             ipam_prefix_list_resolver_target_create_complete_at: BTreeMap::new(),
             ipam_prefix_list_resolver_target_client_tokens: HashMap::new(),
             ipam_internet_registry_associations: BTreeMap::new(),
+            ipam_internet_registry_association_client_tokens: HashMap::new(),
             ipam_routing_policy_registration_deltas: BTreeMap::new(),
             ipam_routing_policy_registration_delta_client_tokens: HashMap::new(),
             vpc_block_public_access_exclusions: BTreeMap::new(),
@@ -8979,9 +8986,9 @@ impl ComAmazonawsEc2Amazonec2State {
                 }
             }
         }
-        // One internet registry association a delete left transient: it reaches the terminal
-        // state that delete recorded for it at the instant it was owed, whether or not
-        // anybody called, and "a message describing the current state of the internet
+        // One internet registry association a create or a delete left transient: it reaches
+        // the terminal state that write recorded for it at the instant it was owed, whether
+        // or not anybody called, and "a message describing the current state of the internet
         // registry association" (`IpamInternetRegistryAssociation$StateMessage`) moves with
         // the state rather than keeping the in-progress wording.
         //
@@ -9018,11 +9025,10 @@ impl ComAmazonawsEc2Amazonec2State {
             };
             let mut released = 0usize;
             let mut charged = 0usize;
-            if state == IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_DELETE_COMPLETE {
+            if let Some(message) = ipam_internet_registry_association_state_message(&state) {
                 released = record.view.state_message.as_deref().map_or(0, str::len);
-                charged = IPAM_INTERNET_REGISTRY_ASSOCIATION_DELETE_COMPLETE_MESSAGE.len();
-                record.view.state_message =
-                    Some(IPAM_INTERNET_REGISTRY_ASSOCIATION_DELETE_COMPLETE_MESSAGE.to_string());
+                charged = message.len();
+                record.view.state_message = Some(message.to_string());
             }
             record.view.state = Some(state);
             record.pending = None;
@@ -47482,6 +47488,36 @@ pub const IPAM_INTERNET_REGISTRY_ASSOCIATION_ID_PREFIX: &str = "ipam-ir-assoc";
 pub const RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION: &str =
     "ipam-internet-registry-association";
 
+/// An association a create has just made: the `IpamInternetRegistryAssociationState`
+/// catalog's `create-in-progress` member (the generated catalog is
+/// `crate::ops::types::IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_VALUES`), the TRANSIENT state
+/// a create answers with.
+pub const IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_CREATE_IN_PROGRESS: &str =
+    "create-in-progress";
+
+/// An association whose creation has finished and whose delegated RPKI setup has not been
+/// enabled yet: that catalog's `pending-enable` member, which the clock owes every
+/// association a create has started on.
+///
+/// Enabling one is a request of its own (`EnableIpamInternetRegistryAssociation`, which takes
+/// the parent handle and the parent BPKI trust anchor the internet registry answered the
+/// child request with), so a created association RESTS here until that call is made rather
+/// than moving on by itself.
+pub const IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_PENDING_ENABLE: &str = "pending-enable";
+
+/// The `StateMessage` an association carries while it is still being created — "a message
+/// describing the current state of the internet registry association"
+/// (`IpamInternetRegistryAssociation$StateMessage`), in this crate's own words rather than a
+/// recording's.
+pub const IPAM_INTERNET_REGISTRY_ASSOCIATION_CREATE_IN_PROGRESS_MESSAGE: &str =
+    "The internet registry association is being created.";
+
+/// The `StateMessage` an association carries once it is created and waiting to be enabled,
+/// written by the clock that owed it
+/// ([`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]).
+pub const IPAM_INTERNET_REGISTRY_ASSOCIATION_PENDING_ENABLE_MESSAGE: &str =
+    "The internet registry association is waiting to be enabled.";
+
 /// An association whose deletion has been asked for and is not finished: the
 /// `IpamInternetRegistryAssociationState` catalog's `delete-in-progress` member (the generated
 /// catalog is `crate::ops::types::IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_VALUES`), the
@@ -47504,6 +47540,30 @@ pub const IPAM_INTERNET_REGISTRY_ASSOCIATION_DELETE_IN_PROGRESS_MESSAGE: &str =
 /// clock that owed it ([`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]).
 pub const IPAM_INTERNET_REGISTRY_ASSOCIATION_DELETE_COMPLETE_MESSAGE: &str =
     "The internet registry association has been deleted.";
+
+/// The `StateMessage` an association sitting in `state` reports, for the states this service
+/// MOVES one into, and `None` for a state it carries no message of its own for.
+///
+/// The ONE mapping of a state to its message, so the clock that materialises a move owed to
+/// an association ([`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]) and the
+/// write that started that move cannot describe one state two ways.
+pub fn ipam_internet_registry_association_state_message(state: &str) -> Option<&'static str> {
+    match state {
+        IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_CREATE_IN_PROGRESS => {
+            Some(IPAM_INTERNET_REGISTRY_ASSOCIATION_CREATE_IN_PROGRESS_MESSAGE)
+        }
+        IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_PENDING_ENABLE => {
+            Some(IPAM_INTERNET_REGISTRY_ASSOCIATION_PENDING_ENABLE_MESSAGE)
+        }
+        IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_DELETE_IN_PROGRESS => {
+            Some(IPAM_INTERNET_REGISTRY_ASSOCIATION_DELETE_IN_PROGRESS_MESSAGE)
+        }
+        IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_DELETE_COMPLETE => {
+            Some(IPAM_INTERNET_REGISTRY_ASSOCIATION_DELETE_COMPLETE_MESSAGE)
+        }
+        _ => None,
+    }
+}
 
 /// The id prefix a routing policy registration delta is minted with.
 ///
@@ -47893,6 +47953,45 @@ impl ComAmazonawsEc2Amazonec2State {
                 pending: None,
             },
         );
+        Some(association_id)
+    }
+
+    /// Store an internet registry association a create has just made, and answer the
+    /// `IpamInternetRegistryAssociationId` it was given — or `None` when the store is at its
+    /// ceiling and NOTHING was stored.
+    ///
+    /// The ONE way a CREATED association is stored, the counterpart of
+    /// [`Self::insert_creating_ipam_prefix_list_resolver`]: the association is answered in the
+    /// non-terminal `create-in-progress` state, so the clock owes it
+    /// [`IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_PENDING_ENABLE`] one [`TRANSITION_DELAY`]
+    /// later ([`PendingStateMove`], applied by [`Self::materialize_due_transitions`]) — the
+    /// span is never zero, so a caller reading the association straight after the call that
+    /// made it still sees `create-in-progress`. `client_token` names the association from here
+    /// on, so a replay of the same request answers it instead of creating a second one.
+    pub fn insert_creating_ipam_internet_registry_association(
+        &mut self,
+        client_token: Option<&str>,
+        mut view: IpamInternetRegistryAssociation,
+    ) -> Option<String> {
+        view.state =
+            Some(IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_CREATE_IN_PROGRESS.to_string());
+        view.state_message =
+            Some(IPAM_INTERNET_REGISTRY_ASSOCIATION_CREATE_IN_PROGRESS_MESSAGE.to_string());
+        let retained = client_token.unwrap_or_default().len();
+        let association_id = self.insert_ipam_internet_registry_association(view)?;
+        self.add_stored_bytes(retained);
+        if let Some(record) = self
+            .ipam_internet_registry_associations
+            .get_mut(&association_id)
+        {
+            record.pending = Some(PendingStateMove::starting_now(
+                IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_PENDING_ENABLE,
+            ));
+        }
+        if let Some(token) = client_token {
+            self.ipam_internet_registry_association_client_tokens
+                .insert(token.to_string(), association_id.clone());
+        }
         Some(association_id)
     }
 
