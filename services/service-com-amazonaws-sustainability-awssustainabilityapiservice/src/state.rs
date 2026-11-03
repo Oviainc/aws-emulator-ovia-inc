@@ -725,6 +725,7 @@ pub fn constraint_message(member: &str, value: Option<&str>, kind: ViolationKind
         path: member.to_string(),
         kind,
         value: value.map(echoed),
+        sensitive: false,
     };
     envelope(std::slice::from_ref(&violation)).unwrap_or_else(|| violation.message())
 }

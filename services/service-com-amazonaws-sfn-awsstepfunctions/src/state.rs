@@ -6120,6 +6120,7 @@ pub fn pattern_violation_message(member: &str, pattern: &str, value: &str) -> St
         path: member.to_string(),
         kind: ::smithy_server_runtime::ViolationKind::Pattern(pattern.to_string()),
         value: Some(value.to_string()),
+        sensitive: false,
     })
 }
 

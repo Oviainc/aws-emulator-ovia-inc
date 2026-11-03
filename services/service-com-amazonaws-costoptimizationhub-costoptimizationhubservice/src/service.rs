@@ -268,6 +268,7 @@ fn refused_by<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) 
             path: member_name,
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         }],
         Err(_) => Vec::new(),
     }

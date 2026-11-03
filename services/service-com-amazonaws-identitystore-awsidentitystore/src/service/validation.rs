@@ -244,7 +244,7 @@ fn render_clause(clause: &Clause) -> String {
     match clause {
         Clause::Single(violation) => format!(
             "{} at '{}'{CONSTRAINT_SEPARATOR}{}",
-            value_fragment(&violation.path, violation.value.as_deref()),
+            value_fragment(&violation.path, violation.value.as_deref(), violation.sensitive),
             violation.path,
             requirement_of(violation)
         ),
@@ -260,7 +260,7 @@ fn render_clause(clause: &Clause) -> String {
             let shown = (!values.is_empty()).then(|| format!("[{}]", values.join(", ")));
             format!(
                 "{} at '{member}'{CONSTRAINT_SEPARATOR}Member must satisfy constraint: [{}]",
-                value_fragment(member, shown.as_deref()),
+                value_fragment(member, shown.as_deref(), is_sensitive(member)),
                 constraints.join(", ")
             )
         }
@@ -270,7 +270,14 @@ fn render_clause(clause: &Clause) -> String {
 /// How the clause opens: `Value '<v>'` for a value it may show, `Value` for one the
 /// model marks sensitive, and `Value null` when the member was absent — absence IS
 /// what that clause states, so it keeps saying so.
-fn value_fragment(path: &str, value: Option<&str>) -> String {
+///
+/// `withheld` is the violation's own answer to "was this value withheld": the validating
+/// walk drops a `@sensitive` member's value as it records the violation, so an empty
+/// value half is not by itself evidence that the member was absent.
+fn value_fragment(path: &str, value: Option<&str>, withheld: bool) -> String {
+    if withheld {
+        return "Value".to_string();
+    }
     match value {
         None => "Value null".to_string(),
         Some(_) if is_sensitive(path) => "Value".to_string(),
@@ -313,6 +320,7 @@ fn requirement_text(kind: ViolationKind) -> String {
         path: String::new(),
         kind,
         value: None,
+        sensitive: false,
     }
     .message();
     let requirement = rendered

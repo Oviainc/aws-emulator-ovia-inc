@@ -111,6 +111,7 @@ fn enum_order_refusal(refusal: &Refusal) -> Option<Refused> {
                 path: violation.path.clone(),
                 kind: ViolationKind::EnumValue(stated_enum_values(allowed)),
                 value: violation.value.clone(),
+                sensitive: violation.sensitive,
             },
             _ => violation.clone(),
         })

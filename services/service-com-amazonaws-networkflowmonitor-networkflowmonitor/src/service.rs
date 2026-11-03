@@ -88,6 +88,7 @@ fn sorted_enum_value_sets(violations: &[Violation]) -> Vec<Violation> {
                     path: violation.path.clone(),
                     kind: ViolationKind::EnumValue(sorted),
                     value: violation.value.clone(),
+                    sensitive: violation.sensitive,
                 }
             }
             _ => violation.clone(),

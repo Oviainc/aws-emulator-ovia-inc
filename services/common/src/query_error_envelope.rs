@@ -487,16 +487,22 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for RequestIdEnvelopeDe
     fn framework_error_response(
         &self,
         error: aws_smithy_schema_server::ProtocolError,
+        req: &RtRequest,
     ) -> RtResponse {
-        (self.report)(self.inner.framework_error_response(error))
+        (self.report)(self.inner.framework_error_response(error, req))
     }
 
     fn refusal_response(
         &self,
         error: aws_smithy_schema_server::ProtocolError,
         chosen: Option<smithy_server_runtime::Refused>,
+        req: &RtRequest,
     ) -> RtResponse {
-        (self.report)(self.inner.refusal_response(error, chosen))
+        (self.report)(self.inner.refusal_response(error, chosen, req))
+    }
+
+    fn wire_protocol(&self, req: &RtRequest) -> smithy_server_runtime::WireProtocol<'_> {
+        self.inner.wire_protocol(req)
     }
 }
 

@@ -282,6 +282,7 @@ fn stated_violations(violations: &[Violation]) -> Vec<Violation> {
                 path: violation.path.clone(),
                 kind: ViolationKind::MinLength(floor.min),
                 value: violation.value.clone(),
+                sensitive: violation.sensitive,
             });
         }
     }

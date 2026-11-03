@@ -140,18 +140,27 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for AuthenticationRefus
         self.inner.routing_error_response(req)
     }
 
-    fn framework_error_response(&self, error: ProtocolError) -> RtResponse {
-        self.inner.framework_error_response(error)
+    fn framework_error_response(&self, error: ProtocolError, req: &RtRequest) -> RtResponse {
+        self.inner.framework_error_response(error, req)
     }
 
-    fn refusal_response(&self, error: ProtocolError, chosen: Option<Refused>) -> RtResponse {
+    fn refusal_response(
+        &self,
+        error: ProtocolError,
+        chosen: Option<Refused>,
+        req: &RtRequest,
+    ) -> RtResponse {
         // A refusal the service worded itself is passed through: this layer states the ones
         // the authentication layer reported in its own generic vocabulary, and nothing else.
         let stated = match (&chosen, &error) {
             (None, ProtocolError::Unauthenticated { code, .. }) => self.stated.stated(code),
             _ => None,
         };
-        self.inner.refusal_response(error, chosen.or(stated))
+        self.inner.refusal_response(error, chosen.or(stated), req)
+    }
+
+    fn wire_protocol(&self, req: &RtRequest) -> ::smithy_server_runtime::WireProtocol<'_> {
+        self.inner.wire_protocol(req)
     }
 }
 

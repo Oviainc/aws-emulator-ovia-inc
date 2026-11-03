@@ -475,6 +475,7 @@ fn refused_before_handling<O: Operation>(
             path: member_name,
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         }],
         Err(_) => Vec::new(),
     };

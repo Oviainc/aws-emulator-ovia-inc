@@ -128,6 +128,7 @@ fn framework_requirement(kind: &ViolationKind) -> Option<String> {
         path: String::new(),
         kind: kind.clone(),
         value: None,
+        sensitive: false,
     }
     .message();
     clause
@@ -523,6 +524,7 @@ mod tests {
             path: deep.clone(),
             kind: ViolationKind::MaxLength(1),
             value: Some("x".to_string()),
+            sensitive: false,
         };
         let message = envelope(std::slice::from_ref(&violation))
             .expect("a length violation is a class this module words");
@@ -556,6 +558,7 @@ mod tests {
                 path: path.to_string(),
                 kind: ViolationKind::MaxLength(50),
                 value: Some("x".to_string()),
+                sensitive: false,
             };
             let refusal = tag_api_refusal(std::slice::from_ref(&violation));
             assert_eq!(
@@ -608,6 +611,7 @@ mod tests {
                 path: (*member).to_string(),
                 kind: kind.clone(),
                 value: None,
+                sensitive: false,
             };
             let refused = refused(&Refusal::Invalid(vec![violation]))
                 .unwrap_or_else(|| panic!("case {member} {kind:?}: nothing was stated"));
@@ -632,6 +636,7 @@ mod tests {
             path: path.to_string(),
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         };
         let cases: &[(&[&str], Option<&str>)] = &[
             (
@@ -678,6 +683,7 @@ mod tests {
                 path: "someMember".to_string(),
                 kind: kind.clone(),
                 value: None,
+                sensitive: false,
             };
             let ours = envelope(std::slice::from_ref(&violation))
                 .unwrap_or_else(|| panic!("case {kind:?}: no envelope was produced"));
@@ -702,6 +708,7 @@ mod tests {
                 path: format!("subscriptionProviderSources.{position}.member"),
                 kind: ViolationKind::EnumValue(vec!["RedHat".to_string()]),
                 value: Some(format!("bad-{position}")),
+                sensitive: false,
             })
             .collect();
         let message =
@@ -724,6 +731,7 @@ mod tests {
                 path: format!("member{index}"),
                 kind: ViolationKind::MaxLength(1),
                 value: Some("too-long".to_string()),
+                sensitive: false,
             })
             .collect();
         let message = envelope(&members).expect("a length violation is worded here");

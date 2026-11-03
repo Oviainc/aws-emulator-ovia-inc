@@ -572,11 +572,13 @@ mod tests {
                 path: "steps.1.member.type".to_string(),
                 kind: ViolationKind::EnumValue(owned(t::WORKFLOW_STEP_TYPE_VALUES)),
                 value: None,
+                sensitive: false,
             },
             Violation {
                 path: "description".to_string(),
                 kind: ViolationKind::MaxLength(200),
                 value: None,
+                sensitive: false,
             },
         ];
         let actual = constraint_envelope(&violations);

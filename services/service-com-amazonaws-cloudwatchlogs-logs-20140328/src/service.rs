@@ -746,6 +746,7 @@ mod tests {
                 "INTELLIGENT_TIERING".to_string(),
             ]),
             value: Some("GLACIER".to_string()),
+            sensitive: false,
         };
         let outside_published_enum = Violation {
             path: "distribution".to_string(),
@@ -756,21 +757,25 @@ mod tests {
                 "ByLogStream".to_string(),
             ]),
             value: Some("ByShard".to_string()),
+            sensitive: false,
         };
         let outside_pattern = Violation {
             path: "lookupTableName".to_string(),
             kind: ViolationKind::Pattern("^[a-zA-Z0-9_]+$".to_string()),
             value: Some("bad-name-with-hyphen".to_string()),
+            sensitive: false,
         };
         let above_bound = Violation {
             path: "limit".to_string(),
             kind: ViolationKind::MaxValue("50".to_string()),
             value: Some("51".to_string()),
+            sensitive: false,
         };
         let absent = Violation {
             path: "storageTier".to_string(),
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         };
         let cases = [
             (

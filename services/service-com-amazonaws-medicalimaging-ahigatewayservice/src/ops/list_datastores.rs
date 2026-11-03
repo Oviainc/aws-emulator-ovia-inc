@@ -167,6 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                             .collect(),
                                     ),
                                     value: Some(value.to_string()),
+                                    sensitive: false,
                                 },
                             ),
                         },

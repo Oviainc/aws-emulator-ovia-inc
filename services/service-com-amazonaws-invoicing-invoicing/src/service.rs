@@ -311,7 +311,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for FrontDoor<Eng> {
                         crate::ops::types::ValidationException::shape_name(),
                         VALIDATION_EXCEPTION_STATUS,
                     )
-                    .unwrap_or_else(|e| svc.definition().framework_error_response(e));
+                    .unwrap_or_else(|e| svc.definition().framework_error_response(e, req));
             }
             // Nothing to restate: run the generated deserialize -> validate -> handle
             // -> serialize walk. Reached through the routing table rather than through

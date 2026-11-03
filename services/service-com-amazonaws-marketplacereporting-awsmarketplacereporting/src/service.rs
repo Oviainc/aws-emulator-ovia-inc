@@ -125,7 +125,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AvailabilityGate<Eng> {
                         refusal.shape_name(),
                         refusal.http_status(),
                     )
-                    .unwrap_or_else(|e| svc.definition().framework_error_response(e));
+                    .unwrap_or_else(|e| svc.definition().framework_error_response(e, req));
             }
             // Available: run the generated deserialize -> validate -> handle ->
             // serialize walk. Reached through the routing table rather than through

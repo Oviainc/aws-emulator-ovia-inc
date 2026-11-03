@@ -2558,6 +2558,7 @@ pub fn repeated_tag_key_message(member: &str, key: &str) -> String {
         path: member.to_string(),
         kind: ViolationKind::UniqueItems,
         value: Some(key.to_string()),
+        sensitive: false,
     };
     // One violation always renders; the bare clause is the same sentence without the
     // envelope's count prefix.

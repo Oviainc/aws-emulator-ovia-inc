@@ -746,6 +746,7 @@ pub fn stated_violation(member_path: &str, submitted: Option<&str>, kind: Violat
         path: member_path.to_string(),
         kind,
         value: submitted.map(echoed),
+        sensitive: false,
     };
     envelope(std::slice::from_ref(&violation)).unwrap_or_else(|| violation.message())
 }

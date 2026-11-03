@@ -864,6 +864,7 @@ pub fn additional_info_violation(
                 )),
                 kind,
                 value: Some(format!("{} items", values.len())),
+                sensitive: false,
             })
         })
         .collect();
@@ -914,6 +915,7 @@ pub fn enum_violation(member: &str, value: &str, allowed: &[&str]) -> Option<Str
         // `Violation::value` must arrive ALREADY elided: the message interpolates
         // it verbatim, and this one is a caller-supplied string of any length.
         value: Some(elided(value)),
+        sensitive: false,
     };
     ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
 }

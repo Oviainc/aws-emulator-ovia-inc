@@ -734,6 +734,7 @@ pub fn pattern_validation_failure(
         path: path.to_string(),
         kind: ::aws_smithy_schema_server::ViolationKind::Pattern(pattern.to_string()),
         value: Some(echoed(value).into_owned()),
+        sensitive: false,
     };
     let clause = violation.message();
     let requirement = clause

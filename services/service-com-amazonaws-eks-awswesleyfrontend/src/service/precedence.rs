@@ -190,7 +190,7 @@ impl Answer {
     /// never fall through to a handler that would report something else. Where the
     /// modelled envelope cannot be rendered at all, the same code and message are
     /// answered through the service's framework-refusal envelope instead.
-    fn response(self, definition: &dyn ErasedServiceDefinition) -> RtResponse {
+    fn response(self, definition: &dyn ErasedServiceDefinition, req: &RtRequest) -> RtResponse {
         let code = self.shape_name().to_string();
         let message = match &self {
             Self::PassRoleDenied(exception) => exception.message.clone(),
@@ -211,6 +211,7 @@ impl Answer {
                 definition.refusal_response(
                     ProtocolError::Invalid(Vec::new()),
                     Some(Refused { code, message }),
+                    req,
                 )
             })
     }
@@ -519,7 +520,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for PrecedenceFirst<Eng> {
                     .and_then(|key| addressed(key, protocol, req))
                     .and_then(|addressed| self.answer(&addressed, ctx))
                 {
-                    Some(answer) => Ok(answer.response(definition)),
+                    Some(answer) => Ok(answer.response(definition, req)),
                     None => match key.and_then(|key| definition.routing_table().get(key)) {
                         Some(operation) => Err(operation),
                         None => Ok(definition.routing_error_response(req)),

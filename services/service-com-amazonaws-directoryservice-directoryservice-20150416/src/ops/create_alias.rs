@@ -271,6 +271,7 @@ fn alias_pattern_violation(alias: &str) -> Option<String> {
         // boundary validator enforces before this handler runs, so the echo is bounded
         // by the model rather than by the request.
         value: Some(alias.to_string()),
+        sensitive: false,
     }])
 }
 

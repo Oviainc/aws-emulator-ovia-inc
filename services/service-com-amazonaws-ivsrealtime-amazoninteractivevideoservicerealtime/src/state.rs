@@ -6299,6 +6299,7 @@ pub fn missing_member_violation(member_name: String) -> Violation {
         path: member_name,
         kind: ViolationKind::MissingRequiredMember,
         value: None,
+        sensitive: false,
     }
 }
 
@@ -6433,6 +6434,7 @@ pub fn check_tag_count(operation: &str, found: usize) -> Result<(), String> {
             // The walk renders a collection as `"<n> items"`, which is what
             // `violation_clause` reads the found count back off.
             value: Some(format!("{found} items")),
+            sensitive: false,
         },
     ))
 }
@@ -6729,6 +6731,7 @@ mod tests {
                     path: "duration".to_string(),
                     kind: ViolationKind::MaxValue("20160".to_string()),
                     value: Some("20161".to_string()),
+                    sensitive: false,
                 },
                 "CreateParticipantToken.duration is required to have a maximum value of \
                  20160.0, found 20161.0",
@@ -6739,6 +6742,7 @@ mod tests {
                     path: "duration".to_string(),
                     kind: ViolationKind::MinValue("1".to_string()),
                     value: Some("0".to_string()),
+                    sensitive: false,
                 },
                 "CreateParticipantToken.duration is required to have a minimum value of 1.0, \
                  found 0.0",
@@ -6749,6 +6753,7 @@ mod tests {
                     path: "stageArn".to_string(),
                     kind: ViolationKind::Pattern("^arn:aws:ivs:".to_string()),
                     value: Some("nope".to_string()),
+                    sensitive: false,
                 },
                 "CreateParticipantToken.stageArn does not match the required pattern \
                  ^arn:aws:ivs:",
@@ -6759,6 +6764,7 @@ mod tests {
                     path: "stageArn".to_string(),
                     kind: ViolationKind::MinLength(1),
                     value: Some(String::new()),
+                    sensitive: false,
                 },
                 "CreateParticipantToken.stageArn is required to have a minimum length of 1, \
                  found 0",

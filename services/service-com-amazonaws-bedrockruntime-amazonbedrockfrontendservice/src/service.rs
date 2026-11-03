@@ -164,6 +164,7 @@ fn in_service_value_order(refusal: &Refusal) -> Refusal {
                     ),
                     path: violation.path.clone(),
                     value: violation.value.clone(),
+                    sensitive: violation.sensitive,
                 },
                 _ => violation.clone(),
             })

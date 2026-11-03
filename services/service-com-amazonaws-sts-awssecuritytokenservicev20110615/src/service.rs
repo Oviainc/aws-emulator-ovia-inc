@@ -388,8 +388,11 @@ where
                 // depend on which definition the service hands back; the restatement is
                 // idempotent, so passing an already-stated document through costs nothing.
                 return message_text::with_literal_message_text(
-                    svc.definition()
-                        .refusal_response(ProtocolError::Invalid(violations), Some(stated)),
+                    svc.definition().refusal_response(
+                        ProtocolError::Invalid(violations),
+                        Some(stated),
+                        req,
+                    ),
                 );
             }
             // Every failure an operation answers — a modelled error, and a refusal the

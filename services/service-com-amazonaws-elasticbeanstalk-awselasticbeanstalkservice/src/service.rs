@@ -312,6 +312,7 @@ fn requirement_of(violation: &smithy_server_runtime::Violation) -> String {
         path: violation.path.clone(),
         kind: violation.kind.clone(),
         value: None,
+        sensitive: violation.sensitive,
     }
     .message();
     match stated.rsplit_once(CONSTRAINT_MARKER) {

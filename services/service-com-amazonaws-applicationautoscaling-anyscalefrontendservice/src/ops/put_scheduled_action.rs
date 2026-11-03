@@ -474,6 +474,7 @@ fn check_scheduled_action_name(name: &str) -> Result<(), String> {
             SCHEDULED_ACTION_NAME_PATTERN,
         )),
         value: Some(name.to_string()),
+        sensitive: false,
     }];
     // `envelope` answers `None` only for an empty set of violations, which this is not.
     Err(envelope(&violations).unwrap_or_else(|| violations[0].message()))

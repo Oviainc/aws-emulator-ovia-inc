@@ -162,6 +162,7 @@ fn as_stated(violation: &Violation) -> Violation {
         path: violation.path.clone(),
         kind: as_rendered(&violation.kind),
         value: violation.value.clone(),
+        sensitive: violation.sensitive,
     }
 }
 
@@ -198,6 +199,7 @@ fn requirement_text(kind: &ViolationKind) -> String {
         path: String::new(),
         kind: as_rendered(kind),
         value: None,
+        sensitive: false,
     }
     .message();
     match rendered.rsplit_once(CONSTRAINT_SEPARATOR) {
@@ -530,6 +532,7 @@ mod tests {
                     values.iter().map(|value| (*value).to_string()).collect(),
                 ),
                 value: Some("ml.totally.bogus".to_string()),
+                sensitive: false,
             };
             let stated = refusal(std::slice::from_ref(&found))
                 .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
@@ -558,6 +561,7 @@ mod tests {
                     .collect(),
             ),
             value: Some(value.to_string()),
+            sensitive: false,
         };
 
         // Rows differ along the member's depth in the request, the echoed value's shape
@@ -643,6 +647,7 @@ mod tests {
                             .collect(),
                     ),
                     value: Some("Maybe".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value 'Maybe' at 'modelApprovalStatus' \
                  failed to satisfy constraint: Member must satisfy enum value set: \
@@ -654,6 +659,7 @@ mod tests {
                     path: "transformInput.dataSource.s3DataSource.s3Uri".to_string(),
                     kind: ViolationKind::Pattern(r"^(https|s3)://([^/]+)/?(.*)$".to_string()),
                     value: Some("not-a-valid-s3-uri".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value 'not-a-valid-s3-uri' at \
                  'transformInput.dataSource.s3DataSource.s3Uri' failed to satisfy \
@@ -666,6 +672,7 @@ mod tests {
                     path: "modelPackageArn".to_string(),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 },
                 "1 validation error detected: Value null at 'modelPackageArn' failed to \
                  satisfy constraint: Member must not be null",
@@ -676,6 +683,7 @@ mod tests {
                     path: "displayName".to_string(),
                     kind: ViolationKind::MaxLength(120),
                     value: Some("x".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value 'x' at 'displayName' failed to \
                  satisfy constraint: Member must have length less than or equal to 120",

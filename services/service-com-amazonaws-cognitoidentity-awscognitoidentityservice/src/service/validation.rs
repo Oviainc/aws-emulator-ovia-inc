@@ -168,6 +168,7 @@ where
                             code: VALIDATION_EXCEPTION.to_string(),
                             message,
                         }),
+                        req,
                     ));
                 }
             }

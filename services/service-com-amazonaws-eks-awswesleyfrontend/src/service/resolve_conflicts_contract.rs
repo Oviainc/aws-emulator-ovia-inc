@@ -104,7 +104,7 @@ impl ResolveConflictsRefusal {
     /// one. Where the modelled envelope cannot be rendered at all, the same sentence
     /// is answered through the service's framework-refusal envelope instead, which is
     /// the same 400 and the same code.
-    fn response(self, definition: &dyn ErasedServiceDefinition) -> RtResponse {
+    fn response(self, definition: &dyn ErasedServiceDefinition, req: &RtRequest) -> RtResponse {
         let Self {
             operation,
             exception,
@@ -128,6 +128,7 @@ impl ResolveConflictsRefusal {
                     code: INVALID_PARAMETER_EXCEPTION.to_string(),
                     message: stated,
                 }),
+                req,
             )
         })
     }
@@ -268,7 +269,7 @@ impl ErasedOperation for RefusedAddonRequest {
                 // [`ResolveConflictsRefusal::response`]). If it somehow is not found,
                 // the modelled operation serves the request as it would have anyway.
                 match key.and_then(|key| refusal_for(key, protocol, req)) {
-                    Some(refusal) => Ok(refusal.response(definition)),
+                    Some(refusal) => Ok(refusal.response(definition, req)),
                     None => match key.and_then(|key| definition.routing_table().get(key)) {
                         Some(operation) => Err(operation),
                         None => Ok(definition.routing_error_response(req)),

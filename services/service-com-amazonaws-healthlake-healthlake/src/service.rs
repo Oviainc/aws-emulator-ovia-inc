@@ -179,6 +179,7 @@ pub(crate) fn enum_violation_message(path: &str, allowed: &[&str]) -> String {
         kind: ViolationKind::EnumValue(allowed.iter().map(|value| value.to_string()).collect()),
         // Deliberately absent: this service's enum clause quotes no value.
         value: None,
+        sensitive: false,
     }])
 }
 

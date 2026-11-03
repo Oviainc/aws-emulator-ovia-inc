@@ -132,6 +132,7 @@ fn as_stated(violations: &[Violation]) -> Vec<Violation> {
                 path: violation.path.clone(),
                 kind: ViolationKind::EnumValue(stated_value_order(allowed)),
                 value: violation.value.clone(),
+                sensitive: violation.sensitive,
             },
             _ => violation.clone(),
         })

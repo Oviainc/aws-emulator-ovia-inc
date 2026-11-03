@@ -764,6 +764,7 @@ pub fn tag_key_violation(path: &str, key: &str) -> Option<Violation> {
         path: path.to_string(),
         kind,
         value: Some(echoed_value(key)),
+        sensitive: false,
     })
 }
 

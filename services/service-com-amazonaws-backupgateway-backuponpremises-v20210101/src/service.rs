@@ -132,6 +132,10 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
         _ => return None,
     };
     let subject = match (&violation.kind, &violation.value) {
+        // A value the validating walk itself WITHHELD is a withheld value and not an
+        // absent one: the walk drops a `@sensitive` member's value as it records the
+        // violation, so an empty value half is not evidence that the member was absent.
+        _ if violation.sensitive => "Value".to_string(),
         // An absent member is reported as the null it was: a fact of the request's
         // shape, not a rendering of a value the caller sent.
         (ViolationKind::MissingRequiredMember, _) | (_, None) => "Value null".to_string(),

@@ -148,8 +148,10 @@ struct Probe {
 /// The rows this suite pins, at most two per service so the table spans services rather
 /// than repeating one.
 ///
-/// SOURCE: the published default-quota data of each service code. The rows differ along
-/// everything the rule generalises over: a counted resource plane and a request rate, an
+/// SOURCE: the published default-quota data of each service code, and the recorded
+/// default-quota listing of each service for which code names which quota. The rows
+/// differ along everything the rule generalises over: a counted resource plane and a
+/// request rate, an
 /// adjustable row and a not-adjustable one, `Unit` `None` and a throughput unit, a row
 /// with no `Period` and rows published over a one-second window, metered and unmetered
 /// rows, and values from 5 to 10,000,000. Every row but the two `glacier` ones names a
@@ -179,12 +181,12 @@ const PROBES: &[Probe] = &[
     Probe {
         service_code: "firehose",
         quota_code: "L-CC1FDDAA",
-        quota_name: "Delivery streams per Region",
+        quota_name: "Rate of PutRecordBatch requests",
         value: 5000.0,
         unit: "None",
-        adjustable: true,
-        period: None,
-        call_count: None,
+        adjustable: false,
+        period: Some((1, "SECOND")),
+        call_count: Some(("Kinesis Firehose", "PutRecordBatch")),
     },
     Probe {
         service_code: "firehose",
@@ -192,7 +194,7 @@ const PROBES: &[Probe] = &[
         quota_name: "Throughput per delivery stream",
         value: 5.0,
         unit: "Megabytes/Second",
-        adjustable: true,
+        adjustable: false,
         period: Some((1, "SECOND")),
         call_count: None,
     },
@@ -212,7 +214,7 @@ const PROBES: &[Probe] = &[
         quota_name: "ONTAP storage virtual machines per file system",
         value: 24.0,
         unit: "None",
-        adjustable: false,
+        adjustable: true,
         period: None,
         call_count: None,
     },
@@ -289,8 +291,8 @@ const PROBES: &[Probe] = &[
     Probe {
         service_code: "guardduty",
         quota_code: "L-8B0D7135",
-        quota_name: "Member accounts per administrator account",
-        value: 5000.0,
+        quota_name: "Member accounts through AWS Organizations",
+        value: 50_000.0,
         unit: "None",
         adjustable: false,
         period: None,

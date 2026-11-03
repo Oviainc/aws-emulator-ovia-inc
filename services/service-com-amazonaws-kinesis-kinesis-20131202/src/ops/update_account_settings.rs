@@ -184,6 +184,7 @@ fn off_catalog_status(status: &str) -> UpdateAccountSettingsError {
                 .collect(),
         ),
         value: Some(status.to_string()),
+        sensitive: false,
     };
     UpdateAccountSettingsErrorModeled::ValidationException(ValidationException {
         message: envelope(&[violation]),

@@ -547,7 +547,7 @@ fn pass_role_denial_response(svc: &dyn Service, req: &RtRequest) -> Option<RtRes
         denial.http_status(),
     ) {
         Ok(response) => Some(response),
-        Err(error) => Some(svc.definition().framework_error_response(error)),
+        Err(error) => Some(svc.definition().framework_error_response(error, req)),
     }
 }
 

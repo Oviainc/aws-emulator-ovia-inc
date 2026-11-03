@@ -236,7 +236,7 @@ impl ErasedOperation for FrontDoorAnswer {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
-        _req: &'r RtRequest,
+        req: &'r RtRequest,
         _ctx: &'r smithy_server_runtime::OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
@@ -253,7 +253,7 @@ impl ErasedOperation for FrontDoorAnswer {
                     self.0.code,
                     self.0.status,
                 )
-                .unwrap_or_else(|e| svc.definition().framework_error_response(e))
+                .unwrap_or_else(|e| svc.definition().framework_error_response(e, req))
         })
     }
 }
@@ -442,6 +442,7 @@ where
                     path: member_name,
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 }])
             })
         }
@@ -522,12 +523,12 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for ConstraintRefusal<Eng> {
                         VALIDATION_EXCEPTION_CODE,
                         VALIDATION_EXCEPTION_STATUS,
                     )
-                    .unwrap_or_else(|e| svc.definition().framework_error_response(e)),
+                    .unwrap_or_else(|e| svc.definition().framework_error_response(e, req)),
                 // With no violation to state there is nothing this service can word, so
                 // the framework answers the refusal itself, as it did before this seam.
                 None => svc
                     .definition()
-                    .framework_error_response(ProtocolError::Invalid(violations)),
+                    .framework_error_response(ProtocolError::Invalid(violations), req),
             }
         })
     }

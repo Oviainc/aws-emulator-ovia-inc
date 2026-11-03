@@ -270,6 +270,7 @@ fn unseen_pattern_violations(
             // Present, so the clause reads "Value at '<member>' …" rather than the
             // "Value null at …" form an ABSENT member takes.
             value: Some(value.clone()),
+            sensitive: false,
         });
     }
     violations
@@ -430,6 +431,7 @@ pub(crate) fn refusal_for<O: Operation>(
             path: member_name,
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         }]),
         // The body was open and the request read as this protocol, but a value would not
         // go into the member it is bound to: the same layer as an undeclared enum value,
@@ -475,6 +477,7 @@ mod tests {
             path: path.to_string(),
             kind,
             value: value.map(str::to_string),
+            sensitive: false,
         }
     }
 
@@ -749,6 +752,7 @@ mod tests {
             path: "resourceARN".to_string(),
             kind: ViolationKind::Pattern(declared.to_string()),
             value: Some("not-an-arn-at-all".to_string()),
+            sensitive: false,
         }];
         assert!(
             unseen_pattern_violations(schema, body.as_bytes(), &found).is_empty(),

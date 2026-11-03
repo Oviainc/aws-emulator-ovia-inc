@@ -101,6 +101,7 @@ fn stated(violation: &Violation) -> String {
         } else {
             violation.value.clone()
         },
+        sensitive: violation.sensitive,
     };
     let clause = restated.message();
     if !withheld {

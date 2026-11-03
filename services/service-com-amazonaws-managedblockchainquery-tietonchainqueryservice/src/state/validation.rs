@@ -370,6 +370,7 @@ impl Violations {
             path: path.to_string(),
             kind,
             value: Some(shown),
+            sensitive: false,
         });
         false
     }

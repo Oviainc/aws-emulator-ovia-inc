@@ -142,6 +142,7 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
         path: String::new(),
         kind: kind.clone(),
         value: None,
+        sensitive: false,
     };
     restated(&probe)
         .message()
@@ -286,6 +287,7 @@ fn stated_violations(violation: &Violation) -> Vec<Violation> {
             path: violation.path.clone(),
             kind,
             value: violation.value.clone(),
+            sensitive: violation.sensitive,
         })
         .collect();
     if stated.is_empty() {
@@ -366,6 +368,7 @@ pub(crate) fn constraint_report(member: &str, value: &str, kind: ViolationKind) 
         path: constraints::path::member(member),
         kind,
         value: Some(value.to_owned()),
+        sensitive: false,
     };
     // Through [`stated_report`], the one path every refusal of this service is worded by.
     // One violation always states one clause, so a message is always rendered; the clause
@@ -900,6 +903,7 @@ mod tests {
             path: path.to_owned(),
             kind,
             value: Some(value.to_owned()),
+            sensitive: false,
         }
     }
 
@@ -992,6 +996,7 @@ mod tests {
                 path: "packageID".to_owned(),
                 kind: ViolationKind::MissingRequiredMember,
                 value: None,
+                sensitive: false,
             },
         ]);
         let stated = aws_validation_refusal(&refusal).expect("a constraint refusal is stated");

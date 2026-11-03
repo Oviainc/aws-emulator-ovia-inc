@@ -2367,6 +2367,7 @@ pub fn filter_pair_refusal<'a>(
                 path: format!("{element}.name"),
                 kind: ViolationKind::MissingRequiredMember,
                 value: None,
+                sensitive: false,
             });
         }
         match value_count {
@@ -2375,6 +2376,7 @@ pub fn filter_pair_refusal<'a>(
                 path: format!("{element}.values"),
                 kind: ViolationKind::MissingRequiredMember,
                 value: None,
+                sensitive: false,
             }),
             // Present, and so not null, but naming no value to match. The value a
             // violation carries only decides whether the clause says `null`; no
@@ -2383,6 +2385,7 @@ pub fn filter_pair_refusal<'a>(
                 path: format!("{element}.values"),
                 kind: ViolationKind::MinLength(1),
                 value: Some(String::new()),
+                sensitive: false,
             }),
             Some(_) => {}
         }
@@ -2860,6 +2863,7 @@ fn framework_requirement(kind: &ViolationKind) -> String {
         path: String::new(),
         kind: kind.clone(),
         value: None,
+        sensitive: false,
     }
     .message();
     match clause.split_once(CONSTRAINT_MARKER) {

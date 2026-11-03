@@ -415,6 +415,19 @@ fn s3_refusal(violation: &Violation) -> Refused {
     }
 }
 
+/// The XML element a member of a request DOCUMENT is spelled with: the member's own
+/// declared name, which a violation path carries with its first character lower-cased (the
+/// constraint walk's spelling of a member), so it is recovered by upper-casing that
+/// character back. restXml writes a member under its declared name, and no member read
+/// through here is renamed by the model.
+fn element_of(member_path_segment: &str) -> String {
+    let mut characters = member_path_segment.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
+}
+
 /// The refusal S3 publishes for the request field `violation` names, or `None` for a field
 /// it publishes none for.
 ///
@@ -433,7 +446,26 @@ fn s3_refusal(violation: &Violation) -> Refused {
 fn published_refusal(violation: &Violation) -> Option<Refused> {
     let mut segments = violation.path.split('.');
     let member = segments.next()?;
-    let rejected = violation.value.as_deref().unwrap_or_default();
+    // The validating walk WITHHOLDS the value of a `@sensitive` member as it records the
+    // violation (`KMSKeyArn` is one), leaving the clause no value half at all, so a
+    // sentence that quotes the value reads it from the request's own XML document instead
+    // — the same reading an `<ArgumentValue>` echo makes, and the one place this service
+    // recovers the TEXT a caller sent.
+    let withheld = violation
+        .sensitive
+        .then(|| {
+            violation
+                .path
+                .rsplit('.')
+                .next()
+                .map(element_of)
+                .and_then(|element| wire::spelled_in_request(&element))
+        })
+        .flatten();
+    let rejected = withheld
+        .as_deref()
+        .or(violation.value.as_deref())
+        .unwrap_or_default();
     let (code, message) = match member {
         // The two `CopyObject` directives, each an enum over [COPY, REPLACE].
         "taggingDirective" => (
@@ -998,11 +1030,16 @@ impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for EmulatedService<Eng
         self.entry.routing_error_response(req)
     }
 
-    fn framework_error_response(&self, error: ProtocolError) -> RtResponse {
-        self.entry.framework_error_response(error)
+    fn framework_error_response(&self, error: ProtocolError, req: &RtRequest) -> RtResponse {
+        self.entry.framework_error_response(error, req)
     }
 
-    fn refusal_response(&self, error: ProtocolError, chosen: Option<Refused>) -> RtResponse {
+    fn refusal_response(
+        &self,
+        error: ProtocolError,
+        chosen: Option<Refused>,
+        req: &RtRequest,
+    ) -> RtResponse {
         // The ONE refusal the framework renders through here is the authentication one: a
         // caller it refused before any handler ran, which this service words itself.
         // Anything else — and an authentication refusal this service declines to word — falls
@@ -1013,6 +1050,10 @@ impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for EmulatedService<Eng
                 return response;
             }
         }
-        self.entry.refusal_response(error, chosen)
+        self.entry.refusal_response(error, chosen, req)
+    }
+
+    fn wire_protocol(&self, req: &RtRequest) -> smithy_server_runtime::WireProtocol<'_> {
+        self.entry.wire_protocol(req)
     }
 }

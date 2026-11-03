@@ -287,7 +287,7 @@ impl ErasedOperation for OversizedPayload {
                     modeled.shape_name(),
                     modeled.http_status(),
                 )
-                .unwrap_or_else(|e| svc.definition().framework_error_response(e))
+                .unwrap_or_else(|e| svc.definition().framework_error_response(e, req))
         })
     }
 }

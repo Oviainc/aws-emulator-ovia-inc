@@ -329,6 +329,7 @@ fn member_must_not_be_null(member: &str) -> GenerateRandomError {
         path: path::member(member),
         kind: ViolationKind::MissingRequiredMember,
         value: None,
+        sensitive: false,
     };
     match envelope(&[violation]) {
         Some(message) => crate::scaffolded::Scaffolded::validation(message),

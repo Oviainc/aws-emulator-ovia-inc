@@ -246,6 +246,7 @@ pub fn payload_over_maximum(input_schema: &Schema, bytes: usize) -> Option<Strin
         path: payload_path(input_schema)?,
         kind: ViolationKind::MaxLength(maximum),
         value: Some(format!("{bytes} bytes")),
+        sensitive: false,
     }])
 }
 
@@ -445,6 +446,7 @@ where
                 path: member_name,
                 kind: ViolationKind::MissingRequiredMember,
                 value: None,
+                sensitive: false,
             }])
         }
         Err(error) => return Read::Unread(format!("{UNREADABLE}: {error}")),
@@ -604,6 +606,7 @@ mod tests {
                 path: "member".to_string(),
                 kind: ViolationKind::Pattern(declared.to_string()),
                 value: Some("submitted".to_string()),
+                sensitive: false,
             }])
             .expect("a constraint refusal is stated");
             assert_eq!(
@@ -625,6 +628,7 @@ mod tests {
             path: "endpointName".to_string(),
             kind: ViolationKind::MaxLength(63),
             value: Some("x".repeat(64)),
+            sensitive: false,
         }]))
         .expect("a constraint refusal is stated");
         assert_eq!(

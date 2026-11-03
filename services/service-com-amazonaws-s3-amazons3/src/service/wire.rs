@@ -565,6 +565,7 @@ fn xml_charset_violation(request: &Request, input_schema: &Schema) -> Option<Vio
         path: path::member(payload.member_name()?),
         kind: ViolationKind::Pattern(XML_CHARACTER_SET.to_string()),
         value: Some(format!("{forbidden:?}")),
+        sensitive: false,
     })
 }
 

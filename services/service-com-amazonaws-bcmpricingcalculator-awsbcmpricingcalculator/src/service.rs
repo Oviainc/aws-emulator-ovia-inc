@@ -738,6 +738,7 @@ mod tests {
             // The framework attaches the rejected value; this service drops it, which is
             // what these cases pin.
             value: Some("submitted".to_string()),
+            sensitive: false,
         };
         let one = [violation("name", ViolationKind::MaxLength(64))];
         assert_eq!(
@@ -756,6 +757,7 @@ mod tests {
                 path: "identifier".to_string(),
                 kind: ViolationKind::MissingRequiredMember,
                 value: None,
+                sensitive: false,
             },
         ];
         assert_eq!(

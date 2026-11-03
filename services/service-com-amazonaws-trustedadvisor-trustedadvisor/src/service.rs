@@ -290,6 +290,7 @@ fn modelled_refusal<O: Operation>(
                     path: constraints::path::member(&member_name),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 };
                 let message = refusal_message(&[absent], &RenderedCollections::new())?;
                 return validation_exception(protocol, message);

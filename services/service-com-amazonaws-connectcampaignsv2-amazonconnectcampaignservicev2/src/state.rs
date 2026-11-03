@@ -245,6 +245,7 @@ fn map_keys_violation<'k>(
                 // `Violation::value` must arrive ALREADY elided: the message
                 // interpolates it verbatim.
                 value: Some(echoed),
+                sensitive: false,
             })
         })
         .take(MAX_REPORTED_VIOLATIONS)
@@ -295,6 +296,7 @@ pub fn tag_key_list_violation(member: &str, keys: &[String]) -> Option<String> {
                 // `Violation::value` must arrive ALREADY elided: the message
                 // interpolates it verbatim.
                 value: Some(elided(key)),
+                sensitive: false,
             })
         })
         .take(MAX_REPORTED_VIOLATIONS)
@@ -319,6 +321,7 @@ pub fn tag_count_violation(member: &str, count: usize) -> Option<String> {
         kind: ::smithy_server_runtime::ViolationKind::MaxLength(MAX_TAGS_PER_RESOURCE as i64),
         // The `<n> entries` form the framework displays a map's own length with.
         value: Some(format!("{count} entries")),
+        sensitive: false,
     };
     ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
 }
@@ -397,6 +400,7 @@ pub fn communication_limits_violation(
         // The `<n> items` form the framework displays a LIST's own length with (a map's
         // is `<n> entries`, which is what [`tag_count_violation`] shows).
         value: Some(format!("{count} items")),
+        sensitive: false,
     };
     ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
 }
@@ -454,6 +458,7 @@ pub fn enum_value_violation(member: &str, allowed: &[&str], value: Option<&str>)
         // `Violation::value` must arrive ALREADY elided: the message interpolates it
         // verbatim.
         value: Some(elided(value)),
+        sensitive: false,
     };
     ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
 }

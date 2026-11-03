@@ -379,7 +379,7 @@ where
                 // framework's.
                 let response = svc
                     .definition()
-                    .refusal_response(ProtocolError::Invalid(violations), Some(stated));
+                    .refusal_response(ProtocolError::Invalid(violations), Some(stated), req);
                 record_refusal(ctx, O::NAME, &code, &response, started.elapsed());
                 return response;
             }

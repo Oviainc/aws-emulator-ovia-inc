@@ -270,6 +270,7 @@ fn invalid_status(submitted: &str) -> UpdateUserPoolReplicaError {
         // Echoed only as far as the envelope's own bound, so a long submitted
         // value cannot amplify this refusal.
         value: Some(crate::state::echoed_value(submitted)),
+        sensitive: false,
     };
     UpdateUserPoolReplicaErrorModeled::InvalidParameterException(InvalidParameterException {
         message: ::aws_smithy_schema_server::constraints::envelope(&[violation]),

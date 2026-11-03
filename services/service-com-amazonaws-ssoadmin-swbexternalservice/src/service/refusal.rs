@@ -129,6 +129,7 @@ pub fn value_above_maximum(member_path: &str, maximum: i32) -> String {
         path: member_path.to_string(),
         kind: ViolationKind::MaxValue(maximum.to_string()),
         value: None,
+        sensitive: false,
     })
 }
 
@@ -335,6 +336,7 @@ mod tests {
             path: path.to_owned(),
             kind,
             value: value.map(str::to_owned),
+            sensitive: false,
         }
     }
 

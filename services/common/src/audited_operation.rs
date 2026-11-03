@@ -635,15 +635,21 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for AuditedDefinition<D
     fn framework_error_response(
         &self,
         error: ::aws_smithy_schema_server::ProtocolError,
+        req: &RtRequest,
     ) -> RtResponse {
-        self.inner.framework_error_response(error)
+        self.inner.framework_error_response(error, req)
     }
 
     fn refusal_response(
         &self,
         error: ::aws_smithy_schema_server::ProtocolError,
         chosen: Option<::smithy_server_runtime::Refused>,
+        req: &RtRequest,
     ) -> RtResponse {
-        self.inner.refusal_response(error, chosen)
+        self.inner.refusal_response(error, chosen, req)
+    }
+
+    fn wire_protocol(&self, req: &RtRequest) -> ::smithy_server_runtime::WireProtocol<'_> {
+        self.inner.wire_protocol(req)
     }
 }

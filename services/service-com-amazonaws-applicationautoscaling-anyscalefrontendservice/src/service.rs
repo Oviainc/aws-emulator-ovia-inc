@@ -165,6 +165,7 @@ fn as_published(violation: &constraints::Violation) -> constraints::Violation {
         path: violation.path.clone(),
         kind: constraints::ViolationKind::Pattern(service_common::validation::unanchored(declared)),
         value: violation.value.clone(),
+        sensitive: violation.sensitive,
     }
 }
 
@@ -202,6 +203,7 @@ where
                         code: VALIDATION_EXCEPTION.to_string(),
                         message,
                     }),
+                    req,
                 );
             }
             self.operation.run(svc, req, ctx).await

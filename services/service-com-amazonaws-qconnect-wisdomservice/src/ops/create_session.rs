@@ -289,9 +289,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
         use ::smithy_server_runtime::OperationError;
 
         ::std::boxed::Box::pin(async move {
-            // The request itself is not read: the refusal is the same for every request
-            // this caller could have sent to this route.
-            let _ = req;
+            // The request itself is not read for the refusal's CONTENT: it is the same
+            // for every request this caller could have sent to this route, and is handed
+            // to the error renderer only so the answer closes the envelope of the
+            // protocol this request is served in.
             let started = ::std::time::Instant::now();
             let recording = ::emulator_telemetry::recording_active();
             let request_metadata = recording
@@ -314,7 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
                     error.shape_name(),
                     error.http_status(),
                 )
-                .unwrap_or_else(|failed| definition.framework_error_response(failed));
+                .unwrap_or_else(|failed| definition.framework_error_response(failed, req));
 
             // Counted as the operation it refused, with the same classification the
             // walk would have recorded for the same modeled error.

@@ -399,7 +399,7 @@ impl<O: Operation> ErasedOperation for ModelledValidation<O> {
                             crate::ops::types::ValidationException::shape_name(),
                             VALIDATION_STATUS,
                         )
-                        .unwrap_or_else(|e| svc.definition().framework_error_response(e));
+                        .unwrap_or_else(|e| svc.definition().framework_error_response(e, req));
                 }
             }
             // Nothing this seam states: run the generated deserialize -> validate ->

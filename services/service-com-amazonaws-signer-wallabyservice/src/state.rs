@@ -1706,6 +1706,7 @@ pub fn platform_id_pattern_refusal(member: &str, value: &str) -> Option<String> 
             REVOCATION_PLATFORM_ID_PATTERN.to_string(),
         ),
         value: Some(stated_value(value)),
+        sensitive: false,
     }])
 }
 

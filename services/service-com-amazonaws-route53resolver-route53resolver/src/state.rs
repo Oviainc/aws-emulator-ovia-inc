@@ -2015,6 +2015,7 @@ pub fn name_pattern_violation(name: &str) -> String {
         // `Name`'s modelled length (0..64) is checked before a handler runs, so
         // the value echoed here is already bounded.
         value: Some(name.to_string()),
+        sensitive: false,
     };
     ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
         .unwrap_or_else(|| String::from("Name is outside the pattern the model declares for it"))

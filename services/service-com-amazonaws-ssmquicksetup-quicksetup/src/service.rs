@@ -251,7 +251,7 @@ impl<Op: Operation, Eng: Send + Sync + 'static> TargetAuthorization<Op, Eng> {
         if self.serves(&arn, ctx) {
             return None;
         }
-        Some(unauthorized(svc))
+        Some(unauthorized(svc, req))
     }
 
     /// Whether the endpoint this request reached serves a resource with this ARN.
@@ -335,7 +335,7 @@ fn carried_in_uri(member: &Schema) -> bool {
 /// the same envelope (and the same `x-amzn-errortype` header) as every other error this
 /// service answers. The status and the error code come from the refusal itself: the shape
 /// is not in the model, so there is no modelled error to read them off.
-fn unauthorized(svc: &dyn Service) -> RtResponse {
+fn unauthorized(svc: &dyn Service, req: &RtRequest) -> RtResponse {
     svc.definition()
         .protocol()
         .serialize_error(
@@ -344,7 +344,7 @@ fn unauthorized(svc: &dyn Service) -> RtResponse {
             UNAUTHORIZED_CODE,
             UNAUTHORIZED_STATUS,
         )
-        .unwrap_or_else(|error| svc.definition().framework_error_response(error))
+        .unwrap_or_else(|error| svc.definition().framework_error_response(error, req))
 }
 
 /// Every operation whose route carries, as a path label, the ARN of a resource the route

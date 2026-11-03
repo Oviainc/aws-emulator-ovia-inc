@@ -6423,6 +6423,7 @@ pub fn constraint_report(member: &str, kind: ViolationKind) -> String {
         // `Value null` one an absent member gets. What it holds is irrelevant:
         // the value never reaches the body.
         value: Some(String::new()),
+        sensitive: false,
     })])
 }
 

@@ -100,6 +100,7 @@ fn quoting_the_submitted_value(violation: &Violation, echo: &SubmittedEcho) -> V
             SubmittedEcho::Absent => None,
             SubmittedEcho::Unrendered => violation.value.clone(),
         },
+        sensitive: violation.sensitive,
     }
 }
 

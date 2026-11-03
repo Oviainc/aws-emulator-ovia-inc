@@ -746,6 +746,7 @@ pub fn page_refusal(operation: &str, error: PageError) -> String {
                 path: MAX_RESULTS_MEMBER.to_string(),
                 kind,
                 value: None,
+                sensitive: false,
             };
             crate::service::constraint_envelope(std::slice::from_ref(&violation)).unwrap_or_else(
                 || {

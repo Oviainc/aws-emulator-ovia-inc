@@ -542,6 +542,7 @@ pub fn requirement_text(kind: ViolationKind) -> String {
         path: String::new(),
         kind,
         value: None,
+        sensitive: false,
     }
     .message();
     let requirement = rendered

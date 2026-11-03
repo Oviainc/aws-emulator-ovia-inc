@@ -143,6 +143,7 @@ pub fn range_violation_message(member_path: &str, value: i32, min: i32, max: i32
         path: member_path.to_string(),
         kind,
         value: Some(value.to_string()),
+        sensitive: false,
     }])
 }
 

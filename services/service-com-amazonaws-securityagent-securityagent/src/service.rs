@@ -211,6 +211,7 @@ fn as_stated(violation: &Violation) -> Violation {
                 .collect(),
         ),
         value: violation.value.clone(),
+        sensitive: violation.sensitive,
     }
 }
 
@@ -238,6 +239,7 @@ mod tests {
                 values.iter().map(|value| (*value).to_string()).collect(),
             ),
             value: Some("NOT_A_PROVIDER".to_string()),
+            sensitive: false,
         }
     }
 
@@ -314,6 +316,7 @@ mod tests {
                     path: "provider".to_string(),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 }]),
             ),
             (
@@ -322,6 +325,7 @@ mod tests {
                     path: "targetUrl".to_string(),
                     kind: ViolationKind::MaxLength(2048),
                     value: Some("x".to_string()),
+                    sensitive: false,
                 }]),
             ),
         ];
@@ -353,6 +357,7 @@ mod tests {
                 path: "clientId".to_string(),
                 kind: ViolationKind::MissingRequiredMember,
                 value: None,
+                sensitive: false,
             },
         ]);
         let expected = "2 validation errors detected: Value 'NOT_A_PROVIDER' at 'provider' \

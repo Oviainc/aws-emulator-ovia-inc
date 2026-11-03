@@ -201,7 +201,9 @@ impl<O: Operation> ErasedOperation for ModeledInputCheck<O> {
                             BAD_REQUEST_EXCEPTION,
                             BAD_REQUEST_EXCEPTION_STATUS,
                         )
-                        .unwrap_or_else(|error| svc.definition().framework_error_response(error))
+                        .unwrap_or_else(|error| {
+                            svc.definition().framework_error_response(error, req)
+                        })
                 })
             };
             if let Some(response) = refused {
@@ -222,9 +224,10 @@ impl<O: Operation> ErasedOperation for ModeledInputCheck<O> {
             // straight back here.
             match svc.definition().routing_table().get(O::NAME) {
                 Some(operation) => operation.run(svc, req, ctx).await,
-                None => svc
-                    .definition()
-                    .framework_error_response(ProtocolError::UnknownOperation(O::NAME.to_string())),
+                None => svc.definition().framework_error_response(
+                    ProtocolError::UnknownOperation(O::NAME.to_string()),
+                    req,
+                ),
             }
         })
     }

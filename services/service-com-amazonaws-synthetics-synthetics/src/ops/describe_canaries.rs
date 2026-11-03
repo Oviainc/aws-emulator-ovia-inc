@@ -144,6 +144,7 @@ fn out_of_range(requested: i32) -> DescribeCanariesError {
         path: path::member("MaxResults"),
         kind,
         value: Some(requested.to_string()),
+        sensitive: false,
     };
     let message = envelope(std::slice::from_ref(&violation)).unwrap_or_else(|| {
         // Unreachable: `envelope` answers `None` only for an empty slice.

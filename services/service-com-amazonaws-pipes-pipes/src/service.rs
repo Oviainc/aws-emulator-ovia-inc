@@ -275,7 +275,7 @@ where
             let refused = {
                 let protocol = svc.definition().protocol();
                 let violations = refusing_violations_with_echoes::<O>(protocol, req);
-                front_door_refusal(O::INPUT_SCHEMA, &violations).map(|exception| {
+                let stated = front_door_refusal(O::INPUT_SCHEMA, &violations).map(|exception| {
                     protocol
                         .serialize_error(
                             &exception,
@@ -283,7 +283,25 @@ where
                             VALIDATION_EXCEPTION,
                             VALIDATION_EXCEPTION_STATUS,
                         )
-                        .unwrap_or_else(|error| svc.definition().framework_error_response(error))
+                        .unwrap_or_else(|error| {
+                            svc.definition().framework_error_response(error, req)
+                        })
+                });
+                // The tagging layer's own refusal, worded HERE rather than in
+                // `override_refusal` because its clause echoes the tag's value and the
+                // validating walk withholds the value of a `@sensitive` member — which a
+                // tag's is — as it records the violation. This reading of the request is
+                // what still holds it.
+                stated.or_else(|| {
+                    tag_rule_refusal(&violations).map(|stated| {
+                        svc.definition().refusal_response(
+                            ::aws_smithy_schema_server::ProtocolError::Invalid(
+                                violations.iter().map(|(violation, _)| violation.clone()).collect(),
+                            ),
+                            Some(stated),
+                            req,
+                        )
+                    })
                 })
             };
             if let Some(response) = refused {
@@ -298,6 +316,47 @@ where
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
         self.operation.auth_schemes()
     }
+}
+
+/// The tagging layer's refusal of a tag whose CONTENT breaks a published tag rule, or
+/// `None` when this refusal is not that one.
+///
+/// The same decision [`Service::override_refusal`] takes — every violation has to be about
+/// one tag's content, and the layer states the first rule the request broke — over the
+/// violations as a reading of the REQUEST restores them: the clause echoes the tag's value,
+/// and the validating walk withholds the value of a `@sensitive` member (a tag's value is
+/// one) as it records the violation, so the restoration
+/// ([`service_common::validation_message::quoting_the_whole_submitted_value`], which puts
+/// back exactly what that walk would have stored) is what lets the clause state it.
+fn tag_rule_refusal(refused: &[(Violation, SubmittedEcho)]) -> Option<Refused> {
+    if refused.is_empty()
+        || !refused
+            .iter()
+            .all(|(violation, _)| TAG_CONTENT_MEMBERS.contains(&member_of(violation)))
+    {
+        return None;
+    }
+    let message = refused
+        .iter()
+        .filter_map(|(violation, echo)| {
+            // ONLY a withheld value is restored: everything else reaches here with the
+            // value the framework's own walk stored — already elided at that walk's
+            // ceiling — which is the value this layer's recorded clause quotes.
+            let stated = if violation.sensitive {
+                service_common::validation_message::quoting_the_whole_submitted_value(
+                    violation.clone(),
+                    echo,
+                )
+            } else {
+                violation.clone()
+            };
+            tag_content_clause(&stated)
+        })
+        .next()?;
+    Some(Refused {
+        code: TAG_RULE_REFUSAL_CODE.to_string(),
+        message,
+    })
 }
 
 /// The `ValidationException` the front door answers one refused request with, or `None`

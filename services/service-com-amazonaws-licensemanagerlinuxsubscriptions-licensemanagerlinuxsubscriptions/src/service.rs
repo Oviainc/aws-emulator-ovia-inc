@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service, Violation,
+    http, ErasedOperation, Refusal, Refused, Service, Violation,
     ViolationKind,
 };
 use std::sync::Arc;
@@ -141,6 +141,7 @@ fn absent_tag_removal_parameters(
             path,
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         })
         .collect();
     (!absent.is_empty()).then_some(absent)
@@ -237,6 +238,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         Some(self.entry.refusal_response(
             aws_smithy_schema_server::ProtocolError::Invalid(violations),
             chosen,
+            req,
         ))
     }
 

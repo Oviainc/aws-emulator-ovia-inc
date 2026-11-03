@@ -99,6 +99,7 @@ fn restate(violation: &Violation) -> Violation {
             path: violation.path.clone(),
             kind: ViolationKind::Pattern(unanchored(pattern).to_string()),
             value: violation.value.clone(),
+            sensitive: violation.sensitive,
         },
         _ => violation.clone(),
     }

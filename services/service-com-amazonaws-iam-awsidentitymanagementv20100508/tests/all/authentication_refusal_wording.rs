@@ -53,11 +53,27 @@ const AUTHORIZATION_DENIAL: &str = "AccessDenied";
 /// the parse.
 const WRONG_SIGNATURE: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-/// The instant every request below signs at, in SigV4's own `YYYYMMDDTHHMMSSZ` form.
-const SIGNING_INSTANT: &str = "20260101T000000Z";
-
-/// The scope date that instant falls on.
-const SIGNING_DATE: &str = "20260101";
+/// The instant every request below signs at, in SigV4's own `YYYYMMDDTHHMMSSZ` form, and the
+/// scope date it falls on — read from the CLOCK rather than written down, because a request
+/// signed at a fixed instant is refused for the difference between that instant and the
+/// current time once the clock has moved past the window SigV4 admits, and what these rows
+/// are about is the CREDENTIAL. Both halves come from one reading, so the scope date and the
+/// signing instant can never name different days.
+fn signed_at() -> (String, String) {
+    let rendered = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now())
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .expect("the current instant renders in RFC 3339");
+    let (date, time) = rendered
+        .split_once('T')
+        .expect("an RFC 3339 instant separates its date and time with 'T'");
+    let date: String = date.chars().filter(|held| held.is_ascii_digit()).collect();
+    let time: String = time
+        .chars()
+        .filter(|held| held.is_ascii_digit())
+        .take(6)
+        .collect();
+    (format!("{date}T{time}Z"), date)
+}
 
 /// The user a MUTATION row names, so the store can be read afterwards to show the refused
 /// write never happened.
@@ -131,8 +147,9 @@ async fn signed_call(
     for (name, value) in params {
         body.push_str(&format!("&{name}={value}"));
     }
+    let (signing_instant, signing_date) = signed_at();
     let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={access_key_id}/{SIGNING_DATE}/{HARNESS_REGION}/iam/\
+        "AWS4-HMAC-SHA256 Credential={access_key_id}/{signing_date}/{HARNESS_REGION}/iam/\
          aws4_request, SignedHeaders=host;x-amz-date, Signature={WRONG_SIGNATURE}"
     );
     let request = http::Request::builder()
@@ -140,7 +157,7 @@ async fn signed_call(
         .uri("https://iam.amazonaws.com/")
         .header("host", "iam.amazonaws.com")
         .header("content-type", "application/x-www-form-urlencoded")
-        .header("x-amz-date", SIGNING_INSTANT)
+        .header("x-amz-date", &signing_instant)
         .header("authorization", authorization)
         .body(bytes::Bytes::from(body))
         .expect("a well-formed awsQuery request");

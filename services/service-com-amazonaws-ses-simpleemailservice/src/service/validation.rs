@@ -93,6 +93,7 @@ fn restated(violation: &Violation) -> Violation {
             path: violation.path.clone(),
             kind: ViolationKind::EnumValue(listed(values)),
             value: violation.value.clone(),
+            sensitive: violation.sensitive,
         },
         _ => violation.clone(),
     }
@@ -156,6 +157,7 @@ mod tests {
             path: "destination".to_string(),
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         }]))
         .expect("a structural refusal is stated");
         assert_eq!(
@@ -202,6 +204,7 @@ mod tests {
                     declared.iter().map(|value| (*value).to_string()).collect(),
                 ),
                 value: Some("Bogus".to_string()),
+                sensitive: false,
             }]))
             .expect("a structural refusal is stated");
             let expected = format!(
@@ -223,6 +226,7 @@ mod tests {
             path: "maxItems".to_string(),
             kind: ViolationKind::MaxValue("1000".to_string()),
             value: Some("1001".to_string()),
+            sensitive: false,
         }]))
         .expect("a structural refusal is stated");
         assert_eq!(

@@ -610,6 +610,7 @@ fn modelled_refusal<Op: Operation>(
                     path: constraints::path::member(&member_name),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 };
                 // Nothing was read, so there is no list value to render.
                 return refusal_message(&[absent], &HashMap::new(), input)

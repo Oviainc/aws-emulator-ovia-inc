@@ -1813,6 +1813,7 @@ pub fn text_pattern_refusal<'a>(members: impl IntoIterator<Item = TextMember<'a>
             // by the member's own `@length` maximum (50 for a name or a title, 200 for a
             // description), which the boundary already enforced.
             value: Some(value.to_string()),
+            sensitive: false,
         })
         .collect();
     envelope(&violations)

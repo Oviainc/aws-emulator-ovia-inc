@@ -339,6 +339,7 @@ pub(crate) fn element_pattern_refusal(
                 .cloned()
                 .unwrap_or_default(),
         ),
+        sensitive: false,
     };
     // The value a clause states at a list member is the whole list, rendered the way the
     // walk's own collector renders one (`service_common::validation::submitted_lists`):
@@ -507,7 +508,7 @@ where
             if let Some((violations, stated)) = refused {
                 return svc
                     .definition()
-                    .refusal_response(ProtocolError::Invalid(violations), Some(stated));
+                    .refusal_response(ProtocolError::Invalid(violations), Some(stated), req);
             }
             self.operation.run(svc, req, ctx).await
         })
@@ -688,6 +689,7 @@ mod tests {
             path: "applicationId".to_string(),
             kind: ViolationKind::Pattern(r"^[\w\d\.-]+$".to_string()),
             value: Some("bad app id!".to_string()),
+            sensitive: false,
         };
         let stated = constraint_envelope(std::slice::from_ref(&pattern))
             .expect("one clause is stated");
@@ -716,6 +718,7 @@ mod tests {
                     ViolationKind::MissingRequiredMember => None,
                     _ => Some("x".to_string()),
                 },
+                sensitive: false,
             };
             let stated = constraint_envelope(std::slice::from_ref(&violation))
                 .expect("one clause is stated");
@@ -743,6 +746,7 @@ mod tests {
             path: path.to_string(),
             kind,
             value: value.map(str::to_string),
+            sensitive: false,
         }
     }
 

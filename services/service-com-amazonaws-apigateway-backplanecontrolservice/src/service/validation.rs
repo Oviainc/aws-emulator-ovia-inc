@@ -137,6 +137,7 @@ fn as_stated(root: &str, violation: &Violation) -> Violation {
         path: format!("{root}.{}", violation.path),
         kind: as_rendered(&violation.kind),
         value: violation.value.clone(),
+        sensitive: violation.sensitive,
     }
 }
 
@@ -366,6 +367,7 @@ mod tests {
                             .collect(),
                     ),
                     value: Some("invalid_op".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value 'invalid_op' at \
                  'updateRestApiInput.patchOperations.1.member.op' failed to satisfy \
@@ -378,6 +380,7 @@ mod tests {
                     path: "statusCode".to_string(),
                     kind: ViolationKind::Pattern(r"^[1-5]\d\d$".to_string()),
                     value: Some("999".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value '999' at \
                  'updateRestApiInput.statusCode' failed to satisfy constraint: Member \
@@ -389,6 +392,7 @@ mod tests {
                     path: "name".to_string(),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 },
                 "1 validation error detected: Value null at 'updateRestApiInput.name' \
                  failed to satisfy constraint: Member must not be null",
@@ -399,6 +403,7 @@ mod tests {
                     path: "tags.someKey.member".to_string(),
                     kind: ViolationKind::MaxLength(128),
                     value: Some("x".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value 'x' at \
                  'updateRestApiInput.tags.someKey.member' failed to satisfy constraint: \
@@ -466,6 +471,7 @@ mod tests {
                 path: path.to_string(),
                 kind: ViolationKind::EnumValue(vec!["ONE".to_string(), "TWO".to_string()]),
                 value: Some("THREE".to_string()),
+                sensitive: false,
             };
             let stated = refusal(operation, std::slice::from_ref(&found))
                 .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));

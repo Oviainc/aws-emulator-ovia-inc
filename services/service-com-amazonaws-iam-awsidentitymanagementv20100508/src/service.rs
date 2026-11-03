@@ -380,8 +380,10 @@ impl ErasedOperation for UnusableCredential {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         // The refusal is reached from the credential alone: nothing of the request's
-        // body or metadata is read, and nothing is written.
-        let _ = (req, ctx);
+        // body or metadata is read, and nothing is written — the request is handed to
+        // the renderer only so the refusal closes the envelope of the protocol this
+        // request is served in.
+        let _ = ctx;
         Box::pin(async move {
             svc.definition().refusal_response(
                 ProtocolError::Unauthenticated {
@@ -389,6 +391,7 @@ impl ErasedOperation for UnusableCredential {
                     message: UNUSABLE_CREDENTIAL_MESSAGE,
                 },
                 None,
+                req,
             )
         })
     }

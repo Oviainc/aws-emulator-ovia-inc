@@ -394,12 +394,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // Read-only: the guard is taken, the object is copied out, and nothing is
+        // written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(GetObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+
         // A `versionId` that is not SHAPED like one cannot name a version of anything, so it
         // is a malformed argument rather than an absent version: `InvalidArgument` with HTTP
         // 400, naming the parameter and the token it rejected, which leaves
-        // `NoSuchVersion`/404 for a well-formed id the bucket holds no version for. Judged on
-        // the request alone, so it is settled before the store is read and before
-        // authorization, the way a value the boundary validator refuses is.
+        // `NoSuchVersion`/404 for a well-formed id the bucket holds no version for.
+        //
+        // Judged AFTER the bucket the request addresses is resolved: a bucket that is not
+        // there is what S3 reports first, whatever else the request carries, because every
+        // other answer about the object would be an answer about a bucket the account does
+        // not hold.
         if let Some(version_id) = input
             .version_id
             .as_deref()
@@ -407,13 +417,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::scaffolded::Scaffolded::invalid_version_id(version_id));
         }
-
-        // Read-only: the guard is taken, the object is copied out, and nothing is
-        // written — a later caller sees exactly what this one saw.
-        let store = state.lock();
-        let Some(bucket) = store.bucket(&input.bucket) else {
-            return Err(GetObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
-        };
 
         // WHO is asking comes before anything this read reports, and is judged against the
         // version the address resolves to — read here, ahead of the key lookup below, so a

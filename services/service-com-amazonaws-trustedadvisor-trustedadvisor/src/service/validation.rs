@@ -306,7 +306,14 @@ fn requirement_of(kind: &ViolationKind) -> Option<String> {
 /// * a COLLECTION member is reported as the collection the caller sent, in place of the
 ///   framework's `<n> items` summary of it;
 /// * everything else echoes the value the framework stored.
+///
+/// A value the validating walk itself withheld (`Violation::sensitive`) is a withheld
+/// value and not an absent one, so it is answered before the null above: the walk drops
+/// a `@sensitive` member's value as it records the violation.
 fn subject(violation: &Violation, collections: &RenderedCollections) -> String {
+    if violation.sensitive {
+        return "Value".to_string();
+    }
     let Some(stored) = violation.value.as_deref() else {
         return "Value null".to_string();
     };

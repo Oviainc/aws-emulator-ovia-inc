@@ -224,7 +224,7 @@ where
             if let Some((violations, stated)) = refused {
                 return svc
                     .definition()
-                    .refusal_response(ProtocolError::Invalid(violations), Some(stated));
+                    .refusal_response(ProtocolError::Invalid(violations), Some(stated), req);
             }
             self.operation.run(svc, req, ctx).await
         })

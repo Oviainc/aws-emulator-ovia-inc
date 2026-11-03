@@ -556,6 +556,10 @@ fn modelled_refusal<Op: Operation>(
                     path: constraints::path::member(&member_name),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    // There is no value to withhold: the member was absent, so the
+                    // clause names the path alone whether or not the model marks it
+                    // `@sensitive`.
+                    sensitive: false,
                 };
                 return Some(ConstraintRefusal::of(&absent, Op::INPUT_SCHEMA));
             }

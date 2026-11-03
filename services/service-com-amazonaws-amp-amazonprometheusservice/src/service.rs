@@ -316,6 +316,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for ListScrapersFromQuery<Eng> 
                 Err(refused) => {
                     return announced(modelled_validation_response(
                         svc,
+                        req,
                         protocol,
                         &refused,
                         <Op<Eng> as Operation>::NAME,
@@ -329,6 +330,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for ListScrapersFromQuery<Eng> 
                 let refused = crate::state::constraint_validation_failed(&violations);
                 return announced(modelled_validation_response(
                     svc,
+                    req,
                     protocol,
                     &refused,
                     <Op<Eng> as Operation>::NAME,
@@ -349,7 +351,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for ListScrapersFromQuery<Eng> 
                 ),
             };
             announced(response.unwrap_or_else(|error| {
-                svc.definition().framework_error_response(error)
+                svc.definition().framework_error_response(error, req)
             }))
         })
     }
@@ -413,6 +415,7 @@ fn refuse_invalid_input<Op: Operation>(
 /// rendered in the entry's own framework envelope instead, and logged.
 fn modelled_validation_response(
     svc: &dyn Service,
+    req: &RtRequest,
     protocol: &dyn ServerHttpProtocol,
     error: &crate::ops::types::ValidationException,
     operation: &str,
@@ -424,7 +427,7 @@ fn modelled_validation_response(
             "the modelled ValidationException would not serialize; this refusal falls \
              back to the framework's generic envelope"
         );
-        svc.definition().framework_error_response(error)
+        svc.definition().framework_error_response(error, req)
     })
 }
 

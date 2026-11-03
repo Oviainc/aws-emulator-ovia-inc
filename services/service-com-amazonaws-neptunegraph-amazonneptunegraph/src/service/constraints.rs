@@ -85,7 +85,7 @@ impl<Inner: Operation + ErasedOperation> ErasedOperation for ConstraintGate<Inne
             // statements below: `&dyn ErasedServiceDefinition` is not `Sync`, so holding
             // it across the await would make this future non-`Send`.
             let refused = constraint_violations::<Inner>(svc.definition().protocol(), req);
-            if let Some(response) = constraint_refusal::<Inner>(svc, &refused) {
+            if let Some(response) = constraint_refusal::<Inner>(svc, req, &refused) {
                 return response;
             }
             self.operation.run(svc, req, ctx).await
@@ -138,6 +138,7 @@ pub fn constraint_violations<O: Operation>(
             path: member_name,
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         }],
         Err(_) => Vec::new(),
     }
@@ -157,6 +158,7 @@ pub fn constraint_violations<O: Operation>(
 /// than inventing a sentence for it (see [`super::constraint_clause`]).
 pub fn constraint_refusal<O: Operation>(
     svc: &dyn Service,
+    req: &RtRequest,
     refused: &[Violation],
 ) -> Option<RtResponse> {
     let clauses = super::constraint_clauses(refused)?;
@@ -180,6 +182,9 @@ pub fn constraint_refusal<O: Operation>(
         VALIDATION_EXCEPTION_STATUS,
     ) {
         Ok(response) => Some(response),
-        Err(unserializable) => Some(svc.definition().framework_error_response(unserializable)),
+        Err(unserializable) => Some(
+            svc.definition()
+                .framework_error_response(unserializable, req),
+        ),
     }
 }

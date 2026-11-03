@@ -219,6 +219,7 @@ impl ErasedOperation for StatedStartMigration {
                 return svc.definition().refusal_response(
                     aws_smithy_schema_server::ProtocolError::Invalid(violations),
                     Some(refused),
+                    req,
                 );
             }
             match svc.definition().routing_table().get(self.routing_key) {

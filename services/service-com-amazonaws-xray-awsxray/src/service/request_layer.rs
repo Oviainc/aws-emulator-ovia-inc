@@ -363,7 +363,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for ConstraintRefusal<Eng> {
                 &crate::service::in_stated_value_order(&Refusal::Invalid(violations.clone())),
             );
             svc.definition()
-                .refusal_response(ProtocolError::Invalid(violations), chosen)
+                .refusal_response(ProtocolError::Invalid(violations), chosen, req)
         })
     }
 }

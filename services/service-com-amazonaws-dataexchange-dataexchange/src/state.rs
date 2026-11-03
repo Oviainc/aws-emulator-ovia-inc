@@ -1139,6 +1139,7 @@ fn max_results_out_of_range(value: i32) -> ValidationException {
         path: MAX_RESULTS_QUERY.to_string(),
         kind,
         value: Some(value.to_string()),
+        sensitive: false,
     };
     // One violated bound is one violation, so the envelope always renders.
     invalid_request(envelope(&[violation]).unwrap_or_default())

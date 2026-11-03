@@ -2141,6 +2141,7 @@ pub fn enum_value_refusal_message(member: &str, value: &str, values: &[&str]) ->
         path: ::aws_smithy_schema_server::constraints::path::member(member),
         kind: ::aws_smithy_schema_server::constraints::ViolationKind::EnumValue(stated),
         value: Some(value.to_string()),
+        sensitive: false,
     };
     ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
         .unwrap_or_default()

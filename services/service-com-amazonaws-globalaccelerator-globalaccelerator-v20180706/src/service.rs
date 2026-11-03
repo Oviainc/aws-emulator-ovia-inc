@@ -236,6 +236,7 @@ mod tests {
             path: path.to_owned(),
             kind: ViolationKind::MaxLength(128),
             value: Some("x".to_owned()),
+            sensitive: false,
         }
     }
 

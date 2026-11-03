@@ -413,6 +413,7 @@ mod tests {
             path: path.to_owned(),
             kind,
             value: value.map(str::to_owned),
+            sensitive: false,
         }
     }
 

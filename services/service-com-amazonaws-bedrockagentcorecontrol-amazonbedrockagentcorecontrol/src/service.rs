@@ -153,13 +153,15 @@ impl ErasedOperation for CapacityProviderDenial {
         req: &'r RtRequest,
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
-        let _ = (req, ctx);
+        let _ = ctx;
         Box::pin(async move {
-            svc.definition()
-                .framework_error_response(ProtocolError::Unauthenticated {
+            svc.definition().framework_error_response(
+                ProtocolError::Unauthenticated {
                     code: crate::state::ACCESS_DENIED_SHAPE,
                     message: crate::state::CAPACITY_PROVIDER_DENIAL,
-                })
+                },
+                req,
+            )
         })
     }
 }
@@ -455,7 +457,7 @@ where
             if let Some((violations, stated)) = refused {
                 return svc
                     .definition()
-                    .refusal_response(ProtocolError::Invalid(violations), Some(stated));
+                    .refusal_response(ProtocolError::Invalid(violations), Some(stated), req);
             }
             self.operation.run(svc, req, ctx).await
         })

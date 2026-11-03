@@ -561,7 +561,10 @@ where
                 error.http_status(),
             ),
         };
-        Some(rendered.unwrap_or_else(|failed| svc.definition().framework_error_response(failed)))
+        Some(
+            rendered
+                .unwrap_or_else(|failed| svc.definition().framework_error_response(failed, req)),
+        )
     }
 }
 
@@ -619,6 +622,7 @@ where
                             code: INVALID_PARAMETER_EXCEPTION.to_string(),
                             message,
                         }),
+                        req,
                     ),
                     INVALID_PARAMETER_EXCEPTION,
                 );

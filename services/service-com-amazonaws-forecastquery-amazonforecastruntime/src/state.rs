@@ -927,6 +927,7 @@ fn pattern_clause(member: &str, value: &str, pattern: &str) -> String {
         path: constraints::path::member(member),
         kind: constraints::ViolationKind::Pattern(pattern.to_string()),
         value: Some(echoed(value).into_owned()),
+        sensitive: false,
     }
     .message()
 }

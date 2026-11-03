@@ -189,6 +189,7 @@ where
                         code: VALIDATION_EXCEPTION.to_string(),
                         message,
                     }),
+                    req,
                 );
             }
             self.operation.run(svc, req, ctx).await

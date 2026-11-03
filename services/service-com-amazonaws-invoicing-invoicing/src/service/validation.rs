@@ -392,6 +392,7 @@ mod tests {
                     path: "invoiceReceiver".to_string(),
                     kind: ViolationKind::Pattern(r"^\d{12}$".to_string()),
                     value: Some(rejected.to_string()),
+                    sensitive: false,
                 },
                 "Value at 'invoiceReceiver' failed to satisfy constraint: Member must \
                  satisfy regular expression pattern: \\d{12}",
@@ -401,6 +402,7 @@ mod tests {
                     path: "name".to_string(),
                     kind: ViolationKind::MaxLength(50),
                     value: Some(rejected.to_string()),
+                    sensitive: false,
                 },
                 "Value at 'name' failed to satisfy constraint: Member must have length \
                  less than or equal to 50",
@@ -410,6 +412,7 @@ mod tests {
                     path: "name".to_string(),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 },
                 "Value null at 'name' failed to satisfy constraint: Member must not be null",
             ),
@@ -434,6 +437,7 @@ mod tests {
             path: "maxResults".to_string(),
             kind: ViolationKind::MaxValue("500".to_string()),
             value: Some("501".to_string()),
+            sensitive: false,
         }];
         let two = vec![
             one[0].clone(),
@@ -441,6 +445,7 @@ mod tests {
                 path: "nextToken".to_string(),
                 kind: ViolationKind::MinLength(1),
                 value: Some(String::new()),
+                sensitive: false,
             },
         ];
         for (violations, expected) in [
@@ -490,6 +495,7 @@ mod tests {
                     path: format!("resourceTags.{}.member.key", index + 1),
                     kind: ViolationKind::MinLength(1),
                     value: Some(String::new()),
+                    sensitive: false,
                 })
                 .collect();
             let message = envelope(&violations).expect("a worded refusal");
@@ -535,6 +541,7 @@ mod tests {
             path: "name".to_string(),
             kind: ViolationKind::Pattern(format!("^{}$", "a".repeat(2 * MAX_MESSAGE_LENGTH))),
             value: Some("nope".to_string()),
+            sensitive: false,
         };
         let message = envelope(std::slice::from_ref(&violation)).expect("a worded refusal");
         let length = message.chars().count();

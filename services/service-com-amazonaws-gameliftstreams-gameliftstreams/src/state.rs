@@ -286,6 +286,7 @@ pub fn stream_class_violation(value: Option<&str>) -> ::aws_smithy_schema_server
                 .collect(),
         ),
         value: value.map(str::to_string),
+        sensitive: false,
     }
 }
 
@@ -349,6 +350,7 @@ pub fn service_violation(
                 .collect(),
         ),
         value: violation.value.clone(),
+        sensitive: violation.sensitive,
     }
 }
 

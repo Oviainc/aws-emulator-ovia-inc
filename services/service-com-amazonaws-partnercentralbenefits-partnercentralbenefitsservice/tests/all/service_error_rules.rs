@@ -783,6 +783,7 @@ fn violation(path: &str, kind: ViolationKind) -> Violation {
         path: path.to_string(),
         kind,
         value,
+        sensitive: false,
     }
 }
 

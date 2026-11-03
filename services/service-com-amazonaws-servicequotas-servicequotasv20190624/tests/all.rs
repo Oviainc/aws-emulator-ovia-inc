@@ -41,6 +41,8 @@ mod cross_region_settlement;
 mod default_quota_catalog;
 #[path = "all/default_quota_catalog_fidelity.rs"]
 mod default_quota_catalog_fidelity;
+#[path = "all/default_quota_code_binding.rs"]
+mod default_quota_code_binding;
 #[path = "all/default_quota_published_codes.rs"]
 mod default_quota_published_codes;
 #[path = "all/default_quota_row_text.rs"]

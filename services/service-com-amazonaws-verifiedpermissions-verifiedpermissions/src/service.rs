@@ -113,6 +113,7 @@ fn clause(violation: &Violation) -> String {
         path: json_pointer(&violation.path),
         kind: violation.kind.clone(),
         value: violation.value.clone(),
+        sensitive: violation.sensitive,
     };
     let stated = addressed.message();
     let subject = match &addressed.value {

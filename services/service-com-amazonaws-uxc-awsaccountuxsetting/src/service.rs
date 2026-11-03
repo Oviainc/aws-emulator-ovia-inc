@@ -581,7 +581,7 @@ fn request_rejection<O: Operation>(svc: &dyn Service, req: &RtRequest) -> Option
     let violations = match read_request::<O>(protocol, req) {
         RequestReading::Read(violations) => violations,
         RequestReading::UnreadableBody(failure) => {
-            return Some(front_door_rejection(svc, failure));
+            return Some(front_door_rejection(svc, req, failure));
         }
         RequestReading::UnreadableRequest => return None,
     };
@@ -592,9 +592,9 @@ fn request_rejection<O: Operation>(svc: &dyn Service, req: &RtRequest) -> Option
         .into_iter()
         .partition(|violation| binds_to_body(O::INPUT_SCHEMA, &violation.path));
     if !body.is_empty() {
-        return Some(front_door_rejection(svc, ProtocolError::Invalid(body)));
+        return Some(front_door_rejection(svc, req, ProtocolError::Invalid(body)));
     }
-    Some(member_constraint_rejection(svc, protocol, uri))
+    Some(member_constraint_rejection(svc, req, protocol, uri))
 }
 
 /// Whether `violation_path` names a member `input_schema` carries in the request
@@ -641,13 +641,14 @@ fn carried_in_the_body(member: &Schema) -> bool {
 /// entry renders from the service's model-derived protocol). Only the code and
 /// the message are this service's, and they travel together: a client branches on
 /// the code, so one without the other is worse than neither.
-fn front_door_rejection(svc: &dyn Service, refused: ProtocolError) -> RtResponse {
+fn front_door_rejection(svc: &dyn Service, req: &RtRequest, refused: ProtocolError) -> RtResponse {
     svc.definition().refusal_response(
         refused,
         Some(Refused {
             code: BAD_REQUEST_EXCEPTION.to_string(),
             message: INVALID_REQUEST_BODY.to_string(),
         }),
+        req,
     )
 }
 
@@ -663,6 +664,7 @@ fn restated(violations: &[Violation]) -> Vec<Violation> {
                 path: violation.path.clone(),
                 kind: ViolationKind::Pattern(unanchored(pattern)),
                 value: violation.value.clone(),
+                sensitive: violation.sensitive,
             },
             _ => violation.clone(),
         })
@@ -703,6 +705,7 @@ fn member_constraint_exception(
 /// serialized, so a refusal is never dropped over a rendering failure.
 fn member_constraint_rejection(
     svc: &dyn Service,
+    req: &RtRequest,
     protocol: &dyn ServerHttpProtocol,
     violations: Vec<Violation>,
 ) -> RtResponse {
@@ -719,7 +722,7 @@ fn member_constraint_rejection(
     rendered.unwrap_or_else(|| {
         let chosen = svc.override_refusal(&Refusal::Invalid(violations.clone()));
         svc.definition()
-            .refusal_response(ProtocolError::Invalid(violations), chosen)
+            .refusal_response(ProtocolError::Invalid(violations), chosen, req)
     })
 }
 

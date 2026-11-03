@@ -432,6 +432,7 @@ pub fn string_violation(shape: ConstrainedString, path: &str, value: &str) -> Op
         path: path.to_string(),
         kind,
         value: Some(value.to_string()),
+        sensitive: false,
     })
 }
 
@@ -712,6 +713,7 @@ fn stated_clause(violation: &Violation) -> String {
         path: violation.path.clone(),
         kind: stated_kind(&violation.kind),
         value: violation.value.clone(),
+        sensitive: violation.sensitive,
     }
     .message()
 }
@@ -728,6 +730,7 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
         path: String::new(),
         kind: stated_kind(kind),
         value: None,
+        sensitive: false,
     };
     probe
         .message()

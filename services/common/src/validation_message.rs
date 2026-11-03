@@ -204,6 +204,9 @@ pub fn quoting_the_submitted_collection(
     match echo {
         crate::validation::SubmittedEcho::Rendered(value) if summarised => Violation {
             value: Some(value),
+            // The caller asked for the submitted collection to be QUOTED, so the clause
+            // states it: a value restored on purpose is not one the walk withheld.
+            sensitive: false,
             ..violation
         },
         _ => violation,
@@ -233,12 +236,34 @@ pub fn quoting_the_whole_submitted_value(
     let crate::validation::SubmittedEcho::Rendered(submitted) = echo else {
         return violation;
     };
+    // A value the validating walk WITHHELD (a `@sensitive` member's, dropped as the
+    // violation was recorded) leaves the clause with no value half to restore FROM, so it
+    // is restored to exactly what that walk would have stored had it not withheld it: the
+    // submitted value under the framework's own echo ceiling. Only the redaction is
+    // undone, never the framework's elision — a service whose clause quotes the whole
+    // value states its own ceiling for that.
+    if violation.sensitive {
+        return Violation {
+            value: Some(
+                crate::validation::quoted_echo_up_to(
+                    submitted,
+                    crate::validation::FRAMEWORK_ECHO_CEILING,
+                )
+                .into_owned(),
+            ),
+            sensitive: false,
+            ..violation
+        };
+    }
     let elided = violation.value.as_deref().is_some_and(|stored| {
         stored != submitted && crate::validation::is_elision_of(stored, submitted)
     });
     if elided {
         return Violation {
             value: Some(submitted.clone()),
+            // The caller asked for the submitted value to be QUOTED whole, so the clause
+            // states it: a value restored on purpose is not one the walk withheld.
+            sensitive: false,
             ..violation
         };
     }
@@ -353,6 +378,7 @@ pub fn in_sorted_enum_order(violation: &Violation) -> Violation {
         path: violation.path.clone(),
         kind: ViolationKind::EnumValue(sorted),
         value: violation.value.clone(),
+        sensitive: violation.sensitive,
     }
 }
 
@@ -601,6 +627,7 @@ pub fn map_key_refusal_quoting(
         path: member_path.to_string(),
         kind: ViolationKind::MissingRequiredMember,
         value: None,
+        sensitive: false,
     };
     match envelope(std::slice::from_ref(&placeholder)) {
         Some(rendered) => rendered.replace(&placeholder.message(), &clause),
@@ -619,6 +646,7 @@ fn requirement(kind: ViolationKind) -> String {
         path: String::new(),
         kind,
         value: None,
+        sensitive: false,
     }
     .message();
     match clause.split_once(CLAUSE_SEPARATOR) {
@@ -1000,6 +1028,7 @@ fn requoted(violation: &Violation, quote_pattern: &dyn Fn(&str) -> String) -> Vi
             path: violation.path.clone(),
             kind: ViolationKind::Pattern(quote_pattern(pattern)),
             value: violation.value.clone(),
+            sensitive: violation.sensitive,
         },
         _ => violation.clone(),
     }
@@ -1121,6 +1150,7 @@ fn envelope_over(clauses: &[String]) -> Option<String> {
         path: String::new(),
         kind: ViolationKind::MissingRequiredMember,
         value: None,
+        sensitive: false,
     };
     let rendered = envelope(&vec![placeholder.clone(); clauses.len()])?;
     let stated = placeholder.message();
@@ -1157,6 +1187,7 @@ mod tests {
             path: path.to_owned(),
             kind,
             value: Some(value.to_owned()),
+            sensitive: false,
         }
     }
 
@@ -1717,6 +1748,7 @@ mod tests {
                     path: "queries".to_owned(),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 },
                 "Value null at 'queries' failed to satisfy constraint: Member must not be null",
             ),
@@ -1726,6 +1758,7 @@ mod tests {
                     path: "sources".to_owned(),
                     kind: ViolationKind::MinLength(1),
                     value: None,
+                    sensitive: false,
                 },
                 "Value null at 'sources' failed to satisfy constraint: Member must have length \
                  greater than or equal to 1",
@@ -1757,6 +1790,7 @@ mod tests {
                     path: "secret".to_owned(),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 },
                 "Value at 'secret' failed to satisfy constraint: Member must not be null",
             ),
@@ -2456,6 +2490,7 @@ mod tests {
                     path: format!("member{index}"),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 })
                 .collect();
             // The framework's envelope over the same number of clauses, with its own

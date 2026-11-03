@@ -329,6 +329,7 @@ fn requested_tags(body: &[u8]) -> Result<Vec<(String, String)>, String> {
                 path: entry_path(TAGS_MEMBER, key),
                 kind: ViolationKind::MaxLength(bound(MAX_TAG_VALUE_LEN)),
                 value: Some(bounded(value)),
+                sensitive: false,
             });
         }
         requested.push((key.clone(), value.to_string()));
@@ -366,6 +367,7 @@ fn requested_tag_keys(body: &[u8]) -> Result<Vec<String>, String> {
             // Deliberately absent: echoing a whole collection back would let a
             // request amplify itself into the response.
             value: None,
+            sensitive: false,
         }]));
     }
     if sent.len() > MAX_TAG_KEYS {
@@ -420,6 +422,7 @@ fn missing_member(member: &str) -> String {
         kind: ViolationKind::MissingRequiredMember,
         // An absent member has no value to echo.
         value: None,
+        sensitive: false,
     }])
 }
 
@@ -442,6 +445,7 @@ fn collection_too_long(member: &str, max: usize) -> Violation {
         // Deliberately absent, as for the minimum above: a collection is as long as
         // the caller chose, so echoing it would amplify the request.
         value: None,
+        sensitive: false,
     }
 }
 
@@ -468,6 +472,7 @@ fn key_length_violations(path: &str, key: &str) -> Vec<Violation> {
         path: path.to_string(),
         kind,
         value: Some(bounded(key)),
+        sensitive: false,
     }]
 }
 

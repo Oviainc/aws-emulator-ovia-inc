@@ -269,6 +269,7 @@ mod tests {
                     path: "export.name".to_string(),
                     kind: ViolationKind::Pattern(r"^[0-9A-Za-z\-_]+$".to_string()),
                     value: Some("bad name!".to_string()),
+                    sensitive: false,
                 },
                 SubmittedEcho::Rendered("bad name!".to_string()),
                 "Value 'bad name!' at 'export.name' failed to satisfy constraint: Member \
@@ -281,6 +282,7 @@ mod tests {
                     path: "resourceTags".to_string(),
                     kind: ViolationKind::MaxLength(200),
                     value: Some("201 items".to_string()),
+                    sensitive: false,
                 },
                 SubmittedEcho::Rendered(
                     "[ResourceTag(key=k0, value=v0), ResourceTag(key=k1, value=v1)]"
@@ -297,6 +299,7 @@ mod tests {
                     path: "resourceTags".to_string(),
                     kind: ViolationKind::MaxLength(200),
                     value: Some("201 items".to_string()),
+                    sensitive: false,
                 },
                 SubmittedEcho::Unrendered,
                 "Value '201 items' at 'resourceTags' failed to satisfy constraint: Member \
@@ -307,6 +310,7 @@ mod tests {
                     path: "export.name".to_string(),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 },
                 SubmittedEcho::Absent,
                 "Value null at 'export.name' failed to satisfy constraint: Member must \
@@ -330,6 +334,7 @@ mod tests {
             path: "maxResults".to_string(),
             kind: ViolationKind::MaxValue("300".to_string()),
             value: Some("301".to_string()),
+            sensitive: false,
         }];
         let two = vec![
             one[0].clone(),
@@ -337,6 +342,7 @@ mod tests {
                 path: "exportArn".to_string(),
                 kind: ViolationKind::MinLength(20),
                 value: Some("arn:aws".to_string()),
+                sensitive: false,
             },
         ];
         for (violations, expected) in [

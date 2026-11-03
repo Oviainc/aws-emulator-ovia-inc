@@ -220,7 +220,7 @@ impl<O: Operation> FrontDoor<O> {
         // names neither the member nor the value, so no echo has to be restored.
         if self.wording.is_none() && self.uri_wording.is_none() {
             let refused = body_violations::<O>(protocol, req);
-            return (!refused.is_empty()).then(|| rejection(svc, refused));
+            return (!refused.is_empty()).then(|| rejection(svc, req, refused));
         }
         let (body, uri) = violations_by_binding::<O>(protocol, req);
         if !body.is_empty() {
@@ -230,15 +230,15 @@ impl<O: Operation> FrontDoor<O> {
                 Some(wording) => {
                     let chosen = wording(&body)?;
                     let violations = body.into_iter().map(|(violation, _)| violation).collect();
-                    return Some(worded_rejection(svc, violations, chosen));
+                    return Some(worded_rejection(svc, req, violations, chosen));
                 }
                 None => body.into_iter().map(|(violation, _)| violation).collect(),
             };
-            return Some(rejection(svc, violations));
+            return Some(rejection(svc, req, violations));
         }
         let chosen = self.uri_wording?(&uri)?;
         let violations = uri.into_iter().map(|(violation, _)| violation).collect();
-        Some(worded_rejection(svc, violations, chosen))
+        Some(worded_rejection(svc, req, violations, chosen))
     }
 }
 
@@ -320,9 +320,10 @@ pub fn binds_to_body(input_schema: &Schema, violation_path: &str) -> bool {
 /// [`BAD_REQUEST_EXCEPTION`] and [`INVALID_REQUEST_BODY`] replacing the code and the
 /// message together — a client branches on the code, so one without the other is worse
 /// than neither.
-pub fn rejection(svc: &dyn Service, refused: Vec<Violation>) -> RtResponse {
+pub fn rejection(svc: &dyn Service, req: &RtRequest, refused: Vec<Violation>) -> RtResponse {
     worded_rejection(
         svc,
+        req,
         refused,
         Refused {
             code: BAD_REQUEST_EXCEPTION.to_string(),
@@ -337,11 +338,12 @@ pub fn rejection(svc: &dyn Service, refused: Vec<Violation>) -> RtResponse {
 /// every protocol — so a service's wording decides the words and nothing else.
 pub fn worded_rejection(
     svc: &dyn Service,
+    req: &RtRequest,
     refused: Vec<Violation>,
     chosen: Refused,
 ) -> RtResponse {
     svc.definition()
-        .refusal_response(ProtocolError::Invalid(refused), Some(chosen))
+        .refusal_response(ProtocolError::Invalid(refused), Some(chosen), req)
 }
 
 /// The routing table a service serves its operations behind its front door through:

@@ -293,6 +293,7 @@ fn violation_clause(violation: &Violation) -> String {
             path: violation.path.clone(),
             kind: ViolationKind::Pattern(unanchored(pattern)),
             value: violation.value.clone(),
+            sensitive: violation.sensitive,
         },
         _ => violation.clone(),
     };
@@ -322,6 +323,7 @@ pub fn constraint_report(member: &str, kind: ViolationKind) -> String {
         // one an absent member gets. What it holds is irrelevant: the value never
         // reaches the body.
         value: Some(String::new()),
+        sensitive: false,
     })])
 }
 

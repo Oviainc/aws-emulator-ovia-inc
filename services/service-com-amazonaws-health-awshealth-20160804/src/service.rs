@@ -145,8 +145,10 @@ impl ErasedOperation for SubscriptionGate {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
         // Neither the request nor its context can change the answer: the refusal is
-        // about the ACCOUNT, so every operation and every input gets the same one.
-        let _ = (req, ctx);
+        // about the ACCOUNT, so every operation and every input gets the same one. The
+        // request is handed to the error renderer below so the refusal closes the
+        // envelope of the protocol this request is served in.
+        let _ = ctx;
         Box::pin(async move {
             let payload = SubscriptionRequiredException {
                 message: SUBSCRIPTION_REQUIRED_MESSAGE,
@@ -162,7 +164,7 @@ impl ErasedOperation for SubscriptionGate {
                     SUBSCRIPTION_REQUIRED_CODE,
                     SUBSCRIPTION_REQUIRED_STATUS,
                 )
-                .unwrap_or_else(|error| svc.definition().framework_error_response(error))
+                .unwrap_or_else(|error| svc.definition().framework_error_response(error, req))
         })
     }
 }

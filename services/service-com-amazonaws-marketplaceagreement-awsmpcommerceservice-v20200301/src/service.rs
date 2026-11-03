@@ -152,7 +152,7 @@ impl<Op: Operation> ErasedOperation for ModelledValidation<Op> {
                         VALIDATION_EXCEPTION_CODE,
                         VALIDATION_EXCEPTION_STATUS,
                     )
-                    .unwrap_or_else(|e| svc.definition().framework_error_response(e));
+                    .unwrap_or_else(|e| svc.definition().framework_error_response(e, req));
             }
             // Nothing to restate: run the generated deserialize -> validate ->
             // handle -> serialize walk. Reached through the routing table rather

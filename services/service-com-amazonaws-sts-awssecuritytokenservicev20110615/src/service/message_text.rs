@@ -143,20 +143,27 @@ impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for StatedMessageDefini
     fn framework_error_response(
         &self,
         error: aws_smithy_schema_server::ProtocolError,
+        req: &RtRequest,
     ) -> RtResponse {
-        with_literal_message_text(self.entry.framework_error_response(error))
+        with_literal_message_text(self.entry.framework_error_response(error, req))
     }
 
     fn refusal_response(
         &self,
         error: aws_smithy_schema_server::ProtocolError,
         chosen: Option<smithy_server_runtime::Refused>,
+        req: &RtRequest,
     ) -> RtResponse {
         with_literal_message_text(ErasedServiceDefinition::refusal_response(
             &self.entry,
             error,
             chosen,
+            req,
         ))
+    }
+
+    fn wire_protocol(&self, req: &RtRequest) -> smithy_server_runtime::WireProtocol<'_> {
+        self.entry.wire_protocol(req)
     }
 }
 

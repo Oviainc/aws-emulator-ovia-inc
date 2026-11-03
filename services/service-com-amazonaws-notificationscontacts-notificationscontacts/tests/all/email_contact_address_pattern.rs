@@ -318,6 +318,7 @@ async fn the_refusal_blames_the_member_and_states_the_modelled_expression() {
                 EMAIL_CONTACT_ADDRESS_PATTERN.to_string(),
             ),
             value: Some(address.clone()),
+            sensitive: false,
         };
         let expected = aws_smithy_schema_server::envelope(std::slice::from_ref(&violation))
             .unwrap_or_else(|| panic!("one violation renders one envelope"));

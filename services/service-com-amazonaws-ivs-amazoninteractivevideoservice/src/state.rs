@@ -1123,6 +1123,7 @@ pub fn missing_member_violation(member_name: String) -> Violation {
         path: member_name,
         kind: ViolationKind::MissingRequiredMember,
         value: None,
+        sensitive: false,
     }
 }
 

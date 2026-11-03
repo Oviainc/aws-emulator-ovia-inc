@@ -203,7 +203,7 @@ impl<Eng: Send + Sync + 'static> FrontDoor<Eng> {
         if federated_subject(&*self.engine, ctx).is_some() {
             return Decision::Serve(operation);
         }
-        Decision::Refuse(Box::new(unauthorized_response(definition)))
+        Decision::Refuse(Box::new(unauthorized_response(definition, req)))
     }
 }
 
@@ -216,7 +216,7 @@ impl<Eng: Send + Sync + 'static> FrontDoor<Eng> {
 /// and code then cannot drift from the model. (The same construction as the IAM
 /// Identity Center portal's own gate, which renders its refusal through
 /// `ListAccounts`'s enum for exactly this reason.)
-fn unauthorized_response(definition: &dyn ErasedServiceDefinition) -> RtResponse {
+fn unauthorized_response(definition: &dyn ErasedServiceDefinition, req: &RtRequest) -> RtResponse {
     let refusal =
         crate::ops::get_q_app::GetQAppErrorModeled::UnauthorizedException(unauthorized());
     let rendered = definition.protocol().serialize_error(
@@ -236,6 +236,7 @@ fn unauthorized_response(definition: &dyn ErasedServiceDefinition) -> RtResponse
                 code: refusal.shape_name().to_string(),
                 message: UNAUTHORIZED_MESSAGE.to_string(),
             }),
+            req,
         ),
     }
 }

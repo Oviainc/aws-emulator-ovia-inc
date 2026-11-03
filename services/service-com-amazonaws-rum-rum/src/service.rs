@@ -705,7 +705,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AnnouncedMediaType<Eng> {
             if let Some((violations, chosen)) = refused {
                 let response = svc
                     .definition()
-                    .refusal_response(ProtocolError::Invalid(violations), Some(chosen));
+                    .refusal_response(ProtocolError::Invalid(violations), Some(chosen), req);
                 return announced(req, response);
             }
             // The generated operation serves the request through the framework's own

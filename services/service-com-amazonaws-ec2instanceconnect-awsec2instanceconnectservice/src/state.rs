@@ -172,6 +172,7 @@ pub fn instance_os_user_violation(value: &str) -> Option<Violation> {
         path: path::member(INSTANCE_OS_USER_MEMBER),
         kind: ViolationKind::Pattern(INSTANCE_OS_USER_PATTERN.to_string()),
         value: Some(echoed_within_member_length(value)),
+        sensitive: false,
     })
 }
 

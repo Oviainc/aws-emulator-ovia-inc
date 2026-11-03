@@ -223,7 +223,7 @@ impl ErasedOperation for NotEntitledAnswer {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
-        _req: &'r aws_smithy_runtime_api::http::Request,
+        req: &'r aws_smithy_runtime_api::http::Request,
         _ctx: &'r smithy_server_runtime::OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
@@ -242,7 +242,7 @@ impl ErasedOperation for NotEntitledAnswer {
                     ACCESS_DENIED_CODE,
                     ACCESS_DENIED_STATUS,
                 )
-                .unwrap_or_else(|error| definition.framework_error_response(error))
+                .unwrap_or_else(|error| definition.framework_error_response(error, req))
         })
     }
 }

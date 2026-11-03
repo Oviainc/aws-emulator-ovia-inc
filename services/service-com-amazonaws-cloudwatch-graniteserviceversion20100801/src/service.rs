@@ -591,7 +591,7 @@ where
         match answered {
             Ok(output) => protocol
                 .serialize_output(&output, O::OUTPUT_SCHEMA, O::NAME, O::SUCCESS_STATUS)
-                .unwrap_or_else(|error| svc.definition().framework_error_response(error)),
+                .unwrap_or_else(|error| svc.definition().framework_error_response(error, req)),
             // The modelled error as this service renders one, header and all
             // ([`modelled_error_response`]), so a failure answered here and the same failure
             // answered from the framework's sequence are one response.

@@ -397,7 +397,7 @@ impl<Op: Operation, Eng: Send + Sync + 'static> ErasedOperation for Gated<Op, En
             // off the request come from ONE deserialization of its input.
             let read = request_arns::<Op>(svc.definition().protocol(), req, &region);
             if let Some((path, value)) = read.cross_region {
-                return rejection::<Op>(svc, path, value);
+                return rejection::<Op>(svc, req, path, value);
             }
             // IAM's decision, taken before the operation reads or writes anything: the
             // action is this operation's own name under this service's prefix, and the
@@ -412,6 +412,28 @@ impl<Op: Operation, Eng: Send + Sync + 'static> ErasedOperation for Gated<Op, En
             };
             if let Some(denial) = denial {
                 return authorization::refusal_response(svc.definition().protocol(), &denial);
+            }
+            // The modelled input constraints, worded by this service's own seam
+            // ([`Service::override_refusal`], the ONE formatter) over the violations as a
+            // reading of the REQUEST restores them: the validating walk withholds the value
+            // of a `@sensitive` member as it records the violation, and that seam is handed
+            // the violations alone, so a clause of this service that quotes the value has
+            // to be worded where the request is still in hand. A refusal the seam declines
+            // is left to the walk behind the delegate exactly as before, and the violations
+            // are the framework's own, so nothing is refused here that it would accept.
+            let refused =
+                ::service_common::validation::refusing_violations::<Op>(
+                    svc.definition().protocol(),
+                    req,
+                );
+            if !refused.is_empty() {
+                if let Some(stated) = svc.override_refusal(&Refusal::Invalid(refused.clone())) {
+                    return svc.definition().refusal_response(
+                        ProtocolError::Invalid(refused),
+                        Some(stated),
+                        req,
+                    );
+                }
             }
             let delegate = svc.definition().routing_table().get(Op::NAME);
             match delegate {
@@ -694,6 +716,7 @@ fn declared_pattern(input_schema: &Schema, member_path: &str) -> Option<&'static
 /// wire, since the chosen code and message replace it.
 fn rejection<Op: Operation>(
     svc: &dyn Service,
+    req: &aws_smithy_runtime_api::http::Request,
     member_path: String,
     value: String,
 ) -> aws_smithy_runtime_api::http::Response {
@@ -703,11 +726,13 @@ fn rejection<Op: Operation>(
             path: member_path,
             kind: ViolationKind::Pattern(declared.to_string()),
             value: Some(value),
+            sensitive: false,
         }]),
         Some(Refused {
             code: VALIDATION_EXCEPTION.to_string(),
             message: crate::state::ARN_INVALID_FOR_SERVICE_REGION.to_string(),
         }),
+        req,
     )
 }
 

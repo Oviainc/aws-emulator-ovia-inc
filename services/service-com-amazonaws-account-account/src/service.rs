@@ -40,8 +40,11 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema_server::ProtocolError;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
+    Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -175,6 +178,29 @@ fn refusal_message(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same modelled operations the generated table holds, each wrapped in
+    /// [`StatedPerOperation`] so a refused request is worded the way this service words
+    /// it — including the input string a clause quotes, which only a reading of the
+    /// REQUEST can state. Keyed by the routing key the protocol resolves (the key the
+    /// generated table uses) and built from the SAME shared engine, so a wrapped
+    /// operation reads and writes the one store.
+    stated: OperationRoutingTable,
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`StatedPerOperation`] and keyed by its operation shape name — the routing key
+/// `ServerProtocol::routing_key` resolves and the generated table is keyed by.
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(StatedPerOperation::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -182,9 +208,125 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut stated = OperationRoutingTable::new();
+        // EVERY modelled operation (one per file in `src/ops/`), because the rule is the
+        // SERVICE's and not one operation's: an operation whose input declares no
+        // constraint simply never has a violation to state, which the wrapper reads off
+        // that operation's own input schema.
+        wrap_operations!(
+            stated,
+            engine,
+            accept_primary_email_update::AcceptPrimaryEmailUpdate,
+            delete_alternate_contact::DeleteAlternateContact,
+            disable_region::DisableRegion,
+            enable_region::EnableRegion,
+            get_account_information::GetAccountInformation,
+            get_alternate_contact::GetAlternateContact,
+            get_contact_information::GetContactInformation,
+            get_gov_cloud_account_information::GetGovCloudAccountInformation,
+            get_primary_email::GetPrimaryEmail,
+            get_primary_email_update_status::GetPrimaryEmailUpdateStatus,
+            get_region_opt_status::GetRegionOptStatus,
+            list_regions::ListRegions,
+            put_account_name::PutAccountName,
+            put_alternate_contact::PutAlternateContact,
+            put_contact_information::PutContactInformation,
+            send_phone_number_verification::SendPhoneNumberVerification,
+            start_primary_email_update::StartPrimaryEmailUpdate,
+            verify_phone_number::VerifyPhoneNumber,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            stated,
         }
+    }
+}
+
+/// One modelled operation, served so that a refused request is stated the way Account
+/// states it — the violated expression or bound and THE INPUT STRING that broke it.
+///
+/// Nothing else is re-implemented. A request this wrapper does not refuse is handed to the
+/// generated [`ErasedOperation::run`], which owns deserialize -> validate -> handle ->
+/// serialize, telemetry and every modelled error. The violations come from the framework's
+/// own machinery, so this cannot refuse a request the framework's own walk would accept,
+/// nor accept one it would refuse.
+///
+/// Why the wrapper exists at all, rather than `override_refusal` alone: Account's clause
+/// QUOTES the value that broke the constraint, and the validating walk drops the value of
+/// a member the model marks `@sensitive` (an email address is one) as it records the
+/// violation. `override_refusal` is handed the violations alone, so by then the input
+/// string is gone; the shared collecting walk here re-reads the request and restores it
+/// (`service_common::validation_message::quoting_the_whole_submitted_value`). A refusal
+/// that still reaches `override_refusal` — one raised for an operation this table does not
+/// hold — is worded by the SAME two clause builders, so the two paths cannot differ.
+struct StatedPerOperation<O> {
+    operation: O,
+}
+
+impl<O> StatedPerOperation<O> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+/// Account's wording for every modelled constraint `req` breaks, for the operation `O`, or
+/// `None` when it breaks none — or when one of them is of a class this service has no
+/// wording for, which keeps the framework's whole message exactly as
+/// [`refusal_message`] decides for the other path.
+fn stated_refusal<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<(Vec<Violation>, Refused)> {
+    let violations: Vec<Violation> =
+        service_common::validation::refusing_violations_with_echoes::<O>(protocol, req)
+            .into_iter()
+            .map(|(violation, echo)| {
+                service_common::validation_message::quoting_the_whole_submitted_value(
+                    violation, &echo,
+                )
+            })
+            .collect();
+    let message = refusal_message(&violations)?;
+    Some((
+        violations,
+        Refused {
+            code: VALIDATION_EXCEPTION.to_string(),
+            message,
+        },
+    ))
+}
+
+impl<O> ErasedOperation for StatedPerOperation<O>
+where
+    O: Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // The definition is read, used and dropped inside each statement:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
+            // below would make this future non-`Send`.
+            let refused = stated_refusal::<O>(svc.definition().protocol(), req);
+            if let Some((violations, stated)) = refused {
+                return svc.definition().refusal_response(
+                    ProtocolError::Invalid(violations),
+                    Some(stated),
+                    req,
+                );
+            }
+            self.operation.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not change
+    /// which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
     }
 }
 
@@ -214,8 +356,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // NOT a re-route: the key is the one the generated table's own protocol resolves,
+        // and the operation it names is the one served — wrapped in [`StatedPerOperation`]
+        // so a refused request is worded the way this service words it, with the input
+        // string its clause quotes. A key the model does not name resolves to `None` here
+        // exactly as it does in the generated table, so the router's routing-error path is
+        // unchanged.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.stated.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

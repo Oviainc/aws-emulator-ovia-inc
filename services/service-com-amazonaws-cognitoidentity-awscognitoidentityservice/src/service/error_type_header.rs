@@ -167,16 +167,22 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for ErrorTypeHeaderDefi
     fn framework_error_response(
         &self,
         error: aws_smithy_schema_server::ProtocolError,
+        req: &RtRequest,
     ) -> RtResponse {
-        with_error_type_header(self.0.framework_error_response(error))
+        with_error_type_header(self.0.framework_error_response(error, req))
     }
 
     fn refusal_response(
         &self,
         error: aws_smithy_schema_server::ProtocolError,
         chosen: Option<smithy_server_runtime::Refused>,
+        req: &RtRequest,
     ) -> RtResponse {
-        with_error_type_header(self.0.refusal_response(error, chosen))
+        with_error_type_header(self.0.refusal_response(error, chosen, req))
+    }
+
+    fn wire_protocol(&self, req: &RtRequest) -> smithy_server_runtime::WireProtocol<'_> {
+        self.0.wire_protocol(req)
     }
 }
 

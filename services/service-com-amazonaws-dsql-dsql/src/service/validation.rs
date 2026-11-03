@@ -232,6 +232,7 @@ fn refusal_for<O: Operation>(
                 path: member_name,
                 kind: ViolationKind::MissingRequiredMember,
                 value: None,
+                sensitive: false,
             }])
         }
         // The body was open and read as this protocol, but a value would not go into
@@ -292,6 +293,7 @@ mod tests {
             path: path.to_string(),
             kind,
             value: None,
+            sensitive: false,
         }
     }
 

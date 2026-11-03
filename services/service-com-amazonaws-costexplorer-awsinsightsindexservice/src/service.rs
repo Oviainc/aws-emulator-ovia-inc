@@ -245,6 +245,7 @@ mod tests {
             path: path.to_string(),
             kind,
             value: Some("whatever the caller sent".to_string()),
+            sensitive: false,
         }
     }
 
@@ -348,6 +349,7 @@ mod tests {
                     path: "timePeriod".to_string(),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 },
             ),
         ];

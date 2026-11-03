@@ -294,7 +294,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         match error {
             aws_smithy_schema_server::ProtocolError::Malformed(message) => {
                 let rebuilt = aws_smithy_schema_server::ProtocolError::Malformed(message.clone());
-                Some(RESPONSE_MEDIA_TYPE.announce(self.entry.framework_error_response(rebuilt)))
+                // Rendered through the framework's own renderer for this service's
+                // protocol envelope rather than through the entry: this seam is handed
+                // the error alone, and the entry's renderer resolves the envelope from
+                // the REQUEST it is given. The model declares restJson1, and the media
+                // type this service announces is re-stamped on the rendering anyway.
+                Some(RESPONSE_MEDIA_TYPE.announce(
+                    smithy_server_runtime::protocol_error_response(
+                        smithy_server_runtime::PreDispatchProtocol::Json {
+                            content_type: REST_JSON_MEDIA_TYPE,
+                            errortype_header: true,
+                        },
+                        rebuilt,
+                    ),
+                ))
             }
             _ => None,
         }

@@ -168,6 +168,7 @@ fn requirement_of(kind: ViolationKind) -> Option<String> {
         path: String::new(),
         kind,
         value: None,
+        sensitive: false,
     }
     .message();
     clause
@@ -853,6 +854,7 @@ mod tests {
             path: path.to_string(),
             kind: ViolationKind::Pattern(pattern.to_string()),
             value: Some(value.to_string()),
+            sensitive: false,
         }
     }
 
@@ -992,6 +994,7 @@ mod tests {
             path: "pipelineName".to_string(),
             kind: ViolationKind::MinLength(3),
             value: Some("ab".to_string()),
+            sensitive: false,
         }];
         assert_eq!(
             invalid_message(&too_short),

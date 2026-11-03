@@ -352,6 +352,7 @@ fn refused_by<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) 
             path: member_name,
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         }],
         Err(_) => Vec::new(),
     }
@@ -471,6 +472,7 @@ fn relisted(violation: &Violation) -> Option<Violation> {
         path: violation.path.clone(),
         kind: ViolationKind::EnumValue(listing.iter().map(|value| (*value).to_string()).collect()),
         value: violation.value.clone(),
+        sensitive: violation.sensitive,
     })
 }
 
@@ -541,6 +543,7 @@ pub(crate) fn enum_value_set_refusal(member_path: &str, allowed: &[&str], reject
         path: member_path.to_string(),
         kind: ViolationKind::EnumValue(allowed.iter().map(|value| (*value).to_string()).collect()),
         value: Some(rejected.to_string()),
+        sensitive: false,
     };
     // One violation, so `stated` answers `Some`; the fallback states the same clause
     // without the count rather than asserting that with a panic in a request path.

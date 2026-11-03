@@ -144,6 +144,7 @@ impl<Eng: Send + Sync + 'static> DenyUnauthorizedResource<Eng> {
                     code: ACCESS_DENIED_CODE,
                     message: crate::state::ACCESS_DENIED_MESSAGE,
                 },
+                req,
             );
         };
         let denial = crate::ops::types::AccessDeniedException {
@@ -161,7 +162,7 @@ impl<Eng: Send + Sync + 'static> DenyUnauthorizedResource<Eng> {
                 ACCESS_DENIED_CODE,
                 ACCESS_DENIED_STATUS,
             )
-            .unwrap_or_else(|error| definition.framework_error_response(error))
+            .unwrap_or_else(|error| definition.framework_error_response(error, req))
     }
 }
 

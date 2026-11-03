@@ -196,6 +196,7 @@ fn requested_source_format(uri: &str) -> Result<&'static str, String> {
             path: SOURCE_FORMAT_MEMBER.to_string(),
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         }]));
     };
     if let Some(validated) = VALIDATED_SOURCE_FORMATS
@@ -222,6 +223,7 @@ fn requested_source_format(uri: &str) -> Result<&'static str, String> {
         // violation: a value outside the set never became a value of the type, so the
         // refusal quotes none (see `crate::service::clause_for`).
         value: None,
+        sensitive: false,
     }]))
 }
 
@@ -238,6 +240,7 @@ fn submitted_document(body: &[u8]) -> Result<(), String> {
             path: SOURCE_FILE_MEMBER.to_string(),
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         }]));
     }
     if body.len() > MAX_SOURCE_FILE_BYTES {
@@ -249,6 +252,7 @@ fn submitted_document(body: &[u8]) -> Result<(), String> {
             // The value is the document itself: a sensitive blob, which no message
             // echoes.
             value: None,
+            sensitive: true,
         }]));
     }
     Ok(())

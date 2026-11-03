@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -193,6 +193,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 path: member.to_string(),
                 kind: ViolationKind::MissingRequiredMember,
                 value: None,
+                sensitive: false,
             })
             .collect();
         // Rendered through the generated entry, so this refusal lands in the same
@@ -205,6 +206,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         Some(self.entry.refusal_response(
             aws_smithy_schema_server::ProtocolError::Invalid(violations),
             chosen,
+            req,
         ))
     }
 

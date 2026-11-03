@@ -372,7 +372,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for InstanceGate<Eng> {
             // The code travels to the telemetry row below as well as onto the wire, so it is
             // read off the refusal once rather than named again here.
             let code = refusal.code;
-            let response = refusal_response(svc, &refusal);
+            let response = refusal_response(svc, req, &refusal);
             record_refusal(
                 ctx,
                 self.route.operation,
@@ -440,6 +440,7 @@ fn body_member(req: &aws_smithy_runtime_api::http::Request, member: &str) -> Opt
 /// it cannot carry the status.
 fn refusal_response(
     svc: &dyn Service,
+    req: &aws_smithy_runtime_api::http::Request,
     refusal: &crate::scaffolded::ServiceRefusal,
 ) -> aws_smithy_runtime_api::http::Response {
     match svc.definition().protocol().serialize_error(
@@ -462,6 +463,7 @@ fn refusal_response(
                     code: refusal.code.to_string(),
                     message: refusal.message.clone(),
                 }),
+                req,
             )
         }
     }

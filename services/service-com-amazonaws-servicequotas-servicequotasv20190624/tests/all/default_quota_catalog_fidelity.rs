@@ -262,7 +262,10 @@ const USAGE_METRIC_SERVICE_NAMES: &[(&str, &str)] = &[
     ("dynamodb", "DynamoDB"),
     ("ec2", "EC2"),
     ("events", "EventBridge"),
-    ("firehose", "Kinesis Data Firehose"),
+    // `AWS/Usage` publishes Amazon Data Firehose's usage under the service's current
+    // display name, which the recorded default-quota listing of `firehose` carries on
+    // every metered row — not the former "Kinesis Data Firehose" product name.
+    ("firehose", "Kinesis Firehose"),
     ("fms", "Firewall Manager"),
     ("fsx", "FSx"),
     ("gamelift", "GameLift"),

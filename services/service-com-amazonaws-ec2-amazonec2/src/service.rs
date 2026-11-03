@@ -192,7 +192,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // first; an error [`restated`] cannot restate answers `None`, which keeps
         // the framework's own rendering rather than reporting the failure as a
         // different kind.
-        let mut response = self.entry.framework_error_response(restated(error)?);
+        //
+        // The default rendering is taken from the framework's own renderer for this
+        // service's protocol envelope rather than from the entry: this seam is handed
+        // the error alone, and the entry's renderer resolves the envelope from the
+        // REQUEST it is given. EC2 declares one protocol — ec2Query — so the envelope
+        // is the same one the entry would select for every request it serves.
+        let mut response = smithy_server_runtime::protocol_error_response(
+            smithy_server_runtime::PreDispatchProtocol::Query { ec2: true },
+            restated(error)?,
+        );
         stamp_envelope(&mut response);
         Some(response)
     }

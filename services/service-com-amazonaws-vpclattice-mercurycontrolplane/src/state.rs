@@ -670,6 +670,7 @@ pub fn check_health_check(
             path: format!("{path_prefix}.{member}"),
             kind,
             value: Some(value.to_string()),
+            sensitive: false,
         });
     }
     Ok(())
@@ -1664,6 +1665,7 @@ pub fn check_resource_name(
         path: member.to_string(),
         kind: ViolationKind::Pattern(reported_pattern(pattern)),
         value: Some(name.to_string()),
+        sensitive: false,
     })
 }
 
@@ -1702,6 +1704,7 @@ pub fn check_tag_count(tags: Option<&HashMap<String, String>>) -> Result<(), Fie
             path: "tags".to_string(),
             kind: ViolationKind::MaxLength(MAX_TAGS as i64),
             value: Some(format!("{count} entries")),
+            sensitive: false,
         });
     }
     Ok(())

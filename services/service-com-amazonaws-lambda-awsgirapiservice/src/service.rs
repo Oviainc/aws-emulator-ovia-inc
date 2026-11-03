@@ -452,6 +452,7 @@ fn stated_violations(violations: &[Violation]) -> Option<Refused> {
                 path: violation.path.clone(),
                 kind: ViolationKind::EnumValue(reported_enum_order(allowed)),
                 value: violation.value.clone(),
+                sensitive: violation.sensitive,
             },
             _ => violation.clone(),
         })
@@ -490,7 +491,7 @@ where
                 let names_no_fault_class = opaque_members::names_no_fault_class(&violations);
                 let response = svc
                     .definition()
-                    .refusal_response(ProtocolError::Invalid(violations), Some(stated));
+                    .refusal_response(ProtocolError::Invalid(violations), Some(stated), req);
                 return if names_no_fault_class {
                     response
                 } else {

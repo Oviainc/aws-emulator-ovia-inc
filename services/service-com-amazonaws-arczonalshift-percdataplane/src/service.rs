@@ -178,6 +178,7 @@ fn as_stated(violation: &Violation) -> Violation {
         path: violation.path.clone(),
         kind,
         value: violation.value.clone(),
+        sensitive: violation.sensitive,
     }
 }
 
@@ -359,11 +360,13 @@ mod tests {
             path: "zonalShiftId".to_string(),
             kind: ViolationKind::Pattern("^[A-Za-z0-9-]+$".to_string()),
             value: Some("bad_id_1".to_string()),
+            sensitive: false,
         };
         let absent = Violation {
             path: "comment".to_string(),
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         };
         assert_eq!(
             clause(&outside_pattern),

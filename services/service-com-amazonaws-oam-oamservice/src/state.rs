@@ -777,6 +777,7 @@ pub fn missing_member_message(member: &str) -> String {
         path: ::aws_smithy_schema_server::constraints::path::member(member),
         kind: ::aws_smithy_schema_server::constraints::ViolationKind::MissingRequiredMember,
         value: None,
+        sensitive: false,
     }
     .message()
 }

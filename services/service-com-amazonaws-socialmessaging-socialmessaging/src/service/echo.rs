@@ -250,6 +250,7 @@ mod tests {
                     SubmittedEcho::Absent => None,
                     _ => Some("whatever the framework rendered".to_string()),
                 },
+                sensitive: false,
             };
             let actual = clause(&violation, &echo);
             assert_eq!(

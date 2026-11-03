@@ -181,6 +181,7 @@ fn enum_violation(value: &str) -> CompleteRolloutError {
             )
             .into_owned(),
         ),
+        sensitive: false,
     };
     let message = crate::service::refusal_message(std::slice::from_ref(&violation))
         .unwrap_or_else(|| violation.message());

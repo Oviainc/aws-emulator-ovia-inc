@@ -207,7 +207,7 @@ where
             // the await below would make this future non-`Send`.
             let refused = body_violations::<O>(svc.definition().protocol(), req);
             if !refused.is_empty() {
-                return front_door_rejection(svc, refused);
+                return front_door_rejection(svc, req, refused);
             }
             self.operation.run(svc, req, ctx).await
         })
@@ -275,13 +275,14 @@ fn binds_to_body(input_schema: &Schema, violation_path: &str) -> bool {
 /// The envelope and the status stay with the framework's refusal channel
 /// (`refusal_response`, which the generated entry renders from the service's
 /// model-derived protocol); only the code and the message are this service's.
-fn front_door_rejection(svc: &dyn Service, refused: Vec<Violation>) -> RtResponse {
+fn front_door_rejection(svc: &dyn Service, req: &RtRequest, refused: Vec<Violation>) -> RtResponse {
     svc.definition().refusal_response(
         ProtocolError::Invalid(refused),
         Some(Refused {
             code: BAD_REQUEST_EXCEPTION.to_string(),
             message: INVALID_REQUEST_BODY.to_string(),
         }),
+        req,
     )
 }
 

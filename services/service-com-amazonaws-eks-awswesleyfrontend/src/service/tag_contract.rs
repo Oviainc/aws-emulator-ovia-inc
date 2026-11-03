@@ -237,6 +237,7 @@ fn length_clause(member_path: String, shown: &str, min: i64, max: i64) -> Option
         path: member_path,
         kind,
         value: Some(echoed(shown)),
+        sensitive: false,
     })
 }
 
@@ -339,6 +340,7 @@ fn entry_clause(key: &str, value: &str, half: EntryHalf) -> Option<EntryClause> 
             path: path::member(TAGS_MEMBER),
             kind,
             value: Some(echoed(shown)),
+            sensitive: false,
         },
         clause,
     })
@@ -512,6 +514,7 @@ impl ErasedOperation for RefusedTagRequest {
                             code: BAD_REQUEST_EXCEPTION.to_string(),
                             message: refusal.message,
                         }),
+                        req,
                     )),
                     None => match key.and_then(|key| definition.routing_table().get(key)) {
                         Some(operation) => Err(operation),
@@ -620,16 +623,19 @@ mod tests {
             path: TAGS_MEMBER.to_string(),
             kind: ViolationKind::MaxLength(50),
             value: Some("51 entries".to_string()),
+            sensitive: false,
         };
         let absent = Violation {
             path: TAGS_MEMBER.to_string(),
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         };
         let long_value = Violation {
             path: path::join(&[path::member(TAGS_MEMBER), "env".to_string()]),
             kind: ViolationKind::MaxLength(MAX_TAG_VALUE_LENGTH),
             value: Some("v".repeat(257)),
+            sensitive: false,
         };
 
         let ceiling = declared_refusal(vec![over_limit.clone()]).expect("a refusal");
@@ -655,6 +661,7 @@ mod tests {
             path: TAGS_MEMBER.to_string(),
             kind: ViolationKind::MaxLength(MAX_TAG_KEY_LENGTH),
             value: Some("x".repeat(129)),
+            sensitive: false,
         };
         for (case, violation) in [
             ("a long key", long_key),
@@ -687,6 +694,7 @@ mod tests {
                 path: TAGS_MEMBER.to_string(),
                 kind: ViolationKind::MaxLength(limit),
                 value: Some(format!("{} entries", limit + 1)),
+                sensitive: false,
             }]);
             assert_eq!(
                 found,
@@ -700,6 +708,7 @@ mod tests {
             path: path::join(&[path::member(TAG_KEYS_MEMBER), path::element(1)]),
             kind: ViolationKind::MaxLength(MAX_TAG_KEY_LENGTH),
             value: Some("x".repeat(129)),
+            sensitive: false,
         }]);
         assert_eq!(
             elsewhere, None,

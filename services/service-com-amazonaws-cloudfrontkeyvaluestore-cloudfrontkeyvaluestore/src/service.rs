@@ -159,6 +159,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                         path: "ifMatch".to_string(),
                         kind: smithy_server_runtime::ViolationKind::MissingRequiredMember,
                         value: None,
+                        sensitive: false,
                     },
                 ]),
             ));

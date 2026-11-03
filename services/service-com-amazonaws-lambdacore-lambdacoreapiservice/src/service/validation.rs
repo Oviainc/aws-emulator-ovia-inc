@@ -217,6 +217,7 @@ fn framework_requirement(kind: &ViolationKind) -> Option<String> {
         path: String::new(),
         kind: kind.clone(),
         value: None,
+        sensitive: false,
     }
     .message();
     stated
@@ -288,6 +289,7 @@ mod tests {
             path: path.to_string(),
             kind,
             value: value.map(str::to_string),
+            sensitive: false,
         }
     }
 

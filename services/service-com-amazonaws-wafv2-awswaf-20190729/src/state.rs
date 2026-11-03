@@ -5344,6 +5344,7 @@ pub fn collection_constraint_envelope(
                     path: violation.path.clone(),
                     kind: violation.kind.clone(),
                     value: Some(rendered.clone()),
+                    sensitive: violation.sensitive,
                 }
                 .message(),
             );

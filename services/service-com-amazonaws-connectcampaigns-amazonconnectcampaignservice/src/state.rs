@@ -653,6 +653,7 @@ pub fn campaign_ids_over_cap_message(campaign_ids: &[String]) -> String {
             ::service_common::validation::quoted_echo_up_to(&submitted, MAX_QUOTED_CAMPAIGN_IDS)
                 .into_owned(),
         ),
+        sensitive: false,
     };
     // One violation always renders an envelope; the fallback keeps this infallible rather
     // than answering a refusal with no sentence at all.

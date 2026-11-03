@@ -347,6 +347,7 @@ fn enum_violation(path: String, value: &str, allowed: Vec<String>) -> Violation 
         path,
         kind: ViolationKind::EnumValue(allowed),
         value: Some(echoed(value)),
+        sensitive: false,
     }
 }
 
@@ -513,6 +514,7 @@ fn compile_filters(
                 path: filter_member_path(index, "values"),
                 kind: ViolationKind::MinLength(FILTER_VALUES_MIN_LEN),
                 value: Some(format!("{} items", action_filter.values.len())),
+                sensitive: false,
             });
         }
         // The ELEMENTS of `values` are NOT validated here: the model closes no value
@@ -689,6 +691,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         path: constraints::path::member("maxResults"),
                         kind,
                         value: Some(max_results.to_string()),
+                        sensitive: false,
                     };
                     ListRecommendedActionsError::from(field_validation_failed(&[violation]))
                 })?,

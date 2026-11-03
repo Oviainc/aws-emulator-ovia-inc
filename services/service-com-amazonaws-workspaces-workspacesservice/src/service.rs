@@ -155,7 +155,7 @@ where
             // the await below would make this future non-`Send`.
             let refused = violations_in::<O>(svc.definition().protocol(), req);
             if !refused.is_empty() {
-                return account_link_refusal(svc, refused);
+                return account_link_refusal(svc, req, refused);
             }
             self.operation.run(svc, req, ctx).await
         })
@@ -201,6 +201,7 @@ fn violations_in<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtReques
             path: member_name,
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         }],
         Err(_) => Vec::new(),
     }
@@ -215,13 +216,14 @@ fn violations_in<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtReques
 /// model-derived protocol); only the code and the message are chosen here, and they
 /// are chosen together — a client branches on the code, so one without the other is
 /// worse than neither.
-fn account_link_refusal(svc: &dyn Service, refused: Vec<Violation>) -> RtResponse {
+fn account_link_refusal(svc: &dyn Service, req: &RtRequest, refused: Vec<Violation>) -> RtResponse {
     svc.definition().refusal_response(
         ProtocolError::Invalid(refused),
         Some(Refused {
             code: VALIDATION_EXCEPTION.to_string(),
             message: crate::state::ACCOUNT_LINK_INVALID_REQUEST_MESSAGE.to_string(),
         }),
+        req,
     )
 }
 

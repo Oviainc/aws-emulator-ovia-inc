@@ -333,6 +333,7 @@ pub(crate) fn connection_arn_refusal(path: &str) -> String {
         path: path.to_string(),
         kind: ViolationKind::Pattern(CONNECTION_ARN_PATTERN.to_string()),
         value: None,
+        sensitive: false,
     };
     envelope(std::slice::from_ref(&violation))
         .expect("a @pattern violation always states one clause")

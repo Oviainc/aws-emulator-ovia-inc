@@ -434,6 +434,7 @@ where
                 // The rejected key is the value, and this service states no value in a
                 // constraint refusal at all — see `constraint_clause`.
                 value: None,
+                sensitive: false,
             })
         })
         .collect();

@@ -1019,6 +1019,7 @@ fn constraint_clause(violation: &Violation) -> String {
             other => other.clone(),
         },
         value: None,
+        sensitive: violation.sensitive,
     };
     let stated = unechoed.message();
     if violation.value.is_none() {

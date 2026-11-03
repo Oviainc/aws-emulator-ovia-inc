@@ -93,6 +93,7 @@ fn rooted_at_request(violations: &[Violation]) -> Vec<Violation> {
             },
             kind: violation.kind.clone(),
             value: violation.value.clone(),
+            sensitive: violation.sensitive,
         })
         .collect()
 }
@@ -222,6 +223,7 @@ where
                         code: VALIDATION_EXCEPTION.to_owned(),
                         message,
                     }),
+                    req,
                 );
             }
             self.operation.run(svc, req, ctx).await

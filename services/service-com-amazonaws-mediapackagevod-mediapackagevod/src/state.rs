@@ -1556,6 +1556,7 @@ mod tests {
             path: path.to_string(),
             kind,
             value: None,
+            sensitive: false,
         }
     }
 

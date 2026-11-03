@@ -117,6 +117,7 @@ fn clause(violation: &Violation) -> String {
             other => other.clone(),
         },
         value: if withhold { None } else { violation.value.clone() },
+        sensitive: violation.sensitive,
     };
     let stated = restated.message();
     if withhold {
@@ -171,6 +172,7 @@ mod tests {
             path: path.to_string(),
             kind,
             value: value.map(str::to_string),
+            sensitive: false,
         }
     }
 

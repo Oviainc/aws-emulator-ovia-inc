@@ -77,15 +77,14 @@
 //! which names it as every other modelled error of this service is named.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
-use aws_smithy_schema::serde::SerdeError;
 use aws_smithy_schema::{Schema, ShapeType};
 use aws_smithy_schema_server::constraints;
 use aws_smithy_schema_server::constraints::path;
 use aws_smithy_types::body::SdkBody;
 use serde_json::Value;
 use smithy_server_runtime::{
-    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext,
-    OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
+    Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -245,21 +244,13 @@ where
 /// Both classes come from the framework's own machinery (the protocol's deserializer
 /// and `constraints::validate` over the built input), so this cannot find a different
 /// set of violations from the walk that follows it.
+///
+/// Taken from the tree's shared collecting half, which is also where the value each
+/// clause quotes is restored to the bytes the caller sent — including a value the
+/// validating walk withheld as it recorded the violation, which this service's clause
+/// states.
 fn refused_by<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Vec<Violation> {
-    let Ok(mut deserializer) = protocol.deserialize_input(req, O::INPUT_SCHEMA) else {
-        return Vec::new();
-    };
-    match <O::Input as DeserializableStruct>::deserialize(&mut *deserializer) {
-        Ok(input) => constraints::validate(&input, O::INPUT_SCHEMA),
-        // Absence is found while READING the request and a bad value while walking
-        // what was read; to a caller they are one refusal, so they are one here.
-        Err(SerdeError::MissingMember { member_name }) => vec![Violation {
-            path: member_name,
-            kind: ViolationKind::MissingRequiredMember,
-            value: None,
-        }],
-        Err(_) => Vec::new(),
-    }
+    ::service_common::validation::refusing_violations_restoring_withheld::<O>(protocol, req)
 }
 
 /// This service's answer to `violations`: HTTP 400 `ValidationException` with the
@@ -624,6 +615,7 @@ fn absent_bound_members(route: &Schema, req: &RtRequest) -> Vec<Violation> {
                 path: path::member(name),
                 kind: ViolationKind::MissingRequiredMember,
                 value: None,
+                sensitive: false,
             });
         }
     }

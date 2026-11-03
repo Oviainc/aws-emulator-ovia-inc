@@ -431,6 +431,7 @@ fn modelled_refusal<Op: Operation>(
                     path: constraints::path::member(&member_name),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 };
                 return refusal_message(&[absent]).map(validation_exception);
             }

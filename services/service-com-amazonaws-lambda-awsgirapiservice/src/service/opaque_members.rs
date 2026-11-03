@@ -110,6 +110,7 @@ mod tests {
             path: path.to_string(),
             kind,
             value: value.map(ToString::to_string),
+            sensitive: false,
         }
     }
 

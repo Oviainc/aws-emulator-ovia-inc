@@ -148,6 +148,7 @@ fn absent_required_members<O: Operation>(
             path: path::member(member),
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         })
         .collect()
 }
@@ -260,7 +261,7 @@ impl<O: Operation> ErasedOperation for AbsentMemberGate<O> {
                 record_refusal::<O>(ctx, started.elapsed(), &stated.code);
                 return svc
                     .definition()
-                    .refusal_response(ProtocolError::Invalid(absent), Some(stated));
+                    .refusal_response(ProtocolError::Invalid(absent), Some(stated), req);
             }
             // The request carries every required member: the generated handler serves it,
             // which runs the whole framework sequence (deserialize, validate, handle,
@@ -270,9 +271,10 @@ impl<O: Operation> ErasedOperation for AbsentMemberGate<O> {
             // straight back here.
             match svc.definition().routing_table().get(O::NAME) {
                 Some(operation) => operation.run(svc, req, ctx).await,
-                None => svc
-                    .definition()
-                    .framework_error_response(ProtocolError::UnknownOperation(O::NAME.to_string())),
+                None => svc.definition().framework_error_response(
+                    ProtocolError::UnknownOperation(O::NAME.to_string()),
+                    req,
+                ),
             }
         })
     }
@@ -320,11 +322,13 @@ mod tests {
             path: member.to_string(),
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         };
         let outside = |member: &str, kind: ViolationKind, value: &str| Violation {
             path: member.to_string(),
             kind,
             value: Some(value.to_string()),
+            sensitive: false,
         };
 
         let rows: Vec<(&str, Vec<Violation>, &str)> = vec![

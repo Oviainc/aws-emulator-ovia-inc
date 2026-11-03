@@ -40,9 +40,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -382,6 +380,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 path: member,
                 kind: aws_smithy_schema_server::ViolationKind::MissingRequiredMember,
                 value: None,
+                sensitive: false,
             })
             .collect();
         // Nothing was absent after all, so the miss is not about a required member and
@@ -393,6 +392,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 code: "InvalidRequestException".to_string(),
                 message,
             }),
+            req,
         ))
     }
 

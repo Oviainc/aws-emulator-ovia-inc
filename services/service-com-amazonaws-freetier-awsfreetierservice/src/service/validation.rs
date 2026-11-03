@@ -206,6 +206,7 @@ fn framework_requirement(kind: &ViolationKind) -> Option<String> {
         path: String::new(),
         kind: reported,
         value: None,
+        sensitive: false,
     }
     .message();
     stated
@@ -356,6 +357,7 @@ mod tests {
             path: path.to_string(),
             kind,
             value: Some(value.to_string()),
+            sensitive: false,
         }
     }
 
@@ -557,6 +559,7 @@ mod tests {
                     path: "accountPlanType".to_string(),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 },
                 "1 validation error detected: Value null at 'accountPlanType' failed to \
                  satisfy constraint: Member must not be null"

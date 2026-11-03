@@ -1868,6 +1868,7 @@ pub fn session_policy_over_plaintext_limit(member_path: &str, policy: &str) -> O
         value: Some(
             ::service_common::validation::quoted_echo(policy).into_owned(),
         ),
+        sensitive: false,
     };
     ::service_common::validation_message::aws_validation_refusal(
         &::smithy_server_runtime::Refusal::Invalid(vec![violation]),

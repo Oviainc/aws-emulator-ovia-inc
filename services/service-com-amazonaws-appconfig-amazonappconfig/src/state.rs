@@ -634,6 +634,7 @@ fn inline_override_violation(
             path: inline_override_entry_path(entity, remaining),
             kind: ViolationKind::Pattern(TREATMENT_KEY_PATTERN.to_string()),
             value: Some(echoed_within(treatment, remaining)),
+            sensitive: false,
         });
     } else {
         return None;
@@ -642,6 +643,7 @@ fn inline_override_violation(
         path: inline_override_entry_path(entity, remaining),
         kind,
         value: Some(echoed_within(entity, remaining)),
+        sensitive: false,
     })
 }
 
@@ -676,6 +678,7 @@ pub fn treatment_overrides_rejection(overrides: &TreatmentOverrides) -> Option<S
                     path: inline_overrides_path(),
                     kind: ViolationKind::MaxLength(MAX_INLINE_TREATMENT_OVERRIDES as i64),
                     value: Some(format!("{assigned} entries")),
+                    sensitive: false,
                 }]
             } else {
                 // Then the entries, by entity id, so one request is refused with one

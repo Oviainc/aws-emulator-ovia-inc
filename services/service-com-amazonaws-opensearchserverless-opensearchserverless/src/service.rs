@@ -100,6 +100,7 @@ fn as_reported(violation: &Violation) -> Violation {
         path: violation.path.clone(),
         kind: ViolationKind::Pattern(unanchored.to_string()),
         value: violation.value.clone(),
+        sensitive: violation.sensitive,
     }
 }
 
@@ -269,7 +270,11 @@ fn operation_stated_refusal<O: Operation>(
         code: VALIDATION_EXCEPTION.to_string(),
         message: envelope(&stated)?,
     };
-    Some(definition.refusal_response(ProtocolError::Invalid(violations), Some(chosen)))
+    Some(definition.refusal_response(
+        ProtocolError::Invalid(violations),
+        Some(chosen),
+        req,
+    ))
 }
 
 /// The `com-amazonaws-opensearchserverless-opensearchserverless` emulated service: the generated [`ServiceDefinition`] plus

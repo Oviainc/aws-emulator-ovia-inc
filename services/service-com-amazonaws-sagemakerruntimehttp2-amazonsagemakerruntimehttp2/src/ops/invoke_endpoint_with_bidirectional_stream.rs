@@ -979,6 +979,7 @@ async fn decode_request_frames(body: &[u8]) -> Result<Vec<RequestFrame>, Failure
             path: constraints::path::member("Body"),
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         }]));
     }
     Ok(frames)

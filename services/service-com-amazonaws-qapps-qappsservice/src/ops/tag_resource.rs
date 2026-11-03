@@ -211,6 +211,7 @@ fn too_many_tags(would_hold: usize) -> String {
             i64::try_from(crate::state::MAX_TAGS_PER_RESOURCE).unwrap_or(i64::MAX),
         ),
         value: Some(format!("{would_hold} entries")),
+        sensitive: false,
     };
     // The framework's own clause for the same violation, for the unreachable case below:
     // a sentence is never written here.

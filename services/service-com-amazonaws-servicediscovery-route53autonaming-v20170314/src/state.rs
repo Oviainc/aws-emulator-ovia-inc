@@ -244,6 +244,7 @@ pub fn namespace_name_violation(member: &str, name: &str, pattern: &'static str)
         path: member.to_string(),
         kind: ::smithy_server_runtime::ViolationKind::Pattern(pattern.to_string()),
         value: Some(echoed(name)),
+        sensitive: false,
     }])
 }
 

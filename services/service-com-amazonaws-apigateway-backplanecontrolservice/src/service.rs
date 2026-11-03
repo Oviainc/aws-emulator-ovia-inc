@@ -439,6 +439,7 @@ fn violations_of<O: Operation>(
             path: member_name,
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         }],
         Err(_) => Vec::new(),
     }
@@ -476,7 +477,7 @@ where
             if let Some(stated) = validation::refusal(O::NAME, &refused) {
                 return svc
                     .definition()
-                    .refusal_response(ProtocolError::Invalid(refused), Some(stated));
+                    .refusal_response(ProtocolError::Invalid(refused), Some(stated), req);
             }
             self.operation.run(svc, req, ctx).await
         })

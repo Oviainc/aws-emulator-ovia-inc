@@ -266,6 +266,7 @@ fn held_within_the_message_maximum(
                 .value
                 .as_deref()
                 .map(|echo| service_common::validation::echo_held_to(echo, room[at]).into_owned()),
+            sensitive: violation.sensitive,
         })
         .collect();
     constraints::envelope(&held)
@@ -566,6 +567,7 @@ mod tests {
             path: LONGEST_MEMBER_PATH.to_string(),
             kind,
             value,
+            sensitive: false,
         };
         vec![
             (
@@ -684,6 +686,7 @@ mod tests {
             path: ARN_MEMBER_PATH.to_string(),
             kind: ViolationKind::Pattern(JOB_ARN_PATTERN.to_string()),
             value: Some("z".repeat(1024 * 1024)),
+            sensitive: false,
         }])
         .expect("the malformed-ARN sentence");
         assert!(

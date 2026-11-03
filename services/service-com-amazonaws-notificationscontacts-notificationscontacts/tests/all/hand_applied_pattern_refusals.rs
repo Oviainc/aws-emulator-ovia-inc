@@ -263,6 +263,7 @@ fn rendered(path: &str, pattern: &str, value: &str) -> (String, String) {
         path: path.to_string(),
         kind: aws_smithy_schema_server::ViolationKind::Pattern(pattern.to_string()),
         value: Some(value.to_string()),
+        sensitive: false,
     };
     let clause = violation.message();
     let requirement = clause

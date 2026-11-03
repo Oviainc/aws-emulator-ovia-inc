@@ -513,6 +513,7 @@ pub fn refuse_preferences(prefs: &ConnectionRecordingPreferences) -> Option<Stri
             ]),
             kind: ViolationKind::Pattern(BUCKET_NAME_PATTERN.to_string()),
             value: Some(echoed(&bucket.bucket_name)),
+            sensitive: false,
         })
         .collect();
     envelope(&violations)

@@ -137,6 +137,7 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
         path: String::new(),
         kind: kind.clone(),
         value: None,
+        sensitive: false,
     }
     .message();
     rendered
@@ -322,6 +323,7 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
             path,
             kind,
             value: violation.value.clone(),
+            sensitive: violation.sensitive,
         }
         .message(),
     )
@@ -373,6 +375,7 @@ fn implied_account_id_length(violation: &Violation) -> Option<Violation> {
         path: violation.path.clone(),
         kind,
         value: violation.value.clone(),
+        sensitive: violation.sensitive,
     })
 }
 
@@ -680,6 +683,7 @@ mod tests {
                     path: "servicePrincipal".to_string(),
                     kind: ViolationKind::Pattern(r"^[\w+=,.@-]+$".to_string()),
                     value: Some("not a valid principal!!".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value at 'servicePrincipal' failed to \
                  satisfy constraint: Member must satisfy regular expression pattern: \
@@ -691,6 +695,7 @@ mod tests {
                     path: "requesterAccountId".to_string(),
                     kind: ViolationKind::Pattern(r"^\d{12}$".to_string()),
                     value: Some("not-an-acct1".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value 'not-an-acct1' at \
                  'requesterAccountId' failed to satisfy constraint: Member must satisfy \
@@ -702,6 +707,7 @@ mod tests {
                     path: "storedQuery.queryName".to_string(),
                     kind: ViolationKind::Pattern("^[a-zA-Z0-9-_]+$".to_string()),
                     value: Some("invalid query name".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value 'invalid query name' at \
                  'QueryName' failed to satisfy constraint: Member must satisfy regular \
@@ -713,6 +719,7 @@ mod tests {
                     path: "requesterAwsRegion".to_string(),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 },
                 "1 validation error detected: Value null at 'requesterAwsRegion' failed \
                  to satisfy constraint: Member must not be null",
@@ -723,6 +730,7 @@ mod tests {
                     path: "servicePrincipal".to_string(),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 },
                 "1 validation error detected: Value null at 'servicePrincipal' failed to \
                  satisfy constraint: Member must not be null",
@@ -733,6 +741,7 @@ mod tests {
                     path: "storedQuery.queryName".to_string(),
                     kind: ViolationKind::MaxLength(64),
                     value: Some("q".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value 'q' at 'QueryName' failed to satisfy \
                  constraint: Member must have length less than or equal to 64",
@@ -743,6 +752,7 @@ mod tests {
                     path: "tags".to_string(),
                     kind: ViolationKind::MaxLength(50),
                     value: Some("51 items".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value '51 items' at 'tags' failed to \
                  satisfy constraint: Member must have length less than or equal to 50",
@@ -768,11 +778,13 @@ mod tests {
                 path: "storedQuery.queryName".to_string(),
                 kind: ViolationKind::MinLength(1),
                 value: Some(String::new()),
+                sensitive: false,
             },
             Violation {
                 path: "requesterAccountId".to_string(),
                 kind: ViolationKind::Pattern(r"^\d{12}$".to_string()),
                 value: Some("not-an-acct1".to_string()),
+                sensitive: false,
             },
         ];
         let stated = constraint_envelope(&found).expect("two violations word a refusal");
@@ -802,6 +814,7 @@ mod tests {
                     path: "authorizedAccountId".to_string(),
                     kind: account_id_pattern.clone(),
                     value: Some("not-an-account-id".to_string()),
+                    sensitive: false,
                 },
                 "2 validation errors detected: Value 'not-an-account-id' at \
                  'authorizedAccountId' failed to satisfy constraint: Member must have \
@@ -815,6 +828,7 @@ mod tests {
                     path: "requesterAccountId".to_string(),
                     kind: account_id_pattern.clone(),
                     value: Some("12345".to_string()),
+                    sensitive: false,
                 },
                 "2 validation errors detected: Value '12345' at 'requesterAccountId' \
                  failed to satisfy constraint: Member must have length greater than or \
@@ -827,6 +841,7 @@ mod tests {
                     path: "accountId".to_string(),
                     kind: account_id_pattern.clone(),
                     value: Some(String::new()),
+                    sensitive: false,
                 },
                 "2 validation errors detected: Value '' at 'accountId' failed to satisfy \
                  constraint: Member must have length greater than or equal to 12; Value \
@@ -841,6 +856,7 @@ mod tests {
                     path: "authorizedAccountId".to_string(),
                     kind: account_id_pattern.clone(),
                     value: Some("not-an-acct1".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value 'not-an-acct1' at \
                  'authorizedAccountId' failed to satisfy constraint: Member must satisfy \
@@ -855,6 +871,7 @@ mod tests {
                         .to_string(),
                     kind: account_id_pattern,
                     value: Some("12345".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value '12345' at \
                  'accountAggregationSources.1.member.accountIds.1.member' failed to \
@@ -888,6 +905,7 @@ mod tests {
                 path: "queryId".to_string(),
                 kind: ViolationKind::Pattern(pattern.to_string()),
                 value: Some(value.to_string()),
+                sensitive: false,
             };
             let stated = constraint_envelope(std::slice::from_ref(&found))
                 .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
@@ -1015,6 +1033,7 @@ mod tests {
                 path: violation_path.to_string(),
                 kind: ViolationKind::EnumValue(resource_types.clone()),
                 value: Some(value.to_string()),
+                sensitive: false,
             };
             let stated = constraint_envelope(std::slice::from_ref(&found))
                 .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
@@ -1031,6 +1050,7 @@ mod tests {
             path: "chronologicalOrder".to_string(),
             kind: ViolationKind::EnumValue(vec!["Forward".to_string(), "Reverse".to_string()]),
             value: Some("Sideways".to_string()),
+            sensitive: false,
         };
         let stated =
             constraint_envelope(std::slice::from_ref(&other)).expect("an enum states a clause");

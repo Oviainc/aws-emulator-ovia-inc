@@ -245,7 +245,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> EventStreamOperat
             );
             if !violations.is_empty() {
                 let chosen = svc.override_refusal(&Refusal::Invalid(violations.clone()));
-                return definition.refusal_response(ProtocolError::Invalid(violations), chosen);
+                return definition.refusal_response(
+                    ProtocolError::Invalid(violations),
+                    chosen,
+                    req,
+                );
             }
             service_common::event_stream::error_response(
                 definition.protocol(),

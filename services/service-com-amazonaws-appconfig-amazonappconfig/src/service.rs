@@ -136,6 +136,7 @@ pub(crate) fn as_stated(violation: &Violation) -> Violation {
             path: violation.path.clone(),
             kind: ViolationKind::Pattern(quoted_pattern(pattern).to_string()),
             value: violation.value.clone(),
+            sensitive: violation.sensitive,
         },
         _ => violation.clone(),
     }
@@ -244,6 +245,7 @@ fn constraint_refusal<O: Operation>(svc: &dyn Service, req: &RtRequest) -> Optio
     let message = envelope(&stated)?;
     Some(service_common::front_door::worded_rejection(
         svc,
+        req,
         violations,
         Refused {
             code: CONSTRAINT_REFUSAL_CODE.to_string(),
@@ -643,6 +645,7 @@ mod tests {
             path: "flagKey".to_string(),
             kind: ViolationKind::Pattern(r"^[a-z][a-zA-Z0-9_-]{1,64}$".to_string()),
             value: Some("1invalid".to_string()),
+            sensitive: false,
         };
         let stated = as_stated(&pattern);
         assert_eq!(
@@ -671,6 +674,7 @@ mod tests {
                 path: "name".to_string(),
                 kind: other.clone(),
                 value: Some("x".to_string()),
+                sensitive: false,
             };
             let stated = as_stated(&violation);
             assert_eq!(

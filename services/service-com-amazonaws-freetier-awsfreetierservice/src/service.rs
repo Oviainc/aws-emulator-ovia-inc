@@ -261,10 +261,11 @@ where
             // await below would make this future non-`Send`.
             let refused = stated_refusal::<O>(svc.definition().protocol(), req);
             if let Some((violations, stated)) = refused {
-                return RESPONSE_MEDIA_TYPE.announce(
-                    svc.definition()
-                        .refusal_response(ProtocolError::Invalid(violations), Some(stated)),
-                );
+                return RESPONSE_MEDIA_TYPE.announce(svc.definition().refusal_response(
+                    ProtocolError::Invalid(violations),
+                    Some(stated),
+                    req,
+                ));
             }
             // Every other answer of a routed request — a success, a modelled failure, a
             // refusal the walk raises that this wrapper found nothing to state — is
@@ -395,7 +396,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             aws_smithy_schema_server::ProtocolError::Malformed(message) => {
                 let rebuilt =
                     aws_smithy_schema_server::ProtocolError::Malformed(message.clone());
-                Some(RESPONSE_MEDIA_TYPE.announce(self.entry.framework_error_response(rebuilt)))
+                // Rendered through the framework's own renderer for this service's
+                // protocol envelope rather than through the entry: this seam is handed
+                // the error alone, and the entry's renderer resolves the envelope from
+                // the REQUEST it is given. The model declares one protocol family
+                // (awsJson), and the media type this service announces is re-stamped on
+                // the rendering below anyway.
+                Some(RESPONSE_MEDIA_TYPE.announce(
+                    smithy_server_runtime::protocol_error_response(
+                        smithy_server_runtime::PreDispatchProtocol::Json {
+                            content_type: RESPONSE_MEDIA_TYPE.implied(),
+                            errortype_header: false,
+                        },
+                        rebuilt,
+                    ),
+                ))
             }
             _ => None,
         }

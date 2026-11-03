@@ -222,6 +222,12 @@ fn subject(
     violation: &Violation,
     lists: &HashMap<String, String>,
 ) -> String {
+    // A value the validating walk itself withheld is a withheld value and not an absent
+    // one: the walk drops a `@sensitive` member's value as it records the violation, so
+    // an EMPTY value half is not evidence that the member was absent.
+    if violation.sensitive {
+        return "Value".to_string();
+    }
     if violation.value.is_none() {
         return "Value null".to_string();
     }

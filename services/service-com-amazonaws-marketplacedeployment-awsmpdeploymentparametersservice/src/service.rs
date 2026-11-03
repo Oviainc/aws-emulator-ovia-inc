@@ -202,7 +202,7 @@ impl ErasedOperation for FrontDoorAnswer {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
-        _req: &'r aws_smithy_runtime_api::http::Request,
+        req: &'r aws_smithy_runtime_api::http::Request,
         _ctx: &'r smithy_server_runtime::OperationContext<'r>,
     ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
         Box::pin(async move {
@@ -221,7 +221,7 @@ impl ErasedOperation for FrontDoorAnswer {
                         self.0.code,
                         self.0.status,
                     )
-                    .unwrap_or_else(|e| svc.definition().framework_error_response(e)),
+                    .unwrap_or_else(|e| svc.definition().framework_error_response(e, req)),
             )
         })
     }
@@ -327,6 +327,10 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
         _ => return None,
     };
     let subject = match (&violation.kind, &violation.value) {
+        // A value the validating walk itself WITHHELD is a withheld value and not an
+        // absent one: the walk drops a `@sensitive` member's value as it records the
+        // violation, so an empty value half is not evidence that the member was absent.
+        _ if violation.sensitive => "Value".to_string(),
         // An absent member is reported as the null it was: a fact of the request's
         // shape, not a rendering of a value the caller sent.
         (ViolationKind::MissingRequiredMember, _) | (_, None) => "Value null".to_string(),

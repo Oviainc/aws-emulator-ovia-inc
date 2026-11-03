@@ -302,6 +302,7 @@ mod tests {
             path: "identifiers.1.member.featureGroupName".to_string(),
             kind: ViolationKind::Pattern("^[a-zA-Z0-9]+$".to_string()),
             value: Some("not a valid name!!".to_string()),
+            sensitive: false,
         };
         assert_eq!(
             as_stated(&outside_pattern).message(),
@@ -313,6 +314,7 @@ mod tests {
             path: "maxResults".to_string(),
             kind: ViolationKind::MaxValue("100".to_string()),
             value: Some("1000".to_string()),
+            sensitive: false,
         };
         assert_eq!(
             as_stated(&out_of_range),

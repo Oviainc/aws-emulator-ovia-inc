@@ -188,6 +188,7 @@ fn framework_requirement(kind: &ViolationKind) -> Option<String> {
         path: String::new(),
         kind: kind.clone(),
         value: None,
+        sensitive: false,
     }
     .message();
     stated
@@ -421,6 +422,7 @@ mod tests {
                     path: "profilingGroupName".to_string(),
                     kind: ViolationKind::Pattern(r"^[\w-]+$".to_string()),
                     value: Some("has a space".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value 'has a space' at 'profilingGroupName' \
                  failed to satisfy constraint: Member must satisfy regular expression \
@@ -432,6 +434,7 @@ mod tests {
                     path: "fleetInstanceId".to_string(),
                     kind: ViolationKind::MaxLength(255),
                     value: Some(long_id.clone()),
+                    sensitive: false,
                 },
                 &long_clause,
             ),
@@ -441,6 +444,7 @@ mod tests {
                     path: "channels".to_string(),
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 },
                 "1 validation error detected: Value null at 'channels' failed to satisfy \
                  constraint: Member must not be null",
@@ -451,6 +455,7 @@ mod tests {
                     path: "channels".to_string(),
                     kind: ViolationKind::MaxLength(2),
                     value: Some("3 items".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value '3 items' at 'channels' failed to \
                  satisfy constraint: Member must have length less than or equal to 2",
@@ -461,6 +466,7 @@ mod tests {
                     path: "maxResults".to_string(),
                     kind: ViolationKind::MaxValue("1000".to_string()),
                     value: Some("5000".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value '5000' at 'maxResults' failed to \
                  satisfy constraint: Member must have value less than or equal to 1000",
@@ -476,6 +482,7 @@ mod tests {
                             .collect(),
                     ),
                     value: Some("P2D".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value 'P2D' at 'period' failed to satisfy \
                  constraint: Member must satisfy enum value set: [P1D, PT1H, PT5M]",
@@ -486,6 +493,7 @@ mod tests {
                     path: "channels.1.member.eventPublishers.1.member".to_string(),
                     kind: ViolationKind::EnumValue(vec!["AnomalyDetection".to_string()]),
                     value: Some("NotARealPublisher".to_string()),
+                    sensitive: false,
                 },
                 "1 validation error detected: Value '[NotARealPublisher]' at \
                  'channels.1.member.eventPublishers' failed to satisfy constraint: Member \
@@ -544,6 +552,7 @@ mod tests {
                     path: format!("eventPublishers.{position}.member"),
                     kind: ViolationKind::EnumValue(vec!["AnomalyDetection".to_string()]),
                     value: Some(submitted[position - 1].to_string()),
+                    sensitive: false,
                 })
                 .collect();
             let expected = format!(
@@ -574,11 +583,13 @@ mod tests {
                 path: "profilingGroupName".to_string(),
                 kind: ViolationKind::MinLength(1),
                 value: Some(String::new()),
+                sensitive: false,
             },
             Violation {
                 path: "fleetInstanceId".to_string(),
                 kind: ViolationKind::MaxLength(255),
                 value: Some("x".repeat(256)),
+                sensitive: false,
             },
         ];
 
@@ -619,6 +630,7 @@ mod tests {
                 path: "eventPublishers.1.member".to_string(),
                 kind: ViolationKind::EnumValue(vec!["AnomalyDetection".to_string()]),
                 value: Some(element.clone()),
+                sensitive: false,
             }],
             // `submitted_lists` offers nothing for this list.
             HashMap::new,

@@ -238,6 +238,21 @@ pub fn refusing_violations_with_lists<O: Operation>(
     (refusing.violations, refusing.lists)
 }
 
+/// Every violation that refuses `req` before `O`'s handler runs, with the framework's own
+/// rendering of each value kept — except where the validating walk WITHHELD it, which is
+/// put back as that walk itself would have stored it ([`with_withheld_values`]).
+///
+/// For a service whose clause quotes the value the framework stored, a collection's count
+/// summary included: the redaction of a `@sensitive` member's value is what has to be
+/// undone, and nothing else about the clause.
+#[must_use]
+pub fn refusing_violations_restoring_withheld<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Vec<Violation> {
+    violations_in::<O>(protocol, req, Echoes::Withheld).violations
+}
+
 /// What one collecting walk found: the violations, and the request's lists when the caller
 /// asked for them ([`Echoes::SubmittedWithLists`]; otherwise empty).
 #[derive(Debug, Default)]
@@ -492,6 +507,12 @@ pub(crate) enum Echoes {
     SubmittedUpTo(usize),
     /// Leave the framework's own rendering in place.
     Rendered,
+    /// Leave the framework's own rendering in place, EXCEPT where the validating walk
+    /// withheld the value as it recorded the violation: that one is put back as that walk
+    /// itself would have stored it ([`with_withheld_values`]). For a service whose clause
+    /// quotes the value the framework stored — a collection's count summary included — and
+    /// so needs the redaction undone and nothing else.
+    Withheld,
     /// Restore each echo, and collect the request's lists too ([`submitted_lists`]).
     SubmittedWithLists,
     /// Pair each violation with how a clause can state its value
@@ -593,6 +614,11 @@ pub(crate) fn violations_in<O: Operation>(
                 },
                 Echoes::Rendered => Refusing {
                     violations,
+                    lists: HashMap::new(),
+                    echoes: Vec::new(),
+                },
+                Echoes::Withheld => Refusing {
+                    violations: with_withheld_values(violations, &input, O::INPUT_SCHEMA),
                     lists: HashMap::new(),
                     echoes: Vec::new(),
                 },
@@ -733,6 +759,9 @@ pub(crate) fn violations_in<O: Operation>(
                 path: member_name,
                 kind: ViolationKind::MissingRequiredMember,
                 value: None,
+                // An absent member has no value to withhold, so the clause names the
+                // path alone whether or not the model marks the member `@sensitive`.
+                sensitive: false,
             }],
             lists: HashMap::new(),
             // An absent member has no submitted value, whichever echo the caller asked
@@ -846,6 +875,15 @@ fn char_prefix(value: &str, max: usize) -> &str {
     &value[..end]
 }
 
+/// The framework's own ceiling on the value one clause echoes
+/// (`MAX_ECHOED_VALUE` in `aws_smithy_schema_server::constraints`, which is private): a
+/// longer value is stored on the violation ALREADY elided to `<prefix>... [<n> bytes]`.
+///
+/// Read only by [`crate::validation_message::quoting_the_whole_submitted_value`], to put
+/// back exactly what the framework's own walk would have stored for a value it WITHHELD —
+/// so undoing a redaction never also undoes that elision.
+pub(crate) const FRAMEWORK_ECHO_CEILING: usize = 256;
+
 /// The largest single submitted value restored into a clause by default, and the ceiling a
 /// service that states none is held to (see the module docs).
 const MAX_RESTORED_ECHO: usize = 16 * 1024;
@@ -910,8 +948,13 @@ pub fn with_submitted_values_up_to(
     max_echo: usize,
 ) -> Vec<Violation> {
     // Nothing to re-echo: a walk over the whole input is not worth doing for a refusal
-    // that states no value at all (an absent `@required` member is the common case).
-    if violations.iter().all(|violation| violation.value.is_none()) {
+    // that states no value at all (an absent `@required` member is the common case). A
+    // violation whose value the validating walk WITHHELD is not one of those: the member
+    // was there, so this walk still holds what it sent.
+    if violations
+        .iter()
+        .all(|violation| violation.value.is_none() && !violation.sensitive)
+    {
         return violations;
     }
     let leaves = submitted_leaves_up_to(input, schema, max_echo);
@@ -920,6 +963,21 @@ pub fn with_submitted_values_up_to(
     let index = Submitted::of(&leaves);
     let mut budget = MAX_RESTORED_TOTAL;
     for violation in &mut violations {
+        // A value the walk WITHHELD is put back as that walk itself would have stored it —
+        // the submitted value under the framework's own echo ceiling — so only the
+        // redaction is undone, never the elision, and a service that withholds such a
+        // value does so in its own clause builder rather than by its absence here.
+        if violation.sensitive {
+            let withheld = index
+                .candidate(violation)
+                .map(|submitted| quoted_echo_up_to(submitted, FRAMEWORK_ECHO_CEILING).into_owned());
+            if let Some(withheld) = withheld.filter(|value| value.len() <= budget) {
+                budget -= withheld.len();
+                violation.value = Some(withheld);
+                violation.sensitive = false;
+            }
+            continue;
+        }
         let Some(stored) = violation.value.as_deref() else {
             continue;
         };
@@ -943,6 +1001,48 @@ pub fn with_submitted_values_up_to(
         }
         budget -= restored.len();
         violation.value = Some(restored);
+    }
+    violations
+}
+
+/// `violations` with the value of every one the validating walk WITHHELD — a `@sensitive`
+/// member's, dropped as the violation was recorded — put back as that walk itself would
+/// have stored it: the submitted value under the framework's own echo ceiling
+/// ([`FRAMEWORK_ECHO_CEILING`]). Every other violation is untouched, the framework's own
+/// rendering (a collection's count summary included) and all.
+///
+/// For a service whose published clause QUOTES the value the framework stored: the
+/// redaction is what has to be undone, and nothing else about the clause. A service whose
+/// clause withholds such a value reads [`Violation::sensitive`] (or its own reading of the
+/// model) in its clause builder instead of relying on the value's absence.
+///
+/// `input` and `schema` must be the ones the violations were collected from, exactly as for
+/// [`with_submitted_values`].
+#[must_use]
+pub fn with_withheld_values(
+    mut violations: Vec<Violation>,
+    input: &dyn SerializableStruct,
+    schema: &Schema,
+) -> Vec<Violation> {
+    // Nothing was withheld: a walk over the whole input would be read by nobody.
+    if violations.iter().all(|violation| !violation.sensitive) {
+        return violations;
+    }
+    let leaves = submitted_leaves_up_to(input, schema, FRAMEWORK_ECHO_CEILING);
+    let index = Submitted::of(&leaves);
+    let mut budget = MAX_RESTORED_TOTAL;
+    for violation in &mut violations {
+        if !violation.sensitive {
+            continue;
+        }
+        let withheld = index
+            .candidate(violation)
+            .map(|submitted| quoted_echo_up_to(submitted, FRAMEWORK_ECHO_CEILING).into_owned());
+        if let Some(withheld) = withheld.filter(|value| value.len() <= budget) {
+            budget -= withheld.len();
+            violation.value = Some(withheld);
+            violation.sensitive = false;
+        }
     }
     violations
 }
@@ -1002,8 +1102,13 @@ fn echoed_over(
     max_echo: usize,
 ) -> Vec<(Violation, SubmittedEcho)> {
     // A refusal that states no value at all (an absent `@required` member is the common
-    // case) is not worth a walk over the whole input.
-    if violations.iter().all(|violation| violation.value.is_none()) {
+    // case) is not worth a walk over the whole input. A violation whose value the
+    // validating walk WITHHELD is not one of those: the member was there, so this walk
+    // still has a rendering to collect for a service whose refusal quotes it.
+    if violations
+        .iter()
+        .all(|violation| violation.value.is_none() && !violation.sensitive)
+    {
         return violations
             .into_iter()
             .map(|violation| (violation, SubmittedEcho::Absent))
@@ -1032,13 +1137,20 @@ fn echoed_over(
 
 /// How a clause can state `violation`'s value, within the bounds this module states and the
 /// ceiling the caller stated for one value.
+///
+/// A violation whose value the validating walk WITHHELD — the value of a `@sensitive`
+/// member, which the walk drops as it records the violation and marks
+/// [`Violation::sensitive`] for — is not an absent member: this walk re-reads the request
+/// itself, so it can still state what the caller sent, for a service whose published
+/// refusal quotes that value. A service that withholds it instead reads the flag in its own
+/// clause builder.
 fn echo_of(
     violation: &Violation,
     by_path: &HashMap<&str, Option<&str>>,
     budget: &mut usize,
     max_echo: usize,
 ) -> SubmittedEcho {
-    if violation.value.is_none() {
+    if violation.value.is_none() && !violation.sensitive {
         return SubmittedEcho::Absent;
     }
     let rendered = match violation.kind {
@@ -2887,6 +2999,7 @@ mod tests {
                 path: leaf_path.to_string(),
                 kind,
                 value: Some("whatever".to_string()),
+                sensitive: false,
             };
             let actual = index.candidate(&violation);
             assert_eq!(
@@ -2952,6 +3065,7 @@ mod tests {
                 path: path.to_string(),
                 kind: ViolationKind::MaxLength(50),
                 value: Some(stored.to_string()),
+                sensitive: false,
             };
             let actual = index.collection_candidate(&violation, stored);
             assert_eq!(
@@ -3266,6 +3380,7 @@ mod tests {
                 path: path.to_string(),
                 kind,
                 value: value.map(str::to_string),
+                sensitive: false,
             };
             let mut budget = MAX_RESTORED_TOTAL;
             let actual = echo_of(&violation, &by_path, &mut budget, MAX_RESTORED_ECHO);

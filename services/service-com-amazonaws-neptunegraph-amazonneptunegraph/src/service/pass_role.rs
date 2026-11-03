@@ -95,7 +95,9 @@ impl<Inner: PassesRole + ErasedOperation> ErasedOperation for PassRoleGate<Inner
             // authorization decision above, which is the one thing that comes first.
             let refused =
                 super::constraints::constraint_violations::<Inner>(svc.definition().protocol(), req);
-            if let Some(response) = super::constraints::constraint_refusal::<Inner>(svc, &refused) {
+            if let Some(response) =
+                super::constraints::constraint_refusal::<Inner>(svc, req, &refused)
+            {
                 return response;
             }
             self.operation.run(svc, req, ctx).await
@@ -151,6 +153,9 @@ fn denial_response<O: PassesRole>(
         error.http_status(),
     ) {
         Ok(response) => Some(response),
-        Err(unserializable) => Some(svc.definition().framework_error_response(unserializable)),
+        Err(unserializable) => Some(
+            svc.definition()
+                .framework_error_response(unserializable, req),
+        ),
     }
 }

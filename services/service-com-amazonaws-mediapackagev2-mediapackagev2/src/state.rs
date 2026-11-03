@@ -5107,6 +5107,7 @@ mod tests {
                 path: "channelGroupName".to_string(),
                 kind: kind.clone(),
                 value: Some("bad name!".to_string()),
+                sensitive: false,
             };
             let error = member_validation_failed(&violation);
             assert_eq!(
