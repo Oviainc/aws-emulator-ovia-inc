@@ -117,7 +117,8 @@ async fn opening_a_support_case_writes_the_request_and_the_case_review_approves_
     // counted per Region or account-wide, and in the FORM of `SupportCaseAllowed`
     // (absent, explicitly true, explicitly false) — the seeded defaults are
     // `src/state.rs::seed_default_quotas` (vpc/L-F678F1CE = 5, ec2/L-0263D0A3 = 5,
-    // s3/L-DC2B2D3D = 10000 and global, dynamodb/L-F98FE922 = 2500, vpc/L-A4707A72 = 5).
+    // budgets/Budgets = 20000 and global, dynamodb/L-F98FE922 = 2500,
+    // vpc/L-A4707A72 = 5).
     let rows = vec![
         CaseRow {
             why: "SupportCaseAllowed absent",
@@ -135,9 +136,9 @@ async fn opening_a_support_case_writes_the_request_and_the_case_review_approves_
         },
         CaseRow {
             why: "an account-wide quota",
-            service_code: "s3",
-            quota_code: "L-DC2B2D3D",
-            desired: 20_000.0,
+            service_code: "budgets",
+            quota_code: "Budgets",
+            desired: 30_000.0,
             support_case_allowed: Some(true),
         },
         CaseRow {

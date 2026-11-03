@@ -75,8 +75,8 @@ fn rows() -> Vec<Row> {
         },
         Row {
             why: "an account-wide quota of a regional service, requested in Europe",
-            service_code: "s3",
-            quota_name: "General purpose buckets",
+            service_code: "notifications-contacts",
+            quota_name: "Email contacts per account",
             global: true,
             made_at: "eu-west-1",
             read_at: ["us-east-1", "sa-east-1"],
@@ -114,9 +114,9 @@ fn rows() -> Vec<Row> {
             read_at: ["eu-west-1", "ap-northeast-1"],
         },
         Row {
-            why: "a PER-REGION quota of a service that also publishes account-wide ones",
+            why: "a PER-REGION quota of a storage service",
             service_code: "s3",
-            quota_name: "Access points per Region",
+            quota_name: "Replication Destinations",
             global: false,
             made_at: "eu-north-1",
             read_at: ["us-west-1", "ca-central-1"],

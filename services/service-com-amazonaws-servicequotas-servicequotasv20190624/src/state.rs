@@ -3268,6 +3268,24 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         // a documented code resolve the wrong record. Each of those services stays
         // in [`SEED_SERVICE_CATALOG`], so its code still resolves and its listing
         // still answers 200.
+        //
+        // And it covers eight further services, whose recorded default-quota listings
+        // publish every quota under an AWS `L-` code and report this catalog's
+        // descriptive row as a surplus entry: `ram/ResourceSharesPerAccount`,
+        // `rds/DBInstances`, `rds/DBClusters`, `rds/ManualDBInstanceSnapshots`,
+        // `redshift/Clusters`, `redshift/NodesPerCluster`,
+        // `redshift-serverless/NamespacesPerAccount`,
+        // `route53resolver/ResolverEndpointsPerRegion`,
+        // `route53resolver/ResolverRulesPerRegion`, `s3/AccessPointsPerRegion`,
+        // `s3/MultiRegionAccessPointsPerAccount`, `scheduler/SchedulesPerAccount` and
+        // `secretsmanager/SecretsPerRegion`. Each stand-in is dropped and the quotas
+        // that evidence states under AWS's own codes are published in its place
+        // ([`ram_quotas`], [`rds_quotas`], [`redshift_quotas`],
+        // [`redshift_serverless_quotas`], [`route53resolver_quotas`], [`s3_quotas`],
+        // [`scheduler_quotas`], [`secretsmanager_quotas`]); the S3 bucket plane, the
+        // one row of the eight this catalog already keyed onto AWS's code, is counted
+        // per Region like the rest of that service's published rows rather than
+        // account-wide.
         service(
             "b2bi",
             "AWS B2B Data Interchange",
@@ -3938,29 +3956,18 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "ram",
             "AWS Resource Access Manager (AWS RAM)",
-            vec![quota("Resource shares per account", 5000.0)],
+            ram_quotas(),
         ),
         service(
             "rds",
             "Amazon Relational Database Service (Amazon RDS)",
-            vec![
-                quota("DB instances", 40.0),
-                quota("DB clusters", 40.0),
-                quota("Manual DB instance snapshots", 100.0),
-            ],
+            rds_quotas(),
         ),
-        service(
-            "redshift",
-            "Amazon Redshift",
-            vec![
-                quota("Clusters", 100.0),
-                quota("Nodes per cluster", 128.0).fixed(),
-            ],
-        ),
+        service("redshift", "Amazon Redshift", redshift_quotas()),
         service(
             "redshift-serverless",
             "Amazon Redshift Serverless",
-            vec![quota("Namespaces per account", 25.0)],
+            redshift_serverless_quotas(),
         ),
         service(
             "rekognition",
@@ -3980,22 +3987,12 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "route53resolver",
             "Amazon Route 53 Resolver",
-            vec![
-                quota("Resolver endpoints per Region", 4.0),
-                quota("Resolver rules per Region", 1000.0),
-            ],
+            route53resolver_quotas(),
         ),
         service(
             "s3",
             "Amazon Simple Storage Service (Amazon S3)",
-            vec![
-                // Buckets are counted per account across every region.
-                quota("General purpose buckets", 10000.0)
-                    .code("L-DC2B2D3D")
-                    .global(),
-                quota("Access points per Region", 10000.0),
-                quota("Multi-Region Access Points per account", 100.0).global(),
-            ],
+            s3_quotas(),
         ),
         service(
             "sagemaker",
@@ -4009,12 +4006,12 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "scheduler",
             "Amazon EventBridge Scheduler",
-            vec![quota("Schedules per account", 1000000.0)],
+            scheduler_quotas(),
         ),
         service(
             "secretsmanager",
             "AWS Secrets Manager",
-            vec![quota("Secrets per Region", 500000.0)],
+            secretsmanager_quotas(),
         ),
         service(
             "servicediscovery",
@@ -4609,7 +4606,10 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ),
     ("route53domains", "Amazon Route 53 Domains"),
     ("route53profiles", "Amazon Route 53 Profiles"),
-    ("route53resolver", "Amazon Route 53 Resolver"),
+    // Service Quotas reports this code under the service's name WITHOUT the `Amazon`
+    // prefix, which is the `ServiceName` the recorded default-quota listing of the code
+    // carries on every one of its rows.
+    ("route53resolver", "Route 53 Resolver"),
     ("rtbfabric", "AWS RTB Fabric"),
     ("rum", "Amazon CloudWatch RUM"),
     ("s3", "Amazon Simple Storage Service (Amazon S3)"),
@@ -6009,6 +6009,362 @@ fn es_quotas() -> Vec<QuotaRow> {
         // resource type the per-resource plane applies to, which for this service is
         // its domain resource.
         quota("Instances per domain", 80.0).adjustable_at(LEVEL_ALL, "AWS::Elasticsearch::Domain"),
+    ]
+}
+
+/// AWS Resource Access Manager's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `ram` service code, and the
+/// recorded default-quota listing of that code for WHICH `QuotaCode` names which
+/// quota: this service publishes its planes in the "Number of …" form the rows below
+/// carry, each under a code in AWS's own namespace. The rest of the service's
+/// published catalog names no quota this catalog can cite under the remaining codes
+/// that listing reports, and a code identifies ONE quota, so those rows are left to
+/// the default-quota-set gap rather than published under a binding this catalog would
+/// be guessing at (see [`descriptive_quota_code`]).
+fn ram_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("Number of custom permissions per resource type", 10.0)
+            .code("L-2870BE9D")
+            .describe("The maximum number of custom permissions per resource type."),
+        quota("Number of resource associations", 25_000.0)
+            .code("L-4A6CEE66")
+            .describe("The maximum number of resource associations."),
+        // This row's `Description` is the service's own published sentence, as the
+        // recorded listing carries it; the three beside it publish this catalog's own
+        // wording in the form AWS's quota descriptions take ("The maximum number of
+        // <what the quota counts>."), because the service's text for them is not
+        // among the data available here.
+        quota("Number of resource shares", 25_000.0)
+            .code("L-595828F9")
+            .describe("The maximum number of resource shares."),
+        quota("Number of principal associations", 25_000.0)
+            .code("L-8491BF81")
+            .describe("The maximum number of principal associations."),
+    ]
+}
+
+/// The `AWS/Usage` display name Amazon RDS publishes its usage counts under, which is
+/// the `Service` dimension of every metered RDS quota.
+const RDS_USAGE_SERVICE: &str = "RDS";
+
+/// Amazon RDS's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `rds` service code (the
+/// "Quotas and constraints for Amazon RDS" page of the Amazon RDS User Guide), and
+/// the recorded default-quota listing of that code for which `QuotaCode` names which
+/// quota, for the ONE-HOUR window RDS publishes its resource planes over and for the
+/// `AWS/Usage` `ResourceCount` metric it meters them with. The rest of the service's
+/// published catalog names no quota this catalog can cite under the remaining codes
+/// that listing reports, so those rows are left to the default-quota-set gap rather
+/// than published under a guessed binding (see [`descriptive_quota_code`]).
+fn rds_quotas() -> Vec<QuotaRow> {
+    vec![
+        // A per-cluster plane RDS meters: the `Service` dimension is the one the
+        // recorded row carries, and the `Resource` dimension is this catalog's naming
+        // of the series the quota counts (its resource's published name as one
+        // identifier), since no source available here states the value RDS publishes
+        // it under.
+        quota("Custom endpoints per DB cluster", 5.0)
+            .code("L-9372BAB3")
+            .period(1, "HOUR")
+            .metric(usage_metric(
+                RDS_USAGE_SERVICE,
+                &[
+                    ("Class", "None"),
+                    ("Resource", "CustomEndpoints"),
+                    ("Type", "Resource"),
+                ],
+            ))
+            .describe("The maximum number of custom endpoints per DB cluster."),
+        quota("Parameter groups", 50.0)
+            .code("L-DE55804A")
+            .period(1, "HOUR")
+            .metric(usage_metric(
+                RDS_USAGE_SERVICE,
+                &[
+                    ("Class", "None"),
+                    ("Resource", "ParameterGroups"),
+                    ("Type", "Resource"),
+                ],
+            ))
+            .describe("The maximum number of parameter groups."),
+        // The RDS Data API's concurrency plane, which AWS publishes as not adjustable.
+        quota("Data API maximum concurrent cluster-secret pairs", 30.0)
+            .code("L-E3721453")
+            .fixed()
+            .describe(
+                "The maximum number of concurrent cluster-secret pairs the Data API \
+                 serves.",
+            ),
+    ]
+}
+
+/// Amazon Redshift's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `redshift` service code (the
+/// "Quotas and limits in Amazon Redshift" page of the Amazon Redshift Management
+/// Guide), and the recorded default-quota listing of that code for which `QuotaCode`
+/// names which quota. Redshift publishes planes of the CLUSTER and of the database
+/// inside it beside the account's own, which is why the rows are named for the thing
+/// the quota counts rather than for a resource type. The rest of the service's
+/// published catalog names no quota this catalog can cite under the remaining codes
+/// that listing reports, so those rows are left to the default-quota-set gap rather
+/// than published under a guessed binding (see [`descriptive_quota_code`]).
+fn redshift_quotas() -> Vec<QuotaRow> {
+    vec![
+        // The schema plane of a database, which AWS publishes as not adjustable.
+        quota("Schemas in each database per cluster", 9900.0)
+            .code("L-4E1FE923")
+            .fixed()
+            .describe("The maximum number of schemas in each database per cluster."),
+        quota(
+            "Column limit for external tables with pseudocolumns when using AWS Glue Data \
+             Catalog",
+            1597.0,
+        )
+        .code("L-8AFA7F04")
+        .describe(
+            "The maximum number of columns for an external table with pseudocolumns when \
+             using the AWS Glue Data Catalog.",
+        ),
+        quota("Tables for 4xlarge cluster node type", 200_000.0)
+            .code("L-99F53FC8")
+            .describe("The maximum number of tables for a 4xlarge cluster node type."),
+        quota("Nodes in a cluster", 128.0)
+            .code("L-BB966966")
+            .describe("The maximum number of nodes in a cluster."),
+    ]
+}
+
+/// Amazon Redshift Serverless's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `redshift-serverless` service
+/// code (the "Quotas for Amazon Redshift Serverless" page of the Amazon Redshift
+/// Management Guide), and the recorded default-quota listing of that code for which
+/// `QuotaCode` names which quota, for the `Count` unit its resource planes are
+/// published in and for the `AWS/Usage` `ResourceCount` metric the namespace plane is
+/// metered with.
+fn redshift_serverless_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("Redshift Processing Units (RPUs)", 3200.0)
+            .code("L-1854027F")
+            .unit("Count")
+            .metric(usage_metric(
+                "RedshiftServerless",
+                &[
+                    ("Class", "None"),
+                    ("Resource", "RedshiftProcessingUnits"),
+                    ("Type", "Resource"),
+                ],
+            ))
+            .describe("The maximum number of Redshift Processing Units (RPUs)."),
+        quota("Serverless Workgroups", 25.0)
+            .code("L-51089E7F")
+            .unit("Count")
+            .metric(usage_metric(
+                "RedshiftServerless",
+                &[
+                    ("Class", "None"),
+                    ("Resource", "ServerlessWorkgroups"),
+                    ("Type", "Resource"),
+                ],
+            ))
+            .describe("The maximum number of Redshift Serverless workgroups."),
+        // The namespace plane, metered like the two rows above: the `Service`
+        // dimension is the one the recorded rows carry, and the `Resource` dimension
+        // is this catalog's naming of the series each quota counts, since no source
+        // available here states the value the service publishes it under.
+        quota("Serverless Namespaces", 25.0)
+            .code("L-96772D74")
+            .unit("Count")
+            .metric(usage_metric(
+                "RedshiftServerless",
+                &[
+                    ("Class", "None"),
+                    ("Resource", "ServerlessNamespaces"),
+                    ("Type", "Resource"),
+                ],
+            ))
+            .describe("The maximum number of Redshift Serverless namespaces."),
+    ]
+}
+
+/// Amazon Route 53 Resolver's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `route53resolver` service code
+/// (the "Quotas on Route 53 Resolver" page of the Amazon Route 53 Developer Guide,
+/// which publishes the Resolver planes beside the DNS Firewall ones), and the recorded
+/// default-quota listing of that code for which `QuotaCode` names which quota. The
+/// rest of the service's published catalog names no quota this catalog can cite under
+/// the remaining codes that listing reports, so those rows are left to the
+/// default-quota-set gap rather than published under a guessed binding (see
+/// [`descriptive_quota_code`]).
+fn route53resolver_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("DNS Firewall rule groups per Region", 1000.0)
+            .code("L-02CC8B74")
+            .describe("The maximum number of DNS Firewall rule groups per Region."),
+        quota("DNS Firewall rule group associations per VPC", 5.0)
+            .code("L-15219E1D")
+            .fixed()
+            .describe("The maximum number of DNS Firewall rule group associations per VPC."),
+        // A plane counted in DOMAIN NAMES rather than in resources: the size of the
+        // domain list a file imported from Amazon S3 may carry.
+        quota("Domains in a file imported from S3", 250_000.0)
+            .code("L-1B2BDF0A")
+            .describe("The maximum number of domains in a file imported from Amazon S3."),
+        quota("Resolver rules per AWS Region", 1000.0)
+            .code("L-51D8A1FB")
+            .describe("The maximum number of Resolver rules per AWS Region."),
+        // The target plane of a rule, which AWS publishes as not adjustable.
+        quota("Target IP addresses per resolver rule", 6.0)
+            .code("L-D74B6237")
+            .fixed()
+            .describe("The maximum number of target IP addresses per Resolver rule."),
+    ]
+}
+
+/// Amazon S3's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `s3` service code (the "Amazon
+/// S3 quotas" section of the Amazon S3 User Guide), and the recorded default-quota
+/// listing of that code for which `QuotaCode` names which quota, for the units its
+/// measured planes are published in and for the one-second window its transfer rate is
+/// published over. The rest of the service's published catalog names no quota this
+/// catalog can cite under the remaining codes that listing reports, so those rows are
+/// left to the default-quota-set gap rather than published under a guessed binding
+/// (see [`descriptive_quota_code`]).
+fn s3_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("Replication Destinations", 28.0)
+            .code("L-1A9B467F")
+            .describe("The maximum number of destinations in a replication configuration."),
+        // A quota published as a RATE of data moved rather than as a count, so it
+        // carries the one-second window AWS publishes it over.
+        quota("Replication transfer rate", 1.0)
+            .code("L-349AD9CA")
+            .unit("Gigabits")
+            .period(1, "SECOND")
+            .describe("The maximum replication transfer rate, in gigabits per second."),
+        // A plane measured in the SIZE of one object rather than in a count of them.
+        quota("Object size", 48.828125)
+            .code("L-89BABEE8")
+            .unit("Terabytes")
+            .describe("The maximum size of an object."),
+        // The replication-rule plane of a bucket, which AWS publishes as not
+        // adjustable.
+        quota("Replication rules", 1000.0)
+            .code("L-B461D596")
+            .fixed()
+            .describe("The maximum number of rules in a replication configuration."),
+        quota("General purpose buckets", 10_000.0)
+            .code("L-DC2B2D3D")
+            .describe("The maximum number of general purpose buckets."),
+    ]
+}
+
+/// One Amazon EventBridge Scheduler API REQUEST-RATE quota: `<api> request rate`, the
+/// most requests to that one operation Scheduler serves per second.
+///
+/// Scheduler publishes a rate quota for each of its API operations, and every member
+/// of such a row but the operation's own name and the value is the same across the
+/// class: the `QuotaName` is the operation's name followed by `request rate`, the
+/// window is one second, the usage metric is that operation's `AWS/Usage` `CallCount`
+/// ([`call_count_metric`]) under the service's `AWS/Usage` display name, and the
+/// `Description` is the sentence AWS publishes for a request-rate quota with the
+/// operation it throttles named in it.
+fn scheduler_request_rate(api_name: &str, requests_per_second: f64) -> QuotaRow {
+    quota(format!("{api_name} request rate"), requests_per_second)
+        .period(1, "SECOND")
+        .metric(call_count_metric("EventBridge Scheduler", api_name))
+        .describe(&format!(
+            "The maximum number of {api_name} requests you can make per second in this \
+             account in the current Region."
+        ))
+}
+
+/// Amazon EventBridge Scheduler's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `scheduler` service code (the
+/// "Quotas for EventBridge Scheduler" page of the Amazon EventBridge Scheduler User
+/// Guide), and the recorded default-quota listing of that code for which `QuotaCode`
+/// names which quota: the account's schedule plane beside a per-API request rate for
+/// each throttled operation. The rest of the service's published catalog names no
+/// quota this catalog can cite under the remaining codes that listing reports, so
+/// those rows are left to the default-quota-set gap rather than published under a
+/// guessed binding (see [`descriptive_quota_code`]).
+fn scheduler_quotas() -> Vec<QuotaRow> {
+    vec![
+        // The read operations of the API share one published rate, and the write
+        // operations their own, which is the pair of values these rows carry.
+        scheduler_request_rate("ListSchedules", 1000.0).code("L-66629D52"),
+        scheduler_request_rate("CreateSchedule", 5000.0).code("L-6F4B17DE"),
+        quota("Number of schedules", 10_000_000.0)
+            .code("L-EE5D6FF0")
+            .describe("The maximum number of schedules."),
+        scheduler_request_rate("GetSchedule", 1000.0).code("L-FB03E819"),
+    ]
+}
+
+/// One AWS Secrets Manager API REQUEST-RATE quota: `Rate of <api> API requests`, the
+/// most requests to that one operation Secrets Manager serves per second.
+///
+/// Secrets Manager publishes a rate quota for each of its API operations, and every
+/// member of such a row but the operation's own name and the value is the same across
+/// the class: the `QuotaName` names the operation whose requests the rate throttles,
+/// the window is one second, the usage metric is that operation's `AWS/Usage`
+/// `CallCount` ([`call_count_metric`]) under the service's `AWS/Usage` display name,
+/// and the `Description` is the sentence AWS publishes for a request-rate quota.
+fn secrets_manager_request_rate(api_name: &str, requests_per_second: f64) -> QuotaRow {
+    quota(
+        format!("Rate of {api_name} API requests"),
+        requests_per_second,
+    )
+    .period(1, "SECOND")
+    .metric(call_count_metric("Secrets Manager", api_name))
+    .describe(&format!(
+        "The maximum number of {api_name} requests you can make per second in this account \
+         in the current Region."
+    ))
+}
+
+/// AWS Secrets Manager's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `secretsmanager` service code
+/// (the "Quotas for AWS Secrets Manager" page of the AWS Secrets Manager User Guide),
+/// and the recorded default-quota listing of that code for which `QuotaCode` names
+/// which quota and for the adjustability of each: this service publishes its request
+/// rates as NOT adjustable, which is why every row below is fixed. One of them is
+/// published as a COMBINED rate over four resource-policy operations, so no single
+/// operation's call count meters it. The rest of the service's published catalog names
+/// no quota this catalog can cite under the remaining codes that listing reports, so
+/// those rows are left to the default-quota-set gap rather than published under a
+/// guessed binding (see [`descriptive_quota_code`]).
+fn secretsmanager_quotas() -> Vec<QuotaRow> {
+    vec![
+        secrets_manager_request_rate("GetSecretValue", 10_000.0)
+            .code("L-2D877201")
+            .fixed(),
+        secrets_manager_request_rate("DescribeSecret", 40_000.0)
+            .code("L-385CE7B7")
+            .fixed(),
+        quota(
+            "Combined rate of DeleteResourcePolicy, GetResourcePolicy, PutResourcePolicy and \
+             ValidateResourcePolicy API requests",
+            50.0,
+        )
+        .code("L-8D82A813")
+        .fixed()
+        .period(1, "SECOND")
+        .describe(
+            "The maximum number of DeleteResourcePolicy, GetResourcePolicy, \
+             PutResourcePolicy and ValidateResourcePolicy requests you can make per second \
+             in this account in the current Region.",
+        ),
+        secrets_manager_request_rate("CreateSecret", 50.0)
+            .code("L-CBA4CAC4")
+            .fixed(),
     ]
 }
 

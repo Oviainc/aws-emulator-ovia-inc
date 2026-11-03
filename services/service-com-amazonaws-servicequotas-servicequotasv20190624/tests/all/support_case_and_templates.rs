@@ -170,7 +170,7 @@ async fn support_case_allowed_decides_the_terminal_status_and_the_applied_value(
     // false), in the service and quota they name, and in whether the quota is counted
     // per Region or account-wide — the seeded defaults are
     // `src/state.rs::seed_default_quotas` (vpc/L-F678F1CE = 5, ec2/L-0263D0A3 = 5,
-    // vpc/L-A4707A72 = 5, s3/L-DC2B2D3D = 10000 and global, dynamodb/L-F98FE922 =
+    // vpc/L-A4707A72 = 5, budgets/Budgets = 20000 and global, dynamodb/L-F98FE922 =
     // 2500).
     let rows = vec![
         SupportCaseRow {
@@ -194,11 +194,11 @@ async fn support_case_allowed_decides_the_terminal_status_and_the_applied_value(
         SupportCaseRow {
             why: "explicitly allowed on an account-wide quota",
             flag: Some(true),
-            service_code: "s3",
-            quota_code: "L-DC2B2D3D",
-            desired: 20_000.0,
+            service_code: "budgets",
+            quota_code: "Budgets",
+            desired: 30_000.0,
             terminal_status: "APPROVED",
-            in_force: 20_000.0,
+            in_force: 30_000.0,
         },
         SupportCaseRow {
             why: "opted out: no support case is opened",

@@ -1032,10 +1032,10 @@ async fn an_approved_increase_on_a_global_quota_is_in_force_in_every_region() {
 
     // (ServiceCode, QuotaCode, DesiredValue, in force elsewhere afterwards): the
     // global row's value crosses regions, the regional row's does not.
-    let global = json!({"ServiceCode": "s3", "QuotaCode": "L-DC2B2D3D"});
+    let global = json!({"ServiceCode": "budgets", "QuotaCode": "Budgets"});
     let regional = json!({"ServiceCode": "vpc", "QuotaCode": "L-F678F1CE"});
 
-    for (pair, desired) in [(&global, 20_000.0_f64), (&regional, 20.0)] {
+    for (pair, desired) in [(&global, 30_000.0_f64), (&regional, 20.0)] {
         let mut body = pair.clone();
         body["DesiredValue"] = json!(desired);
         let response = home.ok("RequestServiceQuotaIncrease", body).await;
@@ -1049,7 +1049,7 @@ async fn an_approved_increase_on_a_global_quota_is_in_force_in_every_region() {
     tokio::time::sleep(PAST_DECISION).await;
 
     // us-east-1 made both requests, so both are in force there.
-    for (pair, desired) in [(&global, 20_000.0_f64), (&regional, 20.0)] {
+    for (pair, desired) in [(&global, 30_000.0_f64), (&regional, 20.0)] {
         let quota = home.ok("GetServiceQuota", pair.clone()).await;
         assert_eq!(
             quota["Quota"]["Value"].as_f64(),
@@ -1063,7 +1063,7 @@ async fn an_approved_increase_on_a_global_quota_is_in_force_in_every_region() {
     let global_elsewhere = elsewhere.ok("GetServiceQuota", global.clone()).await;
     assert_eq!(
         global_elsewhere["Quota"]["Value"].as_f64(),
-        Some(20_000.0),
+        Some(30_000.0),
         "case a global quota read from another region: an account-wide increase must be in \
          force, got {global_elsewhere}"
     );
@@ -1082,7 +1082,7 @@ async fn an_approved_increase_on_a_global_quota_is_in_force_in_every_region() {
             .await;
         assert_eq!(
             default["Quota"]["Value"].as_f64(),
-            Some(10_000.0),
+            Some(20_000.0),
             "case the global quota's default in {region}: must be unchanged, got {default}"
         );
     }

@@ -47,6 +47,8 @@ mod default_quota_code_binding;
 mod default_quota_published_codes;
 #[path = "all/default_quota_row_text.rs"]
 mod default_quota_row_text;
+#[path = "all/default_quota_rows_under_aws_codes.rs"]
+mod default_quota_rows_under_aws_codes;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/history_filter_chain.rs"]

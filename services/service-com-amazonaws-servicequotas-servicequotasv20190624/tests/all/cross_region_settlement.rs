@@ -104,7 +104,7 @@ fn rows() -> Vec<Row> {
         Row {
             why: "a REGIONAL quota: the control, in force only where it was requested",
             service_code: "s3",
-            quota_name: "Access points per Region",
+            quota_name: "General purpose buckets",
             global: false,
             requested_at: "us-east-1",
             read_from: "ap-northeast-1",
