@@ -7,6 +7,8 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+# The request-claim rule for the two services that share the `greengrass` signing name.
+service-common = { path = "../common" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

@@ -74,13 +74,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `greengrass` — the signing name it SHARES with the
+        // 2017-06-07 Greengrass API (`services/…-greengrass-greengrass`), whose model
+        // declares the same endpoint prefix, the same ARN namespace and the same sigv4
+        // name, because AWS serves both API versions from ONE endpoint. The router
+        // resolves a request's routing key from the SigV4 credential scope first, so both
+        // services see the key `greengrass`: claiming on the signing name alone makes
+        // each claim the other's traffic, and the router — which refuses rather than
+        // guesses — answers `500 AmbiguousService` for every Greengrass request of either
+        // version, a code no AWS model carries.
+        //
+        // Nor can a first path segment separate them: both models publish `greengrass`
+        // and `tags` and nothing else.
+        //
+        // What separates them is what AWS itself dispatches on: the `restJson1` route
+        // each request addresses. So this service claims a request whose routing key
+        // names this endpoint and whose method + URI its OWN model binds a route for, by
+        // the one rule `service_common::greengrass` states for the family — which also
+        // names the single claimant of the few routes the two models bind identically.
+        service_common::greengrass::claims_request(
+            parts,
+            self.definition(),
+            crate::ROUTE_PATH_SEGMENTS,
+        )
     }
 
     fn override_operation(

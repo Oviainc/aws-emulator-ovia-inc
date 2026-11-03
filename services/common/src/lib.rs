@@ -287,6 +287,10 @@ pub mod event_pattern;
 pub mod event_stream;
 pub mod feature_store_groups;
 pub mod front_door;
+/// The request-claim rule for the two emulated services whose SigV4 signing name is
+/// `greengrass` — the 2017-06-07 and 2020-11-30 API versions of one product, which AWS
+/// serves from one endpoint and tells apart by the `restJson1` route a request addresses.
+pub mod greengrass;
 pub mod iam_authorization;
 /// The ONE construction of the in-process IAM client a service resolves a caller-supplied
 /// IAM entity through, so that hop is configured once rather than per service.

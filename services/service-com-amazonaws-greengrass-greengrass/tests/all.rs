@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/group_lifecycle.rs"]
 mod group_lifecycle;
+#[path = "all/shared_endpoint_routing.rs"]
+mod shared_endpoint_routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
