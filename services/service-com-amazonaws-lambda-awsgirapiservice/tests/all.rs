@@ -163,6 +163,8 @@ mod function_version_listing;
 mod function_versions_by_capacity_provider;
 #[path = "all/functions_by_code_signing_config.rs"]
 mod functions_by_code_signing_config;
+#[path = "all/invocation_count_series.rs"]
+mod invocation_count_series;
 #[path = "all/kinesis_event_source_delivery.rs"]
 mod kinesis_event_source_delivery;
 #[path = "all/layer_archive_unzipped_size.rs"]

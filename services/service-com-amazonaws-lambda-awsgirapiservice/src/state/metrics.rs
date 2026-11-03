@@ -31,7 +31,8 @@
 //!
 //! What a series is identified by and what one observation of it is are this module's
 //! ([`series`], [`observation`], [`append`]), so every metric this service publishes —
-//! the per-function ones here, the invocations Lambda's recursive-loop guardrail drops
+//! the per-function ones here, the invocations Lambda admits to a function
+//! ([`publish_invocation`]), the invocations Lambda's recursive-loop guardrail drops
 //! ([`super::recursion`]) and the account-level concurrency metering in
 //! [`super::concurrency_metering`] — reaches the store the same way and carries the same
 //! resolution. An account-level series carries NO dimension: "a metric is uniquely defined
@@ -61,6 +62,15 @@ pub const METRIC_NAMESPACE: &str = "AWS/Lambda";
 
 /// The dimension they are reported per: the function the work was done for.
 pub const FUNCTION_NAME_DIMENSION: &str = "FunctionName";
+
+/// The dimension that names the RESOURCE an invocation addressed, beside the function it
+/// belongs to: the function itself for an unqualified invocation, and the alias or version
+/// the caller named for a qualified one ([`invoked_resource`]).
+///
+/// It is what tells two targets of one function apart in the same series — an invocation of
+/// an alias and one of the function at large are both invocations of that function, so they
+/// share the per-function series and differ in this one.
+pub const RESOURCE_DIMENSION: &str = "Resource";
 
 /// The dimension a series about ONE EVENT SOURCE MAPPING's own work is reported per: that
 /// mapping's `UUID`, which is "The identifier of the event source mapping". The work such a
@@ -160,6 +170,23 @@ pub const ITERATOR_AGE_METRIC: &str = "IteratorAge";
 /// `StandardUnit` spells `Milliseconds`.
 pub const ITERATOR_AGE_UNIT: &str = "Milliseconds";
 
+/// How many invocations of a function Lambda performed: the series a client reads to learn
+/// that a function is being called at all.
+///
+/// It counts the invocation REQUESTS Lambda admitted to the function — the ones that got
+/// past resolution, the function's lifecycle state, the payload limits and the
+/// recursive-loop guardrail — whatever the execution each of them started then came to. A
+/// request Lambda refuses before the function is reached is no invocation of it and is not
+/// counted here: an unresolvable name, a function that cannot be invoked yet, a payload over
+/// the limit or not JSON, a dry run, which "validate[s] parameter values" and invokes
+/// nothing, and an invocation the guardrail stopped, which is metered as one
+/// [`RECURSIVE_INVOCATIONS_DROPPED_METRIC`] datapoint instead.
+///
+/// One observation of 1 is published per admitted invocation, in [`COUNT_UNIT`], so a reader
+/// summing a window over the series gets the invocations of that window and a function
+/// nobody invoked has no datapoint at all rather than a zero.
+pub const INVOCATIONS_METRIC: &str = "Invocations";
+
 /// How many invocation REQUESTS Lambda dropped because it detected the function being
 /// invoked as part of a recursive loop and the function's recursive loop detection
 /// configuration told it to stop the chain.
@@ -201,6 +228,34 @@ pub fn function_dimensions(function_name: &str) -> cloudwatch::DimensionSet {
     )]
     .into_iter()
     .collect()
+}
+
+/// The dimension set of a series reported per INVOKED RESOURCE: the function, and the
+/// resource of it the invocation addressed ([`RESOURCE_DIMENSION`]).
+#[must_use]
+pub fn resource_dimensions(function_name: &str, resource: &str) -> cloudwatch::DimensionSet {
+    [
+        (
+            FUNCTION_NAME_DIMENSION.to_string(),
+            function_name.to_string(),
+        ),
+        (RESOURCE_DIMENSION.to_string(), resource.to_string()),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// The resource an invocation of `function_name` addressed, as [`RESOURCE_DIMENSION`] names
+/// it: the function itself for an invocation that resolved the unpublished version the
+/// function is addressed by with no qualifier at all, and `name:qualifier` for one that named
+/// an alias or a published version — the same distinction the unqualified and `:`-suffixed
+/// forms of a function ARN draw ([`super::FunctionRecord::versioned_arn`]).
+#[must_use]
+pub fn invoked_resource(function_name: &str, qualifier: &str) -> String {
+    if qualifier == crate::state::VERSION_LATEST {
+        return function_name.to_string();
+    }
+    format!("{function_name}:{qualifier}")
 }
 
 /// The dimension set of a series reported per event source mapping: the mapping whose
@@ -287,6 +342,23 @@ pub fn append(
     true
 }
 
+/// Publish the ONE datapoint an invocation Lambda admitted to a function is metered by: a
+/// count of 1 on the [`INVOCATIONS_METRIC`] series of the function `function_name` names and
+/// on that of the resource `resource` addresses, so a reader summing a window over either
+/// gets the invocations of that window.
+///
+/// It goes into the CloudWatch store of the SAME engine, which is the store
+/// `GetMetricStatistics`, `GetMetricData` and `ListMetrics` answer from. An engine carrying
+/// no CloudWatch has nowhere to publish to, so nothing is. Call it with no Lambda store lock
+/// held: it takes the CloudWatch store's own.
+pub fn publish_invocation<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    function_name: &str,
+    resource: &str,
+) {
+    FunctionMetrics::new(cloudwatch_state(engine)).publish_invocation(function_name, resource);
+}
+
 /// The publisher of the metrics Lambda publishes about its own work — on the function a
 /// batch is handed to and on the event source mapping that polled it — held by the poller
 /// doing that work.
@@ -322,6 +394,34 @@ impl FunctionMetrics {
     /// shard when it was read.
     pub fn publish_iterator_age(&self, function_name: &str, age_millis: f64) {
         self.publish(ITERATOR_AGE_METRIC, function_name, age_millis, ITERATOR_AGE_UNIT);
+    }
+
+    /// Publish the ONE invocation of `function_name` that was admitted to the function,
+    /// addressed as `resource` ([`invoked_resource`]): a single observation of
+    /// [`INVOCATIONS_METRIC`], counting that one invocation.
+    ///
+    /// It is published TWICE, once in each of the dimension sets the invocation belongs to —
+    /// the function's own ([`function_dimensions`]) and the invoked resource's
+    /// ([`resource_dimensions`]) — because "a metric is uniquely defined by a name, a
+    /// namespace, and zero or more dimensions", so a reader asking for the function's
+    /// invocations and one asking for an alias's are asking for two different series and
+    /// each must carry the invocations it is of. Both observations are taken at the same
+    /// instant, so a window sums the same count over either.
+    pub fn publish_invocation(&self, function_name: &str, resource: &str) {
+        let at_secs = cloudwatch::now_secs();
+        for dimensions in [
+            function_dimensions(function_name),
+            resource_dimensions(function_name, resource),
+        ] {
+            self.publish_series(
+                INVOCATIONS_METRIC,
+                dimensions,
+                1.0,
+                COUNT_UNIT,
+                at_secs,
+                function_name,
+            );
+        }
     }
 
     /// Publish that ONE invocation of the function `function_name` names was dropped by

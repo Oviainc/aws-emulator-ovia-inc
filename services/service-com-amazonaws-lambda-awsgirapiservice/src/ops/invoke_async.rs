@@ -13,7 +13,9 @@
 //! An invocation Lambda's recursive-loop guardrail STOPS is accepted the same way and
 //! never delivered: the event is held with the outcome that records the guardrail stopped
 //! it, and the stop is metered as one `RecursiveInvocationsDropped` datapoint for the
-//! function (`crate::state::recursion`).
+//! function (`crate::state::recursion`). An invocation nothing stopped is one Lambda
+//! admitted to the function, and is metered as one `Invocations` datapoint of the function
+//! and of the resource this call addressed (`crate::state::metrics`).
 //!
 //! ## Shape of an operation
 //!
@@ -349,6 +351,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stopped = crate::state::guardrail(record, chain.as_deref(), now)
             == crate::state::Guardrail::Stopped;
         let function_name = record.config.name.clone();
+        let resource = crate::state::invoked_resource(&function_name, &version);
         if stopped {
             record.record_stopped_async_invocation(&version, input.invoke_args, now);
         } else {
@@ -357,6 +360,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         drop(store);
         if stopped {
             crate::state::publish_recursive_invocation_dropped(&*self.engine, &function_name);
+        } else {
+            // An invocation nothing stopped is one Lambda ADMITTED to the function, which is
+            // metered as one `Invocations` datapoint of the function and of the resource this
+            // call addressed (`crate::state::metrics`), exactly as `Invoke` meters its own.
+            crate::state::publish_invocation(&*self.engine, &function_name, &resource);
         }
 
         Ok(InvokeAsyncOutput {

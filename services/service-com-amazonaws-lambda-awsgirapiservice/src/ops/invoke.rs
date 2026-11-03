@@ -30,6 +30,12 @@
 //! delivered, and each is metered as one `RecursiveInvocationsDropped` datapoint for the
 //! function (`crate::state::recursion`).
 //!
+//! Every invocation the guardrail does NOT stop is one Lambda admits to the function, and
+//! each is metered as one `Invocations` datapoint of the function and of the resource the
+//! call addressed (`crate::state::metrics`), which is what a client reads to learn that a
+//! function is being invoked at all. The dry run is metered by neither series, because it
+//! invokes nothing.
+//!
 //! Running the deployment package is NOT implemented: this emulator has no in-process
 //! runtime for a Lambda zip archive or container image, so `RequestResponse` answers
 //! HTTP 501 rather than a payload no function produced, and a queued asynchronous
@@ -525,6 +531,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stopped = crate::state::guardrail(record, chain.as_deref(), now)
             == crate::state::Guardrail::Stopped;
         let function_name = record.config.name.clone();
+        // An invocation the guardrail did not stop is one Lambda ADMITS to the function, and
+        // every admitted invocation is metered as one `Invocations` datapoint of the function
+        // and of the resource this call addressed (`crate::state::metrics`). The count is of
+        // invocation requests that reached the function, whatever the execution each one
+        // started comes to, so it is published for the run this emulator refuses below as
+        // much as for one it serves — and never for a request refused before the function is
+        // reached (an unresolvable name, a function that cannot be invoked yet, a payload
+        // over the limit or not JSON, the dry run that returns above, a stopped invocation).
+        let resource = crate::state::invoked_resource(&function_name, &version);
 
         if invocation_type == INVOCATION_TYPE_EVENT {
             // An accepted event whose invocation the guardrail stopped is still ACCEPTED —
@@ -581,6 +596,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !started.deduplicated {
                 record.queue_async_invocation(&version, payload, now);
             }
+            drop(store);
+            // The de-duplicated repeat is the SAME invocation answered again rather than a
+            // second one, so it is not counted a second time either.
+            if !started.deduplicated {
+                crate::state::publish_invocation(&*self.engine, &function_name, &resource);
+            }
             return Ok(InvokeOutput {
                 status_code: ACCEPTED_STATUS,
                 payload: Some(Vec::new()),
@@ -605,6 +626,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // The invocation is admitted to the function at this point, so it is metered before
+        // the run is attempted: the datapoint counts this invocation request, and reports
+        // nothing about what the execution produced.
+        drop(store);
+        crate::state::publish_invocation(&*self.engine, &function_name, &resource);
 
         // RequestResponse means "run the deployment package and answer with what it
         // returned". This emulator has no in-process runtime that can, and a response

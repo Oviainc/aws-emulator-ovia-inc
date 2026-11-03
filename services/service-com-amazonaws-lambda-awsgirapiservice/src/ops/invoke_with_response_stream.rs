@@ -43,7 +43,9 @@
 //! back round into this function is stopped when the function's recursive loop detection
 //! configuration is `Terminate`, which is the modelled `RecursiveInvocationException` and
 //! one `RecursiveInvocationsDropped` datapoint for the function
-//! (`crate::state::recursion`). This emulator has no in-process runtime that can run a deployment
+//! (`crate::state::recursion`). An invocation nothing stopped is one Lambda admitted to the
+//! function, metered as one `Invocations` datapoint of the function and of the resource this
+//! call addressed (`crate::state::metrics`). This emulator has no in-process runtime that can run a deployment
 //! package (the same gap `crate::ops::invoke` states for the same reason), and a chunk
 //! sequence, a trailer error code or a log tail invented for a handler that never ran would
 //! be indistinguishable from a real one — so that path is refused, naming the function and
@@ -373,11 +375,18 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         let stopped = crate::state::guardrail(record, chain.as_deref(), now)
             == crate::state::Guardrail::Stopped;
         let function_name = record.config.name.clone();
+        let resource = crate::state::invoked_resource(&function_name, &version);
         drop(store);
         if stopped {
             crate::state::publish_recursive_invocation_dropped(&*self.engine, &function_name);
             return Err(recursive_invocation());
         }
+        // The invocation is admitted to the function at this point, so it is metered as one
+        // `Invocations` datapoint of the function and of the resource this call addressed
+        // (`crate::state::metrics`) before the run is attempted: the count is of invocation
+        // requests that reached the function, and says nothing about what the execution
+        // produced.
+        crate::state::publish_invocation(&*self.engine, &function_name, &resource);
 
         // Running the deployment package is what this path means, and this emulator has no
         // in-process runtime for one; see the module docs.

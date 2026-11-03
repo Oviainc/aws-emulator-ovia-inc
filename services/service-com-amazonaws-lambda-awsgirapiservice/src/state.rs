@@ -228,6 +228,7 @@ pub use capacity_provider::{
 /// `crate::state::…`.
 pub mod event_source_poller;
 pub mod metrics;
+pub use metrics::{invoked_resource, publish_invocation};
 pub mod sqs_poller;
 pub use sqs_poller::{drive_sqs_pollers, poll_due, PollSession, POLL_INTERVAL};
 
