@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: deletes the stored domain, and with it everything [`crate::state`]
+//! scopes to that domain.
+//! It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +145,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDomain"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteDomainErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The domain is resolved against the store before anything is dropped, so a
+        // domainId this store does not hold is the modelled 404 rather than a silent
+        // success. The delete is a HARD one — the documented effect is that the
+        // domain is deleted, and that Cases can be used with the Amazon Connect
+        // instance again only after the deleted domain is disassociated from it — so
+        // the record goes, taking the fields, templates, layouts and cases scoped to
+        // it with it, and a repeat of the call finds nothing left to delete.
+        store
+            .remove_domain(&input.domain_id)
+            .map_err(DeleteDomainErrorModeled::ResourceNotFoundException)?;
+
+        // The documented success: HTTP 200 with an empty body.
+        Ok(DeleteDomainOutput {})
     }
 }

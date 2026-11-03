@@ -19,6 +19,8 @@ mod case_event_configuration;
 mod case_lifecycle;
 #[path = "all/case_search.rs"]
 mod case_search;
+#[path = "all/domain_deletion.rs"]
+mod domain_deletion;
 #[path = "all/domain_listing.rs"]
 mod domain_listing;
 #[path = "all/field_deletion.rs"]

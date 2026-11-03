@@ -569,6 +569,28 @@ impl ComAmazonawsConnectcasesAmazonconnectcasesState {
         }
     }
 
+    /// Delete the domain `domain_id` names, with everything scoped to it (its
+    /// fields, templates, layouts, cases and their related items and audit
+    /// history), or answer the modelled 404 for a domain this store does not
+    /// hold.
+    ///
+    /// The domain is the container every other resource of this service hangs
+    /// off, so dropping the record drops the whole subtree with it: nothing can
+    /// resolve a resource of a domain that no longer exists. The remembered
+    /// `CreateCase` tokens of that domain go too — a token that outlived its
+    /// domain would answer a replay with the id of a case nothing holds.
+    pub fn remove_domain(&mut self, domain_id: &str) -> Result<Domain, ResourceNotFoundException> {
+        let removed = self
+            .domains
+            .remove(domain_id)
+            .ok_or_else(|| not_found("Domain", domain_id))?;
+        self.case_idempotency
+            .retain(|(domain, _), _| domain != domain_id);
+        self.idempotency_order
+            .retain(|(domain, _)| domain != domain_id);
+        Ok(removed)
+    }
+
     /// Forget every token that resolved to `case_id` in `domain_id`, so a
     /// replay cannot answer with the id of a case that no longer exists.
     pub fn forget_idempotent_case(&mut self, domain_id: &str, case_id: &str) {
