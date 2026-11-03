@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInternetGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInternetGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInternetGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one internet gateway and stores it in [`crate::state`], where
+//! `DescribeInternetGateways` reports it from. The gateway is answered attached to no VPC —
+//! "After creating the internet gateway, you attach it to a VPC using AttachInternetGateway"
+//! — so its attachment set comes back EMPTY, and it carries the tags the request's
+//! `TagSpecifications` assign to it.
+//!
+//! The request names nothing else: this operation takes no `ClientToken`, so a repeat of it
+//! is a second gateway rather than a replay of the first.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +135,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInternetGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInternetGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInternetGateway"))
+        use crate::state;
+
+        // `ctx` carries request metadata only, and nothing about an internet gateway is a
+        // fact of the Region (the modelled `InternetGateway` carries no Region or ARN
+        // member), so this operation reads none of it. The store is reached through the
+        // engine held on `self`.
+        let _ = ctx;
+
+        // "The tags to assign to the internet gateway"
+        // (`CreateInternetGatewayRequest$TagSpecifications`) — the shared reader refuses a
+        // specification naming any other resource type and holds the payload to the
+        // documented bounds.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::INTERNET_GATEWAY_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+
+        // The caller-chosen bytes this create would retain, counted by the ONE definition of
+        // that charge, so the gate below asks exactly what the insert will take.
+        let payload_bytes = state::internet_gateway_payload_bytes(&tags);
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds the tag text the caller chose the length of.
+        // Both are the bounds `insert_internet_gateway` itself enforces, asked HERE so the
+        // refusal names what is full and so a dry run of a create the store has no room for
+        // is refused with that reason.
+        if !store.has_internet_gateway_capacity() {
+            return Err(state::internet_gateway_limit_exceeded(format!(
+                "This emulator holds {max} internet gateways, which is as many as it stores",
+                max = state::MAX_STORED_RECORDS_PER_STORE,
+            )));
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::internet_gateway_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation"
+        // (`CreateInternetGatewayRequest$DryRun`). Nothing has been written yet, and nothing
+        // is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let Some(internet_gateway_id) = store.insert_internet_gateway(tags) else {
+            // Unreachable: both bounds the insert enforces were asked above, and the store
+            // is locked throughout. Answered rather than unwrapped, so a store at a ceiling
+            // can only ever refuse.
+            return Err(state::internet_gateway_limit_exceeded(
+                "This emulator has no room for another internet gateway",
+            ));
+        };
+
+        // The answer is the record as it was stored, so `CreateInternetGateway` and
+        // `DescribeInternetGateways` cannot drift apart.
+        let Some(internet_gateway) = store.internet_gateways.get(&internet_gateway_id).cloned()
+        else {
+            return Err(state::internal_error(
+                "the internet gateway just created could not be read back",
+            ));
+        };
+        Ok(CreateInternetGatewayOutput {
+            internet_gateway: Some(internet_gateway),
+        })
     }
 }

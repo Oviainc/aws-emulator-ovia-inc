@@ -1656,6 +1656,25 @@
 //! (`CreatePlacementGroup`) with nothing to provision, so it is stored `available` and no
 //! clock-owed move is recorded for it.
 //!
+//! ## Internet gateways
+//!
+//! [`ComAmazonawsEc2Amazonec2State::internet_gateways`] holds the account's internet
+//! gateways as the modelled [`InternetGateway`] shape itself, keyed by `InternetGatewayId`,
+//! for the reason [`ComAmazonawsEc2Amazonec2State::vpcs`] holds VPCs that way:
+//! `CreateInternetGateway` and `DescribeInternetGateways` answer the same shape, so storing
+//! it is what stops them reporting one gateway differently. A gateway has nothing to
+//! provision and no status member at all, so the clock owes one nothing; it starts life
+//! attached to no VPC, an attachment being what `AttachInternetGateway` records on it later.
+//! The store's own primitives live in the [`internet_gateways`] module.
+//!
+//! Nothing here gives the ambient default network of a Region the internet gateway AWS
+//! attaches to a default VPC, so an unfiltered `DescribeInternetGateways` on an account that
+//! created none reports an empty set where AWS reports that one: the gateway AWS gives a
+//! default VPC is an ATTACHED one, and the attachment seam it needs is
+//! `AttachInternetGateway`, which is still a scaffold (`src/ops/attach_internet_gateway.rs`
+//! carries the stub marker). Seeding it here would write an attachment no implemented
+//! operation owns, so it belongs with that operation rather than with this store.
+//!
 //! ## Infrastructure Performance metric subscriptions
 //!
 //! [`ComAmazonawsEc2Amazonec2State::network_performance_subscriptions`] holds the
@@ -1711,7 +1730,8 @@ use crate::ops::types::{
     IpamResourceDiscovery, IpamResourceDiscoveryAssociation, IpamResourceTag,
     IpamRoutingPolicyRegistration, IpamRoutingPolicyRegistrationDelta, IpamScope,
     MemoryInfo, NetworkInfo, NitroTpmInfo, PlacementGroupInfo, ProcessorInfo, VCpuInfo,
-    InstanceState, InstanceTypeOffering, InterruptibleCapacityAllocation, InterruptionInfo,
+    InstanceState, InstanceTypeOffering, InternetGateway, InterruptibleCapacityAllocation,
+    InterruptionInfo,
     IpPermission, IpRange, Ipv6Range,
     LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, MacModificationTask, MacSystemIntegrityProtectionConfiguration,
@@ -1770,6 +1790,13 @@ pub use image_recycle_bin::{RecycledImageRecord, recycled_image, require_recycle
 /// `crate::state::<item>` like every other primitive of this module.
 pub mod network_acls;
 pub use network_acls::*;
+
+/// The internet gateway store's own primitives — the id prefix, the `ResourceType` a tag
+/// specification may name, the bounds, the byte charge, the one writer and the error channel
+/// `CreateInternetGateway` and `DescribeInternetGateways` share. Re-exported, so a handler
+/// reaches them as `crate::state::<item>` like every other primitive of this module.
+pub mod internet_gateways;
+pub use internet_gateways::*;
 
 /// The Traffic Mirror filter store's own primitives — the id prefix, the bounds, the byte
 /// charge and the error channel `CreateTrafficMirrorFilter` and
@@ -3609,6 +3636,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// network ACL, so [`Self::insert_vpc`] writes it and [`Self::remove_vpc`] takes it
     /// away. See the `Network ACLs` section at the end of this module.
     pub network_acls: BTreeMap<String, NetworkAcl>,
+    /// Every internet gateway the account holds, by `InternetGatewayId`, as the modelled
+    /// [`crate::ops::types::InternetGateway`] shape itself — so a member a writer sets
+    /// round-trips through `DescribeInternetGateways` without a field-by-field copy that can
+    /// silently drop one, the way [`Self::network_acls`] holds an ACL. Ordered by id, the one
+    /// stable order the describe reports and pages over, so a pagination token can name the
+    /// id the next page starts at.
+    ///
+    /// A fresh account holds NONE here: `CreateInternetGateway` is what creates one. See the
+    /// [`internet_gateways`] module for the store's own primitives.
+    pub internet_gateways: BTreeMap<String, InternetGateway>,
     /// Every network interface the account holds, by `NetworkInterfaceId`, as the modelled
     /// [`NetworkInterface`] shape itself — the same reason the VPC and subnet stores hold
     /// their modelled shapes: a member a writer sets round-trips through
@@ -4811,6 +4848,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // `insert_vpc` writes as each VPC is stored — including the default VPC the
             // default network below seeds.
             network_acls: BTreeMap::new(),
+            // Nothing in AWS gives an account an internet gateway until something asks for
+            // one, so a fresh account holds none.
+            internet_gateways: BTreeMap::new(),
             network_interfaces: BTreeMap::new(),
             network_interfaces_by_instance: BTreeMap::new(),
             network_interface_client_tokens: HashMap::new(),
@@ -11274,6 +11314,17 @@ const MAC_HOSTS: [(&str, i32, i64); 9] = [
 /// a new AWS size does not need it changed.
 pub const MAX_SIZE_MULTIPLE: u32 = 512;
 
+/// The largest High Memory size, in TiB, this module will read out of a family token.
+///
+/// AWS's published High Memory families top out at 32 TiB (`u7in-32tb`), so a token above
+/// this ceiling names no instance type AWS offers. The ceiling is what BOUNDS the
+/// arithmetic in [`stated_memory_gib`], exactly as [`MAX_SIZE_MULTIPLE`] bounds the size
+/// component's: the family token is TEXT, so a figure near `i64::MAX` would otherwise
+/// overflow the conversion into GiB and then into MiB — a panic where overflow checks are
+/// on, a wrapped figure where they are off, reported as `MemoryInfo`. It sits well above
+/// the published families so a larger one does not need it changed.
+pub const MAX_STATED_MEMORY_TIB: i64 = 256;
+
 /// The size component of an instance type name, in SIXTEENTHS of the family's `large`
 /// size.
 ///
@@ -11419,7 +11470,15 @@ fn stated_memory_gib(family: &str) -> Option<i64> {
     if !token[digits..].starts_with("tb") {
         return None;
     }
-    token[..digits].parse::<i64>().ok().map(|tib| tib * 1024)
+    token[..digits]
+        .parse::<i64>()
+        .ok()
+        // A figure above the ceiling is not a High Memory size at all, so it is answered
+        // `None` the way any other unreadable token is, rather than multiplied out;
+        // `checked_mul` is what makes the bound structural rather than a comment, the same
+        // pair `instance_size_sixteenths` holds the size component to.
+        .filter(|tib| *tib <= MAX_STATED_MEMORY_TIB)
+        .and_then(|tib| tib.checked_mul(1024))
 }
 
 /// The vCPUs and memory of the EC2 Mac host `family` names, if it is one.
@@ -11474,7 +11533,10 @@ fn default_threads_per_core(
 /// The memory of one size of one family, in MiB.
 fn memory_mib_of(name: &InstanceTypeName<'_>, sixteenths: u32) -> i64 {
     if let Some(gib) = stated_memory_gib(name.family) {
-        return gib * 1024;
+        // Bounded by `MAX_STATED_MEMORY_TIB`, so this product cannot overflow; the
+        // saturating form is what keeps that true if the ceiling ever moves, like the arm
+        // below.
+        return gib.saturating_mul(1024);
     }
     // Bounded by `MAX_SIZE_MULTIPLE` like the vCPU count above, and saturating for the same
     // reason.

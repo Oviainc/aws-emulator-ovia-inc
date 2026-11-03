@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// An account's internet gateways: what `CreateInternetGateway` stores and
+// `DescribeInternetGateways` reports back out of that store — the id, the owning account, the
+// empty attachment set, the tags, and how the id list, the documented filters and the page
+// size narrow the report. Declared beside `prefix_lists` for the reason the note above gives.
+#[path = "all/internet_gateways.rs"]
+mod internet_gateways;
 // What `DescribeNatGateways` reports out of the NAT gateway store: every member a stored
 // gateway holds, how the id list, the documented filters and the page size narrow it, what it
 // refuses, and the address status the clock owes a gateway it is read through. Declared beside
