@@ -12,6 +12,25 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::Instance;
 
+/// The sentence AWS Supply Chain refuses the Product Bill Of Materials (BOM) import API
+/// with: that API is WITHDRAWN, so both of its operations
+/// (`CreateBillOfMaterialsImportJob` and `GetBillOfMaterialsImportJob`) answer the
+/// modelled `AccessDeniedException` (HTTP 403) carrying it.
+///
+/// Its SOURCE is the recorded wire response of this API — the recorded unit
+/// `supplychain.bom-import-job-fails-without-s3-access` probes both halves of it and both
+/// answer this sentence. The model declares no deprecation and fixes no text, and the
+/// operations' own documentation still describes creating and reading an import job, so a
+/// later reader re-verifies this against a recording rather than against the model. The
+/// whole sentence is FIXED: it names the API that has been withdrawn and the channel to
+/// ask about it, and carries nothing from the request, so no part of it is interpolated.
+/// Stated once, here, so the two operations cannot drift into two sentences for one
+/// refusal.
+pub const WITHDRAWN_BOM_IMPORT_API_MESSAGE: &str = "This API has been deprecated. Please contact \
+                                                    ASC support team at \
+                                                    https://aws.amazon.com/contact-us/ for more \
+                                                    details.";
+
 /// `InstanceState` as the model spells it: a freshly created instance is still being
 /// built. `CreateInstance`'s own documentation — "Upon receiving a CreateInstance
 /// request, Amazon Web Services Supply Chain immediately returns the instance resource,

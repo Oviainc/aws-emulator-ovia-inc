@@ -381,9 +381,11 @@ async fn new_material_for_a_key_whose_material_expired_becomes_current() {
     let metadata = create_key(&router, &json!({"Origin": "EXTERNAL"})).await;
     let key_id = text("setup", &metadata, "KeyId");
 
-    // The first material, stated to expire at the next second the wire can carry: the
-    // shortest expiry a caller can ask for, so the clock makes the deletion due during
-    // the test rather than being waited out.
+    // The first material, stated to expire a couple of seconds out: short enough that
+    // the clock makes the deletion due DURING the test rather than being waited out, and
+    // far enough ahead that the import itself still lands inside the window on a loaded
+    // machine — `ValidTo` is refused unless it is in the future when the handler reads
+    // it, so a sub-second margin races the request it travels in.
     let expiring = random_bytes(SYMMETRIC_MATERIAL_LEN).expect("entropy");
     let (public_key, token) =
         parameters_for(&router, "setup", &key_id, "RSAES_OAEP_SHA_256").await;
@@ -393,7 +395,7 @@ async fn new_material_for_a_key_whose_material_expired_becomes_current() {
         .expect("the clock is after the epoch")
         .as_secs_f64()
         .trunc()
-        + 1.0;
+        + 3.0;
     ok(
         &router,
         "ImportKeyMaterial",
@@ -408,8 +410,8 @@ async fn new_material_for_a_key_whose_material_expired_becomes_current() {
     .await;
 
     // The expiry is a deletion the CLOCK makes due, so once it passes the key reports
-    // that it is waiting for material again.
-    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    // that it is waiting for material again. The wait clears the whole margin above.
+    tokio::time::sleep(std::time::Duration::from_millis(3_500)).await;
     let described = describe(&router, &key_id).await;
     assert_eq!(
         described["KeyState"].as_str().unwrap_or_default(),
