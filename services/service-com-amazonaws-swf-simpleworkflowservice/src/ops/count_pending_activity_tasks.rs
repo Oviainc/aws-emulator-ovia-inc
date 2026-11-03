@@ -6,9 +6,9 @@
 //! from the persisted history of that domain's runs — one per `ActivityTaskScheduled`
 //! event naming the list that nothing has taken out of it — exactly as
 //! `CountPendingDecisionTasks` counts decision tasks. A task list is not a registered
-//! resource, so a list nothing has ever scheduled in counts 0; only the DOMAIN can be
-//! unknown, which is the modelled `UnknownResourceFault`. Counting is a pure read: it
-//! takes no task out of a list.
+//! resource, so a list nothing has ever scheduled in counts 0 — including a list named
+//! in a domain this service holds no record of, which holds no waiting task either.
+//! Counting is a pure read: it takes no task out of a list.
 //!
 //! ## Shape of an operation
 //!
@@ -175,20 +175,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // materialised: a timed-out run is closed, and a closed run has no task waiting
         // in any list.
         guard.materialise_due_timeouts_in(&input.domain, swept_at);
-        // A task list lives inside a domain, so an unregistered domain name addresses
-        // no task list at all: that is the modelled `UnknownResourceFault`. The
-        // documented zero ("If you specify a task list that no activity task was ever
-        // scheduled in then 0 is returned") is about the LIST within a known domain,
-        // not about the domain. A deprecated domain is still a known one: deprecation
-        // stops new registrations and starts, while the runs already in it keep their
-        // tasks.
-        let domain = guard.domains.get(&input.domain).ok_or_else(|| {
-            CountPendingActivityTasksErrorModeled::UnknownResourceFault(UnknownResourceFault {
-                message: Some(format!("Unknown domain: {}", input.domain)),
-            })
-        })?;
-
-        let pending = domain.pending_activity_tasks_on(&input.task_list.name);
+        // "Returns the estimated number of activity tasks in the specified task list ...
+        // If you specify a task list that no activity task was ever scheduled in then 0
+        // is returned." A task list is not a registered resource — it comes into being
+        // with the first task scheduled in it — so a name no task was ever scheduled
+        // under holds nothing, whether that is because the domain holds no such list or
+        // because it holds no such domain at all: either way the documented zero is the
+        // count of what is waiting. A deprecated domain is counted the same way:
+        // deprecation stops new registrations and starts, while the runs already in it
+        // keep their tasks.
+        let pending = guard
+            .domains
+            .get(&input.domain)
+            .map_or(0, |domain| domain.pending_activity_tasks_on(&input.task_list.name));
 
         // `truncated` reports a count clipped to the most this API answers with, the
         // same bound every `Count*` operation of this service reports at.

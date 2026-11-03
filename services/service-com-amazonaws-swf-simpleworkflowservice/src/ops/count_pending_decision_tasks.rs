@@ -8,7 +8,9 @@
 //! no task and decides nothing; the one thing it writes is what the CLOCK already made
 //! due, timing out a decision task whose own `startToCloseTimeout` ran out (and
 //! scheduling its replacement in the same list) before counting. A list no decision task
-//! was ever scheduled in answers 0, as the operation's own doc states.
+//! was ever scheduled in answers 0, as the operation's own doc states — including a list
+//! named in a domain this service holds no record of, which likewise holds no waiting
+//! task.
 //!
 //! ## Shape of an operation
 //!
@@ -175,31 +177,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // materialised: a timed-out run is closed, and a closed run has no task waiting
         // in any list.
         guard.materialise_due_timeouts_in(&input.domain, now);
-        // A task list lives inside a domain, so an unregistered domain name addresses
-        // no task list at all: that is the modelled `UnknownResourceFault` ("Returned
-        // when the named resource cannot be found with in the scope of this operation
-        // (region or domain)"), the same answer `ListOpenWorkflowExecutions` and the
-        // execution readers give it. The documented zero ("If you specify a task list
-        // that no decision task was ever scheduled in then 0 is returned") is about the
-        // LIST within a known domain, not about the domain.
+        // "Returns the estimated number of decision tasks in the specified task list ...
+        // If you specify a task list that no decision task was ever scheduled in then 0
+        // is returned." A task list is not a registered resource — it comes into being
+        // with the first task scheduled in it — so a name no task was ever scheduled
+        // under holds nothing, whether that is because the domain holds no such list or
+        // because it holds no such domain at all: either way the documented zero is the
+        // count of what is waiting.
         //
-        // A deprecated domain is still a known one: deprecation stops new registrations
-        // and starts, while the runs already in it keep their tasks.
-        let domain = guard.domains.get_mut(&input.domain).ok_or_else(|| {
-            CountPendingDecisionTasksErrorModeled::UnknownResourceFault(UnknownResourceFault {
-                message: Some(format!("Unknown domain: {}", input.domain)),
-            })
-        })?;
-
+        // A deprecated domain is counted the same way: deprecation stops new
+        // registrations and starts, while the runs already in it keep their tasks.
+        //
         // A decision task handed to a decider and not completed within its own
         // `startToCloseTimeout` is timed out — and a replacement scheduled in the same
         // list — at the instant that duration ran out, whether or not anybody calls.
         // Counting materialises what the clock already made due, so the count reports
         // the tasks waiting NOW rather than a view that expires unread; it decides
         // nothing itself and takes no task out of any list.
-        domain.expire_due_decision_tasks(now);
-
-        let pending = domain.pending_decision_tasks_on(&input.task_list.name);
+        let pending = match guard.domains.get_mut(&input.domain) {
+            Some(domain) => {
+                domain.expire_due_decision_tasks(now);
+                domain.pending_decision_tasks_on(&input.task_list.name)
+            }
+            None => 0,
+        };
 
         // `truncated` reports a count clipped to the most this API answers with. Every
         // waiting decision task belongs to one of the domain's open runs, so the cap on

@@ -198,12 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is the modelled `DomainAlreadyExistsFault` ("You may get this fault if you are
         // registering a domain that is either already registered or deprecated, or if
         // you undeprecate a domain that is currently registered"), and the stored record
-        // is left exactly as it was. The message names the requested domain, in the same
-        // form `RegisterDomain` reports this fault with.
+        // is left exactly as it was. The fault IDENTIFIES the domain that already
+        // exists: its whole message is the requested name, in the same form
+        // `RegisterDomain` reports this fault with.
         if !domain.is_deprecated() {
             return Err(UndeprecateDomainErrorModeled::DomainAlreadyExistsFault(
                 DomainAlreadyExistsFault {
-                    message: Some(format!("the domain {} already exists", input.name)),
+                    message: Some(input.name.clone()),
                 },
             )
             .into());

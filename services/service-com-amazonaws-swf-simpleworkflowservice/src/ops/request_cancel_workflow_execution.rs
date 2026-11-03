@@ -14,11 +14,12 @@
 //! a caller from growing the stored history once per call for as long as a run stays
 //! open.
 //!
-//! SWF keeps at most one decision task outstanding per execution, and in this slice
-//! every open run still has the decision task its start scheduled (nothing consumes
-//! one — `PollForDecisionTask`/`RespondDecisionTaskCompleted` are still 501), so no
-//! further decision task is ever owed here; scheduling the decider's reaction belongs
-//! to those operations' own issues.
+//! The event is one "the decider [must] take appropriate actions when it receives an
+//! execution history with", and a decider only ever receives a history through a
+//! decision task, so the request also makes that reaction pollable: it schedules a
+//! decision task on the run's effective task list. SWF keeps at most one decision task
+//! outstanding per execution, so a run that already has one in flight gets no second —
+//! the history that task's decider is handed carries this event anyway.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -196,10 +197,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(unknown().into());
         };
-        let Some(execution) = domain
-            .executions
-            .get_mut(&(input.workflow_id.clone(), run_id))
-        else {
+        let key = (input.workflow_id.clone(), run_id);
+        let Some(execution) = domain.executions.get_mut(&key) else {
             return Err(unknown().into());
         };
         // Only a "currently running workflow execution" can be asked to cancel; a run
@@ -219,29 +218,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(RequestCancelWorkflowExecutionOutput);
         }
 
+        // Amazon SWF Quotas bounds one run's history, and a run that reaches that bound
+        // is TERMINATED by the service rather than grown further. This request records
+        // the cancel-requested event and the decision task that carries it to a decider,
+        // so a run without room for both is closed instead — and a closed run is out of
+        // this operation's scope, exactly as above.
+        if !execution.has_history_room_for(2) {
+            domain.close_run(
+                &key,
+                crate::state::RunClose::event_limit_exceeded(),
+                requested_at,
+            );
+            return Err(unknown().into());
+        }
+        let Some(execution) = domain.executions.get_mut(&key) else {
+            return Err(unknown().into());
+        };
+
         // The run stays OPEN and keeps its close status absent: this call only
         // "logically requests the cancellation of the workflow execution as a whole. It
         // is up to the decider to take appropriate actions when it receives an execution
-        // history with this event."
-        execution.cancel_requested = true;
-        execution.append_event(
+        // history with this event." Recording the event and scheduling the decision task
+        // that carries it to a decider is the shared state path every requester of a
+        // cancellation takes.
+        execution.request_cancel(
+            WorkflowExecutionCancelRequestedEventAttributes {
+                // Both members describe a request made by ANOTHER execution's
+                // `RequestCancelExternalWorkflowExecution` decision; this request
+                // came straight from the caller, so there is no external execution
+                // and no initiating event. `externalInitiatedEventId` models a
+                // default of 0, which is that "no initiating event" value.
+                external_workflow_execution: None,
+                external_initiated_event_id: 0,
+                // `cause` is set only when SWF generated the request itself ("If
+                // set, indicates that the request to cancel the workflow execution
+                // was automatically generated"), its one modelled value being
+                // CHILD_POLICY_APPLIED. This call is the caller's own.
+                cause: None,
+            },
             requested_at,
-            crate::state::EventAttributes::WorkflowExecutionCancelRequested(
-                WorkflowExecutionCancelRequestedEventAttributes {
-                    // Both members describe a request made by ANOTHER execution's
-                    // `RequestCancelExternalWorkflowExecution` decision; this request
-                    // came straight from the caller, so there is no external execution
-                    // and no initiating event. `externalInitiatedEventId` models a
-                    // default of 0, which is that "no initiating event" value.
-                    external_workflow_execution: None,
-                    external_initiated_event_id: 0,
-                    // `cause` is set only when SWF generated the request itself ("If
-                    // set, indicates that the request to cancel the workflow execution
-                    // was automatically generated"), its one modelled value being
-                    // CHILD_POLICY_APPLIED. This call is the caller's own.
-                    cause: None,
-                },
-            ),
         );
 
         Ok(RequestCancelWorkflowExecutionOutput)

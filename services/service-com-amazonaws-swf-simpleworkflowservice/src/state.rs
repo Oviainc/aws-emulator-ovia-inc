@@ -1998,6 +1998,34 @@ impl Execution {
         Some(event_id)
     }
 
+    /// Latch a cancellation request on this run as of `at`: the one
+    /// `WorkflowExecutionCancelRequested` event that records it, and the decision task
+    /// the decider answers it in. Returns the `eventId` of the appended event.
+    ///
+    /// The ONE place a cancellation request is recorded, shared by every way SWF delivers
+    /// one — a caller's `RequestCancelWorkflowExecution`, another run's
+    /// `RequestCancelExternalWorkflowExecution` decision, and a parent's
+    /// `REQUEST_CANCEL` child policy. "It is up to the decider to take appropriate
+    /// actions when it receives an execution history with this event", and a decider only
+    /// ever receives a history through a decision task, so recording the event and making
+    /// the decider's reaction pollable are one step. The one-decision-task-per-execution
+    /// rule stays [`Execution::schedule_decision_task_if_idle`]'s: a run that already has
+    /// one in flight gets no second one, because the history that task's decider is
+    /// handed carries this event anyway.
+    pub fn request_cancel(
+        &mut self,
+        attributes: WorkflowExecutionCancelRequestedEventAttributes,
+        at: DateTime,
+    ) -> i64 {
+        self.cancel_requested = true;
+        let event_id = self.append_event(
+            at,
+            EventAttributes::WorkflowExecutionCancelRequested(attributes),
+        );
+        self.schedule_decision_task_if_idle(at);
+        event_id
+    }
+
     /// Fire every timer of this run the clock has already made due at `now`: "This timer
     /// fires after the specified delay and record a `TimerFired` event." Each event is
     /// stamped at the instant its own `startToFireTimeout` ran out, whether or not
@@ -2816,20 +2844,16 @@ impl Domain {
             if !execution.has_history_room_for(2) {
                 continue;
             }
-            execution.cancel_requested = true;
-            execution.append_event(
+            execution.request_cancel(
+                WorkflowExecutionCancelRequestedEventAttributes {
+                    // The request came from the parent's policy, not from another
+                    // run's decision, so no external execution initiated it.
+                    external_workflow_execution: None,
+                    external_initiated_event_id: 0,
+                    cause: Some(CAUSE_CHILD_POLICY_APPLIED.to_string()),
+                },
                 at,
-                EventAttributes::WorkflowExecutionCancelRequested(
-                    WorkflowExecutionCancelRequestedEventAttributes {
-                        // The request came from the parent's policy, not from another
-                        // run's decision, so no external execution initiated it.
-                        external_workflow_execution: None,
-                        external_initiated_event_id: 0,
-                        cause: Some(CAUSE_CHILD_POLICY_APPLIED.to_string()),
-                    },
-                ),
             );
-            execution.schedule_decision_task_if_idle(at);
         }
     }
 
@@ -3378,6 +3402,84 @@ pub fn unknown_domain_resource_message(resource_arn: &str) -> String {
 /// event either, and reports the `EventId` member's own modelled default of `0`.
 pub fn unknown_activity_message(scheduled_event_id: i64) -> String {
     format!("Unknown activity, scheduledEventId = {scheduled_event_id}")
+}
+
+/// The `UnknownResourceFault` message for a decision task a decider's completion
+/// addresses and that is no longer outstanding, while its run is still available:
+/// `Unknown decision task, scheduledEventId = <id>`.
+///
+/// The id is the `scheduledEventId` of the task the token names, taken from the stored
+/// `DecisionTaskStarted` event it addressed; a token that names no decision task of any
+/// stored run names no scheduling event either, and reports the `EventId` member's own
+/// modelled default of `0`. Built the same way, and for the same reason, as
+/// [`unknown_activity_message`]: the fault names the resource the lookup failed on, and
+/// the only pointer back to a task that is over is the history event that scheduled it.
+pub fn unknown_decision_task_message(scheduled_event_id: i64) -> String {
+    format!("Unknown decision task, scheduledEventId = {scheduled_event_id}")
+}
+
+/// What Amazon SWF reports when a request would carry a resource past the documented
+/// maximum of [`MAX_TAGS_PER_DOMAIN`] tags: one fixed sentence that names no part of the
+/// request and no part of the store, so every refusal of that bound reads the same
+/// whichever call tripped it and whichever bound tripped first.
+pub const TOO_MANY_TAGS_MESSAGE: &str = "Too many tags provided.";
+
+/// One decision task a decision `taskToken` is the handle on, as the stored history
+/// records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionTaskHandle {
+    pub domain: String,
+    pub workflow_id: String,
+    pub run_id: String,
+    /// The `eventId` of the `DecisionTaskScheduled` event that put the task in its list.
+    pub scheduled_event_id: i64,
+    /// The `eventId` of the `DecisionTaskStarted` event that handed it to a decider,
+    /// which is the identity the token is derived from.
+    pub started_event_id: i64,
+}
+
+/// The decision task `token` is the handle on, whether or not that task is still
+/// outstanding and whether or not its run is still open.
+///
+/// The token is derived from `(domain, workflowId, runId, startedEventId)`
+/// ([`decision_task_token`]), so the stored `DecisionTaskStarted` events ARE the record of
+/// which tokens were ever minted: a handle on a task that has since been completed or
+/// timed out still resolves here, which is what lets a decider's late completion be
+/// refused naming what it was holding rather than nothing at all. Whether the task is
+/// still outstanding is a separate question, answered by
+/// [`Execution::decision_task_is_outstanding`].
+pub fn decision_task_by_token(
+    guard: &ComAmazonawsSwfSimpleworkflowserviceState,
+    token: &str,
+) -> Option<DecisionTaskHandle> {
+    guard.domains.iter().find_map(|(name, domain)| {
+        domain.executions.values().find_map(|execution| {
+            execution
+                .history
+                .iter()
+                .filter_map(|event| match &event.attributes {
+                    EventAttributes::DecisionTaskStarted(started) => {
+                        Some((event.event_id, started.scheduled_event_id))
+                    }
+                    _ => None,
+                })
+                .find(|(started_event_id, _)| {
+                    decision_task_token(
+                        name,
+                        &execution.workflow_id,
+                        &execution.run_id,
+                        *started_event_id,
+                    ) == token
+                })
+                .map(|(started_event_id, scheduled_event_id)| DecisionTaskHandle {
+                    domain: name.clone(),
+                    workflow_id: execution.workflow_id.clone(),
+                    run_id: execution.run_id.clone(),
+                    scheduled_event_id,
+                    started_event_id,
+                })
+        })
+    })
 }
 
 /// One activity task an activity `taskToken` is the handle on, as the stored history

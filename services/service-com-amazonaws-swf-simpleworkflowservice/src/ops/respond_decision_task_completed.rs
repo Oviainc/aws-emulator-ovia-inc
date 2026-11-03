@@ -349,22 +349,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
 
         // `taskToken` is "the opaque string used as a handle on the task" and is derived
-        // from the task's own identity, so it is resolved by looking for the outstanding
-        // decision task whose identity produces it.
-        let unknown_token = || {
+        // from the task's own identity, so it is resolved by looking for the
+        // `DecisionTaskStarted` event whose identity produces it — whether or not that
+        // task is still outstanding, which is what lets a refusal name what the token was
+        // holding.
+        let unknown_task = |scheduled_event_id: i64| {
             RespondDecisionTaskCompletedErrorModeled::UnknownResourceFault(UnknownResourceFault {
-                message: Some(
-                    "Unknown decision task: the taskToken does not address a decision task \
-                     that is still outstanding"
-                        .to_string(),
-                ),
+                message: Some(crate::state::unknown_decision_task_message(
+                    scheduled_event_id,
+                )),
             })
         };
-        let Some((domain_name, workflow_id, run_id, started_event_id)) =
-            resolve_task_token(&guard, &input.task_token)
-        else {
-            return Err(unknown_token().into());
+        let Some(handle) = crate::state::decision_task_by_token(&guard, &input.task_token) else {
+            // The token names no `DecisionTaskStarted` event of any stored run, so there
+            // is no scheduling event of this service's state behind it either, and the
+            // `EventId` member's own modelled default of 0 is what names it.
+            return Err(unknown_task(0).into());
         };
+        // The two resources a stale handle can have lost, reported each as the one the
+        // lookup failed on: the EXECUTION when the addressed run is no longer available,
+        // and the decision task itself — by the `scheduledEventId` of the task the token
+        // addressed — while that run is still open.
+        let unknown_task = || unknown_task(handle.scheduled_event_id);
+        let unknown_execution = || {
+            RespondDecisionTaskCompletedErrorModeled::UnknownResourceFault(UnknownResourceFault {
+                message: Some(crate::state::unknown_execution_message(
+                    &handle.workflow_id,
+                    &handle.run_id,
+                )),
+            })
+        };
+        let (domain_name, started_event_id) = (handle.domain.clone(), handle.started_event_id);
 
         // The service's own sweeps, materialised before the token is honoured: a run the
         // clock closed, and a decision task the clock timed out, were over at their own
@@ -372,33 +387,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused instead of recording a completion into a history that moved on.
         guard.materialise_due_timeouts_in(&domain_name, now);
         let Some(domain) = guard.domains.get_mut(&domain_name) else {
-            return Err(unknown_token().into());
+            return Err(unknown_execution().into());
         };
         domain.expire_due_decision_tasks(now);
 
-        let key = (workflow_id, run_id);
+        let key = (handle.workflow_id.clone(), handle.run_id.clone());
         let Some(execution) = domain.executions.get_mut(&key) else {
-            return Err(unknown_token().into());
+            return Err(unknown_execution().into());
         };
-        if !execution.is_open() || !execution.decision_task_is_outstanding(started_event_id) {
-            return Err(unknown_token().into());
+        if !execution.is_open() {
+            return Err(unknown_execution().into());
+        }
+        if !execution.decision_task_is_outstanding(started_event_id) {
+            return Err(unknown_task().into());
         }
 
         // Amazon SWF Quotas bounds one run's history, and a run that reaches it is
         // TERMINATED by the service rather than grown further. This completion records
         // one event plus whatever its decisions record, so a run without room for them
-        // is closed instead — and a closed run has no decision task to complete.
+        // is closed instead — and the token then addresses a run that is gone.
         if !execution.has_history_room_for(2 + decisions.len() * EVENTS_PER_DECISION) {
             domain.close_run(&key, crate::state::RunClose::event_limit_exceeded(), now);
-            return Err(unknown_token().into());
+            return Err(unknown_execution().into());
         }
 
-        let scheduled_event_id = execution
-            .outstanding_decision_tasks()
-            .into_iter()
-            .find(|(_, started, _)| *started == started_event_id)
-            .map(|(scheduled, _, _)| scheduled)
-            .unwrap_or(0);
+        // The task's own scheduling event, as the handle the token resolved to recorded
+        // it: the `DecisionTaskCompleted` event names the task by both of its events.
+        let scheduled_event_id = handle.scheduled_event_id;
 
         // What the decider CANNOT have seen: whatever was recorded after the task it is
         // answering was handed over.
@@ -467,50 +482,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(RespondDecisionTaskCompletedOutput)
     }
-}
-
-/// The decision task a `taskToken` is the handle on: `(domain, workflowId, runId,
-/// startedEventId)`, or `None` when no outstanding decision task of any stored run
-/// produces that token.
-///
-/// The token is derived from exactly that identity
-/// ([`crate::state::decision_task_token`]), so the stored history IS the record of which
-/// tokens are live: a token whose task has been completed or timed out addresses nothing.
-///
-/// The search is over the runs this service holds, which is bounded by
-/// [`crate::state::MAX_DOMAINS`] domains of [`crate::state::MAX_EXECUTIONS_PER_DOMAIN`]
-/// runs each, and only over the runs that have a decision task in flight at all.
-fn resolve_task_token(
-    guard: &crate::state::ComAmazonawsSwfSimpleworkflowserviceState,
-    token: &str,
-) -> Option<(String, String, String, i64)> {
-    guard.domains.iter().find_map(|(name, domain)| {
-        domain
-            .executions
-            .values()
-            .filter(|execution| execution.is_open() && execution.open_decision_tasks != 0)
-            .find_map(|execution| {
-                execution
-                    .outstanding_decision_tasks()
-                    .into_iter()
-                    .find(|(_, started_event_id, _)| {
-                        crate::state::decision_task_token(
-                            name,
-                            &execution.workflow_id,
-                            &execution.run_id,
-                            *started_event_id,
-                        ) == token
-                    })
-                    .map(|(_, started_event_id, _)| {
-                        (
-                            name.clone(),
-                            execution.workflow_id.clone(),
-                            execution.run_id.clone(),
-                            started_event_id,
-                        )
-                    })
-            })
-    })
 }
 
 /// Refuse a decision this service cannot read as one: a `decisionType` outside the
@@ -1309,20 +1280,16 @@ fn request_cancel_external(
         run_id: key.1.clone(),
     };
     if let Some(execution) = domain.executions.get_mut(&target) {
-        execution.cancel_requested = true;
-        execution.append_event(
+        execution.request_cancel(
+            WorkflowExecutionCancelRequestedEventAttributes {
+                external_workflow_execution: Some(requester),
+                external_initiated_event_id: initiated_event_id,
+                // `cause` records a cancellation the SERVICE asked for under a
+                // parent's child policy; this one is another run's decision.
+                cause: None,
+            },
             at,
-            EventAttributes::WorkflowExecutionCancelRequested(
-                WorkflowExecutionCancelRequestedEventAttributes {
-                    external_workflow_execution: Some(requester),
-                    external_initiated_event_id: initiated_event_id,
-                    // `cause` records a cancellation the SERVICE asked for under a
-                    // parent's child policy; this one is another run's decision.
-                    cause: None,
-                },
-            ),
         );
-        execution.schedule_decision_task_if_idle(at);
     }
     record(
         domain,

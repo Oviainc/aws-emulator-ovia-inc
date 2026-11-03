@@ -17,6 +17,8 @@ mod activity_task_terminal_responses;
 mod activity_type_lifecycle;
 #[path = "all/activity_type_registration.rs"]
 mod activity_type_registration;
+#[path = "all/cooperative_cancellation.rs"]
+mod cooperative_cancellation;
 #[path = "all/count_open_workflow_executions.rs"]
 mod count_open_workflow_executions;
 #[path = "all/count_pending_decision_tasks.rs"]
@@ -43,6 +45,8 @@ mod domain_untagging;
 mod execution_record_projection;
 #[path = "all/execution_start_to_close_timeout.rs"]
 mod execution_start_to_close_timeout;
+#[path = "all/fixed_fault_message_text.rs"]
+mod fixed_fault_message_text;
 #[path = "all/list_activity_types.rs"]
 mod list_activity_types;
 #[path = "all/list_closed_workflow_executions.rs"]
@@ -51,6 +55,8 @@ mod list_closed_workflow_executions;
 mod list_open_workflow_executions;
 #[path = "all/pending_activity_task_count.rs"]
 mod pending_activity_task_count;
+#[path = "all/pending_task_count_unknown_domain.rs"]
+mod pending_task_count_unknown_domain;
 #[path = "all/poll_for_activity_task.rs"]
 mod poll_for_activity_task;
 #[path = "all/poll_for_decision_task.rs"]
@@ -67,6 +73,8 @@ mod respond_decision_task_completed;
 mod signal_history_pagination;
 #[path = "all/signal_workflow_execution.rs"]
 mod signal_workflow_execution;
+#[path = "all/stale_decision_task_token_refusals.rs"]
+mod stale_decision_task_token_refusals;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_resource_value_fidelity.rs"]

@@ -178,11 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if tags.len() > crate::state::MAX_TAGS_PER_DOMAIN {
             return Err(RegisterDomainErrorModeled::TooManyTagsFault(TooManyTagsFault {
-                message: Some(format!(
-                    "a domain accepts at most {} tags, got {}",
-                    crate::state::MAX_TAGS_PER_DOMAIN,
-                    tags.len()
-                )),
+                // The same fixed sentence `TagResource` refuses the same bound with:
+                // the fault names neither the count nor the resource.
+                message: Some(crate::state::TOO_MANY_TAGS_MESSAGE.to_string()),
             })
             .into());
         }
@@ -197,7 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if guard.domains.contains_key(&input.name) {
             return Err(RegisterDomainErrorModeled::DomainAlreadyExistsFault(
                 DomainAlreadyExistsFault {
-                    message: Some(format!("the domain {} already exists", input.name)),
+                    // The fault IDENTIFIES the domain that already exists: its whole
+                    // message is the requested name, with no text around it, which is
+                    // what lets a caller read the message as the resource identifier.
+                    message: Some(input.name.clone()),
                 },
             )
             .into());

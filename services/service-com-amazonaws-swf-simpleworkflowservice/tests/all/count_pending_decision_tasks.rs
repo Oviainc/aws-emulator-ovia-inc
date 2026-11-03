@@ -8,8 +8,8 @@
 //! tasks waiting in the named domain's task list — one per decision task scheduled on
 //! that list by a run of that domain that is still OPEN and that nothing has taken out
 //! of the list — so a list no decision task was ever scheduled in answers 0, a list
-//! named in another domain contributes nothing, an unregistered domain is the modelled
-//! `UnknownResourceFault`, and counting changes nothing a later caller sees.
+//! named in another domain contributes nothing, a list named in a domain no record is
+//! stored under likewise answers 0, and counting changes nothing a later caller sees.
 //!
 //! Every expected count is computed by the TEST from the seeded table, never hardcoded,
 //! and the rows vary along what the rule generalises over: which task list is asked
@@ -445,17 +445,15 @@ async fn a_task_list_is_scoped_to_its_own_domain() {
         );
     }
 
-    // A domain that was never registered addresses no task list: the modelled
-    // UnknownResourceFault, and asking for it does not create it.
+    // A domain that was never registered holds no task waiting in any list: the
+    // documented zero, and asking for it does not create the domain.
     for domain in ["never-registered", "LEFT", "left-2"] {
-        emulator
-            .refused(
-                domain,
-                "CountPendingDecisionTasks",
-                &json!({ "domain": domain, "taskList": { "name": list } }),
-                "UnknownResourceFault",
-            )
-            .await;
+        let actual = emulator.count_of(domain, domain, list).await;
+        assert_eq!(
+            actual, 0,
+            "case {domain:?}: a list in a domain no record is stored under holds nothing, \
+             got {actual}"
+        );
         emulator
             .refused(
                 domain,

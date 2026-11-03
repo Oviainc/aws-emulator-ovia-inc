@@ -184,11 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the merge below O(number of tags) and the critical section short.
         if input.tags.len() > crate::state::MAX_TAGS_PER_DOMAIN {
             return Err(TagResourceErrorModeled::TooManyTagsFault(TooManyTagsFault {
-                message: Some(format!(
-                    "The request carries {} tags, above the maximum of {} per resource",
-                    input.tags.len(),
-                    crate::state::MAX_TAGS_PER_DOMAIN
-                )),
+                // The fault's own fixed sentence: it names neither the count nor the
+                // resource, so the refusal reads the same whichever of the two bounds
+                // below tripped.
+                message: Some(crate::state::TOO_MANY_TAGS_MESSAGE.to_string()),
             })
             .into());
         }
@@ -251,11 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is what refuses.
         if merged.len() > crate::state::MAX_TAGS_PER_DOMAIN {
             return Err(TagResourceErrorModeled::TooManyTagsFault(TooManyTagsFault {
-                message: Some(format!(
-                    "The domain would carry {} tags, above the maximum of {} per resource",
-                    merged.len(),
-                    crate::state::MAX_TAGS_PER_DOMAIN
-                )),
+                message: Some(crate::state::TOO_MANY_TAGS_MESSAGE.to_string()),
             })
             .into());
         }
