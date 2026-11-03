@@ -87,6 +87,8 @@ mod crawler_deletion;
 mod crawler_event_queue;
 #[path = "all/crawler_listing.rs"]
 mod crawler_listing;
+#[path = "all/crawler_metrics.rs"]
+mod crawler_metrics;
 #[path = "all/crawler_role_trust.rs"]
 mod crawler_role_trust;
 #[path = "all/crawler_schedule_suspension.rs"]

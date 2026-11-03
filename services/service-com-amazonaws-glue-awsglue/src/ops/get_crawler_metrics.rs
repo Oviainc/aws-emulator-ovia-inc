@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCrawlerMetrics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCrawlerMetrics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCrawlerMetrics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the metrics of the crawlers a request names, in name order, one bounded page at
+//! a time: "Retrieves metrics about specified crawlers." The names only SELECT which
+//! crawlers are reported on — a request that names none asks about every crawler this
+//! account holds — and each element is computed from the record `CreateCrawler` wrote and
+//! `GetCrawler` reads back, so a name no crawler is stored under has no metrics to report
+//! and is simply absent from the answer.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -68,8 +68,20 @@
 //!
 //! * `OperationTimeoutException` (HTTP 400) — The operation timed out.
 
+use std::collections::BTreeSet;
+
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page this operation serves, and the page size it uses when the request
+/// names no `MaxResults`.
+///
+/// Source: the model's `MaxResults` target `PageSize`, whose range is 1..1000
+/// (`smithy_query(query="operation",operation="GetCrawlerMetrics")`). The response's own
+/// `CrawlerMetricsList` carries no length of its own, so the page is bounded by the
+/// largest size a request may ask for and by nothing narrower — unlike `ListCrawlers`,
+/// whose answer is a `CrawlerNameList` of at most 100.
+const MAX_PAGE_SIZE: i32 = 1_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -139,18 +151,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCrawlerMetrics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCrawlerMetricsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCrawlerMetrics"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as its own timeout error rather than as a shape the model does not declare
+            // for it — the same way `GetCrawlers` reports it.
+            return Err(GetCrawlerMetricsErrorModeled::OperationTimeoutException(
+                OperationTimeoutException {
+                    message: Some("the Glue crawler store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // Absent `MaxResults`, page at the largest value the model accepts for it. The
+        // clamp re-states that range in the handler so the page size is never 0 even if
+        // the boundary validator ever stops enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        // "A list of the names of crawlers about which to retrieve metrics": a SET of
+        // names to narrow the answer to, so the same name listed twice narrows to the same
+        // one crawler. A request that narrows by NO name — the member absent, or an empty
+        // list — asks about every crawler this account holds, the way an empty `Tags`
+        // filter narrows `ListCrawlers` by nothing. A name is only a filter here, so one
+        // no crawler is stored under selects nothing: this answer has no member to report
+        // a miss in, unlike the batch reader, whose `CrawlersNotFound` answers every
+        // requested name one for one.
+        let selected: Option<BTreeSet<&str>> = input
+            .crawler_name_list
+            .as_ref()
+            .filter(|names| !names.is_empty())
+            .map(|names| names.iter().map(String::as_str).collect());
+
+        let store = state.lock();
+        // Name order, so one page follows another deterministically however the store
+        // happens to hash its keys. The crawler namespace is per account rather than per
+        // Region, so every crawler the store holds is in scope.
+        let mut ordered: Vec<&crate::state::CrawlerEntry> = store
+            .crawlers
+            .values()
+            .filter(|crawler| {
+                selected
+                    .as_ref()
+                    .is_none_or(|names| names.contains(crawler.name.as_str()))
+            })
+            .collect();
+        ordered.sort_by(|left, right| left.name.cmp(&right.name));
+
+        // The token is the last name of the previous page, so the page resumes at the
+        // first selected name strictly after it — which stays correct across crawlers
+        // created or deleted between two calls.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => ordered.partition_point(|crawler| crawler.name.as_str() <= cursor),
+            None => 0,
+        };
+        // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose
+        // can never index outside the set.
+        let page: Vec<&crate::state::CrawlerEntry> =
+            ordered.iter().skip(start).take(page_size).copied().collect();
+        let end = start.saturating_add(page.len());
+        // The token names the last entry of the page, taken from the page itself so there
+        // is no index arithmetic to underflow on an empty page.
+        let next_token = if end < ordered.len() {
+            page.last().map(|crawler| crawler.name.clone())
+        } else {
+            None
+        };
+
+        Ok(GetCrawlerMetricsOutput {
+            // Present even when empty: a request that selects no crawler has an empty
+            // metrics list, not an absent one.
+            crawler_metrics_list: Some(
+                page.iter()
+                    .map(|crawler| crawler.to_crawler_metrics())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

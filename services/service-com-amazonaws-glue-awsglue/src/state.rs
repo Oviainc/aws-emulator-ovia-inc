@@ -269,7 +269,8 @@ use crate::ops::types::{
     ConfigurationObject,
     Condition,
     Connection, ConnectionInput,
-    ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateClassifierInput,
+    ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerMetrics, CrawlerTargets,
+    CreateClassifierInput,
     CreateColumnStatisticsTaskSettingsInput, CreateCrawlerInput,
     CreateCustomEntityTypeInput, CreateDataQualityRulesetInput, CreateGlossaryInput,
     CreateGlossaryTermInput,
@@ -5097,6 +5098,46 @@ impl CrawlerEntry {
     pub fn suspend_schedule(&mut self, now: SystemTime) {
         self.schedule_state = SCHEDULE_STATE_NOT_SCHEDULED.to_string();
         self.last_updated = now;
+    }
+
+    /// Whether a crawl of this crawler is IN PROGRESS, i.e. its run state is not the one
+    /// modelled `CrawlerState` with no run in it ([`CRAWLER_STATE_READY`]): of the other
+    /// two, [`CRAWLER_STATE_RUNNING`] is a crawl under way and [`CRAWLER_STATE_STOPPING`]
+    /// one that has been asked to stop and has not finished, so each still has a crawl
+    /// the service is working on.
+    pub fn crawl_in_progress(&self) -> bool {
+        self.state != CRAWLER_STATE_READY
+    }
+
+    /// Rebuild the modelled `CrawlerMetrics` shape from what is stored: "Metrics for a
+    /// specified crawler".
+    ///
+    /// Every member is computed from what the store holds about THIS crawler — whether it
+    /// has a crawl in progress, and what the crawls it has finished did:
+    ///
+    /// * "True if the crawler is still estimating how long it will take to complete this
+    ///   run" (`StillEstimating`) is about a run in progress, and the service estimates a
+    ///   run's remaining time from the runs that finished before it; a crawler here has
+    ///   finished none, so a crawl in progress is one that is still being estimated and a
+    ///   crawler with no crawl in progress has nothing to estimate.
+    /// * `TimeLeftSeconds` is "the estimated time left to complete a running crawl", so
+    ///   there is no estimate to report for a run still being estimated, and none at all
+    ///   for a crawler that is not running.
+    /// * `LastRuntimeSeconds` and `MedianRuntimeSeconds` are durations of this crawler's
+    ///   runs, and `TablesCreated`/`TablesUpdated`/`TablesDeleted` the catalog tables its
+    ///   crawls have written; no crawl has run, which is why [`Self::to_crawler`] reports
+    ///   no `LastCrawl` either, so each is zero.
+    pub fn to_crawler_metrics(&self) -> CrawlerMetrics {
+        CrawlerMetrics {
+            crawler_name: Some(self.name.clone()),
+            time_left_seconds: 0.0,
+            still_estimating: self.crawl_in_progress(),
+            last_runtime_seconds: 0.0,
+            median_runtime_seconds: 0.0,
+            tables_created: 0,
+            tables_updated: 0,
+            tables_deleted: 0,
+        }
     }
 
     /// Rebuild the modelled `Crawler` output shape from what is stored.
