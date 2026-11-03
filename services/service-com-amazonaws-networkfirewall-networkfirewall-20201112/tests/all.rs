@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/error_messages.rs"]
 mod error_messages;
+#[path = "all/firewall_delete_protection_updates.rs"]
+mod firewall_delete_protection_updates;
 #[path = "all/firewall_lifecycle.rs"]
 mod firewall_lifecycle;
 #[path = "all/firewall_policy_associations.rs"]
