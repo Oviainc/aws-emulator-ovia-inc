@@ -805,6 +805,70 @@ async fn a_constraint_refusal_is_the_modeled_invalid_parameter_failure() {
     }
 }
 
+/// RULE: a clause about the `@sensitive` `token` states the member and the requirement
+/// and NO value — `Value at 'token' …` — which is not the `Value null at 'token' …` an
+/// ABSENT member earns: the request DID carry a token, and the two facts are worded
+/// differently.
+///
+/// Asserted as the WHOLE message, because the difference between the two is one word:
+/// a clause that merely "names the member and the constraint" is satisfied by either.
+/// The rows span the classes the member's own constraints can break — its `@pattern`
+/// and its `@length` minimum (`smithy_query(query="shape", shape="JwtToken")`) — and
+/// the absent case beside them.
+#[tokio::test]
+async fn a_withheld_tokens_clause_is_not_the_clause_an_absent_token_earns() {
+    let harness = Harness::seeded();
+
+    // (case, the body, the requirement the clause states)
+    let withheld: &[(&str, serde_json::Value, &str)] = &[
+        (
+            "a token outside its pattern",
+            serde_json::json!({ "token": "this-is-not-a-jwt-token" }),
+            r"Member must satisfy regular expression pattern: [A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+",
+        ),
+        (
+            "an empty token, under its length minimum",
+            serde_json::json!({ "token": "" }),
+            "Member must have length greater than or equal to 1",
+        ),
+    ];
+    for (case, body, requirement) in withheld {
+        let reply = post(&harness, CLUSTER, body.clone()).await;
+        assert_eq!(
+            reply.verdict(),
+            "400 InvalidParameterException",
+            "case {case:?}: expected the modeled parameter failure, got {reply:?}"
+        );
+        // Every clause of the refusal opens with the withheld subject: an empty token
+        // breaks both of the member's constraints, so the envelope carries two.
+        for clause in reply.message.split("; ") {
+            let opens = clause.starts_with("Value at 'token' ")
+                || clause.contains("detected: Value at 'token' ");
+            assert!(
+                opens,
+                "case {case:?}: every clause must open with the withheld subject, not the \
+                 null an absent member earns, got {:?}",
+                reply.message
+            );
+        }
+        assert!(
+            reply.message.contains(requirement),
+            "case {case:?}: the clause must state the requirement {requirement:?}, got {:?}",
+            reply.message
+        );
+    }
+
+    // The member ABSENT: nothing was sent, so the clause states the null it was.
+    let reply = post(&harness, CLUSTER, serde_json::json!({})).await;
+    assert_eq!(
+        reply.message,
+        "1 validation error detected: Value null at 'token' failed to satisfy constraint: \
+         Member must not be null",
+        "case \"an absent token\": expected the null clause, got {:?}",
+        reply.message
+    );
+}
+
 /// The tokens a cluster issues are JSON Web Tokens of its own signing key, which is what
 /// makes the parse above a check on the same thing the real service checks: the header
 /// names the cluster's algorithm and key id, and the claim set names the service account

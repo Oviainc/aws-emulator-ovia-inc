@@ -177,6 +177,58 @@ mod tests {
         }
     }
 
+    /// RULE: a violation the WALK itself withheld — which it hands over with no value and
+    /// says so — is stated as a withheld clause and not as an absent member, whatever
+    /// this service's own reading of the member path says.
+    ///
+    /// The walk is what produces this shape (`vendor/smithy-schema-server`'s constraint
+    /// walk drops a `@sensitive` member's value as it records the violation), and `Value
+    /// null at '<member>'` — the clause an ABSENT member earns — is what the same
+    /// violation reads as when the withheld mark is not read.
+    #[test]
+    fn a_violation_the_walk_withheld_is_not_stated_as_an_absent_member() {
+        // (case, the member path, the class, the requirement the clause states)
+        let rows = [
+            (
+                "a sensitive member outside its pattern",
+                "name",
+                ViolationKind::Pattern(r"^[A-Za-z0-9\-_ ]+$".to_string()),
+                r"Member must satisfy regular expression pattern: [A-Za-z0-9\-_ ]+$",
+            ),
+            (
+                "a sensitive member past its length maximum",
+                "targetAddress",
+                ViolationKind::MaxLength(320),
+                "Member must have length less than or equal to 320",
+            ),
+        ];
+        for (case, path, kind, requirement) in rows {
+            let withheld = Violation {
+                path: path.to_string(),
+                kind,
+                // What the walk hands over for a member whose value it withheld.
+                value: None,
+                sensitive: true,
+            };
+            let stated = clause(&withheld);
+            let expected =
+                format!("Value at '{path}' failed to satisfy constraint: {requirement}");
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: expected {expected:?}, got {stated:?}"
+            );
+        }
+
+        // The same member ABSENT: no value was sent, so the clause states the null it was.
+        let absent = violation("name", ViolationKind::MissingRequiredMember, None);
+        let stated = clause(&absent);
+        assert_eq!(
+            stated,
+            "Value null at 'name' failed to satisfy constraint: Member must not be null",
+            "case \"an absent member\": expected the null clause, got {stated:?}"
+        );
+    }
+
     /// The sensitive member paths are the framework's own spelling of the model's member
     /// names, not literals that can drift from them.
     #[test]

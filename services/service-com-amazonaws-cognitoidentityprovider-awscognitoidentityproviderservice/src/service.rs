@@ -438,6 +438,13 @@ impl<O> WithSubmittedValues<O> {
 /// Every other clause keeps the framework's own rendering, which already states the bytes the
 /// caller submitted, and a value the echo bounds declined to render keeps the framework's
 /// text rather than losing the clause.
+///
+/// A member the model marks `@sensitive` is quoted too: the validating walk withholds
+/// such a value, and Amazon Cognito's recorded constraint clause states it — the refusal
+/// of a `ClientId` outside its `@pattern` quotes the id the request carried
+/// (`tests/all/input_validation_refusal_wording.rs`, and the recorded
+/// `DescribeTermsByClient` refusal behind it). The value comes from the request this walk
+/// re-read, which is the only place it survives.
 fn quoting_the_submitted_value(violation: Violation, echo: SubmittedEcho) -> Violation {
     let quoted = quoting_the_whole_submitted_value(
         quoting_the_submitted_collection(withheld_value_quoted(violation, &echo), echo.clone()),

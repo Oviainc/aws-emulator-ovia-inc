@@ -93,7 +93,8 @@ fn stated(violation: &Violation) -> String {
     // service withholds the value of every member it classes as one, so either side of
     // that is the same clause: the value half is dropped and the subject names the member
     // alone.
-    let withheld = violation.sensitive || (violation.value.is_some() && is_sensitive(&violation.path));
+    let withheld =
+        violation.sensitive || (violation.value.is_some() && is_sensitive(&violation.path));
     let restated = Violation {
         path: violation.path.clone(),
         kind: match &violation.kind {

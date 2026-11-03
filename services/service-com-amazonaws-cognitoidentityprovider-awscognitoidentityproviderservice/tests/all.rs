@@ -175,6 +175,8 @@ mod risk_configuration;
 mod self_service_refusal_wire;
 #[path = "all/self_service_sign_up.rs"]
 mod self_service_sign_up;
+#[path = "all/sensitive_member_refusal_values.rs"]
+mod sensitive_member_refusal_values;
 #[path = "all/set_user_mfa_preference.rs"]
 mod set_user_mfa_preference;
 #[path = "all/set_user_settings.rs"]

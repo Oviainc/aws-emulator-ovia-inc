@@ -64,8 +64,8 @@ pub mod sigv4;
 pub mod wire;
 
 use smithy_server_runtime::{
-    http, ErasedOperation, ErasedServiceDefinition, OperationRoutingTable, Refusal, Refused,
-    ServerHttpProtocol, Service, ServiceIdentity,
+    http, ErasedOperation, ErasedServiceDefinition, OperationRoutingTable,
+    Refusal, Refused, ServerHttpProtocol, Service, ServiceIdentity,
 };
 use std::borrow::Cow;
 use std::sync::Arc;
