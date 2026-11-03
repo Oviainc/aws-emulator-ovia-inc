@@ -486,7 +486,8 @@ use super::template::{
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
     SCHEDULER_SCHEDULE_GROUP, SES_CONFIGURATION_SET, SES_RECEIPT_RULE, SES_RECEIPT_RULE_SET,
     SNS_SUBSCRIPTION,
-    SNS_TOPIC, SQS_QUEUE, SQS_QUEUE_INLINE_POLICY, SQS_QUEUE_POLICY,
+    SNS_TOPIC, SNS_TOPIC_INLINE_POLICY, SNS_TOPIC_POLICY, SQS_QUEUE, SQS_QUEUE_INLINE_POLICY,
+    SQS_QUEUE_POLICY,
     SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
     TRANSFER_SERVER, WAFV2_IP_SET, WAFV2_REGEX_PATTERN_SET, WAFV2_RULE_GROUP, WAFV2_WEB_ACL,
     WAFV2_WEB_ACL_ASSOCIATION, WAF_REGIONAL_IP_SET, XRAY_SAMPLING_RULE,
@@ -652,6 +653,12 @@ pub(super) enum Provisioner {
     SqsQueuePolicy,
     SageMakerModelPackageGroup,
     SnsTopic,
+    /// `AWS::SNS::TopicPolicy` and `AWS::SNS::TopicInlinePolicy`, which are not resources
+    /// of Amazon SNS's own: each is the `Policy` ATTRIBUTE of the topics it names, so both
+    /// are deployed through `SetTopicAttributes` and differ only in which property carries
+    /// the topic — the queue-policy pair's rule ([`Provisioner::SqsQueuePolicy`]) for the
+    /// other service that holds a policy as an attribute.
+    SnsTopicPolicy,
     /// `AWS::SNS::Subscription`: a subscriber of a topic, which is a resource of Amazon
     /// SNS's own — `Subscribe` creates it and `Unsubscribe` deletes it — beside the inline
     /// `Subscription` list an `AWS::SNS::Topic` may declare.
@@ -821,6 +828,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         SQS_QUEUE_POLICY | SQS_QUEUE_INLINE_POLICY => Some(Provisioner::SqsQueuePolicy),
         SAGEMAKER_MODEL_PACKAGE_GROUP => Some(Provisioner::SageMakerModelPackageGroup),
         SNS_TOPIC => Some(Provisioner::SnsTopic),
+        SNS_TOPIC_POLICY | SNS_TOPIC_INLINE_POLICY => Some(Provisioner::SnsTopicPolicy),
         SNS_SUBSCRIPTION => Some(Provisioner::SnsSubscription),
         FIS_EXPERIMENT_TEMPLATE => Some(Provisioner::FisExperimentTemplate),
         WAF_REGIONAL_IP_SET => Some(Provisioner::WafRegionalIpSet),
@@ -993,6 +1001,10 @@ impl Provisioner {
                 create_model_package_group(ctx, region, resource, propagated).await
             }
             Self::SnsTopic => create_topic(ctx, region, resource, propagated).await,
+            // Neither topic-policy type publishes a `Tags` property — a policy is an
+            // attribute of the topics it names, and those carry the tags — so no tags are
+            // propagated to one.
+            Self::SnsTopicPolicy => put_topic_policy(ctx, region, resource).await,
             // A subscription publishes no `Tags` property — SNS holds tags on topics alone —
             // so no tags are propagated to one.
             Self::SnsSubscription => subscribe(ctx, region, resource).await,
@@ -1709,6 +1721,12 @@ impl Provisioner {
             // the stack created — under the ARN its `Ref` resolves to — rather than
             // replacing it ([`update_topic`]).
             Self::SnsTopic => update_topic(ctx, region, resource, declared).await.map(Some),
+            // The same attribute write the create made, against the topics the NEW
+            // declaration names: a topic it no longer names stops carrying the document,
+            // which is how an update revokes a grant.
+            Self::SnsTopicPolicy => update_topic_policy(ctx, region, resource, declared)
+                .await
+                .map(Some),
             // A parameter group's `Parameters` map is the one property of either group type
             // Amazon RDS can change on a group that exists, and the modify is the call that
             // changes it — the same call the create makes for the values a template declares
@@ -1946,6 +1964,7 @@ impl Provisioner {
                 delete_model_package_group(ctx, region, physical_resource_id).await
             }
             Self::SnsTopic => delete_topic(ctx, region, physical_resource_id).await,
+            Self::SnsTopicPolicy => delete_topic_policy(ctx, region, resource).await,
             Self::SnsSubscription => unsubscribe(ctx, region, resource).await,
             Self::FisExperimentTemplate => {
                 delete_experiment_template(ctx, region, physical_resource_id).await
@@ -2308,6 +2327,10 @@ impl Provisioner {
                 describe_model_package_group(ctx, region, physical_resource_id).await
             }
             Self::SnsTopic => describe_topic(ctx, region, physical_resource_id).await,
+            // A policy resource's configuration is the `Policy` attribute of the topics it
+            // names, which is read back from Amazon SNS as the document those topics carry
+            // now.
+            Self::SnsTopicPolicy => describe_topic_policy(ctx, region, resource).await,
             Self::SnsSubscription => describe_subscription(ctx, region, resource).await,
             Self::FisExperimentTemplate => {
                 describe_experiment_template(ctx, region, physical_resource_id).await
@@ -10137,6 +10160,171 @@ fn topic_name(resource: &StoredResource) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Amazon SNS: AWS::SNS::TopicPolicy and AWS::SNS::TopicInlinePolicy
+// ---------------------------------------------------------------------------
+
+/// The topic attribute both policy types write: `Policy`, "the JSON serialization of the
+/// topic's access control policy" (`GetTopicAttributes`) — so a policy resource's
+/// deployment IS that attribute write, through the one Amazon SNS call that writes an
+/// attribute of an existing topic ([`set_topic_attribute`]), exactly as [`update_topic`]
+/// applies every other changed attribute.
+const TOPIC_POLICY_ATTRIBUTE: &str = "Policy";
+
+/// The topic ARNs a policy resource applies its document to.
+///
+/// `AWS::SNS::TopicPolicy` names them in `Topics`, the topics to add the policy to;
+/// `AWS::SNS::TopicInlinePolicy` names the one topic it belongs to in `TopicArn`. Both are
+/// read here, so the two types differ only in which property carries the topic and not in
+/// how the document reaches it.
+fn policy_topic_arns(properties: &Value) -> Vec<String> {
+    let mut arns: Vec<String> = properties
+        .get("Topics")
+        .and_then(Value::as_array)
+        .map(|declared| {
+            declared
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(topic) = properties.get("TopicArn").and_then(Value::as_str) {
+        arns.push(topic.to_string());
+    }
+    arns
+}
+
+/// Write the policy an `AWS::SNS::TopicPolicy` / `AWS::SNS::TopicInlinePolicy` declares onto
+/// each topic it names.
+///
+/// The policy is not a resource of Amazon SNS's own: it is the `Policy` attribute of the
+/// topics the declaration names, so a later `GetTopicAttributes` reports the rendered
+/// document in place of the default policy the topic came up with — which is what lets
+/// another service's publish to the topic be authorized by the grant the template declared.
+/// CloudFormation decides this resource's physical id (its generated name), so nothing is
+/// reported back.
+async fn put_topic_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let document = declared_policy_document(&resource.properties, &resource.resource_type)?;
+    for arn in policy_topic_arns(&resource.properties) {
+        write_topic_policy(ctx, region, &arn, &document).await?;
+    }
+    Ok(Created::default())
+}
+
+/// Apply a CHANGED policy declaration: every topic the new declaration names carries the
+/// new document, and a topic it no longer names stops carrying one — which is how a stack
+/// update REVOKES a grant it used to make.
+async fn update_topic_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let document = declared_policy_document(declared, &resource.resource_type)?;
+    let named = policy_topic_arns(declared);
+    for arn in policy_topic_arns(&resource.properties) {
+        if !named.contains(&arn) {
+            write_topic_policy(ctx, region, &arn, NO_POLICY).await?;
+        }
+    }
+    for arn in &named {
+        write_topic_policy(ctx, region, arn, &document).await?;
+    }
+    Ok(Created::default())
+}
+
+/// Remove the policy a deleted policy resource had written: the topics it named stop
+/// carrying a document, which is the state the delete asks for.
+async fn delete_topic_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    for arn in policy_topic_arns(&resource.properties) {
+        write_topic_policy(ctx, region, &arn, NO_POLICY).await?;
+    }
+    Ok(())
+}
+
+/// One `SetTopicAttributes` writing the `Policy` attribute of the topic `arn` names.
+///
+/// A topic Amazon SNS no longer holds (`NotFound`) carries no attribute to write: a stack
+/// whose topic was deleted before the policy that named it is already in the state the
+/// deployment asks for.
+async fn write_topic_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    arn: &str,
+    document: &str,
+) -> Result<(), Refusal> {
+    match set_topic_attribute(ctx, region, arn, TOPIC_POLICY_ATTRIBUTE, document).await {
+        Ok(()) => Ok(()),
+        Err(refusal) if refusal.code == NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The policy the topics a policy resource names carry NOW, for drift detection.
+///
+/// The resource's configuration is the document those topics hold, so the actual
+/// configuration is read from Amazon SNS's own `Policy` attribute; a topic that is gone
+/// carries none, and no topic carrying one means the resource's effect is gone, which is the
+/// `DELETED` drift status. The document is reported as the attribute's text, which
+/// [`super::drift`] compares against the declared object by parsing it.
+async fn describe_topic_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let arns = policy_topic_arns(&resource.properties);
+    let mut carried: Option<String> = None;
+    for arn in &arns {
+        let answered = match call_query(
+            ctx,
+            SNS_SIGNING_NAME,
+            region,
+            SNS_API_VERSION,
+            "GetTopicAttributes",
+            &[("TopicArn".to_string(), arn.clone())],
+        )
+        .await
+        {
+            Ok(answered) => answered,
+            Err(refusal) if refusal.code == NOT_FOUND => continue,
+            Err(refusal) => return Err(refusal),
+        };
+        if let Some(document) = xml_entry_map(&answered, "Attributes")
+            .get(TOPIC_POLICY_ATTRIBUTE)
+            .and_then(Value::as_str)
+            .filter(|document| !document.is_empty())
+        {
+            carried = Some(document.to_string());
+            break;
+        }
+    }
+    let Some(document) = carried else {
+        return Ok(None);
+    };
+    // Reported under the same property names the declaration uses, so the comparison is
+    // between the declared document and the one the topics hold.
+    let mut reported = Map::new();
+    if resource.properties.get("Topics").is_some() {
+        reported.insert(
+            "Topics".to_string(),
+            Value::Array(arns.iter().map(|arn| Value::String(arn.clone())).collect()),
+        );
+    }
+    if let Some(topic) = resource.properties.get("TopicArn") {
+        reported.insert("TopicArn".to_string(), topic.clone());
+    }
+    reported.insert("PolicyDocument".to_string(), Value::String(document));
+    Ok(Some(Value::Object(reported)))
 }
 
 /// The `Attributes` map an `AWS::SNS::Topic`'s declared properties are, as `CreateTopic`

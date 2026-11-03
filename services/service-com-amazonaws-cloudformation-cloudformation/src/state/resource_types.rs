@@ -779,6 +779,10 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     // Amazon SNS
     "AWS::SNS::Subscription",
     "AWS::SNS::Topic",
+    // The two types that carry a topic's access policy: the one that applies a document to
+    // a list of topics, and the one that belongs to a single topic (`TopicArn` plus
+    // `PolicyDocument`), which the resource reference publishes beside it.
+    "AWS::SNS::TopicInlinePolicy",
     "AWS::SNS::TopicPolicy",
     // Amazon SQS
     "AWS::SQS::Queue",

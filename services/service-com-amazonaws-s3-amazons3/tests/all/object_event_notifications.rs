@@ -487,12 +487,40 @@ impl Emulator {
         }
     }
 
-    /// Create the queue named `name`, carrying the grant a rule's target needs —
-    /// EventBridge makes that target's `sqs:SendMessage` as its own service principal
-    /// and "relies on resource-based policies" for a queue (`PutTargets`), so a queue
-    /// that has granted it nothing receives nothing — and answer its url. Each call
-    /// below goes through [`Emulator::sqs`], which asserts its own 200.
+    /// Create the queue named `name`, carrying the grants an S3 notification destination
+    /// and an EventBridge rule target need, and answer its url.
+    ///
+    /// Both services reach the queue as their own SERVICE PRINCIPAL and "rely on
+    /// resource-based policies" for a queue (`PutTargets`), so a queue that has granted
+    /// them nothing receives nothing: S3 refuses a configuration naming a queue whose
+    /// policy does not let it publish, and an EventBridge target delivery is dropped. Each
+    /// call below goes through [`Emulator::sqs`], which asserts its own 200.
     pub(crate) async fn create_queue(&self, name: &str) -> String {
+        let (url, arn) = self.create_queue_without_policy(name).await;
+        let document = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "events.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                    "Resource": arn,
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "s3.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                    "Resource": arn,
+                },
+            ],
+        });
+        self.set_queue_policy(&url, &document.to_string()).await;
+        url
+    }
+
+    /// Create the queue named `name` with NO access policy at all, and answer its url
+    /// beside the ARN Amazon SQS keyed it by — the ARN a policy's statements name.
+    pub(crate) async fn create_queue_without_policy(&self, name: &str) -> (String, String) {
         let created = self.sqs("CreateQueue", &json!({ "QueueName": name })).await;
         let url = created["QueueUrl"]
             .as_str()
@@ -508,26 +536,17 @@ impl Emulator {
             .as_str()
             .unwrap_or_else(|| panic!("GetQueueAttributes must answer a QueueArn, got {attributes}"))
             .to_string();
+        (url, arn)
+    }
+
+    /// Write `document` as the `Policy` attribute of the queue at `url` — "the queue's
+    /// policy. A valid Amazon Web Services policy" (`SetQueueAttributes`).
+    pub(crate) async fn set_queue_policy(&self, url: &str, document: &str) {
         self.sqs(
             "SetQueueAttributes",
-            &json!({
-                "QueueUrl": url,
-                "Attributes": {
-                    "Policy": json!({
-                        "Version": "2012-10-17",
-                        "Statement": [{
-                            "Effect": "Allow",
-                            "Principal": {"Service": "events.amazonaws.com"},
-                            "Action": "sqs:SendMessage",
-                            "Resource": arn,
-                        }],
-                    })
-                    .to_string(),
-                },
-            }),
+            &json!({ "QueueUrl": url, "Attributes": { "Policy": document } }),
         )
         .await;
-        url
     }
 
     /// The url SQS addresses the queue `arn` names, read from SQS itself rather than

@@ -35,7 +35,8 @@
 use quick_xml::events::Event as XmlEvent;
 use quick_xml::Reader;
 use service_com_amazonaws_s3_amazons3::state::{
-    EVENT_VALUES, FILTER_RULE_NAME_VALUES, MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET,
+    canonical_filter_rule_name, EVENT_VALUES, FILTER_RULE_NAME_VALUES,
+    MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -50,6 +51,22 @@ const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const TOPIC_ARN: &str = "arn:aws:sns:us-east-1:123456789012:object-events";
 const QUEUE_ARN: &str = "arn:aws:sqs:us-east-1:123456789012:object-events";
 const LAMBDA_ARN: &str = "arn:aws:lambda:us-east-1:123456789012:function:object-events";
+
+/// The `<Message>` S3 sends for an `Events` entry that is not one of the published `Event`
+/// values, and the one it sends for a container whose rules cannot both be in force — each
+/// FIXED text, so the code being the same for every notification refusal leaves the message
+/// to say which rule was broken.
+const UNSUPPORTED_EVENT: &str = "The event is not supported for notifications";
+const AMBIGUOUS: &str = "Configuration is ambiguously defined. Cannot have overlapping \
+                         suffixes in two rules if the prefixes are overlapping for the same \
+                         event type.";
+
+/// The `<Message>` S3 sends for a document that does not validate against the schema it
+/// publishes, which is what a value breaking a modelled constraint it states no sentence of
+/// its own for is refused with.
+const MALFORMED_XML: &str =
+    "The XML you provided was not well-formed or did not validate against our published \
+     schema";
 
 /// Which destination a configuration publishes to, and so which element it is carried in.
 ///
@@ -142,11 +159,25 @@ impl Configuration {
         self
     }
 
-    /// The same configuration with whatever id came back, so a row that named no id can be
-    /// compared on everything else.
-    fn with_reported_id(&self, reported: &Configuration) -> Self {
+    /// The same configuration as S3 REPORTS it: with whatever id came back, so a row that
+    /// named no id can be compared on everything else, and with each filter rule under the
+    /// CANONICAL capitalised name S3 keeps the rule under — the `FilterRuleName` values are
+    /// the request vocabulary, and the stored rule's name is the capitalised spelling
+    /// ([`service_com_amazonaws_s3_amazons3::state::canonical_filter_rule_name`] is the one
+    /// place that mapping lives).
+    fn as_reported(&self, reported: &Configuration) -> Self {
         let mut expected = self.clone();
         expected.id = reported.id.clone();
+        expected.filter_rules = self.filter_rules.as_ref().map(|rules| {
+            rules
+                .iter()
+                .map(|(name, value)| {
+                    let canonical = canonical_filter_rule_name(name)
+                        .map_or_else(|| name.clone(), str::to_string);
+                    (canonical, value.clone())
+                })
+                .collect()
+        });
         expected
     }
 
@@ -389,11 +420,14 @@ fn round_trip_rows() -> Vec<(&'static str, Vec<Configuration>, bool)> {
             false,
         ),
         (
+            // One prefix each, because two configurations of one event that would both
+            // match the same key cannot both be in force.
             "exactly as many configurations as one bucket may carry",
             (0..MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET)
                 .map(|index| {
                     Configuration::new(Destination::Queue, &["s3:ObjectCreated:Put"])
                         .with_id(&format!("at-the-bound-{index}"))
+                        .with_filter_rules(&[("prefix", &format!("category-{index}/"))])
                 })
                 .collect(),
             false,
@@ -430,7 +464,7 @@ async fn assert_reports(
     );
     for (want, got) in expected.iter().zip(configurations.iter()) {
         assert_eq!(
-            &want.with_reported_id(got),
+            &want.as_reported(got),
             got,
             "case {case:?}: expected the stored configuration back unchanged, got {got:?}"
         );
@@ -569,6 +603,89 @@ async fn every_published_event_round_trips() {
     }
 }
 
+/// One row of the filter-rule-name table: the case, the rules as the request carries them
+/// (`(Name, Value)` pairs) and the names the read back must report.
+type FilterRuleRow = (&'static str, Vec<(&'static str, &'static str)>, Vec<&'static str>);
+
+#[tokio::test]
+async fn a_filter_rule_reads_back_under_its_canonical_name() {
+    let router = router();
+
+    // (case, the rules as the request carries them, the names the read must report).
+    // `FilterRuleName`'s values are the request vocabulary — the enum is `prefix` and
+    // `suffix` — and the rule S3 stores is named with the canonical capitalised spelling,
+    // in the order the request carried the rules. The rows differ along what that
+    // generalises over: WHICH kinds the filter carries, in which ORDER, HOW MANY, and what
+    // the values are.
+    let rows: Vec<FilterRuleRow> = vec![
+        (
+            "a prefix rule alone",
+            vec![("prefix", "CategoryA/")],
+            vec!["Prefix"],
+        ),
+        (
+            "a suffix rule alone",
+            vec![("suffix", ".csv")],
+            vec!["Suffix"],
+        ),
+        (
+            "a prefix and a suffix, in that order",
+            vec![("prefix", "CategoryA/"), ("suffix", ".csv")],
+            vec!["Prefix", "Suffix"],
+        ),
+        (
+            "a suffix and a prefix, in that order",
+            vec![("suffix", ".json"), ("prefix", "incoming/2026/")],
+            vec!["Suffix", "Prefix"],
+        ),
+        (
+            "rules whose values are empty",
+            vec![("prefix", ""), ("suffix", "")],
+            vec!["Prefix", "Suffix"],
+        ),
+        (
+            "a filter carrying no rule at all",
+            vec![],
+            vec![],
+        ),
+    ];
+
+    for (index, (case, rules, expected)) in rows.into_iter().enumerate() {
+        let bucket = format!("notification-filter-rule-names-{index}");
+        create_bucket(&router, &bucket, None, None).await;
+
+        let configurations = vec![
+            Configuration::new(Destination::Queue, &["s3:ObjectCreated:*"])
+                .with_id("filtered")
+                .with_filter_rules(&rules),
+        ];
+        let put = put_notification(&router, &bucket, &configurations, false).await;
+        assert_eq!(
+            put.status, 200,
+            "case {case:?}: the filtered configuration must be accepted, got {} with body \
+             {:?}",
+            put.status,
+            String::from_utf8_lossy(&put.body)
+        );
+
+        let read = get_notification(&router, &bucket).await;
+        let (reported, _) = reported(&read);
+        let names: Vec<String> = reported
+            .first()
+            .and_then(|configuration| configuration.filter_rules.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names, expected,
+            "case {case:?}: expected the stored rule names {expected:?}, got {names:?}"
+        );
+        // The rest of the configuration survives the re-casing untouched, values included.
+        assert_reports(&router, &bucket, case, &configurations, false).await;
+    }
+}
+
 #[tokio::test]
 async fn a_bucket_with_no_notifications_reports_the_empty_configuration() {
     let router = router();
@@ -638,34 +755,38 @@ async fn a_refused_notification_configuration_changes_nothing() {
         String::from_utf8_lossy(&put.body)
     );
 
-    // (case, the refused container, the code the refusal carries). One row per way a
-    // container falls outside what the API accepts: an event one step past the published
-    // `Event` set (including one differing only in case, since the set is case-sensitive),
-    // a filter rule name outside `FilterRuleName`, an id used twice, a destination ARN that
-    // is not an ARN of that destination's service, and one configuration past the bound a
-    // bucket may carry.
+    // (case, the refused container, the code the refusal carries, the message it carries).
+    // One row per way a container falls outside what the API accepts: an event one step
+    // past the published `Event` set (including one differing only in case, since the set
+    // is case-sensitive), a filter rule name outside `FilterRuleName`, a second rule of one
+    // kind inside one filter, two configurations of one event that would both match the
+    // same key, an id used twice, a destination ARN that is not an ARN of that
+    // destination's service, and one configuration past the bound a bucket may carry.
     //
-    // Two codes appear, and which one a row carries says WHERE the request is refused:
-    // `Event` and `FilterRuleName` are modelled enums and `Events` is a modelled required
-    // member, so a row breaking one of those is refused by the boundary validator before
-    // the handler runs — inside the request's XML document, which S3 answers
-    // `MalformedXML`; every other row breaks a rule the model cannot state, which the
-    // handler refuses with the code S3 publishes for an argument it cannot accept,
-    // `InvalidArgument`. Both are HTTP 400 — the status AWS answers every row with.
+    // Two codes appear, and which one a row carries says WHERE the request is refused.
+    // Every rule the notification container breaks is refused with the code S3 publishes
+    // for an argument it cannot accept, `InvalidArgument`, and the MESSAGE is what says
+    // which rule was broken — so a row whose value the model itself can refuse (an `Event`
+    // outside the enum) carries that same code and the sentence S3 publishes for it.
+    // `MalformedXML` is left for a document that breaks a modelled constraint S3 states no
+    // sentence of its own for — a `FilterRuleName` outside the enum, an element the schema
+    // does not carry, a configuration naming no event. Both are HTTP 400 — the status AWS
+    // answers every row with.
     let past_the_bound: Vec<Configuration> = (0..=MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET)
         .map(|index| {
             Configuration::new(Destination::Queue, &["s3:ObjectCreated:Put"])
                 .with_id(&format!("past-the-bound-{index}"))
         })
         .collect();
-    let rows: Vec<(&str, Vec<Configuration>, &str)> = vec![
+    let rows: Vec<(&str, Vec<Configuration>, &str, &str)> = vec![
         (
             "an event outside the published set",
             vec![Configuration::new(
                 Destination::Queue,
                 &["s3:ObjectCreated:Rename"],
             )],
-            "MalformedXML",
+            "InvalidArgument",
+            UNSUPPORTED_EVENT,
         ),
         (
             "a published event differing only in case",
@@ -673,7 +794,8 @@ async fn a_refused_notification_configuration_changes_nothing() {
                 Destination::Queue,
                 &["S3:ObjectCreated:Put"],
             )],
-            "MalformedXML",
+            "InvalidArgument",
+            UNSUPPORTED_EVENT,
         ),
         (
             "one unpublished event among events that are fine",
@@ -681,12 +803,14 @@ async fn a_refused_notification_configuration_changes_nothing() {
                 Destination::Topic,
                 &["s3:ObjectCreated:Put", "s3:ObjectVanished"],
             )],
-            "MalformedXML",
+            "InvalidArgument",
+            UNSUPPORTED_EVENT,
         ),
         (
             "a configuration naming no event at all",
             vec![Configuration::new(Destination::Topic, &[])],
             "MalformedXML",
+            MALFORMED_XML,
         ),
         (
             "a filter rule name outside FilterRuleName",
@@ -695,6 +819,60 @@ async fn a_refused_notification_configuration_changes_nothing() {
                     .with_filter_rules(&[("Prefix", "logs/")]),
             ],
             "MalformedXML",
+            MALFORMED_XML,
+        ),
+        (
+            "two suffix rules in one filter",
+            vec![
+                Configuration::new(Destination::Queue, &["s3:ObjectCreated:Put"])
+                    .with_filter_rules(&[("suffix", ".csv"), ("suffix", ".tsv")]),
+            ],
+            "InvalidArgument",
+            "Cannot specify more than one suffix rule in a filter.",
+        ),
+        (
+            "two prefix rules in one filter",
+            vec![
+                Configuration::new(Destination::LambdaFunction, &["s3:ObjectCreated:Put"])
+                    .with_filter_rules(&[("prefix", "one/"), ("prefix", "two/")]),
+            ],
+            "InvalidArgument",
+            "Cannot specify more than one prefix rule in a filter.",
+        ),
+        (
+            "two configurations of one event whose prefixes overlap",
+            vec![
+                Configuration::new(Destination::Queue, &["s3:ObjectCreated:*"])
+                    .with_id("outer")
+                    .with_filter_rules(&[("prefix", "CategoryA/")]),
+                Configuration::new(Destination::Queue, &["s3:ObjectCreated:*"])
+                    .with_id("inner")
+                    .with_filter_rules(&[("prefix", "CategoryA/sub/")]),
+            ],
+            "InvalidArgument",
+            AMBIGUOUS,
+        ),
+        (
+            "two configurations of one event whose suffixes overlap",
+            vec![
+                Configuration::new(Destination::Topic, &["s3:ObjectRemoved:Delete"])
+                    .with_id("every-csv")
+                    .with_filter_rules(&[("suffix", ".csv")]),
+                Configuration::new(Destination::LambdaFunction, &["s3:ObjectRemoved:Delete"])
+                    .with_id("every-report-csv")
+                    .with_filter_rules(&[("suffix", "-report.csv")]),
+            ],
+            "InvalidArgument",
+            AMBIGUOUS,
+        ),
+        (
+            "two configurations of one event neither of which filters",
+            vec![
+                Configuration::new(Destination::Queue, &["s3:ObjectRestore:Post"]).with_id("one"),
+                Configuration::new(Destination::Topic, &["s3:ObjectRestore:Post"]).with_id("two"),
+            ],
+            "InvalidArgument",
+            AMBIGUOUS,
         ),
         (
             "a filter rule naming an unknown attribute",
@@ -703,6 +881,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                     .with_filter_rules(&[("prefix", "ok/"), ("extension", ".json")]),
             ],
             "MalformedXML",
+            MALFORMED_XML,
         ),
         (
             "one id used by two configurations of the same kind",
@@ -712,6 +891,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                     .with_id("twice"),
             ],
             "InvalidArgument",
+            "Configuration ID twice is not unique",
         ),
         (
             "one id used by configurations of two different kinds",
@@ -721,6 +901,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                     .with_id("shared"),
             ],
             "InvalidArgument",
+            "Configuration ID shared is not unique",
         ),
         (
             "a queue ARN carried in a topic configuration",
@@ -729,6 +910,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                     .with_arn(QUEUE_ARN),
             ],
             "InvalidArgument",
+            "",
         ),
         (
             "a topic ARN carried in a Lambda configuration",
@@ -737,6 +919,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                     .with_arn(TOPIC_ARN),
             ],
             "InvalidArgument",
+            "",
         ),
         (
             "a destination that is not an ARN at all",
@@ -745,6 +928,7 @@ async fn a_refused_notification_configuration_changes_nothing() {
                     .with_arn("object-events"),
             ],
             "InvalidArgument",
+            "",
         ),
         (
             "an ARN missing its resource field",
@@ -753,15 +937,17 @@ async fn a_refused_notification_configuration_changes_nothing() {
                     .with_arn("arn:aws:sqs:us-east-1:123456789012:"),
             ],
             "InvalidArgument",
+            "",
         ),
         (
             "one configuration past the bound",
             past_the_bound,
             "InvalidArgument",
+            "",
         ),
     ];
 
-    for (case, configurations, code) in rows {
+    for (case, configurations, code, message) in rows {
         let refused = put_notification(&router, bucket, &configurations, false).await;
         assert_eq!(
             refused.status, 400,
@@ -776,6 +962,17 @@ async fn a_refused_notification_configuration_changes_nothing() {
             "case {case:?}: expected the refusal to carry {code}, got {:?}",
             refused.error_code()
         );
+        // The code is the same for most of these, so the MESSAGE is what says which rule
+        // the container broke. The rows that leave it empty are the ones whose sentence
+        // this suite pins elsewhere.
+        if !message.is_empty() {
+            assert_eq!(
+                refused.error_message(),
+                message,
+                "case {case:?}: expected the refusal's message to be {message:?}, got {:?}",
+                refused.error_message()
+            );
+        }
 
         // "The PUT notification is an atomic operation … Amazon S3 will not add the
         // configuration to your bucket": the stored configuration is untouched.

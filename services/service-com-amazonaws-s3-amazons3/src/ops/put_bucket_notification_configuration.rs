@@ -3,9 +3,10 @@
 //! @op PutBucketNotificationConfiguration
 //! Sets a bucket's whole event notification configuration, replacing whatever it carried
 //! before, and answers the modelled 200 with an empty body. Every destination the container
-//! names is resolved against the service that owns it first — by publishing the
-//! `s3:TestEvent` test notification to it — and a container naming one that service refuses
-//! is refused whole with `InvalidArgument` (400) rather than recorded.
+//! names is validated against the service that owns it first — it has to BE there, and its
+//! resource policy has to let Amazon S3 publish this bucket's notifications to it — and a
+//! container naming one that fails either is refused whole with `InvalidArgument` (400),
+//! naming each failed destination and its reason, rather than recorded.
 //! `GetBucketNotificationConfiguration` reports what this stored.
 //!
 //! ## Shape of an operation
@@ -319,18 +320,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .await;
             if !unvalidated.is_empty() {
-                // The ARNs ride in the log: the sentence S3 sends for this refusal is
-                // fixed text, and the one error document this channel renders carries the
-                // code and that sentence.
                 ::tracing::warn!(
                     bucket = %input.bucket,
                     destinations = ?unvalidated,
                     "this notification configuration names destinations that do not \
-                     resolve; it is refused rather than recorded"
+                     validate; it is refused rather than recorded"
                 );
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::INVALID_ARGUMENT_CODE,
-                    crate::state::INVALID_ARGUMENT_STATUS,
+                // The sentence S3 sends for this refusal is FIXED text, so the destinations
+                // that failed and the reason each failed for travel in the numbered
+                // `<ArgumentName{n}>` / `<ArgumentValue{n}>` series beside it: the ARN the
+                // request named, and what was wrong with that destination.
+                return Err(crate::scaffolded::Scaffolded::invalid_arguments(
+                    unvalidated,
                     crate::state::UNABLE_TO_VALIDATE_DESTINATIONS_MESSAGE,
                 ));
             }
@@ -370,6 +371,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// (`smithy_query(query="shape",shape="NotificationConfigurationFilter")`), so a `Filter`
 /// naming no `Key` restricts nothing and is recorded as no filter at all; a `Key` naming no
 /// `FilterRules` is an empty rule list, which is also what it filters by.
+///
+/// Each rule is recorded under the CANONICAL spelling of its name
+/// ([`crate::state::canonical_filter_rule_name`]): `FilterRuleName`'s values are the
+/// REQUEST vocabulary, and the rule S3 stores — and reports to every reader of this
+/// bucket's notification document — is the capitalised one, in the order the request
+/// carried the rules. A name outside the enum is kept as it came so the validation that
+/// follows is what refuses it.
 fn stored_filter_rules(
     filter: Option<&NotificationConfigurationFilter>,
 ) -> Option<Vec<crate::state::NotificationFilterRule>> {
@@ -379,7 +387,10 @@ fn stored_filter_rules(
             .iter()
             .flatten()
             .map(|rule| crate::state::NotificationFilterRule {
-                name: rule.name.clone(),
+                name: rule.name.as_deref().map(|name| {
+                    crate::state::canonical_filter_rule_name(name)
+                        .map_or_else(|| name.to_string(), str::to_string)
+                }),
                 value: rule.value.clone(),
             })
             .collect(),

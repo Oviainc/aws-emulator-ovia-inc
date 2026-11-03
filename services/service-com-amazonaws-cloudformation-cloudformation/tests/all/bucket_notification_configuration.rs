@@ -133,6 +133,11 @@ fn installed(xml: &str, block: &str, destination: &str) -> Vec<Installed> {
 }
 
 /// The same reading of what a row EXPECTS, so the two sides are compared as one value.
+///
+/// A row states its filter rules the way its TEMPLATE spells them — `FilterRuleName`'s own
+/// values, `prefix` and `suffix` — and Amazon S3 keeps each rule under the canonical
+/// capitalised name it reports to every reader, which is the one mapping applied here
+/// (`service_com_amazonaws_s3_amazons3::state::canonical_filter_rule_name`).
 fn expected(configurations: &[Expected<'_>]) -> Vec<Installed> {
     configurations
         .iter()
@@ -146,7 +151,12 @@ fn expected(configurations: &[Expected<'_>]) -> Vec<Installed> {
             rules: configuration
                 .rules
                 .iter()
-                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .map(|(name, value)| {
+                    let reported =
+                        service_com_amazonaws_s3_amazons3::state::canonical_filter_rule_name(name)
+                            .map_or_else(|| (*name).to_string(), str::to_string);
+                    (reported, (*value).to_string())
+                })
                 .collect(),
         })
         .collect()
@@ -265,7 +275,10 @@ async fn a_bucket_a_stack_declares_carries_the_notification_configuration_it_dec
         NotificationCase {
             // All three destination kinds on one bucket: a literal function ARN, a literal
             // queue ARN, and the topic ARN a `Ref` on a declared topic returns. The queue
-            // states no `Filter` at all, so it must read back without one.
+            // states no `Filter` at all, so it must read back without one. The topic the
+            // same template declares carries the policy that lets Amazon S3 publish to it,
+            // which S3 validates before it records the configuration — and the bucket
+            // `DependsOn` that policy, so it is in force by the time the bucket is created.
             case: "a function, a queue and a topic configuration on one bucket",
             stack_name: "fan-out-ingest",
             template: concat!(
@@ -274,8 +287,23 @@ async fn a_bucket_a_stack_declares_carries_the_notification_configuration_it_dec
                 "    Type: AWS::SNS::Topic\n",
                 "    Properties:\n",
                 "      TopicName: fan-out-ingest-notices\n",
+                "  NoticesPolicy:\n",
+                "    Type: AWS::SNS::TopicPolicy\n",
+                "    Properties:\n",
+                "      Topics:\n",
+                "        - !Ref Notices\n",
+                "      PolicyDocument:\n",
+                "        Version: '2012-10-17'\n",
+                "        Statement:\n",
+                "          - Sid: AllowS3Publish\n",
+                "            Effect: Allow\n",
+                "            Principal:\n",
+                "              Service: s3.amazonaws.com\n",
+                "            Action: sns:Publish\n",
+                "            Resource: !Ref Notices\n",
                 "  IngestBucket:\n",
                 "    Type: AWS::S3::Bucket\n",
+                "    DependsOn: NoticesPolicy\n",
                 "    Properties:\n",
                 "      BucketName: fan-out-ingest-landing\n",
                 "      NotificationConfiguration:\n",

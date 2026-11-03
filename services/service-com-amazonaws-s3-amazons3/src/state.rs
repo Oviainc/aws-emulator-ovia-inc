@@ -1843,6 +1843,48 @@ pub use crate::ops::types::EVENT_VALUES;
 /// model-generated value list, like [`EVENT_VALUES`].
 pub use crate::ops::types::FILTER_RULE_NAME_VALUES;
 
+/// Each `FilterRuleName` wire value beside the CANONICAL spelling S3 keeps the rule under.
+///
+/// The enum is the REQUEST vocabulary — `FilterRuleName`'s values are `prefix` and `suffix`
+/// (`smithy_query(query="shape",shape="FilterRuleName")`), which is what a caller sends —
+/// while the rule S3 stores, and reports to every reader of the bucket's notification
+/// document, is named with the capitalised spelling. The two differ only in the case of the
+/// first character, so the pair is kept here once and [`canonical_filter_rule_name`] is the
+/// one way either spelling is resolved.
+const FILTER_RULE_NAME_SPELLINGS: &[(&str, &str)] = &[
+    (FILTER_RULE_PREFIX, "Prefix"),
+    (FILTER_RULE_SUFFIX, "Suffix"),
+];
+
+/// The `FilterRuleName` value that filters on the START of an object key, and the one that
+/// filters on its END — the request vocabulary's two values, named so a rule of one kind
+/// can be asked for by kind.
+pub const FILTER_RULE_PREFIX: &str = "prefix";
+/// See [`FILTER_RULE_PREFIX`].
+pub const FILTER_RULE_SUFFIX: &str = "suffix";
+
+/// The canonical spelling of one key-name filter rule's `Name`, or `None` for a value that
+/// is no `FilterRuleName` at all.
+///
+/// Both spellings resolve — the wire value a request carries and the canonical one a stored
+/// rule holds — so a configuration read out of the store is as valid as the one that was
+/// put, and the store never holds two spellings of one rule kind.
+pub fn canonical_filter_rule_name(name: &str) -> Option<&'static str> {
+    FILTER_RULE_NAME_SPELLINGS
+        .iter()
+        .find(|(wire, _)| wire.eq_ignore_ascii_case(name))
+        .map(|(_, canonical)| *canonical)
+}
+
+/// The WIRE value of a filter rule kind, as the sentence refusing a second rule of that
+/// kind spells it, or `None` for a value that is no `FilterRuleName`.
+fn filter_rule_kind(name: &str) -> Option<&'static str> {
+    FILTER_RULE_NAME_SPELLINGS
+        .iter()
+        .find(|(wire, _)| wire.eq_ignore_ascii_case(name))
+        .map(|(wire, _)| *wire)
+}
+
 /// How many destination configurations one bucket's notification configuration may carry.
 ///
 /// `PutBucketNotificationConfiguration`'s own documentation points at the published quota
@@ -1890,6 +1932,39 @@ impl NotificationDestination {
             Self::LambdaFunction => "lambda",
         }
     }
+
+    /// What the destination IS, as the per-destination detail of a validation refusal names
+    /// it — the noun S3's own sentence for that destination kind uses (see
+    /// [`destination_permissions_detail`]).
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Topic => "topic",
+            Self::Queue => "queue",
+            Self::LambdaFunction => "Lambda function",
+        }
+    }
+}
+
+/// The per-destination detail S3 carries for a destination that EXISTS and whose resource
+/// policy does not let Amazon S3 publish this bucket's notifications to it.
+///
+/// The `<ArgumentValue{n}>` beside the fixed
+/// [`UNABLE_TO_VALIDATE_DESTINATIONS_MESSAGE`] sentence: the refusal's message is the same
+/// for every destination that failed, so the detail is where the reason for ONE of them is
+/// stated. Only the destination's kind varies in it ([`NotificationDestination::noun`]);
+/// nothing of the request is interpolated.
+pub fn destination_permissions_detail(destination: NotificationDestination) -> String {
+    format!(
+        "Permissions on the destination {} do not allow S3 to publish notifications from \
+         this bucket",
+        destination.noun()
+    )
+}
+
+/// The same detail for a destination the service that owns it does not hold at all, which
+/// is a different reason and so reads differently.
+pub fn destination_absent_detail(destination: NotificationDestination) -> String {
+    format!("The destination {} does not exist", destination.noun())
 }
 
 /// One object key name filtering rule of a configuration's `Filter`.
@@ -1898,12 +1973,29 @@ impl NotificationDestination {
 /// so each is kept exactly as the request carried it rather than defaulted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotificationFilterRule {
-    /// A `FilterRuleName` value — one of [`FILTER_RULE_NAME_VALUES`] — or `None` when the
-    /// rule named none.
+    /// A `FilterRuleName` value in its CANONICAL spelling
+    /// ([`canonical_filter_rule_name`]) — the name S3 keeps the rule under and reports to
+    /// every reader — or `None` when the rule named none.
     pub name: Option<String>,
     /// "The value that the filter searches for in object key names" (`FilterRule$Value`),
     /// or `None` when the rule named none.
     pub value: Option<String>,
+}
+
+impl NotificationFilterRule {
+    /// Which KIND of rule this is, as the `FilterRuleName` wire vocabulary spells it, or
+    /// `None` for a rule naming no published name at all. Whichever spelling the rule is
+    /// held in answers the same kind, so a filter cannot carry one kind twice under two
+    /// spellings.
+    pub fn kind(&self) -> Option<&'static str> {
+        filter_rule_kind(self.name.as_deref()?)
+    }
+
+    /// The value this rule filters by, empty when it named none — which filters on
+    /// nothing, the way a filter with no rule at all does.
+    pub fn filtered_value(&self) -> &str {
+        self.value.as_deref().unwrap_or_default()
+    }
 }
 
 /// One destination configuration a bucket's notification configuration carries: a topic,
@@ -1928,6 +2020,19 @@ pub struct NotificationTarget {
     /// The key-name filter rules of the configuration's `Filter`, or `None` when it
     /// carries no `Filter` (and so matches every key).
     pub filter_rules: Option<Vec<NotificationFilterRule>>,
+}
+
+impl NotificationTarget {
+    /// The value this configuration filters keys by for one rule KIND (`prefix` /
+    /// `suffix`), empty when it carries no rule of that kind — which restricts nothing, so
+    /// it is the value a configuration with no `Filter` filters by too.
+    fn filtered_by(&self, kind: &str) -> &str {
+        self.filter_rules
+            .iter()
+            .flatten()
+            .find(|rule| rule.kind() == Some(kind))
+            .map_or("", NotificationFilterRule::filtered_value)
+    }
 }
 
 /// The whole notification configuration a bucket carries.
@@ -2004,9 +2109,10 @@ impl BucketNotificationConfiguration {
 /// it was.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotificationConfigurationRejection {
-    /// An event outside [`EVENT_VALUES`].
+    /// An event outside [`EVENT_VALUES`]. The sentence S3 sends for this is FIXED text,
+    /// so neither member is interpolated into it; they are what the refusal is logged with.
     UnsupportedEvent {
-        /// The member the configuration arrived on, for the message.
+        /// The member the configuration arrived on.
         member: &'static str,
         /// The value that is not a published event.
         event: String,
@@ -2023,6 +2129,17 @@ pub enum NotificationConfigurationRejection {
         /// The rule's `Name`, or the empty string when it named none.
         name: String,
     },
+    /// A second rule of one KIND inside a single `Filter`: "overlapping prefixes and
+    /// suffixes are not supported" (`FilterRule$Name`), so one filter carries at most one
+    /// prefix rule and at most one suffix rule.
+    DuplicateFilterRuleKind {
+        /// The kind named twice, as the request vocabulary spells it (`prefix`/`suffix`).
+        kind: &'static str,
+    },
+    /// Two configurations that would both match the same key for the same event: their
+    /// prefixes overlap AND their suffixes overlap, which leaves the document unable to say
+    /// which rule an object matches.
+    AmbiguousConfiguration,
     /// Two configurations carrying the same `Id`: "An optional UNIQUE identifier for
     /// configurations in a notification configuration" (`NotificationId`).
     DuplicateConfigurationId {
@@ -2048,10 +2165,7 @@ pub enum NotificationConfigurationRejection {
 impl std::fmt::Display for NotificationConfigurationRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupportedEvent { member, event } => write!(
-                f,
-                "The event {event} is not supported for notifications (member {member})"
-            ),
+            Self::UnsupportedEvent { .. } => f.write_str(UNSUPPORTED_EVENT_MESSAGE),
             Self::NoEvents { member } => write!(
                 f,
                 "A {member} configuration must specify at least one event"
@@ -2059,6 +2173,13 @@ impl std::fmt::Display for NotificationConfigurationRejection {
             Self::InvalidFilterRuleName { name } => write!(
                 f,
                 "filter rule name must be either prefix or suffix, got {name}"
+            ),
+            Self::DuplicateFilterRuleKind { kind } => {
+                write!(f, "Cannot specify more than one {kind} rule in a filter.")
+            }
+            Self::AmbiguousConfiguration => f.write_str(
+                "Configuration is ambiguously defined. Cannot have overlapping suffixes in \
+                 two rules if the prefixes are overlapping for the same event type.",
             ),
             Self::DuplicateConfigurationId { id } => {
                 write!(f, "Configuration ID {id} is not unique")
@@ -2201,6 +2322,11 @@ pub fn malformed_arn_reason(value: &str) -> &'static str {
 /// `Events` is required, so a request breaking one never reaches the store). They are
 /// still checked here because this function, not the wire, is what guards the STORE: a
 /// configuration no reader could report back is never recorded, whoever writes it.
+///
+/// The last two rules are about the document as a whole rather than one value in it, and
+/// no model can state either: a `Filter` carries at most one rule of each kind, and no two
+/// configurations may both match the same key for the same event
+/// ([`configurations_are_ambiguous`]).
 pub fn validate_notification_configuration(
     configuration: &BucketNotificationConfiguration,
 ) -> Result<(), NotificationConfigurationRejection> {
@@ -2235,10 +2361,24 @@ pub fn validate_notification_configuration(
 
         for rule in target.filter_rules.iter().flatten() {
             let name = rule.name.as_deref().unwrap_or_default();
-            if !FILTER_RULE_NAME_VALUES.contains(&name) {
+            if canonical_filter_rule_name(name).is_none() {
                 return Err(NotificationConfigurationRejection::InvalidFilterRuleName {
                     name: name.to_string(),
                 });
+            }
+        }
+
+        // "Overlapping prefixes and suffixes are not supported" (`FilterRule$Name`): one
+        // `Filter` carries at most ONE rule of each kind, because two of a kind leave the
+        // filter with two answers for one key.
+        let mut seen_kinds: BTreeSet<&str> = BTreeSet::new();
+        for rule in target.filter_rules.iter().flatten() {
+            if let Some(kind) = rule.kind() {
+                if !seen_kinds.insert(kind) {
+                    return Err(NotificationConfigurationRejection::DuplicateFilterRuleKind {
+                        kind,
+                    });
+                }
             }
         }
 
@@ -2253,7 +2393,93 @@ pub fn validate_notification_configuration(
         }
     }
 
+    // And the document as a WHOLE: no two of its configurations may both match the same
+    // key for the same event — "overlapping prefixes and suffixes are not supported"
+    // ([`filters_overlap`] is the key half of the rule) — because S3 could not then say
+    // which rule an object matches. The check is over every pair across all three lists,
+    // since which destination a configuration publishes to does not make two rules
+    // distinguish an object.
+    //
+    // Each configuration's events are read ONCE, into the bit set [`event_mask`] encodes
+    // them as, so the pair walk below costs one AND per pair: the walk is bounded by the
+    // configuration count alone (at most
+    // [`MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`], checked above, so at most 4950
+    // pairs) and reading the `Events` lists is ONE pass over them, whatever a request
+    // carries in them. Comparing the lists pair by pair instead would multiply the pair
+    // count by the two lists' lengths, which no published limit bounds.
+    let targets: Vec<(&NotificationTarget, u64)> = configuration
+        .targets()
+        .map(|(_, target)| (target, event_mask(target)))
+        .collect();
+    for (position, (one, one_events)) in targets.iter().enumerate() {
+        for (other, other_events) in &targets[position + 1..] {
+            if one_events & other_events != 0 && filters_overlap(one, other) {
+                return Err(NotificationConfigurationRejection::AmbiguousConfiguration);
+            }
+        }
+    }
+
     Ok(())
+}
+
+/// The events one configuration names, as one bit per published `Event` value — the set two
+/// configurations are asked to share an element of.
+///
+/// The `Event` vocabulary is CLOSED and small ([`EVENT_VALUES`], which
+/// [`EVENT_VALUES_FIT_ONE_MASK`] holds to the width of this mask), and every event of the
+/// container has already been checked to be one of its values by the time this is built, so
+/// the mask loses nothing: a value outside the set has been refused, and a value repeated in
+/// one list is the same bit.
+///
+/// The event sets are compared AS THE DOCUMENT NAMES THEM: two configurations share an
+/// event when the same `Event` value appears in both, so a configuration naming a value and
+/// another naming the `s3:<Type>:*` form of its type are two distinct rules and are both
+/// kept — the pair a bucket carries to route one event class and one event of it to
+/// different destinations.
+fn event_mask(target: &NotificationTarget) -> u64 {
+    target
+        .events
+        .iter()
+        .filter_map(|event| {
+            EVENT_VALUES
+                .iter()
+                .position(|published| *published == event.as_str())
+        })
+        .fold(0, |mask, index| mask | (1 << index))
+}
+
+/// Whether the published `Event` catalog still fits in the one mask [`event_mask`] encodes
+/// a configuration's events as. Asserted by this crate's own test beside the rule it serves.
+pub const EVENT_VALUES_FIT_ONE_MASK: usize = u64::BITS as usize;
+
+/// Whether two destination configurations of one document would both match the same object
+/// KEY: their prefixes overlap and their suffixes overlap, so some key passes both filters.
+///
+/// A rule's prefix and suffix each restrict the keys it matches, and two restrictions of
+/// the same kind overlap when one is a prefix (respectively a suffix) of the other — a
+/// configuration carrying no rule of that kind restricts nothing, which overlaps every
+/// value. Two configurations whose prefixes are disjoint, or whose suffixes are, can
+/// therefore never both match one key and are both kept, however their events compare.
+fn filters_overlap(one: &NotificationTarget, other: &NotificationTarget) -> bool {
+    prefixes_overlap(
+        one.filtered_by(FILTER_RULE_PREFIX),
+        other.filtered_by(FILTER_RULE_PREFIX),
+    ) && suffixes_overlap(
+        one.filtered_by(FILTER_RULE_SUFFIX),
+        other.filtered_by(FILTER_RULE_SUFFIX),
+    )
+}
+
+/// Whether two key-name PREFIXES restrict to key sets that intersect: one is a prefix of
+/// the other, which includes either of them being empty.
+fn prefixes_overlap(one: &str, other: &str) -> bool {
+    one.starts_with(other) || other.starts_with(one)
+}
+
+/// Whether two key-name SUFFIXES restrict to key sets that intersect: one is a suffix of
+/// the other, which includes either of them being empty.
+fn suffixes_overlap(one: &str, other: &str) -> bool {
+    one.ends_with(other) || other.ends_with(one)
 }
 
 /// One rule of a bucket's default server-side-encryption configuration: one
@@ -12150,9 +12376,21 @@ pub const INVALID_ARGUMENT_STATUS: u16 = 400;
 /// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a
 /// `NotificationConfiguration` naming a destination it could not validate.
 ///
-/// A FIXED sentence: nothing about the request is interpolated into it.
+/// A FIXED sentence: nothing about the request is interpolated into it. WHICH destinations
+/// failed, and why each did, travel in the numbered `<ArgumentName{n}>` /
+/// `<ArgumentValue{n}>` series beside it
+/// ([`crate::scaffolded::Scaffolded::invalid_arguments`]).
 pub const UNABLE_TO_VALIDATE_DESTINATIONS_MESSAGE: &str =
     "Unable to validate the following destination configurations";
+
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for an `Events` entry that is
+/// not one of the published `Event` values.
+///
+/// Also FIXED text — the event that is not published is not interpolated into it — and the
+/// sentence both paths that can refuse such a value answer with: the boundary refusal of
+/// the modelled enum (`crate::service`) and
+/// [`NotificationConfigurationRejection::UnsupportedEvent`], which guards the store.
+pub const UNSUPPORTED_EVENT_MESSAGE: &str = "The event is not supported for notifications";
 
 /// The code S3 answers a request whose content is not one it can carry out as given:
 /// "InvalidRequest", HTTP 400 (Amazon S3 "Error responses", list of error codes).
@@ -13152,6 +13390,77 @@ mod tests {
         }
     }
 
+    /// The same, filtering on one key-name `prefix` — what makes two configurations of one
+    /// event distinguish the objects they publish.
+    fn prefixed_queue_target(id: &str, prefix: &str, events: &[&str]) -> NotificationTarget {
+        NotificationTarget {
+            filter_rules: Some(vec![NotificationFilterRule {
+                name: Some(FILTER_RULE_PREFIX.to_string()),
+                value: Some(prefix.to_string()),
+            }]),
+            ..queue_target(Some(id), events)
+        }
+    }
+
+    /// The published `Event` catalog fits in the one mask a configuration's events are
+    /// read into, which is what lets the document-wide ambiguity walk cost one AND per
+    /// pair of configurations.
+    #[test]
+    fn the_published_event_catalog_fits_one_event_mask() {
+        assert!(
+            EVENT_VALUES.len() <= EVENT_VALUES_FIT_ONE_MASK,
+            "case \"the catalog's width\": {} published events do not fit the {} bits the \
+             ambiguity walk reads them into",
+            EVENT_VALUES.len(),
+            EVENT_VALUES_FIT_ONE_MASK
+        );
+        // And every value of it is a distinct bit, so two configurations named by two
+        // different events never read as sharing one.
+        for (index, published) in EVENT_VALUES.iter().enumerate() {
+            let target = queue_target(None, &[published]);
+            assert_eq!(
+                event_mask(&target),
+                1 << index,
+                "case {published:?}: expected the bit of its position in the catalog"
+            );
+        }
+    }
+
+    /// Every published `FilterRuleName` has a canonical spelling, each differs from the
+    /// wire value only in case, and the canonical spelling resolves to itself — which is
+    /// what makes a stored configuration as readable as the request that put it.
+    #[test]
+    fn every_published_filter_rule_name_has_a_canonical_spelling() {
+        for published in FILTER_RULE_NAME_VALUES {
+            let canonical = canonical_filter_rule_name(published).unwrap_or_else(|| {
+                panic!("case {published:?}: a published filter rule name must canonicalise")
+            });
+            assert!(
+                canonical.eq_ignore_ascii_case(published),
+                "case {published:?}: the canonical spelling must differ only in case, got \
+                 {canonical:?}"
+            );
+            assert_eq!(
+                canonical_filter_rule_name(canonical),
+                Some(canonical),
+                "case {published:?}: the canonical spelling must resolve to itself, got {:?}",
+                canonical_filter_rule_name(canonical)
+            );
+            assert_eq!(
+                filter_rule_kind(canonical),
+                Some(*published),
+                "case {published:?}: the canonical spelling must name the wire kind, got {:?}",
+                filter_rule_kind(canonical)
+            );
+        }
+        assert_eq!(
+            canonical_filter_rule_name("extension"),
+            None,
+            "case \"a name outside the enum\": nothing outside the published set may \
+             canonicalise"
+        );
+    }
+
     #[test]
     fn the_default_store_holds_every_published_object() {
         // The store a fresh engine hands this service already holds what AWS publishes,
@@ -13355,12 +13664,120 @@ mod tests {
                 "a filter rule name outside the published set",
                 queue_configuration(vec![NotificationTarget {
                     filter_rules: Some(vec![NotificationFilterRule {
+                        name: Some("extension".to_string()),
+                        value: Some(".json".to_string()),
+                    }]),
+                    ..queue_target(None, &["s3:ObjectCreated:Put"])
+                }]),
+                Some("prefix or suffix"),
+            ),
+            (
+                // The spelling a STORED rule is held under, which this same function has
+                // to admit: the store is what it guards, and the store holds the canonical
+                // name.
+                "a filter rule under its canonical name",
+                queue_configuration(vec![NotificationTarget {
+                    filter_rules: Some(vec![NotificationFilterRule {
                         name: Some("Prefix".to_string()),
                         value: Some("logs/".to_string()),
                     }]),
                     ..queue_target(None, &["s3:ObjectCreated:Put"])
                 }]),
-                Some("prefix or suffix"),
+                None,
+            ),
+            (
+                "one filter carrying two rules of one kind",
+                queue_configuration(vec![NotificationTarget {
+                    filter_rules: Some(vec![
+                        NotificationFilterRule {
+                            name: Some("Suffix".to_string()),
+                            value: Some(".csv".to_string()),
+                        },
+                        NotificationFilterRule {
+                            name: Some("suffix".to_string()),
+                            value: Some(".tsv".to_string()),
+                        },
+                    ]),
+                    ..queue_target(None, &["s3:ObjectCreated:Put"])
+                }]),
+                Some("Cannot specify more than one suffix rule in a filter."),
+            ),
+            (
+                "two configurations of one event whose prefixes overlap",
+                queue_configuration(vec![
+                    prefixed_queue_target("a", "CategoryA/", &["s3:ObjectCreated:*"]),
+                    prefixed_queue_target("b", "CategoryA/sub/", &["s3:ObjectCreated:*"]),
+                ]),
+                Some("ambiguously defined"),
+            ),
+            (
+                "two configurations of one event whose prefixes are disjoint",
+                queue_configuration(vec![
+                    prefixed_queue_target("a", "CategoryA/", &["s3:ObjectCreated:*"]),
+                    prefixed_queue_target("b", "CategoryC/", &["s3:ObjectCreated:*"]),
+                ]),
+                None,
+            ),
+            (
+                // The wildcard form and a literal value of its type are two distinct
+                // rules, so a bucket may route an event class and one event of it to
+                // different destinations.
+                "a wildcard event beside a literal one of the same type",
+                queue_configuration(vec![
+                    prefixed_queue_target("a", "shared/", &["s3:ObjectCreated:*"]),
+                    prefixed_queue_target("b", "shared/", &["s3:ObjectCreated:Put"]),
+                ]),
+                None,
+            ),
+            (
+                "two configurations naming the same event with no filter at all",
+                queue_configuration(vec![
+                    queue_target(Some("a"), &["s3:ObjectCreated:Put"]),
+                    queue_target(Some("b"), &["s3:ObjectCreated:Put"]),
+                ]),
+                Some("ambiguously defined"),
+            ),
+            (
+                // The suffixes decide it: two configurations of one event whose prefixes
+                // overlap are kept when no key can carry both suffixes.
+                "overlapping prefixes with disjoint suffixes",
+                queue_configuration(vec![
+                    NotificationTarget {
+                        filter_rules: Some(vec![
+                            NotificationFilterRule {
+                                name: Some("Prefix".to_string()),
+                                value: Some("CategoryA/".to_string()),
+                            },
+                            NotificationFilterRule {
+                                name: Some("Suffix".to_string()),
+                                value: Some(".csv".to_string()),
+                            },
+                        ]),
+                        ..queue_target(Some("a"), &["s3:ObjectCreated:*"])
+                    },
+                    NotificationTarget {
+                        filter_rules: Some(vec![
+                            NotificationFilterRule {
+                                name: Some("Prefix".to_string()),
+                                value: Some("CategoryA/sub/".to_string()),
+                            },
+                            NotificationFilterRule {
+                                name: Some("Suffix".to_string()),
+                                value: Some(".json".to_string()),
+                            },
+                        ]),
+                        ..queue_target(Some("b"), &["s3:ObjectCreated:*"])
+                    },
+                ]),
+                None,
+            ),
+            (
+                "the same prefix for two events that cannot both happen",
+                queue_configuration(vec![
+                    prefixed_queue_target("a", "shared/", &["s3:ObjectCreated:Put"]),
+                    prefixed_queue_target("b", "shared/", &["s3:ObjectRemoved:Delete"]),
+                ]),
+                None,
             ),
             (
                 "both published filter rule names",
@@ -13381,8 +13798,8 @@ mod tests {
             (
                 "the same id twice",
                 queue_configuration(vec![
-                    queue_target(Some("twice"), &["s3:ObjectCreated:Put"]),
-                    queue_target(Some("twice"), &["s3:ObjectCreated:Post"]),
+                    prefixed_queue_target("twice", "one/", &["s3:ObjectCreated:Put"]),
+                    prefixed_queue_target("twice", "two/", &["s3:ObjectCreated:Post"]),
                 ]),
                 Some("not unique"),
             ),
@@ -13395,15 +13812,25 @@ mod tests {
                 Some("not a valid sns ARN"),
             ),
             (
+                // Each on a prefix of its own, because two configurations of one event
+                // that both match every key are ambiguous however many there are.
                 "exactly as many configurations as a bucket may carry",
                 queue_configuration(
                     (0..MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET)
-                        .map(|_| queue_target(None, &["s3:ObjectCreated:Put"]))
+                        .map(|index| {
+                            prefixed_queue_target(
+                                &format!("at-the-bound-{index}"),
+                                &format!("category-{index}/"),
+                                &["s3:ObjectCreated:Put"],
+                            )
+                        })
                         .collect(),
                 ),
                 None,
             ),
             (
+                // The COUNT is what this row is about, and the count is judged before the
+                // document's own rules.
                 "one configuration past the bound",
                 queue_configuration(
                     (0..=MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET)

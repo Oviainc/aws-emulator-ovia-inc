@@ -525,6 +525,28 @@ fn published_refusal(violation: &Violation) -> Option<Refused> {
             };
             (crate::state::INVALID_REQUEST_CODE, message)
         }
+        // `PutBucketNotificationConfiguration`'s container: S3 refuses every notification
+        // validation failure with the one generic code, so the MESSAGE is what says which
+        // rule was broken — and an `Events` entry outside the published `Event` set is the
+        // one such value the model can refuse by itself, which would otherwise go out as the
+        // generic schema refusal and blame the document's shape instead of the event name.
+        // The sentence is FIXED text, and it is the same one the handler's own check of a
+        // stored container answers with
+        // (`crate::state::NotificationConfigurationRejection::UnsupportedEvent`).
+        //
+        // Nothing else in the container is refused here: every other rule it breaks is one
+        // the model cannot state, which the handler refuses itself.
+        "notificationConfiguration" => {
+            let unsupported_event = matches!(violation.kind, ViolationKind::EnumValue(_))
+                && segments.any(|segment| segment == "events");
+            if !unsupported_event {
+                return None;
+            }
+            (
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::UNSUPPORTED_EVENT_MESSAGE.to_string(),
+            )
+        }
         _ => return None,
     };
     Some(Refused {

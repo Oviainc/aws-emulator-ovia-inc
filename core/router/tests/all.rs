@@ -909,6 +909,8 @@ mod cloudformation_provisions_guardduty_detector;
 mod cloudformation_provisions_sns_topics;
 #[path = "all/cloudformation_provisions_sns_subscriptions.rs"]
 mod cloudformation_provisions_sns_subscriptions;
+#[path = "all/cloudformation_sns_topic_policy_admits_s3_notifications.rs"]
+mod cloudformation_sns_topic_policy_admits_s3_notifications;
 #[path = "all/cloudformation_provisions_waf_regional_ip_sets.rs"]
 mod cloudformation_provisions_waf_regional_ip_sets;
 #[path = "all/cloudformation_provisions_grafana_workspaces.rs"]

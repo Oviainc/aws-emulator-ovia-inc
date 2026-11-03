@@ -98,6 +98,12 @@
 //! refusing a field answers through [`Scaffolded::invalid_argument`], which attaches the
 //! pair the same way.
 //!
+//! Where ONE refusal is about several arguments at once, S3 NUMBERS the pairs —
+//! `<ArgumentName1>`/`<ArgumentValue1>`, `<ArgumentName2>`/`<ArgumentValue2>`, … — one per
+//! argument it is refusing, which is how a client reading a single fixed message learns
+//! which of the values it sent failed and why. [`Scaffolded::invalid_arguments`] attaches
+//! that series.
+//!
 //! ## Every refusal carries the members of ITS class
 //!
 //! The naming member is one case of the general shape of an S3 error document: beside the
@@ -121,6 +127,8 @@
 //! * a precondition that did not hold — the `<Condition>` naming the conditional HEADER
 //!   that failed, which is the only thing that tells a conditional-retry loop which of
 //!   several headers it carried to change.
+
+use std::sync::LazyLock;
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -623,6 +631,51 @@ static ARGUMENT_VALUE: Schema = Schema::new_member(
 )
 .with_xml_name("ArgumentValue");
 
+/// How many NUMBERED argument pairs one error document names, which bounds the schemas
+/// built for them: a refusal is about at most as many arguments as the request could carry,
+/// and the request that names several at once is the notification put, whose container
+/// carries at most [`crate::state::MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`]
+/// configurations.
+const MAX_NUMBERED_ARGUMENTS: usize = crate::state::MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET;
+
+/// The `<ArgumentName{n}>` / `<ArgumentValue{n}>` member pair for each position a numbered
+/// refusal may name, built ONCE on first use.
+///
+/// The element names are positional, so they cannot be written as literals the way
+/// [`ARGUMENT_NAME`] is; they are built here, for the whole bounded series, rather than per
+/// refusal — a response path must not allocate a schema per element it writes.
+static NUMBERED_ARGUMENTS: LazyLock<Vec<(Schema, Schema)>> = LazyLock::new(|| {
+    (1..=MAX_NUMBERED_ARGUMENTS)
+        .map(|position| {
+            (
+                numbered_member("argumentName", format!("ArgumentName{position}"), 4),
+                numbered_member("argumentValue", format!("ArgumentValue{position}"), 5),
+            )
+        })
+        .collect()
+});
+
+/// One member of the numbered series: the same member as its unnumbered sibling, under the
+/// element name its position gives it.
+///
+/// `element` is a name computed from a position rather than a literal, and a schema's XML
+/// name is borrowed for the schema's whole life, so the series' names live as long as the
+/// process — which is exactly how long [`NUMBERED_ARGUMENTS`] holds them, and why the series
+/// is bounded by [`MAX_NUMBERED_ARGUMENTS`].
+fn numbered_member(member: &'static str, element: String, index: usize) -> Schema {
+    Schema::new_member(
+        ShapeId::from_static(
+            "smithy.framework#RefusedResource$argumentName",
+            "smithy.framework",
+            member,
+        ),
+        ShapeType::String,
+        member,
+        index,
+    )
+    .with_xml_name(Box::leak(element.into_boxed_str()))
+}
+
 /// The `<Key>` of an S3 error document: the member an OBJECT-scoped refusal names the key it
 /// is about by. See [`BUCKET_NAME`] and [`OBJECT_SCOPED_ERROR_CODES`].
 static OBJECT_KEY: Schema = Schema::new_member(
@@ -887,6 +940,11 @@ pub enum ErrorDetail {
         /// that is a container and carried no value of its own.
         value: Option<String>,
     },
+    /// A refusal about SEVERAL arguments at once, named by the NUMBERED series
+    /// `<ArgumentName1>`/`<ArgumentValue1>`, `<ArgumentName2>`/`<ArgumentValue2>`, … — one
+    /// pair per argument the refusal is about, in the order the request carried them. See
+    /// [`Scaffolded::invalid_arguments`].
+    Arguments(Vec<(String, String)>),
     /// A refusal about one multipart UPLOAD, named by `<UploadId>`: the upload the refusal is
     /// about, where it is not simply the one the request addressed (which
     /// [`UPLOAD_SCOPED_ERROR_CODES`] names from the request itself).
@@ -958,6 +1016,21 @@ impl ErrorDetail {
                     None => Ok(()),
                 }
             }
+            // One pair per argument, each under the element name its POSITION gives it,
+            // counted from one the way S3's document numbers them. A refusal naming more
+            // arguments than the bounded series has names states the ones it can; the
+            // bound is the most a request can carry.
+            Self::Arguments(arguments) => {
+                for (position, (name, value)) in arguments.iter().enumerate() {
+                    let Some((name_schema, value_schema)) = NUMBERED_ARGUMENTS.get(position)
+                    else {
+                        break;
+                    };
+                    s.write_string(name_schema, name)?;
+                    s.write_string(value_schema, value)?;
+                }
+                Ok(())
+            }
             Self::Upload(upload_id) => s.write_string(&UPLOAD_ID, upload_id),
             Self::Part {
                 upload_id,
@@ -1010,6 +1083,10 @@ impl ErrorDetail {
             | Self::Argument { name, .. }
             | Self::Upload(name)
             | Self::Condition(name) => name.clone(),
+            // The first of the series, which is the one such a refusal is reported by.
+            Self::Arguments(arguments) => arguments
+                .first()
+                .map_or_else(String::new, |(name, _)| name.clone()),
             Self::Part {
                 upload_id,
                 part_number,
@@ -1266,6 +1343,27 @@ impl<E> Scaffolded<E> {
             name: argument.to_string(),
             value: value.map(str::to_string),
         })
+    }
+
+    /// The refusal S3 answers a request whose SEVERAL named arguments it cannot accept
+    /// with: the same `InvalidArgument` as above and one fixed message, plus the NUMBERED
+    /// `<ArgumentName{n}>` / `<ArgumentValue{n}>` series naming each argument and the reason
+    /// it was refused.
+    ///
+    /// `message` is the class's own sentence, which says nothing about which argument
+    /// failed — so the series is the whole of what a client reads to find that out, and
+    /// each pair comes from the request and from this emulator's own state rather than
+    /// being invented here.
+    pub fn invalid_arguments(
+        arguments: Vec<(String, String)>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::unmodeled(
+            crate::state::INVALID_ARGUMENT_CODE,
+            crate::state::INVALID_ARGUMENT_STATUS,
+            message,
+        )
+        .naming(ErrorDetail::Arguments(arguments))
     }
 
     /// The refusal every operation that takes a `versionId` answers one that is not shaped

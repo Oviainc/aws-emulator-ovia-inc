@@ -15,18 +15,20 @@
 //! * a container whose every destination takes that test notification is recorded, and
 //!   each queue destination it named has the `s3:TestEvent` waiting on it, naming the
 //!   bucket and the request that configured it;
-//! * a container naming ONE destination the service that owns it REFUSES — a queue or a
-//!   function that does not exist, a queue S3 cannot publish to at all, a function whose
-//!   resource-based policy does not let Amazon S3 invoke it for this bucket — is refused
-//!   WHOLE, HTTP 400 `InvalidArgument`, and the bucket keeps the configuration it already
-//!   carried;
+//! * a container naming ONE destination S3 cannot publish to — a queue or a function that
+//!   does not exist, a queue S3 cannot publish to at all, a queue whose own access policy
+//!   does not let Amazon S3 send to it, a function whose resource-based policy does not let
+//!   Amazon S3 invoke it for this bucket — is refused WHOLE, HTTP 400 `InvalidArgument`
+//!   with one fixed message and the NUMBERED `<ArgumentName{n}>`/`<ArgumentValue{n}>` pair
+//!   naming each failed destination and the reason it failed, and the bucket keeps the
+//!   configuration it already carried;
 //! * `SkipDestinationValidation` "skips validation of Amazon SQS, Amazon SNS, and Lambda
 //!   destinations", so such a request is recorded as given and publishes no test
 //!   notification at all.
 //!
 //! The rows span what the rule generalises over: the destination KIND (an SQS queue, a
-//! Lambda function), WHY the destination's service refuses it (it does not hold it, it
-//! cannot take the publication, it grants Amazon S3 no invoke), WHICH grant a function
+//! Lambda function), WHY S3 cannot publish to it (its service does not hold it, it cannot
+//! take the publication, its policy grants S3 nothing), WHICH grant its resource policy
 //! carries (none, one for this bucket, one for every source, one for another bucket,
 //! another principal, another action), HOW MANY destinations one container names (one, two
 //! of one kind, two kinds) and which of them is refused, and whether validation is skipped.
@@ -102,20 +104,20 @@ impl Existing {
     }
 }
 
-/// Which grant the function destination of a row carries when the put is made — the
-/// resource-based policy statement `AddPermission` adds to it, which is what S3 reads to
-/// decide whether it may invoke the function.
+/// Which grant the destination of a row carries when the put is made — the resource-based
+/// policy S3 reads to decide whether it may publish this bucket's notifications to it: the
+/// statement `AddPermission` adds to a function, and the `Policy` attribute of a queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Grant {
-    /// No `AddPermission` call at all: the function carries no resource-based policy.
+    /// No grant at all: the destination carries no resource policy.
     None,
-    /// `lambda:InvokeFunction` to `s3.amazonaws.com`, narrowed to THIS bucket's ARN.
+    /// The action S3 needs, to `s3.amazonaws.com`, narrowed to THIS bucket's ARN.
     ThisBucket,
     /// The same action and principal with no `SourceArn`, so every source is granted.
     AnySource,
     /// The same action and principal, narrowed to ANOTHER bucket's ARN.
     OtherBucket,
-    /// `lambda:InvokeFunction` to another service principal.
+    /// The action S3 needs, to another service principal.
     OtherPrincipal,
     /// Another action to `s3.amazonaws.com`.
     OtherAction,
@@ -126,15 +128,30 @@ enum Grant {
 const ANOTHER_BUCKET: &str = "some-other-bucket";
 
 /// One destination a row's container names: its kind, the resource's name, how that
-/// resource exists in the owning service before the put is made, and — for a function —
-/// the grant its resource-based policy carries.
+/// resource exists in the owning service before the put is made, the grant its resource
+/// policy carries, and — for one the put must refuse — the per-destination DETAIL the
+/// refusal has to carry for it.
 #[derive(Debug, Clone, Copy)]
 struct Named {
     kind: Kind,
     name: &'static str,
     existing: Existing,
     grant: Grant,
+    /// `None` for a destination that validates.
+    rejected: Option<&'static str>,
 }
+
+/// The detail a refusal carries for a destination the service that owns it does not hold —
+/// one per destination kind, since only the kind varies in the sentence.
+const QUEUE_ABSENT: &str = "The destination queue does not exist";
+const FUNCTION_ABSENT: &str = "The destination Lambda function does not exist";
+
+/// The detail it carries for a destination that IS there and whose resource policy does not
+/// let Amazon S3 publish this bucket's notifications to it.
+const QUEUE_UNPERMITTED: &str = "Permissions on the destination queue do not allow S3 to \
+                                 publish notifications from this bucket";
+const FUNCTION_UNPERMITTED: &str = "Permissions on the destination Lambda function do not \
+                                    allow S3 to publish notifications from this bucket";
 
 /// One row of the table.
 struct Row {
@@ -150,15 +167,76 @@ struct Row {
 fn rows() -> Vec<Row> {
     vec![
         Row {
-            case: "one queue that exists",
+            case: "one queue that exists, granting this bucket the publish",
             destinations: &[Named {
                 kind: Kind::Queue,
                 name: "validated-queue",
                 existing: Existing::Yes,
-                grant: Grant::None,
+                grant: Grant::ThisBucket,
+                rejected: None,
             }],
             skip_validation: false,
             expected_status: 200,
+        },
+        Row {
+            case: "one queue that exists, granting every source the publish",
+            destinations: &[Named {
+                kind: Kind::Queue,
+                name: "any-source-queue",
+                existing: Existing::Yes,
+                grant: Grant::AnySource,
+                rejected: None,
+            }],
+            skip_validation: false,
+            expected_status: 200,
+        },
+        Row {
+            case: "one queue that exists with no policy at all",
+            destinations: &[Named {
+                kind: Kind::Queue,
+                name: "ungranted-queue",
+                existing: Existing::Yes,
+                grant: Grant::None,
+                rejected: Some(QUEUE_UNPERMITTED),
+            }],
+            skip_validation: false,
+            expected_status: INVALID_ARGUMENT_STATUS,
+        },
+        Row {
+            case: "one queue whose policy names another bucket",
+            destinations: &[Named {
+                kind: Kind::Queue,
+                name: "other-bucket-queue",
+                existing: Existing::Yes,
+                grant: Grant::OtherBucket,
+                rejected: Some(QUEUE_UNPERMITTED),
+            }],
+            skip_validation: false,
+            expected_status: INVALID_ARGUMENT_STATUS,
+        },
+        Row {
+            case: "one queue whose policy names another principal",
+            destinations: &[Named {
+                kind: Kind::Queue,
+                name: "other-principal-queue",
+                existing: Existing::Yes,
+                grant: Grant::OtherPrincipal,
+                rejected: Some(QUEUE_UNPERMITTED),
+            }],
+            skip_validation: false,
+            expected_status: INVALID_ARGUMENT_STATUS,
+        },
+        Row {
+            case: "one queue whose policy grants another action",
+            destinations: &[Named {
+                kind: Kind::Queue,
+                name: "other-action-queue",
+                existing: Existing::Yes,
+                grant: Grant::OtherAction,
+                rejected: Some(QUEUE_UNPERMITTED),
+            }],
+            skip_validation: false,
+            expected_status: INVALID_ARGUMENT_STATUS,
         },
         Row {
             case: "one queue that does not exist",
@@ -167,17 +245,21 @@ fn rows() -> Vec<Row> {
                 name: "absent-queue",
                 existing: Existing::No,
                 grant: Grant::None,
+                rejected: Some(QUEUE_ABSENT),
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
         },
         Row {
+            // Granted the publish and still unable to take it, so what the put reports is
+            // that it could not publish to the destination at all.
             case: "a FIFO queue, which exists and takes no publication from S3",
             destinations: &[Named {
                 kind: Kind::Queue,
                 name: "ordered-queue.fifo",
                 existing: Existing::AsFifoQueue,
-                grant: Grant::None,
+                grant: Grant::AnySource,
+                rejected: Some(QUEUE_ABSENT),
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
@@ -189,6 +271,7 @@ fn rows() -> Vec<Row> {
                 name: "validated-function",
                 existing: Existing::Yes,
                 grant: Grant::ThisBucket,
+                rejected: None,
             }],
             skip_validation: false,
             expected_status: 200,
@@ -200,6 +283,7 @@ fn rows() -> Vec<Row> {
                 name: "any-source-function",
                 existing: Existing::Yes,
                 grant: Grant::AnySource,
+                rejected: None,
             }],
             skip_validation: false,
             expected_status: 200,
@@ -211,6 +295,7 @@ fn rows() -> Vec<Row> {
                 name: "ungranted-function",
                 existing: Existing::Yes,
                 grant: Grant::None,
+                rejected: Some(FUNCTION_UNPERMITTED),
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
@@ -222,6 +307,7 @@ fn rows() -> Vec<Row> {
                 name: "other-bucket-function",
                 existing: Existing::Yes,
                 grant: Grant::OtherBucket,
+                rejected: Some(FUNCTION_UNPERMITTED),
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
@@ -233,6 +319,7 @@ fn rows() -> Vec<Row> {
                 name: "other-principal-function",
                 existing: Existing::Yes,
                 grant: Grant::OtherPrincipal,
+                rejected: Some(FUNCTION_UNPERMITTED),
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
@@ -244,6 +331,7 @@ fn rows() -> Vec<Row> {
                 name: "other-action-function",
                 existing: Existing::Yes,
                 grant: Grant::OtherAction,
+                rejected: Some(FUNCTION_UNPERMITTED),
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
@@ -255,43 +343,48 @@ fn rows() -> Vec<Row> {
                 name: "absent-function",
                 existing: Existing::No,
                 grant: Grant::None,
+                rejected: Some(FUNCTION_ABSENT),
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
         },
         Row {
-            case: "a queue and a function that both exist",
+            case: "a queue and a function that both exist and both grant it",
             destinations: &[
                 Named {
                     kind: Kind::Queue,
                     name: "both-kinds-queue",
                     existing: Existing::Yes,
-                    grant: Grant::None,
+                    grant: Grant::ThisBucket,
+                    rejected: None,
                 },
                 Named {
                     kind: Kind::Function,
                     name: "both-kinds-function",
                     existing: Existing::Yes,
                     grant: Grant::ThisBucket,
+                    rejected: None,
                 },
             ],
             skip_validation: false,
             expected_status: 200,
         },
         Row {
-            case: "a queue that exists and a function that grants no invoke",
+            case: "a queue that grants it and a function that grants no invoke",
             destinations: &[
                 Named {
                     kind: Kind::Queue,
                     name: "mixed-kinds-queue",
                     existing: Existing::Yes,
-                    grant: Grant::None,
+                    grant: Grant::ThisBucket,
+                    rejected: None,
                 },
                 Named {
                     kind: Kind::Function,
                     name: "mixed-kinds-ungranted-function",
                     existing: Existing::Yes,
                     grant: Grant::None,
+                    rejected: Some(FUNCTION_UNPERMITTED),
                 },
             ],
             skip_validation: false,
@@ -304,13 +397,38 @@ fn rows() -> Vec<Row> {
                     kind: Kind::Queue,
                     name: "partly-valid-queue",
                     existing: Existing::Yes,
-                    grant: Grant::None,
+                    grant: Grant::ThisBucket,
+                    rejected: None,
                 },
                 Named {
                     kind: Kind::Queue,
                     name: "partly-valid-absent-queue",
                     existing: Existing::No,
                     grant: Grant::None,
+                    rejected: Some(QUEUE_ABSENT),
+                },
+            ],
+            skip_validation: false,
+            expected_status: INVALID_ARGUMENT_STATUS,
+        },
+        Row {
+            // Both refused, so the refusal names BOTH, each with its own reason — which is
+            // what the numbered series is for.
+            case: "two queues refused for two different reasons",
+            destinations: &[
+                Named {
+                    kind: Kind::Queue,
+                    name: "two-reasons-ungranted-queue",
+                    existing: Existing::Yes,
+                    grant: Grant::None,
+                    rejected: Some(QUEUE_UNPERMITTED),
+                },
+                Named {
+                    kind: Kind::Queue,
+                    name: "two-reasons-absent-queue",
+                    existing: Existing::No,
+                    grant: Grant::None,
+                    rejected: Some(QUEUE_ABSENT),
                 },
             ],
             skip_validation: false,
@@ -323,6 +441,7 @@ fn rows() -> Vec<Row> {
                 name: "skipped-queue",
                 existing: Existing::Yes,
                 grant: Grant::None,
+                rejected: None,
             }],
             skip_validation: true,
             expected_status: 200,
@@ -334,6 +453,7 @@ fn rows() -> Vec<Row> {
                 name: "skipped-absent-queue",
                 existing: Existing::No,
                 grant: Grant::None,
+                rejected: None,
             }],
             skip_validation: true,
             expected_status: 200,
@@ -345,6 +465,7 @@ fn rows() -> Vec<Row> {
                 name: "skipped-ungranted-function",
                 existing: Existing::Yes,
                 grant: Grant::None,
+                rejected: None,
             }],
             skip_validation: true,
             expected_status: 200,
@@ -368,13 +489,21 @@ fn destination_arn(named: &Named) -> String {
 
 /// The `NotificationConfiguration` payload naming `destinations`, each notified about
 /// `event`.
+///
+/// Each configuration filters on a key prefix of its own, which is what lets one container
+/// name SEVERAL destinations for one event: two configurations of one event that would both
+/// match the same key cannot both be in force, and what this suite is about is the
+/// destinations rather than the filters.
 fn payload(destinations: &[Named], event: &str) -> String {
     let mut body = format!("<NotificationConfiguration xmlns=\"{XMLNS}\">");
     for named in destinations {
         let (element, arn_element) = named.kind.elements();
         body.push_str(&format!(
-            "<{element}><{arn_element}>{arn}</{arn_element}><Event>{event}</Event></{element}>",
-            arn = destination_arn(named)
+            "<{element}><{arn_element}>{arn}</{arn_element}><Event>{event}</Event>\
+             <Filter><S3Key><FilterRule><Name>prefix</Name><Value>{prefix}/</Value>\
+             </FilterRule></S3Key></Filter></{element}>",
+            arn = destination_arn(named),
+            prefix = named.name
         ));
     }
     body.push_str("</NotificationConfiguration>");
@@ -417,18 +546,67 @@ async fn put_notification(
 }
 
 /// Create the FIFO queue named `name` — `FifoQueue` is the attribute that makes a queue one
-/// ("you can't change the queue type after you create it").
-async fn create_fifo_queue(emulator: &Emulator, name: &str) {
+/// ("you can't change the queue type after you create it") — and answer its url.
+async fn create_fifo_queue(emulator: &Emulator, name: &str) -> String {
     let created = emulator
         .sqs(
             "CreateQueue",
             &json!({ "QueueName": name, "Attributes": { "FifoQueue": "true" } }),
         )
         .await;
-    assert!(
-        created["QueueUrl"].is_string(),
-        "creating the FIFO queue {name:?} must answer a QueueUrl, got {created}"
-    );
+    created["QueueUrl"]
+        .as_str()
+        .unwrap_or_else(|| panic!("creating the FIFO queue {name:?} must answer a QueueUrl, got {created}"))
+        .to_string()
+}
+
+/// The queue's access policy for the statement `grant` describes, or `None` for
+/// [`Grant::None`] — the queue then carries no policy at all.
+///
+/// `sqs:SendMessage` is the action S3 performs on a queue destination, and the grant is
+/// narrowed to the publishing bucket by `aws:SourceArn`, which is the condition key AWS
+/// documents for a queue policy that admits S3 — an S3 bucket's ARN being
+/// `arn:aws:s3:::<bucket>`, with no Region or account "because a bucket name is globally
+/// unique".
+fn queue_policy(grant: Grant, queue_arn: &str, bucket: &str) -> Option<String> {
+    let bucket_arn = |bucket: &str| format!("arn:aws:s3:::{bucket}");
+    let mut statement = match grant {
+        Grant::None => return None,
+        Grant::ThisBucket => json!({
+            "Sid": "s3-publish",
+            "Effect": "Allow",
+            "Principal": {"Service": "s3.amazonaws.com"},
+            "Action": "sqs:SendMessage",
+            "Condition": {"ArnLike": {"aws:SourceArn": bucket_arn(bucket)}},
+        }),
+        Grant::AnySource => json!({
+            "Sid": "s3-publish-any",
+            "Effect": "Allow",
+            "Principal": {"Service": "s3.amazonaws.com"},
+            "Action": "sqs:SendMessage",
+        }),
+        Grant::OtherBucket => json!({
+            "Sid": "s3-publish-other-bucket",
+            "Effect": "Allow",
+            "Principal": {"Service": "s3.amazonaws.com"},
+            "Action": "sqs:SendMessage",
+            "Condition": {"ArnLike": {"aws:SourceArn": bucket_arn(ANOTHER_BUCKET)}},
+        }),
+        Grant::OtherPrincipal => json!({
+            "Sid": "events-publish",
+            "Effect": "Allow",
+            "Principal": {"Service": "events.amazonaws.com"},
+            "Action": "sqs:SendMessage",
+        }),
+        Grant::OtherAction => json!({
+            "Sid": "s3-receive",
+            "Effect": "Allow",
+            "Principal": {"Service": "s3.amazonaws.com"},
+            "Action": "sqs:ReceiveMessage",
+        }),
+    };
+    statement["Resource"] = json!(queue_arn);
+    Some(json!({ "Version": "2012-10-17", "Statement": [statement] }).to_string())
 }
 
 /// Create the Lambda function named `name`, so a configuration naming it resolves, and add
@@ -550,8 +728,9 @@ async fn a_configuration_is_recorded_only_once_every_destination_it_names_resolv
             seeded.text()
         );
 
-        // The destinations this row says exist, created in the services that own them.
-        // A queue's url travels with it: it is where the row reads the test notification.
+        // The destinations this row says exist, created in the services that own them,
+        // each carrying the resource policy the row's grant describes. A queue's url
+        // travels with it: it is where the row reads the test notification.
         let mut queue_urls: Vec<(&str, String)> = Vec::new();
         for named in row
             .destinations
@@ -560,10 +739,17 @@ async fn a_configuration_is_recorded_only_once_every_destination_it_names_resolv
         {
             match (named.kind, named.existing) {
                 (Kind::Queue, Existing::AsFifoQueue) => {
-                    create_fifo_queue(&emulator, named.name).await;
+                    let url = create_fifo_queue(&emulator, named.name).await;
+                    if let Some(document) = queue_policy(named.grant, &queue_arn(named.name), &bucket)
+                    {
+                        emulator.set_queue_policy(&url, &document).await;
+                    }
                 }
                 (Kind::Queue, _) => {
-                    let url = emulator.create_queue(named.name).await;
+                    let (url, arn) = emulator.create_queue_without_policy(named.name).await;
+                    if let Some(document) = queue_policy(named.grant, &arn, &bucket) {
+                        emulator.set_queue_policy(&url, &document).await;
+                    }
                     queue_urls.push((named.name, url));
                 }
                 (Kind::Function, _) => {
@@ -670,6 +856,46 @@ async fn a_configuration_is_recorded_only_once_every_destination_it_names_resolv
                 elements(&answer.text(), "Message").contains(&UNABLE_TO_VALIDATE.to_string()),
                 "case {case:?}: expected the refusal's Message to be {UNABLE_TO_VALIDATE:?}, \
                  got {}",
+                answer.text()
+            );
+
+            // That message is the same sentence for every destination that failed, so the
+            // document also carries the NUMBERED pair naming each one and the reason it
+            // failed, in the order the container named them.
+            let expected: Vec<(String, String)> = row
+                .destinations
+                .iter()
+                .filter_map(|named| {
+                    named
+                        .rejected
+                        .map(|detail| (destination_arn(named), detail.to_string()))
+                })
+                .collect();
+            let refused: Vec<(String, String)> = (1..=expected.len())
+                .map(|position| {
+                    let name = elements(&answer.text(), &format!("ArgumentName{position}"));
+                    let value = elements(&answer.text(), &format!("ArgumentValue{position}"));
+                    (
+                        name.first().cloned().unwrap_or_default(),
+                        value.first().cloned().unwrap_or_default(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                refused,
+                expected,
+                "case {case:?}: expected the refusal to name each failed destination and its \
+                 reason as {expected:?}, got {refused:?} in {}",
+                answer.text()
+            );
+            assert!(
+                elements(
+                    &answer.text(),
+                    &format!("ArgumentName{}", expected.len() + 1)
+                )
+                .is_empty(),
+                "case {case:?}: the refusal must name no destination past the ones that \
+                 failed, got {}",
                 answer.text()
             );
             let answered = elements(&reported, "Queue");

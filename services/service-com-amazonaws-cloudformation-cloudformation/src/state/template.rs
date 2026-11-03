@@ -5049,6 +5049,16 @@ pub const SNS_TOPIC: &str = "AWS::SNS::Topic";
 /// identifier `Unsubscribe`/`SetSubscriptionAttributes` address a subscription by.
 pub const SNS_SUBSCRIPTION: &str = "AWS::SNS::Subscription";
 
+/// The two resource types that carry a TOPIC's access policy: the one that applies a
+/// document to a list of topics, and the one that belongs to a single topic.
+///
+/// Neither is a resource of Amazon SNS's own — a topic's policy is its `Policy` ATTRIBUTE —
+/// so neither carries a [`return_values`] arm: the default applies and the physical resource
+/// id is the name CloudFormation generated for the resource, exactly as it is for the two
+/// queue-policy types ([`SQS_QUEUE_POLICY`]).
+pub const SNS_TOPIC_POLICY: &str = "AWS::SNS::TopicPolicy";
+pub const SNS_TOPIC_INLINE_POLICY: &str = "AWS::SNS::TopicInlinePolicy";
+
 /// An Amazon SES configuration set's resource type (the SES model:
 /// `awsService.cloudFormationName: SES`). This is the type `super::provisioning` creates
 /// in Amazon SES itself, through that service's own `CreateConfigurationSet`.

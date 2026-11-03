@@ -36,8 +36,11 @@
 //! verifies that any Amazon Simple Notification Service (Amazon SNS) or Amazon Simple
 //! Queue Service (Amazon SQS) destination exists, and that the bucket owner has permission
 //! to publish to it by sending a test notification". That is
-//! [`unvalidated_destinations`], and the test notification it publishes is the
-//! `s3:TestEvent` a consumer of a validated destination receives.
+//! [`unvalidated_destinations`]: each destination has to BE there and its own resource
+//! policy has to let the Amazon S3 service principal publish this bucket's notifications to
+//! it ([`destination_granted`]) — the same question for a queue, a topic and a function —
+//! and the test notification it then publishes is the `s3:TestEvent` a consumer of a
+//! validated destination receives.
 //!
 //! Delivery is BEST EFFORT and never changes what the operation answers: S3 publishes a
 //! notification asynchronously, after the write that produced it was accepted, so a write
@@ -52,7 +55,9 @@
 use ::std::time::SystemTime;
 
 use super::request_ids::RequestCorrelation;
-use super::{bucket_arn, canonical_user_id, NotificationTarget};
+use super::{
+    bucket_arn, canonical_user_id, NotificationTarget, FILTER_RULE_PREFIX, FILTER_RULE_SUFFIX,
+};
 
 /// The `eventSource` of every record S3 publishes.
 const EVENT_SOURCE: &str = "aws:s3";
@@ -80,13 +85,6 @@ const EVENT_DETAIL_SEPARATOR: char = ':';
 
 /// The `s3:<Type>:*` suffix that stands for every event of one type.
 const EVENT_WILDCARD_SUFFIX: &str = ":*";
-
-/// The `FilterRuleName` value that filters on the start of a key
-/// (`super::FILTER_RULE_NAME_VALUES`).
-const FILTER_RULE_PREFIX: &str = "prefix";
-
-/// The `FilterRuleName` value that filters on the end of a key.
-const FILTER_RULE_SUFFIX: &str = "suffix";
 
 /// Which object change happened, which is what decides the `Event` value a configuration
 /// has to name to be notified, the EventBridge detail-type the event is published under,
@@ -340,11 +338,15 @@ pub fn event_matches(configured: &str, actual: &str) -> bool {
 /// hold, so a filter naming both a prefix and a suffix notifies only the keys with both.
 /// A configuration carrying no `Filter` — `None` — restricts nothing, and so does one
 /// whose rule names no value.
+///
+/// A rule is read by its KIND ([`super::NotificationFilterRule::kind`]), not by the text
+/// of its `Name`: the store holds a rule under the canonical capitalised spelling and the
+/// request vocabulary spells it in lower case, and both name the same rule.
 #[must_use]
 pub fn key_matches(filter_rules: Option<&Vec<super::NotificationFilterRule>>, key: &str) -> bool {
     filter_rules.into_iter().flatten().all(|rule| {
-        let value = rule.value.as_deref().unwrap_or_default();
-        match rule.name.as_deref() {
+        let value = rule.filtered_value();
+        match rule.kind() {
             Some(FILTER_RULE_PREFIX) => key.starts_with(value),
             Some(FILTER_RULE_SUFFIX) => key.ends_with(value),
             // The store holds no other rule name: a put naming one is refused
@@ -907,37 +909,43 @@ fn test_notification(bucket: &str, correlation: &RequestCorrelation) -> ::serde_
     })
 }
 
-/// The destinations of `configuration` that could NOT be validated, in configuration
-/// order — empty when every one of them was, which is what lets the put be recorded.
+/// The destinations of `configuration` that could NOT be validated, in configuration order,
+/// each with the per-destination DETAIL saying why — empty when every one of them was, which
+/// is what lets the put be recorded.
 ///
 /// Each destination is resolved against the service that owns it, through this same
-/// emulator: a queue and a topic by publishing the test notification
-/// ([`test_notification`]) to it, which is how the real service validates them, and a
-/// function by reading its configuration, because S3 "verifies that the Lambda function
-/// permissions grant Amazon S3 permission to invoke the function" rather than invoking it.
-/// Nothing is written by any of them, so a put this refuses leaves every service it asked
-/// exactly as it was.
+/// emulator, and two things are asked about it, because S3 "first verifies that any Amazon
+/// Simple Notification Service (Amazon SNS) or Amazon Simple Queue Service (Amazon SQS)
+/// destination EXISTS, and that the bucket owner has PERMISSION to publish to it"
+/// (`PutBucketNotificationConfiguration`'s own documentation): the destination is read from
+/// its own service, and its resource policy is evaluated for the Amazon S3 service principal
+/// publishing this bucket's notifications ([`destination_granted`]). A queue and a topic are
+/// then sent the test notification ([`test_notification`]), which is what a consumer of a
+/// validated destination finds waiting on it; a function is not invoked, because S3
+/// "verifies that the Lambda function permissions grant Amazon S3 permission to invoke the
+/// function" instead. Nothing else is written by any of them, so a put this refuses leaves
+/// every service it asked exactly as it was.
 ///
-/// A destination whose own service REFUSES the test notification is not validated: "the PUT
-/// notification is an atomic operation … if the message fails, the entire PUT action will
-/// fail, and Amazon S3 will not add the configuration to your bucket". Where this emulator
-/// could not reach that service AT ALL ([`TRANSPORT_REFUSALS`]) nothing judged the
-/// destination, so it is treated as validated and the failure logged — the outcome
+/// A destination its own service REFUSES is not validated: "the PUT notification is an
+/// atomic operation … if the message fails, the entire PUT action will fail, and Amazon S3
+/// will not add the configuration to your bucket". Where this emulator could not reach that
+/// service AT ALL ([`TRANSPORT_REFUSALS`]) nothing judged the destination, so it is treated
+/// as validated and the failure logged — the outcome
 /// `PutBucketNotificationConfigurationRequest$SkipDestinationValidation` asks for
 /// explicitly.
 ///
 /// Nothing here opens a socket or leaves the host: every destination is reached through the
 /// in-process callback, the way a delivery to it is, and the ARN decides only which service
 /// of this same emulator is asked and in which Region. The work is bounded by the container
-/// itself — at most [`super::MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`] destinations, one
-/// await each, with the store's guard released — so one request cannot grow it.
+/// itself — at most [`super::MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`] destinations, two
+/// awaits each, with the store's guard released — so one request cannot grow it.
 pub async fn unvalidated_destinations(
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     bucket: &str,
     bucket_region: &str,
     configuration: &super::BucketNotificationConfiguration,
     correlation: &RequestCorrelation,
-) -> Vec<String> {
+) -> Vec<(String, String)> {
     let mut clients = Clients::default();
     let mut unvalidated = Vec::new();
     let notification = test_notification(bucket, correlation).to_string();
@@ -947,38 +955,121 @@ pub async fn unvalidated_destinations(
         let region = destination_region(&target.arn)
             .unwrap_or(bucket_region)
             .to_string();
-        let validated = match destination {
+        let rejected = match destination {
             super::NotificationDestination::Queue => {
-                queue_validated(&mut clients, callback, &region, &target.arn, &notification).await
+                queue_rejection(
+                    &mut clients,
+                    callback,
+                    &region,
+                    &target.arn,
+                    bucket,
+                    &notification,
+                )
+                .await
             }
             super::NotificationDestination::Topic => {
-                topic_validated(&mut clients, callback, &region, &target.arn, &notification).await
+                topic_rejection(
+                    &mut clients,
+                    callback,
+                    &region,
+                    &target.arn,
+                    bucket,
+                    &notification,
+                )
+                .await
             }
             super::NotificationDestination::LambdaFunction => {
-                function_validated(&mut clients, callback, &region, &target.arn, bucket).await
+                function_rejection(&mut clients, callback, &region, &target.arn, bucket).await
             }
         };
-        if !validated {
-            unvalidated.push(target.arn.clone());
+        if let Some(rejection) = rejected {
+            unvalidated.push((target.arn.clone(), rejection.detail(destination)));
         }
     }
     unvalidated
 }
 
-/// Whether the queue `arn` names took the test notification.
-async fn queue_validated(
+/// Why ONE destination of a notification configuration did not validate.
+///
+/// The refusal's own message is the same sentence however many destinations failed and
+/// whichever way they did, so this is what the per-destination detail beside it states (see
+/// [`super::destination_absent_detail`] and [`super::destination_permissions_detail`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestinationRejection {
+    /// The service that owns the destination does not hold it.
+    Absent,
+    /// It is there, and its resource policy does not let Amazon S3 publish this bucket's
+    /// notifications to it.
+    Unpermitted,
+}
+
+impl DestinationRejection {
+    /// The detail S3's refusal carries for this destination kind.
+    fn detail(self, destination: super::NotificationDestination) -> String {
+        match self {
+            Self::Absent => super::destination_absent_detail(destination),
+            Self::Unpermitted => super::destination_permissions_detail(destination),
+        }
+    }
+}
+
+/// The IAM action S3 needs on a QUEUE destination to publish a notification to it, and the
+/// one it needs on a TOPIC destination — the grant each destination's own resource policy
+/// has to state for the S3 service principal.
+const SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";
+/// See [`SEND_MESSAGE_ACTION`].
+const PUBLISH_ACTION: &str = "sns:Publish";
+
+/// Why the queue `arn` names is not a destination this configuration may be recorded with,
+/// or `None` when it is one.
+async fn queue_rejection(
     clients: &mut Clients,
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     arn: &str,
+    bucket: &str,
     notification: &str,
-) -> bool {
+) -> Option<DestinationRejection> {
     // A value that addresses no queue at all names no destination to validate. The stored
     // ARN is already known to be an SQS ARN (`super::validate_notification_configuration`),
     // so this is the resource field that does not name a queue.
     let Some(url) = queue_url(arn) else {
-        return false;
+        return Some(DestinationRejection::Absent);
     };
+    // The queue's `Policy` attribute is "the queue's policy. A valid Amazon Web Services
+    // policy" (`GetQueueAttributes`), and `QueueArn` is the ARN that policy's statements
+    // name — so the grant is judged against the ARN SQS itself resolved the queue to.
+    let answer = clients
+        .sqs(callback, region)
+        .get_queue_attributes()
+        .queue_url(&url)
+        .attribute_names(::aws_sdk_sqs::types::QueueAttributeName::Policy)
+        .attribute_names(::aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+        .send()
+        .await;
+    let attributes = match answer {
+        Ok(answered) => answered,
+        Err(error) => {
+            if refused_by_its_service(&error) {
+                return Some(DestinationRejection::Absent);
+            }
+            unverifiable("an Amazon SQS queue", &url, &error);
+            return None;
+        }
+    };
+    let attribute = |name: &::aws_sdk_sqs::types::QueueAttributeName| {
+        attributes
+            .attributes()
+            .and_then(|held| held.get(name))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let resolved = attribute(&::aws_sdk_sqs::types::QueueAttributeName::QueueArn);
+    let document = attribute(&::aws_sdk_sqs::types::QueueAttributeName::Policy);
+    let queue_arn = if resolved.is_empty() { arn } else { &resolved };
+    if !destination_granted(&document, SEND_MESSAGE_ACTION, queue_arn, bucket) {
+        return Some(DestinationRejection::Unpermitted);
+    }
     let answer = clients
         .sqs(callback, region)
         .send_message()
@@ -987,25 +1078,55 @@ async fn queue_validated(
         .send()
         .await;
     match answer {
-        Ok(_) => true,
+        Ok(_) => None,
         Err(error) => {
             if refused_by_its_service(&error) {
-                return false;
+                return Some(DestinationRejection::Absent);
             }
             unverifiable("an Amazon SQS queue", &url, &error);
-            true
+            None
         }
     }
 }
 
-/// Whether the topic `arn` names took the test notification.
-async fn topic_validated(
+/// Why the topic `arn` names is not a destination this configuration may be recorded with,
+/// or `None` when it is one.
+///
+/// The topic's `Policy` attribute is the document that decides it — "the JSON serialization
+/// of the topic's access control policy" (`GetTopicAttributes`) — which is where the grant
+/// S3 needs lives, so a topic that exists and states no such grant is refused rather than
+/// published to.
+async fn topic_rejection(
     clients: &mut Clients,
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     arn: &str,
+    bucket: &str,
     notification: &str,
-) -> bool {
+) -> Option<DestinationRejection> {
+    let answer = clients
+        .sns(callback, region)
+        .get_topic_attributes()
+        .topic_arn(arn)
+        .send()
+        .await;
+    let document = match answer {
+        Ok(answered) => answered
+            .attributes()
+            .and_then(|held| held.get(TOPIC_POLICY_ATTRIBUTE))
+            .cloned()
+            .unwrap_or_default(),
+        Err(error) => {
+            if refused_by_its_service(&error) {
+                return Some(DestinationRejection::Absent);
+            }
+            unverifiable("an Amazon SNS topic", arn, &error);
+            return None;
+        }
+    };
+    if !destination_granted(&document, PUBLISH_ACTION, arn, bucket) {
+        return Some(DestinationRejection::Unpermitted);
+    }
     let answer = clients
         .sns(callback, region)
         .publish()
@@ -1014,19 +1135,23 @@ async fn topic_validated(
         .send()
         .await;
     match answer {
-        Ok(_) => true,
+        Ok(_) => None,
         Err(error) => {
             if refused_by_its_service(&error) {
-                return false;
+                return Some(DestinationRejection::Absent);
             }
             unverifiable("an Amazon SNS topic", arn, &error);
-            true
+            None
         }
     }
 }
 
-/// Whether the function `arn` names resolves in Lambda AND its resource-based policy lets
-/// Amazon S3 invoke it for `bucket`.
+/// The topic attribute carrying its access control policy, as `GetTopicAttributes` names
+/// it.
+const TOPIC_POLICY_ATTRIBUTE: &str = "Policy";
+
+/// Why the function `arn` names is not a destination this configuration may be recorded
+/// with, or `None` when it is one.
 ///
 /// Both halves are what the real service checks: "in the case of Lambda destinations,
 /// Amazon S3 verifies that the Lambda function permissions grant Amazon S3 permission to
@@ -1034,19 +1159,18 @@ async fn topic_validated(
 /// (`PutBucketNotificationConfiguration`'s own documentation). The permission is a grant on
 /// the FUNCTION, so it is read where it lives — the function's own resource-based policy,
 /// which Lambda reports through `GetPolicy` — and evaluated by the one IAM evaluator every
-/// service of this emulator decides an access request with: the S3 service principal
-/// invoking the resolved function, with the request's source bucket and account as the
-/// condition context a grant may be narrowed by. A function carrying no policy at all
-/// answers `GetPolicy` with its own refusal, which grants nothing.
+/// service of this emulator decides an access request with ([`destination_granted`]). A
+/// function carrying no policy at all answers `GetPolicy` with its own refusal, which grants
+/// nothing.
 ///
 /// Nothing is written by either call.
-async fn function_validated(
+async fn function_rejection(
     clients: &mut Clients,
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     arn: &str,
     bucket: &str,
-) -> bool {
+) -> Option<DestinationRejection> {
     let answer = clients
         .lambda(callback, region)
         .get_function_configuration()
@@ -1062,10 +1186,10 @@ async fn function_validated(
             .unwrap_or_else(|| arn.to_string()),
         Err(error) => {
             if refused_by_its_service(&error) {
-                return false;
+                return Some(DestinationRejection::Absent);
             }
             unverifiable("a Lambda function", arn, &error);
-            return true;
+            return None;
         }
     };
     let answer = clients
@@ -1078,15 +1202,18 @@ async fn function_validated(
         Ok(policy) => policy.policy.unwrap_or_default(),
         Err(error) => {
             if refused_by_its_service(&error) {
-                // A function with no resource-based policy is reported as having none, and
-                // a function whose policy cannot be read grants nothing either way.
-                return false;
+                // A function with no resource-based policy is reported as having none, which
+                // grants nothing.
+                return Some(DestinationRejection::Unpermitted);
             }
             unverifiable("a Lambda function", arn, &error);
-            return true;
+            return None;
         }
     };
-    invoke_granted(&document, &resolved, bucket)
+    if destination_granted(&document, INVOKE_FUNCTION_ACTION, &resolved, bucket) {
+        return None;
+    }
+    Some(DestinationRejection::Unpermitted)
 }
 
 /// The IAM action S3 needs on a function destination to deliver an event to it.
@@ -1104,19 +1231,23 @@ const SOURCE_ARN_KEY: &str = "aws:SourceArn";
 /// it by.
 const SOURCE_ACCOUNT_KEY: &str = "aws:SourceAccount";
 
-/// Whether `document`, a function's resource-based policy, allows the S3 service principal
-/// to invoke `function_arn` for an event published by `bucket`.
+/// Whether `document`, the resource policy of one destination, allows the Amazon S3 service
+/// principal to perform `action` on `resource` for a notification published by `bucket`.
 ///
-/// The decision is [`::service_common::iam_authorization`]'s, so a document this reads and
-/// the same document read by the service that owns it cannot disagree; the two condition
-/// keys an invoke grant is narrowed by travel as the request's context, and are declared as
-/// keys this request MODELS because it carries a value for each.
+/// The ONE place a destination's permission is decided, for all three destination kinds: S3
+/// asks the same question of each — may Amazon S3 publish this bucket's notifications to
+/// it? — and only the action and the resource differ ([`SEND_MESSAGE_ACTION`],
+/// [`PUBLISH_ACTION`], [`INVOKE_FUNCTION_ACTION`]). The decision is
+/// [`::service_common::iam_authorization`]'s, so a document this reads and the same document
+/// read by the service that owns it cannot disagree; the two condition keys such a grant is
+/// narrowed by travel as the request's context, and are declared as keys this request MODELS
+/// because it carries a value for each.
 ///
-/// `aws:SourceAccount` is the account that OWNS the invoking bucket, which here is the one
+/// `aws:SourceAccount` is the account that OWNS the publishing bucket, which here is the one
 /// account this emulator serves ([`::engine::emulator_account_id`]) — the same account
 /// every bucket's owner is reported as. A deployment where bucket ownership varies reads
 /// the owner off the bucket's own record instead, and this is the seam that changes.
-fn invoke_granted(document: &str, function_arn: &str, bucket: &str) -> bool {
+fn destination_granted(document: &str, action: &str, resource: &str, bucket: &str) -> bool {
     let principals = [S3_SERVICE_PRINCIPAL.to_string()];
     let context = [
         (SOURCE_ARN_KEY.to_string(), bucket_arn(bucket)),
@@ -1125,13 +1256,10 @@ fn invoke_granted(document: &str, function_arn: &str, bucket: &str) -> bool {
             ::engine::emulator_account_id().to_string(),
         ),
     ];
-    let request = ::service_common::iam_authorization::Request::new(
-        INVOKE_FUNCTION_ACTION,
-        function_arn,
-        &principals,
-    )
-    .with_context(&context)
-    .with_published_keys(&[SOURCE_ARN_KEY, SOURCE_ACCOUNT_KEY]);
+    let request =
+        ::service_common::iam_authorization::Request::new(action, resource, &principals)
+            .with_context(&context)
+            .with_published_keys(&[SOURCE_ARN_KEY, SOURCE_ACCOUNT_KEY]);
     ::service_common::iam_authorization::resource_decision(document, &request)
         == ::service_common::iam_authorization::Decision::Allowed
 }
