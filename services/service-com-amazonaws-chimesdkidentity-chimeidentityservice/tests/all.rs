@@ -19,6 +19,8 @@ mod app_instance_bot_description;
 mod app_instance_bots;
 #[path = "all/app_instance_lifecycle.rs"]
 mod app_instance_lifecycle;
+#[path = "all/app_instance_retention_settings.rs"]
+mod app_instance_retention_settings;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/resource_update.rs"]

@@ -37,7 +37,10 @@ use std::hash::BuildHasher as _;
 use std::ops::Bound;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::{Configuration, EndpointAttributes, EndpointState, ExpirationSettings};
+use crate::ops::types::{
+    AppInstanceRetentionSettings, Configuration, EndpointAttributes, EndpointState,
+    ExpirationSettings,
+};
 
 /// The region used for a minted ARN when the request carries no SigV4 credential
 /// scope to read one from (an unsigned or presigned request).
@@ -186,6 +189,20 @@ pub struct AppInstanceRecord {
     pub users: BTreeMap<String, AppInstanceUserRecord>,
     /// This instance's bots, keyed by `AppInstanceBotArn`.
     pub bots: BTreeMap<String, AppInstanceBotRecord>,
+    /// The data-retention settings last written for this instance, or `None` while
+    /// nobody has written any.
+    ///
+    /// Retention settings are a sub-resource of the instance addressed by its own route
+    /// rather than a member of the `AppInstance` shape, so they are held beside the
+    /// instance here and are reported only by the retention-settings reader.
+    pub retention_settings: Option<AppInstanceRetentionSettings>,
+    /// The instant from which the data this instance holds outside the retention window
+    /// is deleted: the instant the settings now in effect were written.
+    ///
+    /// `None` while no retention period is in effect — settings that name no number of
+    /// days are how a caller turns retention off, and nothing is then due for deletion,
+    /// so there is no deletion instant to report.
+    pub retention_deletion_initiated_at: Option<SystemTime>,
 }
 
 /// What [`ComAmazonawsChimesdkidentityChimeidentityserviceState::insert_user`] did, so
@@ -769,6 +786,20 @@ pub fn endpoint_request_fingerprint(
     field(name);
     field(allow_messages);
     ::hex::encode(hasher.finalize())
+}
+
+/// The number of days a retention-settings structure puts in effect, or `None` when it
+/// names none.
+///
+/// Every level of the structure is optional (`AppInstanceRetentionSettings$Channel\
+/// RetentionSettings`, `ChannelRetentionSettings$RetentionDays`), and omitting the
+/// number of days is how a caller turns retention off, so "no days anywhere in the
+/// structure" and "no retention in effect" are the same answer.
+pub fn retention_days_in_effect(settings: &AppInstanceRetentionSettings) -> Option<i32> {
+    settings
+        .channel_retention_settings
+        .as_ref()
+        .and_then(|channel| channel.retention_days)
 }
 
 /// A stored instant as the wire timestamp the model declares (`Timestamp`).

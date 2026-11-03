@@ -222,6 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_updated_timestamp: None,
             users: ::std::collections::BTreeMap::new(),
             bots: ::std::collections::BTreeMap::new(),
+            // Retention is off until a caller writes settings for this instance, so
+            // there is nothing to report and no deletion instant yet.
+            retention_settings: None,
+            retention_deletion_initiated_at: None,
         };
 
         state.app_instances.insert(arn.clone(), record);
