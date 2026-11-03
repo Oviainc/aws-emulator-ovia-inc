@@ -104,6 +104,10 @@ mod resource_tags_batch;
 mod reusable_delegation_sets;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+// Declared beside the hosted-zone and tagging suites: this one is the two reads
+// TOGETHER — the listing a client pages and the tag set it selects a zone by.
+#[path = "all/tag_driven_zone_discovery.rs"]
+mod tag_driven_zone_discovery;
 #[path = "all/traffic_policies.rs"]
 mod traffic_policies;
 #[path = "all/traffic_policy_comment_updates.rs"]
