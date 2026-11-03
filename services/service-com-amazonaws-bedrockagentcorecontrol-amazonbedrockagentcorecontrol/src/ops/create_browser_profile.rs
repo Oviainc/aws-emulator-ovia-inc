@@ -171,6 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
+        // A profile whose accepted deletion the clock has already made due is
+        // gone before this call looks at the names and tokens it holds, so the
+        // name it held is free again.
+        store.expire_deleted_browser_profiles(now);
 
         // A replayed request carrying the same `clientToken` answers with the
         // profile that token first produced, rather than minting a second one:
@@ -230,6 +234,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_saved_at: None,
             last_saved_browser_session_id: None,
             last_saved_browser_id: None,
+            // Nothing has deleted a profile this call just minted, so the clock
+            // owes it no removal.
+            removal_due_at: None,
         };
         let output = record.create_output();
 

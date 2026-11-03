@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end HTTP tests for the browser-profile lifecycle (`CreateBrowserProfile`,
-//! `GetBrowserProfile`).
+//! `GetBrowserProfile`, `DeleteBrowserProfile`).
 //!
 //! Every test drives the service the way the router does: an `http::Request` through
 //! [`MultiServiceRouter::dispatch`], so the wire protocol (`restJson1`), the boundary
@@ -9,6 +9,7 @@
 //! engine, so what one request writes is what the next request reads.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
@@ -33,6 +34,10 @@ const MAX_NAME_LEN: usize = 48;
 /// operation=CreateBrowserProfile`).
 const MIN_DESCRIPTION_LEN: usize = 1;
 const MAX_DESCRIPTION_LEN: usize = 4096;
+
+/// The span `src/state.rs` gives a browser profile's clock-owed removal, plus slack, so
+/// a test can wait the clock out.
+const PAST_REMOVAL: Duration = Duration::from_millis(3_300);
 
 /// A `clientToken` inside the modelled `ClientToken` constraints (len 33..256,
 /// `^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,256}$`, `smithy_query operation=CreateBrowserProfile`).
@@ -100,6 +105,20 @@ async fn get_profile(router: &MultiServiceRouter, profile_id: &str) -> (u16, Val
         None,
     )
     .await
+}
+
+/// `DeleteBrowserProfile`: `DELETE /browser-profiles/{profileId}`, with the optional
+/// `clientToken` on the query string (`smithy_query operation=DeleteBrowserProfile`).
+async fn delete_profile(
+    router: &MultiServiceRouter,
+    profile_id: &str,
+    client_token: Option<&str>,
+) -> (u16, Value) {
+    let uri = match client_token {
+        Some(token) => format!("/browser-profiles/{profile_id}?clientToken={token}"),
+        None => format!("/browser-profiles/{profile_id}"),
+    };
+    send(router, "DELETE", &uri, None).await
 }
 
 /// The error code `restJson1` puts in `__type` / `x-amzn-errortype`.
@@ -564,5 +583,324 @@ async fn a_browser_profile_and_a_browser_of_one_name_are_separate_resources() {
     assert_eq!(
         status, 404,
         "a profile id addresses no browser, got {status} ({answered})"
+    );
+}
+
+/// A deletion reports the profile it addressed as `DELETING`, the profile reads back in
+/// that status until the removal the clock owes comes due, and from then on every call
+/// addressing it is the modelled 404 — and the name it held is free again.
+///
+/// The rows differ along what the deleted profile carries (nothing beyond its name, a
+/// description, tags), how many times the delete is sent, and whether it carries the
+/// optional `clientToken`: the deletion is `@idempotent` (`smithy_query
+/// operation=DeleteBrowserProfile`), so a repeat while it is under way reports the same
+/// profile at the same instant rather than re-arming the clock. One profile in the
+/// router is never deleted, so the removal is shown to be per-profile.
+#[tokio::test]
+async fn a_deleted_browser_profile_reports_deleting_and_is_then_not_found() {
+    let router = router();
+
+    // The profile nobody deletes: a delete of one profile leaves it alone.
+    let (status, untouched) = create_profile(&router, &json!({"name": "keptProfile"})).await;
+    assert_eq!(
+        status, 200,
+        "the profile nobody deletes is created, got {status} ({untouched})"
+    );
+    let untouched_id = text(&untouched, "profileId");
+
+    // (case, name, the members beyond `name`, how many deletes to send, the delete's
+    //  clientToken)
+    let rows: [(&str, &str, Value, usize, Option<String>); 4] = [
+        ("only the required name", "bareProfile", json!({}), 1, None),
+        (
+            "a described profile",
+            "describedProfile",
+            json!({"description": "the shared shopping profile"}),
+            1,
+            None,
+        ),
+        (
+            "a tagged profile deleted twice",
+            "taggedProfile",
+            json!({"tags": {"owner": "retail", "environment": "test"}}),
+            2,
+            None,
+        ),
+        (
+            "deleted three times with an idempotency token",
+            "tokenProfile",
+            json!({"description": "deleted with a token", "clientToken": client_token("createIt")}),
+            3,
+            Some(client_token("deleteIt")),
+        ),
+    ];
+
+    // Each row is created, deleted and read while its removal is still pending; the
+    // clock is then waited out ONCE for all of them.
+    let mut deleted: Vec<(&str, &str, String, Value)> = Vec::new();
+    for (case, name, extra, deletes, token) in rows {
+        let mut body = json!({"name": name});
+        for (member, value) in extra.as_object().expect("the row's members are an object") {
+            body[member] = value.clone();
+        }
+        let (status, created) = create_profile(&router, &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from CreateBrowserProfile, got {status} ({created})"
+        );
+        let id = text(&created, "profileId");
+
+        let mut first_delete = Value::Null;
+        for attempt in 1..=deletes {
+            let (status, answered) = delete_profile(&router, &id, token.as_deref()).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} (delete {attempt}): expected HTTP 200 from DeleteBrowserProfile, \
+                 got {status} ({answered})"
+            );
+            assert_eq!(
+                text(&answered, "profileId"),
+                id,
+                "case {case:?} (delete {attempt}): the deletion reports the profile addressed, \
+                 got {}",
+                text(&answered, "profileId")
+            );
+            assert_eq!(
+                text(&answered, "profileArn"),
+                text(&created, "profileArn"),
+                "case {case:?} (delete {attempt}): the deletion reports the ARN the create \
+                 handed back, got {}",
+                text(&answered, "profileArn")
+            );
+            assert_eq!(
+                text(&answered, "status"),
+                "DELETING",
+                "case {case:?} (delete {attempt}): an accepted deletion reports DELETING, got {}",
+                text(&answered, "status")
+            );
+            assert_date_time(case, "lastUpdatedAt", &answered["lastUpdatedAt"]);
+            assert!(
+                answered["lastSavedAt"].is_null(),
+                "case {case:?} (delete {attempt}): no browser session saved into this profile, \
+                 so lastSavedAt is absent, got {}",
+                answered["lastSavedAt"]
+            );
+            if attempt == 1 {
+                first_delete = answered;
+            } else {
+                assert_eq!(
+                    answered, first_delete,
+                    "case {case:?} (delete {attempt}): a repeated delete reports the first \
+                     deletion unchanged, got {answered} against {first_delete}"
+                );
+            }
+        }
+
+        // The profile is still readable while its removal is pending, and reports the
+        // status the deletion put it in.
+        let (status, fetched) = get_profile(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a profile whose removal is still pending is readable, got {status} \
+             ({fetched})"
+        );
+        assert_eq!(
+            text(&fetched, "status"),
+            "DELETING",
+            "case {case:?}: a profile whose deletion is under way reports DELETING, got {}",
+            text(&fetched, "status")
+        );
+        assert_eq!(
+            fetched["lastUpdatedAt"], first_delete["lastUpdatedAt"],
+            "case {case:?}: the read reports the instant the deletion recorded, got {} against {}",
+            fetched["lastUpdatedAt"], first_delete["lastUpdatedAt"]
+        );
+        assert_eq!(
+            text(&fetched, "name"),
+            name,
+            "case {case:?}: the stored profile is unchanged beyond its status, got {}",
+            text(&fetched, "name")
+        );
+
+        deleted.push((case, name, id, first_delete));
+    }
+
+    // The profile nobody deleted is untouched by any of it.
+    let (status, kept) = get_profile(&router, &untouched_id).await;
+    assert_eq!(
+        status, 200,
+        "the profile nobody deleted is readable, got {status} ({kept})"
+    );
+    assert_eq!(
+        text(&kept, "status"),
+        "READY",
+        "deleting one profile leaves another READY, got {}",
+        text(&kept, "status")
+    );
+
+    tokio::time::sleep(PAST_REMOVAL).await;
+
+    for (case, name, id, first_delete) in deleted {
+        // (the call, its HTTP method and URI tail)
+        let reads: [(&str, (u16, Value)); 2] = [
+            ("GetBrowserProfile", get_profile(&router, &id).await),
+            (
+                "DeleteBrowserProfile",
+                delete_profile(&router, &id, None).await,
+            ),
+        ];
+        for (operation, (status, answered)) in reads {
+            assert_eq!(
+                status, 404,
+                "case {case:?}: a removed profile is not found by {operation}, got {status} \
+                 ({answered})"
+            );
+            assert_eq!(
+                error_code(&answered),
+                "ResourceNotFoundException",
+                "case {case:?}: {operation} expected ResourceNotFoundException, got {} \
+                 ({answered})",
+                error_code(&answered)
+            );
+            assert_eq!(
+                text(&answered, "message"),
+                format!("Browser profile with ID {id} does not exist"),
+                "case {case:?}: {operation}'s refusal names the profile id the request carried, \
+                 got {}",
+                text(&answered, "message")
+            );
+        }
+
+        // The name the removed profile held is free again, and the create that takes it
+        // mints its own profile rather than resurrecting the deleted one.
+        let (status, recreated) = create_profile(&router, &json!({"name": name})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the name a removed profile held is free again, got {status} \
+             ({recreated})"
+        );
+        let new_id = text(&recreated, "profileId");
+        assert!(
+            is_modelled_profile_id(&new_id, name),
+            "case {case:?}: the second create mints a modelled profileId, got {new_id:?}"
+        );
+        assert_ne!(
+            new_id, id,
+            "case {case:?}: the second create mints its own profile, got {new_id}"
+        );
+        assert_eq!(
+            text(&recreated, "status"),
+            "READY",
+            "case {case:?}: the profile taking the freed name is READY, got {}",
+            text(&recreated, "status")
+        );
+        assert_ne!(
+            recreated["createdAt"], first_delete["lastUpdatedAt"],
+            "case {case:?}: the second create is its own instant, got {}",
+            recreated["createdAt"]
+        );
+    }
+
+    // And the profile nobody deleted survives the span too.
+    let (status, kept) = get_profile(&router, &untouched_id).await;
+    assert_eq!(
+        status, 200,
+        "the profile nobody deleted is still readable once the span has passed, got {status} \
+         ({kept})"
+    );
+    assert_eq!(
+        text(&kept, "status"),
+        "READY",
+        "a profile nobody deleted stays READY, got {}",
+        text(&kept, "status")
+    );
+}
+
+/// What `DeleteBrowserProfile` refuses: an id naming no profile of this account, and an
+/// id outside `BrowserProfileId`'s published pattern.
+///
+/// The rows differ along why the request is refused — a well-formed id no profile holds,
+/// an id whose stem a browser could hold, and ids one step outside the pattern
+/// `^[a-zA-Z][a-zA-Z0-9_]{0,47}-[a-zA-Z0-9]{10}$` (`smithy_query shape=BrowserProfileId`).
+#[tokio::test]
+async fn delete_browser_profile_refuses_an_unknown_and_an_unmodelled_profile_id() {
+    let router = router();
+
+    // A profile that exists, so a refusal is about the id addressed and not an empty
+    // store; it is never deleted by this test.
+    let (status, created) = create_profile(&router, &json!({"name": "livingProfile"})).await;
+    assert_eq!(
+        status, 200,
+        "the profile the refusals are measured against is created, got {status} ({created})"
+    );
+
+    // (case, the profileId addressed, expected status, expected error code)
+    let rows: [(&str, &str, u16, &str); 5] = [
+        (
+            "an id no profile holds",
+            "absentProfile-0123456789",
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "an id whose stem a living profile holds",
+            "livingProfile-9876543210",
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "an id whose suffix is one character short of the pattern",
+            "shortProfile-012345678",
+            400,
+            "ValidationException",
+        ),
+        (
+            "an id whose suffix is one character past the pattern",
+            "longProfile-01234567890",
+            400,
+            "ValidationException",
+        ),
+        (
+            "an id the pattern does not admit at all",
+            "1profile-0123456789",
+            400,
+            "ValidationException",
+        ),
+    ];
+
+    for (case, profile_id, expected_status, expected_code) in rows {
+        let (status, answered) = delete_profile(&router, profile_id, None).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status} from DeleteBrowserProfile, got \
+             {status} ({answered})"
+        );
+        assert_eq!(
+            error_code(&answered),
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {} ({answered})",
+            error_code(&answered)
+        );
+        if expected_status == 404 {
+            assert_eq!(
+                text(&answered, "message"),
+                format!("Browser profile with ID {profile_id} does not exist"),
+                "case {case:?}: the refusal names the profile id the request carried, got {}",
+                text(&answered, "message")
+            );
+        }
+    }
+
+    // A refused delete persisted nothing: the living profile is still READY.
+    let (status, fetched) = get_profile(&router, &text(&created, "profileId")).await;
+    assert_eq!(
+        status, 200,
+        "the living profile is still readable, got {status} ({fetched})"
+    );
+    assert_eq!(
+        text(&fetched, "status"),
+        "READY",
+        "a refused delete does not move another profile's status, got {}",
+        text(&fetched, "status")
     );
 }

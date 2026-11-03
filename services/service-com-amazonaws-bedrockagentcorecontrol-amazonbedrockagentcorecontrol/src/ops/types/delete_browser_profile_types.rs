@@ -18,7 +18,15 @@ pub struct DeleteBrowserProfileInput {
     pub client_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#DeleteBrowserProfileResponse")]
+/// `DeleteBrowserProfileResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `lastUpdatedAt` and `lastSavedAt` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="DeleteBrowserProfile")`), and the derive
+/// does not put that trait on a member schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct DeleteBrowserProfileOutput {
     pub profile_id: String,
@@ -27,4 +35,17 @@ pub struct DeleteBrowserProfileOutput {
     pub last_updated_at: ::aws_smithy_types::DateTime,
     pub last_saved_at: Option<::aws_smithy_types::DateTime>,
 }
+
+agentcore_schema_and_codec!(
+    DeleteBrowserProfileOutput,
+    DELETE_BROWSER_PROFILE_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#DeleteBrowserProfileResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "DeleteBrowserProfileResponse",
+    (M_PROFILE_ID, profile_id, "profileId", 0, req, string),
+    (M_PROFILE_ARN, profile_arn, "profileArn", 1, req, string),
+    (M_STATUS, status, "status", 2, req, string),
+    (M_LAST_UPDATED_AT, last_updated_at, "lastUpdatedAt", 3, req, date_time),
+    (M_LAST_SAVED_AT, last_saved_at, "lastSavedAt", 4, opt, date_time),
+);
 

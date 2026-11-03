@@ -28,8 +28,10 @@
 //!   is removing;
 //! * the browser profile (`/browser-profiles/`): one [`BrowserProfileRecord`]
 //!   per `profileId`, holding the name, description and tags
-//!   `CreateBrowserProfile` persisted and the instant a browser session last
-//!   saved data into it, so `GetBrowserProfile` reports exactly that;
+//!   `CreateBrowserProfile` persisted, the instant a browser session last saved
+//!   data into it and the removal the clock owes an accepted deletion, so
+//!   `GetBrowserProfile` reports exactly that and `DeleteBrowserProfile`
+//!   reports what it is removing;
 //! * the code interpreter (`/code-interpreters/`): one
 //!   [`CodeInterpreterRecord`] per `codeInterpreterId`, holding the
 //!   configuration `CreateCodeInterpreter` persisted and the statuses the clock
@@ -63,7 +65,7 @@ use crate::ops::types::{
     CodeInterpreterNetworkConfiguration, CreateCodeInterpreterOutput, DeleteCodeInterpreterOutput,
     GetCodeInterpreterOutput,
     CreateBrowserOutput, CreateGatewayOutput, DeleteBrowserOutput, GetBrowserOutput,
-    CreateBrowserProfileOutput, GetBrowserProfileOutput,
+    CreateBrowserProfileOutput, DeleteBrowserProfileOutput, GetBrowserProfileOutput,
     RecordingConfig, ToolsFileSystemConfiguration,
     CreateGatewayTargetOutput, CredentialProviderConfiguration, CustomTransformConfiguration,
     DeleteGatewayTargetOutput,
@@ -2577,6 +2579,19 @@ pub const BROWSER_PROFILE_ARN_RESOURCE: &str = "browser-profile";
 /// three are driven by a session saving into it and by its deletion.
 pub const BROWSER_PROFILE_STATUS_READY: &str = "READY";
 
+/// The `BrowserProfileStatus` a profile reports once a deletion has been
+/// accepted for it, until the clock removes the record.
+pub const BROWSER_PROFILE_STATUS_DELETING: &str = "DELETING";
+
+/// How long an accepted browser-profile deletion leaves the profile `DELETING`
+/// before the record is gone.
+///
+/// AWS documents no duration for the transition, so the span is chosen: long
+/// enough that a caller acting straight after the delete still observes the
+/// transient status, short enough to keep a client script quick — the same span
+/// the sibling browser's transitions take ([`BROWSER_SETTLE_DELAY`]).
+pub const BROWSER_PROFILE_REMOVAL_DELAY: Duration = BROWSER_SETTLE_DELAY;
+
 /// How many browser profiles this emulator will hold.
 ///
 /// `CreateBrowserProfile` models `ServiceQuotaExceededException` (HTTP 402) for
@@ -2611,9 +2626,20 @@ pub struct BrowserProfileRecord {
     pub last_saved_at: Option<SystemTime>,
     pub last_saved_browser_session_id: Option<String>,
     pub last_saved_browser_id: Option<String>,
+    /// The instant an accepted deletion removes this record, once
+    /// `DeleteBrowserProfile` has accepted one; `None` for a profile nobody has
+    /// deleted. Stored, never slept on, like
+    /// [`BrowserRecord::removal_due_at`](BrowserRecord#structfield.removal_due_at).
+    pub removal_due_at: Option<SystemTime>,
 }
 
 impl BrowserProfileRecord {
+    /// Whether a deletion has been accepted for this profile: it reports
+    /// `DELETING` and the clock owes its removal.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
     /// What the create of this profile reports: the four members
     /// `CreateBrowserProfileResponse` declares, every one of them off the record
     /// just written.
@@ -2639,6 +2665,20 @@ impl BrowserProfileRecord {
             last_saved_at: self.last_saved_at.map(timestamp),
             last_saved_browser_session_id: self.last_saved_browser_session_id.clone(),
             last_saved_browser_id: self.last_saved_browser_id.clone(),
+        }
+    }
+
+    /// What the deletion of this profile reports: the identifiers it addressed,
+    /// the status it now holds, when it was last updated — the deletion itself
+    /// is the last update — and, for a profile a browser session had saved
+    /// into, the instant of that save.
+    pub fn delete_output(&self) -> DeleteBrowserProfileOutput {
+        DeleteBrowserProfileOutput {
+            profile_id: self.profile_id.clone(),
+            profile_arn: self.profile_arn.clone(),
+            status: self.status.clone(),
+            last_updated_at: timestamp(self.updated_at),
+            last_saved_at: self.last_saved_at.map(timestamp),
         }
     }
 }
@@ -3812,6 +3852,37 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
             token_key(operation, &token),
             profile_id.to_string(),
         );
+    }
+
+    /// Drop the idempotency records naming a browser profile that no longer
+    /// exists, for the same reason [`Self::forget_client_tokens_for`] does.
+    fn forget_browser_profile_client_tokens_for(&mut self, profile_id: &str) {
+        self.browser_profile_idempotency
+            .retain(|_, id| id != profile_id);
+        let live = &self.browser_profile_idempotency;
+        self.browser_profile_idempotency_order
+            .retain(|token| live.contains_key(token));
+    }
+
+    /// Remove every browser profile whose accepted deletion the clock has made
+    /// due, and the name index entry and idempotency records naming it, on the
+    /// same clock-owed rule as [`Self::expire_deleted_browsers`]:
+    /// `DeleteBrowserProfile` reports the profile `DELETING`, and the record
+    /// itself goes when the span it owes passes, so a caller polling the profile
+    /// sees `DELETING` and then the modelled 404.
+    pub fn expire_deleted_browser_profiles(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .browser_profiles
+            .iter()
+            .filter(|(_, record)| record.removal_due_at.is_some_and(|at| now >= at))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            if let Some(record) = self.browser_profiles.remove(&id) {
+                self.browser_profile_names.remove(&record.name);
+                self.forget_browser_profile_client_tokens_for(&record.profile_id);
+            }
+        }
     }
 
     /// Mint a `codeInterpreterId` for `name` that no stored code interpreter

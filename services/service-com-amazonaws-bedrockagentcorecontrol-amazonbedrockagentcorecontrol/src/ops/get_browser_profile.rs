@@ -164,7 +164,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the browser profile store is unavailable".to_string()),
             })
         })?;
-        let store = state.lock();
+        let mut store = state.lock();
+        // A profile whose accepted deletion the clock has already made due is
+        // gone before this read looks for it — the removal was due at this
+        // instant whether or not anybody called.
+        store.expire_deleted_browser_profiles(::std::time::SystemTime::now());
 
         // The store is keyed by the `profileId` the create minted; an id naming
         // no stored profile is the modelled 404 rather than an empty envelope.
