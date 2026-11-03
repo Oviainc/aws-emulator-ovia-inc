@@ -5,6 +5,12 @@
 //! filtered by the request's `status` / `exclusionStatus` / `regionCode`, in
 //! resource-ARN order and cut into a page by the shared cursor helper.
 //!
+//! The projection of a stored resource this reports
+//! ([`crate::state::resource_summary`]) and the predicate those three filters
+//! select it with ([`crate::state::ResourceFilters`]) are the ones the
+//! organization-level view of the same resources applies too, so they live in
+//! [`crate::state`] and are stated once for both levels.
+//!
 //! The identifier carries the OWNING ACCOUNT of the recommendation it names
 //! (`AccountRecommendationIdentifier`:
 //! `^arn:[\w-]+:trustedadvisor::\d{12}:recommendation\/[\w-]+$`), so one naming
@@ -102,25 +108,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-
-/// The stored resource, as the modelled `RecommendationResourceSummary`.
-fn resource_summary(resource: &crate::state::ResourceEntry) -> RecommendationResourceSummary {
-    RecommendationResourceSummary {
-        id: resource.id.clone(),
-        arn: resource.arn.clone(),
-        aws_resource_id: resource.aws_resource_id.clone(),
-        region_code: resource.region_code.clone(),
-        status: resource.status.clone(),
-        metadata: resource
-            .metadata
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-        last_updated_at: crate::state::date_time(resource.last_updated_at_millis),
-        exclusion_status: resource.exclusion_status.clone(),
-        recommendation_arn: resource.recommendation_arn.clone(),
-    }
-}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -245,20 +232,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The three filters this read cuts on, and the ONE predicate they
+        // select a stored resource with — the same one the organization-level
+        // view of these resources applies
+        // ([`crate::state::ResourceFilters`]), so the two cannot select
+        // differently. Each summary is likewise the one shared projection of
+        // the stored resource ([`crate::state::resource_summary`]).
+        let filters = crate::state::ResourceFilters {
+            status: input.status.as_deref(),
+            exclusion_status: input.exclusion_status.as_deref(),
+            region_code: input.region_code.as_deref(),
+        };
         let matching: Vec<(String, RecommendationResourceSummary)> = state
             .resources_of(&input.recommendation_identifier)
-            .filter(|(_, resource)| {
-                input.status.as_ref().is_none_or(|status| &resource.status == status)
-                    && input
-                        .exclusion_status
-                        .as_ref()
-                        .is_none_or(|exclusion| &resource.exclusion_status == exclusion)
-                    && input
-                        .region_code
-                        .as_ref()
-                        .is_none_or(|region| &resource.region_code == region)
-            })
-            .map(|(arn, resource)| (arn.clone(), resource_summary(resource)))
+            .filter(|(_, resource)| filters.keeps(resource))
+            .map(|(arn, resource)| (arn.clone(), crate::state::resource_summary(resource)))
             .collect();
 
         // The cursor's scope names this recommendation AND this read's filters,
@@ -267,11 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page = crate::state::paginate(
             &crate::state::list_scope(
                 &format!("resources/{}", input.recommendation_identifier),
-                &[
-                    ("status", input.status.as_deref()),
-                    ("exclusionStatus", input.exclusion_status.as_deref()),
-                    ("regionCode", input.region_code.as_deref()),
-                ],
+                &filters.scope(),
             ),
             matching,
             input.next_token.as_deref(),

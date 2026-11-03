@@ -73,6 +73,14 @@
 //! stated once rather than once per operation, so the two levels cannot drift
 //! apart on it.
 //!
+//! The two levels' READ of one stored [`ResourceEntry`] lives here for the same
+//! reason: [`resource_summary`] is the projection both resource lists report,
+//! [`organization_resource_summary`] is that projection with the two members the
+//! organization view is modelled to carry differently, and [`ResourceFilters`]
+//! is the `status` / `exclusionStatus` / `regionCode` predicate both reads cut
+//! their rows on — each stated once, so no account-level and organization-level
+//! view of one resource can disagree.
+//!
 //! The same ownership test ([`is_foreign_resource`]) SCOPES the account-level
 //! views: [`recommendations`](ComAmazonawsTrustedadvisorTrustedadvisorState::recommendations)
 //! and [`recommendation_resources`](ComAmazonawsTrustedadvisorTrustedadvisorState::recommendation_resources)
@@ -84,8 +92,9 @@
 use std::collections::BTreeMap;
 
 use crate::ops::types::{
-    AccessDeniedException, ConflictException, RecommendationCostOptimizingAggregates,
-    RecommendationPillarSpecificAggregates, RecommendationResourcesAggregates,
+    AccessDeniedException, ConflictException, OrganizationRecommendationResourceSummary,
+    RecommendationCostOptimizingAggregates, RecommendationPillarSpecificAggregates,
+    RecommendationResourceSummary, RecommendationResourcesAggregates,
 };
 
 /// What this service answers a caller whose account's support plan does not
@@ -767,6 +776,129 @@ pub struct ResourceEntry {
     /// member reports this figure, so it exists only where a cost aggregate is
     /// computed from it, and a non-cost resource contributes nothing.
     pub estimated_monthly_spend: Option<f64>,
+}
+
+// ---------------------------------------------------------------------------
+// The resource views
+// ---------------------------------------------------------------------------
+
+/// The stored resource, as the modelled `RecommendationResourceSummary`.
+///
+/// This is the projection of a [`ResourceEntry`] that BOTH resource lists
+/// report — `ListRecommendationResources` over one recommendation's resources
+/// and `ListOrganizationRecommendationResources` over the member accounts'
+/// resources an organization recommendation aggregates — so it is stated here
+/// ONCE, as [`apply_lifecycle_update`] states the one lifecycle write of the two
+/// levels. Reporting the two views from one projection is what makes them unable
+/// to disagree about a resource, instead of agreeing only while two copies of
+/// the projection happen to be written identically.
+pub fn resource_summary(resource: &ResourceEntry) -> RecommendationResourceSummary {
+    RecommendationResourceSummary {
+        id: resource.id.clone(),
+        arn: resource.arn.clone(),
+        aws_resource_id: resource.aws_resource_id.clone(),
+        region_code: resource.region_code.clone(),
+        status: resource.status.clone(),
+        metadata: resource
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        last_updated_at: date_time(resource.last_updated_at_millis),
+        exclusion_status: resource.exclusion_status.clone(),
+        recommendation_arn: resource.recommendation_arn.clone(),
+    }
+}
+
+/// The same stored resource, as the modelled
+/// `OrganizationRecommendationResourceSummary`: [`resource_summary`]'s
+/// projection, with the two members the organization view is modelled to carry
+/// differently layered on top. Every other value is the one the account-level
+/// view reports, taken from the same projection rather than written out again,
+/// so the two views of one resource cannot disagree. The two:
+///
+/// * `accountId` is the account segment of the resource's own ARN — the account
+///   that owns it — so no stored field can contradict the ARN a caller reads
+///   beside it, taken through [`arn_account_id`], the one derivation every view
+///   of a stored resource's owning account shares;
+/// * `recommendationArn` is the ARN of the ORGANIZATION recommendation the
+///   resource is reported under, which is what that member is modelled to carry
+///   (`OrganizationRecommendationArn`, pattern
+///   `^arn:[\w-]+:trustedadvisor:::organization-recommendation\/[\w-]+$`) — the
+///   member account's own recommendation ARN does not satisfy it.
+pub fn organization_resource_summary(
+    resource: &ResourceEntry,
+    organization_recommendation_arn: &str,
+) -> OrganizationRecommendationResourceSummary {
+    // Destructured by NAME, so every shared member reaches the organization
+    // view as the projection computed it: the account-level
+    // `recommendationArn` is the only one this view replaces outright.
+    let RecommendationResourceSummary {
+        id,
+        arn,
+        aws_resource_id,
+        region_code,
+        status,
+        metadata,
+        last_updated_at,
+        exclusion_status,
+        recommendation_arn: _,
+    } = resource_summary(resource);
+    OrganizationRecommendationResourceSummary {
+        id,
+        arn,
+        aws_resource_id,
+        region_code,
+        status,
+        metadata,
+        last_updated_at,
+        exclusion_status,
+        account_id: arn_account_id(&resource.arn),
+        recommendation_arn: organization_recommendation_arn.to_string(),
+    }
+}
+
+/// The resource filters BOTH resource lists cut their rows on, as one read's
+/// request states them: `status`, `exclusionStatus` and `regionCode`, each
+/// `None` when the request named it not at all.
+///
+/// The three are modelled identically on the two operations and select over the
+/// resource's own stored members, so the predicate is stated once — by
+/// [`Self::keeps`] — and the cursor scope the filters contribute once, by
+/// [`Self::scope`]. `ListOrganizationRecommendationResources` layers its extra
+/// `affectedAccountId` test on top of this one; it has no account-level
+/// counterpart, because an account-level list reports one account's resources.
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceFilters<'request> {
+    pub status: Option<&'request str>,
+    pub exclusion_status: Option<&'request str>,
+    pub region_code: Option<&'request str>,
+}
+
+impl<'request> ResourceFilters<'request> {
+    /// Whether this read reports `resource`: a filter in force keeps a resource
+    /// whose own member EQUALS the value asked for, and a filter the request
+    /// omitted keeps every resource.
+    pub fn keeps(&self, resource: &ResourceEntry) -> bool {
+        self.status.is_none_or(|status| resource.status == status)
+            && self
+                .exclusion_status
+                .is_none_or(|exclusion| resource.exclusion_status == exclusion)
+            && self
+                .region_code
+                .is_none_or(|region| resource.region_code == region)
+    }
+
+    /// These filters as [`list_scope`] names them, under the member names the
+    /// requests carry and in the order both reads list them — so a token issued
+    /// under one filter set cannot resume a differently filtered sequence.
+    pub fn scope(&self) -> Vec<(&'static str, Option<&'request str>)> {
+        vec![
+            ("status", self.status),
+            ("exclusionStatus", self.exclusion_status),
+            ("regionCode", self.region_code),
+        ]
+    }
 }
 
 /// Per-service state for com-amazonaws-trustedadvisor-trustedadvisor. A handler reaches it through [`service_state`].

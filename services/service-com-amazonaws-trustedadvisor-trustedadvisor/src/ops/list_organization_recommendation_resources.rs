@@ -18,6 +18,14 @@
 //! i.e. the aggregate the caller asked about rather than the member account's
 //! own recommendation.
 //!
+//! Those two members are the ONLY ones this view states for itself: the rest of
+//! the summary is [`crate::state::resource_summary`]'s projection of the stored
+//! resource, layered by [`crate::state::organization_resource_summary`], and the
+//! three filters it shares with the account-level view select a resource through
+//! that view's predicate ([`crate::state::ResourceFilters`]), with this
+//! operation's own `affectedAccountId` test on top — so the two views of one
+//! stored resource cannot disagree.
+//!
 //! A well-formed `organizationRecommendationIdentifier` that names nothing in
 //! the store is a `ResourceNotFoundException` (404) — an empty list would claim
 //! the organization recommendation exists and aggregates no resources.
@@ -101,43 +109,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-
-/// One member account's stored resource, as the modelled
-/// `OrganizationRecommendationResourceSummary`.
-///
-/// Every value but two is the resource's own stored one, so the account-level
-/// and the organization-level view of a resource cannot disagree. The two:
-///
-/// * `accountId` is the account segment of the resource's own ARN — the account
-///   that owns it — so no stored field can contradict the ARN a caller reads
-///   beside it, taken through [`crate::state::arn_account_id`], the one
-///   derivation every view of a stored resource's owning account shares;
-/// * `recommendationArn` is the ARN of the ORGANIZATION recommendation the
-///   resource is reported under, which is what that member is modelled to
-///   carry (`OrganizationRecommendationArn`, pattern
-///   `^arn:[\w-]+:trustedadvisor:::organization-recommendation\/[\w-]+$`) — the
-///   member account's own recommendation ARN does not satisfy it.
-fn organization_resource_summary(
-    resource: &crate::state::ResourceEntry,
-    organization_recommendation_arn: &str,
-) -> OrganizationRecommendationResourceSummary {
-    OrganizationRecommendationResourceSummary {
-        id: resource.id.clone(),
-        arn: resource.arn.clone(),
-        aws_resource_id: resource.aws_resource_id.clone(),
-        region_code: resource.region_code.clone(),
-        status: resource.status.clone(),
-        metadata: resource
-            .metadata
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-        last_updated_at: crate::state::date_time(resource.last_updated_at_millis),
-        exclusion_status: resource.exclusion_status.clone(),
-        account_id: crate::state::arn_account_id(&resource.arn),
-        recommendation_arn: organization_recommendation_arn.to_string(),
-    }
-}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -264,33 +235,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of this list — and only for a member the store really holds a
         // recommendation for, since an ARN naming no stored recommendation
         // names no resources of this organization either.
+        //
+        // The three filters the account-level view of these same resources cuts
+        // on, selected with that ONE shared predicate
+        // ([`crate::state::ResourceFilters`]), and this operation's own
+        // `affectedAccountId` test layered on top of it: the account that owns a
+        // resource is the account segment of its own ARN
+        // ([`crate::state::arn_account_id`]), which is what this list reports as
+        // `accountId` beside it.
+        let filters = crate::state::ResourceFilters {
+            status: input.status.as_deref(),
+            exclusion_status: input.exclusion_status.as_deref(),
+            region_code: input.region_code.as_deref(),
+        };
         let mut matching: Vec<(String, OrganizationRecommendationResourceSummary)> = state
             .member_recommendations_of(identifier)
             .into_iter()
             .flat_map(|member_arn| state.resources_of(member_arn))
+            .filter(|(_, resource)| {
+                filters.keeps(resource)
+                    && input.affected_account_id.as_deref().is_none_or(|account| {
+                        crate::state::arn_account_id(&resource.arn).as_deref() == Some(account)
+                    })
+            })
             .map(|(arn, resource)| {
                 (
                     arn.clone(),
-                    organization_resource_summary(resource, &entry.arn),
+                    crate::state::organization_resource_summary(resource, &entry.arn),
                 )
-            })
-            .filter(|(_, summary)| {
-                input
-                    .status
-                    .as_ref()
-                    .is_none_or(|status| &summary.status == status)
-                    && input
-                        .exclusion_status
-                        .as_ref()
-                        .is_none_or(|exclusion| &summary.exclusion_status == exclusion)
-                    && input
-                        .region_code
-                        .as_ref()
-                        .is_none_or(|region| &summary.region_code == region)
-                    && input
-                        .affected_account_id
-                        .as_deref()
-                        .is_none_or(|account| summary.account_id.as_deref() == Some(account))
             })
             .collect();
         matching.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -299,15 +271,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read's filters, so a token issued for one organization
         // recommendation's resources (or under another filter set) cannot
         // resume another sequence.
+        let mut scope_filters = filters.scope();
+        scope_filters.push(("affectedAccountId", input.affected_account_id.as_deref()));
         let page = crate::state::paginate(
             &crate::state::list_scope(
                 &format!("organizationRecommendationResources/{identifier}"),
-                &[
-                    ("status", input.status.as_deref()),
-                    ("exclusionStatus", input.exclusion_status.as_deref()),
-                    ("regionCode", input.region_code.as_deref()),
-                    ("affectedAccountId", input.affected_account_id.as_deref()),
-                ],
+                &scope_filters,
             ),
             matching,
             input.next_token.as_deref(),
