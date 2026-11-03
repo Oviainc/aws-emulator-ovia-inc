@@ -128,6 +128,17 @@ impl Emulator {
         self.post(&format!("/domains/{domain}/profiles/search{query}"), body)
             .await
     }
+
+    /// `DeleteProfile`: `POST /domains/{DomainName}/profiles/delete`. The one place the
+    /// route is spelled for a call; the refusal tables below drive it through
+    /// [`Self::send`] because what they vary IS the path.
+    pub(crate) async fn delete_profile(&self, domain: &str, profile_id: &str) -> (u16, Value) {
+        self.post(
+            &format!("/domains/{domain}/profiles/delete"),
+            json!({ "ProfileId": profile_id }),
+        )
+        .await
+    }
 }
 
 /// The wire error code restJson1 carries in the body's `__type` discriminator.
@@ -267,12 +278,7 @@ async fn the_domain_profile_lifecycle_round_trips_through_stored_state() {
         "SearchProfiles for an unknown id: expected 200 with empty Items, got {status} {empty:?}"
     );
 
-    let (status, deleted) = emulator
-        .post(
-            "/domains/testdom/profiles/delete",
-            json!({ "ProfileId": profile_id.clone() }),
-        )
-        .await;
+    let (status, deleted) = emulator.delete_profile("testdom", &profile_id).await;
     assert_eq!(status, 200, "DeleteProfile: expected 200, got {status} {deleted:?}");
     assert!(
         deleted.get("Message").and_then(Value::as_str).is_some(),
