@@ -33,7 +33,10 @@ const STORED_STACK: &str = "stored-stack";
 
 /// AWS's `ResourceNotFoundException` sentence for a named resource the account does not
 /// hold.
-fn not_found_sentence(kind: &str, name: &str) -> String {
+///
+/// Shared with the other suites in this target (`tests/all/stack_registry.rs`), so every
+/// suite states the sentence once.
+pub(crate) fn not_found_sentence(kind: &str, name: &str) -> String {
     format!("The {kind} {name} for account {ACCOUNT} does not exist.")
 }
 

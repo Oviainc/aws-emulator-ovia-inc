@@ -17,6 +17,8 @@ mod associated_fleets;
 mod refusal_messages;
 #[path = "all/stack_fleet_lifecycle.rs"]
 mod stack_fleet_lifecycle;
+#[path = "all/stack_registry.rs"]
+mod stack_registry;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_stack.rs"]
