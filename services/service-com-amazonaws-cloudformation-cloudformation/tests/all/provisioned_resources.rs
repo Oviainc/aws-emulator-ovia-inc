@@ -575,6 +575,202 @@ async fn a_declared_pipeline_exists_in_codepipeline_wired_to_the_stacks_resource
     );
 }
 
+/// The template a custom-action-type row deploys: the registration alone, declared with
+/// the properties the row states.
+fn custom_action_type_template(properties: Value) -> String {
+    json!({"Resources": {
+        "Worker": {
+            "Type": "AWS::CodePipeline::CustomActionType",
+            "Properties": properties,
+        }
+    }})
+    .to_string()
+}
+
+/// A custom action type a stack declares is REGISTERED in CodePipeline, so a job worker
+/// polling for the action type the template declared is served rather than refused, and
+/// deleting the stack takes the registration with it.
+///
+/// The rows differ along what this generalises over: the `Category` and `Version` the
+/// declaration states (every property of the identifying triple), whether the type
+/// declares configuration properties and settings, and whether it carries tags — each a
+/// property `CreateCustomActionType` takes under its own member name.
+#[tokio::test]
+async fn a_declared_custom_action_type_is_registered_in_codepipeline() {
+    // (case, Category, Provider, Version, the extra properties the row declares)
+    let rows: Vec<(&str, &str, &str, &str, Value)> = vec![
+        (
+            "the smallest declaration",
+            "Build",
+            "cfn-build-worker",
+            "1",
+            json!({}),
+        ),
+        (
+            "a Test category with configuration properties and settings",
+            "Test",
+            "cfn-test-worker",
+            "2",
+            json!({
+                "ConfigurationProperties": [{
+                    "Name": "ProjectName",
+                    "Description": "the project the worker builds",
+                    "Key": true,
+                    "Required": true,
+                    "Secret": false,
+                    "Queryable": false,
+                    "Type": "String",
+                }],
+                "Settings": {
+                    "EntityUrlTemplate": "https://example.test/{Config:ProjectName}",
+                    "ExecutionUrlTemplate": "https://example.test/runs",
+                },
+            }),
+        ),
+        (
+            "a Deploy category carrying tags",
+            "Deploy",
+            "cfn-deploy-worker",
+            "3",
+            json!({"Tags": [{"Key": "owner", "Value": "platform"}]}),
+        ),
+    ];
+
+    for (case, category, provider, version, extra) in rows {
+        let router = router();
+        let mut properties = json!({
+            "Category": category,
+            "Provider": provider,
+            "Version": version,
+            // `ArtifactDetails` is `@required` on both sides of the create, with
+            // `maximumCount`/`minimumCount` inside it.
+            "InputArtifactDetails": {"MaximumCount": 1, "MinimumCount": 0},
+            "OutputArtifactDetails": {"MaximumCount": 1, "MinimumCount": 0},
+        });
+        for (key, value) in extra.as_object().into_iter().flatten() {
+            properties[key] = value.clone();
+        }
+        let template = custom_action_type_template(properties);
+        let (status, reason) = deploy(&router, "action-type-stack", &template).await;
+        assert_eq!(
+            status.as_deref(),
+            Some("CREATE_COMPLETE"),
+            "case {case:?}: expected the create to complete, got {status:?} ({reason:?})"
+        );
+
+        // The registration exists: a worker polling for exactly the action type the
+        // template declared is SERVED (an empty job list until a job is due), which is
+        // the fact a stack's own completion is supposed to have established.
+        let polled = json!({
+            "actionTypeId": {
+                "category": category,
+                "owner": "Custom",
+                "provider": provider,
+                "version": version,
+            },
+            "maxBatchSize": 10,
+        });
+        let (code, body) = codepipeline(&router, "PollForJobs", &polled).await;
+        assert_eq!(
+            code, 200,
+            "case {case:?}: expected the declared action type to be pollable, got {code}: \
+             {body}"
+        );
+        assert_eq!(
+            body["jobs"],
+            json!([]),
+            "case {case:?}: no job is due yet, so the poll is served an empty list, got {body}"
+        );
+
+        // And the same registration through the catalog, carrying the artifact counts the
+        // declaration stated.
+        let (code, body) = codepipeline(
+            &router,
+            "ListActionTypes",
+            &json!({"actionOwnerFilter": "Custom"}),
+        )
+        .await;
+        assert_eq!(
+            code, 200,
+            "case {case:?}: expected the catalog to answer, got {code}: {body}"
+        );
+        let listed = body["actionTypes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|action_type| {
+                action_type["id"]["provider"] == json!(provider)
+                    && action_type["id"]["category"] == json!(category)
+                    && action_type["id"]["version"] == json!(version)
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the stack's action type must be listed, got {body}")
+            });
+        assert_eq!(
+            listed["inputArtifactDetails"],
+            json!({"maximumCount": 1, "minimumCount": 0}),
+            "case {case:?}: expected the declared input artifact details, got {listed}"
+        );
+        assert_eq!(
+            listed["outputArtifactDetails"],
+            json!({"maximumCount": 1, "minimumCount": 0}),
+            "case {case:?}: expected the declared output artifact details, got {listed}"
+        );
+        if let Some(declared) = extra.get("ConfigurationProperties") {
+            assert_eq!(
+                listed["actionConfigurationProperties"][0]["name"],
+                declared[0]["Name"],
+                "case {case:?}: expected the declared configuration property, got {listed}"
+            );
+            assert_eq!(
+                listed["actionConfigurationProperties"][0]["queryable"],
+                declared[0]["Queryable"],
+                "case {case:?}: expected the declared property's queryability, got {listed}"
+            );
+        }
+        if let Some(declared) = extra.get("Settings") {
+            assert_eq!(
+                listed["settings"]["entityUrlTemplate"],
+                declared["EntityUrlTemplate"],
+                "case {case:?}: expected the declared settings, got {listed}"
+            );
+        }
+
+        // Deleting the stack takes the registration with it: the account no longer holds
+        // the action type, so the catalog no longer reports it. A worker still polling a
+        // custom action this account DELETED is answered rather than refused (it drains),
+        // which is why the poll above is not what says the registration is gone.
+        let (code, body) = call(
+            &router,
+            "DeleteStack",
+            &[member("StackName", "action-type-stack")],
+        )
+        .await;
+        assert_eq!(code, 200, "case {case:?}: DeleteStack answered {code}: {body}");
+        wait_for_the_transition().await;
+        let (code, body) = codepipeline(
+            &router,
+            "ListActionTypes",
+            &json!({"actionOwnerFilter": "Custom"}),
+        )
+        .await;
+        assert_eq!(
+            code, 200,
+            "case {case:?}: expected the catalog to answer, got {code}: {body}"
+        );
+        let still_listed = body["actionTypes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|action_type| action_type["id"]["provider"] == json!(provider));
+        assert!(
+            !still_listed,
+            "case {case:?}: expected the registration to be gone with the stack, got {body}"
+        );
+    }
+}
+
 /// A resource the owning service REFUSES is not created, so the deployment FAILS: the
 /// stack reports a failed status whose reason summarises which resource failed, that
 /// service's own refusal is reported on the resource's own event, and the resource is

@@ -343,18 +343,35 @@ pub struct StageRun {
     pub declaration_index: usize,
     /// A `StageExecutionStatus` value, or `None` while the stage has not been entered.
     pub status: Option<String>,
-    /// When this execution's ENTRY into the stage becomes due, once something held it at
-    /// that boundary.
+    /// When this execution's ENTRY into the stage becomes due.
     ///
-    /// An execution that WAITED at a boundary — for the turn of a stage another execution
-    /// holds, or for a disabled transition to be enabled — does not enter the stage at the
-    /// instant it is let in: being let in is itself a clock-owed transition, a span long
-    /// like every other step ([`ACTION_STEP`]), so the stage keeps reporting the run that
-    /// just left it until the next execution really enters. `None` for an execution
-    /// nothing held, which enters as soon as its turn comes.
+    /// Entering a stage is a clock-owed transition, a span long like every other step
+    /// ([`ACTION_STEP`]), so a plan records the instant each of its stages may be entered
+    /// ([`plan_stage_at`]) and the execution is at that boundary until it falls due. Every
+    /// later hold at the same boundary — the turn of a stage another execution holds, a
+    /// disabled transition, a gate a caller overrode — records a fresh instant the same
+    /// way, so the stage keeps reporting the run that just left it until the next
+    /// execution really enters. `None` would enter as soon as its turn comes, which is
+    /// what a plan built before this was recorded means.
     pub entry_due: Option<SystemTime>,
     /// This stage's actions, in declaration order.
     pub actions: Vec<ActionRun>,
+    /// The condition site whose MET condition decided this execution's run of the stage,
+    /// as a `ConditionType` value, or `None` while no condition has been met here.
+    ///
+    /// A condition is MET when a rule of it reached a FAILING verdict, and the `Result`
+    /// it declares is then what the execution does ([`super::rules`]). The site that
+    /// decided it is recorded because the gate is what `OverrideStageCondition` acts on:
+    /// a condition nothing was met at is not in a state that can be overridden, and
+    /// `GetPipelineState` reports the run of each declared site from the same fact.
+    pub blocked_by: Option<String>,
+    /// The condition sites a caller has OVERRIDDEN for this run of the stage, as
+    /// `ConditionType` values.
+    ///
+    /// `OverrideStageCondition` is "used to override a stage condition", so an overridden
+    /// site is not evaluated again for this run — the execution carries on past the gate
+    /// — and `GetPipelineState` reports its run as `Overridden`.
+    pub overridden: BTreeSet<String>,
 }
 
 impl StageRun {
@@ -433,6 +450,16 @@ pub fn plan_stage(
 }
 
 /// One declared stage, as the engine will run it.
+///
+/// The stage is not entered at the instant the plan is made: ENTERING a stage is itself a
+/// clock-owed transition, due a span ([`ACTION_STEP`]) after the call that started the
+/// execution, exactly as being let in past a boundary that held the execution is. So a
+/// caller acting straight after `StartPipelineExecution` observes the execution
+/// `InProgress` with no stage entered — which is the state a newer execution SUPERSEDES
+/// in `SUPERSEDED` mode, because an execution that has not entered a stage is still
+/// waiting at that boundary. For the stages after the first the instant is long past by
+/// the time the execution reaches them (each earlier step took at least that span), so
+/// this holds nothing up twice.
 fn plan_stage_at(
     declaration: &PipelineDeclaration,
     index: usize,
@@ -443,7 +470,9 @@ fn plan_stage_at(
         name: stage.name.clone(),
         declaration_index: index,
         status: None,
-        entry_due: None,
+        entry_due: Some(now + ACTION_STEP),
+        blocked_by: None,
+        overridden: BTreeSet::new(),
         actions: stage
             .actions
             .iter()
@@ -575,10 +604,15 @@ pub fn resolved_configuration(
 /// ([`super::Pipeline::transition_state`]) — and, as the stored-pipeline reader
 /// already words it, an inbound transition is the edge INTO a stage, so the first stage
 /// reports none unless a caller changed one for it.
+///
+/// `rules` are the rule executions the condition plane recorded for this pipeline, which
+/// is where the run of each declared condition site comes from
+/// ([`super::condition_state`]).
 pub fn stage_states(
     pipeline: &super::Pipeline,
     executions: &[&super::PipelineExecutionRecord],
     revisions: &BTreeMap<(String, String, String), crate::ops::types::ActionRevision>,
+    rules: &[super::RuleExecutionRecord],
 ) -> Vec<StageState> {
     // One pass over the executions, newest first, builds both indexes: the newest
     // execution that ENTERED each stage, and the newest non-terminal one still waiting
@@ -669,22 +703,41 @@ pub fn stage_states(
                 // A condition set has a state exactly when the stage DECLARES it:
                 // `beforeEntry` and `onSuccess` carry their conditions directly, while
                 // `onFailure` also carries the stage's failure `result` and retry
-                // configuration, which are declaration rather than state. The
-                // conditions themselves are evaluated by the rule plane, which this
-                // engine does not run, so no condition or rule carries an execution.
-                before_entry_condition_state: stage
-                    .before_entry
-                    .as_ref()
-                    .map(|before_entry| super::condition_state(&before_entry.conditions)),
-                on_success_condition_state: stage
-                    .on_success
-                    .as_ref()
-                    .map(|on_success| super::condition_state(&on_success.conditions)),
+                // configuration, which are declaration rather than state. What each
+                // site's run WAS is the rule executions the condition plane recorded for
+                // the execution that reached the stage.
+                before_entry_condition_state: stage.before_entry.as_ref().map(|before_entry| {
+                    super::condition_state(
+                        &before_entry.conditions,
+                        Some(super::rules::CONDITION_TYPE_BEFORE_ENTRY),
+                        run.map(|(record, _)| record.pipeline_execution_id.as_str()),
+                        run.is_some_and(|(_, run)| {
+                            run.overridden
+                                .contains(super::rules::CONDITION_TYPE_BEFORE_ENTRY)
+                        }),
+                        rules,
+                    )
+                }),
+                on_success_condition_state: stage.on_success.as_ref().map(|on_success| {
+                    super::condition_state(
+                        &on_success.conditions,
+                        Some(super::rules::CONDITION_TYPE_ON_SUCCESS),
+                        run.map(|(record, _)| record.pipeline_execution_id.as_str()),
+                        run.is_some_and(|(_, run)| {
+                            run.overridden
+                                .contains(super::rules::CONDITION_TYPE_ON_SUCCESS)
+                        }),
+                        rules,
+                    )
+                }),
+                // `onFailure` is the remediation site: `ConditionType` declares no value
+                // for it and this engine evaluates nothing there ([`super::rules`]), so
+                // its conditions carry no run.
                 on_failure_condition_state: stage
                     .on_failure
                     .as_ref()
                     .and_then(|on_failure| on_failure.conditions.as_deref())
-                    .map(super::condition_state),
+                    .map(|conditions| super::condition_state(conditions, None, None, false, rules)),
                 retry_stage_metadata: run.and_then(|(record, _)| {
                     (record.manual_retry_attempts > 0).then(|| {
                         crate::ops::types::RetryStageMetadata {

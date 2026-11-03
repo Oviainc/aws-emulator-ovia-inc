@@ -506,8 +506,14 @@ fn settle_conditions(
     if conditions.is_empty() {
         return ConditionGate::Proceed;
     }
+    // A site a caller OVERRODE is not evaluated again for this run of the stage: the
+    // override decided the gate, so the execution carries on past it.
+    if record.stages[stage].overridden.contains(condition_type) {
+        return ConditionGate::Proceed;
+    }
 
     let stage_name = record.stages[stage].name.clone();
+    let variables = record.resolution_variables();
     let outcome = super::rules::evaluate_conditions(
         context.rules,
         &record.pipeline_name,
@@ -516,7 +522,7 @@ fn settle_conditions(
         &stage_name,
         condition_type,
         &conditions,
-        &record.variables_map,
+        &variables,
         now,
     );
     record.last_update_time = now;
@@ -550,6 +556,9 @@ fn settle_conditions(
         }
     }
     record.stages[stage].status = Some(STAGE_FAILED.to_string());
+    // The site whose met condition decided this run of the stage, which is what an
+    // override of the gate acts on.
+    record.stages[stage].blocked_by = Some(condition_type.to_string());
     record.status = STATUS_FAILED.to_string();
     record.status_summary = Some(format!(
         "the {condition_type} condition of stage {stage_name} was met: {detail}"
@@ -681,7 +690,7 @@ fn start_action(
 ) -> Option<Job> {
     let declaration = context.declaration;
     let pipeline_arn = context.pipeline_arn.to_string();
-    let variables = record.variables_map.clone();
+    let variables = record.resolution_variables();
     let pipeline_name = record.pipeline_name.clone();
     let stage_name = record.stages[stage].name.clone();
     let artifact_bucket = record.artifact_bucket.clone();

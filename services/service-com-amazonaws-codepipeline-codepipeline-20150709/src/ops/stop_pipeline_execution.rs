@@ -184,14 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             // The model declares no "no such execution" error for this operation, and an
             // execution that is not there cannot be stopped, which is what
-            // `PipelineExecutionNotStoppableException` reports.
+            // `PipelineExecutionNotStoppableException` reports — in the one statement the
+            // service makes for both reasons a stop cannot be served.
             return Err(
                 StopPipelineExecutionErrorModeled::PipelineExecutionNotStoppableException(
                     PipelineExecutionNotStoppableException {
-                        message: Some(format!(
-                            "Pipeline execution {} of pipeline {} is not in a state that \
-                             can be stopped",
-                            input.pipeline_execution_id, input.pipeline_name
+                        message: Some(crate::state::execution_not_stoppable_message(
+                            &input.pipeline_execution_id,
+                            &input.pipeline_name,
                         )),
                     },
                 )
@@ -200,16 +200,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "You can stop a pipeline execution that is in progress": one that has already
-        // reached a terminal status cannot be stopped at all, and one that is already
-        // stopping has already had this request.
+        // reached a terminal status has no action execution in progress to stop, which is
+        // what `PipelineExecutionNotStoppableException` reports — in the same words,
+        // whichever terminal status it holds, because the service does not disclose
+        // which of the two reasons it was. One that is already stopping has already had
+        // this request.
         if crate::state::is_terminal_status(&record.status) {
             return Err(
                 StopPipelineExecutionErrorModeled::PipelineExecutionNotStoppableException(
                     PipelineExecutionNotStoppableException {
-                        message: Some(format!(
-                            "Pipeline execution {} has already reached the terminal status \
-                             {} and cannot be stopped",
-                            input.pipeline_execution_id, record.status
+                        message: Some(crate::state::execution_not_stoppable_message(
+                            &input.pipeline_execution_id,
+                            &input.pipeline_name,
                         )),
                     },
                 )

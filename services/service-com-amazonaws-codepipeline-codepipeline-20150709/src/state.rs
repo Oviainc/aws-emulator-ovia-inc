@@ -29,6 +29,7 @@ use crate::ops::types::{
     ActionRevision, ActionType,
     ActionTypeDeclaration, ActionTypeId, ActionTypeIdentifier, ActionTypeProperty,
     ActionTypeSettings, Artifact, ArtifactDetail, ArtifactDetails, ArtifactLocation, Condition,
+    ConditionExecution,
     ConditionState, CurrentRevision, EncryptionKey, ErrorDetails, ExecutionDetails,
     ExecutionTrigger,
     FailureDetails, Job,
@@ -36,7 +37,7 @@ use crate::ops::types::{
     PipelineExecutionSummary, PipelineMetadata, PipelineRollbackMetadata, PipelineSummary,
     PipelineVariable,
     ResolvedPipelineVariable, RuleState, S3ArtifactLocation, S3Location, SourceRevision,
-    StageConditionState,
+    StageConditionState, StageConditionsExecution,
     StageContext, Tag, ThirdPartyJob, TransitionState, WebhookDefinition,
 };
 
@@ -181,6 +182,21 @@ pub const JOB_STATUS_TIMED_OUT: &str = "TimedOut";
 /// still live (`Created`, `Queued`, `Dispatched`, `InProgress`).
 pub const TERMINAL_JOB_STATUSES: [&str; 3] =
     [JOB_STATUS_SUCCEEDED, JOB_STATUS_FAILED, JOB_STATUS_TIMED_OUT];
+
+/// The namespace CodePipeline's OWN variables live in, as opposed to the `variables`
+/// namespace of `PipelineDeclaration$variables` and the namespace an action declares
+/// for its output variables.
+///
+/// A variable of this namespace is a fact about the EXECUTION that the service
+/// publishes for every pipeline, so a configuration may reference it without the
+/// declaration declaring anything
+/// ([`PipelineExecutionRecord::resolution_variables`]).
+pub const BUILT_IN_VARIABLE_NAMESPACE: &str = "codepipeline";
+
+/// The built-in variable that carries the id of the execution resolving it: the
+/// `#{codepipeline.PipelineExecutionId}` reference an action's configuration may use to
+/// key what it produces by the execution that produced it.
+pub const BUILT_IN_PIPELINE_EXECUTION_ID: &str = "PipelineExecutionId";
 
 /// How long one `PollForJobs` call withholds a job it reported from later polls.
 ///
@@ -826,19 +842,29 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
     ///
     /// A job is owed to a worker exactly while the action that queued it is still
     /// `InProgress`: once the action has been abandoned by a stop, or has reached an
-    /// outcome, the job it was waiting on is not work any more and is forgotten. A job
-    /// whose execution record this store no longer holds is left alone — it is kept by
-    /// the paths that drop an execution ([`Self::forget_pipeline`] and the eviction in
-    /// [`Self::record_execution`]) and by [`MAX_QUEUED_JOBS`], not by this sweep.
+    /// outcome nobody reported through the job, the job it was waiting on is not work
+    /// any more and is forgotten. A job whose execution record this store no longer
+    /// holds is left alone — it is kept by the paths that drop an execution
+    /// ([`Self::forget_pipeline`] and the eviction in [`Self::record_execution`]) and by
+    /// [`MAX_QUEUED_JOBS`], not by this sweep.
+    ///
+    /// A job a WORKER carried to a terminal `JobStatus` is kept, with that status: it is
+    /// still a job this account was issued, so a later result reported for it is the
+    /// state error `PutJobSuccessResult`/`PutJobFailureResult` model for exactly that
+    /// condition ([`jobs::record_success`]) rather than an id the service never had.
+    /// Nothing hands it out again — a poll leases only a job still waiting
+    /// ([`JobRecord::is_available`]) — and the retained records are held to the same
+    /// [`MAX_QUEUED_JOBS`] bound as the waiting ones.
     pub fn retire_finished_jobs(&mut self) {
         let Self { jobs, executions, .. } = self;
         jobs.retain(|_, queue| {
             queue.retain(|job| {
-                executions
-                    .get(&job.pipeline_execution_id)
-                    .and_then(|record| record.stages.get(job.stage))
-                    .and_then(|stage| stage.actions.get(job.action))
-                    .is_none_or(ActionRun::is_in_progress)
+                TERMINAL_JOB_STATUSES.contains(&job.status.as_str())
+                    || executions
+                        .get(&job.pipeline_execution_id)
+                        .and_then(|record| record.stages.get(job.stage))
+                        .and_then(|stage| stage.actions.get(job.action))
+                        .is_none_or(ActionRun::is_in_progress)
             });
             !queue.is_empty()
         });
@@ -2612,40 +2638,127 @@ impl Pipeline {
 }
 
 /// The `StageConditionState` of one declared condition set: one `ConditionState` per
-/// declared condition, each naming the condition's rules.
+/// declared condition, each naming the condition's rules, with the run the condition
+/// plane recorded for each of them.
 ///
-/// A condition is EVALUATED by the rule plane, which this slice does not run, so
-/// neither the set, nor a condition in it, nor a rule of it carries an execution: what
-/// is reported is the declaration the store holds, exactly as a stage's action states
-/// report the declared actions by name.
-pub fn condition_state(conditions: &[Condition]) -> StageConditionState {
-    StageConditionState {
-        latest_execution: None,
-        condition_states: Some(
-            conditions
+/// Every declared condition and rule is reported whether or not an execution has reached
+/// it, exactly as a stage's action states report the declared actions by name. What a
+/// rule's run WAS comes from the rule executions the condition plane recorded for this
+/// stage's site ([`rules`]): the newest record of that rule for `execution_id`, which is
+/// the run `RuleState$latestExecution` reports and the one a condition's and the set's
+/// own status roll up from. A site a caller OVERRODE reports `Overridden` for the set and
+/// for the conditions of it a rule failed at, because that is what the override decided
+/// about the gate; a rule's own run keeps the verdict it reached.
+///
+/// `condition_type` is `None` for the one site the model declares no `ConditionType`
+/// value for (`onFailure`), and `execution_id` is `None` where no execution has reached
+/// the stage: either way no record can be this site's, so every condition reports its
+/// declaration alone.
+pub fn condition_state(
+    conditions: &[Condition],
+    condition_type: Option<&str>,
+    execution_id: Option<&str>,
+    overridden: bool,
+    rules: &[RuleExecutionRecord],
+) -> StageConditionState {
+    let run_of = |rule_name: &str| -> Option<&RuleExecutionRecord> {
+        let condition_type = condition_type?;
+        let execution_id = execution_id?;
+        rules.iter().rev().find(|record| {
+            record.condition_type == condition_type
+                && record.rule_name == rule_name
+                && record.pipeline_execution_id == execution_id
+        })
+    };
+    let condition_states: Vec<ConditionState> = conditions
+        .iter()
+        .map(|condition| {
+            let runs: Vec<&RuleExecutionRecord> = condition
+                .rules
+                .as_deref()
+                .unwrap_or_default()
                 .iter()
-                .map(|condition| ConditionState {
-                    latest_execution: None,
-                    // `Condition$rules` is optional, so a condition declaring no rule
-                    // reports no rule states rather than an empty list — the same way
-                    // a stage declaring no condition set reports none.
-                    rule_states: condition.rules.as_ref().map(|rules| {
-                        rules
-                            .iter()
-                            .map(|rule| RuleState {
-                                rule_name: Some(rule.name.clone()),
-                                current_revision: None,
-                                latest_execution: None,
-                                entity_url: None,
-                                revision_url: None,
-                            })
-                            .collect()
-                    }),
-                })
-                .collect(),
-        ),
+                .filter_map(|rule| run_of(&rule.name))
+                .collect();
+            ConditionState {
+                latest_execution: condition_execution(&runs, overridden),
+                // `Condition$rules` is optional, so a condition declaring no rule
+                // reports no rule states rather than an empty list — the same way
+                // a stage declaring no condition set reports none.
+                rule_states: condition.rules.as_ref().map(|rules| {
+                    rules
+                        .iter()
+                        .map(|rule| RuleState {
+                            rule_name: Some(rule.name.clone()),
+                            current_revision: None,
+                            latest_execution: run_of(&rule.name)
+                                .map(RuleExecutionRecord::to_rule_execution),
+                            entity_url: None,
+                            revision_url: None,
+                        })
+                        .collect()
+                }),
+            }
+        })
+        .collect();
+    StageConditionState {
+        // The SET's run is the roll-up of the runs of its conditions: it has one exactly
+        // when a condition of it has one. `ConditionList` is modelled `@length(min: 1,
+        // max: 1)`, so a site declares ONE condition and that condition's run is the
+        // set's.
+        latest_execution: condition_states
+            .iter()
+            .filter_map(|state| state.latest_execution.as_ref())
+            .map(|execution| StageConditionsExecution {
+                status: execution.status.clone(),
+                summary: execution.summary.clone(),
+            })
+            .next_back(),
+        condition_states: Some(condition_states),
     }
 }
+
+/// The run of ONE condition: the roll-up of the runs of the rules that make it up, or
+/// `None` while none of them has run.
+///
+/// `Condition$result` is "the action to be done when the condition is MET", and a
+/// condition is met when a rule of it reached a FAILING verdict, so the condition's own
+/// status is that of the rule that decided it: `Failed` where one failed, `Abandoned`
+/// where one reached no verdict at all, and `Succeeded` only where every rule of it
+/// passed. A failing condition a caller OVERRODE is reported `Overridden`, which is the
+/// `ConditionExecutionStatus` of a gate a caller decided rather than a rule.
+fn condition_execution(
+    runs: &[&RuleExecutionRecord],
+    overridden: bool,
+) -> Option<ConditionExecution> {
+    let decided = runs
+        .iter()
+        .find(|record| record.status == rules::RULE_EXECUTION_FAILED)
+        .or_else(|| {
+            runs.iter()
+                .find(|record| record.status == rules::RULE_EXECUTION_ABANDONED)
+        })
+        .or_else(|| runs.last())?;
+    let failed = decided.status == rules::RULE_EXECUTION_FAILED;
+    Some(ConditionExecution {
+        status: Some(match (failed, overridden) {
+            (true, true) => CONDITION_EXECUTION_OVERRIDDEN.to_string(),
+            _ => decided.status.clone(),
+        }),
+        summary: decided
+            .error
+            .as_ref()
+            .map(|(_, message)| message.clone())
+            .or_else(|| (!failed).then(|| decided.status.clone())),
+        last_status_change: Some(to_date_time(decided.last_update_time)),
+    })
+}
+
+/// The `ConditionExecutionStatus` a condition reaches when a caller overrode the gate it
+/// was holding, from the model's enum (`smithy_query query="shape"
+/// shape="ConditionExecutionStatus"` -> `InProgress`, `Failed`, `Errored`, `Succeeded`,
+/// `Cancelled`, `Abandoned`, `Overridden`).
+pub const CONDITION_EXECUTION_OVERRIDDEN: &str = "Overridden";
 
 /// A tag set this service refuses, and the modelled error shape that states it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3416,6 +3529,25 @@ pub struct PipelineExecutionRecord {
 }
 
 impl PipelineExecutionRecord {
+    /// Every variable a `#{namespace.key}` placeholder of this execution resolves
+    /// against: the ones the execution carries ([`Self::variables_map`]) plus
+    /// CodePipeline's OWN built-in variables.
+    ///
+    /// `#{codepipeline.PipelineExecutionId}` is available to every action of every
+    /// pipeline without being declared — it is the service's variable rather than one of
+    /// `PipelineDeclaration$variables` or an action's output — so it is resolved HERE,
+    /// from the execution it names, rather than stored on the record: the value is the
+    /// id of the execution doing the resolving, so an execution that inherits another
+    /// one's variables (a stage rollback) still resolves its own id.
+    pub fn resolution_variables(&self) -> BTreeMap<String, String> {
+        let mut variables = self.variables_map.clone();
+        variables.insert(
+            format!("{BUILT_IN_VARIABLE_NAMESPACE}.{BUILT_IN_PIPELINE_EXECUTION_ID}"),
+            self.pipeline_execution_id.clone(),
+        );
+        variables
+    }
+
     /// This execution as `GetPipelineExecution` reports it.
     pub fn to_execution(&self) -> PipelineExecution {
         PipelineExecution {
@@ -3561,7 +3693,7 @@ impl ActionExecutionRecord {
                 resolved_configuration: configuration
                     .as_ref()
                     .and_then(|configuration| {
-                        resolved_configuration(configuration, &execution.variables)
+                        resolved_configuration(configuration, execution)
                     }),
                 configuration,
                 role_arn: Some(
@@ -3691,15 +3823,16 @@ pub fn run_order(action: &ActionDeclaration) -> i32 {
 /// with none.
 pub const MAX_RESOLVED_CONFIGURATION_VALUE_BYTES: usize = 1_000 * 1_000;
 
-/// `configuration` with every pipeline-variable reference replaced by the value this
-/// execution resolved for that variable, or `None` when a reference is left that this
-/// emulator cannot resolve here.
+/// `configuration` with every variable reference replaced by the value this execution
+/// resolved for that variable, or `None` when a reference is left that this emulator
+/// cannot resolve here.
 ///
-/// CodePipeline's variable syntax is `#{namespace.variable}`, and a pipeline-level
-/// variable — the kind `PipelineDeclaration$variables` declares and
-/// `StartPipelineExecution` overrides — lives in the `variables` namespace. Those are
-/// exactly the variables an execution record resolves
-/// ([`resolve_execution_variables`]), so they are substituted here.
+/// CodePipeline's variable syntax is `#{namespace.variable}`. Two namespaces are facts
+/// about the execution itself and are substituted here: a pipeline-level variable — the
+/// kind `PipelineDeclaration$variables` declares and `StartPipelineExecution` overrides,
+/// which an execution record resolves ([`resolve_execution_variables`]) — under
+/// `variables`, and the service's own built-ins under
+/// [`BUILT_IN_VARIABLE_NAMESPACE`] ([`PipelineExecutionRecord::resolution_variables`]).
 ///
 /// Every other namespace is an ACTION's: its values are the output variables that
 /// action published as it ran, which the engine resolves against the execution's own
@@ -3709,57 +3842,62 @@ pub const MAX_RESOLVED_CONFIGURATION_VALUE_BYTES: usize = 1_000 * 1_000;
 /// `ActionExecutionInput$resolvedConfiguration` is reported absent rather than
 /// half-resolved. A configuration with no reference in it resolves to itself.
 ///
-/// The resolved variables are indexed by name ONCE and each value is then resolved in
-/// a single pass, so resolution is linear in the configuration's size — not one
-/// `String::replace` over the accumulating text per declared variable, which re-scans
-/// what the previous substitution produced and lets a request-supplied value that
-/// looks like a reference expand transitively. A replacement's OWN text is therefore
-/// never read as a reference: a variable whose resolved value is itself `#{...}` text
-/// is substituted literally, so the reported `resolvedConfiguration` can carry that
-/// text even though no reference of the stored configuration was left unresolved.
+/// The resolvable variables are indexed by their FULL reference name once and each value
+/// is then resolved in a single pass, so resolution is linear in the configuration's
+/// size — not one `String::replace` over the accumulating text per declared variable,
+/// which re-scans what the previous substitution produced and lets a request-supplied
+/// value that looks like a reference expand transitively. A replacement's OWN text is
+/// therefore never read as a reference: a variable whose resolved value is itself
+/// `#{...}` text is substituted literally, so the reported `resolvedConfiguration` can
+/// carry that text even though no reference of the stored configuration was left
+/// unresolved.
 fn resolved_configuration(
     configuration: &HashMap<String, String>,
-    variables: &[ResolvedPipelineVariable],
+    execution: &PipelineExecutionRecord,
 ) -> Option<HashMap<String, String>> {
-    let by_name: HashMap<&str, &str> = variables
+    let mut by_reference: HashMap<String, &str> = execution
+        .variables
         .iter()
         .filter_map(|variable| {
             Some((
-                variable.name.as_deref()?,
+                format!("{VARIABLES_NAMESPACE}.{}", variable.name.as_deref()?),
                 variable.resolved_value.as_deref()?,
             ))
         })
         .collect();
+    by_reference.insert(
+        format!("{BUILT_IN_VARIABLE_NAMESPACE}.{BUILT_IN_PIPELINE_EXECUTION_ID}"),
+        execution.pipeline_execution_id.as_str(),
+    );
 
     let mut resolved = HashMap::with_capacity(configuration.len());
     for (key, value) in configuration {
-        resolved.insert(key.clone(), substitute_variables(value, &by_name)?);
+        resolved.insert(key.clone(), substitute_variables(value, &by_reference)?);
     }
     Some(resolved)
 }
 
-/// `value` with every `#{variables.<name>}` reference replaced by `by_name`'s entry
-/// for that name, in ONE pass over `value`.
+/// The namespace a pipeline-level variable's references carry.
+const VARIABLES_NAMESPACE: &str = "variables";
+
+/// `value` with every `#{<namespace>.<name>}` reference replaced by `by_reference`'s
+/// entry for that full name, in ONE pass over `value`.
 ///
 /// `None` — the configuration has no resolved form — when a reference is not one this
-/// emulator can resolve (an unterminated `#{`, a namespace other than `variables`, or
-/// a name this execution resolved no value for) or when the resolved text would pass
+/// emulator can resolve (an unterminated `#{`, or a name this execution resolved no
+/// value for, in whatever namespace) or when the resolved text would pass
 /// [`MAX_RESOLVED_CONFIGURATION_VALUE_BYTES`].
 ///
 /// A replacement is never re-scanned: a variable whose value is itself `#{...}` text
 /// is substituted literally, the way a single-pass substitution does, so no chain of
 /// references can amplify one request into unbounded allocation.
-fn substitute_variables(value: &str, by_name: &HashMap<&str, &str>) -> Option<String> {
-    /// The namespace a pipeline-level variable's references carry.
-    const VARIABLES_NAMESPACE: &str = "variables.";
-
+fn substitute_variables(value: &str, by_reference: &HashMap<String, &str>) -> Option<String> {
     let mut resolved = String::new();
     let mut rest = value;
     while let Some(start) = rest.find("#{") {
         let (before, reference) = (&rest[..start], &rest[start + 2..]);
         let end = reference.find('}')?;
-        let name = reference[..end].strip_prefix(VARIABLES_NAMESPACE)?;
-        let substitution = *by_name.get(name)?;
+        let substitution = *by_reference.get(&reference[..end])?;
         if resolved.len() + before.len() + substitution.len()
             > MAX_RESOLVED_CONFIGURATION_VALUE_BYTES
         {
@@ -4291,6 +4429,23 @@ pub fn duplicate_action_name_message(action_name: &str, stage_name: &str) -> Str
 /// account digits, a colon and one resource character — so no value the pattern admits
 /// falls below it, and a value below it is one the pattern already refused.
 pub const RESOURCE_ARN_MIN_LENGTH: i64 = 37;
+
+/// The message `PipelineExecutionNotStoppableException` carries: the execution the
+/// request named, the pipeline it named it in, and the one statement AWS makes for both
+/// reasons a stop cannot be served.
+///
+/// The condition covers two cases at once — the pipeline holds no such execution, and
+/// the execution it holds has no action execution in progress to stop — and the service
+/// states them together rather than disclosing which it was, so one template serves both
+/// branches of the handler. The only variable parts are the two values taken FROM THE
+/// REQUEST.
+pub fn execution_not_stoppable_message(pipeline_execution_id: &str, pipeline_name: &str) -> String {
+    format!(
+        "The pipeline execution with ID '{pipeline_execution_id}' in '{pipeline_name}' can't be \
+         stopped now. Either it does not exist in the pipeline, or the pipeline execution has no \
+         action executions in progress."
+    )
+}
 
 /// The fewest characters an approval token carries.
 ///

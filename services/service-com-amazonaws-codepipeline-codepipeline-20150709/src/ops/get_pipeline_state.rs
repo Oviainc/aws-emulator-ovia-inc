@@ -197,6 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 pipeline,
                 &executions,
                 &state.action_revisions,
+                state
+                    .rule_executions
+                    .get(&input.name)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
             )),
             created: Some(crate::state::to_date_time(pipeline.created)),
             updated: Some(crate::state::to_date_time(pipeline.updated)),

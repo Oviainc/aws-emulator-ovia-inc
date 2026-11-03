@@ -28,10 +28,12 @@
 //!   the claim exclusive — while the job is still waiting, EVERY nonce a poll
 //!   published for it claims it, because a redelivery does not take the job away from
 //!   the worker that was handed it first;
-//! * a job whose ACTION is no longer running — abandoned by a stop, or already finished
-//!   — is not work any more, so it is swept away ([`super::ComAmazonawsCodepipelineCodepipeline20150709State::retire_finished_jobs`])
+//! * a job whose ACTION is no longer running — abandoned by a stop, or finished without
+//!   the job reporting it — is not work any more, so it is swept away ([`super::ComAmazonawsCodepipelineCodepipeline20150709State::retire_finished_jobs`])
 //!   and a call naming it is answered `JobNotFoundException`, exactly as `PollForJobs`
-//!   and `GetJobDetails` answer it.
+//!   and `GetJobDetails` answer it. A job the worker itself carried to a terminal
+//!   status is KEPT, so the late result above is the state error and
+//!   `JobNotFoundException` stays what an id that was never issued is answered with.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -40,7 +42,7 @@ use crate::ops::types::{CurrentRevision, ExecutionDetails, FailureDetails};
 
 use super::{
     ComAmazonawsCodepipelineCodepipeline20150709State as State, JOB_STATUS_FAILED,
-    JOB_STATUS_IN_PROGRESS, JOB_STATUS_QUEUED, JOB_STATUS_SUCCEEDED,
+    JOB_STATUS_IN_PROGRESS, JOB_STATUS_QUEUED, JOB_STATUS_SUCCEEDED, TERMINAL_JOB_STATUSES,
 };
 
 /// The `ActionExecutionStatus` an action reaches when its worker reports success, from
@@ -174,6 +176,7 @@ pub fn record_success(
             return Err(JobProblem::InvalidState(invalid_state_message(
                 job_id,
                 &job.status,
+                JOB_STATUS_SUCCEEDED,
             )));
         }
         if let Some(token) = continuation_token {
@@ -277,6 +280,7 @@ pub fn record_failure(
             return Err(JobProblem::InvalidState(invalid_state_message(
                 job_id,
                 &job.status,
+                JOB_STATUS_FAILED,
             )));
         }
         job.status = JOB_STATUS_FAILED.to_string();
@@ -331,10 +335,25 @@ fn job_mut<'a>(
 }
 
 /// Why a job cannot take a result: it is not one a worker holds and has still to
-/// complete. Built from the request and the job's own status.
-fn invalid_state_message(job_id: &str, status: &str) -> String {
-    format!(
-        "Job with id {job_id} is in status {status}, so no result can be reported for it; only a \
-         job a worker has acknowledged and not yet completed accepts one"
-    )
+/// complete. Built from the request (the `jobId`) and the job's own status, against the
+/// status the result being reported would move it to (`desired`).
+///
+/// Three conditions, each with its own statement:
+///
+/// * a job already carrying the status this result reports cannot be updated with the
+///   same status and a different result — the outcome it holds is already that one;
+/// * a job in any other terminal status has terminated, so its outcome is settled;
+/// * a job that is not terminal and not `InProgress` is one no worker has acknowledged,
+///   so there is no worker whose outcome it would be.
+fn invalid_state_message(job_id: &str, status: &str, desired: &str) -> String {
+    if status == desired {
+        return format!(
+            "The status of job with id {job_id} is already set to the desired value. It cannot \
+             be updated with the same status, but different result or output variables."
+        );
+    }
+    if TERMINAL_JOB_STATUSES.contains(&status) {
+        return format!("Job with id {job_id} has already terminated");
+    }
+    format!("Job with id {job_id} has not been acknowledged")
 }

@@ -29,6 +29,8 @@ mod action_type_definitions;
 mod action_type_provider_entitlement;
 #[path = "all/approval_result_messages.rs"]
 mod approval_result_messages;
+#[path = "all/built_in_execution_variables.rs"]
+mod built_in_execution_variables;
 #[path = "all/codecommit_source_actions.rs"]
 mod codecommit_source_actions;
 #[path = "all/custom_action_job_results.rs"]
@@ -41,6 +43,10 @@ mod custom_action_types;
 mod declaration_structure_rules;
 #[path = "all/delete_custom_action_type.rs"]
 mod delete_custom_action_type;
+// The suite of the stage-ENTRY and supersession rules (its file name is the one it was
+// added under).
+#[path = "all/diagnose.rs"]
+mod diagnose;
 #[path = "all/error_message_rules.rs"]
 mod error_message_rules;
 #[path = "all/execution_engine.rs"]
@@ -71,6 +77,8 @@ mod run_order_concurrency;
 mod s3_deploy_object_key;
 #[path = "all/source_revision_overrides.rs"]
 mod source_revision_overrides;
+#[path = "all/stage_condition_overrides.rs"]
+mod stage_condition_overrides;
 #[path = "all/stage_condition_rules.rs"]
 mod stage_condition_rules;
 #[path = "all/stage_transitions.rs"]
@@ -79,6 +87,8 @@ mod stage_transitions;
 mod state_roundtrip;
 #[path = "all/stop_pipeline_execution.rs"]
 mod stop_pipeline_execution;
+#[path = "all/terminal_state_refusals.rs"]
+mod terminal_state_refusals;
 #[path = "all/third_party_job_failure_results.rs"]
 mod third_party_job_failure_results;
 #[path = "all/third_party_job_results.rs"]

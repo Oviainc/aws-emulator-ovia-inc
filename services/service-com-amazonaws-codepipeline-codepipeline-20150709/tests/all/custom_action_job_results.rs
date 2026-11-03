@@ -428,16 +428,17 @@ async fn the_outcome_a_worker_reports_is_the_actions_outcome() {
             );
         }
 
-        // Whatever the outcome, the job it was reported for is no longer work: its
-        // action has finished, so the job is swept away and a second result for it
-        // reaches no job at all (the same rule `GetJobDetails` answers by).
+        // Whatever the outcome, the job it was reported for has TERMINATED: the job is
+        // still one this account was issued, so a second result for it is the state
+        // error — never `JobNotFoundException`, which is reserved for an id that was
+        // never issued.
         let (status, refusal) = emulator
             .refusal("PutJobSuccessResult", &json!({"jobId": job_id}))
             .await;
         assert_eq!(
             (status, refusal.as_str()),
-            (REFUSAL_STATUS, "JobNotFoundException"),
-            "case {case:?}: a completed action's job takes no second result"
+            (REFUSAL_STATUS, "InvalidJobStateException"),
+            "case {case:?}: a terminated job takes no second result"
         );
     }
 }

@@ -521,6 +521,16 @@ const IAM_MANAGED_POLICY: &str = "AWS::IAM::ManagedPolicy";
 /// `AWS::CodePipeline::Pipeline`: "Ref returns the pipeline name".
 const CODEPIPELINE_PIPELINE: &str = "AWS::CodePipeline::Pipeline";
 
+/// `AWS::CodePipeline::CustomActionType`: the REGISTRATION of a custom action type in
+/// CodePipeline, which `CreateCustomActionType` makes and `DeleteCustomActionType`
+/// removes.
+///
+/// It is no named resource of that service's own: every call on one addresses it by the
+/// triple its declaration states (`Category`, `Provider`, `Version`), which is what the
+/// arms below read the registration's identity from — the physical resource id is not a
+/// handle any CodePipeline operation takes.
+const CODEPIPELINE_CUSTOM_ACTION_TYPE: &str = "AWS::CodePipeline::CustomActionType";
+
 /// `AWS::RDS::DBInstance`: "Ref returns the DBInstanceIdentifier", so a resource of this
 /// type is a DB instance of Amazon RDS addressed by its physical resource id.
 const RDS_DB_INSTANCE: &str = "AWS::RDS::DBInstance";
@@ -625,6 +635,10 @@ pub(super) enum Provisioner {
     IamAccessKey,
     IamManagedPolicy,
     CodePipelinePipeline,
+    /// `AWS::CodePipeline::CustomActionType`: the custom action type a job worker of the
+    /// account polls for, which `CreateCustomActionType` registers from the declaration's
+    /// own members and `DeleteCustomActionType` removes by the triple that identifies it.
+    CodePipelineCustomActionType,
     /// `AWS::CodeBuild::ReportGroup`: a report group of AWS CodeBuild, which
     /// `CreateReportGroup` creates under the name the template states and
     /// `DeleteReportGroup` removes by the ARN that service keyed it by.
@@ -800,6 +814,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         IAM_ACCESS_KEY => Some(Provisioner::IamAccessKey),
         IAM_MANAGED_POLICY => Some(Provisioner::IamManagedPolicy),
         CODEPIPELINE_PIPELINE => Some(Provisioner::CodePipelinePipeline),
+        CODEPIPELINE_CUSTOM_ACTION_TYPE => Some(Provisioner::CodePipelineCustomActionType),
         CODEBUILD_REPORT_GROUP => Some(Provisioner::CodeBuildReportGroup),
         ECS_CLUSTER => Some(Provisioner::EcsCluster),
         SQS_QUEUE => Some(Provisioner::SqsQueue),
@@ -964,6 +979,9 @@ impl Provisioner {
             Self::IamManagedPolicy => create_managed_policy(ctx, region, resource).await,
             Self::CodePipelinePipeline => {
                 create_pipeline(ctx, region, resource, propagated).await
+            }
+            Self::CodePipelineCustomActionType => {
+                create_custom_action_type(ctx, region, resource, propagated).await
             }
             Self::EcsCluster => create_cluster(ctx, region, resource, propagated).await,
             Self::SqsQueue => create_queue(ctx, region, resource, propagated).await,
@@ -1335,6 +1353,10 @@ impl Provisioner {
             Self::IamRole
                 | Self::IamUser
                 | Self::CodePipelinePipeline
+                // CodePipeline refuses a tag key in the reserved namespace on
+                // `CreateCustomActionType` too, in the same tag validation its
+                // `CreatePipeline` runs.
+                | Self::CodePipelineCustomActionType
                 | Self::EcsCluster
                 | Self::EcrPublicRepository
                 | Self::FirehoseDeliveryStream
@@ -1912,6 +1934,11 @@ impl Provisioner {
             Self::CodePipelinePipeline => {
                 delete_pipeline(ctx, region, physical_resource_id).await
             }
+            // The registration is addressed by the triple its declaration states, not by
+            // a name, so the delete takes the whole record rather than the id.
+            Self::CodePipelineCustomActionType => {
+                delete_custom_action_type(ctx, region, resource).await
+            }
             Self::EcsCluster => delete_cluster(ctx, region, physical_resource_id).await,
             Self::SqsQueue => delete_queue(ctx, region, physical_resource_id).await,
             Self::SqsQueuePolicy => delete_queue_policy(ctx, region, resource).await,
@@ -2257,6 +2284,10 @@ impl Provisioner {
             }
             Self::CodePipelinePipeline => {
                 describe_pipeline(ctx, region, physical_resource_id).await
+            }
+            // Read back by the same triple the delete addresses the registration by.
+            Self::CodePipelineCustomActionType => {
+                describe_custom_action_type(ctx, region, resource).await
             }
             Self::EcsCluster => describe_cluster(ctx, region, physical_resource_id).await,
             Self::SqsQueue => describe_queue(ctx, region, physical_resource_id).await,
@@ -8165,6 +8196,151 @@ async fn describe_pipeline(
         Err(refusal) if refusal.code == PIPELINE_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
+}
+
+/// The `ActionOwner` of every action type `CreateCustomActionType` registers ("used for
+/// custom actions only"), which is also the owner a poll for one of their jobs names.
+const CODEPIPELINE_OWNER_CUSTOM: &str = "Custom";
+
+/// The three properties that IDENTIFY an `AWS::CodePipeline::CustomActionType`, which are
+/// the three members `DeleteCustomActionType` addresses a registration by.
+const CODEPIPELINE_ACTION_TYPE_IDENTITY: &[&str] = &["Category", "Provider", "Version"];
+
+/// Register the custom action type an `AWS::CodePipeline::CustomActionType` declares — so
+/// a job worker that polls for the action type the stack declared is SERVED, and the
+/// pipeline the same stack declares can have its custom action claimed, rather than
+/// CodePipeline refusing an action type its own completed stack was supposed to register.
+///
+/// This type's CloudFormation properties ARE `CreateCustomActionType`'s own input, member
+/// for member — `Category`/`category`, `Provider`/`provider`, `Version`/`version`,
+/// `ConfigurationProperties`/`configurationProperties`,
+/// `InputArtifactDetails`/`inputArtifactDetails`,
+/// `OutputArtifactDetails`/`outputArtifactDetails`, `Settings`/`settings` and the members
+/// nested inside them (`smithy_query query="operation" operation="CreateCustomActionType"`)
+/// — differing only in the case of each member's initial letter, so the evaluated property
+/// document is carried through with that one transformation ([`camel_cased`]) rather than
+/// mapped member by member.
+///
+/// `Tags` is taken out of the document and sent as the request's own member, carrying the
+/// tags the declaration asks for plus the ones CloudFormation gives the resource
+/// ([`tags_of`]), as the list CodePipeline's own `Tag` shape spells in lower camel case.
+async fn create_custom_action_type(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = match camel_cased(&resource.properties, 0)? {
+        Value::Object(object) => object,
+        _ => Map::new(),
+    };
+    // `Tags` is the request's own member rather than part of the action type.
+    request.remove("tags");
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), tags_as_list(&tags, LOWER_CASED_TAG));
+    }
+    call_json_rpc(
+        ctx,
+        CODEPIPELINE_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{CODEPIPELINE_TARGET_PREFIX}.CreateCustomActionType"),
+        &Value::Object(request),
+    )
+    .await?;
+    Ok(Created::default())
+}
+
+/// Remove the registration a stack created, addressed by the triple that identifies it.
+///
+/// `DeleteCustomActionType` models no does-not-exist error: an identity CodePipeline holds
+/// no registration of is already in the state the delete asks for. A declaration that
+/// states none of the triple names no registration at all, so there is nothing to remove.
+async fn delete_custom_action_type(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let Some(identity) = custom_action_type_identity(resource) else {
+        return Ok(());
+    };
+    call_json_rpc(
+        ctx,
+        CODEPIPELINE_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{CODEPIPELINE_TARGET_PREFIX}.DeleteCustomActionType"),
+        &Value::Object(identity),
+    )
+    .await?;
+    Ok(())
+}
+
+/// The registration as CodePipeline reports it, for drift detection: the identifying
+/// triple of the action type the account holds under this declaration's identity.
+///
+/// `ListActionTypes` reports the action types the account holds rather than refusing a
+/// read of one it does not, so an answer that lists no action type of this identity is
+/// that service saying it no longer holds the resource — the `DELETED` drift status.
+async fn describe_custom_action_type(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let Some(identity) = custom_action_type_identity(resource) else {
+        return Ok(None);
+    };
+    let answered = call_json_rpc(
+        ctx,
+        CODEPIPELINE_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{CODEPIPELINE_TARGET_PREFIX}.ListActionTypes"),
+        &serde_json::json!({ "actionOwnerFilter": CODEPIPELINE_OWNER_CUSTOM }),
+    )
+    .await?;
+    let held = answered
+        .get("actionTypes")
+        .and_then(Value::as_array)
+        .is_some_and(|action_types| {
+            action_types.iter().any(|action_type| {
+                CODEPIPELINE_ACTION_TYPE_IDENTITY.iter().all(|property| {
+                    action_type
+                        .get("id")
+                        .and_then(|id| id.get(lower_initial(property)))
+                        == identity.get(&lower_initial(property))
+                })
+            })
+        });
+    if !held {
+        return Ok(None);
+    }
+    let reported: Map<String, Value> = identity
+        .into_iter()
+        .filter_map(|(member, value)| {
+            let property = CODEPIPELINE_ACTION_TYPE_IDENTITY
+                .iter()
+                .find(|property| lower_initial(property) == member)?;
+            Some(((*property).to_string(), value))
+        })
+        .collect();
+    Ok(Some(Value::Object(reported)))
+}
+
+/// The members `DeleteCustomActionType` takes for the registration a resource record
+/// describes, read off the declaration that made it: the three properties that identify
+/// an action type, under that call's own member names.
+///
+/// `None` when the declaration states none of them as a scalar — the record names no
+/// registration, so no call can address one.
+fn custom_action_type_identity(resource: &StoredResource) -> Option<Map<String, Value>> {
+    let mut identity = Map::new();
+    for property in CODEPIPELINE_ACTION_TYPE_IDENTITY {
+        let value = resource.properties.get(*property).and_then(scalar_text)?;
+        identity.insert(lower_initial(property), Value::String(value));
+    }
+    Some(identity)
 }
 
 // ---------------------------------------------------------------------------

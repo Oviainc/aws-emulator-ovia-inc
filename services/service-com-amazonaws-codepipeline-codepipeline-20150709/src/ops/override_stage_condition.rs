@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op OverrideStageCondition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `OverrideStageCondition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`OverrideStageCondition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +168,166 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `OverrideStageCondition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(OverrideStageConditionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("OverrideStageCondition"))
+        let state = crate::state::require_state(&*self.engine)?;
+        // Whether a condition has been met at all is a fact the clock may still owe, so
+        // every due step is materialised before the request is judged.
+        crate::state::advance(&*self.engine, ctx, &input.pipeline_name).await;
+        let now = ::std::time::SystemTime::now();
+
+        {
+            let mut state = state.lock();
+            if !state.pipelines.contains_key(&input.pipeline_name) {
+                return Err(
+                    OverrideStageConditionErrorModeled::PipelineNotFoundException(
+                        PipelineNotFoundException {
+                            // An override acts on the work an execution is doing — it
+                            // releases a stage so that execution runs it — so it words
+                            // this refusal as the execution-CONTROL plane does, with
+                            // `StartPipelineExecution`, `StopPipelineExecution` and
+                            // `RetryStageExecution`.
+                            message: Some(crate::state::pipeline_not_found_message(
+                                crate::state::PipelineNotFoundWording::ExecutionControl,
+                                &input.pipeline_name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // An override acts on the stage of the LATEST execution of the pipeline: an
+            // id that is out of date — "the stage has failed in a later run of the
+            // pipeline" — is what `NotLatestPipelineExecutionException` reports.
+            let latest = state
+                .executions_by_pipeline
+                .get(&input.pipeline_name)
+                .and_then(|ids| ids.last().cloned());
+            if latest.as_deref() != Some(input.pipeline_execution_id.as_str()) {
+                return Err(
+                    OverrideStageConditionErrorModeled::NotLatestPipelineExecutionException(
+                        NotLatestPipelineExecutionException {
+                            message: Some(not_latest_execution_message(
+                                &input.pipeline_execution_id,
+                                &input.pipeline_name,
+                                &input.stage_name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // Unreachable: the id just matched the pipeline's latest execution, so the
+            // store holds it. Stated as the same fact, through the same formatter.
+            let Some(record) = state.executions.get_mut(&input.pipeline_execution_id) else {
+                return Err(
+                    OverrideStageConditionErrorModeled::NotLatestPipelineExecutionException(
+                        NotLatestPipelineExecutionException {
+                            message: Some(not_latest_execution_message(
+                                &input.pipeline_execution_id,
+                                &input.pipeline_name,
+                                &input.stage_name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            let Some(stage) = record
+                .stages
+                .iter_mut()
+                .find(|stage| stage.name == input.stage_name)
+            else {
+                return Err(OverrideStageConditionErrorModeled::StageNotFoundException(
+                    StageNotFoundException {
+                        message: Some(crate::state::stage_not_found_message(
+                            &input.pipeline_name,
+                            &input.stage_name,
+                        )),
+                    },
+                )
+                .into());
+            };
+
+            // What an override overrides is a GATE: a condition of that site was met and
+            // the `Result` it declares is what stopped this execution's run of the stage.
+            // A site nothing was met at — one the stage declares no condition for, one
+            // whose rules all passed, another site than the one that stopped the stage,
+            // or a stage this execution is already past — is not in a state an override
+            // acts on, which is the condition not allowing one.
+            if stage.blocked_by.as_deref() != Some(input.condition_type.as_str()) {
+                return Err(
+                    OverrideStageConditionErrorModeled::ConditionNotOverridableException(
+                        ConditionNotOverridableException {
+                            message: Some(not_overridable_message(
+                                &input.condition_type,
+                                &input.stage_name,
+                                &input.pipeline_execution_id,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // The gate is overridden: the site is not evaluated again for this run, and
+            // the stage goes back to not having been entered, so the execution enters it
+            // and runs it. Being let in past a boundary is a clock-owed step like every
+            // other, so the entry becomes due a span from now. Nothing else about the run
+            // is touched — an override decides the condition, it does not re-run what
+            // already ran.
+            stage.overridden.insert(input.condition_type.clone());
+            stage.blocked_by = None;
+            stage.status = None;
+            stage.entry_due = Some(now + crate::state::execution::ACTION_STEP);
+            record.status = crate::state::STATUS_IN_PROGRESS.to_string();
+            record.status_summary = None;
+            record.last_update_time = now;
+        }
+
+        // The stage the override released is entered a span from now, like any other
+        // clock-owed step.
+        crate::state::advance(&*self.engine, ctx, &input.pipeline_name).await;
+
+        Ok(OverrideStageConditionOutput)
     }
+}
+
+/// What `ConditionNotOverridableException` states: the site the request asked to
+/// override and the stage it named it on, with the three reasons the service gives for a
+/// condition it will not override now — the last of them naming the execution the
+/// request named.
+///
+/// Fixed text with the request's own values in it, so the statement is a template over
+/// what the caller asked for rather than words about one particular pipeline.
+fn not_overridable_message(
+    condition_type: &str,
+    stage_name: &str,
+    pipeline_execution_id: &str,
+) -> String {
+    format!(
+        "The condition type {condition_type} in stage {stage_name} cannot be overridden now. \
+         Either it contains no failed or in-progress rule, the execution \
+         '{pipeline_execution_id}' is already superseded, or the pipeline definition has \
+         changed since the rules(s) failed."
+    )
+}
+
+/// What `NotLatestPipelineExecutionException` states: the execution the request named is
+/// out of date for the stage it named it on, because a later run of the pipeline has
+/// taken that stage over.
+///
+/// The model documents the condition as "the stage has failed in a later run of the
+/// pipeline and the pipelineExecutionId associated with the request is out of date", so
+/// the statement names that stage, that pipeline and the id the REQUEST carried rather
+/// than claiming the execution does not exist — it does; it is simply not the latest.
+fn not_latest_execution_message(
+    pipeline_execution_id: &str,
+    pipeline_name: &str,
+    stage_name: &str,
+) -> String {
+    format!(
+        "Stage {stage_name} of pipeline {pipeline_name} has run since pipeline execution \
+         {pipeline_execution_id}, so that execution id is out of date"
+    )
 }

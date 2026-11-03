@@ -8,7 +8,9 @@
 //! stored action in declaration order, one condition state per declared condition set
 //! naming that set's rules, an inbound transition for every stage an execution
 //! transitions INTO (that is, every stage but the first), and no execution anywhere,
-//! because nothing in this emulator runs a stage, an action or a rule.
+//! because within the span this state is read in — the span entering a stage is owed —
+//! the run the pipeline's creation started has reached no stage, no action and no rule.
+//! (What a run that HAS reached them reports is the execution plane's own suites.)
 //!
 //! The table below spans that class: the rows differ in stage count, in how many
 //! actions each stage declares, in the character forms a `StageName` may take, and in
@@ -279,17 +281,15 @@ async fn the_state_reports_every_stored_stage_and_action_in_order() {
                 );
             }
 
-            // Creating a pipeline RUNS it once, so the run that creation started has
-            // entered the FIRST stage (it reports that execution) and waits at the one
-            // after it (which reports it as the execution inbound to it); nothing has
-            // reached any stage beyond that, and a revision only `PutActionRevision`
-            // records is not reported anywhere.
-            let entered_by_the_creation_run = position == 0;
-            let waited_at_by_the_creation_run = position == 1;
+            // Creating a pipeline RUNS it once, and ENTERING a stage is itself a
+            // clock-owed step (`state::execution::ACTION_STEP`), so at the instant this
+            // state is read — within that span of the create — the run that creation
+            // started has entered NO stage yet: it is waiting at the first one, which
+            // reports it as the execution inbound to it, and nothing has reached any
+            // stage at all. A revision only `PutActionRevision` records is not reported
+            // anywhere either.
+            let waited_at_by_the_creation_run = position == 0;
             for absent in ["latestExecution", "inboundExecution", "inboundExecutions"] {
-                if entered_by_the_creation_run && absent == "latestExecution" {
-                    continue;
-                }
                 if waited_at_by_the_creation_run && absent == "inboundExecution" {
                     continue;
                 }
@@ -300,18 +300,11 @@ async fn the_state_reports_every_stored_stage_and_action_in_order() {
                 );
             }
             for action in reported["actionStates"].as_array().expect("action states") {
-                for absent in ["currentRevision", "entityUrl", "revisionUrl"] {
+                for absent in ["currentRevision", "entityUrl", "revisionUrl", "latestExecution"] {
                     assert!(
                         action.get(absent).is_none(),
                         "case {label:?} stage {stage:?}: nothing ran this action, so \
                          {absent} must be absent, got {action}"
-                    );
-                }
-                if !entered_by_the_creation_run {
-                    assert!(
-                        action.get("latestExecution").is_none(),
-                        "case {label:?} stage {stage:?}: no execution has reached this \
-                         action, so latestExecution must be absent, got {action}"
                     );
                 }
             }

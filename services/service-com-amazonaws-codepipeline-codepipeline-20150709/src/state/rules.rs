@@ -172,6 +172,37 @@ pub struct RuleExecutionRecord {
 }
 
 impl RuleExecutionRecord {
+    /// This evaluation as `GetPipelineState` reports it inside the state of the rule it
+    /// evaluated (`RuleState$latestExecution`).
+    ///
+    /// The same run, reported from the same record as the listing above: only the members
+    /// `RuleExecution` carries differ. `token` is absent — it is "the system-generated
+    /// token used to identify a unique request", and no request of a caller's ran this
+    /// rule; the condition plane did — and so is `lastUpdatedBy`, for the reason the
+    /// listing's `updatedBy` is: nobody changed this run.
+    pub fn to_rule_execution(&self) -> crate::ops::types::RuleExecution {
+        crate::ops::types::RuleExecution {
+            rule_execution_id: Some(self.rule_execution_id.clone()),
+            status: Some(self.status.clone()),
+            summary: self
+                .error
+                .as_ref()
+                .map(|(_, message)| message.clone())
+                .or_else(|| Some(self.status.clone())),
+            last_status_change: Some(to_date_time(self.last_update_time)),
+            token: None,
+            last_updated_by: None,
+            // The three `external*` members report the run the PROVIDER performed, and
+            // no provider ran, so none of them is invented.
+            external_execution_id: None,
+            external_execution_url: None,
+            error_details: self.error.as_ref().map(|(code, message)| ErrorDetails {
+                code: Some(code.clone()),
+                message: Some(message.clone()),
+            }),
+        }
+    }
+
     /// This evaluation as `ListRuleExecutions` reports it.
     pub fn to_detail(&self) -> RuleExecutionDetail {
         RuleExecutionDetail {
