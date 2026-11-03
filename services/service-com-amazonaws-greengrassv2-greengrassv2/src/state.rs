@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     CloudComponentStatus, ComponentDeploymentSpecification, ComponentPlatform,
-    DeploymentIoTJobConfiguration, DeploymentPolicies,
+    DeploymentIoTJobConfiguration, DeploymentPolicies, ResourceNotFoundException,
 };
 
 /// This service's ARN namespace (`OPERATIONS.md`: ARN namespace `greengrass`).
@@ -337,6 +337,24 @@ impl ComAmazonawsGreengrassv2Greengrassv2State {
         (entry.arn == arn).then_some(entry)
     }
 
+    /// The tag set stored for the resource a `GenericV2ARN` names, or `None` when
+    /// this service holds no such resource.
+    ///
+    /// A tag set belongs to the resource it was written on, so this reads the ONE
+    /// copy the creating operation persisted rather than a second map beside it:
+    /// a component version's tags from the catalog entry, a deployment's from the
+    /// deployment history. No operation registers a core device, so a core-device
+    /// ARN names no resource here.
+    pub fn resource_tags(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        match NamedResource::from_arn(arn)? {
+            NamedResource::ComponentVersion { .. } => Some(&self.component_version(arn)?.tags),
+            NamedResource::Deployment { deployment_id } => {
+                Some(&self.deployments.get(&deployment_id)?.tags)
+            }
+            NamedResource::CoreDevice { .. } => None,
+        }
+    }
+
     /// Insert a published component version, maintaining the total count.
     pub fn insert_component_version(&mut self, name_arn: &str, entry: ComponentVersionEntry) {
         let component = self
@@ -625,6 +643,95 @@ pub fn parse_component_arn(arn: &str) -> Option<String> {
             Some((*name).to_string())
         }
         _ => None,
+    }
+}
+
+/// The resource a `GenericV2ARN` names.
+///
+/// That shape's pattern admits exactly three resource fields — `components:`,
+/// `deployments:` and `coreDevices:` — so an ARN any operation taking one carries
+/// names a component version, a deployment or a core device, and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamedResource {
+    /// A published component version, `components:<name>:versions:<version>`.
+    ComponentVersion { name: String, version: String },
+    /// A deployment, `deployments:<deploymentId>`.
+    Deployment { deployment_id: String },
+    /// A core device, `coreDevices:<coreDeviceThingName>`.
+    CoreDevice { core_device_thing_name: String },
+}
+
+impl NamedResource {
+    /// The resource `arn` names, or `None` when its resource field is not the shape
+    /// any of the three kinds has.
+    ///
+    /// Every one of those resource fields is colon-separated and its identifier is
+    /// itself colon-free (`ComponentVersionARN`'s pattern, and a deployment id and a
+    /// thing name carry no `:`), so a plain `:` split recovers it.
+    pub fn from_arn(arn: &str) -> Option<Self> {
+        // The component-version shape is already parsed once in this module, for the
+        // operations that take a `ComponentVersionARN`; this is the same ARN.
+        if let Some((name, version)) = parse_component_version_arn(arn) {
+            return Some(Self::ComponentVersion { name, version });
+        }
+        let fields: Vec<&str> = arn.split(':').collect();
+        match fields.as_slice() {
+            ["arn", _partition, "greengrass", _region, _account, "deployments", deployment_id]
+                if !deployment_id.is_empty() =>
+            {
+                Some(Self::Deployment {
+                    deployment_id: (*deployment_id).to_string(),
+                })
+            }
+            ["arn", _partition, "greengrass", _region, _account, "coreDevices", thing_name]
+                if !thing_name.is_empty() =>
+            {
+                Some(Self::CoreDevice {
+                    core_device_thing_name: (*thing_name).to_string(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The `resourceType` an exception about this resource carries, as the handlers
+    /// that already report each kind word it.
+    pub fn resource_type(&self) -> &'static str {
+        match self {
+            Self::ComponentVersion { .. } => "COMPONENT_VERSION",
+            Self::Deployment { .. } => "DEPLOYMENT",
+            Self::CoreDevice { .. } => "CORE_DEVICE",
+        }
+    }
+}
+
+/// What an operation taking a `GenericV2ARN` reports for an ARN that names no
+/// resource this service holds: a 404 naming the resource kind the ARN addressed,
+/// worded for that kind as the operations dedicated to it word it.
+pub fn named_resource_not_found(arn: &str) -> ResourceNotFoundException {
+    let named = NamedResource::from_arn(arn);
+    let message = match &named {
+        Some(NamedResource::ComponentVersion { name, version }) => format!(
+            "Component [{name} : {version}] in the accountId [{}] does not exist",
+            account_id()
+        ),
+        Some(NamedResource::Deployment { deployment_id }) => {
+            format!("The deployment {deployment_id} does not exist.")
+        }
+        Some(NamedResource::CoreDevice {
+            core_device_thing_name,
+        }) => format!("The core device {core_device_thing_name} does not exist."),
+        // In the pattern's resource space, but not the shape any kind's ARN has, so
+        // there is no identifier to name beyond the ARN the caller sent.
+        None => format!("The resource {arn} does not exist."),
+    };
+    ResourceNotFoundException {
+        message,
+        resource_id: arn.to_string(),
+        resource_type: named
+            .as_ref()
+            .map_or("RESOURCE", NamedResource::resource_type)
+            .to_string(),
     }
 }
 
