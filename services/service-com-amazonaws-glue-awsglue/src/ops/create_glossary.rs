@@ -191,11 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.glossary_by_name(&input.name).is_some() {
             return Err(CreateGlossaryErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
-                    // Wording for this slice is pinned by no recording or doc, so the
-                    // refusal states the resource kind and withholds the requested name,
-                    // as this service's other already-exists refusals do. ONE copy,
-                    // shared with the update that renames a glossary onto a stored name.
-                    message: Some(crate::state::GLOSSARY_ALREADY_EXISTS.to_string()),
+                    // The business-catalog surface wraps its refusal text in a JSON
+                    // document, so the modelled member carries that document and not a
+                    // bare sentence. ONE copy, shared with the update that renames a
+                    // glossary onto a stored name.
+                    message: Some(crate::state::glossary_already_exists_message(&input.name)),
                 },
             )
             .into());

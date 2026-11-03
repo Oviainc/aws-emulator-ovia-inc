@@ -123,6 +123,8 @@ mod data_quality_rulesets;
 mod database_listing;
 #[path = "all/delete_partition.rs"]
 mod delete_partition;
+#[path = "all/duplicate_create_refusals.rs"]
+mod duplicate_create_refusals;
 #[path = "all/error_classification.rs"]
 mod error_classification;
 #[path = "all/error_messages.rs"]

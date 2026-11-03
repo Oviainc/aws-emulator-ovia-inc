@@ -201,7 +201,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if existing.is_some_and(|catalog| catalog.connections.contains_key(&name)) {
             return Err(CreateConnectionErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
-                    message: Some(format!("Connection already exists: {name}")),
+                    // The service states the collision over the member the create named
+                    // the connection in, not the value, so the requested name is
+                    // withheld.
+                    message: Some(
+                        crate::state::messages::CONNECTION_ALREADY_EXISTS.to_string(),
+                    ),
                 },
             )
             .into());

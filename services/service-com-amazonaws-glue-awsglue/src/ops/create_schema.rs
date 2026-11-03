@@ -282,7 +282,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(CreateSchemaErrorModeled::AlreadyExistsException(
                         AlreadyExistsException {
                             message: Some(
-                                crate::state::messages::SCHEMA_ALREADY_EXISTS.to_string(),
+                                crate::state::messages::schema_already_exists(
+                                    &input.schema_name,
+                                ),
                             ),
                         },
                     )

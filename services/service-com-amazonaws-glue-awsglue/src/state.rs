@@ -8444,13 +8444,19 @@ pub fn glossary_not_found_message(identifier: &str) -> String {
 /// The message every refusal of a glossary NAME this account already holds a glossary
 /// under carries: the value of that refusal's `AlreadyExistsException$Message`.
 ///
+/// Worded the way this surface words every refusal ([`glossary_not_found_message`],
+/// [`form_type_not_found_message`]): the refusal text is itself a JSON document carrying
+/// the sentence under a `Message` key, so that text — braces and all — is what the
+/// modelled member carries. The sentence names the glossary the write asked for, in
+/// single quotes, which is its one variable part; `serde_json` renders it, so a name
+/// carrying a quote or a backslash still yields a well-formed document.
+///
 /// One copy, shared by the create that would mint a second glossary under a stored name
 /// and the update that would rename one onto it, so the two cannot disagree about how the
-/// one collision is worded. Pinned by no recording, so it follows the per-resource
-/// constant shape this service's other already-exists refusals use
-/// ([`messages::DATABASE_ALREADY_EXISTS`]): the resource kind, and no disclosure of the
-/// requested name.
-pub const GLOSSARY_ALREADY_EXISTS: &str = "Glossary already exists.";
+/// one collision is worded.
+pub fn glossary_already_exists_message(name: &str) -> String {
+    catalog_refusal_document(&format!("A glossary with name '{name}' already exists."))
+}
 
 /// A stored form type: the schema for structured metadata `PutFormType` registers in the
 /// Data Catalog.
@@ -9517,6 +9523,44 @@ impl JobEntry {
         }
     }
 
+    /// Whether this stored job definition is the one `input` asks to create, member for
+    /// member.
+    ///
+    /// "It must be unique in your account" (`CreateJobRequest$Name`), so the name is what
+    /// a create reuses when it submits a definition under one already taken: such a create
+    /// is a RETRY of the create that stored this record only when it asks for the very
+    /// same job, and otherwise it has associated one identifier with two different
+    /// records — which is what the operation's `IdempotentParameterMismatchException`
+    /// ("the same unique identifier was associated with two different records") states.
+    ///
+    /// The comparison is over the whole stored definition, the tags included, because any
+    /// member of it is part of the job the caller asked for. It is made on the modelled
+    /// `Job` shape rendered by this service's own JSON codec rather than member by member:
+    /// the definition carries the `CodeGenConfigurationNodes` ETL graph, whose modelled
+    /// shapes derive no equality and hold `HashMap` members whose iteration order comes
+    /// from a per-process hash seed, so neither `Debug` nor the rendered bytes of two equal
+    /// graphs match while `serde_json::Value`'s own equality compares objects member by
+    /// member whichever map backs them. The two SERVER-set instants are not part of the
+    /// submitted definition, so the candidate is built carrying this record's own.
+    ///
+    /// A definition the codec cannot render is not shown to be this one, so such a create
+    /// is answered as the mismatch it cannot be told apart from rather than as a retry
+    /// that would drop what it sent behind a refusal.
+    pub fn matches_create_input(&self, input: &CreateJobInput) -> bool {
+        let mut candidate = Self::from_create_input(input, self.created_on);
+        candidate.last_modified_on = self.last_modified_on;
+        if self.tags != candidate.tags {
+            return false;
+        }
+        match (
+            rendered_shape(&Job::SCHEMA, &self.to_job()),
+            rendered_shape(&Job::SCHEMA, &candidate.to_job()),
+        ) {
+            (Some(stored), Some(requested)) => stored == requested,
+            _ => false,
+        }
+    }
+
     /// Rebuild the modelled `Job` output shape from what is stored.
     pub fn to_job(&self) -> Job {
         Job {
@@ -9552,6 +9596,44 @@ impl JobEntry {
             maintenance_window: self.maintenance_window.clone(),
             // `ProfileName` names a usage profile, which `CreateJob` cannot set.
             profile_name: None,
+        }
+    }
+}
+
+/// One modelled shape as the JSON value this service's own codec renders for it.
+///
+/// Rendering through the codec is what makes two shapes COMPARABLE at all: the modelled
+/// structures derive no equality, and several of them hold `std::collections::HashMap`
+/// members (a job's `DefaultArguments`, its `CodeGenConfigurationNodes` and the options
+/// inside them) whose iteration order comes from a per-process hash seed, so neither
+/// `Debug` nor the rendered bytes of two equal values match. `serde_json::Value` then
+/// supplies the equality: its objects compare by member, not by order, whichever map
+/// backs them, and its lists keep their order, which is right for the modelled sequences.
+///
+/// A value the codec cannot render answers `None`, so the comparison is impossible rather
+/// than false and the caller decides what to do with that.
+fn rendered_shape(
+    schema: &::aws_smithy_schema::Schema,
+    value: &dyn ::aws_smithy_schema::serde::SerializableStruct,
+) -> Option<::serde_json::Value> {
+    use ::aws_smithy_schema::serde::ShapeSerializer;
+
+    let mut serializer = ::aws_smithy_schema_server::json::JsonShapeSerializer::new();
+    if let Err(error) = serializer.write_struct(schema, value) {
+        ::tracing::warn!(
+            %error,
+            "the JSON codec could not render a stored shape, so two definitions cannot be compared"
+        );
+        return None;
+    }
+    match ::serde_json::from_str::<::serde_json::Value>(&serializer.into_string()) {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            ::tracing::warn!(
+                %error,
+                "the JSON this service renders for a stored shape did not parse back"
+            );
+            None
         }
     }
 }
@@ -11106,11 +11188,15 @@ pub fn next_version_id(current: &str) -> String {
 /// ("Table `<Name>` not found."), `GetTable`'s table miss (the constant
 /// "Entity Not Found", which names neither table nor database) and `CreateDatabase`'s
 /// duplicate (the constant "Database already exists.", which withholds the requested
-/// name). A fifth is the classifier miss ([`messages::classifier_not_found`]), whose
-/// recorded wording states the miss TWICE ("Classifier `<Name>` not found. not found.")
-/// because the service composes its per-resource sentence with its generic one; it is
-/// enumerated here so the doubling reads as the requirement it is rather than as a typo
-/// to tidy. The rest are the same per-resource wording for the same refusal on the
+/// name). A fifth and a sixth are the classifier's own refusals
+/// ([`messages::classifier_not_found`], [`messages::classifier_already_exists`]), whose
+/// recorded wordings state the miss and the collision TWICE ("Classifier `<Name>` not
+/// found. not found.") because the service composes its per-resource sentence with its
+/// generic one; they are enumerated here so the doubling reads as the requirement it is
+/// rather than as a typo to tidy. The classifier DELETE words its own miss differently
+/// again ([`messages::classifier_not_found_for_delete`]), which is why the read's
+/// sentence and the delete's are two strings and not one.
+/// The rest are the same per-resource wording for the same refusal on the
 /// sibling operations. Every handler refuses through these constructors, so one
 /// operation's wording is never silently borrowed for another's refusal.
 ///
@@ -11230,9 +11316,8 @@ pub mod messages {
         )
     }
 
-    /// A classifier lookup (`GetClassifier`, and the `UpdateClassifier` and
-    /// `DeleteClassifier` that address one the same way) for a name no classifier in this
-    /// account has.
+    /// A classifier READ (`GetClassifier`, and the `UpdateClassifier` that addresses one
+    /// the same way) for a name no classifier in this account has.
     ///
     /// Recorded template, reproduced as the service words this error class and NOT
     /// shortened: the sentence names the classifier the request addressed — the only
@@ -11244,10 +11329,39 @@ pub mod messages {
         format!("Classifier {name} not found. not found.")
     }
 
-    /// `CreateClassifier` for a name already taken. NOT recorded: inferred from the
-    /// recorded `CreateDatabase` duplicate, like [`CRAWLER_ALREADY_EXISTS`] — 400,
-    /// `AlreadyExistsException`, and no disclosure of the requested name.
-    pub const CLASSIFIER_ALREADY_EXISTS: &str = "Classifier already exists.";
+    /// The DELETE of a classifier this account holds none of (`DeleteClassifier`).
+    ///
+    /// Recorded template, and a DIFFERENT sentence from the read's above — which is why
+    /// the two are not one shared string, exactly as the connection read and write keep
+    /// their own ([`connection_not_found`], [`connection_not_found_for_write`]): the
+    /// delete states the miss ONCE, over the whole address it resolved — the account whose
+    /// namespace was searched and the requested name, joined by a colon, because a
+    /// classifier name is unique per account. The name is read off the request, exactly as
+    /// sent; the account is the one this emulator serves, as
+    /// [`custom_entity_type_not_found`] reads it.
+    pub fn classifier_not_found_for_delete(name: &str) -> String {
+        format!(
+            "Classifier {}:{name} not found.",
+            ::engine::emulator_account_id()
+        )
+    }
+
+    /// `CreateClassifier` for a name already taken.
+    ///
+    /// Recorded template, reproduced as the service words this error class and NOT
+    /// shortened: the sentence names the classifier the create asked for — the only
+    /// variable part, read off the request — and then states the collision a second time,
+    /// for the same reason the read's miss above states it twice.
+    pub fn classifier_already_exists(name: &str) -> String {
+        format!("Classifier {name} already exists. already exists")
+    }
+
+    /// `CreateCustomEntityType` for a `Name` this account already holds a custom pattern
+    /// under. Recorded constant, and the whole message: the service states the collision
+    /// over the resource kind and the namespace a custom pattern's name is unique in, and
+    /// echoes back neither the name the create asked for nor the account.
+    pub const CUSTOM_ENTITY_TYPE_ALREADY_EXISTS: &str =
+        "A Custom Entity Type with the same name exist in this account";
 
     /// `CreateClassifier` naming none of the four classifier members. The kind to create
     /// is "which field of the request is present" (`CreateClassifier`), so a request
@@ -11393,6 +11507,18 @@ pub mod messages {
     /// every job-definition lookup, so a client matching on the sentence recognises the
     /// miss whichever operation reported it.
     pub const JOB_NOT_FOUND: &str = "Job not found.";
+
+    /// `CreateJob` for a `Name` the request's Region already holds a job definition
+    /// under, where the definition submitted is the stored one — so the create is a
+    /// retry of the one that stored it rather than a second, different job under one
+    /// name ([`already_submitted_with_different_configuration`] words that one).
+    ///
+    /// NOT recorded, because what the corpus records for this name collision is the
+    /// idempotency mismatch: inferred from the recorded `CreateDatabase` duplicate, like
+    /// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
+    /// the requested name, which is also how the recorded job-definition miss above
+    /// withholds it.
+    pub const JOB_ALREADY_EXISTS: &str = "Job already exists.";
 
     /// `CreateCrawler` for an S3 target whose `EventQueueArn` (or `DlqEventQueueArn`)
     /// names a queue the crawler's `Role` cannot consume ([`super::event_queue_refusal`]).
@@ -11779,6 +11905,12 @@ pub mod messages {
         format!("Connection not found: {name}")
     }
 
+    /// `CreateConnection` for a `ConnectionInput$Name` the addressed Data Catalog already
+    /// holds a connection under. Recorded constant, and the whole message: the service
+    /// states the resource kind and withholds the name the create asked for, as the
+    /// recorded `CreateDatabase` duplicate does for its own resource.
+    pub const CONNECTION_ALREADY_EXISTS: &str = "Connection already exists.";
+
     /// `GetTable` for a table the database does not hold. Recorded constant: this
     /// read's refusal names neither the table nor the database.
     pub const TABLE_ENTITY_NOT_FOUND: &str = "Entity Not Found";
@@ -11899,11 +12031,14 @@ pub mod messages {
     /// schema lookup, so one operation's miss cannot drift from another's.
     pub const SCHEMA_NOT_FOUND: &str = "Schema is not found.";
 
-    /// `CreateSchema` for a `SchemaName` its registry already holds. NOT recorded:
-    /// inferred from the recorded `CreateDatabase` duplicate, like
-    /// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
-    /// the requested name.
-    pub const SCHEMA_ALREADY_EXISTS: &str = "Schema already exists.";
+    /// `CreateSchema` for a `SchemaName` its registry already holds.
+    ///
+    /// Recorded template: the fixed collision sentence followed by the MEMBER the create
+    /// addressed the schema set by, spelled as the model spells it, and the value it sent
+    /// — the only variable part. The registry the name was taken in is not disclosed.
+    pub fn schema_already_exists(schema_name: &str) -> String {
+        format!("Schema already exists. SchemaName: {schema_name}")
+    }
 
     /// A column statistics task run lookup (`GetColumnStatisticsTaskRun`) for an id no
     /// run in this account has. NOT recorded: the sentence follows the per-resource
@@ -11963,21 +12098,25 @@ pub mod messages {
 
     /// `CreateRegistry` for a `RegistryName` this account already holds. NOT recorded
     /// either: inferred from the recorded `CreateDatabase` duplicate, like
-    /// [`SCHEMA_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of the
+    /// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of the
     /// requested name.
     pub const REGISTRY_ALREADY_EXISTS: &str = "Registry already exists.";
 
-    /// `CreateWorkflow` for a `Name` this account already holds a workflow under. NOT
-    /// recorded: inferred from the recorded `CreateDatabase` duplicate, like
-    /// [`REGISTRY_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
-    /// the requested name.
-    pub const WORKFLOW_ALREADY_EXISTS: &str = "Workflow already exists.";
+    /// `CreateWorkflow` for a `Name` this account already holds a workflow under.
+    ///
+    /// Recorded constant, and the whole message: the service states the collision over
+    /// the MEMBER the create named the workflow in rather than the value, so the
+    /// requested name is withheld — reproduced as recorded, its capital `E` and its
+    /// missing trailing period included, because a client recognises the refusal by its
+    /// wording.
+    pub const WORKFLOW_ALREADY_EXISTS: &str = "Workflow with given name already Exists";
 
-    /// `CreateBlueprint` for a `Name` this account already holds a blueprint under. NOT
-    /// recorded: inferred from the recorded `CreateDatabase` duplicate, like
-    /// [`WORKFLOW_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
-    /// the requested name.
-    pub const BLUEPRINT_ALREADY_EXISTS: &str = "Blueprint already exists.";
+    /// `CreateBlueprint` for a `Name` this account already holds a blueprint under.
+    ///
+    /// Recorded constant, and the whole message: like [`WORKFLOW_ALREADY_EXISTS`] it
+    /// names the member the create addressed the blueprint by and withholds the value,
+    /// with no trailing period, as recorded.
+    pub const BLUEPRINT_ALREADY_EXISTS: &str = "Blueprint with given name already exists";
 
     /// Any blueprint operation whose `Name` names no blueprint this account holds
     /// (`GetBlueprint`, and the same miss on every sibling that addresses one by name).
@@ -12176,10 +12315,12 @@ pub mod messages {
     }
 
     /// `CreateDataQualityRuleset` for a name this account already holds a ruleset under.
-    /// NOT recorded: inferred from the recorded `CreateDatabase` duplicate, like
-    /// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of the
-    /// requested name.
-    pub const DATA_QUALITY_RULESET_ALREADY_EXISTS: &str = "Data quality ruleset already exists.";
+    ///
+    /// Recorded template: the fixed collision sentence plus the `Name` the create asked
+    /// for, its one variable part, read off the request exactly as sent.
+    pub fn data_quality_ruleset_already_exists(name: &str) -> String {
+        format!("Another ruleset with the same name already exists: {name}")
+    }
 
     /// A partition create whose `PartitionInput` carries no `Values`. NOT recorded: what
     /// is pinned is the behaviour — `InvalidInputException`, as a per-item error for a

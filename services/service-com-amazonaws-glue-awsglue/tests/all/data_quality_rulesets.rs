@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::ops::types::CreateDataQualityRulesetInput;
-use service_com_amazonaws_glue_awsglue::state::messages::DATA_QUALITY_RULESET_ALREADY_EXISTS;
 use service_com_amazonaws_glue_awsglue::state::{
     ComAmazonawsGlueAwsglueState, DataQualityRulesetEntry, MAX_DATA_QUALITY_RULESETS,
 };
@@ -383,7 +382,7 @@ async fn reusing_a_client_token_with_a_different_definition_is_refused() {
         );
         assert_eq!(
             error_message(&body),
-            DATA_QUALITY_RULESET_ALREADY_EXISTS,
+            "Another ruleset with the same name already exists: token-mismatch",
             "case {case}: expected the one duplicate wording this service gives, got {body}"
         );
 
@@ -474,16 +473,12 @@ async fn a_duplicate_ruleset_name_is_refused_and_changes_nothing() {
             error_code(&body).contains("AlreadyExistsException"),
             "case {case}: expected AlreadyExistsException, got {body}"
         );
-        // One wording for this miss, whichever member the second create differs by, and it
-        // discloses no name.
+        // One wording for this collision, whichever member the second create differs by,
+        // and it names the ruleset the create asked for.
         assert_eq!(
             error_message(&body),
-            DATA_QUALITY_RULESET_ALREADY_EXISTS,
+            format!("Another ruleset with the same name already exists: {name}"),
             "case {case}: expected the one duplicate wording this service gives, got {body}"
-        );
-        assert!(
-            !error_message(&body).contains(name),
-            "case {case}: the duplicate refusal must not disclose {name:?}, got {body}"
         );
 
         // The stored ruleset is still the FIRST create's, member for member and instant

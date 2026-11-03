@@ -181,10 +181,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.custom_entity_types.contains_key(&input.name) {
             return Err(CreateCustomEntityTypeErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
-                    // Wording for this slice is pinned by no recording or doc, so the
-                    // refusal states the resource kind and withholds the requested name,
-                    // as this service's other already-exists refusals do.
-                    message: Some("Custom entity type already exists.".to_string()),
+                    // Wording for this slice is the service's own sentence for a custom
+                    // pattern whose name is already taken, which states the resource kind
+                    // and the namespace it is unique in and names neither the pattern nor
+                    // the account.
+                    message: Some(
+                        crate::state::messages::CUSTOM_ENTITY_TYPE_ALREADY_EXISTS.to_string(),
+                    ),
                 },
             )
             .into());

@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(UpdateGlossaryErrorModeled::AlreadyExistsException(
                     AlreadyExistsException {
-                        message: Some(crate::state::GLOSSARY_ALREADY_EXISTS.to_string()),
+                        message: Some(crate::state::glossary_already_exists_message(requested)),
                     },
                 )
                 .into());

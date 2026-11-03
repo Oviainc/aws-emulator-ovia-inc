@@ -199,7 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateDataQualityRulesetErrorModeled::AlreadyExistsException(
                     AlreadyExistsException {
                         message: Some(
-                            crate::state::messages::DATA_QUALITY_RULESET_ALREADY_EXISTS.to_string(),
+                            crate::state::messages::data_quality_ruleset_already_exists(
+                                &input.name,
+                            ),
                         ),
                     },
                 )

@@ -152,7 +152,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.classifiers.remove(&input.name).is_none() {
             return Err(DeleteClassifierErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::classifier_not_found(&input.name)),
+                    message: Some(crate::state::messages::classifier_not_found_for_delete(
+                        &input.name,
+                    )),
                     from_federation_source: None,
                 },
             )

@@ -369,11 +369,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // "It must be unique in your account." Glue is regional, so the name has to be
-        // free in THIS Region: the same name in another Region names another job.
-        if store.job(&region, &input.name).is_some() {
+        // free in THIS Region: the same name in another Region names another job. The
+        // name is also this create's idempotency identifier, so a create under a name
+        // already taken is told which of the two it is: a retry of the create that stored
+        // the job definition, or one request associating that identifier with a second,
+        // different definition.
+        if let Some(stored) = store.job(&region, &input.name) {
+            if !stored.matches_create_input(&input) {
+                return Err(CreateJobErrorModeled::IdempotentParameterMismatchException(
+                    IdempotentParameterMismatchException {
+                        message: Some(
+                            crate::state::messages::already_submitted_with_different_configuration(
+                                "Job",
+                            ),
+                        ),
+                    },
+                )
+                .into());
+            }
             return Err(CreateJobErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
-                    message: Some(format!("Job already exists: {}", input.name)),
+                    message: Some(crate::state::messages::JOB_ALREADY_EXISTS.to_string()),
                 },
             )
             .into());

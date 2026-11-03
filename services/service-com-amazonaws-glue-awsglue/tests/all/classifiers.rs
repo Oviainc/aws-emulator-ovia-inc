@@ -21,7 +21,9 @@ use service_com_amazonaws_glue_awsglue::state::{
 use service_com_amazonaws_glue_awsglue::ops::types::CreateClassifierInput;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{assert_echoed, call, emulator, emulator_on, error_code, error_message, ok};
+use crate::wire::{
+    assert_echoed, call, emulator, emulator_on, error_code, error_message, ok, ACCOUNT_ID,
+};
 
 /// The longest `Name` the model accepts for a classifier: "len 1..255" on `NameString`
 /// (`smithy_query operation=GetClassifier`).
@@ -650,9 +652,10 @@ async fn a_deleted_classifier_is_gone_and_its_name_is_free() {
 
 /// A name this account holds no classifier under is refused by every operation that
 /// addresses one, with the modelled `EntityNotFoundException` and the sentence the service
-/// words that refusal with, built from the requested name. The wording is the service's
-/// own, doubled sentence and all (`state::messages::classifier_not_found`); only the name
-/// in it comes from the request.
+/// words THAT operation's refusal with: the read and the update state the service's own
+/// doubled sentence (`state::messages::classifier_not_found`), and the delete states the
+/// miss once over the account and the name
+/// (`state::messages::classifier_not_found_for_delete`).
 ///
 /// The rows differ along how the requested name misses — never created, a prefix of a
 /// stored name, a suffix of one, a stored name in another case (the model documents no
@@ -673,15 +676,24 @@ async fn addressing_an_unknown_classifier_is_refused() {
         ("a stored name lowercased", "storedclassifier"),
         ("a stored name uppercased", "STOREDCLASSIFIER"),
     ] {
-        let requests: Vec<(&str, Value)> = vec![
-            ("GetClassifier", json!({ "Name": name })),
-            ("DeleteClassifier", json!({ "Name": name })),
+        let requests: Vec<(&str, Value, String)> = vec![
+            (
+                "GetClassifier",
+                json!({ "Name": name }),
+                format!("Classifier {name} not found. not found."),
+            ),
+            (
+                "DeleteClassifier",
+                json!({ "Name": name }),
+                format!("Classifier {ACCOUNT_ID}:{name} not found."),
+            ),
             (
                 "UpdateClassifier",
                 json!({ "JsonClassifier": { "Name": name, "JsonPath": "$.other" } }),
+                format!("Classifier {name} not found. not found."),
             ),
         ];
-        for (operation, request) in &requests {
+        for (operation, request, expected) in &requests {
             let (status, body) = call(&router, operation, request).await;
             assert_eq!(
                 status, 400,
@@ -693,10 +705,9 @@ async fn addressing_an_unknown_classifier_is_refused() {
                 "case {case} through {operation}: expected EntityNotFoundException, got {body}"
             );
             assert_eq!(
-                error_message(&body),
-                format!("Classifier {name} not found. not found."),
-                "case {case} through {operation}: the refusal must name the requested \
-                 classifier, got {body}"
+                &error_message(&body),
+                expected,
+                "case {case} through {operation}: expected Message {expected:?}, got {body}"
             );
         }
     }

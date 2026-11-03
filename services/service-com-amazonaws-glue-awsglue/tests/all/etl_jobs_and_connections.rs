@@ -18,8 +18,9 @@
 //!   timeout is defaulted to 2,880 minutes for Glue version 4.0 and earlier, or 480
 //!   minutes for Glue version 5.0 and later") and
 //!   `ExecutionProperty$MaxConcurrentRuns` ("The default is 1").
-//! * A job name is unique per account ("It must be unique in your account"), so a repeat
-//!   is `AlreadyExistsException`; a request contradicting a documented rule is
+//! * A job name is unique per account ("It must be unique in your account") and is the
+//!   create's idempotency identifier, so a repeat carrying ANOTHER definition is
+//!   `IdempotentParameterMismatchException`; a request contradicting a documented rule is
 //!   `InvalidInputException` and writes nothing.
 //! * `CreateConnection` creates a connection definition in the addressed catalog, which
 //!   `GetConnection` reports back; `HidePassword` withholds the password properties from
@@ -410,8 +411,9 @@ async fn a_job_request_that_contradicts_a_documented_rule_is_refused_and_writes_
         "a repeated job name must be refused, got {status} {body}"
     );
     assert!(
-        error_code(&body).ends_with("AlreadyExistsException"),
-        "a repeated job name must answer AlreadyExistsException, got {}",
+        error_code(&body).ends_with("IdempotentParameterMismatchException"),
+        "a repeated job name carrying another definition must answer \
+         IdempotentParameterMismatchException, got {}",
         error_code(&body)
     );
     let read = ok(&router, "GetJob", &json!({ "JobName": "unique-job" })).await;

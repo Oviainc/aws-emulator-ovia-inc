@@ -231,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateClassifierErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
                     message: Some(
-                        crate::state::messages::CLASSIFIER_ALREADY_EXISTS.to_string(),
+                        crate::state::messages::classifier_already_exists(&entry.name),
                     ),
                 },
             )

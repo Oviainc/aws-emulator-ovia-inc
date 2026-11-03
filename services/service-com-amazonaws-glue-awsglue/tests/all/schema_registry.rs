@@ -674,9 +674,11 @@ async fn a_duplicate_schema_name_is_refused_per_registry() {
             error_code(&refusal).contains("AlreadyExistsException"),
             "case {label}: expected AlreadyExistsException, got {refusal}"
         );
-        assert!(
-            !error_message(&refusal).contains("twice"),
-            "case {label}: the refusal withholds the requested name, got {refusal}"
+        assert_eq!(
+            error_message(&refusal),
+            "Schema already exists. SchemaName: twice",
+            "case {label}: the refusal names the member the create addressed the schema \
+             set by, got {refusal}"
         );
     }
 
