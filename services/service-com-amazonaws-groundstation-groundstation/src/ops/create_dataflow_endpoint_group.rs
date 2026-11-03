@@ -294,16 +294,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A dataflow endpoint is `creating` until the service has attached it; the move to
-        // `created` is owed at a stored instant and materialised by whoever reads next. An
-        // agent endpoint carries no `status` of its own, so a group of those owes no move.
-        let endpoints_settle_at = stored_endpoints
-            .iter()
-            .any(|details| details.endpoint.is_some())
-            .then(|| {
-                ::std::time::SystemTime::now() + crate::state::ENDPOINT_CREATION_SETTLES_AFTER
-            });
-
         let stored = crate::state::DataflowEndpointGroup {
             dataflow_endpoint_group_id: dataflow_endpoint_group_id.clone(),
             dataflow_endpoint_group_arn: dataflow_endpoint_group_arn.clone(),
@@ -311,7 +301,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             contact_pre_pass_duration_seconds: input.contact_pre_pass_duration_seconds,
             contact_post_pass_duration_seconds: input.contact_post_pass_duration_seconds,
             tags: input.tags.unwrap_or_default(),
-            endpoints_settle_at,
         };
 
         guard.arn_index.insert(
@@ -348,9 +337,11 @@ fn invalid_parameter(parameter: &str, message: String) -> CreateDataflowEndpoint
 /// member="healthStatus")`), so whatever the request carried is dropped and the health the
 /// service observes is reported instead:
 ///
-/// * a dataflow endpoint starts `creating`, which is its dataplane coming up
-///   (`INITIALIZING_DATAPLANE`), and becomes `created`/`HEALTHY` once the clock makes that
-///   move due (`ComAmazonawsGroundstationGroundstationState::settle_due_endpoints`);
+/// * a dataflow endpoint is reported `created`, its dataplane up and so `HEALTHY` for the
+///   `HEALTHY` reason: the recorded dataflow endpoint group lifecycle reads a group back
+///   after creating it and is answered `created` / `HEALTHY` / `[HEALTHY]`, so the stream
+///   this service attaches is attached by the time the caller's next call arrives and the
+///   group is handed back ready rather than in a transient state no read of it reports;
 /// * an AWS Ground Station Agent endpoint's stream is carried by an agent the customer
 ///   registers with `RegisterAgent`, so what it reports is that agent's
 ///   (`crate::state::apply_agent_endpoint_health`) — and at create time no agent can carry
@@ -365,11 +356,10 @@ fn endpoint_as_created(
     match kind {
         crate::state::EndpointKind::Dataflow => {
             if let Some(endpoint) = stored.endpoint.as_mut() {
-                endpoint.status = Some(crate::state::ENDPOINT_CREATING.to_string());
+                endpoint.status = Some(crate::state::ENDPOINT_CREATED.to_string());
             }
-            stored.health_status = Some(crate::state::HEALTH_UNHEALTHY.to_string());
-            stored.health_reasons =
-                Some(vec![crate::state::REASON_INITIALIZING_DATAPLANE.to_string()]);
+            stored.health_status = Some(crate::state::HEALTH_HEALTHY.to_string());
+            stored.health_reasons = Some(vec![crate::state::REASON_HEALTHY.to_string()]);
         }
         crate::state::EndpointKind::Agent => {
             crate::state::apply_agent_endpoint_health(&mut stored, None);

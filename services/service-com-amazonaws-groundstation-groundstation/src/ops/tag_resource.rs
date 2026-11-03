@@ -12,8 +12,10 @@
 //! Every resource this service hands out is taggable and is addressed here only by ARN,
 //! so the resolution is `crate::state`'s one ARN index
 //! ([`crate::state::ComAmazonawsGroundstationGroundstationState::tags_mut`]); an ARN this
-//! service never minted, or one whose resource has been deleted, is
-//! `ResourceNotFoundException` (HTTP 434).
+//! service never minted, or one whose resource has been deleted, is the tagging plane's own
+//! not-found refusal ([`crate::state::TaggingError::not_found`]) — the modelled
+//! `ResourceNotFoundException` payload and status under the code that plane puts on the
+//! wire, shared with `UntagResource` and `ListTagsForResource`.
 //!
 //! The map itself is held to AWS's platform-wide tagging rules — the model constrains
 //! `TagsMap` not at all — through the gate every create of this service already applies
@@ -86,6 +88,11 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-groundstation-groundsta
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
+//
+// The `ResourceNotFoundException` variant is NOT what this handler answers for an ARN that
+// resolves to nothing: the tagging plane names that condition by its own wire code, so it
+// goes through `crate::state::TaggingError::not_found` (which carries this shape's payload
+// and status). Constructing the variant here would put the modelled code back on the wire.
 #[smithy_macros::operation_error("com.amazonaws.groundstation#TagResource")]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
@@ -95,17 +102,22 @@ pub enum TagResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::tag_resource::TagResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type TagResourceError = crate::scaffolded::Scaffolded<TagResourceErrorModeled>;
+/// (`crate::ops::tag_resource::TagResourceError`).
+///
+/// It is NOT `crate::scaffolded::Scaffolded` any more: this operation is implemented, so it
+/// needs neither the 501 (that variant is the stub signal) nor the framework's synthetic
+/// `ValidationException` (an invalid request here is the modelled
+/// `InvalidParameterException`). What it does need is the tagging plane's own not-found
+/// refusal, whose wire code no modelled shape of this service spells — so the channel is
+/// the shared [`crate::state::TaggingError`], exactly as `UntagResource` and
+/// `ListTagsForResource` declare it.
+pub type TagResourceError = crate::state::TaggingError<TagResourceErrorModeled>;
 
-/// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
-/// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// Lets `?` and `.into()` lift a modeled failure into the error channel, so the handler
+/// writes `Err(SomeModeledError.into())` rather than naming the wrapper variant.
 impl From<TagResourceErrorModeled> for TagResourceError {
     fn from(modeled: TagResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        crate::state::TaggingError::Modeled(modeled)
     }
 }
 
@@ -167,13 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One lock for the lookup AND the merge, so the whole read-modify-write of the
         // resource's tag map is atomic: a concurrent write of other keys is not lost.
         let mut guard = state.lock();
-        let tags = guard.tags_mut(&input.resource_arn).ok_or_else(|| {
-            TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::tagged_resource_not_found_message(
-                    &input.resource_arn,
-                )),
-            })
-        })?;
+        let tags = guard
+            .tags_mut(&input.resource_arn)
+            .ok_or_else(TagResourceError::not_found)?;
 
         // The per-resource bound is about what the resource ENDS UP carrying, and this
         // call merges into what it already holds, so it is judged against the merged map

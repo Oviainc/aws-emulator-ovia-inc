@@ -28,29 +28,16 @@
 //! * `ListDataflowEndpointGroups` returns every group exactly once across its pages, and
 //!   a deleted group is gone from every read.
 
-use std::time::Duration;
-
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
-    AGENT_INACTIVE, BAD_REQUEST_ERROR_CODE, ENDPOINT_CREATED, ENDPOINT_CREATING,
-    ENDPOINT_CREATION_SETTLES_AFTER, HEALTH_HEALTHY, HEALTH_UNHEALTHY, INVALID_REQUEST_BODY,
-    REASON_HEALTHY, REASON_INITIALIZING_DATAPLANE, REASON_NO_REGISTERED_AGENT,
+    AGENT_INACTIVE, BAD_REQUEST_ERROR_CODE, ENDPOINT_CREATED, HEALTH_HEALTHY, HEALTH_UNHEALTHY,
+    INVALID_REQUEST_BODY, REASON_DATAPLANE_FAILURE, REASON_HEALTHY, REASON_NO_REGISTERED_AGENT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::dataflow_endpoint_group_deletion::assert_group_absent;
 use crate::dataflow_endpoint_group_listing::listed_ids;
-use crate::scheduling_loop::{harness, is_uuid, send, Reply, ABSENT_UUID, REGION};
-
-/// Longer than this service's chosen `creating` -> `created` endpoint settle span, so a
-/// read taken after it observes the move the service owed. Derived from that span rather
-/// than written out, so it cannot drift from what the service actually owes.
-///
-/// Waited out with `std::thread::sleep` rather than `tokio::time::sleep`: the emulator
-/// stores a due instant and never arms a timer, so there is no task to drive while
-/// waiting, and this workspace's `tokio` carries no `time` feature.
-const AFTER_SETTLE: Duration =
-    ENDPOINT_CREATION_SETTLES_AFTER.saturating_add(Duration::from_millis(600));
+use crate::scheduling_loop::{harness, is_uuid, send, Reply, ABSENT_UUID, AFTER_SETTLE, REGION};
 
 /// The published bounds of `DataflowEndpointGroupDurationInSeconds` (range 30..480 —
 /// `smithy_query(query="shape", shape="DataflowEndpointGroupDurationInSeconds")`).
@@ -74,8 +61,9 @@ pub(crate) struct Kind {
     pub(crate) body: Value,
     /// The member the service fills in on the endpoint itself, and the value it reports.
     derived: (&'static str, Value),
-    /// The one `CapabilityHealthReason` the service reports for a freshly created
-    /// endpoint of this kind.
+    /// The `CapabilityHealth` and the one `CapabilityHealthReason` the service reports for
+    /// a freshly created endpoint of this kind.
+    health_status: &'static str,
     health_reason: &'static str,
     /// Whether an endpoint of this kind can only be created WITH `securityDetails`.
     ///
@@ -105,10 +93,11 @@ pub(crate) fn endpoint_kinds() -> Vec<Kind> {
                 "address": {"name": "172.31.0.10", "port": 55888},
                 "mtu": 1500,
             }),
-            // A dataflow endpoint is admitted `creating`: the service has not finished
-            // attaching it when the create answers.
-            derived: ("status", json!(ENDPOINT_CREATING)),
-            health_reason: REASON_INITIALIZING_DATAPLANE,
+            // A dataflow endpoint is handed back attached: the recorded group lifecycle
+            // reads a created group and is answered `created` / HEALTHY / [HEALTHY].
+            derived: ("status", json!(ENDPOINT_CREATED)),
+            health_status: HEALTH_HEALTHY,
+            health_reason: REASON_HEALTHY,
             needs_security_details: true,
         },
         Kind {
@@ -129,6 +118,7 @@ pub(crate) fn endpoint_kinds() -> Vec<Kind> {
                 },
             }),
             derived: ("agentStatus", json!(AGENT_INACTIVE)),
+            health_status: HEALTH_UNHEALTHY,
             health_reason: REASON_NO_REGISTERED_AGENT,
             needs_security_details: false,
         },
@@ -152,6 +142,7 @@ pub(crate) fn endpoint_kinds() -> Vec<Kind> {
                 }},
             }),
             derived: ("agentStatus", json!(AGENT_INACTIVE)),
+            health_status: HEALTH_UNHEALTHY,
             health_reason: REASON_NO_REGISTERED_AGENT,
             needs_security_details: false,
         },
@@ -175,6 +166,7 @@ pub(crate) fn endpoint_kinds() -> Vec<Kind> {
                 }},
             }),
             derived: ("agentStatus", json!(AGENT_INACTIVE)),
+            health_status: HEALTH_UNHEALTHY,
             health_reason: REASON_NO_REGISTERED_AGENT,
             needs_security_details: false,
         },
@@ -259,6 +251,7 @@ async fn a_created_group_reads_back_every_endpoint_kind_it_was_created_with() {
             member,
             body,
             derived,
+            health_status,
             health_reason,
             needs_security_details: _,
         } = kind;
@@ -346,8 +339,8 @@ async fn a_created_group_reads_back_every_endpoint_kind_it_was_created_with() {
         // `healthStatus`/`healthReasons` are the service's to report, not the caller's.
         assert_eq!(
             endpoint.get("healthStatus").and_then(Value::as_str),
-            Some(HEALTH_UNHEALTHY),
-            "case {label}: a freshly created endpoint is not healthy yet, got {endpoint}"
+            Some(health_status),
+            "case {label}: wrong healthStatus, got {endpoint}"
         );
         assert_eq!(
             endpoint.get("healthReasons"),
@@ -361,13 +354,19 @@ async fn a_created_group_reads_back_every_endpoint_kind_it_was_created_with() {
 async fn the_health_a_request_asks_for_is_ignored_and_the_observed_health_reported() {
     let router = harness();
 
-    // Every row asks for a health the endpoint does not have; the model documents both
-    // members as "ignored when calling CreateDataflowEndpointGroup".
+    // Every row asks for a health the endpoint does NOT have — the opposite of the health
+    // the service observes for that kind — and the model documents both members as "ignored
+    // when calling CreateDataflowEndpointGroup".
     for kind in endpoint_kinds() {
+        let asked = if kind.health_status == HEALTH_HEALTHY {
+            (HEALTH_UNHEALTHY, REASON_DATAPLANE_FAILURE)
+        } else {
+            (HEALTH_HEALTHY, REASON_HEALTHY)
+        };
         let mut item = details(kind.member, &kind.body, true);
         let object = item.as_object_mut().expect("an endpoint details object");
-        object.insert("healthStatus".to_string(), json!(HEALTH_HEALTHY));
-        object.insert("healthReasons".to_string(), json!([REASON_HEALTHY]));
+        object.insert("healthStatus".to_string(), json!(asked.0));
+        object.insert("healthReasons".to_string(), json!([asked.1]));
 
         let created = create_group(&router, json!({"endpointDetails": [item]})).await;
         assert_eq!(
@@ -379,7 +378,7 @@ async fn the_health_a_request_asks_for_is_ignored_and_the_observed_health_report
         let endpoint = &read.field("endpointsDetails").as_array().expect("a list")[0];
         assert_eq!(
             endpoint.get("healthStatus").and_then(Value::as_str),
-            Some(HEALTH_UNHEALTHY),
+            Some(kind.health_status),
             "case {}: the requested healthStatus must be ignored, got {endpoint}",
             kind.label
         );
@@ -491,8 +490,8 @@ async fn security_details_are_demanded_only_of_the_endpoint_kind_whose_streams_n
         );
         assert_eq!(
             endpoint.get("healthStatus").and_then(Value::as_str),
-            Some(HEALTH_UNHEALTHY),
-            "case {}: a freshly created endpoint is not healthy yet, got {endpoint}",
+            Some(kind.health_status),
+            "case {}: wrong healthStatus, got {endpoint}",
             kind.label
         );
         assert_eq!(
@@ -697,8 +696,7 @@ async fn one_group_holds_endpoints_of_one_type_and_each_item_names_exactly_one()
 }
 
 #[tokio::test]
-async fn a_dataflow_endpoint_settles_from_creating_to_created_and_an_agent_endpoint_waits_for_its_agent(
-) {
+async fn a_dataflow_endpoint_is_created_attached_and_an_agent_endpoint_waits_for_its_agent() {
     let router = harness();
     let kinds = endpoint_kinds();
     let dataflow = &kinds[0];
@@ -717,48 +715,46 @@ async fn a_dataflow_endpoint_settles_from_creating_to_created_and_an_agent_endpo
     .await
     .string("dataflowEndpointGroupId");
 
-    // Straight after the create, the endpoint is still being attached.
-    let read = get_group(&router, &dataflow_id).await;
-    let endpoint = &read.field("endpointsDetails").as_array().expect("a list")[0];
-    assert_eq!(
-        endpoint.pointer("/endpoint/status").and_then(Value::as_str),
-        Some(ENDPOINT_CREATING),
-        "case straight after the create: expected {ENDPOINT_CREATING}, got {endpoint}"
-    );
-    assert_eq!(
-        endpoint.get("healthReasons"),
-        Some(&json!([REASON_INITIALIZING_DATAPLANE])),
-        "case straight after the create: expected the dataplane to be initializing, got {endpoint}"
-    );
-
-    std::thread::sleep(AFTER_SETTLE);
-
-    // Past the due instant the move the service owed is materialised by the read.
+    // The read taken straight after the create reports the endpoint ATTACHED: the recorded
+    // group lifecycle creates a group and reads it back, and that read is answered
+    // `created` / HEALTHY / [HEALTHY], so the group is handed back ready rather than in a
+    // transient state the caller has to wait out.
     let read = get_group(&router, &dataflow_id).await;
     let endpoint = &read.field("endpointsDetails").as_array().expect("a list")[0];
     assert_eq!(
         endpoint.pointer("/endpoint/status").and_then(Value::as_str),
         Some(ENDPOINT_CREATED),
-        "case after the settle span: expected {ENDPOINT_CREATED}, got {endpoint}"
+        "case straight after the create: expected {ENDPOINT_CREATED}, got {endpoint}"
     );
     assert_eq!(
         endpoint.get("healthStatus").and_then(Value::as_str),
         Some(HEALTH_HEALTHY),
-        "case after the settle span: an attached endpoint is healthy, got {endpoint}"
+        "case straight after the create: an attached endpoint is healthy, got {endpoint}"
     );
     assert_eq!(
         endpoint.get("healthReasons"),
         Some(&json!([REASON_HEALTHY])),
-        "case after the settle span: wrong healthReasons, got {endpoint}"
+        "case straight after the create: wrong healthReasons, got {endpoint}"
     );
 
-    // The move is the clock's, so a read repeated after it reports the same thing.
+    std::thread::sleep(AFTER_SETTLE);
+
+    // And it stays exactly that, however long the clock runs and however often it is read:
+    // a resource handed back ready owes no later move, so no read's answer differs from the
+    // first one's.
+    let later = get_group(&router, &dataflow_id).await;
+    assert_eq!(
+        later.field("endpointsDetails"),
+        read.field("endpointsDetails"),
+        "case read again later: an attached endpoint must read the same, got {} then {}",
+        read.body,
+        later.body
+    );
     let again = get_group(&router, &dataflow_id).await;
     assert_eq!(
         again.field("endpointsDetails"),
         read.field("endpointsDetails"),
-        "case read twice after the settle span: a read must not change what the next one \
-         sees, got {} then {}",
+        "case read twice: a read must not change what the next one sees, got {} then {}",
         read.body,
         again.body
     );
@@ -767,16 +763,21 @@ async fn a_dataflow_endpoint_settles_from_creating_to_created_and_an_agent_endpo
     let read = get_group(&router, &agent_id).await;
     let endpoint = &read.field("endpointsDetails").as_array().expect("a list")[0];
     assert_eq!(
+        endpoint.get("healthStatus").and_then(Value::as_str),
+        Some(HEALTH_UNHEALTHY),
+        "case an agent endpoint with no agent: expected {HEALTH_UNHEALTHY}, got {endpoint}"
+    );
+    assert_eq!(
         endpoint.get("healthReasons"),
         Some(&json!([REASON_NO_REGISTERED_AGENT])),
-        "case an agent endpoint after the settle span: no agent has registered, got {endpoint}"
+        "case an agent endpoint with no agent: no agent has registered, got {endpoint}"
     );
     assert_eq!(
         endpoint
             .pointer("/awsGroundStationAgentEndpoint/agentStatus")
             .and_then(Value::as_str),
         Some(AGENT_INACTIVE),
-        "case an agent endpoint after the settle span: expected {AGENT_INACTIVE}, got {endpoint}"
+        "case an agent endpoint with no agent: expected {AGENT_INACTIVE}, got {endpoint}"
     );
 }
 

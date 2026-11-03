@@ -155,11 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let mut guard = state.lock();
-        // A `creating` endpoint becomes `created` at an instant the create recorded, so
-        // the move was owed at this instant whether or not anybody read: materialising it
-        // before reading changes nothing a later caller could otherwise have seen.
-        guard.settle_due_endpoints();
+        let guard = state.lock();
 
         let stored = guard
             .dataflow_endpoint_groups

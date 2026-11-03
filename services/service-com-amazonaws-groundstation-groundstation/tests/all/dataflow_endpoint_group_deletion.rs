@@ -19,8 +19,8 @@
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
-    service_state, tagged_resource_not_found_message, BAD_REQUEST_ERROR_CODE,
-    DATAFLOW_ENDPOINT_GROUP_NOT_FOUND, INVALID_REQUEST_BODY,
+    service_state, BAD_REQUEST_ERROR_CODE, DATAFLOW_ENDPOINT_GROUP_NOT_FOUND,
+    INVALID_REQUEST_BODY,
 };
 
 use crate::dataflow_endpoint_group_listing::listed_ids;
@@ -201,7 +201,7 @@ async fn a_deleted_group_is_gone_from_every_read_and_the_others_are_untouched() 
         );
         assert_eq!(
             tags_read.string("message"),
-            tagged_resource_not_found_message(&arn),
+            "Resource was not found",
             "case {label}: wrong refusal text for the deleted ARN, got {}",
             tags_read.body
         );

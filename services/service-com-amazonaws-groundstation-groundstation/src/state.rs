@@ -74,12 +74,13 @@ const CLOCK_OWED_TRANSITION_SPAN: Duration = Duration::from_secs(3);
 /// transient status and the errors it carries.
 pub const SCHEDULING_SETTLES_AFTER: Duration = CLOCK_OWED_TRANSITION_SPAN;
 
-/// `CreateDataflowEndpointGroup` admits a dataflow endpoint in `creating`; the service
-/// finishes attaching it and it becomes `created` on its own. CHOSEN span (AWS documents
-/// no duration for it — the real service takes minutes to place the stream's network
-/// interfaces): the span this emulator gives every transition it owes the clock, so a
-/// caller that goes on working after the create still observes `creating`.
-pub const ENDPOINT_CREATION_SETTLES_AFTER: Duration = CLOCK_OWED_TRANSITION_SPAN;
+// `CreateDataflowEndpointGroup` is deliberately absent from the spans above: it hands back
+// a group whose dataflow endpoints are already attached. The recorded group lifecycle reads
+// a group back after creating it and is answered `endpoint.status` `created` with
+// `healthStatus` `HEALTHY` and `healthReasons` `[HEALTHY]`, so that resource is returned
+// READY and owes the clock no move. (An AWS Ground Station Agent endpoint carries no
+// `status` of its own; the health it reports is that of the agent registered for its group,
+// derived on every read by `apply_agent_endpoint_health`.)
 
 /// `UpdateContact` appends a contact version in `UPDATING` ("the version is being applied
 /// to the contact" — `smithy_query(query="shape", shape="VersionStatus")`); the service
@@ -3022,11 +3023,10 @@ fn check_mtu(path: &str, mtu: Option<i32>) -> Result<(), InvalidParameterExcepti
     ))
 }
 
-/// The `EndpointStatus` a dataflow endpoint carries while the service is still attaching
-/// it, and the one it carries once attached (`smithy_query(query="shape",
-/// shape="EndpointStatus")` — `created`, `creating`, `deleted`, `deleting`, `failed`).
-pub const ENDPOINT_CREATING: &str = "creating";
-/// See [`ENDPOINT_CREATING`].
+/// The `EndpointStatus` a dataflow endpoint carries once the service has attached it,
+/// which is how `CreateDataflowEndpointGroup` hands it back (`smithy_query(query="shape",
+/// shape="EndpointStatus")` — `created`, `creating`, `deleted`, `deleting`, `failed`; the
+/// whole list is `crate::ops::types::ENDPOINT_STATUS_VALUES`).
 pub const ENDPOINT_CREATED: &str = "created";
 
 /// The `CapabilityHealth` values an endpoint's `healthStatus` reports
@@ -3170,9 +3170,6 @@ pub struct DataflowEndpointGroup {
     pub contact_pre_pass_duration_seconds: Option<i32>,
     pub contact_post_pass_duration_seconds: Option<i32>,
     pub tags: HashMap<String, String>,
-    /// The instant the service owes this group's dataflow endpoints their `creating` ->
-    /// `created` move; `None` once the move has been materialised.
-    pub endpoints_settle_at: Option<SystemTime>,
 }
 
 /// An AWS Ground Station Agent as `RegisterAgent` registered it, with the status its
@@ -3261,14 +3258,140 @@ pub fn agent_not_found_message(agent_id: &str) -> String {
 /// What an operation addressed at a resource by its `resourceArn` answers when that ARN
 /// names no resource of this account.
 ///
-/// Shared by every tag operation, so a read and a write of the tags of a resource that is
-/// not there answer one text. The CONTRACT is the error shape and its status —
-/// `ResourceNotFoundException`, HTTP 434 (`smithy_query(query="operation",
-/// operation="TagResource")`); AWS documents no wording for it, so this composition — the
-/// ARN the request asked about, which is the only thing these operations address a
-/// resource by — is this service's.
-pub fn tagged_resource_not_found_message(arn: &str) -> String {
-    format!("No resource found with ARN {arn}")
+/// FIXED text: the whole message, carrying NOTHING from the request. The ARN is taken only
+/// to decide that nothing matched it, which the caller already knows it sent, so a request
+/// about a resource that was deleted, about one this service never minted, and about
+/// another service's resource are all answered with this one sentence. It is the wording
+/// the model gives the shape itself — "Resource was not found."
+/// (`smithy_query(query="shape", shape="ResourceNotFoundException")`) — without the
+/// trailing stop, as the recorded refusal of a tagging call against a deleted resource's
+/// ARN states it.
+///
+/// Shared by every tag operation, so a read, an assignment and a removal of the tags of a
+/// resource that is not there answer one text.
+pub const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The wire error CODE this service's ARN-addressed tagging operations name a resource they
+/// cannot find by.
+///
+/// `TagResource`, `UntagResource` and `ListTagsForResource` each declare the modelled
+/// `ResourceNotFoundException` (`smithy_query(query="operation", operation="TagResource")`),
+/// and that shape's payload and status are what the answer carries — but the code this
+/// service's tagging plane puts on the wire (`x-amzn-errortype`, and the body's `__type`)
+/// is the shorter `NotFoundException`, which the model declares as no shape at all. The
+/// code is what an SDK resolves an error from and what a client branches on, so it is the
+/// recorded one. It belongs to the ARN-addressed tagging operations only: every operation
+/// of this service addressed by an id or a label answers the modelled code.
+pub const TAGGING_NOT_FOUND_ERROR_CODE: &str = "NotFoundException";
+
+/// The HTTP status of that refusal: the `@httpError` of the shape whose payload it carries,
+/// `ResourceNotFoundException` (`smithy_query(query="operation",
+/// operation="TagResource")`), so the code on the wire is the tagging plane's and the status
+/// stays the model's.
+pub const TAGGED_RESOURCE_NOT_FOUND_STATUS: u16 = 434;
+
+/// The body of that refusal: the modelled shape, carrying the one fixed sentence
+/// ([`TAGGED_RESOURCE_NOT_FOUND_MESSAGE`]) and nothing else — the shape declares no member
+/// beside `message`.
+pub fn tagged_resource_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(TAGGED_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
+/// The error channel of this service's ARN-addressed tagging operations: either one of the
+/// operation's own modelled errors, rendered exactly as the model declares it, or the
+/// tagging plane's own not-found refusal.
+///
+/// `TagResource`, `UntagResource` and `ListTagsForResource` are one plane, so they cannot
+/// word one condition three ways: an ARN resolving to nothing is
+/// [`TAGGING_NOT_FOUND_ERROR_CODE`] carrying `ResourceNotFoundException`'s payload at
+/// [`TAGGED_RESOURCE_NOT_FOUND_STATUS`], whichever of the three was called. Generic over the
+/// operation's modelled enum, so the mapping is written once here instead of once per
+/// operation — and so every other refusal those handlers make (an invalid tag map, an
+/// unavailable store) keeps the code, the status and the body its own model gives it.
+#[derive(Debug)]
+pub enum TaggingError<E> {
+    /// One of the operation's modelled errors.
+    Modeled(E),
+    /// "That ARN names no resource of this account" — [`tagged_resource_not_found`]'s body
+    /// under the tagging plane's own code.
+    NotFound(ResourceNotFoundException),
+}
+
+impl<E> TaggingError<E> {
+    /// The not-found refusal for a `resourceArn` naming no resource this service holds.
+    pub fn not_found() -> Self {
+        Self::NotFound(tagged_resource_not_found())
+    }
+}
+
+impl<E: ::std::fmt::Display> ::std::fmt::Display for TaggingError<E> {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Modeled(e) => write!(f, "{e}"),
+            Self::NotFound(_) => {
+                write!(
+                    f,
+                    "{TAGGING_NOT_FOUND_ERROR_CODE}: {TAGGED_RESOURCE_NOT_FOUND_MESSAGE}"
+                )
+            }
+        }
+    }
+}
+
+/// `source()` forwards to the modelled error, so its own `source()` survives the wrapper.
+impl<E: ::std::error::Error + 'static> ::std::error::Error for TaggingError<E> {
+    fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {
+        match self {
+            Self::Modeled(e) => e.source(),
+            Self::NotFound(_) => None,
+        }
+    }
+}
+
+/// Every method delegates a modelled failure to the modelled error, so wrapping the channel
+/// changes NOTHING about how those are rendered; only the plane's own refusal is answered
+/// here, and only its CODE departs from the shape it carries.
+impl<E: ::smithy_server_runtime::OperationError> ::smithy_server_runtime::OperationError
+    for TaggingError<E>
+{
+    fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
+        match self {
+            Self::Modeled(e) => e.as_serializable(),
+            Self::NotFound(e) => e,
+        }
+    }
+
+    fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
+        match self {
+            Self::Modeled(e) => e.variant_schema(),
+            Self::NotFound(_) => &crate::ops::types::SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
+        }
+    }
+
+    fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Modeled(e) => e.shape_name(),
+            Self::NotFound(_) => TAGGING_NOT_FOUND_ERROR_CODE,
+        }
+    }
+
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::Modeled(e) => e.http_status(),
+            Self::NotFound(_) => TAGGED_RESOURCE_NOT_FOUND_STATUS,
+        }
+    }
+
+    fn query_error_code(&self) -> Option<&'static str> {
+        match self {
+            // restJson1 is this service's only protocol, and the shape carries no
+            // `awsQueryError` trait to honour in any case.
+            Self::Modeled(e) => e.query_error_code(),
+            Self::NotFound(_) => None,
+        }
+    }
 }
 
 /// The `ReservationType` of the block of antenna time one of this account's contacts
@@ -5882,38 +6005,6 @@ impl ComAmazonawsGroundstationGroundstationState {
                     }
                 }
             }
-        }
-    }
-
-    /// Materialise every `creating` -> `created` endpoint move the clock has already made
-    /// due. A reporting operation calls this before reading: the move was owed at this
-    /// instant whether or not anybody called, so applying it changes nothing a later
-    /// caller could otherwise have seen.
-    ///
-    /// An endpoint that is `created` is attached, so its health is the dataplane's own:
-    /// `HEALTHY`. An AWS Ground Station Agent endpoint carries no `status` of its own and
-    /// owes no move here: the health it reports is its AGENT's, derived on every read from
-    /// the agent that carries it ([`apply_agent_endpoint_health`]).
-    pub fn settle_due_endpoints(&mut self) {
-        let now = SystemTime::now();
-        for group in self.dataflow_endpoint_groups.values_mut() {
-            let Some(due) = group.endpoints_settle_at else {
-                continue;
-            };
-            if due > now {
-                continue;
-            }
-            for details in &mut group.endpoint_details {
-                let Some(endpoint) = details.endpoint.as_mut() else {
-                    continue;
-                };
-                if endpoint.status.as_deref() == Some(ENDPOINT_CREATING) {
-                    endpoint.status = Some(ENDPOINT_CREATED.to_string());
-                    details.health_status = Some(HEALTH_HEALTHY.to_string());
-                    details.health_reasons = Some(vec![REASON_HEALTHY.to_string()]);
-                }
-            }
-            group.endpoints_settle_at = None;
         }
     }
 

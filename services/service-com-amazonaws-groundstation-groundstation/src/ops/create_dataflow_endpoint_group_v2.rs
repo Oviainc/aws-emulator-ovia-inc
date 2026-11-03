@@ -237,12 +237,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             contact_pre_pass_duration_seconds: input.contact_pre_pass_duration_seconds,
             contact_post_pass_duration_seconds: input.contact_post_pass_duration_seconds,
             tags: input.tags.unwrap_or_default(),
-            // Only a `DataflowEndpoint` carries a `status` the service moves from `creating`
-            // to `created` once it has attached the stream; an AWS Ground Station Agent
-            // endpoint carries none, its health being the health of the agent that carries
-            // it (`crate::state::apply_agent_endpoint_health`), so a group of those owes no
-            // clock-driven move at all.
-            endpoints_settle_at: None,
         };
 
         guard.arn_index.insert(

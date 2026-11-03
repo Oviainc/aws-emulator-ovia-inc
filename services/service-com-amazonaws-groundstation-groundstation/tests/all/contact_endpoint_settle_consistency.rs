@@ -14,9 +14,9 @@
 //!   read after the move fell due: `DescribeContact` and `DescribeContactVersion`, which
 //!   embed the endpoint in a contact's `dataflowList`, and `GetDataflowEndpointGroup`,
 //!   which reports the group holding it;
-//! * which kind of endpoint is stored: the dataflow endpoint the service owes a `creating`
-//!   -> `created` move, and the three AWS Ground Station Agent kinds it owes no move at all
-//!   (their health is the health of the agent registered for the group).
+//! * which kind of endpoint is stored: the dataflow endpoint, which the create hands back
+//!   already attached, and the three AWS Ground Station Agent kinds, whose health is the
+//!   health of the agent registered for their group.
 //!
 //! Every request goes through the real front door — the router, deserialization, constraint
 //! validation, the handler and serialization — on the harness `scheduling_loop.rs` stands
@@ -72,11 +72,11 @@ struct Settled {
 
 /// The settled form of an endpoint described by the `EndpointDetails` member `member`.
 ///
-/// Source: the create's own rule — a dataflow endpoint (the `endpoint` member) is admitted
-/// `creating` / `UNHEALTHY` / `INITIALIZING_DATAPLANE` and is owed the move to `created`,
-/// whose health is the dataplane's own, while an agent endpoint carries no `status` and its
-/// health is that of the agent registered for its group, so one no agent has registered for
-/// stays `UNHEALTHY` / `NO_REGISTERED_AGENT` however long the clock runs.
+/// Source: the create's own rule — a dataflow endpoint (the `endpoint` member) is handed
+/// back attached, `created` / `HEALTHY` / `HEALTHY`, whose health is the dataplane's own,
+/// while an agent endpoint carries no `status` and its health is that of the agent
+/// registered for its group, so one no agent has registered for stays `UNHEALTHY` /
+/// `NO_REGISTERED_AGENT` however long the clock runs.
 fn settled(member: &str) -> Settled {
     if member == "endpoint" {
         Settled {
@@ -288,8 +288,8 @@ async fn every_reader_of_a_stored_dataflow_endpoint_reports_the_moves_the_clock_
         }
     }
 
-    // Past the span the service owes a dataflow endpoint its `creating` -> `created` move,
-    // so every row's move has fallen due before ANY read of its store is taken.
+    // Past every span this service owes a status move, so every row's store has had any
+    // owed move fall due before ANY read of it is taken.
     std::thread::sleep(AFTER_SETTLE);
 
     for case in &cases {

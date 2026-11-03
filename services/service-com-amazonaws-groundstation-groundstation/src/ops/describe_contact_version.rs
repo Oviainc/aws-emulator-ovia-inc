@@ -169,13 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// Describe the contact `{contactId}` names AS OF the version `{versionId}` names.
     ///
     /// A REPORTING operation (`@readonly`, per `smithy_query(query="operation",
-    /// operation="DescribeContactVersion")`): it persists nothing of its own. The writes it
-    /// makes are `settle_due_contacts` and `settle_due_endpoints`, which materialise the
-    /// moves the clock already owed at this instant — a reservation's `SCHEDULING` ->
-    /// `SCHEDULED`, the steps of the pass lifecycle a contact's own window owes it, an
-    /// update's `UPDATING` -> `ACTIVE` and a dataflow endpoint's `creating` -> `created` —
-    /// each owed whether or not anybody called, so they change nothing a later caller could
-    /// otherwise have seen.
+    /// operation="DescribeContactVersion")`): it persists nothing of its own. The one write
+    /// it makes is `settle_due_contacts`, which materialises the moves the clock already
+    /// owed at this instant — a reservation's `SCHEDULING` -> `SCHEDULED`, the steps of the
+    /// pass lifecycle a contact's own window owes it, and an update's `UPDATING` ->
+    /// `ACTIVE` — each owed whether or not anybody called, so they change nothing a later
+    /// caller could otherwise have seen.
     ///
     /// What it reports splits in two. The contact-level facts — the window, the ground
     /// station, the status, the region, the mission profile and its dataflows, the tags —
@@ -215,12 +214,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // status reported for the contact and the status reported for the version are the
         // ones in force now.
         guard.settle_due_contacts();
-        // This response also embeds the dataflow endpoints the contact's dataflows are
-        // wired to (`dataflowList` below), so the moves the clock owes THOSE are
-        // materialised here too: each was owed at this instant whether or not anybody
-        // read, and applying them is what makes one stored endpoint read the same here as
-        // through the group that holds it.
-        guard.settle_due_endpoints();
 
         // The refusal above, built once so the two labels cannot drift into answering two
         // different texts for one unresolvable pair.

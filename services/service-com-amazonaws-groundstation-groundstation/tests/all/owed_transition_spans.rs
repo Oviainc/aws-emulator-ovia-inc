@@ -18,10 +18,15 @@
 //! * `UpdateContact`, which appends a version `UPDATING` and owes it `ACTIVE`;
 //! * `CancelContact` on a pass already under way, which reports `CANCELLING` and owes the
 //!   contact `CANCELLED`;
-//! * `CreateDataflowEndpointGroup`, which admits a dataflow endpoint `creating` and owes
-//!   it `created`;
 //! * `CreateEphemeris`, which admits an ephemeris `VALIDATING` and owes it the verdict its
 //!   data and request earned.
+//!
+//! `CreateDataflowEndpointGroup` is NOT in that table: the recorded group lifecycle reads
+//! a group back after creating it and is answered `endpoint.status` `created` with
+//! `healthStatus` `HEALTHY`, so a dataflow endpoint is handed back ATTACHED and owes the
+//! clock no move at all — what a read of it must report, and that no later read differs, is
+//! asserted in `crate::dataflow_endpoint_groups` and
+//! `crate::contact_endpoint_settle_consistency`.
 //!
 //! Every request goes through the real front door — the router, deserialization,
 //! constraint validation, the handler and serialization — on the harness
@@ -34,13 +39,11 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
     ACTIVE_VERSION_STATUS, CONTACT_CANCELLED, CONTACT_CANCELLING, CONTACT_PASS, CONTACT_SCHEDULED,
-    CONTACT_SCHEDULING, ENDPOINT_CREATED, ENDPOINT_CREATING, EPHEMERIS_ENABLED,
-    EPHEMERIS_VALIDATING, UPDATING_VERSION_STATUS,
+    CONTACT_SCHEDULING, EPHEMERIS_ENABLED, EPHEMERIS_VALIDATING, UPDATING_VERSION_STATUS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::contact_cancellation::put_in_status;
-use crate::dataflow_endpoint_groups::{create_group, details, endpoint_kinds, get_group};
 use crate::ephemeris_catalog::{create_ok, tle_inline, FUTURE};
 use crate::ephemeris_description::describe_ok;
 use crate::minute_usage::reserve_pass;
@@ -85,8 +88,6 @@ enum Reader {
     Contact(String),
     /// `DescribeContact`'s newest `version.status`, for the contact of this id.
     ContactVersion(String),
-    /// `GetDataflowEndpointGroup`'s one endpoint's `endpoint.status`, for this group id.
-    Endpoint(String),
     /// `DescribeEphemeris`'s `status`, for the ephemeris of this id.
     Ephemeris(String),
 }
@@ -129,30 +130,6 @@ async fn observed(router: &MultiServiceRouter, row: &Started) -> String {
                 .unwrap_or_default()
                 .to_string()
         }
-        Reader::Endpoint(group_id) => {
-            let read = get_group(router, group_id).await;
-            assert_eq!(
-                read.status, 200,
-                "case {}: GetDataflowEndpointGroup expected 200, got {} {}",
-                row.case, read.status, read.body
-            );
-            let endpoints = read
-                .field("endpointsDetails")
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let endpoint = endpoints.first().unwrap_or_else(|| {
-                panic!(
-                    "case {}: the group must report the endpoint it was created with, got {}",
-                    row.case, read.body
-                )
-            });
-            endpoint
-                .pointer("/endpoint/status")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        }
         Reader::Ephemeris(ephemeris_id) => {
             let body = describe_ok(router, row.case, ephemeris_id).await;
             body.get("status")
@@ -172,18 +149,6 @@ fn ephemeris_body(name: &str) -> Value {
         "expirationTime": FUTURE,
         "ephemeris": tle_inline(&[(1_800_000_000, 1_800_086_400)]),
     })
-}
-
-/// The request that creates a group holding one dataflow endpoint — the endpoint kind this
-/// service owes a `creating` -> `created` move, from the endpoint-kind table of
-/// `dataflow_endpoint_groups.rs` rather than a second copy of it.
-fn dataflow_group_body() -> Value {
-    let kinds = endpoint_kinds();
-    let dataflow = kinds
-        .iter()
-        .find(|kind| kind.member == "endpoint")
-        .expect("the dataflow-endpoint row of the endpoint-kind table");
-    json!({"endpointDetails": [details(dataflow.member, &dataflow.body, true)]})
 }
 
 #[tokio::test]
@@ -263,20 +228,6 @@ async fn every_transition_this_service_owes_outlasts_the_calls_the_caller_makes_
         reader: Reader::Contact(to_stop.clone()),
         transient: CONTACT_CANCELLING,
         settled: CONTACT_CANCELLED,
-        at: Instant::now(),
-    });
-
-    let group = create_group(&router, dataflow_group_body()).await;
-    assert_eq!(
-        group.status, 200,
-        "CreateDataflowEndpointGroup expected 200, got {} {}",
-        group.status, group.body
-    );
-    started.push(Started {
-        case: "a dataflow endpoint the service owes created",
-        reader: Reader::Endpoint(group.string("dataflowEndpointGroupId")),
-        transient: ENDPOINT_CREATING,
-        settled: ENDPOINT_CREATED,
         at: Instant::now(),
     });
 
@@ -366,33 +317,17 @@ async fn every_transition_this_service_owes_outlasts_the_calls_the_caller_makes_
 async fn a_transition_is_owed_from_its_own_call_so_a_resource_created_later_is_still_transient() {
     let (router, _engine) = harness_with_engine();
 
-    // Two kinds of resource, so the rule is asserted over more than one transition: each
-    // pair's first member is created now and its second once the first has settled.
+    // Two resources of the same kind, so the rule is asserted on the one dimension it is
+    // about: the first is created now and the second once the first has settled.
     let first_ephemeris = create_ok(&router, "the first ephemeris", ephemeris_body("first")).await;
-    let first_group = create_group(&router, dataflow_group_body()).await;
-    assert_eq!(
-        first_group.status, 200,
-        "CreateDataflowEndpointGroup expected 200, got {} {}",
-        first_group.status, first_group.body
-    );
-    let first_group_id = first_group.string("dataflowEndpointGroupId");
 
-    let first_rows = vec![
-        Started {
-            case: "the first ephemeris",
-            reader: Reader::Ephemeris(first_ephemeris),
-            transient: EPHEMERIS_VALIDATING,
-            settled: EPHEMERIS_ENABLED,
-            at: Instant::now(),
-        },
-        Started {
-            case: "the first group's dataflow endpoint",
-            reader: Reader::Endpoint(first_group_id),
-            transient: ENDPOINT_CREATING,
-            settled: ENDPOINT_CREATED,
-            at: Instant::now(),
-        },
-    ];
+    let first_rows = vec![Started {
+        case: "the first ephemeris",
+        reader: Reader::Ephemeris(first_ephemeris),
+        transient: EPHEMERIS_VALIDATING,
+        settled: EPHEMERIS_ENABLED,
+        at: Instant::now(),
+    }];
 
     // Wait each one out through the front door rather than by a fixed sleep, so this suite
     // asserts the per-call rule and not a span it hard-codes.
@@ -422,30 +357,14 @@ async fn a_transition_is_owed_from_its_own_call_so_a_resource_created_later_is_s
     // even though a resource of the same kind created earlier has already settled.
     let second_ephemeris =
         create_ok(&router, "the second ephemeris", ephemeris_body("second")).await;
-    let second_group = create_group(&router, dataflow_group_body()).await;
-    assert_eq!(
-        second_group.status, 200,
-        "CreateDataflowEndpointGroup expected 200, got {} {}",
-        second_group.status, second_group.body
-    );
-    let second_group_id = second_group.string("dataflowEndpointGroupId");
 
-    let second_rows = vec![
-        Started {
-            case: "the second ephemeris",
-            reader: Reader::Ephemeris(second_ephemeris),
-            transient: EPHEMERIS_VALIDATING,
-            settled: EPHEMERIS_ENABLED,
-            at: Instant::now(),
-        },
-        Started {
-            case: "the second group's dataflow endpoint",
-            reader: Reader::Endpoint(second_group_id),
-            transient: ENDPOINT_CREATING,
-            settled: ENDPOINT_CREATED,
-            at: Instant::now(),
-        },
-    ];
+    let second_rows = vec![Started {
+        case: "the second ephemeris",
+        reader: Reader::Ephemeris(second_ephemeris),
+        transient: EPHEMERIS_VALIDATING,
+        settled: EPHEMERIS_ENABLED,
+        at: Instant::now(),
+    }];
 
     for row in &second_rows {
         let now = observed(&router, row).await;

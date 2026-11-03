@@ -8,8 +8,11 @@
 //! key it does hold is overwritten with the value this request carries, and every key the
 //! request does not name is left exactly as it was — and that ONE map is what
 //! `ListTagsForResource` and the resource's own read report. An ARN that resolves to no
-//! resource of this account is refused by both operations with
-//! `ResourceNotFoundException` (HTTP 434), and nothing is written.
+//! resource of this account is refused by both operations with the tagging plane's own
+//! not-found refusal — the code `NotFoundException`, HTTP 434 and one fixed sentence — and
+//! nothing is written. [`crate::tagging_not_found_refusal`] asserts that refusal over its
+//! own table of ARNs that resolve to nothing, across all three operations of the plane;
+//! what the suite below adds is that it persists nothing.
 //!
 //! Each suite asserts that rule over a TABLE rather than one recorded call: every taggable
 //! resource this service hands out (a config of each of the eight capability types, a
@@ -691,14 +694,14 @@ async fn an_arn_that_names_no_resource_is_refused_by_both_tag_operations() {
         );
         assert_eq!(
             tagged.error_code(),
-            "ResourceNotFoundException",
-            "case {case}: TagResource must answer ResourceNotFoundException, got {}",
+            "NotFoundException",
+            "case {case}: TagResource must answer NotFoundException, got {}",
             tagged.error_code()
         );
         let message = tagged.field("message").as_str().unwrap_or_default();
-        assert!(
-            message.contains(&arn),
-            "case {case}: the refusal must name the ARN it was asked about, got {message:?}"
+        assert_eq!(
+            message, "Resource was not found",
+            "case {case}: the refusal states one fixed sentence, got {message:?}"
         );
 
         let listed = list_tags(&router, &arn).await;
@@ -709,8 +712,8 @@ async fn an_arn_that_names_no_resource_is_refused_by_both_tag_operations() {
         );
         assert_eq!(
             listed.error_code(),
-            "ResourceNotFoundException",
-            "case {case}: ListTagsForResource must answer ResourceNotFoundException, got {}",
+            "NotFoundException",
+            "case {case}: ListTagsForResource must answer NotFoundException, got {}",
             listed.error_code()
         );
     }

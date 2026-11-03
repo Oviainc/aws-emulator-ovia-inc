@@ -151,5 +151,7 @@ mod state_roundtrip;
 mod tag_removal;
 #[path = "all/tag_rules.rs"]
 mod tag_rules;
+#[path = "all/tagging_not_found_refusal.rs"]
+mod tagging_not_found_refusal;
 #[path = "all/uplink_echo_reference_rule.rs"]
 mod uplink_echo_reference_rule;

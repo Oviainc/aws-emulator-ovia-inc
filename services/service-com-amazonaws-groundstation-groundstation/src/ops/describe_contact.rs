@@ -181,12 +181,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lifecycle its own window owes it — so the reported status is the one in force
         // now.
         guard.settle_due_contacts();
-        // This response also embeds the dataflow endpoints the contact's dataflows are
-        // wired to (`dataflow_list` below), so the moves the clock owes THOSE are
-        // materialised here too: each was owed at this instant whether or not anybody
-        // read, and applying them is what makes one stored endpoint read the same here as
-        // through the group that holds it.
-        guard.settle_due_endpoints();
         let contact = guard.contacts.get(&input.contact_id).ok_or_else(|| {
             DescribeContactErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 // This service's `DescribeContact` text is a fixed literal: it does not

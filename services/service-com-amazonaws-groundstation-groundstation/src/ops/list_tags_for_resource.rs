@@ -10,7 +10,8 @@
 //! A read: it resolves the ARN through `crate::state`'s one ARN index
 //! ([`crate::state::ComAmazonawsGroundstationGroundstationState::tags_of`]) and writes
 //! nothing. An ARN this service never minted, or one whose resource has been deleted, is
-//! `ResourceNotFoundException` (HTTP 434).
+//! the tagging plane's own not-found refusal ([`crate::state::TaggingError::not_found`]),
+//! the one `TagResource` and `UntagResource` answer.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +82,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-groundstation-groundsta
 // here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
+//
+// The `ResourceNotFoundException` variant is NOT what this handler answers for an ARN that
+// resolves to nothing: that condition goes through `crate::state::TaggingError::not_found`,
+// which carries this shape's payload and status under the tagging plane's own wire code.
 #[smithy_macros::operation_error("com.amazonaws.groundstation#ListTagsForResource")]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
@@ -90,17 +95,17 @@ pub enum ListTagsForResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type ListTagsForResourceError = crate::scaffolded::Scaffolded<ListTagsForResourceErrorModeled>;
+/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`): the shared
+/// tagging-plane channel, the one its two siblings declare, so the not-found refusal of an
+/// ARN resolving to nothing is worded once for the three of them. See
+/// [`crate::state::TaggingError`].
+pub type ListTagsForResourceError = crate::state::TaggingError<ListTagsForResourceErrorModeled>;
 
-/// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
-/// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// Lets `?` and `.into()` lift a modeled failure into the error channel, so the handler
+/// writes `Err(SomeModeledError.into())` rather than naming the wrapper variant.
 impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     fn from(modeled: ListTagsForResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        crate::state::TaggingError::Modeled(modeled)
     }
 }
 
@@ -150,13 +155,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@readonly`: this reports the stored map and writes nothing, so a later caller
         // sees exactly what it would have seen had nobody listed the tags.
         let guard = state.lock();
-        let tags = guard.tags_of(&input.resource_arn).ok_or_else(|| {
-            ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::tagged_resource_not_found_message(
-                    &input.resource_arn,
-                )),
-            })
-        })?;
+        let tags = guard
+            .tags_of(&input.resource_arn)
+            .ok_or_else(ListTagsForResourceError::not_found)?;
 
         Ok(ListTagsForResourceOutput {
             tags: crate::state::response_tags(tags),

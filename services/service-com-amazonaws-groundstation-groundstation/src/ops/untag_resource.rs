@@ -14,7 +14,9 @@
 //! so the resolution is `crate::state`'s one ARN index
 //! ([`crate::state::ComAmazonawsGroundstationGroundstationState::tags_mut`]) — the same
 //! index `TagResource` writes through; an ARN this service never minted, or one whose
-//! resource has been deleted, is `ResourceNotFoundException` (HTTP 434).
+//! resource has been deleted, is the tagging plane's own not-found refusal
+//! ([`crate::state::TaggingError::not_found`]), the one `TagResource` and
+//! `ListTagsForResource` answer.
 //!
 //! The keys themselves are held to the half of AWS's platform-wide tagging rules that
 //! decides which keys are a caller's at all ([`crate::state::validate_tag_keys`]), judged
@@ -87,6 +89,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-groundstation-groundsta
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
+//
+// The `ResourceNotFoundException` variant is NOT what this handler answers for an ARN that
+// resolves to nothing: that condition goes through `crate::state::TaggingError::not_found`,
+// which carries this shape's payload and status under the tagging plane's own wire code.
 #[smithy_macros::operation_error("com.amazonaws.groundstation#UntagResource")]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
@@ -96,17 +102,16 @@ pub enum UntagResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::untag_resource::UntagResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type UntagResourceError = crate::scaffolded::Scaffolded<UntagResourceErrorModeled>;
+/// (`crate::ops::untag_resource::UntagResourceError`): the shared tagging-plane channel,
+/// the one its two siblings declare, so the not-found refusal of an ARN resolving to
+/// nothing is worded once for the three of them. See [`crate::state::TaggingError`].
+pub type UntagResourceError = crate::state::TaggingError<UntagResourceErrorModeled>;
 
-/// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
-/// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// Lets `?` and `.into()` lift a modeled failure into the error channel, so the handler
+/// writes `Err(SomeModeledError.into())` rather than naming the wrapper variant.
 impl From<UntagResourceErrorModeled> for UntagResourceError {
     fn from(modeled: UntagResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        crate::state::TaggingError::Modeled(modeled)
     }
 }
 
@@ -163,13 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One lock for the lookup AND the removal, so the whole read-modify-write of the
         // resource's tag map is atomic: a concurrent write of other keys is not lost.
         let mut guard = state.lock();
-        let tags = guard.tags_mut(&input.resource_arn).ok_or_else(|| {
-            UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::tagged_resource_not_found_message(
-                    &input.resource_arn,
-                )),
-            })
-        })?;
+        let tags = guard
+            .tags_mut(&input.resource_arn)
+            .ok_or_else(UntagResourceError::not_found)?;
 
         // Drop exactly the named keys, in one pass over the stored map however many keys
         // the request names — the named keys go into a set first, which is also why a key

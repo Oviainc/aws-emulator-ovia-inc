@@ -9,7 +9,9 @@
 //! failure (the operation is `@idempotent`, so naming a key twice, or removing it twice,
 //! leaves the same map as removing it once), and the map that is left is the ONE map
 //! `ListTagsForResource` and the resource's own read report. An ARN that resolves to no
-//! resource of this account is refused with `ResourceNotFoundException` (HTTP 434), a list
+//! resource of this account is refused with the tagging plane's own not-found refusal — the
+//! code `NotFoundException`, HTTP 434 and one fixed sentence
+//! ([`crate::tagging_not_found_refusal`] asserts it across the whole plane) — a list
 //! naming a key AWS's tagging rules do not let a caller hold is refused with
 //! `InvalidParameterException` (HTTP 431) naming the `tagKeys` member, and neither
 //! refusal removes anything.
@@ -72,7 +74,12 @@ fn encode_query_value(value: &str) -> String {
 ///
 /// `tagKeys` is bound to `@httpQuery("tagKeys")` (`smithy_query(query="operation",
 /// operation="UntagResource")`), so every key travels as its own query pair.
-async fn untag_resource(router: &MultiServiceRouter, arn: &str, keys: &[&str]) -> Reply {
+/// `DELETE /tags/{resourceArn}?tagKeys=..&tagKeys=..` — `UntagResource`.
+///
+/// `pub(crate)` so a suite asserting the not-found refusal of the tagging plane across all
+/// three of its operations ([`crate::tagging_not_found_refusal`]) reaches the removal
+/// through this one helper rather than building a second copy of it.
+pub(crate) async fn untag_resource(router: &MultiServiceRouter, arn: &str, keys: &[&str]) -> Reply {
     let query: Vec<String> = keys
         .iter()
         .map(|key| format!("tagKeys={}", encode_query_value(key)))
@@ -378,14 +385,14 @@ async fn an_arn_that_names_no_resource_is_refused_by_the_removal() {
         );
         assert_eq!(
             refused.error_code(),
-            "ResourceNotFoundException",
-            "case {case}: UntagResource must answer ResourceNotFoundException, got {}",
+            "NotFoundException",
+            "case {case}: UntagResource must answer NotFoundException, got {}",
             refused.error_code()
         );
         let message = refused.field("message").as_str().unwrap_or_default();
-        assert!(
-            message.contains(&arn),
-            "case {case}: the refusal must name the ARN it was asked about, got {message:?}"
+        assert_eq!(
+            message, "Resource was not found",
+            "case {case}: the refusal states one fixed sentence, got {message:?}"
         );
     }
 
