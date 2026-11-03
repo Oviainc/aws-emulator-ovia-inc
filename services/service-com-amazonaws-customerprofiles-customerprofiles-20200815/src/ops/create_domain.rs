@@ -241,25 +241,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::Domain::new(input.domain_name, input.default_expiration_days, now);
         domain.default_encryption_key = input.default_encryption_key;
         domain.dead_letter_queue_url = input.dead_letter_queue_url;
-        domain.matching = input.matching.map(|matching| MatchingResponse {
-            enabled: Some(matching.enabled),
-            job_schedule: matching.job_schedule,
-            auto_merging: matching.auto_merging,
-            exporting_config: matching.exporting_config,
-        });
+        // The same request-to-stored conversion `UpdateDomain` applies, so a
+        // configuration reads back the same whichever call submitted it.
+        domain.matching = input.matching.map(crate::state::matching_response);
         domain.rule_based_matching =
-            input.rule_based_matching.map(|rule_based| RuleBasedMatchingResponse {
-                enabled: Some(rule_based.enabled),
-                matching_rules: rule_based.matching_rules,
-                // Resolved from the clock on every read, never stored.
-                status: None,
-                max_allowed_rule_level_for_merging: rule_based.max_allowed_rule_level_for_merging,
-                max_allowed_rule_level_for_matching: rule_based
-                    .max_allowed_rule_level_for_matching,
-                attribute_types_selector: rule_based.attribute_types_selector,
-                conflict_resolution: rule_based.conflict_resolution,
-                exporting_config: rule_based.exporting_config,
-            });
+            input.rule_based_matching.map(crate::state::rule_based_matching_response);
         domain.data_store_enabled = input.data_store.and_then(|data_store| data_store.enabled);
         domain.tags = input.tags;
 

@@ -29,5 +29,7 @@ mod profile_object_types;
 mod recommender_schemas;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_domain.rs"]
+mod update_domain;
 #[path = "all/upload_jobs.rs"]
 mod upload_jobs;

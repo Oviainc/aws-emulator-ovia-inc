@@ -149,7 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.domains.remove(&input.domain_name).ok_or_else(|| {
             DeleteDomainError::from(DeleteDomainErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("The domain {} does not exist", input.domain_name)),
+                    message: Some(crate::state::domain_not_found(&input.domain_name)),
                 },
             ))
         })?;

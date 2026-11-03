@@ -482,7 +482,9 @@ async fn an_absent_domain_or_schema_is_reported_absent() {
             "case {case:?}: expected ResourceNotFoundException, got {:?}",
             error_code(&body)
         );
-        let expected = format!("The domain {domain} does not exist");
+        // The wording the service answers an absent domain with, shared by every
+        // domain-scoped operation (`crate::state::domain_not_found`).
+        let expected = format!("Domain {domain} is not found");
         assert_eq!(
             error_message(&body),
             expected,

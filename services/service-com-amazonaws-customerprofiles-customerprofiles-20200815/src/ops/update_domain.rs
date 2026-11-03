@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the stored configuration of an existing domain: every member the request
+//! carries is written to the domain's record, every member it omits is left as it was,
+//! and the answer is read back off that record.
 //!
 //! ## Shape of an operation
 //!
@@ -205,18 +199,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDomain"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // One reading of the clock: `LastUpdatedAt` and any asynchronous work this call
+        // starts are timed from the same instant.
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // This operation updates an EXISTING domain — the name cannot be changed after a
+        // domain is created, and no name creates one here — so a name the store does not
+        // hold is `ResourceNotFoundException`, worded as every domain-scoped operation
+        // words it, with the name taken from the request.
+        let domain = store.domains.get_mut(&input.domain_name).ok_or_else(|| {
+            UpdateDomainError::from(UpdateDomainErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::domain_not_found(&input.domain_name)),
+                },
+            ))
+        })?;
+
+        // Only the members the request carries are written: an absent member leaves the
+        // stored value exactly as it was, so updating one setting cannot clear another.
+        if let Some(days) = input.default_expiration_days {
+            domain.default_expiration_days = days;
+        }
+        // These two members clear the stored value when they arrive as an empty string
+        // ("If specified as an empty string, it will clear any existing value") and
+        // replace it with any other value.
+        if let Some(encryption_key) = input.default_encryption_key {
+            domain.default_encryption_key = crate::state::clear_if_empty(encryption_key);
+        }
+        if let Some(queue_url) = input.dead_letter_queue_url {
+            domain.dead_letter_queue_url = crate::state::clear_if_empty(queue_url);
+        }
+        if let Some(matching) = input.matching {
+            domain.matching = Some(crate::state::matching_response(matching));
+        }
+
+        // A rule-based matching configuration or a data store the request turns ON is
+        // asynchronous work: the matching rule has to be built, the store prepared. Each
+        // has its own span, started here, so the clock-derived `Status` and `Readiness`
+        // beside the configuration this call submitted start over — a caller reading the
+        // domain back straight away still sees the transient state this answer reports —
+        // while the other one, which this call did not touch, keeps the state it had.
+        if let Some(rule_based) = input.rule_based_matching {
+            if rule_based.enabled {
+                domain.rule_based_matching_work = crate::state::AsyncWork::started(now);
+            }
+            domain.rule_based_matching =
+                Some(crate::state::rule_based_matching_response(rule_based));
+        }
+        if let Some(data_store) = input.data_store {
+            if data_store.enabled == Some(true) {
+                domain.data_store_work = crate::state::AsyncWork::started(now);
+            }
+            domain.data_store_enabled = data_store.enabled;
+        }
+
+        // The tags the request carries are this resource's tags from here on; a request
+        // that carries none leaves the ones already on the domain alone.
+        if let Some(tags) = input.tags {
+            domain.tags = Some(tags);
+        }
+
+        // The domain's own configuration changed, so `LastUpdatedAt` is this call's
+        // instant. `CreatedAt` was generated once, by the create, and never moves.
+        domain.last_updated_at = now;
+
+        // Answer from the stored record, so the response cannot differ from what a later
+        // `GetDomain` reads.
+        Ok(UpdateDomainOutput {
+            domain_name: domain.name.clone(),
+            default_expiration_days: Some(domain.default_expiration_days),
+            default_encryption_key: domain.default_encryption_key.clone(),
+            dead_letter_queue_url: domain.dead_letter_queue_url.clone(),
+            matching: domain.matching_response(),
+            rule_based_matching: domain.rule_based_matching_response(now),
+            data_store: domain.data_store_response(now),
+            created_at: crate::state::to_date_time(domain.created_at),
+            last_updated_at: crate::state::to_date_time(domain.last_updated_at),
+            tags: domain.tags.clone(),
+        })
     }
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> UpdateDomainError {
+    UpdateDomainErrorModeled::InternalServerException(crate::state::store_unavailable()).into()
 }

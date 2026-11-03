@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let domain = store.domains.get_mut(&input.domain_name).ok_or_else(|| {
-            not_found(format!("The domain {} does not exist", input.domain_name))
+            not_found(crate::state::domain_not_found(&input.domain_name))
         })?;
 
         // Every profile the merge names, main profile first. An id that appears twice —

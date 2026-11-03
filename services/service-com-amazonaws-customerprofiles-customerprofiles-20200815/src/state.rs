@@ -18,13 +18,13 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AttributeDetails, Conditions, CreateCalculatedAttributeDefinitionInput, DataStoreResponse,
-    Filter, MatchingResponse, ObjectTypeField, ObjectTypeKey, Profile, Readiness,
-    RecommenderSchemaField, ResultsSummary, RuleBasedMatchingResponse,
+    Filter, MatchingRequest, MatchingResponse, ObjectTypeField, ObjectTypeKey, Profile, Readiness,
+    RecommenderSchemaField, ResultsSummary, RuleBasedMatchingRequest, RuleBasedMatchingResponse,
 };
 
-/// How long after `CreateDomain` the asynchronous work a new domain kicks off is treated
-/// as finished: the rule-based matching rule reaches `ACTIVE`, and an enabled data store
-/// reaches 100% readiness.
+/// How long after the call that configures it the asynchronous work a domain kicks off
+/// is treated as finished: the rule-based matching rule reaches `ACTIVE`, and an enabled
+/// data store reaches 100% readiness.
 ///
 /// AWS does not document a duration for either, so this is a CHOSEN span. It is
 /// deliberately non-zero: a caller that reads the domain back immediately must still
@@ -190,6 +190,39 @@ pub struct ComAmazonawsCustomerprofilesCustomerprofiles20200815State {
     pub domains: BTreeMap<String, Domain>,
 }
 
+/// One span of asynchronous work the clock owes a resource: when the call that started
+/// it ran, and when it falls due. Stored as instants so no handler ever sleeps for one,
+/// and held per piece of work, so one resource reaching its terminal state is independent
+/// of another's.
+#[derive(Debug, Clone, Copy)]
+pub struct AsyncWork {
+    /// The instant the call that started this work ran.
+    pub started_at: SystemTime,
+    /// The instant it falls due, one [`ASYNC_WORK_SPAN`] later.
+    pub due_at: SystemTime,
+}
+
+impl AsyncWork {
+    /// Work started by a call made at `now`.
+    pub fn started(now: SystemTime) -> Self {
+        Self {
+            started_at: now,
+            due_at: now + ASYNC_WORK_SPAN,
+        }
+    }
+
+    /// Whether this work is due as of `now`.
+    pub fn is_due(&self, now: SystemTime) -> bool {
+        now >= self.due_at
+    }
+
+    /// How far through its span this work is, as a percentage in 0..=100 (the range
+    /// `Readiness$ProgressPercentage` declares).
+    pub fn progress_percentage(&self, now: SystemTime) -> i32 {
+        progress_percentage(self.started_at, self.due_at, now)
+    }
+}
+
 /// One stored domain: the configuration `CreateDomain` persisted, the timestamps it
 /// generated, and the customer data nested under it.
 #[derive(Debug, Clone)]
@@ -219,9 +252,13 @@ pub struct Domain {
     /// `LastUpdatedAt`: the last time the DOMAIN's own configuration changed. Writing a
     /// profile is not an edit of the domain, so it does not move this.
     pub last_updated_at: SystemTime,
-    /// When the work [`ASYNC_WORK_SPAN`] covers falls due. Stored as an instant so no
-    /// handler ever sleeps for it.
-    pub ready_at: SystemTime,
+    /// The span the rule-based matching rule takes to build, as started by the call that
+    /// configured it. Its own span, so a status that has reached `ACTIVE` does not
+    /// regress because an unrelated member of the same domain was configured.
+    pub rule_based_matching_work: AsyncWork,
+    /// The span the data store takes to prepare, as started by the call that enabled it.
+    /// Its own span, for the same reason.
+    pub data_store_work: AsyncWork,
     /// The domain's profiles, keyed by `ProfileId`.
     pub profiles: BTreeMap<String, StoredProfile>,
     /// The domain's profile object types, keyed by `ObjectTypeName` — the name is the
@@ -530,7 +567,8 @@ impl Domain {
             tags: None,
             created_at: now,
             last_updated_at: now,
-            ready_at: now + ASYNC_WORK_SPAN,
+            rule_based_matching_work: AsyncWork::started(now),
+            data_store_work: AsyncWork::started(now),
             profiles: BTreeMap::new(),
             object_types: BTreeMap::new(),
             upload_jobs: BTreeMap::new(),
@@ -549,17 +587,6 @@ impl Domain {
         self.object_types.contains_key(dataset_type)
     }
 
-    /// Whether the work [`ASYNC_WORK_SPAN`] covers is due as of `now`.
-    pub fn is_ready(&self, now: SystemTime) -> bool {
-        now >= self.ready_at
-    }
-
-    /// How far through [`ASYNC_WORK_SPAN`] this domain is, as a percentage in 0..=100
-    /// (the range `Readiness$ProgressPercentage` declares).
-    pub fn progress_percentage(&self, now: SystemTime) -> i32 {
-        progress_percentage(self.created_at, self.ready_at, now)
-    }
-
     /// `Matching` as the wire reports it.
     pub fn matching_response(&self) -> Option<MatchingResponse> {
         self.matching.clone()
@@ -574,7 +601,7 @@ impl Domain {
     ) -> Option<RuleBasedMatchingResponse> {
         let mut response = self.rule_based_matching.clone()?;
         response.status = (response.enabled == Some(true)).then(|| {
-            if self.is_ready(now) {
+            if self.rule_based_matching_work.is_due(now) {
                 RULE_BASED_MATCHING_ACTIVE.to_string()
             } else {
                 RULE_BASED_MATCHING_IN_PROGRESS.to_string()
@@ -588,9 +615,9 @@ impl Domain {
     pub fn data_store_response(&self, now: SystemTime) -> Option<DataStoreResponse> {
         let enabled = self.data_store_enabled?;
         let readiness = enabled.then(|| Readiness {
-            progress_percentage: Some(self.progress_percentage(now)),
+            progress_percentage: Some(self.data_store_work.progress_percentage(now)),
             message: Some(
-                if self.is_ready(now) {
+                if self.data_store_work.is_due(now) {
                     "The data store is ready."
                 } else {
                     "The data store is being prepared."
@@ -862,11 +889,48 @@ pub fn object_type_not_found(object_type_name: &str) -> String {
     format!("ObjectType {object_type_name} not found")
 }
 
+/// The matching configuration a request carries, as the domain stores and reports it.
+/// `MatchingResponse` has no clock-derived member, so the stored value is the whole
+/// answer. Shared by the operations that configure a domain, so a configuration reads
+/// back the same however it was submitted.
+pub fn matching_response(request: MatchingRequest) -> MatchingResponse {
+    MatchingResponse {
+        enabled: Some(request.enabled),
+        job_schedule: request.job_schedule,
+        auto_merging: request.auto_merging,
+        exporting_config: request.exporting_config,
+    }
+}
+
+/// The rule-based matching configuration a request carries, as the domain stores it:
+/// `Status` is left unset because it is a function of the clock and is resolved on every
+/// read by [`Domain::rule_based_matching_response`]. Shared by the operations that
+/// configure a domain, so a configuration reads back the same however it was submitted.
+pub fn rule_based_matching_response(request: RuleBasedMatchingRequest) -> RuleBasedMatchingResponse {
+    RuleBasedMatchingResponse {
+        enabled: Some(request.enabled),
+        matching_rules: request.matching_rules,
+        status: None,
+        max_allowed_rule_level_for_merging: request.max_allowed_rule_level_for_merging,
+        max_allowed_rule_level_for_matching: request.max_allowed_rule_level_for_matching,
+        attribute_types_selector: request.attribute_types_selector,
+        conflict_resolution: request.conflict_resolution,
+        exporting_config: request.exporting_config,
+    }
+}
+
+/// A member documented to clear the stored value when it arrives as an empty string:
+/// anything else replaces it.
+pub fn clear_if_empty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
 /// The `ResourceNotFoundException` message for a domain this emulator does not hold, as
-/// every domain-scoped operation words that refusal: the resource kind and the name the
-/// request carried.
+/// the service words that refusal: the resource kind and the name the request carried.
+/// Every domain-scoped operation answers with this, so the same absent name reads the
+/// same whichever of them was called.
 pub fn domain_not_found(domain_name: &str) -> String {
-    format!("The domain {domain_name} does not exist")
+    format!("Domain {domain_name} is not found")
 }
 
 /// The `ResourceNotFoundException` message for a recommender schema a domain does not

@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: it answers out of the stored definition and writes nothing.
         let store = state.lock();
         let domain = store.domains.get(&input.domain_name).ok_or_else(|| {
-            not_found(format!("The domain {} does not exist", input.domain_name))
+            not_found(crate::state::domain_not_found(&input.domain_name))
         })?;
         let stored = domain
             .object_types
