@@ -243,9 +243,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(name) = state.resolve_matchmaking_configuration_name(&input.name) else {
             return Err(
                 UpdateMatchmakingConfigurationErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "The matchmaking configuration {} was not found.",
-                        input.name
+                    message: Some(crate::state::matchmaking_configuration_not_found_message(
+                        &input.name,
                     )),
                 })
                 .into(),

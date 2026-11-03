@@ -41,6 +41,8 @@ mod matchmaking_backfill_mode;
 mod matchmaking_rule_set_persistence;
 #[path = "all/refusal_message_wording.rs"]
 mod refusal_message_wording;
+#[path = "all/resource_deletion.rs"]
+mod resource_deletion;
 #[path = "all/resource_updates.rs"]
 mod resource_updates;
 #[path = "all/script_content_revisions.rs"]

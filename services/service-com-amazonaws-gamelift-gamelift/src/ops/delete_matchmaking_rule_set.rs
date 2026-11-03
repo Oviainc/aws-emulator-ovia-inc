@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMatchmakingRuleSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMatchmakingRuleSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMatchmakingRuleSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored FlexMatch rule set the request names — "to delete the rule set,
+//! provide the rule set name" — selected by rule set name or by ARN, unless a matchmaking
+//! configuration is still using it.
 //!
 //! ## Shape of an operation
 //!
@@ -150,20 +145,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMatchmakingRuleSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMatchmakingRuleSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMatchmakingRuleSet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteMatchmakingRuleSetErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the GameLift emulator state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        state.tick(::std::time::SystemTime::now());
+
+        // "To delete the rule set, provide the rule set name" — as the rule set's name or as
+        // its ARN, the two forms the modelled `MatchmakingRuleSetName` accepts for the one
+        // resource. A name that resolves to no stored rule set is the modelled
+        // `NotFoundException` ("the resource was either not created yet or deleted"),
+        // carrying the one text this service's rule-set lookup failure reads as, and nothing
+        // is removed.
+        let Some(name) = state.resolve_rule_set_name(&input.name) else {
+            return Err(
+                DeleteMatchmakingRuleSetErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::matchmaking_rule_set_not_found_message(
+                        &input.name,
+                    )),
+                })
+                .into(),
+            );
+        };
+
+        // "Rule sets cannot be deleted if they are currently being used by a matchmaking
+        // configuration": a configuration "can only use rule sets that are defined in the
+        // same Region", so removing the record would leave that matchmaker pointing at rules
+        // nothing holds. The parameter names a resource that cannot be deleted YET, which is
+        // the modelled `InvalidRequestException` ("one or more parameter values in the
+        // request are invalid"), and the rule set is left exactly as it was.
+        let used_by = state
+            .matchmaking_configurations
+            .values()
+            .filter(|configuration| configuration.rule_set_name == name)
+            .count();
+        if used_by > 0 {
+            return Err(
+                DeleteMatchmakingRuleSetErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "Rule set {name} is being used by {used_by} matchmaking \
+                             configurations and cannot be deleted."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The whole record goes — its name, the ARN minted for it, the rule set body it was
+        // created with and the tags assigned to the resource — so the name stops resolving,
+        // a configuration can no longer be created against it, and the account's rule set
+        // collection is one rule set shorter.
+        state.matchmaking_rule_sets.remove(&name);
+
+        Ok(DeleteMatchmakingRuleSetOutput {})
     }
 }

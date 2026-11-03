@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMatchmakingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMatchmakingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMatchmakingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored FlexMatch matchmaking configuration the request names — "permanently
+//! removes a FlexMatch matchmaking configuration[; to] delete, specify the configuration
+//! name" — selected by configuration name or by ARN, unless an active matchmaking ticket is
+//! still using it.
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +145,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMatchmakingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMatchmakingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMatchmakingConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteMatchmakingConfigurationErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the GameLift emulator state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        state.tick(::std::time::SystemTime::now());
+
+        // "To delete, specify the configuration name" — as the configuration's name or as
+        // its ARN, the two forms the modelled `MatchmakingConfigurationName` accepts for the
+        // one resource. A name that resolves to no stored configuration is the modelled
+        // `NotFoundException` ("the resource was either not created yet or deleted"), the
+        // same refusal `UpdateMatchmakingConfiguration` answers it with, and nothing is
+        // removed.
+        let Some(name) = state.resolve_matchmaking_configuration_name(&input.name) else {
+            return Err(
+                DeleteMatchmakingConfigurationErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::matchmaking_configuration_not_found_message(
+                        &input.name,
+                    )),
+                })
+                .into(),
+            );
+        };
+
+        // "A matchmaking configuration cannot be deleted if it is being used in any active
+        // matchmaking tickets": a ticket still in process is one this matchmaker is deciding
+        // for, so removing the record would leave that request with no rules to be matched
+        // under. The parameter names a resource that cannot be deleted YET, which is the
+        // modelled `InvalidRequestException` ("one or more parameter values in the request
+        // are invalid"), and the configuration is left exactly as it was.
+        let active_tickets = state
+            .matchmaking_tickets
+            .values()
+            .filter(|ticket| ticket.configuration_name == name && ticket.is_in_process())
+            .count();
+        if active_tickets > 0 {
+            return Err(
+                DeleteMatchmakingConfigurationErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "Matchmaking configuration {name} is being used in {active_tickets} \
+                             active matchmaking tickets and cannot be deleted."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Permanently removes a FlexMatch matchmaking configuration": the whole record goes
+        // — its description, queues, timeouts, rule set, notification target, game
+        // properties and the tags assigned to the resource — so the name stops resolving and
+        // the account's configuration collection is one matchmaker shorter. The rule set it
+        // matched with is NOT touched: a configuration points at a rule set, it does not own
+        // one.
+        state.matchmaking_configurations.remove(&name);
+
+        Ok(DeleteMatchmakingConfigurationOutput {})
     }
 }

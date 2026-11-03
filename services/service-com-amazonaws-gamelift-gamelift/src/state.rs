@@ -1213,6 +1213,21 @@ fn routing_strategy_member_required(strategy_type: &str, member: &str) -> String
     format!("{strategy_type} RoutingStrategy must contain a valid {member}.")
 }
 
+/// What the service answers when no custom location is stored under the
+/// `CustomLocationNameOrArnModel` an operation was asked to act on — the message of the
+/// modelled `NotFoundException`, shared by every operation that names ONE custom location,
+/// so the same missing location reads the same way whichever of them was called.
+///
+/// The same template every other GameLift resource this store holds is reported missing
+/// with ([`alias_not_found_message`], [`build_not_found_message`],
+/// [`script_not_found_message`]): the resource kind leads the sentence and the identifier
+/// the CALLER supplied is its one variable part, carried verbatim in parentheses, since
+/// either of the two forms the member accepts (`^(custom-[A-Za-z0-9\-]+|arn:.*:location\/
+/// custom-\S+)$`) selects the same location.
+pub fn custom_location_not_found_message(name_or_arn: &str) -> String {
+    format!("Location ({name_or_arn}) not found")
+}
+
 /// A custom location, as `CreateLocation` persisted it.
 ///
 /// `LocationModel` is "properties of a location, which can include its name, ARN (for
@@ -1578,6 +1593,62 @@ pub fn build_files_present<Eng: Send + Sync + 'static>(engine: &Eng, location: &
         .is_some_and(|bucket| bucket.object(key).is_some())
 }
 
+/// Delete the build files held at a SERVICE-OWNED storage location, the way a
+/// `DeleteObject` of that key would.
+///
+/// `DeleteBuild` "permanently deletes the build resource and any uploaded build files", and
+/// the files this service owns are the ones at the location it handed the caller to upload
+/// to ([`service_owned_build_location`]) — a location in the CALLER's own bucket holds the
+/// caller's objects, which this service was only given read access to, so a location that
+/// is not this service's own is left untouched.
+///
+/// The same LOCK ORDER as [`provision_build_upload_bucket`]: it takes the object store's
+/// lock and holds no other while it does, so it must be called with NO guard of this
+/// service's store held.
+pub fn remove_build_files<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    location: &S3Location,
+) {
+    let (Some(bucket), Some(key)) = (location.bucket.as_deref(), location.key.as_deref()) else {
+        return;
+    };
+    if bucket != service_owned_build_bucket(region) {
+        return;
+    }
+    let Some(state) = ::service_com_amazonaws_s3_amazons3::state::service_state(engine) else {
+        return;
+    };
+    let mut store = state.lock();
+    store.remove_object(bucket, key);
+}
+
+/// What the service answers when no rule set is stored under the
+/// `MatchmakingRuleSetName` an operation was asked to resolve — the one text the service's
+/// rule-set lookup failure reads as, shared by every operation that names ONE rule set, so
+/// the same missing rule set reads the same way whichever of them was called. The modelled
+/// error CLASS it is carried in is each operation's own (`smithy_query`).
+///
+/// The identifier the CALLER supplied is the sentence's one variable part: either of the
+/// two forms the member accepts (`^([a-zA-Z0-9-\.]*|arn:.*:matchmakingruleset\/[a-zA-Z0-9-
+/// \.]*)$`) selects the same rule set, so the refusal states what was asked for rather
+/// than anything the service resolved it to.
+pub fn matchmaking_rule_set_not_found_message(name_or_arn: &str) -> String {
+    format!("Failed to find rule set: {name_or_arn}")
+}
+
+/// What the service answers when no matchmaking configuration is stored under the
+/// `MatchmakingConfigurationName` an operation asked to act ON — the message of the
+/// modelled `NotFoundException`, shared by the operations that mutate ONE named
+/// configuration, so the same missing matchmaker reads the same way whichever of them was
+/// called.
+///
+/// The identifier the CALLER supplied is the sentence's one variable part, for the same
+/// reason as in [`matchmaking_rule_set_not_found_message`].
+pub fn matchmaking_configuration_not_found_message(name_or_arn: &str) -> String {
+    format!("The matchmaking configuration {name_or_arn} was not found.")
+}
+
 /// A FlexMatch rule set, as `CreateMatchmakingRuleSet` persisted it.
 #[derive(Debug, Clone)]
 pub struct MatchmakingRuleSetRecord {
@@ -1690,6 +1761,20 @@ pub struct MatchmakingTicketRecord {
 }
 
 impl MatchmakingTicketRecord {
+    /// Whether this ticket is still being worked on, i.e. it has not reached a terminal
+    /// status.
+    ///
+    /// `MatchmakingTicket$Status`'s own docs call `QUEUED` and `SEARCHING` the statuses a
+    /// request is being processed in ("the matchmaking request has been received[; it] is
+    /// currently being processed"), and `EndTime` is set only "when the matchmaking request
+    /// stopped being processed due to successful completion, timeout, or cancellation" — so
+    /// a ticket in one of those statuses is an ACTIVE one, which is what decides both the
+    /// timeout the clock owes it and whether its matchmaker may be deleted.
+    pub fn is_in_process(&self) -> bool {
+        self.status == MATCHMAKING_TICKET_STATUS_QUEUED
+            || self.status == MATCHMAKING_TICKET_STATUS_SEARCHING
+    }
+
     /// This ticket as the modelled `MatchmakingTicket`.
     ///
     /// `GameSessionConnectionInfo` is "connection information for a new game session[,]
@@ -2148,8 +2233,7 @@ impl ComAmazonawsGameliftGameliftState {
                 ticket.status = MATCHMAKING_TICKET_STATUS_SEARCHING.to_string();
                 ticket.searching_at = None;
             }
-            let in_process = ticket.status == MATCHMAKING_TICKET_STATUS_QUEUED
-                || ticket.status == MATCHMAKING_TICKET_STATUS_SEARCHING;
+            let in_process = ticket.is_in_process();
             if in_process && now >= ticket.timeout_at {
                 ticket.status = MATCHMAKING_TICKET_STATUS_TIMED_OUT.to_string();
                 ticket.searching_at = None;
@@ -2617,6 +2701,25 @@ impl ComAmazonawsGameliftGameliftState {
                 })
         });
         authorizations
+    }
+
+    /// The `LocationName` of the custom location a `CustomLocationNameOrArnModel` names, or
+    /// `None` when no stored custom location matches it.
+    ///
+    /// `LocationModel$LocationArn`'s pattern is `^arn:.*:location\/custom-\S+$`, whose
+    /// resource is the location's own name, so either form selects the same location —
+    /// which is why the member's pattern accepts both.
+    pub fn resolve_custom_location_name(&self, name_or_arn: &str) -> Option<String> {
+        if name_or_arn.starts_with("arn:") {
+            self.custom_locations
+                .values()
+                .find(|location| location.location_arn == name_or_arn)
+                .map(|location| location.location_name.clone())
+        } else {
+            self.custom_locations
+                .get(name_or_arn)
+                .map(|location| location.location_name.clone())
+        }
     }
 
     /// Every stored custom location, oldest first, so a paginated walk is stable.

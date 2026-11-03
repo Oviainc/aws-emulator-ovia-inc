@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBuild
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBuild`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBuild::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored build the request names — "this operation permanently deletes the
+//! build resource and any uploaded build files" — selected by build id or by build ARN, so
+//! every later read of it answers the modelled `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +165,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBuild` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBuildErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteBuildErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "To delete a build, specify the build ID" — as a build id or as a build ARN, the
+        // two forms the modelled `BuildIdOrArn` accepts for the one resource. An identifier
+        // that resolves to no stored build is the modelled `NotFoundException` ("the
+        // resource was either not created yet or deleted"), the same refusal every other
+        // read of a build answers it with, and nothing is removed.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBuild"))
+        // "This operation permanently deletes the build resource": the whole record goes —
+        // its name, version, status, storage location and the tags assigned to the resource
+        // — so every later read of that build can only answer that it is not there, and the
+        // account's build collection is one build shorter. "Deleting a build does not
+        // affect the status of any active fleets using the build", so the fleets deployed
+        // with it are NOT touched.
+        //
+        // The record is taken OUT of the store under the one guard that read it, so two
+        // concurrent deletes of one build have exactly one winner; that guard is released
+        // before the object store is reached, which is the lock order
+        // `crate::state::remove_build_files` documents.
+        let removed = {
+            let mut state = state.lock();
+            state.tick(::std::time::SystemTime::now());
+            let build_id = state.resolve_build_id(&input.build_id);
+            build_id.and_then(|build_id| state.builds.remove(&build_id))
+        };
+        let Some(removed) = removed else {
+            return Err(DeleteBuildErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::build_not_found_message(&input.build_id)),
+            })
+            .into());
+        };
+
+        // "...and any uploaded build files": the files this service owns are the ones at the
+        // location it handed the caller to upload to, so they go with the record they belong
+        // to. A location in the caller's own bucket is left alone — those objects are the
+        // caller's, and this service was only given read access to them.
+        crate::state::remove_build_files(&*self.engine, &removed.region, &removed.storage_location);
+
+        // The upload credential this build was issued is "valid only for the build [it was]
+        // issued for", so a credential whose build is gone can authorise nothing: it is
+        // withdrawn from the credential store rather than left signable.
+        if let Some(credential_id) = removed.upload_credential_id.as_deref() {
+            if let Err(error) = ctx.credential_store().delete(credential_id) {
+                ::tracing::warn!(
+                    operation = Self::NAME,
+                    reason = ?error,
+                    "the upload credential of a deleted build could not be withdrawn from the \
+                     credential store"
+                );
+            }
+        }
+
+        Ok(DeleteBuildOutput)
     }
 }
