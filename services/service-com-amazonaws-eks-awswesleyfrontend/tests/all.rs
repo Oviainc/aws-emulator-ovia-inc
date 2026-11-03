@@ -65,6 +65,10 @@ mod child_resource_deletion;
 mod cluster_config_update;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/cluster_payload_members.rs"]
+mod cluster_payload_members;
+#[path = "all/cluster_scalar_coercion.rs"]
+mod cluster_scalar_coercion;
 #[path = "all/cluster_update_concurrency.rs"]
 mod cluster_update_concurrency;
 #[path = "all/cluster_version_catalog.rs"]

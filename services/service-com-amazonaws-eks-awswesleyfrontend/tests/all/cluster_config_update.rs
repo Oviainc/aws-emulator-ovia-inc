@@ -346,17 +346,10 @@ fn rows() -> Vec<Row> {
             }),
             update_type: "AccessConfigUpdate",
             param_types: vec!["AuthenticationMode"],
-            expected: vec![
-                (
-                    "/accessConfig/authenticationMode",
-                    serde_json::json!("API_AND_CONFIG_MAP"),
-                ),
-                // A creation-time fact of the cluster, which this change leaves alone.
-                (
-                    "/accessConfig/bootstrapClusterCreatorAdminPermissions",
-                    serde_json::json!(true),
-                ),
-            ],
+            expected: vec![(
+                "/accessConfig/authenticationMode",
+                serde_json::json!("API_AND_CONFIG_MAP"),
+            )],
         },
         Row {
             case: "leaving extended support",
@@ -445,7 +438,10 @@ fn rows() -> Vec<Row> {
             cluster: "cfg-scaling-tier",
             body: serde_json::json!({ "controlPlaneScalingConfig": { "tier": "tier-2xl" } }),
             update_type: "ControlPlaneScalingConfigUpdate",
-            param_types: vec!["UpdatedTier"],
+            // A tier change reports the tier it moves TO beside the one it moves
+            // FROM, which a cluster that asked for no provisioned control plane
+            // reports as the `standard` tier it runs on.
+            param_types: vec!["PreviousTier", "UpdatedTier"],
             expected: vec![(
                 "/controlPlaneScalingConfig/tier",
                 serde_json::json!("tier-2xl"),

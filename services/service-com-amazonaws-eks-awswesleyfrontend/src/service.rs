@@ -43,19 +43,25 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! A sixth seam, `override_protocol`, is the one this service also takes: it serves
+//! the model's own `restJson1` with the input deserializer wrapped, because this
+//! service reads a body leniently — a scalar supplied in another of JSON's scalar
+//! types than the modelled one, and the one member it reads without regard to case
+//! (see [`lenient_json`]).
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+pub mod lenient_json;
+pub mod lenient_scalars;
 pub mod off_enum_member_contract;
 pub mod precedence;
 pub mod resolve_conflicts_contract;
 pub mod tag_contract;
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
 /// The `com-amazonaws-eks-awswesleyfrontend` emulated service: the generated [`ServiceDefinition`] plus
@@ -84,6 +90,12 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// shared engine because the missing-cluster half is answered from this
     /// service's store.
     precedence_first: precedence::PrecedenceFirst<Eng>,
+    /// The codec the modelled sequence reads and writes this service's requests
+    /// with: the model's own `restJson1`, reading a body the way this service
+    /// reads one (see [`lenient_json`]). Held on the service because
+    /// [`Service::override_protocol`] hands back a borrow of it and must never
+    /// build one per request.
+    protocol: lenient_json::LenientRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -96,6 +108,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             refused_tag_request: tag_contract::RefusedTagRequest::new(),
             refused_addon_request: resolve_conflicts_contract::RefusedAddonRequest::new(),
             precedence_first: precedence::PrecedenceFirst::new(engine),
+            protocol: lenient_json::LenientRestJson::new(),
         }
     }
 }
@@ -164,6 +177,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             return Some(&self.precedence_first as &dyn ErasedOperation);
         }
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // This service reads a request body leniently: a scalar supplied in
+        // another of JSON's scalar types than the modelled one, and the one member
+        // it reads without regard to case. The codec that applies it is otherwise
+        // the model's own `restJson1`, and it writes every response unchanged. See
+        // [`lenient_json`].
+        Some(&self.protocol)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

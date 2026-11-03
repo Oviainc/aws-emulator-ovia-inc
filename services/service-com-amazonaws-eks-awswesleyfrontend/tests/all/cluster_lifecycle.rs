@@ -210,26 +210,37 @@ async fn a_created_cluster_reads_back_exactly_as_stored() {
             "case {case:?}: a brand new cluster is CREATING, got {:?}",
             created.cluster()["status"]
         );
-        let endpoint = created.cluster()["endpoint"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
+        // The members Amazon EKS fills in only once it has PROVISIONED the control
+        // plane behind the cluster. A cluster still `CREATING` reports none of
+        // them, which is what tells a client building a kubeconfig to keep
+        // waiting; they are read back further down, once the clock owes the
+        // cluster `ACTIVE`.
+        for absent in ["endpoint", "identity"] {
+            assert!(
+                created.cluster()[absent].is_null(),
+                "case {case:?}: a CREATING cluster reports no {absent}, got {:?}",
+                created.cluster()[absent]
+            );
+        }
+        let authority = &created.cluster()["certificateAuthority"];
         assert!(
-            endpoint.starts_with("https://") && endpoint.ends_with(&format!(".{REGION}.eks.amazonaws.com")),
-            "case {case:?}: expected a regional EKS endpoint, got {endpoint:?}"
+            authority["data"].is_null() && authority["active"].is_null(),
+            "case {case:?}: a CREATING cluster has no certificate authority data or \
+             signer, got {authority:?}"
         );
         assert!(
-            created.cluster()["certificateAuthority"]["data"].is_string(),
-            "case {case:?}: expected certificateAuthority.data, got {:?}",
-            created.cluster()["certificateAuthority"]
+            created.cluster()["resourcesVpcConfig"]["clusterSecurityGroupId"].is_null(),
+            "case {case:?}: the cluster security group is created with the control \
+             plane, so a CREATING cluster reports none, got {:?}",
+            created.cluster()["resourcesVpcConfig"]
         );
+        // The idempotency token of the CALL is not a member of the cluster that
+        // call created, so no answer reports it — including this one, which was
+        // given one in two of the rows.
         assert!(
-            created.cluster()["identity"]["oidc"]["issuer"]
-                .as_str()
-                .unwrap_or_default()
-                .contains(&format!("oidc.eks.{REGION}.amazonaws.com/id/")),
-            "case {case:?}: expected an OIDC issuer URL, got {:?}",
-            created.cluster()["identity"]
+            created.cluster()["clientRequestToken"].is_null(),
+            "case {case:?}: a cluster reports no clientRequestToken, got {:?}",
+            created.cluster()["clientRequestToken"]
         );
 
         // `version` is echoed when given and defaulted when not; either way it is
@@ -284,18 +295,57 @@ async fn a_created_cluster_reads_back_exactly_as_stored() {
             );
         }
 
-        // THE ROUND TRIP: the describe is the same object, status aside (which the
-        // clock may already have moved).
+        // The creation-time access flag belongs to this CALL rather than to the
+        // cluster: the create answers with it and a later read of the cluster does
+        // not, so it is asserted here and taken out of the comparison below.
+        let requested_bootstrap = request["accessConfig"]
+            ["bootstrapClusterCreatorAdminPermissions"]
+            .as_bool()
+            .unwrap_or(true);
+        assert_eq!(
+            created.cluster()["accessConfig"]["bootstrapClusterCreatorAdminPermissions"],
+            serde_json::json!(requested_bootstrap),
+            "case {case:?}: the create reports whether it bootstrapped the creator's \
+             admin access, got {:?}",
+            created.cluster()["accessConfig"]
+        );
+
+        // THE ROUND TRIP: the describe is the same object — status aside, and
+        // aside from the members provisioning the control plane fills in, either
+        // of which the clock may already have moved between the two calls.
         let described = describe(&router, name).await;
         assert_eq!(
             described.status, 200,
             "case {case:?}: expected 200 from DescribeCluster, got {described:?}"
+        );
+        assert!(
+            described.cluster()["accessConfig"]
+                ["bootstrapClusterCreatorAdminPermissions"]
+                .is_null(),
+            "case {case:?}: a read of the cluster reports no creation-time access \
+             flag, got {:?}",
+            described.cluster()["accessConfig"]
         );
         let mut from_create = created.cluster().clone();
         let mut from_describe = described.cluster().clone();
         for value in [&mut from_create, &mut from_describe] {
             if let Some(object) = value.as_object_mut() {
                 object.remove("status");
+                object.remove("endpoint");
+                object.remove("identity");
+                object.remove("certificateAuthority");
+                if let Some(vpc_config) = object
+                    .get_mut("resourcesVpcConfig")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    vpc_config.remove("clusterSecurityGroupId");
+                }
+                if let Some(access_config) = object
+                    .get_mut("accessConfig")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    access_config.remove("bootstrapClusterCreatorAdminPermissions");
+                }
             }
         }
         assert_eq!(
@@ -315,6 +365,46 @@ async fn a_created_cluster_reads_back_exactly_as_stored() {
         listed, expected,
         "ListClusters must report every stored cluster once, sorted; got {listed:?}"
     );
+
+    // Once the clock has provisioned the control plane, every member that
+    // describes it is reported — for every row, whatever that row asked for.
+    tokio::time::sleep(CLUSTER_ACTIVATION_DELAY + std::time::Duration::from_millis(250)).await;
+    for (case, request) in &cases {
+        let name = request["name"].as_str().expect("the case names its cluster");
+        let described = describe(&router, name).await;
+        assert_eq!(
+            described.cluster()["status"],
+            serde_json::json!("ACTIVE"),
+            "case {case:?}: the clock owes a new cluster ACTIVE, got {:?}",
+            described.cluster()["status"]
+        );
+        let endpoint = described.cluster()["endpoint"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            endpoint.starts_with("https://")
+                && endpoint.ends_with(&format!(".{REGION}.eks.amazonaws.com")),
+            "case {case:?}: an ACTIVE cluster reports its regional API server \
+             endpoint, got {endpoint:?}"
+        );
+        assert!(
+            described.cluster()["certificateAuthority"]["data"]
+                .as_str()
+                .is_some_and(|data| !data.is_empty()),
+            "case {case:?}: an ACTIVE cluster reports its certificate authority \
+             data, got {:?}",
+            described.cluster()["certificateAuthority"]
+        );
+        assert!(
+            described.cluster()["identity"]["oidc"]["issuer"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&format!("oidc.eks.{REGION}.amazonaws.com/id/")),
+            "case {case:?}: an ACTIVE cluster reports its OIDC issuer, got {:?}",
+            described.cluster()["identity"]
+        );
+    }
 }
 
 /// The ARN a cluster gets is regional: it carries the region the caller's own SigV4
@@ -346,7 +436,19 @@ async fn the_cluster_arn_carries_the_region_the_request_is_signed_for() {
             "case {region:?}: expected arn {expected:?}, got {:?}",
             answer.cluster()["arn"]
         );
-        let endpoint = answer.cluster()["endpoint"]
+        // The endpoint host is regional too, and is reported once the clock has
+        // provisioned the control plane behind it: the cluster is read back in
+        // the region it was created in.
+        tokio::time::sleep(CLUSTER_ACTIVATION_DELAY + std::time::Duration::from_millis(250)).await;
+        let described = call(
+            &router,
+            region,
+            "GET",
+            &format!("/clusters/{}", encode_label("regional")),
+            "",
+        )
+        .await;
+        let endpoint = described.cluster()["endpoint"]
             .as_str()
             .unwrap_or_default()
             .to_owned();
@@ -1125,27 +1227,29 @@ async fn the_tag_ceiling_applies_to_the_accumulated_map() {
 }
 
 // ---------------------------------------------------------------------------
-// RULE: `clientRequestToken` is `@idempotencyToken`, so a retry carrying the SAME
-// token is absorbed and answered with the cluster that token created; any other
-// repeat of the name conflicts.
+// RULE: a cluster is identified by its NAME, so a second create of a name the
+// Region already holds conflicts — 409 `ResourceInUseException` — whatever
+// `clientRequestToken` it carries. The token is `@idempotencyToken`, which is
+// what keeps a retried call from creating a SECOND cluster; it does not turn the
+// answer into the first call's.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_retry_with_the_same_idempotency_token_is_absorbed() {
+async fn a_repeat_create_of_one_name_conflicts_whatever_token_it_carries() {
     // Rows differ along the relationship between the two requests' tokens: equal,
-    // different, present-then-absent, absent-then-present, absent on both, and blank
-    // on both (a blank token identifies nothing, so it is not a retry marker).
-    let cases: Vec<(&str, Option<&str>, Option<&str>, u16)> = vec![
-        ("the same token twice", Some("tok-1"), Some("tok-1"), 200),
-        ("a different token", Some("tok-1"), Some("tok-2"), 409),
-        ("a token, then none", Some("tok-1"), None, 409),
-        ("no token, then one", None, Some("tok-1"), 409),
-        ("no token either time", None, None, 409),
-        ("an empty token twice", Some(""), Some(""), 409),
-        ("a blank token twice", Some("   "), Some("   "), 409),
+    // different, present-then-absent, absent-then-present, absent on both, and
+    // blank on both.
+    let cases: Vec<(&str, Option<&str>, Option<&str>)> = vec![
+        ("the same token twice", Some("tok-1"), Some("tok-1")),
+        ("a different token", Some("tok-1"), Some("tok-2")),
+        ("a token, then none", Some("tok-1"), None),
+        ("no token, then one", None, Some("tok-1")),
+        ("no token either time", None, None),
+        ("an empty token twice", Some(""), Some("")),
+        ("a blank token twice", Some("   "), Some("   ")),
     ];
 
-    for (index, (case, first_token, second_token, expected)) in cases.iter().enumerate() {
+    for (index, (case, first_token, second_token)) in cases.iter().enumerate() {
         let router = emulator();
         let name = format!("idempotent-{index}");
         let mut first_request = minimal_request(&name);
@@ -1164,30 +1268,32 @@ async fn a_retry_with_the_same_idempotency_token_is_absorbed() {
         }
         let second = create(&router, &second_request).await;
         assert_eq!(
-            second.status, *expected,
-            "case {case:?}: expected {expected}, got {second:?}"
+            second.status, 409,
+            "case {case:?}: expected 409, got {second:?}"
         );
-        if *expected == 200 {
-            // The absorbed retry answers with the SAME cluster — same arn and the
-            // original createdAt — not a second one.
-            assert_eq!(
-                second.cluster()["arn"],
-                first.cluster()["arn"],
-                "case {case:?}: an absorbed retry returns the original arn"
-            );
-            assert_eq!(
-                second.cluster()["createdAt"],
-                first.cluster()["createdAt"],
-                "case {case:?}: an absorbed retry returns the original createdAt"
-            );
-        } else {
-            assert_eq!(
-                second.error_type.as_deref(),
-                Some("ResourceInUseException"),
-                "case {case:?}: expected ResourceInUseException, got {second:?}"
-            );
-        }
-        // Exactly one cluster exists either way.
+        assert_eq!(
+            second.error_type.as_deref(),
+            Some("ResourceInUseException"),
+            "case {case:?}: expected ResourceInUseException, got {second:?}"
+        );
+        assert_eq!(
+            second.body["clusterName"],
+            serde_json::json!(name),
+            "case {case:?}: the conflict names the cluster, got {:?}",
+            second.body
+        );
+        assert_eq!(
+            second.body["message"],
+            serde_json::json!(format!("Cluster already exists with name: {name}")),
+            "case {case:?}: the conflict states the name that is taken, got {:?}",
+            second.body
+        );
+        assert!(
+            second.body["cluster"].is_null(),
+            "case {case:?}: a refused create answers with no cluster, got {:?}",
+            second.body
+        );
+        // Exactly one cluster exists either way: the repeat created nothing.
         assert_eq!(
             names_of(&list(&router, "").await),
             vec![name.clone()],

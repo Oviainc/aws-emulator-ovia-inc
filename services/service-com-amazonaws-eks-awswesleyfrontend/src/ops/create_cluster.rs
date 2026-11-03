@@ -419,7 +419,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
             service_ipv6_cidr: is_ipv6.then(|| state::derive_service_ipv6_cidr(&resource_id)),
             ip_family: Some(ip_family),
-            elastic_load_balancing: requested_network.elastic_load_balancing.clone(),
+            elastic_load_balancing: Some(state::reported_elastic_load_balancing(
+                requested_network.elastic_load_balancing.as_ref(),
+            )),
         };
 
         // "By default, public access is enabled, and private access is disabled."
@@ -431,29 +433,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             defaults
         });
-        let resources_vpc_config = VpcConfigResponse {
-            subnet_ids: vpc_request.subnet_ids.clone(),
-            security_group_ids: vpc_request.security_group_ids.clone(),
-            // The group Amazon EKS creates for the cluster is minted below, once
-            // the cluster is in the store and the lock this runs under is
-            // released; until EC2 answers with its id there is none to report,
-            // and a cluster whose subnets no EC2 resolved never gets one.
-            cluster_security_group_id: None,
-            vpc_id: resolved_subnets.vpc_id.clone(),
-            endpoint_public_access: vpc_request.endpoint_public_access.unwrap_or(true),
-            endpoint_private_access: vpc_request.endpoint_private_access.unwrap_or(false),
-            public_access_cidrs: Some(public_access_cidrs),
-            control_plane_egress_mode: vpc_request.control_plane_egress_mode.clone(),
-        };
+        // The group Amazon EKS creates for the cluster is minted below, once the
+        // cluster is in the store and the lock this runs under is released; until
+        // EC2 answers with its id there is none to record, and a cluster whose
+        // subnets no EC2 resolved never gets one.
+        let resources_vpc_config = state::reported_vpc_config(
+            &vpc_request,
+            resolved_subnets.vpc_id.clone(),
+            public_access_cidrs,
+        );
 
         let requested_access = input.access_config.unwrap_or_default();
+        // "The default value is `true`." It is a fact of THIS call rather than part
+        // of the cluster's access configuration, so it is held on the record for
+        // this call's own answer to report
+        // ([`state::ClusterRecord::to_created_cluster`]) and is not part of the
+        // `accessConfig` a later read of the cluster returns.
+        let bootstrap_cluster_creator_admin_permissions = Some(
+            requested_access
+                .bootstrap_cluster_creator_admin_permissions
+                .unwrap_or(true),
+        );
         let access_config = AccessConfigResponse {
-            // "The default value is `true`."
-            bootstrap_cluster_creator_admin_permissions: Some(
-                requested_access
-                    .bootstrap_cluster_creator_admin_permissions
-                    .unwrap_or(true),
-            ),
+            bootstrap_cluster_creator_admin_permissions: None,
             authentication_mode: Some(
                 requested_access
                     .authentication_mode
@@ -499,9 +501,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             role_arn: Some(input.role_arn.clone()),
             resources_vpc_config: Some(resources_vpc_config),
             kubernetes_network_config: Some(kubernetes_network_config),
-            logging: input.logging.clone(),
+            logging: Some(state::reported_logging(input.logging.as_ref())),
             status: STATUS_CREATING.to_string(),
             active_at: Some(now + CLUSTER_ACTIVATION_DELAY),
+            // Nothing of the control plane itself exists yet: the clock owes this
+            // cluster its `ACTIVE` status, and provisioning it is what fills in
+            // the endpoint, the identity, the certificate authority data and the
+            // cluster security group ([`state::ClusterRecord::to_cluster`]).
+            control_plane_provisioned: false,
             // `CreateCluster` provisions an Amazon EKS control plane, so the
             // record it writes is never a connected cluster: only
             // `RegisterCluster` fills these two in.
@@ -514,6 +521,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect::<::std::collections::BTreeMap<_, _>>(),
             encryption_config: input.encryption_config.unwrap_or_default(),
             access_config: Some(access_config),
+            bootstrap_cluster_creator_admin_permissions,
             // "Default value is false."
             deletion_protection: input.deletion_protection.unwrap_or(false),
             client_request_token: input.client_request_token.clone(),
@@ -558,36 +566,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             storage_config: input.storage_config.map(|config| StorageConfigResponse {
                 block_storage: config.block_storage,
             }),
-            control_plane_scaling_config: input.control_plane_scaling_config,
-            kube_api_server_config: input.kube_api_server_config.map(|config| {
-                KubeApiServerConfigResponse {
-                    event_ttl: config.event_ttl,
-                    service_node_port_range: config.service_node_port_range,
-                }
-            }),
-            kube_scheduler_config: input.kube_scheduler_config.map(|config| {
-                KubeSchedulerConfigResponse {
-                    node_resources_fit: config.node_resources_fit,
-                }
-            }),
+            control_plane_scaling_config: Some(state::reported_control_plane_scaling_config(
+                input.control_plane_scaling_config.as_ref(),
+            )),
+            kube_api_server_config: Some(state::reported_kube_api_server_config(
+                input.kube_api_server_config.as_ref(),
+                None,
+            )),
+            kube_scheduler_config: Some(state::reported_kube_scheduler_config(
+                input.kube_scheduler_config.as_ref(),
+                None,
+            )),
             // A brand new cluster has no identity provider associated to it;
             // `AssociateIdentityProviderConfig` is what writes into this map.
             identity_provider_configs: ::std::collections::BTreeMap::new(),
-            kube_controller_manager_config: input.kube_controller_manager_config.map(|config| {
-                KubeControllerManagerConfigResponse {
-                    pod_gc_controller_config: config.pod_gc_controller_config.map(|pod_gc| {
-                        PodGcControllerConfigResponse {
-                            terminated_pod_gc_threshold: pod_gc.terminated_pod_gc_threshold,
-                        }
-                    }),
-                    horizontal_pod_autoscaler_controller_config: config
-                        .horizontal_pod_autoscaler_controller_config
-                        .map(|hpa| HorizontalPodAutoscalerControllerConfigResponse {
-                            horizontal_pod_autoscaler_sync_period: hpa
-                                .horizontal_pod_autoscaler_sync_period,
-                        }),
-                }
-            }),
+            kube_controller_manager_config: Some(state::reported_kube_controller_manager_config(
+                input.kube_controller_manager_config.as_ref(),
+                None,
+            )),
             // A new cluster has no access entries yet: every entry a caller can read
             // is one `CreateAccessEntry` wrote. (The creator's own admin access comes
             // from `accessConfig.bootstrapClusterCreatorAdminPermissions` above, which
@@ -617,35 +613,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Services account that you're creating the cluster in." The store is keyed
             // `(region, name)` and this emulator serves a single account, so the same name
             // in another region is a different cluster.
-            if let Some(existing) = guard.clusters.get(&key) {
-                // `clientRequestToken` is `@idempotencyToken`: "A unique, case-sensitive
-                // identifier that you provide to ensure the idempotency of the request."
-                // An SDK generates it once per call and RESENDS the same value when it
-                // retries, so a retry of the call that created this cluster must be
-                // absorbed and answered with that cluster — not with a conflict.
-                //
-                // A blank token identifies nothing, so it never matches: absorbing on it
-                // would make two unrelated calls that both sent `""` look like a retry of
-                // each other. The comparison is on the token alone — this does not check
-                // that the rest of the retry's body matches the stored record, which is a
-                // simplification of what the real service does with a reused token.
-                let replayed_token = record
-                    .client_request_token
-                    .as_deref()
-                    .filter(|token| !token.trim().is_empty());
-                if let Some(token) = replayed_token {
-                    // And only a retry of a CREATE: a token that happens to match the
-                    // one a `RegisterCluster` used for this name is not a retry of this
-                    // call, so it conflicts rather than answering with a connected
-                    // cluster the caller never asked for.
-                    if !existing.is_connected()
-                        && existing.client_request_token.as_deref() == Some(token)
-                    {
-                        return Ok(CreateClusterOutput {
-                            cluster: Some(existing.to_cluster()),
-                        });
-                    }
-                }
+            if guard.clusters.contains_key(&key) {
+                // A NAME is what identifies a cluster, so a second create of a
+                // name this Region already holds is a conflict — whatever
+                // `clientRequestToken` it carries. The token is
+                // `@idempotencyToken` ("A unique, case-sensitive identifier that
+                // you provide to ensure the idempotency of the request"), which is
+                // what keeps a retried call from creating a SECOND cluster; it
+                // does not turn the second answer into the first one's, and the
+                // recorded service answers a resent create with this conflict
+                // rather than with the cluster the token created.
                 return Err(CreateClusterErrorModeled::ResourceInUseException(
                     ResourceInUseException {
                         cluster_name: Some(record.name.clone()),
@@ -696,7 +673,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
-            let cluster = record.to_cluster();
+            let cluster = record.to_created_cluster();
             guard.arn_index.insert(arn, key.clone());
             guard.clusters.insert(key.clone(), record);
             cluster
@@ -724,7 +701,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     guard.clusters.get_mut(&key).and_then(|record| {
                         let vpc_config = record.resources_vpc_config.as_mut()?;
                         vpc_config.cluster_security_group_id = Some(group_id.clone());
-                        Some(record.to_cluster())
+                        Some(record.to_created_cluster())
                     })
                 };
                 match reported {

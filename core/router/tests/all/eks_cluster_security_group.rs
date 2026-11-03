@@ -325,17 +325,41 @@ fn eks_mints_the_cluster_security_group_in_ec2_and_releases_it_on_delete() {
 
                 // The cluster reports the group it owns and the VPC it resolved, read
                 // back through `DescribeCluster` rather than off the create's answer.
-                let read = eks(
+                // The group is part of what provisioning the control plane produces, so
+                // the cluster reports it from the moment it is `ACTIVE`: nothing sleeps
+                // for that due instant inside the emulator, so this polls the read
+                // rather than waiting on a span it would have to know.
+                let mut read = eks(
                     &router,
                     &runtime,
                     "GET",
                     &format!("/clusters/{}", row.cluster),
                     None,
                 );
+                for _ in 0..40 {
+                    if read.body["cluster"]["status"] == serde_json::json!("ACTIVE") {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    read = eks(
+                        &router,
+                        &runtime,
+                        "GET",
+                        &format!("/clusters/{}", row.cluster),
+                        None,
+                    );
+                }
                 assert_eq!(
                     read.status, 200,
                     "case {:?}: the cluster must be readable back, got {read:?}",
                     row.case
+                );
+                assert_eq!(
+                    read.body["cluster"]["status"],
+                    serde_json::json!("ACTIVE"),
+                    "case {:?}: the cluster must reach ACTIVE, got {}",
+                    row.case,
+                    read.text
                 );
                 assert_eq!(
                     read.body["cluster"]["resourcesVpcConfig"]["clusterSecurityGroupId"],

@@ -220,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .resources_vpc_config
                 .as_ref()
                 .and_then(|vpc_config| vpc_config.cluster_security_group_id.clone());
-            (record.to_cluster(), owned_group)
+            (record.to_deleted_cluster(), owned_group)
         };
 
         // The cluster has already left this service's state, so the answer does not

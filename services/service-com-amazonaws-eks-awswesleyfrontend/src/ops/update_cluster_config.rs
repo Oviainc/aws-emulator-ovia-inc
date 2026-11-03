@@ -464,7 +464,7 @@ fn requested_change(
     if let Some(logging) = input.logging.as_ref() {
         categories.push(UPDATE_TYPE_LOGGING);
         params.push(param(UPDATE_PARAM_CLUSTER_LOGGING, logging_value(logging)));
-        pending.logging = Some(logging.clone());
+        pending.logging = Some(state::reported_logging(Some(logging)));
     }
 
     // `resourcesVpcConfig` carries THREE categories of change — the endpoint access
@@ -697,7 +697,9 @@ fn requested_change(
         }
         if let Some(load_balancing) = requested.elastic_load_balancing.as_ref() {
             let mut next = record.kubernetes_network_config.clone().unwrap_or_default();
-            next.elastic_load_balancing = Some(load_balancing.clone());
+            next.elastic_load_balancing = Some(state::reported_elastic_load_balancing(Some(
+                load_balancing,
+            )));
             categories.push(UPDATE_TYPE_AUTO_MODE);
             params.push(param(
                 UPDATE_PARAM_KUBERNETES_NETWORK_CONFIG,
@@ -751,9 +753,11 @@ fn requested_change(
         {
             params.push(param(UPDATE_PARAM_PREVIOUS_TIER, previous.to_string()));
         }
-        pending.control_plane_scaling_config = Some(ControlPlaneScalingConfig {
-            tier: Some(tier.to_string()),
-        });
+        pending.control_plane_scaling_config = Some(state::reported_control_plane_scaling_config(
+            Some(&ControlPlaneScalingConfig {
+                tier: Some(tier.to_string()),
+            }),
+        ));
     }
 
     // The three Kubernetes control plane component configurations, which share one
@@ -765,10 +769,10 @@ fn requested_change(
             UPDATE_PARAM_KUBE_API_SERVER_CONFIG,
             kube_api_server_value(requested),
         ));
-        pending.kube_api_server_config = Some(KubeApiServerConfigResponse {
-            event_ttl: requested.event_ttl.clone(),
-            service_node_port_range: requested.service_node_port_range.clone(),
-        });
+        pending.kube_api_server_config = Some(state::reported_kube_api_server_config(
+            Some(requested),
+            record.kube_api_server_config.as_ref(),
+        ));
     }
     if let Some(requested) = input.kube_scheduler_config.as_ref() {
         categories.push(UPDATE_TYPE_CONTROL_PLANE_COMPONENT_CONFIG);
@@ -776,9 +780,10 @@ fn requested_change(
             UPDATE_PARAM_KUBE_SCHEDULER_CONFIG,
             kube_scheduler_value(requested),
         ));
-        pending.kube_scheduler_config = Some(KubeSchedulerConfigResponse {
-            node_resources_fit: requested.node_resources_fit.clone(),
-        });
+        pending.kube_scheduler_config = Some(state::reported_kube_scheduler_config(
+            Some(requested),
+            record.kube_scheduler_config.as_ref(),
+        ));
     }
     if let Some(requested) = input.kube_controller_manager_config.as_ref() {
         categories.push(UPDATE_TYPE_CONTROL_PLANE_COMPONENT_CONFIG);
@@ -786,21 +791,12 @@ fn requested_change(
             UPDATE_PARAM_KUBE_CONTROLLER_MANAGER_CONFIG,
             kube_controller_manager_value(requested),
         ));
-        pending.kube_controller_manager_config = Some(KubeControllerManagerConfigResponse {
-            pod_gc_controller_config: requested.pod_gc_controller_config.as_ref().map(
-                |pod_gc| PodGcControllerConfigResponse {
-                    terminated_pod_gc_threshold: pod_gc.terminated_pod_gc_threshold,
-                },
+        pending.kube_controller_manager_config = Some(
+            state::reported_kube_controller_manager_config(
+                Some(requested),
+                record.kube_controller_manager_config.as_ref(),
             ),
-            horizontal_pod_autoscaler_controller_config: requested
-                .horizontal_pod_autoscaler_controller_config
-                .as_ref()
-                .map(|hpa| HorizontalPodAutoscalerControllerConfigResponse {
-                    horizontal_pod_autoscaler_sync_period: hpa
-                        .horizontal_pod_autoscaler_sync_period
-                        .clone(),
-                }),
-        });
+        );
     }
 
     // An `Update` carries ONE `type`, and the type is the category of the change: one

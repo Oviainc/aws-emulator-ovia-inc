@@ -138,12 +138,16 @@ use crate::ops::types::{
 };
 use crate::ops::types::{
     AllowedValuesConstraint, ControlPlaneConfigInfo, ControlPlaneScalingTierInfo,
-    DurationConstraints, DurationParameterConfig,
+    DurationConstraints, DurationParameterConfig, ElasticLoadBalancing,
+    HorizontalPodAutoscalerControllerConfigResponse,
     HorizontalPodAutoscalerControllerVersionConfig, IntegerConstraints, IntegerParameterConfig,
-    IntegerRangeConstraint, KubeApiServerVersionConfig, KubeControllerManagerVersionConfig,
-    KubeSchedulerVersionConfig, NodeResourcesFitVersionConfig, PodGcControllerVersionConfig,
+    IntegerRangeConstraint, KubeApiServerConfigRequest, KubeApiServerVersionConfig,
+    KubeControllerManagerConfigRequest, KubeControllerManagerVersionConfig,
+    KubeSchedulerConfigRequest, KubeSchedulerVersionConfig, LogSetup, NodeResourcesFitConfig,
+    NodeResourcesFitVersionConfig, PodGcControllerConfigResponse, PodGcControllerVersionConfig,
     PortRangeConstraints, PortRangeParameterConfig, ResourceConstraints, ResourceWeight,
     ScoringStrategy, ScoringStrategyConfig, ScoringStrategyConstraints, ServiceNodePortRange,
+    VpcConfigRequest, LOG_TYPE_VALUES,
 };
 
 /// The `ClusterStatus` members this slice uses. The model's enum
@@ -569,6 +573,16 @@ pub const DEFAULT_AUTHENTICATION_MODE: &str = "CONFIG_MAP";
 /// clusters, by default, have extended support enabled"
 /// (`CreateCluster$upgradePolicy`).
 pub const DEFAULT_SUPPORT_TYPE: &str = "EXTENDED";
+
+/// The control plane scaling tier a cluster reports when its request asked for
+/// no provisioned control plane.
+///
+/// `standard` is the first member of `ProvisionedControlPlaneTier`
+/// (`smithy_query query="shape" shape="ProvisionedControlPlaneTier"`) and the
+/// tier a cluster runs on when it asks for none — which is why it is not one of
+/// the provisioned tiers the version catalog publishes (see
+/// [`CONTROL_PLANE_SCALING_TIERS`]).
+pub const DEFAULT_CONTROL_PLANE_TIER: &str = "standard";
 
 /// The CIDR allowed to reach the public endpoint when `publicAccessCidrs` is
 /// absent: "The default value is `0.0.0.0/0` and additionally `::/0` for
@@ -1715,9 +1729,31 @@ pub struct ClusterRecord {
     /// connected cluster the move to `FAILED`. Cleared once the move is
     /// materialised.
     pub activation_expires_at: Option<SystemTime>,
+    /// Whether the Amazon EKS control plane behind this cluster has been
+    /// provisioned.
+    ///
+    /// The members that only exist once there IS a control plane — the API
+    /// server `endpoint`, the `identity` it issues tokens under, the
+    /// `certificateAuthority` it signs with, and the cluster security group
+    /// Amazon EKS creates for it — are reported only from then on, which is what
+    /// [`Self::to_cluster`] gates on this. The clock is what provisions it: the
+    /// `CREATING` -> `ACTIVE` move this record is owed sets it
+    /// ([`Self::materialize_due_transitions`]) and nothing clears it, so a
+    /// cluster keeps reporting them through every later status (`UPDATING`,
+    /// `DELETING`). A connected cluster never has one.
+    pub control_plane_provisioned: bool,
     pub tags: BTreeMap<String, String>,
     pub encryption_config: Vec<EncryptionConfig>,
     pub access_config: Option<AccessConfigResponse>,
+    /// "Specifies whether or not the cluster creator IAM principal was set as a
+    /// cluster admin access entry during cluster creation time"
+    /// (`AccessConfigResponse$bootstrapClusterCreatorAdminPermissions`).
+    ///
+    /// It is a fact of the CALL that created the cluster rather than part of the
+    /// cluster's own access configuration, so it is reported by that call's own
+    /// answer ([`Self::to_created_cluster`], which a retry of it answers with
+    /// too) and by no later read of the cluster.
+    pub bootstrap_cluster_creator_admin_permissions: Option<bool>,
     pub deletion_protection: bool,
     pub client_request_token: Option<String>,
     pub outpost_config: Option<OutpostConfigResponse>,
@@ -2396,6 +2432,234 @@ impl PendingClusterConfig {
     }
 }
 
+/// The cluster control plane logging a cluster reports, for the `logging` a
+/// request asked for.
+///
+/// `Cluster$logging` is "The logging configuration for your cluster", and a
+/// cluster reports the state of EVERY control plane log type Amazon EKS can
+/// export — the ones it exports and the ones it does not — so the types are
+/// grouped into at most two `LogSetup`s: the enabled set first, then the
+/// disabled set. Each type appears exactly once, in the order the model declares
+/// them ([`crate::ops::types::LOG_TYPE_VALUES`]), and a group with no types in it
+/// is not reported at all, so a cluster whose request enabled nothing reports one
+/// entry carrying every type, disabled.
+///
+/// A type is enabled when ANY requested entry that enables logging names it,
+/// which is also why a type named twice, or named in both an enabled and a
+/// disabled entry, still reports once.
+pub fn reported_logging(requested: Option<&Logging>) -> Logging {
+    let requested_setups = requested
+        .and_then(|logging| logging.cluster_logging.as_deref())
+        .unwrap_or_default();
+    let is_enabled = |log_type: &String| {
+        requested_setups.iter().any(|setup| {
+            setup.enabled.unwrap_or(false)
+                && setup
+                    .types
+                    .as_deref()
+                    .is_some_and(|types| types.contains(log_type))
+        })
+    };
+    let (enabled, disabled): (Vec<String>, Vec<String>) = LOG_TYPE_VALUES
+        .iter()
+        .map(|log_type| (*log_type).to_string())
+        .partition(is_enabled);
+    let group = |types: Vec<String>, enabled: bool| {
+        (!types.is_empty()).then_some(LogSetup {
+            types: Some(types),
+            enabled: Some(enabled),
+        })
+    };
+    Logging {
+        cluster_logging: Some(
+            group(enabled, true)
+                .into_iter()
+                .chain(group(disabled, false))
+                .collect(),
+        ),
+    }
+}
+
+/// The VPC configuration a cluster reports, for the `resourcesVpcConfig` a
+/// request asked for and the VPC its subnets resolved to.
+///
+/// Two members are reported whatever the request named: the security groups of
+/// the cross-account network interfaces ("The security groups associated with the
+/// cross-account elastic network interfaces", an EMPTY list when the request
+/// named none, because the cluster has those interfaces either way) and the
+/// egress mode the control plane routes through, which is always one of the modes
+/// `ControlPlaneEgressModeType` declares and is
+/// [`CONTROL_PLANE_EGRESS_AWS_MANAGED`] — "Amazon EKS manages the egress path
+/// from the control plane" — for a cluster that did not ask to route it itself.
+///
+/// `clusterSecurityGroupId` is NOT filled in here: it is the group Amazon EKS
+/// creates while it provisions the control plane, so the create writes it onto
+/// the record once EC2 answers with its id and [`ClusterRecord::to_cluster`]
+/// reports it from then on.
+pub fn reported_vpc_config(
+    requested: &VpcConfigRequest,
+    vpc_id: Option<String>,
+    public_access_cidrs: Vec<String>,
+) -> VpcConfigResponse {
+    VpcConfigResponse {
+        subnet_ids: requested.subnet_ids.clone(),
+        security_group_ids: Some(requested.security_group_ids.clone().unwrap_or_default()),
+        cluster_security_group_id: None,
+        vpc_id,
+        // "By default, public access is enabled, and private access is disabled."
+        endpoint_public_access: requested.endpoint_public_access.unwrap_or(true),
+        endpoint_private_access: requested.endpoint_private_access.unwrap_or(false),
+        public_access_cidrs: Some(public_access_cidrs),
+        control_plane_egress_mode: Some(
+            requested
+                .control_plane_egress_mode
+                .clone()
+                .unwrap_or_else(|| CONTROL_PLANE_EGRESS_AWS_MANAGED.to_string()),
+        ),
+    }
+}
+
+/// The load balancing capability a cluster reports, for the
+/// `kubernetesNetworkConfig.elasticLoadBalancing` a request asked for.
+///
+/// `KubernetesNetworkConfigResponse$elasticLoadBalancing` "indicates the current
+/// configuration of the load balancing capability on your EKS Auto Mode cluster.
+/// For example, if the capability is enabled or disabled" — a capability is
+/// always in one of those two states, so it is always reported, and a cluster
+/// that did not ask for it runs with it disabled.
+pub fn reported_elastic_load_balancing(
+    requested: Option<&ElasticLoadBalancing>,
+) -> ElasticLoadBalancing {
+    ElasticLoadBalancing {
+        enabled: Some(
+            requested
+                .and_then(|load_balancing| load_balancing.enabled)
+                .unwrap_or(false),
+        ),
+    }
+}
+
+/// The scaling tier a cluster reports, for the `controlPlaneScalingConfig` a
+/// request asked for: the tier it asked for, or [`DEFAULT_CONTROL_PLANE_TIER`].
+pub fn reported_control_plane_scaling_config(
+    requested: Option<&ControlPlaneScalingConfig>,
+) -> ControlPlaneScalingConfig {
+    ControlPlaneScalingConfig {
+        tier: Some(
+            requested
+                .and_then(|config| config.tier.clone())
+                .unwrap_or_else(|| DEFAULT_CONTROL_PLANE_TIER.to_string()),
+        ),
+    }
+}
+
+/// The Kubernetes API server configuration a cluster reports, for the
+/// `kubeApiServerConfig` a request asked for over the `current` configuration it
+/// is changing (`None` on a create, which has none to change).
+///
+/// Every parameter of a component is reported, because the component runs with a
+/// value for it either way: the one the request named, else the one the cluster
+/// already runs with, else the default the version catalog publishes for that
+/// parameter (`ClusterVersionInformation$controlPlaneComponentConfig`, built by
+/// [`control_plane_component_config`] from the same constants) — so the
+/// configuration a cluster reports and the default published for it are the same
+/// value, and a change to ONE parameter leaves the others where the caller put
+/// them.
+pub fn reported_kube_api_server_config(
+    requested: Option<&KubeApiServerConfigRequest>,
+    current: Option<&KubeApiServerConfigResponse>,
+) -> KubeApiServerConfigResponse {
+    KubeApiServerConfigResponse {
+        event_ttl: Some(
+            requested
+                .and_then(|config| config.event_ttl.clone())
+                .or_else(|| current.and_then(|config| config.event_ttl.clone()))
+                .unwrap_or_else(|| DEFAULT_EVENT_TTL.to_string()),
+        ),
+        service_node_port_range: Some(
+            requested
+                .and_then(|config| config.service_node_port_range.clone())
+                .or_else(|| current.and_then(|config| config.service_node_port_range.clone()))
+                .unwrap_or_else(default_service_node_port_range),
+        ),
+    }
+}
+
+/// The Kubernetes scheduler configuration a cluster reports, for the
+/// `kubeSchedulerConfig` a request asked for over the `current` one. See
+/// [`reported_kube_api_server_config`] for where the values come from.
+pub fn reported_kube_scheduler_config(
+    requested: Option<&KubeSchedulerConfigRequest>,
+    current: Option<&KubeSchedulerConfigResponse>,
+) -> KubeSchedulerConfigResponse {
+    let requested_strategy = requested
+        .and_then(|config| config.node_resources_fit.as_ref())
+        .and_then(|fit| fit.scoring_strategy.as_ref());
+    let current_strategy = current
+        .and_then(|config| config.node_resources_fit.as_ref())
+        .and_then(|fit| fit.scoring_strategy.as_ref());
+    let default = default_scoring_strategy();
+    KubeSchedulerConfigResponse {
+        node_resources_fit: Some(NodeResourcesFitConfig {
+            scoring_strategy: Some(ScoringStrategy {
+                r#type: requested_strategy
+                    .and_then(|strategy| strategy.r#type.clone())
+                    .or_else(|| current_strategy.and_then(|strategy| strategy.r#type.clone()))
+                    .or(default.r#type),
+                resources: requested_strategy
+                    .and_then(|strategy| strategy.resources.clone())
+                    .or_else(|| current_strategy.and_then(|strategy| strategy.resources.clone()))
+                    .or(default.resources),
+            }),
+        }),
+    }
+}
+
+/// The Kubernetes controller manager configuration a cluster reports, for the
+/// `kubeControllerManagerConfig` a request asked for over the `current` one. See
+/// [`reported_kube_api_server_config`] for where the values come from.
+pub fn reported_kube_controller_manager_config(
+    requested: Option<&KubeControllerManagerConfigRequest>,
+    current: Option<&KubeControllerManagerConfigResponse>,
+) -> KubeControllerManagerConfigResponse {
+    KubeControllerManagerConfigResponse {
+        pod_gc_controller_config: Some(PodGcControllerConfigResponse {
+            terminated_pod_gc_threshold: Some(
+                requested
+                    .and_then(|config| config.pod_gc_controller_config.as_ref())
+                    .and_then(|pod_gc| pod_gc.terminated_pod_gc_threshold)
+                    .or_else(|| {
+                        current
+                            .and_then(|config| config.pod_gc_controller_config.as_ref())
+                            .and_then(|pod_gc| pod_gc.terminated_pod_gc_threshold)
+                    })
+                    .unwrap_or(DEFAULT_TERMINATED_POD_GC_THRESHOLD),
+            ),
+        }),
+        horizontal_pod_autoscaler_controller_config: Some(
+            HorizontalPodAutoscalerControllerConfigResponse {
+                horizontal_pod_autoscaler_sync_period: Some(
+                    requested
+                        .and_then(|config| {
+                            config.horizontal_pod_autoscaler_controller_config.as_ref()
+                        })
+                        .and_then(|hpa| hpa.horizontal_pod_autoscaler_sync_period.clone())
+                        .or_else(|| {
+                            current
+                                .and_then(|config| {
+                                    config.horizontal_pod_autoscaler_controller_config.as_ref()
+                                })
+                                .and_then(|hpa| {
+                                    hpa.horizontal_pod_autoscaler_sync_period.clone()
+                                })
+                        })
+                        .unwrap_or_else(|| DEFAULT_HPA_SYNC_PERIOD.to_string()),
+                ),
+            },
+        ),
+    }
+}
+
 impl ClusterRecord {
     /// Materialise the status moves the clock already owes at `now`.
     ///
@@ -2418,6 +2682,11 @@ impl ClusterRecord {
         if self.active_at.is_some_and(|due| now >= due) {
             self.status = STATUS_ACTIVE.to_string();
             self.active_at = None;
+            // Reaching `ACTIVE` is what provisioning the control plane
+            // completes, so this is where the members that only exist once
+            // there is one start being reported (see
+            // [`Self::control_plane_provisioned`]).
+            self.control_plane_provisioned = true;
         }
         // A connected cluster whose activation window closed with no manifest
         // applied is no longer a usable registration, and that move was due at
@@ -2644,30 +2913,74 @@ impl ClusterRecord {
     }
 
     /// This record as the modelled `Cluster` shape.
+    ///
+    /// Everything it reports is stored on the record, with two rules over which
+    /// of those members a caller may SEE:
+    ///
+    /// * the members that exist only once Amazon EKS has provisioned the control
+    ///   plane behind the cluster — the API server `endpoint`, the `identity` it
+    ///   issues tokens under, the `certificateAuthority` it signs with, and the
+    ///   cluster security group it creates for the cluster — are reported from
+    ///   that point on and not before ([`Self::control_plane_provisioned`]). A
+    ///   client that builds a kubeconfig out of `endpoint` and
+    ///   `certificateAuthority.data` therefore reads nothing while the cluster is
+    ///   still `CREATING`, which is what tells it to keep waiting, instead of a
+    ///   host and a certificate that answer nothing.
+    /// * `clientRequestToken` is reported by nobody: it is the idempotency token
+    ///   of a CALL ("A unique, case-sensitive identifier that you provide to
+    ///   ensure the idempotency of the request"), not a member of the cluster
+    ///   that call created, so a later read of the cluster cannot report one and
+    ///   neither does the create that was given it.
+    ///
+    /// `accessConfig.bootstrapClusterCreatorAdminPermissions` is reported only by
+    /// the call that created the cluster — see [`Self::to_created_cluster`].
+    ///
+    /// The configuration defaults Amazon EKS resolves for a cluster (its control
+    /// plane logging, the security groups and egress mode of its VPC
+    /// configuration, the load balancing capability, the scaling tier and the
+    /// three Kubernetes component configurations) are resolved where the
+    /// configuration is WRITTEN — [`reported_logging`] and the `reported_*`
+    /// functions beside it, called by `CreateCluster` and by the completion of an
+    /// `UpdateClusterConfig` — so this projection reports the record as it
+    /// stands.
     pub fn to_cluster(&self) -> Cluster {
+        let provisioned = self.control_plane_provisioned;
         Cluster {
             name: Some(self.name.clone()),
             arn: Some(self.arn.clone()),
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
             version: self.version.clone(),
-            endpoint: self.endpoint.clone(),
+            endpoint: provisioned.then(|| self.endpoint.clone()).flatten(),
             role_arn: self.role_arn.clone(),
-            resources_vpc_config: self.resources_vpc_config.clone(),
+            resources_vpc_config: self.resources_vpc_config.clone().map(|vpc_config| {
+                VpcConfigResponse {
+                    // The group Amazon EKS creates for the cluster is part of
+                    // provisioning its control plane, so it is reported with the
+                    // rest of what provisioning produced.
+                    cluster_security_group_id: provisioned
+                        .then(|| vpc_config.cluster_security_group_id.clone())
+                        .flatten(),
+                    ..vpc_config
+                }
+            }),
             kubernetes_network_config: self.kubernetes_network_config.clone(),
             logging: self.logging.clone(),
-            identity: self.identity.clone(),
+            identity: provisioned.then(|| self.identity.clone()).flatten(),
             status: Some(self.status.clone()),
             certificate_authority: self.certificate_authority.clone().map(|certificate| {
                 Certificate {
+                    data: provisioned.then(|| certificate.data.clone()).flatten(),
                     // "An object identifying the certificate authority that is
                     // currently signing certificates for the cluster" is derived
                     // from the CA records, so it follows an activation without a
-                    // second copy of the signer's identity.
-                    active: self.active_certificate_authority(),
-                    ..certificate
+                    // second copy of the signer's identity — and nothing signs
+                    // for a control plane that does not exist yet.
+                    active: provisioned
+                        .then(|| self.active_certificate_authority())
+                        .flatten(),
                 }
             }),
-            client_request_token: self.client_request_token.clone(),
+            client_request_token: None,
             platform_version: self.platform_version.clone(),
             tags: Some(
                 self.tags
@@ -2695,6 +3008,52 @@ impl ClusterRecord {
             // cluster insights.
             id: None,
             health: None,
+        }
+    }
+
+    /// This record as the `Cluster` the call that CREATED it answers with: the
+    /// cluster plus the one member that belongs to that call rather than to the
+    /// cluster.
+    ///
+    /// `accessConfig.bootstrapClusterCreatorAdminPermissions` "specifies whether
+    /// or not the cluster creator IAM principal was set as a cluster admin access
+    /// entry during cluster creation time" — a decision the create request made,
+    /// which is why the create answers with it while a later read of the cluster
+    /// reports the cluster's access configuration without it.
+    pub fn to_created_cluster(&self) -> Cluster {
+        let mut cluster = self.to_cluster();
+        if let Some(access_config) = cluster.access_config.as_mut() {
+            access_config.bootstrap_cluster_creator_admin_permissions =
+                self.bootstrap_cluster_creator_admin_permissions;
+        }
+        cluster
+    }
+
+    /// This record as the `Cluster` the call that DELETED it answers with: the
+    /// cluster as it stood, without the configuration of the Kubernetes control
+    /// plane components.
+    ///
+    /// EVIDENCE, not inference: the recorded delete response of this issue's
+    /// fixture carries no `kubeApiServerConfig`, `kubeSchedulerConfig` or
+    /// `kubeControllerManagerConfig` at all, while the recorded CREATE of the same
+    /// cluster carries all three (each of the three is among this issue's
+    /// `CreateCluster` keys and none is among its `DeleteCluster` keys, and the
+    /// replay reported them as divergences the moment this answer began reporting
+    /// them). Those three describe the components a RUNNING control plane serves
+    /// with, and a delete has already started taking that control plane down.
+    ///
+    /// Everything else is what [`Self::to_cluster`] reports — the cluster's name,
+    /// status, networking, logging, scaling tier and access configuration, which a
+    /// client diffing or logging the record it is losing still needs — including
+    /// the provisioning gate: a cluster deleted before its control plane was ever
+    /// provisioned reports no endpoint, identity or certificate authority, because
+    /// there never was one.
+    pub fn to_deleted_cluster(&self) -> Cluster {
+        Cluster {
+            kube_api_server_config: None,
+            kube_scheduler_config: None,
+            kube_controller_manager_config: None,
+            ..self.to_cluster()
         }
     }
 }
@@ -4086,10 +4445,14 @@ fn control_plane_scaling_tiers() -> Vec<ControlPlaneScalingTierInfo> {
 ///
 /// `KubeApiServerConfigRequest$eventTtl` is "The duration that Kubernetes events
 /// are retained. Valid values are single-unit durations such as `30m` or `1h`",
-/// and `1h` is the kube-apiserver `--event-ttl` default — so the catalog
-/// publishes the component's own default, in the single-unit form the member
-/// documents.
-const DEFAULT_EVENT_TTL: &str = "1h";
+/// and one hour is the kube-apiserver `--event-ttl` default. `60m` is the spelling
+/// of that hour the recorded cluster payload carries, and the member's doc states
+/// no rule that would choose between the two spellings of one duration.
+///
+/// It is BOTH what the version catalog publishes as that parameter's default and
+/// what a cluster that overrode nothing reports for it
+/// ([`reported_kube_api_server_config`]), which is why there is one constant.
+const DEFAULT_EVENT_TTL: &str = "60m";
 /// The window the `eventTtl` catalog publishes around [`DEFAULT_EVENT_TTL`].
 ///
 /// AWS publishes no bound for this parameter and the model constrains it only to
@@ -4106,6 +4469,16 @@ const EVENT_TTL_MAX: &str = "24h";
 const DEFAULT_SERVICE_NODE_PORT_MIN: i32 = 30_000;
 /// See [`DEFAULT_SERVICE_NODE_PORT_MIN`].
 const DEFAULT_SERVICE_NODE_PORT_MAX: i32 = 32_767;
+
+/// The default `NodePort` range as the modelled shape — the value both the
+/// version catalog publishes and a cluster that overrode nothing reports (see
+/// [`reported_kube_api_server_config`]).
+fn default_service_node_port_range() -> ServiceNodePortRange {
+    ServiceNodePortRange {
+        min_port: DEFAULT_SERVICE_NODE_PORT_MIN,
+        max_port: DEFAULT_SERVICE_NODE_PORT_MAX,
+    }
+}
 /// The range each end of a `NodePort` range may be chosen from: an unprivileged
 /// TCP/UDP port, so from 1024 up to the last port number there is.
 const SERVICE_NODE_PORT_FLOOR: i32 = 1_024;
@@ -4155,6 +4528,28 @@ const RESOURCE_WEIGHT_MIN: i32 = 1;
 /// See [`RESOURCE_WEIGHT_MIN`].
 const RESOURCE_WEIGHT_MAX: i32 = 100;
 
+/// The default `NodeResourcesFit` scoring strategy as the modelled shape — the
+/// value both the version catalog publishes and a cluster that overrode nothing
+/// reports (see [`reported_kube_scheduler_config`]): the first
+/// `ScoringStrategyType`, scoring the two resources the Kubernetes scheduler
+/// weights by default.
+fn default_scoring_strategy() -> ScoringStrategy {
+    ScoringStrategy {
+        r#type: SCORING_STRATEGY_TYPES
+            .first()
+            .map(|strategy| (*strategy).to_string()),
+        resources: Some(
+            SCORED_RESOURCES
+                .iter()
+                .map(|name| ResourceWeight {
+                    name: Some((*name).to_string()),
+                    weight: Some(DEFAULT_RESOURCE_WEIGHT),
+                })
+                .collect(),
+        ),
+    }
+}
+
 /// The control-plane component configuration defaults and constraints this
 /// service publishes.
 ///
@@ -4178,10 +4573,7 @@ fn control_plane_component_config() -> ControlPlaneConfigInfo {
                 }),
             }),
             service_node_port_range: Some(PortRangeParameterConfig {
-                default_value: Some(ServiceNodePortRange {
-                    min_port: DEFAULT_SERVICE_NODE_PORT_MIN,
-                    max_port: DEFAULT_SERVICE_NODE_PORT_MAX,
-                }),
+                default_value: Some(default_service_node_port_range()),
                 constraints: Some(PortRangeConstraints {
                     min_port: Some(IntegerRangeConstraint {
                         min: Some(SERVICE_NODE_PORT_FLOOR),
@@ -4197,20 +4589,7 @@ fn control_plane_component_config() -> ControlPlaneConfigInfo {
         kube_scheduler_config: Some(KubeSchedulerVersionConfig {
             node_resources_fit: Some(NodeResourcesFitVersionConfig {
                 scoring_strategy: Some(ScoringStrategyConfig {
-                    default_value: Some(ScoringStrategy {
-                        r#type: SCORING_STRATEGY_TYPES
-                            .first()
-                            .map(|strategy| (*strategy).to_string()),
-                        resources: Some(
-                            SCORED_RESOURCES
-                                .iter()
-                                .map(|name| ResourceWeight {
-                                    name: Some((*name).to_string()),
-                                    weight: Some(DEFAULT_RESOURCE_WEIGHT),
-                                })
-                                .collect(),
-                        ),
-                    }),
+                    default_value: Some(default_scoring_strategy()),
                     constraints: Some(ScoringStrategyConstraints {
                         scoring_strategy: Some(AllowedValuesConstraint {
                             allowed_values: Some(

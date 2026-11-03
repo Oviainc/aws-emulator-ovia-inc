@@ -369,6 +369,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // cluster, which is not something this API — or this emulator — does.
             status: STATUS_PENDING.to_string(),
             active_at: None,
+            // There is no Amazon EKS control plane behind a connected cluster, so
+            // nothing provisions one and the members that would report it stay
+            // unset ([`crate::state::ClusterRecord::control_plane_provisioned`]).
+            control_plane_provisioned: false,
             tags: input
                 .tags
                 .unwrap_or_default()
@@ -376,6 +380,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect::<::std::collections::BTreeMap<_, _>>(),
             encryption_config: Vec::new(),
             access_config: None,
+            // A registration sets up no cluster admin access entry: the member
+            // reports what the CREATE of an Amazon EKS cluster decided, and this
+            // is not one.
+            bootstrap_cluster_creator_admin_permissions: None,
             deletion_protection: false,
             client_request_token: input.client_request_token.clone(),
             outpost_config: None,
