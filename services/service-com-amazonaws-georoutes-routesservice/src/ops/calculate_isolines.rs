@@ -1,22 +1,59 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CalculateIsolines
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CalculateIsolines`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The area reachable within each threshold, computed from the same road network and the
+//! same cost function as every other operation of this service
+//! ([`ComAmazonawsGeoroutesRoutesserviceState::compute_route`]): an isoline's boundary is
+//! resolved one bearing at a time, by searching for the farthest point along that bearing
+//! whose route to or from the anchor still costs no more than the threshold. A route to a
+//! point ON an isoline therefore costs within that isoline's threshold and a route past it
+//! costs more — an isoline and a route for the same travel mode and objective cannot
+//! disagree.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CalculateIsolines::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The anchor is the submitted `Origin` snapped onto the road network, or the snapped
+//! `Destination` for the reversed calculation that shows "areas that could reach your
+//! location": a destination-based isoline costs the route INTO the destination. Exactly one
+//! of the two is the anchor — "either Origin or Destination must be provided" — so a request
+//! that sets neither has nothing to calculate from, and one that sets both does not say
+//! which of the two calculations it is asking for.
 //!
-//! ## Shape of an operation
+//! Thresholds "all must be the same type", so a request carries either distance thresholds
+//! or time thresholds, and the answer carries ONE isoline per threshold in the order the
+//! request listed them, each reporting the threshold it was computed for.
 //!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `CalculateIsolines::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! A boundary is a ring of vertices, wound counterclockwise as GeoJSON winds an exterior
+//! ring and closed by repeating its first position. How many vertices it carries is what
+//! `IsolineGranularity` asks for: `MaxResolution` is "the maximum distance in meters between
+//! points along the isoline", so it is the spacing the vertices are placed at, and
+//! `MaxPoints` is a maximum, so the ring carries the vertices that spacing asks for up to
+//! that cap — never more than this emulator computes one boundary with, and never fewer than
+//! the fewest points a caller may ask for. `OptimizeIsolineFor` is the documented trade-off
+//! "between calculation speed and isoline precision", so it is what chooses how finely the
+//! search resolves each bearing.
+//!
+//! Where the anchor matches no road of the network — it lies outside the mapped territory
+//! the network covers — nothing is reachable and the isoline carries no geometry at all; and
+//! a bearing whose corridor leaves that coverage is not carried by the network, which is
+//! what clips an isoline at a coast. An isoline's `Connections` link the polygons of one
+//! isoline to each other, and this model computes one polygon per isoline, so there is
+//! nothing to link.
+//!
+//! `Avoid.Areas` and `Avoid.ControlledAccessHighways` answer 501, as they do on the sibling
+//! operations: an avoidance area is a routing constraint this model does not compute around,
+//! and a violated best-effort avoidance "produces a notice for the violation", which an
+//! isoline has nowhere to carry. `Allow`, `Traffic` and `TravelModeOptions` have nothing to
+//! act on — the model carries no HOV/HOT lane, traffic variation or vehicle restriction —
+//! and the matching, heading and side-of-street options of `OriginOptions` /
+//! `DestinationOptions` are validated but change nothing, because a position is matched onto
+//! the nearest road its travel mode may use.
+//!
+//! ## Authorization
+//!
+//! The emulator verifies every request's signature before any handler runs, so this handler
+//! checks no credentials. The modelled `Key` (API key) member is consequently not consulted
+//! and the modelled `AccessDeniedException` is unreachable here by construction: this
+//! emulator holds no API-key records to authorize a key against, and refusing a correctly
+//! signed request for want of one would refuse a valid caller.
 //!
 //! ## Reaching this service's state
 //!
@@ -34,7 +71,6 @@
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
 //! The engine is NOT reached through `ctx`.
 //!
-//! @generated by the emulator core scaffold op-stub generator.
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -193,6 +229,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    self, CachedRoute, ComAmazonawsGeoroutesRoutesserviceState, Instant, Position, RoutingObjective,
+    TravelMode,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -214,8 +255,9 @@ pub enum CalculateIsolinesErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::calculate_isolines::CalculateIsolinesError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
+/// (`crate::ops::calculate_isolines::CalculateIsolinesError`). The wrapper is kept because
+/// it is also where the two requests this road model cannot compute an area for are
+/// declined; every refusal of a bad request below uses the model's own `ValidationException`.
 pub type CalculateIsolinesError = crate::scaffolded::Scaffolded<CalculateIsolinesErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
@@ -264,18 +306,648 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CalculateIsolines` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CalculateIsolinesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CalculateIsolines"))
+        let _ = ctx;
+
+        // An avoidance area is a routing constraint this model does not compute around, and
+        // an avoidance it can violate "produces a notice for the violation" that an isoline
+        // has nowhere to carry, so both are declined rather than silently ignored. The rest
+        // of `Avoid` is satisfied trivially: this network carries no toll road, ferry,
+        // tunnel, dirt road, car shuttle train, seasonal closure or zone.
+        if let Some(avoid) = input.avoid.as_ref() {
+            if avoid.areas.as_deref().is_some_and(|areas| !areas.is_empty()) {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "CalculateIsolines with Avoid.Areas",
+                ));
+            }
+            if avoid.controlled_access_highways == Some(true) {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "CalculateIsolines with Avoid.ControlledAccessHighways",
+                ));
+            }
+        }
+
+        let travel_mode = match input.travel_mode.as_deref() {
+            // `Default value: Car`.
+            None => TravelMode::Car,
+            Some(value) => TravelMode::from_model_values(value, ISOLINE_TRAVEL_MODE_VALUES).ok_or_else(|| {
+                invalid(
+                    "TravelMode",
+                    state::must_be_one_of("TravelMode", ISOLINE_TRAVEL_MODE_VALUES),
+                )
+            })?,
+        };
+        let objective = match input.optimize_routing_for.as_deref() {
+            // `Default value: FastestRoute`.
+            None => RoutingObjective::FastestRoute,
+            Some(value) => RoutingObjective::from_model(value).ok_or_else(|| {
+                invalid(
+                    "OptimizeRoutingFor",
+                    state::must_be_one_of("OptimizeRoutingFor", ROUTING_OBJECTIVE_VALUES),
+                )
+            })?,
+        };
+        let precision = match input.optimize_isoline_for.as_deref() {
+            // `Default value: BalancedCalculation`.
+            None => Precision::Balanced,
+            Some(value) => Precision::from_model(value).ok_or_else(|| {
+                invalid(
+                    "OptimizeIsolineFor",
+                    state::must_be_one_of("OptimizeIsolineFor", ISOLINE_OPTIMIZATION_OBJECTIVE_VALUES),
+                )
+            })?,
+        };
+        let geometry_format = state::geometry_format("IsolineGeometryFormat", input.isoline_geometry_format.as_ref())
+            .map_err(|message| invalid("IsolineGeometryFormat", message))?;
+
+        // A per-mode option block belongs to the one travel mode its member names, so a
+        // request may set only the block the `TravelMode` it selected names. This
+        // operation's options structure declares no block for every mode its travel-mode
+        // enum admits, so a mode with none permits no block at all.
+        let declared = declared_travel_mode_options(input.travel_mode_options.as_ref());
+        let permitted: Vec<&str> = state::block_of_mode(travel_mode.as_model(), &declared)
+            .into_iter()
+            .collect();
+        state::check_travel_mode_options(travel_mode.as_model(), &permitted, &declared)
+            .map_err(|(member, message)| invalid(&member, message))?;
+
+        let timing = Timing::resolve(&input)?;
+        let anchor = Anchor::resolve(&input)?;
+        let thresholds = resolve_thresholds(&input.thresholds)?;
+        check_granularity(input.isoline_granularity.as_ref())?;
+        if let Some(options) = input.origin_options.as_ref() {
+            check_point_options("OriginOptions", options.heading, options.side_of_street.as_ref())?;
+        }
+        if let Some(options) = input.destination_options.as_ref() {
+            check_point_options(
+                "DestinationOptions",
+                options.heading,
+                options.side_of_street.as_ref(),
+            )?;
+        }
+
+        let state_handle =
+            state::service_state(&*self.engine).ok_or_else(|| internal("the routes service state is unavailable"))?;
+
+        // The anchor is matched onto the road network once: it is the point every route of
+        // every threshold's search starts from or ends at, and the point the answer reports
+        // as the snapped origin or destination.
+        let (matched, pricing_bucket) = {
+            let mut state = state_handle.lock();
+            (
+                state.snap(anchor.position, travel_mode).map(|snapped| snapped.position),
+                state.pricing_bucket.clone(),
+            )
+        };
+
+        // One isoline per threshold, in the order the request listed them. Each boundary is
+        // resolved under ONE acquisition of the shared state lock, which is released between
+        // thresholds, and the handler yields there — so a five-threshold request neither
+        // holds the lock for the whole request nor leaves a cancellation nowhere to land.
+        let mut isolines = Vec::with_capacity(thresholds.len());
+        for threshold in &thresholds {
+            let ring = match matched {
+                // No road of the network near the anchor: nothing is reachable from it, and
+                // an invented ring would be absence dressed as an area.
+                None => Vec::new(),
+                Some(centre) => {
+                    let mut state = state_handle.lock();
+                    let search = Search {
+                        threshold: *threshold,
+                        mode: travel_mode,
+                        objective,
+                        outward: anchor.outward,
+                        max_radius_m: threshold.max_radius_m(&state, travel_mode, objective),
+                        steps: precision.steps(),
+                    };
+                    let vertices = ring_vertices(input.isoline_granularity.as_ref(), search.max_radius_m);
+                    reachable_ring(&mut state, centre, search, vertices)
+                }
+            };
+            isolines.push(Isoline {
+                // A connection links two polygons of ONE isoline; this model computes a
+                // single polygon per isoline, so it has nothing to link.
+                connections: Vec::new(),
+                distance_threshold: threshold.distance_threshold(),
+                geometries: isoline_geometries(&ring, &geometry_format)?,
+                time_threshold: threshold.time_threshold(),
+            });
+            tokio::task::yield_now().await;
+        }
+
+        let matched_position = matched.map(state::position_to_vec);
+        let (snapped_origin, snapped_destination) = if anchor.outward {
+            (matched_position, None)
+        } else {
+            (None, matched_position)
+        };
+        Ok(CalculateIsolinesOutput {
+            // "Returned only if the Destination and ArrivalTime attributes were provided in
+            // the request", and the departure likewise only for a request that gave an
+            // `Origin` and asked for a departure time (`DepartureTime` or `DepartNow`).
+            arrival_time: timing.reported_arrival(anchor.outward)?,
+            departure_time: timing.reported_departure(anchor.outward)?,
+            isoline_geometry_format: geometry_format,
+            isolines,
+            pricing_bucket,
+            snapped_destination,
+            snapped_origin,
+        })
     }
+}
+
+/// Where the reachable area is measured from, and which way travel runs.
+#[derive(Debug, Clone, Copy)]
+struct Anchor {
+    /// The submitted `Origin` or `Destination`.
+    position: Position,
+    /// Whether travel runs OUT of the anchor (an `Origin`) or INTO it (a `Destination`).
+    outward: bool,
+}
+
+impl Anchor {
+    /// The anchor a request named. "Either Origin or Destination must be provided", and the
+    /// two ask for opposite calculations — areas reachable FROM a point against areas that
+    /// can reach it — so a request names exactly one of them.
+    fn resolve(input: &CalculateIsolinesInput) -> Result<Self, CalculateIsolinesError> {
+        match (input.origin.as_deref(), input.destination.as_deref()) {
+            (None, None) => Err(invalid(
+                ORIGIN_MEMBER,
+                state::at_least_one_of(&ANCHOR_MEMBERS),
+            )),
+            (Some(_), Some(_)) => Err(invalid(
+                DESTINATION_MEMBER,
+                must_not_be_set_with(DESTINATION_MEMBER, ORIGIN_MEMBER),
+            )),
+            (Some(origin), None) => Ok(Self {
+                position: state::validate_position(origin).map_err(|message| invalid(ORIGIN_MEMBER, message))?,
+                outward: true,
+            }),
+            (None, Some(destination)) => Ok(Self {
+                position: state::validate_position(destination)
+                    .map_err(|message| invalid(DESTINATION_MEMBER, message))?,
+                outward: false,
+            }),
+        }
+    }
+}
+
+/// The two members a reachable area can be measured from, in the order this operation's own
+/// documentation names them ("Either Origin or Destination must be provided"), which is the
+/// order a refusal that lists them states them in.
+const ANCHOR_MEMBERS: [&str; 2] = ["Origin", "Destination"];
+const ORIGIN_MEMBER: &str = ANCHOR_MEMBERS[0];
+const DESTINATION_MEMBER: &str = ANCHOR_MEMBERS[1];
+
+/// The two members a threshold can be given under, in the order the model declares them.
+const THRESHOLD_MEMBERS: [&str; 2] = ["Thresholds.Distance", "Thresholds.Time"];
+
+/// The sentence for a member that may not be set ALONGSIDE another, which is how this
+/// service words a rule between two members that cannot hold together: the member at fault
+/// and the member that excludes it are the only variable parts, and no request value is
+/// quoted into it.
+fn must_not_be_set_with(member: &str, excluded_by: &str) -> String {
+    format!("'{member}' must not be set when '{excluded_by}' is set.")
+}
+
+/// Which clock the request pinned the calculation to.
+#[derive(Debug, Clone, Copy)]
+enum Timing {
+    /// No time at all: the request named none, so the answer reports none.
+    Unspecified,
+    /// A departure: `DepartureTime`, or the current instant for `DepartNow`.
+    Departure(Instant),
+    /// An arrival: `ArrivalTime`.
+    Arrival(Instant),
+}
+
+impl Timing {
+    /// The clock a request pinned. `DepartureTime`, `ArrivalTime` and `DepartNow` each pin
+    /// it and each "cannot be used together with" the others, so naming more than one is
+    /// contradictory and refused.
+    fn resolve(input: &CalculateIsolinesInput) -> Result<Self, CalculateIsolinesError> {
+        let depart_now = input.depart_now == Some(true);
+        let named = usize::from(input.departure_time.is_some())
+            + usize::from(input.arrival_time.is_some())
+            + usize::from(depart_now);
+        if named > 1 {
+            return Err(invalid(
+                "DepartureTime",
+                "DepartureTime, ArrivalTime and DepartNow each set the time of the calculation, so at most one may be supplied"
+                    .to_string(),
+            ));
+        }
+        if let Some(departure) = &input.departure_time {
+            return Ok(Self::Departure(
+                state::parse_timestamp("DepartureTime", departure)
+                    .map_err(|message| invalid("DepartureTime", message))?,
+            ));
+        }
+        if let Some(arrival) = &input.arrival_time {
+            return Ok(Self::Arrival(
+                state::parse_timestamp("ArrivalTime", arrival).map_err(|message| invalid("ArrivalTime", message))?,
+            ));
+        }
+        if depart_now {
+            return Ok(Self::Departure(state::now()));
+        }
+        Ok(Self::Unspecified)
+    }
+
+    /// The departure time the answer reports: the instant the request departs at, for a
+    /// request that gave an `Origin` and asked for one.
+    fn reported_departure(self, outward: bool) -> Result<Option<String>, CalculateIsolinesError> {
+        match self {
+            Self::Departure(instant) if outward => Ok(Some(
+                state::format_timestamp(instant)
+                    .ok_or_else(|| internal("the departure time is not representable"))?,
+            )),
+            _ => Ok(None),
+        }
+    }
+
+    /// The arrival time the answer reports: the instant the request arrives by, for a
+    /// request that gave a `Destination` and asked for one.
+    fn reported_arrival(self, outward: bool) -> Result<Option<String>, CalculateIsolinesError> {
+        match self {
+            Self::Arrival(instant) if !outward => Ok(Some(
+                state::format_timestamp(instant).ok_or_else(|| internal("the arrival time is not representable"))?,
+            )),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// One threshold of a request: the distance or the time a reachable area is bounded by.
+#[derive(Debug, Clone, Copy)]
+enum Threshold {
+    Distance(i64),
+    Time(i64),
+}
+
+impl Threshold {
+    /// The cost a route must not exceed to lie inside this threshold.
+    fn limit(self) -> i64 {
+        match self {
+            Self::Distance(metres) => metres,
+            Self::Time(seconds) => seconds,
+        }
+    }
+
+    /// The cost of `route` that this threshold bounds.
+    fn cost_of(self, route: &CachedRoute) -> i64 {
+        match self {
+            Self::Distance(_) => route.distance_m,
+            Self::Time(_) => route.duration_s,
+        }
+    }
+
+    /// How far from the anchor this threshold can possibly reach, in metres.
+    ///
+    /// A route's distance is the length of the geometry it travels, which is never shorter
+    /// than the straight line between its endpoints, and its duration is that distance over
+    /// the travel mode's speed scaled by the objective's factor — so a distance threshold
+    /// reaches at most its own metres, and a time threshold at most what the mode covers in
+    /// its seconds. That makes this the upper bound the search starts from, and it is read
+    /// off the same speeds and factors the cost function uses.
+    fn max_radius_m(
+        self,
+        state: &ComAmazonawsGeoroutesRoutesserviceState,
+        mode: TravelMode,
+        objective: RoutingObjective,
+    ) -> f64 {
+        match self {
+            Self::Distance(metres) => metres as f64,
+            Self::Time(seconds) => {
+                seconds as f64 * state.speed_mps(mode) * state.factors(objective).speed.max(f64::MIN_POSITIVE)
+            }
+        }
+    }
+
+    /// `Isoline$DistanceThreshold`: the distance this isoline was computed for, and the
+    /// member's `@default` of 0 for a time-based one.
+    fn distance_threshold(self) -> i64 {
+        match self {
+            Self::Distance(metres) => metres,
+            Self::Time(_) => 0,
+        }
+    }
+
+    /// `Isoline$TimeThreshold`, the mirror of [`Self::distance_threshold`].
+    fn time_threshold(self) -> i64 {
+        match self {
+            Self::Distance(_) => 0,
+            Self::Time(seconds) => seconds,
+        }
+    }
+}
+
+/// The thresholds a request asked for, in the order it listed them.
+///
+/// "You can specify up to five thresholds (which all must be the same type)": the model
+/// carries the count (`@length 1..5` on each list) and the per-threshold bounds, but not
+/// that the two lists are alternatives, so that rule is enforced here. A request that sets
+/// neither list asks for no area at all.
+fn resolve_thresholds(thresholds: &IsolineThresholds) -> Result<Vec<Threshold>, CalculateIsolinesError> {
+    let distance = thresholds.distance.as_deref().unwrap_or_default();
+    let time = thresholds.time.as_deref().unwrap_or_default();
+    if !distance.is_empty() && !time.is_empty() {
+        return Err(invalid(
+            THRESHOLD_MEMBERS[1],
+            must_not_be_set_with(THRESHOLD_MEMBERS[1], THRESHOLD_MEMBERS[0]),
+        ));
+    }
+    if distance.is_empty() && time.is_empty() {
+        return Err(invalid(
+            THRESHOLD_MEMBERS[0],
+            state::at_least_one_of(&THRESHOLD_MEMBERS),
+        ));
+    }
+    let mut resolved = Vec::with_capacity(distance.len() + time.len());
+    for (index, metres) in distance.iter().enumerate() {
+        let member = format!("{}[{index}]", THRESHOLD_MEMBERS[0]);
+        state::check_range(&member, (0.0, MAX_DISTANCE_THRESHOLD_M as f64), *metres as f64)
+            .map_err(|message| invalid(&member, message))?;
+        resolved.push(Threshold::Distance(*metres));
+    }
+    for (index, seconds) in time.iter().enumerate() {
+        let member = format!("{}[{index}]", THRESHOLD_MEMBERS[1]);
+        state::check_range(&member, (0.0, MAX_TIME_THRESHOLD_S as f64), *seconds as f64)
+            .map_err(|message| invalid(&member, message))?;
+        resolved.push(Threshold::Time(*seconds));
+    }
+    Ok(resolved)
+}
+
+/// The modeled ranges of a threshold: `DistanceThresholdList`'s member narrows
+/// `DistanceMeters` to `0..300000` and `TimeThresholdList`'s narrows `DurationSeconds` to
+/// `0..10800`. The framework refuses a value outside them before this handler runs; these
+/// are the belt, and they state the bounds a threshold is read against.
+const MAX_DISTANCE_THRESHOLD_M: i64 = 300_000;
+const MAX_TIME_THRESHOLD_S: i64 = 10_800;
+
+/// The granularity a request asked for, against the bounds the model declares on it: the
+/// framework's constraint walk refuses a value outside them first, and this is the belt.
+fn check_granularity(granularity: Option<&IsolineGranularityOptions>) -> Result<(), CalculateIsolinesError> {
+    let Some(granularity) = granularity else {
+        return Ok(());
+    };
+    if let Some(max_points) = granularity.max_points {
+        let member = "IsolineGranularity.MaxPoints";
+        state::check_range(
+            member,
+            (MIN_RING_POSITIONS as f64, f64::from(i32::MAX)),
+            f64::from(max_points),
+        )
+        .map_err(|message| invalid(member, message))?;
+    }
+    let member = "IsolineGranularity.MaxResolution";
+    state::check_range(
+        member,
+        (0.0, state::MAX_DISTANCE_OR_DURATION as f64),
+        granularity.max_resolution as f64,
+    )
+    .map_err(|message| invalid(member, message))
+}
+
+/// The options that control how a point is matched onto the road network, against the
+/// bounds the model declares on them.
+///
+/// `Heading` carries a `@default` of 0, which the framework's constraint walk does not hold
+/// to the member's `@range`, so the handler does; `SideOfStreet.Position` is a position like
+/// any other and is held to the WGS 84 domain no model expresses. Neither changes the answer
+/// — a point is matched onto the nearest road its travel mode may use — but a value outside
+/// a declared bound is refused rather than served as if it were inside it.
+fn check_point_options(
+    member: &str,
+    heading: f64,
+    side_of_street: Option<&IsolineSideOfStreetOptions>,
+) -> Result<(), CalculateIsolinesError> {
+    let heading_member = format!("{member}.Heading");
+    state::check_range(&heading_member, HEADING_BOUNDS, heading)
+        .map_err(|message| invalid(&heading_member, message))?;
+    if let Some(side_of_street) = side_of_street {
+        let position_member = format!("{member}.SideOfStreet.Position");
+        state::validate_position(&side_of_street.position)
+            .map_err(|message| invalid(&position_member, message))?;
+    }
+    Ok(())
+}
+
+/// The modeled range of `Heading`, in degrees clockwise from north.
+const HEADING_BOUNDS: (f64, f64) = (0.0, 360.0);
+
+/// How finely the search resolves the boundary along one bearing: `OptimizeIsolineFor` is
+/// the documented trade-off "between calculation speed and isoline precision", so it is
+/// what chooses the number of halvings the search takes. Each halving doubles the
+/// precision, so the boundary lands within `2^-steps` of the threshold's reach: about 3%
+/// for a fast calculation, 0.8% for a balanced one and 0.2% for an accurate one.
+#[derive(Debug, Clone, Copy)]
+enum Precision {
+    Fast,
+    Balanced,
+    Accurate,
+}
+
+impl Precision {
+    /// The precision named by a value of `IsolineOptimizationObjective`, or `None` for one
+    /// the generated value list does not declare.
+    fn from_model(value: &str) -> Option<Self> {
+        if !ISOLINE_OPTIMIZATION_OBJECTIVE_VALUES.contains(&value) {
+            return None;
+        }
+        match value {
+            "FastCalculation" => Some(Self::Fast),
+            "BalancedCalculation" => Some(Self::Balanced),
+            "AccurateCalculation" => Some(Self::Accurate),
+            _ => None,
+        }
+    }
+
+    /// Halvings of the radius interval the search takes per bearing.
+    fn steps(self) -> u32 {
+        match self {
+            Self::Fast => 5,
+            Self::Balanced => 7,
+            Self::Accurate => 9,
+        }
+    }
+}
+
+/// What resolving one isoline's boundary needs: the threshold it is bounded by, how travel
+/// is costed, which way travel runs and how far and finely to search.
+#[derive(Debug, Clone, Copy)]
+struct Search {
+    threshold: Threshold,
+    mode: TravelMode,
+    objective: RoutingObjective,
+    /// Whether travel runs out of the anchor or into it.
+    outward: bool,
+    max_radius_m: f64,
+    steps: u32,
+}
+
+/// Fewest and most positions a ring of this service carries.
+///
+/// `IsolineGranularityOptions$MaxPoints` has a modeled minimum of 31, so 31 points is the
+/// fewest a caller may ask an isoline to be drawn with and so the fewest one is drawn with.
+/// The maximum is this emulator's own bound on the work one boundary costs — AWS publishes
+/// none — and it is a legitimate answer to a larger `MaxPoints` because that member is a
+/// MAXIMUM: "the maximum number of points used to define each isoline".
+const MIN_RING_POSITIONS: usize = 31;
+const MAX_RING_POSITIONS: usize = 300;
+
+/// How many DISTINCT vertices a boundary is resolved at, for the granularity a request
+/// asked for and the farthest the threshold can reach.
+///
+/// `MaxResolution` is "the maximum distance in meters between points along the isoline", so
+/// it is the spacing the vertices are placed at; with none asked for they are placed at the
+/// spacing this service samples a geometry at. The boundary lies within the circle of
+/// `max_radius_m`, so its length is at most that circle's circumference and the vertices
+/// that spacing asks for are that circumference over it — plus the one position that closes
+/// the ring.
+fn ring_vertices(granularity: Option<&IsolineGranularityOptions>, max_radius_m: f64) -> usize {
+    let spacing = granularity
+        .map(|granularity| granularity.max_resolution)
+        .filter(|resolution| *resolution > 0)
+        .map_or(state::SAMPLE_SPACING_M, |resolution| resolution as f64);
+    let asked = (2.0 * std::f64::consts::PI * max_radius_m / spacing.max(1.0)).ceil();
+    let asked = if asked.is_finite() && asked >= 0.0 {
+        asked as usize
+    } else {
+        MAX_RING_POSITIONS
+    };
+    let allowed = granularity
+        .and_then(|granularity| granularity.max_points)
+        .and_then(|points| usize::try_from(points).ok())
+        .unwrap_or(MAX_RING_POSITIONS)
+        .clamp(MIN_RING_POSITIONS, MAX_RING_POSITIONS);
+    asked.saturating_add(1).clamp(MIN_RING_POSITIONS, allowed) - 1
+}
+
+/// The boundary of the area reachable within `search.threshold` around `anchor`: one
+/// position per bearing, closed by repeating the first.
+///
+/// The bearings run COUNTERCLOCKWISE — this service measures a bearing clockwise from north,
+/// so the ring is walked in decreasing bearing — because that is how GeoJSON winds the
+/// exterior ring of a polygon.
+fn reachable_ring(
+    state: &mut ComAmazonawsGeoroutesRoutesserviceState,
+    anchor: Position,
+    search: Search,
+    vertices: usize,
+) -> Vec<Position> {
+    let mut ring = Vec::with_capacity(vertices + 1);
+    for index in 0..vertices {
+        let bearing_deg = -360.0 * index as f64 / vertices as f64;
+        let radius_m = boundary_radius_m(state, anchor, bearing_deg, search);
+        ring.push(state::position_at_bearing(anchor, bearing_deg, radius_m));
+    }
+    if let Some(first) = ring.first().copied() {
+        ring.push(first);
+    }
+    ring
+}
+
+/// How far along `bearing_deg` the area reaches: the greatest radius the search resolves
+/// whose route between that point and `anchor` the network carries at no more than the
+/// threshold's cost.
+///
+/// The cost comes from [`ComAmazonawsGeoroutesRoutesserviceState::compute_route`] — the one
+/// cost function of this service — so the boundary is where a route to it stops fitting the
+/// threshold, and a route the network does not carry the whole way (a corridor leaving the
+/// mapped territory) is not reachable at any cost, which is what clips a boundary at a
+/// coast. The search starts at the farthest the threshold could possibly reach and halves
+/// the interval `search.steps` times; the anchor itself costs nothing, so there is always a
+/// radius inside the threshold to return.
+fn boundary_radius_m(
+    state: &mut ComAmazonawsGeoroutesRoutesserviceState,
+    anchor: Position,
+    bearing_deg: f64,
+    search: Search,
+) -> f64 {
+    let mut within_threshold = |radius_m: f64| -> bool {
+        let candidate = state::position_at_bearing(anchor, bearing_deg, radius_m);
+        let positions = if search.outward {
+            [anchor, candidate]
+        } else {
+            [candidate, anchor]
+        };
+        let route = state.compute_route(&positions, search.mode, search.objective, 0);
+        route.connected && search.threshold.cost_of(&route) <= search.threshold.limit()
+    };
+    if within_threshold(search.max_radius_m) {
+        return search.max_radius_m;
+    }
+    let (mut inside, mut outside) = (0.0_f64, search.max_radius_m);
+    for _ in 0..search.steps {
+        let middle = inside + (outside - inside) / 2.0;
+        if within_threshold(middle) {
+            inside = middle;
+        } else {
+            outside = middle;
+        }
+    }
+    inside
+}
+
+/// The geometry of one isoline, in the requested format: the polygon its boundary ring
+/// encloses, or no geometry at all where nothing is reachable.
+fn isoline_geometries(
+    ring: &[Position],
+    format: &str,
+) -> Result<Vec<IsolineShapeGeometry>, CalculateIsolinesError> {
+    // A linear ring carries four positions at least, so a ring shorter than that encloses
+    // no area and there is no polygon to report.
+    if ring.len() < MIN_RING_LENGTH {
+        return Ok(Vec::new());
+    }
+    if format == "Simple" {
+        return Ok(vec![IsolineShapeGeometry {
+            polygon: Some(vec![state::line_string(ring)]),
+            polyline_polygon: None,
+        }]);
+    }
+    Ok(vec![IsolineShapeGeometry {
+        polygon: None,
+        polyline_polygon: Some(vec![state::encode_flexible_polyline(ring)
+            .ok_or_else(|| internal("the isoline geometry could not be encoded as a Flexible Polyline"))?]),
+    }])
+}
+
+/// The modeled minimum length of a `LinearRing`: four positions, the fewest that close a
+/// ring around an area.
+const MIN_RING_LENGTH: usize = 4;
+
+/// Every per-mode option block `IsolineTravelModeOptions` declares, in the model's order,
+/// paired with whether the request set it — what [`state::check_travel_mode_options`] holds
+/// against the selected `TravelMode`.
+fn declared_travel_mode_options(options: Option<&IsolineTravelModeOptions>) -> [(&'static str, bool); 3] {
+    [
+        ("Car", options.is_some_and(|set| set.car.is_some())),
+        ("Scooter", options.is_some_and(|set| set.scooter.is_some())),
+        ("Truck", options.is_some_and(|set| set.truck.is_some())),
+    ]
+}
+
+/// The model's own `ValidationException` (HTTP 400) for a request member this service
+/// refuses, naming the member and the rule it broke.
+fn invalid(member: &str, message: String) -> CalculateIsolinesError {
+    CalculateIsolinesErrorModeled::ValidationException(ValidationException {
+        message: message.clone(),
+        reason: "FieldValidationFailed".to_string(),
+        field_list: vec![ValidationExceptionField {
+            name: member.to_string(),
+            message,
+        }],
+    })
+    .into()
+}
+
+/// The model's `InternalServerException` (HTTP 500), for a failure of this emulator rather
+/// than of the request.
+fn internal(message: &str) -> CalculateIsolinesError {
+    CalculateIsolinesErrorModeled::InternalServerException(InternalServerException {
+        message: message.to_string(),
+    })
+    .into()
 }

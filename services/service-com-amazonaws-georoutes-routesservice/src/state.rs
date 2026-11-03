@@ -141,11 +141,12 @@ const MOTORWAY_SPEED_KPH: f64 = 90.0;
 const STREET_SPEED_KPH: f64 = 50.0;
 const FOOTPATH_SPEED_KPH: f64 = 5.0;
 
-/// Target spacing of the samples a leg's geometry is built from. A leg is sampled every
-/// ~250 m (at least two samples, at most [`MAX_PATH_SEGMENTS`]) and every interior sample
-/// is snapped onto the road network, so the returned geometry follows the roads rather
-/// than the straight line between the two positions.
-const SAMPLE_SPACING_M: f64 = 250.0;
+/// Target spacing of the samples a geometry of this service is built from. A leg is
+/// sampled every ~250 m (at least two samples, at most [`MAX_PATH_SEGMENTS`]) and every
+/// interior sample is snapped onto the road network, so the returned geometry follows the
+/// roads rather than the straight line between the two positions. It is also the spacing
+/// the vertices of a computed area are placed at where the request asks for no other.
+pub const SAMPLE_SPACING_M: f64 = 250.0;
 /// Upper bound on the samples per leg, so a long leg stays a bounded response.
 const MAX_PATH_SEGMENTS: usize = 24;
 
@@ -1274,6 +1275,18 @@ pub fn planar_bearing_deg(from: Position, to: Position) -> Option<f64> {
         return None;
     }
     Some(dx.atan2(dy).to_degrees().rem_euclid(360.0))
+}
+
+/// The position `distance_m` metres from `from` along `bearing_deg`, the bearing measured
+/// clockwise from north in the local planar frame at `from` — the inverse of
+/// [`planar_bearing_deg`], kept inside the WGS 84 bounds.
+pub fn position_at_bearing(from: Position, bearing_deg: f64, distance_m: f64) -> Position {
+    let (mx, my) = metres_per_degree(from[1]);
+    let radians = bearing_deg.to_radians();
+    [
+        (from[0] + distance_m * radians.sin() / mx).clamp(LONGITUDE_BOUNDS.0, LONGITUDE_BOUNDS.1),
+        (from[1] + distance_m * radians.cos() / my).clamp(LATITUDE_BOUNDS.0, LATITUDE_BOUNDS.1),
+    ]
 }
 
 /// The turn from bearing `entered` to bearing `left`, in degrees in `(-180, 180]`:

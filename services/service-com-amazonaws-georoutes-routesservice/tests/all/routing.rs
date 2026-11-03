@@ -2389,7 +2389,7 @@ async fn contradictory_or_unknown_members_are_refused() {
 /// Every operation of this service reports the pricing bucket HELD IN STATE in the
 /// required `PricingBucket` member, which the model binds to the
 /// `x-amz-geo-pricing-bucket` HTTP header (`@httpHeader` on
-/// `CalculateRoutesResponse$PricingBucket` and its three siblings), and reports the same
+/// `CalculateRoutesResponse$PricingBucket` and its four siblings), and reports the same
 /// value however the request varies — the bucket is a property of the service, not of the
 /// request, so nothing in the body carries it.
 #[tokio::test]
@@ -2403,13 +2403,24 @@ async fn every_operation_reports_the_pricing_bucket_held_in_state() {
     let near = [-123.1, 49.28];
     let far = [-123.12, 49.26];
 
-    // Rows span the four implemented operations and, within each, requests that differ in
-    // the dimensions the response varies over (waypoints, size, radius, travel mode).
-    let cases: [(&str, &str, Value); 8] = [
+    // Rows span the five implemented operations and, within each, requests that differ in
+    // the dimensions the response varies over (waypoints, size, radius, travel mode,
+    // threshold).
+    let cases: [(&str, &str, Value); 10] = [
         (
             "a direct route",
             ROUTES,
             json!({ "Origin": near, "Destination": far }),
+        ),
+        (
+            "a time-based isoline",
+            ISOLINES,
+            json!({ "Origin": near, "Thresholds": { "Time": [300] } }),
+        ),
+        (
+            "a distance-based isoline around a destination",
+            ISOLINES,
+            json!({ "Destination": far, "Thresholds": { "Distance": [2000] } }),
         ),
         (
             "a route through a waypoint, on foot",
@@ -2494,7 +2505,7 @@ async fn what_cannot_be_computed_answers_501() {
     let router = routes_service();
     let good = [-123.1, 49.28];
     let area = json!({ "Geometry": { "BoundingBox": [-124.0, 49.0, -123.0, 50.0] } });
-    let cases: [(&str, &str, Value); 13] = [
+    let cases: [(&str, &str, Value); 14] = [
         (
             "a transit route",
             ROUTES,
@@ -2511,9 +2522,22 @@ async fn what_cannot_be_computed_answers_501() {
             json!({ "Origin": good, "Driver": { "RestProfile": { "Profile": "EU" } } }),
         ),
         (
-            "an isoline",
+            "an area to avoid on an isoline",
             ISOLINES,
-            json!({ "Origin": good, "Thresholds": { "Distance": [1000] } }),
+            json!({
+                "Origin": good,
+                "Thresholds": { "Distance": [1000] },
+                "Avoid": { "Areas": [area.clone()] }
+            }),
+        ),
+        (
+            "controlled-access highways avoided on an isoline",
+            ISOLINES,
+            json!({
+                "Origin": good,
+                "Thresholds": { "Time": [600] },
+                "Avoid": { "ControlledAccessHighways": true }
+            }),
         ),
         (
             "a country exclusion",
