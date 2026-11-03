@@ -680,7 +680,7 @@ async fn the_operation_id_a_request_names_is_the_operations_own_and_cannot_be_re
             Some("OperationIdAlreadyExistsException"),
             "case {case:?}: expected the modelled refusal, got {body}"
         );
-        let expected = format!("Operation id {operation_id} already exists");
+        let expected = format!("Operation with Id {operation_id} already exists");
         assert_eq!(
             message.as_deref(),
             Some(expected.as_str()),

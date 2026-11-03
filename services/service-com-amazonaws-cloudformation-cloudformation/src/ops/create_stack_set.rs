@@ -420,10 +420,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             return Err(CreateStackSetErrorModeled::NameAlreadyExistsException(
                 NameAlreadyExistsException {
-                    // "The specified name is already in use", worded as this service words
-                    // every other refusal naming a StackSet (`stack_set_does_not_exist`),
-                    // with the name taken from the request rather than from any one record.
-                    message: Some(format!("StackSet {} already exists", input.stack_set_name)),
+                    // "The specified name is already in use", worded as CloudFormation words
+                    // it: one fixed sentence, with no part of the request in it.
+                    message: Some(stack_sets::STACK_SET_ALREADY_EXISTS.to_string()),
                 },
             )
             .into());

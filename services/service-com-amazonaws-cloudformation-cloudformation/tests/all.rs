@@ -303,6 +303,8 @@ mod stack_set_lifecycle;
 mod stack_set_mutations;
 #[path = "all/stack_set_operation_refusal_wording.rs"]
 mod stack_set_operation_refusal_wording;
+#[path = "all/stack_set_operation_tokens_and_outcomes.rs"]
+mod stack_set_operation_tokens_and_outcomes;
 #[path = "all/stack_set_refusal_wording.rs"]
 mod stack_set_refusal_wording;
 #[path = "all/stack_set_revision_rollout.rs"]

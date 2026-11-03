@@ -560,8 +560,9 @@ async fn updating_stack_instances_puts_the_overrides_in_force_on_the_selected_in
                 case.case
             );
         }
-        // While the operation is in flight the instances it is updating report it running in
-        // their account and Region.
+        // While the operation is in flight the instances it is updating report it as not yet
+        // started in their account and Region: the operation's conclusion is what carries it
+        // out there.
         for (account, region) in &case.updated {
             let (status, body) =
                 describe_stack_instance(&router, case.stack_set_name, account, region).await;
@@ -576,9 +577,9 @@ async fn updating_stack_instances_puts_the_overrides_in_force_on_the_selected_in
             );
             assert_eq!(
                 xml_text(&body, "DetailedStatus").as_deref(),
-                Some(detailed_status::RUNNING),
-                "case {:?}: expected the update to be running in {account}/{region}, got \
-                 {body}",
+                Some(detailed_status::PENDING),
+                "case {:?}: expected the update to have yet to start in {account}/{region}, \
+                 got {body}",
                 case.case
             );
             assert_eq!(

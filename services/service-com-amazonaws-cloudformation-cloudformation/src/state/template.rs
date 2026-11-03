@@ -461,6 +461,22 @@ pub struct DeclaredParameter {
     pub allowed_values: Vec<String>,
 }
 
+/// The latest `AWSTemplateFormatVersion`, which is the version in FORCE for a template that
+/// declares none: "if you don't specify a value, CloudFormation assumes the latest template
+/// format version", and the latest format version is the only value the section accepts.
+pub const LATEST_FORMAT_VERSION: &str = "2010-09-09";
+
+/// The template format version in force for `declared`: the one the template states, or
+/// [`LATEST_FORMAT_VERSION`] for one that states none — a template declaring no
+/// `AWSTemplateFormatVersion` still conforms to a version, which is what a reader of the
+/// version (`GetTemplateSummaryOutput$Version`) asks for.
+pub fn format_version_in_force(declared: &Template) -> String {
+    declared
+        .format_version
+        .clone()
+        .unwrap_or_else(|| LATEST_FORMAT_VERSION.to_string())
+}
+
 /// A template body, as this service reads it.
 #[derive(Debug, Clone, Default)]
 pub struct Template {

@@ -338,6 +338,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // not the request's literal account list: the pre-lock check is a cheap early
             // reject over the accounts the request named, and this is the authoritative one.
             let requested = accounts.len().saturating_mul(regions.len());
+            // "The specified operation ID already exists": the id this request carries is
+            // THIS stack set's record of an operation already, so the work it asks for was
+            // already taken on under that id and is not performed a second time. Answered
+            // BEFORE the single-flight refusal below, since that one is about a DIFFERENT
+            // operation holding the stack set: a caller re-sending its own token is told the
+            // token was already used (do not retry), not to retry later.
+            if stack_set.operation(&operation_id).is_some() {
+                return Err(
+                    CreateStackInstancesErrorModeled::OperationIdAlreadyExistsException(
+                        OperationIdAlreadyExistsException {
+                            message: Some(operation_id_already_exists(&operation_id)),
+                        },
+                    )
+                    .into(),
+                );
+            }
             // "Only one operation can be performed for a stack set at a given time": the
             // refusal names the StackSet it is about and the operation that still holds it.
             if let Some(in_flight) = stack_set.operation_in_flight() {
@@ -350,18 +366,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                     &in_flight.operation_id,
                                 ),
                             ),
-                        },
-                    )
-                    .into(),
-                );
-            }
-            // "The specified operation ID already exists": the same id names the operation
-            // that already ran, so this request is not performed a second time.
-            if stack_set.operation(&operation_id).is_some() {
-                return Err(
-                    CreateStackInstancesErrorModeled::OperationIdAlreadyExistsException(
-                        OperationIdAlreadyExistsException {
-                            message: Some(operation_id_already_exists(&operation_id)),
                         },
                     )
                     .into(),
@@ -636,10 +640,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     operation_id.clone(),
                 );
                 instance.stack_id = Some(stack_id.clone());
-                // "RUNNING: The operation in the specified account and Region is
-                // currently in progress" — the instance is answered mid-deployment and
-                // reaches `CURRENT`/`SUCCEEDED` when the operation concludes.
-                instance.detailed_status = detailed_status::RUNNING.to_string();
+                // "PENDING: The operation in the specified account and Region has yet to
+                // start" — which is the state the deployment to a target is in while the
+                // operation that deploys it is still in flight: the operation's own
+                // progression is what starts a target's deployment, and its CONCLUSION is
+                // what reports the target `CURRENT`/`SUCCEEDED`. So a stop that arrives
+                // before the operation concluded still finds this deployment unstarted and
+                // cancels it, rather than reporting a target that deployed.
                 instance.parameter_overrides = declared_overrides.clone();
                 if let Some(stack_set) = store.resolve_stack_set_mut(&region, &stack_set_id) {
                     stack_set.record_instance(instance);

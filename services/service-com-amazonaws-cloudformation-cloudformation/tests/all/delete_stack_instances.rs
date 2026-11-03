@@ -393,7 +393,8 @@ async fn deleting_stack_instances_takes_them_out_of_the_stack_set() {
             );
         }
         // While the operation is in flight the instances it is deleting are still the
-        // StackSet's, reporting the deletion running in their account and Region.
+        // StackSet's, reporting the deletion as not yet started in their account and Region:
+        // the operation's conclusion is what carries it out there.
         for (account, region) in &case.gone {
             let (status, body) =
                 describe_stack_instance(&router, case.stack_set_name, account, region).await;
@@ -408,9 +409,9 @@ async fn deleting_stack_instances_takes_them_out_of_the_stack_set() {
             );
             assert_eq!(
                 xml_text(&body, "DetailedStatus").as_deref(),
-                Some(detailed_status::RUNNING),
-                "case {:?}: expected the deletion to be running in {account}/{region}, got \
-                 {body}",
+                Some(detailed_status::PENDING),
+                "case {:?}: expected the deletion to have yet to start in {account}/{region}, \
+                 got {body}",
                 case.case
             );
             assert_eq!(

@@ -374,6 +374,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // "The specified operation ID already exists": the id this request carries is THIS
+        // stack set's record of an operation already, so the work it asks for was already
+        // taken on under that id and is not performed a second time. Answered BEFORE the
+        // single-flight refusal below, since that one is about a DIFFERENT operation holding
+        // the stack set.
+        if stack_set.operation(&operation_id).is_some() {
+            return Err(
+                ImportStacksToStackSetErrorModeled::OperationIdAlreadyExistsException(
+                    OperationIdAlreadyExistsException {
+                        message: Some(stack_sets::operation_id_already_exists(&operation_id)),
+                    },
+                )
+                .into(),
+            );
+        }
         // "Only one operation can be performed for a stack set at a given time": the refusal
         // names the StackSet it is about and the operation that still holds it.
         if let Some(in_flight) = stack_set.operation_in_flight() {
@@ -384,18 +399,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             &stack_set.stack_set_arn,
                             &in_flight.operation_id,
                         )),
-                    },
-                )
-                .into(),
-            );
-        }
-        // "The specified operation ID already exists": the same id names the operation that
-        // already ran on this StackSet, so this request is not performed a second time.
-        if stack_set.operation(&operation_id).is_some() {
-            return Err(
-                ImportStacksToStackSetErrorModeled::OperationIdAlreadyExistsException(
-                    OperationIdAlreadyExistsException {
-                        message: Some(stack_sets::operation_id_already_exists(&operation_id)),
                     },
                 )
                 .into(),
@@ -534,10 +537,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The ID of the stack instance": the stack that already exists, which is what
             // makes this an import rather than a deployment.
             instance.stack_id = Some(entry.stack_id.clone());
-            // "RUNNING: The operation in the specified account and Region is currently in
-            // progress" — the import is answered in flight and the instance reaches
-            // `CURRENT`/`SUCCEEDED` when the operation concludes.
-            instance.detailed_status = stack_sets::detailed_status::RUNNING.to_string();
+            // "PENDING: The operation in the specified account and Region has yet to start":
+            // the operation's own progression starts the work on a target, and its
+            // CONCLUSION is what reports the target `CURRENT`/`SUCCEEDED` — so a stop that
+            // arrives first still finds this target's import unstarted.
             instance.organizational_unit_id = organizational_unit_id.clone();
             stack_set.record_instance(instance);
         }

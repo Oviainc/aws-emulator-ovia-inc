@@ -436,7 +436,7 @@ async fn each_import_brings_its_stacks_under_the_stack_set() {
                         .to_string(),
                 ),
                 detailed_status: Some(
-                    expected_status(started, detailed_status::RUNNING, detailed_status::SUCCEEDED)
+                    expected_status(started, detailed_status::PENDING, detailed_status::SUCCEEDED)
                         .to_string(),
                 ),
                 // Nothing has been drift checked by an import.
@@ -828,7 +828,7 @@ async fn each_refused_import_names_its_modelled_taxonomy_and_writes_nothing() {
     );
     assert_eq!(
         xml_text(&body, "Message").as_deref(),
-        Some("Operation id the-first-import already exists"),
+        Some("Operation with Id the-first-import already exists"),
         "expected the documented wording, got {body}"
     );
 

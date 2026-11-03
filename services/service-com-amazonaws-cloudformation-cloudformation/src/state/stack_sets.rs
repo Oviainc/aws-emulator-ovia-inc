@@ -153,6 +153,15 @@ pub mod detailed_status {
     /// "FAILED_IMPORT: The import of the stack instance in the specified account and Region
     /// failed."
     pub const FAILED_IMPORT: &str = "FAILED_IMPORT";
+
+    /// Whether the operation's work in that account and Region has not concluded there: it
+    /// has "yet to start" ([`PENDING`]) or is "currently in progress" ([`RUNNING`]).
+    ///
+    /// Every other value of the enum states what became of the target, so the operation's own
+    /// conclusion is what those two are waiting for.
+    pub fn is_unconcluded(detailed_status: &str) -> bool {
+        detailed_status == PENDING || detailed_status == RUNNING
+    }
 }
 
 /// The model's `StackSetOperationAction`: "the type of operation" a stack-set operation is
@@ -622,9 +631,26 @@ pub fn refuse_oversized_parameters(
 /// The message CloudFormation answers when the `OperationId` a request named already names
 /// an operation of that stack set: "The specified operation ID already exists."
 ///
-/// One builder for the five mutations that take the token, so the wording cannot drift.
+/// One builder for the five mutations that take the token, so the wording cannot drift. The
+/// id is the one the request carried, which is the only variable part of the sentence.
 pub fn operation_id_already_exists(operation_id: &str) -> String {
-    format!("Operation id {operation_id} already exists")
+    format!("Operation with Id {operation_id} already exists")
+}
+
+/// The `NameAlreadyExistsException` message a `CreateStackSet` for a name the administrator
+/// account and Region already holds a stack set under is refused with.
+///
+/// A FIXED sentence: CloudFormation words this refusal without naming the stack set, so the
+/// answer a client compares against carries no part of the request in it.
+pub const STACK_SET_ALREADY_EXISTS: &str = "StackSet already exists.";
+
+/// The `InvalidOperationException` message a `StopStackSetOperation` for an operation that is
+/// not in a stoppable state is refused with, naming the status the operation is in.
+///
+/// "Stops an in-progress operation": the status is the one the operation record holds at that
+/// instant, which is the status a read of the operation reports alongside this refusal.
+pub fn cannot_stop_operation(status: &str) -> String {
+    format!("Cannot Stop since Operation is in {status}")
 }
 
 /// The message for a stack set that declares no template, so there is nothing for an
@@ -1075,14 +1101,15 @@ impl StoredStackSet {
             // of the stack set's, so it leaves the stack set when the operation that deleted
             // it concludes — and the removal having been carried out there is "SUCCEEDED:
             // The operation in the specified account and Region completed successfully",
-            // which the operation's own results keep once the instance is gone. An instance
-            // the deletion FAILED on is left where it is, in the state that failure put it
-            // in, so a partly failed deletion reports exactly which instances it could not
-            // remove.
+            // which the operation's own results keep once the instance is gone. A target the
+            // deletion had not concluded in — one it had yet to start, or one it was carrying
+            // out — is carried out by that conclusion; an instance the deletion FAILED on, or
+            // one a stop CANCELLED, is left where it is, in the state that put it there, so a
+            // partly failed deletion reports exactly which instances it could not remove.
             if concluded.action == operation_action::DELETE {
                 for instance in &mut self.instances {
                     if instance.last_operation_id == concluded.operation_id
-                        && instance.detailed_status == detailed_status::RUNNING
+                        && detailed_status::is_unconcluded(&instance.detailed_status)
                     {
                         instance.detailed_status = detailed_status::SUCCEEDED.to_string();
                     }

@@ -401,8 +401,8 @@ async fn a_name_the_region_already_holds_is_refused() {
         );
         assert_eq!(
             xml_text(&body, "Message").as_deref(),
-            Some("StackSet set-twice already exists"),
-            "case {case:?}: expected the refusal to name the StackSet, got {body}"
+            Some("StackSet already exists."),
+            "case {case:?}: expected the fixed refusal sentence, got {body}"
         );
     }
 

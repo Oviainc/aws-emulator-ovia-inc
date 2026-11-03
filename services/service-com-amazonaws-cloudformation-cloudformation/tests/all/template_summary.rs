@@ -126,11 +126,18 @@ fn without_request_id(xml: &str) -> String {
     }
 }
 
+/// The latest `AWSTemplateFormatVersion`, which is the version in force for a template
+/// that declares none: "if you don't specify a value, CloudFormation assumes the latest
+/// template format version", and the latest is the only value the section accepts. Spelled
+/// out here rather than read from the crate: the value is the requirement.
+const LATEST_FORMAT_VERSION: &str = "2010-09-09";
+
 /// One row of the "what the template declares" table.
 struct Case {
     case: &'static str,
     template: String,
-    /// The `AWSTemplateFormatVersion` the response must report.
+    /// The `AWSTemplateFormatVersion` the template DECLARES, `None` for one that declares
+    /// none — whose summary reports [`LATEST_FORMAT_VERSION`], the version in force for it.
     version: Option<&'static str>,
     description: Option<&'static str>,
     /// The `Metadata` section as the JSON document the response must carry.
@@ -356,8 +363,8 @@ async fn get_template_summary_reports_what_the_template_declares() {
         let outside = outside_parameters(&body);
         assert_eq!(
             xml_text(&outside, "Version").as_deref(),
-            case.version,
-            "case {label:?}: expected the template's own format version, got {body}"
+            Some(case.version.unwrap_or(LATEST_FORMAT_VERSION)),
+            "case {label:?}: expected the format version in force, got {body}"
         );
         assert_eq!(
             xml_text(&outside, "Description").as_deref(),

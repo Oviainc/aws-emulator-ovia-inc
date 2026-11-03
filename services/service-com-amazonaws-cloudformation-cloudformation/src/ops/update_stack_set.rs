@@ -480,6 +480,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 regions.len(),
             )
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            // "The specified operation ID already exists": the id this request carries is
+            // THIS stack set's record of an operation already, so the work it asks for was
+            // already taken on under that id and is not performed a second time. Answered
+            // BEFORE the single-flight refusal below, since that one is about a DIFFERENT
+            // operation holding the stack set.
+            if stack_set.operation(&operation_id).is_some() {
+                return Err(
+                    UpdateStackSetErrorModeled::OperationIdAlreadyExistsException(
+                        OperationIdAlreadyExistsException {
+                            message: Some(operation_id_already_exists(&operation_id)),
+                        },
+                    )
+                    .into(),
+                );
+            }
             // "Only one operation can be performed for a stack set at a given time": the
             // refusal names the StackSet it is about and the operation that still holds it. A
             // mutation arriving while a prior operation runs is REFUSED, never queued.
@@ -493,18 +508,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                     &in_flight.operation_id,
                                 ),
                             ),
-                        },
-                    )
-                    .into(),
-                );
-            }
-            // "The specified operation ID already exists": the same id names the operation
-            // that already ran, so this request is not performed a second time.
-            if stack_set.operation(&operation_id).is_some() {
-                return Err(
-                    UpdateStackSetErrorModeled::OperationIdAlreadyExistsException(
-                        OperationIdAlreadyExistsException {
-                            message: Some(operation_id_already_exists(&operation_id)),
                         },
                     )
                     .into(),
@@ -644,6 +647,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
+            // Re-asserted under the WRITING lock in the order the rule gives them: a token
+            // this stack set already holds an operation under is that operation, whatever
+            // else is in flight.
+            if stack_set.operation(&operation_id).is_some() {
+                return Err(
+                    UpdateStackSetErrorModeled::OperationIdAlreadyExistsException(
+                        OperationIdAlreadyExistsException {
+                            message: Some(operation_id_already_exists(&operation_id)),
+                        },
+                    )
+                    .into(),
+                );
+            }
             if let Some(in_flight) = stack_set.operation_in_flight() {
                 return Err(
                     UpdateStackSetErrorModeled::OperationInProgressException(

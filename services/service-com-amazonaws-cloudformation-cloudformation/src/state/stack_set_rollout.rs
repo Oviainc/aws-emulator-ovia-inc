@@ -154,16 +154,18 @@ pub fn redeploy(
             provenance: stack.provenance(),
         })
     });
-    // "RUNNING: The operation in the specified account and Region is currently in progress",
-    // and the operation that last touched this instance is this one — recorded whether or
-    // not the instance had a stack to redeploy, since the operation acted on it either way.
+    // "PENDING: The operation in the specified account and Region has yet to start", and the
+    // operation that last touched this instance is this one — recorded whether or not the
+    // instance had a stack to redeploy, since the operation acted on it either way. The
+    // operation's own progression starts the work on a target, and its CONCLUSION is what
+    // reports the target updated, so a stop that arrives first still finds it unstarted.
     if let Some(stack_set) = store.resolve_stack_set_mut(stack_set_region, stack_set_id) {
         if let Some(instance) = stack_set
             .instances
             .iter_mut()
             .find(|held| held.is_in(account, region))
         {
-            instance.detailed_status = detailed_status::RUNNING.to_string();
+            instance.detailed_status = detailed_status::PENDING.to_string();
             instance.status_reason = None;
             instance.last_operation_id = operation_id.to_string();
         }

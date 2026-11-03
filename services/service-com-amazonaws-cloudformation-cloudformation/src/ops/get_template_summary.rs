@@ -211,9 +211,9 @@ fn summary_of(
         capabilities_reason: required.reason,
         resource_types: Some(template::declared_resource_types(declared)),
         // "The Amazon Web Services template format version, which identifies the
-        // capabilities of the template": the one the template states, and nothing for a
-        // template that states none.
-        version: declared.format_version.clone(),
+        // capabilities of the template": the version in FORCE for this template — the one it
+        // states, or the latest, which is what a template stating none conforms to.
+        version: Some(template::format_version_in_force(declared)),
         // "The value that's defined for the Metadata property of the template", as the JSON
         // document it is. `properties_blob` is this crate's one serializer of a template
         // node into that document, members in key order so the text does not depend on how

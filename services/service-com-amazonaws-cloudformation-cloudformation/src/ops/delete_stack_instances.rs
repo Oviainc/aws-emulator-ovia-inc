@@ -289,6 +289,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .map(move |target_region| (account.as_str(), target_region.as_str()))
                 })
                 .collect();
+            // "The specified operation ID already exists": the id this request carries is
+            // THIS stack set's record of an operation already, so the work it asks for was
+            // already taken on under that id and is not performed a second time. Answered
+            // BEFORE the single-flight refusal below, since that one is about a DIFFERENT
+            // operation holding the stack set.
+            if stack_set.operation(&operation_id).is_some() {
+                return Err(
+                    DeleteStackInstancesErrorModeled::OperationIdAlreadyExistsException(
+                        OperationIdAlreadyExistsException {
+                            message: Some(operation_id_already_exists(&operation_id)),
+                        },
+                    )
+                    .into(),
+                );
+            }
             // "Only one operation can be performed for a stack set at a given time": the
             // refusal names the StackSet it is about and the operation that still holds it.
             if let Some(in_flight) = stack_set.operation_in_flight() {
@@ -301,18 +316,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                     &in_flight.operation_id,
                                 ),
                             ),
-                        },
-                    )
-                    .into(),
-                );
-            }
-            // "The specified operation ID already exists": the same id names the operation
-            // that already ran, so this request is not performed a second time.
-            if stack_set.operation(&operation_id).is_some() {
-                return Err(
-                    DeleteStackInstancesErrorModeled::OperationIdAlreadyExistsException(
-                        OperationIdAlreadyExistsException {
-                            message: Some(operation_id_already_exists(&operation_id)),
                         },
                     )
                     .into(),
@@ -364,7 +367,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     {
                         continue;
                     }
-                    instance.detailed_status = detailed_status::RUNNING.to_string();
+                    // "PENDING: The operation in the specified account and Region has yet to
+                    // start": the operation's own progression starts the work on a target,
+                    // and its CONCLUSION is what carries the removal out there — so a stop
+                    // that arrives first still finds this target's deletion unstarted.
+                    instance.detailed_status = detailed_status::PENDING.to_string();
                     instance.status_reason = None;
                     instance.last_operation_id = operation_id.clone();
                 }

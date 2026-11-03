@@ -75,18 +75,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::stack_sets::{detailed_status, operation_status, PendingOperationOutcome};
-
-/// The `InvalidOperationException` message CloudFormation answers a stop of an operation
-/// that has already ended with.
-///
-/// "Stops an in-progress operation on a StackSet": an operation that is no longer in
-/// progress is not one a stop can act on, and the refusal says which operation it was and
-/// the status it is in — both read off the record this store holds, never from the request
-/// or from any one run.
-fn operation_cannot_be_stopped(operation_id: &str, status: &str) -> String {
-    format!("StackSet operation {operation_id} is in {status} state and cannot be stopped")
-}
+use crate::state::stack_sets::{
+    cannot_stop_operation, detailed_status, operation_status, PendingOperationOutcome,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -214,10 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !operation_status::is_in_flight(&operation.status) {
                 return Err(StopStackSetOperationErrorModeled::InvalidOperationException(
                     InvalidOperationException {
-                        message: Some(operation_cannot_be_stopped(
-                            &operation.operation_id,
-                            &operation.status,
-                        )),
+                        message: Some(cannot_stop_operation(&operation.status)),
                     },
                 )
                 .into());

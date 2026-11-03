@@ -57,10 +57,9 @@ const HELD_OPEN: Duration = Duration::from_secs(600);
 
 /// The `InvalidOperationException` message a stop of an operation that has already ended is
 /// refused with, spelled out here rather than read from the crate: the sentence is the
-/// requirement, so a reworded one must fail this suite. The operation id and the status are
-/// the record's own.
-fn cannot_be_stopped(operation_id: &str, status: &str) -> String {
-    format!("StackSet operation {operation_id} is in {status} state and cannot be stopped")
+/// requirement, so a reworded one must fail this suite. The status is the record's own.
+fn cannot_be_stopped(status: &str) -> String {
+    format!("Cannot Stop since Operation is in {status}")
 }
 
 /// `StopStackSetOperation` for one operation of one StackSet, signed for `REGION`.
@@ -155,7 +154,10 @@ fn refusal(body: &str) -> (Option<String>, Option<String>) {
 /// that conclusion is due out is what makes a row deterministic. It is the only thing a row
 /// reaches into the store for, and it moves nothing else: the stop itself is what re-dates
 /// the conclusion, so a stopped operation still settles on the clock.
-fn hold_the_operation_open(
+///
+/// `pub(crate)` because `stack_set_operation_tokens_and_outcomes.rs` holds an operation open
+/// for the same reason, and one copy of this device is enough for the target.
+pub(crate) fn hold_the_operation_open(
     engine: &Arc<engine::InMemoryEngine>,
     stack_set_name: &str,
     operation_id: &str,
@@ -302,7 +304,7 @@ async fn a_stop_acts_on_an_operation_that_has_not_concluded_and_refuses_one_that
                 Some("InvalidOperationException"),
                 "case {case:?}: expected the modelled refusal, got {body}"
             );
-            let expected = cannot_be_stopped(&operation_id, row.status);
+            let expected = cannot_be_stopped(row.status);
             assert_eq!(
                 message.as_deref(),
                 Some(expected.as_str()),
@@ -668,14 +670,20 @@ async fn a_stop_ends_the_operation_any_mutation_started_and_then_frees_the_stack
         }
 
         if row.action == operation_action::DELETE {
-            // The deletion the stop waited for was carried out, so the instance it deleted
-            // is no longer one of the StackSet's.
+            // "StackSets will cancel all the unstarted stack instance deployments": the
+            // deletion the stop caught had yet to start in that account and Region, so it was
+            // cancelled there and the instance is still one of the StackSet's.
             let (http_status, body) =
                 describe_instance(&router, row.stack_set, ACCOUNT_ID, REGION).await;
             assert_eq!(
-                http_status, 404,
-                "case {case:?}: expected the deleted instance to be gone, got {http_status} \
-                 {body}"
+                http_status, 200,
+                "case {case:?}: expected the cancelled deletion to leave the instance, got \
+                 {http_status} {body}"
+            );
+            assert_eq!(
+                xml_text(&body, "DetailedStatus").as_deref(),
+                Some(detailed_status::CANCELLED),
+                "case {case:?}: expected the cancelled deletion to report that, got {body}"
             );
         }
 
