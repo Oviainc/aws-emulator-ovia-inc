@@ -67,3 +67,5 @@ mod state_roundtrip;
 mod update_glossary;
 #[path = "all/update_project.rs"]
 mod update_project;
+#[path = "all/user_profiles.rs"]
+mod user_profiles;

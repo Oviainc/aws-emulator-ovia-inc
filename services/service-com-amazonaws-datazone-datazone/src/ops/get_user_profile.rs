@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetUserProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetUserProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetUserProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the user profile a domain holds for the identity the request names, from the
+//! store `CreateUserProfile` wrote it to — so a profile is read back exactly as its
+//! create reported it, and a domain that holds none for the identity answers the
+//! `ResourceNotFoundException` this operation models.
+//!
+//! The identity is resolved by [`crate::state::Domain::user_profile`], the one rule
+//! every user-profile operation shares: the `userIdentifier` and `sessionName` the
+//! profile was created with, or the `UserProfileId` its create reported, narrowed by the
+//! optional `type` when the request carries one.
+//!
+//! A pure report: the only write is the domain lifecycle the clock already owed at this
+//! instant.
 //!
 //! ## Shape of an operation
 //!
@@ -155,20 +159,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetUserProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetUserProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetUserProfile"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetUserProfileErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // The only write a reporting operation makes: materialise the domain lifecycle
+        // steps the clock already owed at this instant.
+        store.settle_clock(crate::state::now_ms());
+
+        // Authorization comes FIRST: a permission is held on a domain, so a caller
+        // holds none on an identifier this store serves no domain for, and the request
+        // is denied before any resource lookup rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(GetUserProfileErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
+        let profile = store
+            .live_domain(&input.domain_identifier)
+            .ok_or_else(|| {
+                GetUserProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::ResourceKind::Domain.not_found_message(),
+                })
+            })?
+            .user_profile(
+                &input.user_identifier,
+                input.session_name.as_deref(),
+                input.r#type.as_deref(),
+            )
+            .ok_or_else(|| {
+                GetUserProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::ResourceKind::UserProfile.not_found_message(),
+                })
+            })?;
+
+        Ok(GetUserProfileOutput {
+            domain_id: Some(profile.domain_id.clone()),
+            id: Some(profile.id.clone()),
+            r#type: Some(profile.profile_type.clone()),
+            status: Some(profile.status.clone()),
+            details: Some(profile.details.clone()),
+        })
     }
 }

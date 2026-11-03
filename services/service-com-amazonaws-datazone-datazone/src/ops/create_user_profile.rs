@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUserProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUserProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUserProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the user profile a domain holds for one identity and stores it there, so
+//! `GetUserProfile` answers from the stored record and the profile disappears with its
+//! domain.
+//!
+//! The identity the request names IS the profile: the `userIdentifier` and, for a role
+//! session, the `sessionName`. So a repeat of the request reports the profile the first
+//! one created rather than storing a second — the model marks this operation
+//! `@idempotent` and gives it no `ConflictException` (smithy_query
+//! operation="CreateUserProfile").
+//!
+//! What the profile reports is derived from the request: `type` from `userType` (or,
+//! when the request names none, from the form of the identifier), `details` under the
+//! union member that type names, and `status` as the member of that type's status pair
+//! which means the user holds the access this call just gave it. The rules live in
+//! `crate::state` beside the stored shape, so this operation and the profile's reader
+//! cannot drift.
 //!
 //! ## Shape of an operation
 //!
@@ -158,20 +166,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUserProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUserProfile"))
+        use crate::state::{
+            created_user_profile_status, now_ms, user_profile_details, user_profile_key,
+            user_profile_type, UserProfile, MAX_USER_PROFILES_PER_DOMAIN,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateUserProfileErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // request is denied before any resource lookup rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(CreateUserProfileErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+        // The profile is created IN a domain, and a domain on its way out no longer
+        // takes a new one.
+        let domain = store
+            .live_domain(&input.domain_identifier)
+            .ok_or_else(|| {
+                CreateUserProfileErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::ResourceKind::Domain.not_found_message(),
+                    },
+                )
+            })?;
+
+        // The identity the request names is what the profile IS, so a repeat of the
+        // request reports the profile the first one created instead of storing a
+        // second: the model marks this operation `@idempotent` and gives it no
+        // `ConflictException`. The `clientToken` needs no record of its own for that —
+        // a retry carries the same identity, so it resolves to the same stored profile
+        // whether or not it repeats the token.
+        let key = user_profile_key(&input.user_identifier, input.session_name.as_deref());
+        if let Some(stored) = domain.user_profiles.get(&key) {
+            return Ok(profile_output(stored));
+        }
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without limit. This operation models no `ServiceQuotaExceededException`, so
+        // the refusal past the bound is its `ValidationException`.
+        if domain.user_profiles.len() >= MAX_USER_PROFILES_PER_DOMAIN {
+            return Err(CreateUserProfileErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "this emulator stores at most {MAX_USER_PROFILES_PER_DOMAIN} user profiles in one domain"
+                ),
+            })
+            .into());
+        }
+
+        let profile_type = user_profile_type(input.user_type.as_deref(), &input.user_identifier);
+        let profile = UserProfile {
+            id: store.mint_user_profile_id(now),
+            domain_id: input.domain_identifier.clone(),
+            user_identifier: input.user_identifier.clone(),
+            session_name: input.session_name.clone(),
+            profile_type: profile_type.to_string(),
+            status: created_user_profile_status(profile_type).to_string(),
+            details: user_profile_details(
+                profile_type,
+                input.user_type.as_deref(),
+                &input.user_identifier,
+                input.session_name.as_deref(),
+            ),
+        };
+        let output = profile_output(&profile);
+
+        // The domain was resolved under this same lock above, so it is still there; if
+        // it somehow were not, the profile would be dropped while the response said it
+        // had been created, so that impossible case is answered as a server fault
+        // rather than silently.
+        let Some(stored_domain) = store.domains.get_mut(&input.domain_identifier) else {
+            return Err(CreateUserProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!(
+                        "Domain {} disappeared while the user profile was being stored",
+                        input.domain_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+        stored_domain.user_profiles.insert(key, profile);
+        Ok(output)
+    }
+}
+
+/// What a create reports for a stored profile — whether it stored the profile just now
+/// or found that the identity the request names already had one.
+fn profile_output(profile: &crate::state::UserProfile) -> CreateUserProfileOutput {
+    CreateUserProfileOutput {
+        domain_id: Some(profile.domain_id.clone()),
+        id: Some(profile.id.clone()),
+        r#type: Some(profile.profile_type.clone()),
+        status: Some(profile.status.clone()),
+        details: Some(profile.details.clone()),
     }
 }

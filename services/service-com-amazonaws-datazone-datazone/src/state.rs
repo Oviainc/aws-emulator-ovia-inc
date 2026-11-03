@@ -285,6 +285,12 @@ pub struct Domain {
     /// identifier `GetAccountPool` addresses one by — so they go with the domain when
     /// it is deleted. Bounded by [`MAX_ACCOUNT_POOLS_PER_DOMAIN`].
     pub account_pools: BTreeMap<String, AccountPool>,
+    /// The user profiles stored in this domain, keyed by [`user_profile_key`] — the
+    /// identity the request names, not the minted id — so the profile of one user is
+    /// reached by the `userIdentifier` every user-profile operation addresses it with.
+    /// Nested under the domain so they go with it when it is deleted. Bounded by
+    /// [`MAX_USER_PROFILES_PER_DOMAIN`].
+    pub user_profiles: BTreeMap<String, UserProfile>,
 }
 
 impl Domain {
@@ -381,6 +387,35 @@ impl Domain {
                     identifier: asset.id.clone(),
                 })
         })
+    }
+
+    /// The user profile this domain holds for the identity a user-profile request
+    /// names: the `userIdentifier` (and, for a role session, the `sessionName`) it was
+    /// created with, or — when the domain holds no profile under that identity — the
+    /// profile whose own minted `UserProfileId` is that identifier, since a profile is
+    /// addressable by the id its create reported as well as by the identity it is for.
+    ///
+    /// `profile_type` is the optional `type` a reader narrows by: a profile of another
+    /// type is not the one that was asked for.
+    pub fn user_profile(
+        &self,
+        user_identifier: &str,
+        session_name: Option<&str>,
+        profile_type: Option<&str>,
+    ) -> Option<&UserProfile> {
+        let matches_type =
+            |profile: &UserProfile| profile_type.is_none_or(|t| profile.profile_type == t);
+        self.user_profiles
+            .get(&user_profile_key(user_identifier, session_name))
+            .filter(|profile| matches_type(profile))
+            .or_else(|| {
+                // A linear scan over a map bounded by [`MAX_USER_PROFILES_PER_DOMAIN`]
+                // — the trade [`Domain::listing_for_entity`] makes: one lookup rule
+                // every handler shares, rather than a second index to keep in step.
+                self.user_profiles
+                    .values()
+                    .find(|profile| profile.id == user_identifier && matches_type(profile))
+            })
     }
 
     /// The object stored in this domain that still hangs UNDER the domain unit
@@ -1137,6 +1172,194 @@ pub fn membership_from_request(
             designation: designation.to_string(),
         },
     ))
+}
+
+/// One user profile stored in a domain: the identity it is for, the type and status
+/// DataZone reports it with, and the details it reports under the matching member of
+/// the modelled `UserProfileDetails` union.
+///
+/// The union is kept as the modelled type itself (the trade [`AccountPool`] makes for
+/// `accountSource`), so the profile's reader reports exactly what its create stored.
+/// The model gives a user profile no timestamps (smithy_query
+/// operation="GetUserProfile"), so nothing beyond what a read reports is kept, and no
+/// member of `UserProfileStatus` is non-terminal, so a profile owes the clock no
+/// transition.
+#[derive(Debug, Clone)]
+pub struct UserProfile {
+    /// The profile's own `UserProfileId`, minted by
+    /// [`ComAmazonawsDatazoneDatazoneState::mint_user_profile_id`].
+    pub id: String,
+    pub domain_id: String,
+    /// The `userIdentifier` the profile was created for — an IAM ARN, a principal name
+    /// or an identity-store user id. The identity half of [`user_profile_key`].
+    pub user_identifier: String,
+    /// The `sessionName` the profile was created with, which is what tells two profiles
+    /// of one IAM role apart. The session half of [`user_profile_key`].
+    pub session_name: Option<String>,
+    /// A `UserProfileType` member — [`USER_PROFILE_TYPE_IAM`] or
+    /// [`USER_PROFILE_TYPE_SSO`].
+    pub profile_type: String,
+    /// A `UserProfileStatus` member — see [`created_user_profile_status`].
+    pub status: String,
+    pub details: crate::ops::types::UserProfileDetails,
+}
+
+/// The `UserProfileType` members (model enum `com.amazonaws.datazone#UserProfileType`:
+/// IAM | SSO): which identity system the profile's user comes from.
+pub const USER_PROFILE_TYPE_IAM: &str = "IAM";
+pub const USER_PROFILE_TYPE_SSO: &str = "SSO";
+
+/// The `UserType` members (model enum `com.amazonaws.datazone#UserType`: IAM_USER |
+/// IAM_ROLE | SSO_USER | IAM_ROLE_SESSION) a create may name the user with.
+pub const USER_TYPE_IAM_USER: &str = "IAM_USER";
+pub const USER_TYPE_IAM_ROLE: &str = "IAM_ROLE";
+pub const USER_TYPE_IAM_ROLE_SESSION: &str = "IAM_ROLE_SESSION";
+pub const USER_TYPE_SSO_USER: &str = "SSO_USER";
+
+/// The `UserProfileStatus` members a profile of each type is reported with (model enum
+/// `com.amazonaws.datazone#UserProfileStatus`: ASSIGNED | NOT_ASSIGNED | ACTIVATED |
+/// DEACTIVATED): an IAM principal's profile is ACTIVATED or DEACTIVATED, an identity
+/// centre user's profile is ASSIGNED or NOT_ASSIGNED.
+pub const USER_PROFILE_STATUS_ACTIVATED: &str = "ACTIVATED";
+pub const USER_PROFILE_STATUS_ASSIGNED: &str = "ASSIGNED";
+
+/// The most user profiles this emulator stores in one domain.
+///
+/// A CHOSEN ceiling, not a published quota: the identities come from the request, so a
+/// create loop is a caller-driven growth site and has to be bounded. `CreateUserProfile`
+/// models no `ServiceQuotaExceededException` (smithy_query operation="CreateUserProfile"),
+/// so the refusal past it is its `ValidationException` — the rule
+/// `CreateProjectMembership` follows for a bound its own model does not name.
+pub const MAX_USER_PROFILES_PER_DOMAIN: usize = 500;
+
+/// The key one user profile is stored under: the identity the request names, plus the
+/// session name that tells two profiles of one IAM role apart.
+///
+/// Injective in `(user_identifier, session_name)`: the separator is a control character
+/// no `UserIdentifier` admits (its `@pattern` is three alternatives of ASCII name, ARN
+/// and hex-and-dash id characters, smithy_query shape="UserIdentifier"), so the two
+/// parts of the key can never be confused for one another.
+pub fn user_profile_key(user_identifier: &str, session_name: Option<&str>) -> String {
+    format!(
+        "{user_identifier}{PRINCIPAL_KEY_SEPARATOR}{}",
+        session_name.unwrap_or_default()
+    )
+}
+
+/// Whether `candidate` has the shape of a `UserProfileId` — an identity id rather than
+/// a principal NAME.
+///
+/// SOURCE: `UserProfileId`'s `@pattern`
+/// `^([0-9a-f]{10}-|)[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$`
+/// (smithy_query shape="UserProfileId"), which is also the FIRST alternative of
+/// `UserIdentifier`: a request may name a user by such an id, and an id is not a
+/// username.
+pub fn is_user_profile_id(candidate: &str) -> bool {
+    /// The hex-digit group lengths of the id, in order.
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let is_hex_run = |text: &str, len: usize| {
+        text.len() == len && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    let mut parts: Vec<&str> = candidate.split('-').collect();
+    // The optional identity-store prefix is a sixth, LOWERCASE hex group of 10 in
+    // front of the five that make up the id itself.
+    if parts.len() == GROUPS.len() + 1 {
+        let prefix = parts.remove(0);
+        if prefix.len() != 10
+            || !prefix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return false;
+        }
+    }
+    parts.len() == GROUPS.len()
+        && parts
+            .iter()
+            .zip(GROUPS)
+            .all(|(part, len)| is_hex_run(part, len))
+}
+
+/// The `UserProfileType` a create reports for the user it names.
+///
+/// `userType` names the identity system when the request carries one: the three IAM
+/// members are IAM profiles and `SSO_USER` is an SSO profile. When the request names
+/// none, the identity system follows the FORM of the identifier — an identity-store id
+/// ([`is_user_profile_id`]) names an identity centre user, anything else (an IAM ARN or
+/// a principal name, the other two alternatives of `UserIdentifier`) an IAM principal.
+pub fn user_profile_type(user_type: Option<&str>, user_identifier: &str) -> &'static str {
+    match user_type {
+        Some(USER_TYPE_SSO_USER) => USER_PROFILE_TYPE_SSO,
+        Some(_) => USER_PROFILE_TYPE_IAM,
+        None if is_user_profile_id(user_identifier) => USER_PROFILE_TYPE_SSO,
+        None => USER_PROFILE_TYPE_IAM,
+    }
+}
+
+/// The status a profile is created with: a profile of an IAM principal is ACTIVATED,
+/// one of an identity centre user is ASSIGNED. Each is the member of its type's pair
+/// that means the user HAS the domain's access the create just gave it;
+/// `UpdateUserProfile` is what moves it to the other member.
+pub fn created_user_profile_status(profile_type: &str) -> &'static str {
+    if profile_type == USER_PROFILE_TYPE_SSO {
+        USER_PROFILE_STATUS_ASSIGNED
+    } else {
+        USER_PROFILE_STATUS_ACTIVATED
+    }
+}
+
+/// The `UserProfileDetails` a profile of `profile_type` reports for the identity the
+/// request named.
+///
+/// The union has one member per profile type (smithy_query shape="UserProfileDetails"),
+/// and each carries what the request itself names:
+///
+/// * `iam` — the IAM principal's ARN, which is the identifier when the request named
+///   one and otherwise the ARN of the principal that `userType` names (a role for
+///   `IAM_ROLE`/`IAM_ROLE_SESSION`, a user for `IAM_USER` and for a request that names
+///   no type), plus the `sessionName` of a role session. `groupProfileId` links the
+///   profile to a group profile, which only `CreateGroupProfile` makes, so a profile
+///   created here belongs to none.
+/// * `sso` — the username, which is the identifier when the request named the user by
+///   NAME. An identity-store id is not a username, and this emulator holds no identity
+///   store to resolve one through, so a profile created from an id reports no username
+///   rather than echoing the id as one; nor are the first and last names anything the
+///   request carries.
+pub fn user_profile_details(
+    profile_type: &str,
+    user_type: Option<&str>,
+    user_identifier: &str,
+    session_name: Option<&str>,
+) -> crate::ops::types::UserProfileDetails {
+    use crate::ops::types::{IamUserProfileDetails, SsoUserProfileDetails, UserProfileDetails};
+    if profile_type == USER_PROFILE_TYPE_SSO {
+        return UserProfileDetails::Sso(SsoUserProfileDetails {
+            username: (!is_user_profile_id(user_identifier))
+                .then(|| user_identifier.to_string()),
+            first_name: None,
+            last_name: None,
+        });
+    }
+    let arn = if user_identifier.starts_with("arn:") {
+        user_identifier.to_string()
+    } else {
+        let resource = match user_type {
+            Some(USER_TYPE_IAM_ROLE) | Some(USER_TYPE_IAM_ROLE_SESSION) => {
+                format!("role/{user_identifier}")
+            }
+            _ => format!("user/{user_identifier}"),
+        };
+        // IAM is a global service, so its ARNs carry no region.
+        ::engine::emulator_arn("iam", "", &resource)
+    };
+    UserProfileDetails::Iam(IamUserProfileDetails {
+        arn: Some(arn),
+        // The principal id is minted by IAM, which this emulator does not stand in
+        // for, so the profile reports none rather than an invented one.
+        principal_id: None,
+        session_name: session_name.map(str::to_string),
+        group_profile_id: None,
+    })
 }
 
 /// One stored DataZone catalog asset: the identity the catalog addresses it by, plus
@@ -2296,6 +2519,33 @@ impl ComAmazonawsDatazoneDatazoneState {
         String::from_utf8(out.to_vec()).expect("the alphabet is ASCII")
     }
 
+    /// Mint a `UserProfileId`: five groups of hex digits, `8-4-4-4-12`, which is what
+    /// the model's
+    /// `^([0-9a-f]{10}-|)[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$`
+    /// pattern (smithy_query shape="UserProfileId") admits. The optional leading group
+    /// belongs to an id an identity store minted, so an id minted HERE omits it.
+    ///
+    /// The 32 digits are the mint instant in the high half and the per-process counter
+    /// in the low one, so two profiles minted in the same millisecond still get
+    /// different ids, and no id is ever reused.
+    pub fn mint_user_profile_id(&mut self, now: i64) -> String {
+        self.id_seq += 1;
+        let digits = format!(
+            "{:016x}{:016x}",
+            u64::try_from(now).unwrap_or(0),
+            self.id_seq
+        );
+        // 32 ASCII hex digits by construction, so every group below is in bounds.
+        format!(
+            "{}-{}-{}-{}-{}",
+            &digits[0..8],
+            &digits[8..12],
+            &digits[12..16],
+            &digits[16..20],
+            &digits[20..32]
+        )
+    }
+
     /// Materialise every domain lifecycle step the clock already owes at `now`: a
     /// `CREATING` domain whose span has elapsed becomes `AVAILABLE`, a `DELETING` one
     /// disappears together with its projects, and a `CREATING` listing whose span has
@@ -2849,6 +3099,7 @@ pub enum ResourceKind {
     AssetFilter,
     DataProduct,
     Listing,
+    UserProfile,
 }
 
 impl ResourceKind {
@@ -2867,6 +3118,7 @@ impl ResourceKind {
             Self::AssetFilter => "Asset filter",
             Self::DataProduct => "Data product",
             Self::Listing => "Listing",
+            Self::UserProfile => "User profile",
         }
     }
 

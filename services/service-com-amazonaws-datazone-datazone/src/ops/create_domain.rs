@@ -323,6 +323,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deleted_domain_unit_ids: std::collections::VecDeque::new(),
             listings: std::collections::BTreeMap::new(),
             account_pools: std::collections::BTreeMap::new(),
+            user_profiles: std::collections::BTreeMap::new(),
             id: id.clone(),
         };
         // The `rootDomainUnitId` this response reports names a unit that exists from
