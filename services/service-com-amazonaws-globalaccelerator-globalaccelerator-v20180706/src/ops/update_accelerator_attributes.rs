@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAcceleratorAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAcceleratorAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAcceleratorAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the flow-log attributes of one accelerator and reports the configuration it
+//! leaves behind.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +154,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAcceleratorAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAcceleratorAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAcceleratorAttributes"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateAcceleratorAttributesErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Global Accelerator store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // The attributes belong to the accelerator, so an ARN the store does not hold
+        // is the accelerator that "doesn't exist" (`AcceleratorNotFoundException`).
+        if !store.accelerators.contains_key(&input.accelerator_arn) {
+            return Err(
+                UpdateAcceleratorAttributesErrorModeled::AcceleratorNotFoundException(
+                    AcceleratorNotFoundException {
+                        message: Some(crate::state::accelerator_not_found_message(
+                            &input.accelerator_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An update carries only the members it changes: every one but the ARN is
+        // optional, so an absent member leaves the stored value alone rather than
+        // resetting it. The mutation is applied to a COPY, so the refusal below cannot
+        // leave half an update in the store.
+        let mut attributes = store
+            .accelerator_attributes
+            .get(&input.accelerator_arn)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(enabled) = input.flow_logs_enabled {
+            attributes.flow_logs_enabled = enabled;
+        }
+        if let Some(bucket) = input.flow_logs_s3_bucket {
+            attributes.flow_logs_s3_bucket = Some(bucket);
+        }
+        if let Some(prefix) = input.flow_logs_s3_prefix {
+            attributes.flow_logs_s3_prefix = Some(prefix);
+        }
+        crate::state::validate_flow_logs(&attributes).map_err(|message| {
+            UpdateAcceleratorAttributesErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
+                },
+            )
+        })?;
+
+        let updated = attributes.to_wire();
+        store
+            .accelerator_attributes
+            .insert(input.accelerator_arn, attributes);
+
+        Ok(UpdateAcceleratorAttributesOutput {
+            accelerator_attributes: Some(updated),
+        })
     }
 }

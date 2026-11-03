@@ -18,8 +18,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Accelerator, EndpointConfiguration, EndpointDescription, EndpointGroup, IpAddressDetail, IpSet,
-    Listener, PortOverride, PortRange, Tag,
+    Accelerator, AcceleratorAttributes, EndpointConfiguration, EndpointDescription, EndpointGroup,
+    IpAddressDetail, IpSet, Listener, PortOverride, PortRange, Tag,
 };
 
 /// `AcceleratorStatus` values, from the model enum of the same name
@@ -444,6 +444,48 @@ pub struct StoredAcceleratorAttributes {
     pub flow_logs_enabled: bool,
     pub flow_logs_s3_bucket: Option<String>,
     pub flow_logs_s3_prefix: Option<String>,
+}
+
+impl StoredAcceleratorAttributes {
+    /// This record as the modelled `AcceleratorAttributes`.
+    ///
+    /// `FlowLogsEnabled` is always reported — it is a boolean the record always
+    /// holds ("The default value is false", `AcceleratorAttributes$FlowLogsEnabled`)
+    /// — while the bucket and the prefix are reported only once set, since an
+    /// accelerator that never enabled flow logs has neither.
+    pub fn to_wire(&self) -> AcceleratorAttributes {
+        AcceleratorAttributes {
+            flow_logs_enabled: Some(self.flow_logs_enabled),
+            flow_logs_s3_bucket: self.flow_logs_s3_bucket.clone(),
+            flow_logs_s3_prefix: self.flow_logs_s3_prefix.clone(),
+        }
+    }
+}
+
+/// A flow-log configuration, validated as a whole.
+///
+/// The rule is the model's own doc for `UpdateAcceleratorAttributes$FlowLogsEnabled`:
+/// "If the value is true, `FlowLogsS3Bucket` and `FlowLogsS3Prefix` must be
+/// specified" — flow logs name a destination, so neither member may be missing or
+/// empty while they are on. Disabled flow logs constrain neither member. Checked over
+/// the configuration the update would LEAVE BEHIND rather than over the request's
+/// members, so a call that only flips the flag is judged against the bucket and prefix
+/// already stored. Returns the message to put on an `InvalidArgumentException`.
+pub fn validate_flow_logs(attributes: &StoredAcceleratorAttributes) -> Result<(), String> {
+    if !attributes.flow_logs_enabled {
+        return Ok(());
+    }
+    for (member, value) in [
+        ("FlowLogsS3Bucket", &attributes.flow_logs_s3_bucket),
+        ("FlowLogsS3Prefix", &attributes.flow_logs_s3_prefix),
+    ] {
+        if value.as_deref().unwrap_or_default().is_empty() {
+            return Err(format!(
+                "{member} must be specified when FlowLogsEnabled is true."
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Per-service state for com-amazonaws-globalaccelerator-globalaccelerator-v20180706. A handler reaches it through [`service_state`].
