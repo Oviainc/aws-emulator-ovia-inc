@@ -22,15 +22,15 @@
 //! * a version `DeleteWorkflowVersion` removed is a modelled 404 everywhere afterwards,
 //!   and while a workflow still holds any version, deleting the workflow is refused.
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use service_com_amazonaws_omics_omics::state::MAX_TAGS;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::private_workflow_runs::{
     assert_absent, assert_arn, assert_members, assert_timestamp, assert_uuid, call,
     create_workflow, created_id, delete_workflow, emulator, error_code, expected_digest,
-    get_workflow, ACCOUNT, CAPACITY_RANGE, POLL_INTERVAL, SETTLE_DEADLINE, STORAGE_TYPES,
-    WORKFLOW_ENGINES,
+    get_workflow, tag_map, ACCOUNT, CAPACITY_RANGE, POLL_INTERVAL, SETTLE_DEADLINE,
+    STORAGE_TYPES, WORKFLOW_ENGINES,
 };
 
 /// `POST /workflow/{workflowId}/version`.
@@ -120,15 +120,6 @@ async fn await_version_status(
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-}
-
-/// A tag map with `count` entries.
-fn tag_map(count: usize) -> Value {
-    let mut tags = Map::new();
-    for n in 0..count {
-        tags.insert(format!("key{n}"), Value::String(format!("value{n}")));
-    }
-    Value::Object(tags)
 }
 
 /// A row of the version create/read-back table: a request body, and the members a later

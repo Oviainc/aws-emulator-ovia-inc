@@ -277,6 +277,18 @@ pub(crate) fn assert_members(case: &str, via: &str, expected: &Value, actual: &V
     }
 }
 
+/// A tag map with `count` entries, each key and value inside the modelled `TagKey` /
+/// `TagValue` lengths.
+///
+/// The one copy every suite in this crate builds its `tags` member from.
+pub(crate) fn tag_map(count: usize) -> Value {
+    let mut tags = Map::new();
+    for n in 0..count {
+        tags.insert(format!("key{n}"), Value::String(format!("value{n}")));
+    }
+    Value::Object(tags)
+}
+
 /// Assert `actual` carries none of `members`.
 pub(crate) fn assert_absent(case: &str, members: &[&str], actual: &Value) {
     for member in members {
@@ -769,13 +781,9 @@ async fn too_many_tags_are_refused() {
         ("at the tag bound", MAX_TAGS, true),
         ("one past the tag bound", MAX_TAGS + 1, false),
     ] {
-        let mut tags = Map::new();
-        for n in 0..count {
-            tags.insert(format!("key{n}"), Value::String(format!("value{n}")));
-        }
         let (status, body) = create_workflow(
             &router,
-            &json!({ "requestId": format!("tags-{count}"), "tags": Value::Object(tags) }),
+            &json!({ "requestId": format!("tags-{count}"), "tags": tag_map(count) }),
         )
         .await;
         if expect_ok {
@@ -1033,12 +1041,13 @@ async fn inputs_naming_a_resource_this_emulator_does_not_hold_are_refused() {
     let router = emulator();
     let workflow_id = workflow_for_runs(&router, "unheld").await;
 
-    // Each of these members names a resource outside the stores this slice holds: a run
-    // configuration, a run group, a run cache or a workflow version (every create for
-    // them is still a 501), or a workflow shared from another account
-    // (`CreateShare`/`AcceptShare` are still 501). Accepting the request and storing the
-    // reference would report a run bound to something nothing resolved, so the request
-    // is refused. The rule generalises over which member names it and over the value.
+    // Each of these members names a resource this emulator does not hold: a run
+    // configuration, a run group or a workflow version (every create for them is still a
+    // 501), a run cache no `CreateRunCache` ever minted, or a workflow shared from
+    // another account (`CreateShare`/`AcceptShare` are still 501). Accepting the request
+    // and storing the reference would report a run bound to something nothing resolved,
+    // so the request is refused. The rule generalises over which member names it and
+    // over the value.
     let rows: Vec<(&str, Value)> = vec![
         (
             "configurationName",
@@ -2480,7 +2489,7 @@ async fn audited_call(
 /// the request presented, the request target, the resource it resolved and the outcome.
 ///
 /// A TABLE over the whole lifecycle, so each distinct outcome the slice can report is a
-/// row: the two creates, the idempotent replay, the reads, the listings, the refusals,
+/// row: the creates, the idempotent replay, the reads, the listings, the refusals,
 /// the "not found"s and the two deletes. Driven through the production router with the
 /// capturing subscriber installed, so what is asserted is the record a real run emits.
 #[tokio::test]
@@ -2504,11 +2513,19 @@ async fn every_call_emits_a_structured_audit_record() {
     let fixture_run_body = start_run_body(&workflow, "audit-fixture-run", &json!({}));
     let (status, response) = start_run(&router, &fixture_run_body).await;
     let run = created_id("the audit fixture run", status, &response);
+    let (status, response) = call(
+        &router,
+        "POST",
+        "/runCache",
+        Some(&json!({
+            "requestId": "audit-fixture-cache",
+            "cacheS3Location": "s3://omics-emulator-cache/audit/",
+        })),
+    )
+    .await;
+    let cache = created_id("the audit fixture run cache", status, &response);
 
-    let mut over_the_tag_bound = Map::new();
-    for n in 0..=MAX_TAGS {
-        over_the_tag_bound.insert(format!("key{n}"), Value::String("audited-tag-value".into()));
-    }
+    let over_the_tag_bound = tag_map(MAX_TAGS + 1);
 
     // An id no store holds, spelled wider than anything this emulator mints.
     let absent = "999999999999999999";
@@ -2539,7 +2556,7 @@ async fn every_call_emits_a_structured_audit_record() {
             uri: "/workflow".to_string(),
             body: Some(json!({
                 "requestId": "audit-tags",
-                "tags": Value::Object(over_the_tag_bound),
+                "tags": over_the_tag_bound,
             })),
             outcome: "validation-refused",
             resource: ExpectedResource::Nothing,
@@ -2624,6 +2641,48 @@ async fn every_call_emits_a_structured_audit_record() {
             body: None,
             outcome: "reported",
             resource: ExpectedResource::Nothing,
+        },
+        AuditCase {
+            case: "a run cache created",
+            operation: "CreateRunCache",
+            method: "POST",
+            uri: "/runCache".to_string(),
+            body: Some(json!({
+                "requestId": "audit-cache",
+                "cacheS3Location": "s3://omics-emulator-cache/audited/",
+            })),
+            outcome: "run-cache-created",
+            resource: ExpectedResource::FromResponse,
+        },
+        AuditCase {
+            case: "the same run cache create replayed",
+            operation: "CreateRunCache",
+            method: "POST",
+            uri: "/runCache".to_string(),
+            body: Some(json!({
+                "requestId": "audit-cache",
+                "cacheS3Location": "s3://omics-emulator-cache/audited/",
+            })),
+            outcome: "no-change",
+            resource: ExpectedResource::FromResponse,
+        },
+        AuditCase {
+            case: "a run cache read",
+            operation: "GetRunCache",
+            method: "GET",
+            uri: format!("/runCache/{cache}"),
+            body: None,
+            outcome: "reported",
+            resource: ExpectedResource::Named(cache.clone()),
+        },
+        AuditCase {
+            case: "a run cache id nothing holds",
+            operation: "GetRunCache",
+            method: "GET",
+            uri: format!("/runCache/{absent}"),
+            body: None,
+            outcome: "not-found",
+            resource: ExpectedResource::Named(absent.to_string()),
         },
     ];
 

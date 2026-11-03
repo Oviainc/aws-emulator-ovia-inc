@@ -7,7 +7,8 @@
 //! **versions** of that workflow (`CreateWorkflowVersion` / `GetWorkflowVersion`), the
 //! **run** started from it (`StartRun` / `GetRun` / `ListRuns` / `DeleteRun`), the
 //! **run group** that caps the compute those runs may use (`CreateRunGroup` /
-//! `GetRunGroup`) and the **sequence store** that holds read sets
+//! `GetRunGroup`), the **run cache** a run reads task outputs from (`CreateRunCache` /
+//! `GetRunCache`) and the **sequence store** that holds read sets
 //! (`CreateSequenceStore` / `GetSequenceStore`). Each resource is stored exactly once, keyed by the numeric id
 //! the model's `^[0-9]+$` patterns describe (a version by its name, inside its
 //! workflow's record), so every operation reads and writes the one record.
@@ -48,6 +49,9 @@ pub const RUN_ARN_RESOURCE_PREFIX: &str = "run/";
 /// The resource portion a sequence store ARN carries before its id.
 pub const SEQUENCE_STORE_ARN_RESOURCE_PREFIX: &str = "sequenceStore/";
 
+/// The resource portion a run cache ARN carries before its id.
+pub const RUN_CACHE_ARN_RESOURCE_PREFIX: &str = "runCache/";
+
 /// The resource portion a run group ARN carries before its id.
 pub const RUN_GROUP_ARN_RESOURCE_PREFIX: &str = "runGroup/";
 
@@ -70,9 +74,27 @@ pub const RUN_ID_OFFSET: u64 = 500_000;
 /// How far above [`FIRST_RESOURCE_ID`] the run group counter starts, for the same
 /// reason [`RUN_ID_OFFSET`] exists: a run group id handed to `GetRun` (or a run id
 /// handed to `GetRunGroup`) resolves to nothing and is answered "not found" instead of
-/// reaching an unrelated record. The three offsets are far enough apart that no store
+/// reaching an unrelated record. The offsets are far enough apart that no store
 /// can reach another's range under the caps below.
 pub const RUN_GROUP_ID_OFFSET: u64 = 250_000;
+
+/// How far above [`FIRST_RESOURCE_ID`] the run cache counter starts, for the same
+/// reason, and far enough from [`RUN_ID_OFFSET`] and [`RUN_GROUP_ID_OFFSET`] that no
+/// cache id can reach a run's or a run group's range under the caps below.
+pub const RUN_CACHE_ID_OFFSET: u64 = 750_000;
+
+/// `RunCacheStatus` a run cache carries once it exists.
+///
+/// From the modelled `RunCacheStatus` enum (ACTIVE | DELETED | FAILED), none of whose
+/// values is a transient "being created" state: a cache the service answers a create
+/// with is already usable, so nothing is owed to the clock here.
+pub const RUN_CACHE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `CacheBehavior` applied when `CreateRunCache` omits `cacheBehavior`.
+///
+/// From that member's own documentation: "If you don't specify a value, the default
+/// behavior is CACHE_ON_FAILURE."
+pub const DEFAULT_CACHE_BEHAVIOR: &str = "CACHE_ON_FAILURE";
 
 /// `WorkflowStatus` a freshly created private workflow carries, from the modelled
 /// `WorkflowStatus` enum.
@@ -249,6 +271,11 @@ pub const MAX_WORKFLOW_VERSIONS: usize = 100;
 /// with the modelled `ServiceQuotaExceededException`.
 pub const MAX_SEQUENCE_STORES: usize = 500;
 
+/// The most run caches this emulator will hold. Emulator resource guard, not an AWS
+/// quota — HealthOmics publishes no run cache ceiling. A create past it is refused with
+/// the modelled `ServiceQuotaExceededException`.
+pub const MAX_RUN_CACHES: usize = 500;
+
 /// The most run groups this emulator will hold. Emulator resource guard, not an AWS
 /// quota. A create past it is refused with the modelled
 /// `ServiceQuotaExceededException`.
@@ -266,7 +293,7 @@ pub const MAX_TAGS: usize = 50;
 /// is capped at one entry per resource either store can hold, and a token whose
 /// resource is gone is reclaimed with it.
 pub const MAX_IDEMPOTENCY_TOKENS: usize =
-    MAX_WORKFLOWS + MAX_RUNS + MAX_SEQUENCE_STORES + MAX_RUN_GROUPS;
+    MAX_WORKFLOWS + MAX_RUNS + MAX_SEQUENCE_STORES + MAX_RUN_CACHES + MAX_RUN_GROUPS;
 
 /// One stored private workflow: every member `GetWorkflow` reports.
 #[derive(Debug, Clone, Default)]
@@ -498,6 +525,38 @@ impl SequenceStore {
     }
 }
 
+/// One stored run cache: every member `GetRunCache` reports.
+///
+/// A run cache is a reference to a caller-owned S3 location, not a resource this
+/// emulator provisions, so every member below is either what the create carried or a
+/// value derived from it and the id this emulator minted.
+#[derive(Debug, Clone, Default)]
+pub struct RunCache {
+    /// The decimal numeric id: this record's store key, rendered.
+    pub id: String,
+    pub arn: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    /// The S3 location the create named, reported back as `cacheS3Uri`.
+    pub cache_s3_uri: String,
+    /// The default cache behavior in force, which is [`DEFAULT_CACHE_BEHAVIOR`] when
+    /// the create named none.
+    pub cache_behavior: String,
+    /// The account that owns the cache bucket, which is this emulator's own account
+    /// when the create named none.
+    pub cache_bucket_owner_id: String,
+    pub status: String,
+    pub creation_time_ms: i64,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl RunCache {
+    /// `tags` as the wire shapes want it: omitted when none were ever set.
+    pub fn tags_output(&self) -> Option<HashMap<String, String>> {
+        tags_output(&self.tags)
+    }
+}
+
 /// A parameter template as the wire shapes want it: omitted when it defines nothing.
 fn parameter_template_output(
     parameter_template: &BTreeMap<String, WorkflowParameter>,
@@ -666,6 +725,7 @@ pub enum IdempotencyScope {
     CreateWorkflow,
     StartRun,
     CreateSequenceStore,
+    CreateRunCache,
     CreateRunGroup,
 }
 
@@ -681,6 +741,8 @@ pub struct ComAmazonawsOmicsOmicsState {
     /// Every sequence store, keyed by its numeric id, in creation order for the same
     /// reason.
     pub sequence_stores: BTreeMap<u64, SequenceStore>,
+    /// Every run cache, keyed by its numeric id, in creation order for the same reason.
+    pub run_caches: BTreeMap<u64, RunCache>,
     /// Every run group, keyed by its numeric id, in creation order for the same reason.
     pub run_groups: BTreeMap<u64, RunGroup>,
     /// `(operation, requestId)` -> the numeric id of the resource that request
@@ -690,6 +752,7 @@ pub struct ComAmazonawsOmicsOmicsState {
     next_workflow_id: u64,
     next_run_id: u64,
     next_sequence_store_id: u64,
+    next_run_cache_id: u64,
     next_run_group_id: u64,
 }
 
@@ -707,6 +770,9 @@ impl ComAmazonawsOmicsOmicsState {
         for store in self.sequence_stores.values_mut() {
             store.settle(now_ms);
         }
+        // A run cache owes the clock nothing: no value of the modelled
+        // `RunCacheStatus` enum is a transient "being created" state, so a cache is
+        // usable from the moment its create answered and no transition is ever due.
     }
 
     /// The workflow the modelled `WorkflowId` `id` names, or `None`.
@@ -729,6 +795,11 @@ impl ComAmazonawsOmicsOmicsState {
     /// The sequence store the modelled `SequenceStoreId` `id` names, or `None`.
     pub fn sequence_store(&self, id: &str) -> Option<&SequenceStore> {
         self.sequence_stores.get(&numeric_id(id)?)
+    }
+
+    /// The run cache the modelled `RunCacheId` `id` names, or `None`.
+    pub fn run_cache(&self, id: &str) -> Option<&RunCache> {
+        self.run_caches.get(&numeric_id(id)?)
     }
 
     /// The run group the modelled `RunGroupId` `id` names, or `None`.
@@ -760,6 +831,16 @@ impl ComAmazonawsOmicsOmicsState {
         (key, key.to_string())
     }
 
+    /// Mint the next run cache id, the same way as a run's, from a counter offset by
+    /// [`RUN_CACHE_ID_OFFSET`] so no cache shares an id with a workflow, a run or a run
+    /// group. The modelled `RunCacheId` is `^[0-9]+$` with length 1..18, which every
+    /// value this mints satisfies.
+    pub fn next_run_cache_id(&mut self) -> (u64, String) {
+        let key = FIRST_RESOURCE_ID + RUN_CACHE_ID_OFFSET + self.next_run_cache_id;
+        self.next_run_cache_id += 1;
+        (key, key.to_string())
+    }
+
     /// Mint the next run group id, the same way, from a counter offset by
     /// [`RUN_GROUP_ID_OFFSET`] so no run group shares an id with a workflow or a run.
     /// The modelled `RunGroupId` is `^[0-9]+$` with length 1..18, which every value this
@@ -781,6 +862,7 @@ impl ComAmazonawsOmicsOmicsState {
             IdempotencyScope::CreateWorkflow => self.workflows.contains_key(&id),
             IdempotencyScope::StartRun => self.runs.contains_key(&id),
             IdempotencyScope::CreateSequenceStore => self.sequence_stores.contains_key(&id),
+            IdempotencyScope::CreateRunCache => self.run_caches.contains_key(&id),
             IdempotencyScope::CreateRunGroup => self.run_groups.contains_key(&id),
         };
         if still_held {
@@ -800,11 +882,13 @@ impl ComAmazonawsOmicsOmicsState {
             let workflows = &self.workflows;
             let runs = &self.runs;
             let sequence_stores = &self.sequence_stores;
+            let run_caches = &self.run_caches;
             let run_groups = &self.run_groups;
             self.idempotency.retain(|key, id| match key.0 {
                 IdempotencyScope::CreateWorkflow => workflows.contains_key(id),
                 IdempotencyScope::StartRun => runs.contains_key(id),
                 IdempotencyScope::CreateSequenceStore => sequence_stores.contains_key(id),
+                IdempotencyScope::CreateRunCache => run_caches.contains_key(id),
                 IdempotencyScope::CreateRunGroup => run_groups.contains_key(id),
             });
         }
@@ -899,6 +983,18 @@ pub fn workflow_version_arn(region: &str, workflow_id: &str, version_name: &str)
 /// The ARN of the run `id` in `region`.
 pub fn run_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("{RUN_ARN_RESOURCE_PREFIX}{id}"))
+}
+
+/// The ARN of the run cache `id` in `region`.
+///
+/// Well inside the modelled `RunCacheArn` length (1..128): the account and region are
+/// fixed and the id is at most 18 characters.
+pub fn run_cache_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{RUN_CACHE_ARN_RESOURCE_PREFIX}{id}"),
+    )
 }
 
 /// The ARN of the run group `id` in `region`.
@@ -1157,6 +1253,8 @@ pub enum AuditOutcome {
     RunDeleted,
     /// A sequence store was minted and stored.
     SequenceStoreCreated,
+    /// A run cache was minted and stored.
+    RunCacheCreated,
     /// A run group was minted and stored.
     RunGroupCreated,
     /// A replayed `@idempotencyToken` changed nothing and answered with the resource the
@@ -1190,6 +1288,7 @@ impl AuditOutcome {
             Self::RunStarted => "run-started",
             Self::RunDeleted => "run-deleted",
             Self::SequenceStoreCreated => "sequence-store-created",
+            Self::RunCacheCreated => "run-cache-created",
             Self::RunGroupCreated => "run-group-created",
             Self::NoChange => "no-change",
             Self::Reported => "reported",

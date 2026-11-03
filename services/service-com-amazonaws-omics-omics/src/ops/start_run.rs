@@ -398,19 +398,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every member below REFERENCES a resource whose own create operation is still a
         // 501 in this crate, so no value can name one that exists: run configurations
-        // (`CreateConfiguration`), run caches (`CreateRunCache`) and workflow versions
-        // (`CreateWorkflowVersion` stores a version inside its workflow, which this
-        // operation does not resolve yet). The real service answers "not found" for an id
-        // none of its stores holds, and so does this one — accepting the reference and
-        // storing it would report a run bound to a cache, configuration or version nothing
-        // ever resolved.
+        // (`CreateConfiguration`) and workflow versions (`CreateWorkflowVersion` stores a
+        // version inside its workflow, which this operation does not resolve yet). The
+        // real service answers "not found" for an id none of its stores holds, and so
+        // does this one — accepting the reference and storing it would report a run bound
+        // to a configuration or version nothing ever resolved.
         for (member, resource, value) in [
             (
                 "configurationName",
                 "run configuration",
                 input.configuration_name.as_deref(),
             ),
-            ("cacheId", "run cache", input.cache_id.as_deref()),
             (
                 "workflowVersionName",
                 "workflow version",
@@ -435,6 +433,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
+        // `cacheId` names a run cache this emulator DOES hold (`CreateRunCache`), so the
+        // reference is resolved against that store rather than refused: an id no cache
+        // carries is "not found", and one that resolves binds the run to that record.
+        // Same precedence as every other inherited member: this request, then the run it
+        // duplicates.
+        let requested_cache_id = input
+            .cache_id
+            .clone()
+            .or_else(|| source.and_then(|run| run.cache_id.clone()));
+        let cache = match requested_cache_id.as_deref() {
+            Some(cache_id) => Some(store.run_cache(cache_id).cloned().ok_or_else(|| {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::NotFound,
+                    Some(cache_id),
+                );
+                StartRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("no run cache with id {cache_id} exists in this region"),
+                })
+            })?),
+            None => None,
+        };
         // `runGroupId` names a run group, which this crate does hold (`CreateRunGroup`),
         // so the id is RESOLVED against that store instead of refused: the run records the
         // group's own canonical id, so `GetRun` and the `ListRuns` filter agree with every
@@ -464,6 +485,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             None => source.and_then(|run| run.run_group_id.clone()),
         };
+
 
         // `workflowOwnerId` asks for a workflow shared from another account; this
         // emulator holds only its own account's workflows (see `is_emulator_account`).
@@ -613,10 +635,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workflow_type,
             workflow_uuid,
             workflow_name,
-            // `workflowVersionName` and `cacheId` are refused above, so no stored run can
-            // carry one and there is nothing to inherit: the fields stay unset rather than
-            // carrying inheritance that can never run. The slice that implements run caches
-            // and resolves workflow versions for a run fills them.
+            // `workflowVersionName` is refused above, so no stored run can carry one and
+            // there is nothing to inherit: the field stays unset rather than carrying
+            // inheritance that can never run. The slice that resolves workflow versions
+            // for a run fills it.
             workflow_version_name: None,
             networking_mode: input
                 .networking_mode
@@ -638,11 +660,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .clone()
                 .or_else(|| source.and_then(|run| run.name.clone())),
             run_group_id,
-            cache_id: None,
+            // The cache's CANONICAL id, not the text the request spelled it with, for
+            // the same reason the workflow's is stored canonically.
+            cache_id: cache.as_ref().map(|cache| cache.id.clone()),
+            // `cacheBehavior`'s own documentation: "You specify this value if you want to
+            // override the default behavior for the cache. You had set the default value
+            // when you created the cache" — so the cache's own default applies when
+            // neither this request nor the run it duplicates names one.
             cache_behavior: input
                 .cache_behavior
                 .clone()
-                .or_else(|| source.and_then(|run| run.cache_behavior.clone())),
+                .or_else(|| source.and_then(|run| run.cache_behavior.clone()))
+                .or_else(|| cache.as_ref().map(|cache| cache.cache_behavior.clone())),
             priority: input.priority.or_else(|| source.and_then(|run| run.priority)),
             parameters,
             engine_settings: input

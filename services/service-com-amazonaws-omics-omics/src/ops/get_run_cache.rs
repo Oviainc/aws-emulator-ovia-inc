@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRunCache
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRunCache`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRunCache::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the run cache the request names, read from the ONE record
+//! [`crate::state`] holds for it: every member comes from what `CreateRunCache`
+//! stored, and an id no cache was minted for is the modelled 404. Reporting only —
+//! nothing here changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +169,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRunCache` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRunCacheErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRunCache"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            GetRunCacheErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics run cache registry is unavailable".to_string(),
+            })
+        })?;
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        let cache = registry.run_cache(&input.id).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.id),
+            );
+            GetRunCacheErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("no run cache with id {} exists in this region", input.id),
+            })
+        })?;
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::Reported,
+            Some(&cache.id),
+        );
+
+        Ok(GetRunCacheOutput {
+            id: Some(cache.id.clone()),
+            arn: Some(cache.arn.clone()),
+            name: cache.name.clone(),
+            description: cache.description.clone(),
+            cache_s3_uri: Some(cache.cache_s3_uri.clone()),
+            cache_behavior: Some(cache.cache_behavior.clone()),
+            cache_bucket_owner_id: Some(cache.cache_bucket_owner_id.clone()),
+            status: Some(cache.status.clone()),
+            creation_time: Some(crate::state::timestamp(cache.creation_time_ms)),
+            tags: cache.tags_output(),
+        })
     }
 }

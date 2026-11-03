@@ -24,13 +24,13 @@
 //!   but never causes;
 //! * an id no store holds is the modelled 404, however the id is shaped.
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use service_com_amazonaws_omics_omics::state::{FIRST_SEQUENCE_STORE_ID, MAX_TAGS};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::private_workflow_runs::{
     assert_absent, assert_arn, assert_members, assert_timestamp, call, emulator, error_code,
-    POLL_INTERVAL, SETTLE_DEADLINE,
+    tag_map, POLL_INTERVAL, SETTLE_DEADLINE,
 };
 
 /// Every value the modelled `ETagAlgorithmFamily` enum admits.
@@ -125,15 +125,6 @@ fn tag_keys(count: usize) -> Value {
             .map(|n| Value::String(format!("propagated{n}")))
             .collect(),
     )
-}
-
-/// A tag map with `count` entries.
-fn tag_map(count: usize) -> Value {
-    let mut tags = Map::new();
-    for n in 0..count {
-        tags.insert(format!("key{n}"), Value::String(format!("value{n}")));
-    }
-    Value::Object(tags)
 }
 
 /// A row of the create/read-back table: a request body, the members both the create and a
