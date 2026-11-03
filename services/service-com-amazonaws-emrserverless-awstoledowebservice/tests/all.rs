@@ -19,6 +19,8 @@ mod application_projection;
 mod effective_configuration_projection;
 #[path = "all/idempotency_and_idle_lifecycle.rs"]
 mod idempotency_and_idle_lifecycle;
+#[path = "all/idle_timeout_observability.rs"]
+mod idle_timeout_observability;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/resource_tagging.rs"]

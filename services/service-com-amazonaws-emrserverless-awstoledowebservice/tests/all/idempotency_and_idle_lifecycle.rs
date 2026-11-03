@@ -32,7 +32,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_emrserverless_awstoledowebservice::state::{
-    ComAmazonawsEmrserverlessAwstoledowebserviceState, JOB_RUN_STAGES, JOB_RUN_STAGE_TRANSITION,
+    idle_span, ComAmazonawsEmrserverlessAwstoledowebserviceState, JOB_RUN_STAGES,
+    JOB_RUN_STAGE_TRANSITION,
 };
 
 use super::application_lifecycle::{
@@ -803,8 +804,8 @@ async fn get_dashboard_for_job_run_mints_an_https_url_per_call() {
 /// documented default when the member is absent, and the stop switched off — and each is
 /// checked on BOTH sides of its threshold. The idle span is advanced by rewinding the
 /// application's recorded last activity in the shared store, so the test asserts the rule
-/// over spans no test could sit through, and every observation still goes through
-/// `GetApplication` over HTTP.
+/// over configurations whose span no test could sit through, and every observation still
+/// goes through `GetApplication` over HTTP.
 #[tokio::test]
 async fn an_idle_application_stops_itself_once_its_idle_timeout_has_passed() {
     // (case, the autoStopConfiguration the create carries, the idle minutes that apply,
@@ -871,10 +872,14 @@ async fn an_idle_application_stops_itself_once_its_idle_timeout_has_passed() {
             "case {case:?}: the application must be STARTED before it can stop itself"
         );
 
-        // A few seconds short of the idle timeout: still running. (Short of it by
-        // seconds rather than by a minute, so the row at the published minimum of one
-        // minute exercises the boundary too.)
-        rewind_last_activity(&engine, &application_id, idle_minutes * 60 - 5);
+        // Seconds short of the span those idle minutes are served as: still running.
+        // (Short of it by seconds whatever the configuration asks for, so every row
+        // exercises the boundary rather than a point well inside it.)
+        rewind_last_activity(
+            &engine,
+            &application_id,
+            idle_span(idle_minutes) - Duration::from_secs(3),
+        );
         assert_eq!(
             get_application(&router, &application_id)
                 .await
@@ -884,7 +889,7 @@ async fn an_idle_application_stops_itself_once_its_idle_timeout_has_passed() {
         );
 
         // Past it: stopped by the service itself, if it is configured to.
-        rewind_last_activity(&engine, &application_id, 10);
+        rewind_last_activity(&engine, &application_id, Duration::from_secs(4));
         let observed = get_application(&router, &application_id).await;
         let expected = if stops { "STOPPED" } else { "STARTED" };
         assert_eq!(
@@ -948,7 +953,7 @@ async fn an_application_running_work_is_not_idle() {
     let job_run_id = submitted_job_run(&router, &application_id, "job-busy").await;
 
     // Well past the idle timeout, with the run still in flight.
-    rewind_last_activity(&engine, &application_id, 3600);
+    rewind_last_activity(&engine, &application_id, Duration::from_secs(3600));
     assert_eq!(
         get_application(&router, &application_id)
             .await
@@ -978,7 +983,7 @@ async fn an_application_running_work_is_not_idle() {
         json!("STARTED"),
         "the idle span starts when the work finished, not before it"
     );
-    rewind_last_activity(&engine, &application_id, 120);
+    rewind_last_activity(&engine, &application_id, Duration::from_secs(120));
     assert_eq!(
         get_application(&router, &application_id)
             .await
@@ -1045,7 +1050,7 @@ async fn an_application_holding_a_live_session_is_not_idle() {
     wait_for_transition();
 
     // Well past the application's idle timeout, with the session still live.
-    rewind_last_activity(&engine, &application_id, 3600);
+    rewind_last_activity(&engine, &application_id, Duration::from_secs(3600));
     assert_eq!(
         get_application(&router, &application_id)
             .await
@@ -1056,8 +1061,8 @@ async fn an_application_holding_a_live_session_is_not_idle() {
 
     // The session's own idle timeout ends it; from then the application is idle, and
     // once its own span has passed it stops itself. The session's termination is moved
-    // just past due, so the application has been idle for seconds rather than minutes.
-    rewind_session_idle_since(&engine, &application_id, &session_id, 61);
+    // exactly to due, so the application has been idle only since the session ended.
+    rewind_session_idle_since(&engine, &application_id, &session_id, idle_span(1));
     let session = call(
         &router,
         "GET",
@@ -1078,7 +1083,7 @@ async fn an_application_holding_a_live_session_is_not_idle() {
         json!("STARTED"),
         "the application's idle span starts when the session ended, not before it"
     );
-    rewind_last_activity(&engine, &application_id, 120);
+    rewind_last_activity(&engine, &application_id, Duration::from_secs(120));
     assert_eq!(
         get_application(&router, &application_id)
             .await
@@ -1197,31 +1202,27 @@ async fn a_create_refusal_names_the_member_that_failed() {
     );
 }
 
-/// Move an application's recorded last activity `seconds` into the past, through the
+/// Move an application's recorded last activity `span` into the past, through the
 /// store the handlers share, so an idle span longer than any test can sit through has
 /// elapsed by the time the next request reads it.
-fn rewind_last_activity(
-    engine: &engine::InMemoryEngine,
-    application_id: &str,
-    seconds: u64,
-) {
+fn rewind_last_activity(engine: &engine::InMemoryEngine, application_id: &str, span: Duration) {
     let state = engine.state::<ComAmazonawsEmrserverlessAwstoledowebserviceState>();
     let mut store = state.lock();
     let record = store
         .applications
         .get_mut(application_id)
         .expect("the application the test created is in the store");
-    record.last_activity_at -= Duration::from_secs(seconds);
+    record.last_activity_at -= span;
 }
 
 /// Move a session's recorded idle instant — and the termination its own idle timeout
-/// owes it — `seconds` into the past, so the span the session's `idleTimeoutMinutes`
+/// owes it — `span` into the past, so the span the session's `idleTimeoutMinutes`
 /// bounds has elapsed by the time the next request reads it.
 fn rewind_session_idle_since(
     engine: &engine::InMemoryEngine,
     application_id: &str,
     session_id: &str,
-    seconds: u64,
+    span: Duration,
 ) {
     let state = engine.state::<ComAmazonawsEmrserverlessAwstoledowebserviceState>();
     let mut store = state.lock();
@@ -1234,6 +1235,6 @@ fn rewind_session_idle_since(
         .get_mut(session_id)
         .expect("the session the test started is in the store");
     if let Some(pending) = session.pending.as_mut() {
-        pending.due -= Duration::from_secs(seconds);
+        pending.due -= span;
     }
 }

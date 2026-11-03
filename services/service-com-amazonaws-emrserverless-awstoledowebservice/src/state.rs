@@ -169,6 +169,32 @@ pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
 /// nothing sleeps.
 pub const JOB_RUN_STAGE_TRANSITION: Duration = Duration::from_millis(750);
 
+/// How long this emulator holds a resource idle for, per MINUTE of idle time the
+/// configuration governing it names.
+///
+/// The idle spans this service is configured with are stated in MINUTES, and the
+/// shortest either of them admits — `AutoStopConfig$idleTimeoutMinutes`
+/// (`@range(min: 1, max: 10080)`) and `StartSessionRequest$idleTimeoutMinutes` — is one
+/// minute, longer than the window a client polls a lifecycle edge in. So the span an
+/// idle timeout is SERVED as is the emulator's own, exactly like [`LIFECYCLE_TRANSITION`]
+/// and [`JOB_RUN_STAGE_TRANSITION`]: each configured minute of idle time is served as
+/// this span, deliberately not zero — a client acting straight after the call that left
+/// the resource idle still observes it in the state it is idle in — and short enough that
+/// the state change the idle timeout owes falls due inside the window a client polls in,
+/// while the configured value still ORDERS those changes: a resource configured for more
+/// idle minutes always stops after one configured for fewer. The configured value itself
+/// is stored and reported verbatim; only the span the emulator waits for is its own.
+pub const IDLE_MINUTE_SPAN: Duration = Duration::from_secs(5);
+
+/// The span this emulator serves `minutes` of configured idle time as: one
+/// [`IDLE_MINUTE_SPAN`] per minute, saturating rather than overflowing, and held to the
+/// longest transient span this service ever waits out ([`MAX_TRANSIENT_SPAN`]).
+pub fn idle_span(minutes: u64) -> Duration {
+    IDLE_MINUTE_SPAN
+        .saturating_mul(u32::try_from(minutes).unwrap_or(u32::MAX))
+        .min(MAX_TRANSIENT_SPAN)
+}
+
 /// How long the URL `GetDashboardForJobRun` mints stays usable.
 ///
 /// Source: the operation's own documentation — "The URL is valid for one hour after you
@@ -814,14 +840,15 @@ impl SessionRecord {
     /// minutes for the session. After the session remains idle for this duration, Amazon
     /// EMR Serverless automatically terminates it." A session that named no timeout, or
     /// named zero minutes, is owed no termination: nothing documents a default, so none
-    /// is invented.
+    /// is invented. Each minute it names is served as one [`IDLE_MINUTE_SPAN`], the span
+    /// this emulator holds a resource idle for.
     fn idle_timeout_pending(&self, idle_since: SystemTime) -> Option<PendingState> {
         let minutes = u64::try_from(self.session.idle_timeout_minutes.unwrap_or(0)).ok()?;
         if minutes == 0 {
             return None;
         }
         Some(PendingState {
-            due: due_at(idle_since, Duration::from_secs(minutes * 60)),
+            due: due_at(idle_since, idle_span(minutes)),
             state: "TERMINATED".to_string(),
             state_details: Some(SESSION_IDLE_TIMEOUT_STATE_DETAILS.to_string()),
         })
@@ -872,6 +899,13 @@ impl ApplicationRecord {
                     self.application.state_details = Some(details.clone());
                 }
                 self.application.updated_at = DateTime::from(pending.due);
+                if self.application.state == "STARTED" {
+                    // The application came up at the due instant, so that is the instant
+                    // from which it has been idle: the span `autoStopConfiguration`
+                    // bounds runs from when the application was there to use, not from
+                    // the call that asked for it.
+                    self.last_activity_at = self.last_activity_at.max(pending.due);
+                }
                 self.pending = None;
             }
         }
@@ -920,7 +954,8 @@ impl ApplicationRecord {
     ///
     /// `AutoStopConfig$idleTimeoutMinutes` is "the amount of idle time in minutes after
     /// which your application will automatically stop" (`@range(min: 1, max: 10080)`,
-    /// "Defaults to 15 minutes"), so the caller's value is the span that applies.
+    /// "Defaults to 15 minutes"), so the caller's value is the number of idle minutes
+    /// that applies, each served as one [`IDLE_MINUTE_SPAN`].
     pub fn idle_timeout(&self) -> Duration {
         let minutes = self
             .application
@@ -929,7 +964,7 @@ impl ApplicationRecord {
             .and_then(|config| config.idle_timeout_minutes)
             .unwrap_or(DEFAULT_IDLE_TIMEOUT_MINUTES);
         let minutes = u64::try_from(minutes).unwrap_or(1).max(1);
-        Duration::from_secs(minutes * 60)
+        idle_span(minutes)
     }
 
     /// The instant the clock owes this application a `STOPPED` state with no

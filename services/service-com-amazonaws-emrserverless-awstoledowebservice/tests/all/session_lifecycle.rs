@@ -20,9 +20,9 @@
 //!    application: the release it runs (`7.13.0` and later), interactive sessions being
 //!    enabled on it, and it being `STARTED` or starting by itself.
 //! 4. `clientToken` is an idempotency token: the same token names the same session.
-//! 5. A session's `idleTimeoutMinutes` terminates it when it falls due. The smallest
-//!    value the model admits is a whole minute, so that one rule is asserted against a
-//!    synthetic clock over the stored record rather than waited for.
+//! 5. A session's `idleTimeoutMinutes` terminates it when it falls due. The span the
+//!    emulator serves those configured minutes as is its own, so that one rule is
+//!    asserted against a synthetic clock over the stored record rather than waited for.
 
 use std::time::{Duration, SystemTime};
 
@@ -31,7 +31,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_emrserverless_awstoledowebservice::ops::types::Session;
 use service_com_amazonaws_emrserverless_awstoledowebservice::state::{
-    PendingState, SessionRecord, LIFECYCLE_TRANSITION,
+    idle_span, PendingState, SessionRecord, LIFECYCLE_TRANSITION,
 };
 
 use super::application_lifecycle::{
@@ -837,9 +837,9 @@ fn at_secs(value: aws_smithy_types::DateTime) -> i64 {
 /// none is owed no termination however long nobody reads it.
 ///
 /// The smallest timeout the model admits (`@range(min: 0, max: 1000000)`) is one minute,
-/// so the owed termination is asserted against a synthetic clock over the stored record
-/// instead of being waited for; the HTTP-level tests above cover the same record's
-/// `STARTED` transition.
+/// which the emulator serves as a span of its own choosing, so the owed termination is
+/// asserted against a synthetic clock over the stored record instead of being waited for;
+/// the HTTP-level tests above cover the same record's `STARTED` transition.
 #[test]
 fn an_idle_session_is_terminated_when_its_idle_timeout_falls_due() {
     let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
@@ -867,25 +867,25 @@ fn an_idle_session_is_terminated_when_its_idle_timeout_falls_due() {
         (
             "the smallest timeout, before it falls due",
             Some(1),
-            Duration::from_secs(59),
+            idle_span(1) - Duration::from_secs(1),
             "STARTED",
         ),
         (
             "the smallest timeout, after it falls due",
             Some(1),
-            Duration::from_secs(61),
+            idle_span(1) + Duration::from_secs(1),
             "TERMINATED",
         ),
         (
             "half an hour, before it falls due",
             Some(30),
-            Duration::from_secs(29 * 60),
+            idle_span(30) - Duration::from_secs(1),
             "STARTED",
         ),
         (
             "half an hour, after it falls due",
             Some(30),
-            Duration::from_secs(31 * 60),
+            idle_span(30) + Duration::from_secs(1),
             "TERMINATED",
         ),
         (
@@ -926,7 +926,7 @@ fn an_idle_session_is_terminated_when_its_idle_timeout_falls_due() {
         );
         match (expected_state, minutes) {
             ("TERMINATED", Some(minutes)) => {
-                let due = idle_since + Duration::from_secs(minutes as u64 * 60);
+                let due = idle_since + idle_span(u64::try_from(minutes).unwrap_or(0));
                 assert_eq!(
                     session.ended_at.map(at_secs),
                     Some(aws_smithy_types::DateTime::from(due).secs()),
