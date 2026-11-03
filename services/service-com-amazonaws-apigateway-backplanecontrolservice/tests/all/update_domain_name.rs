@@ -32,7 +32,7 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::ops::types::{
     SECURITY_POLICY_VALUES,
 };
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
-    invalid_patch_path, DEFAULT_SECURITY_POLICY, DOMAIN_NAME_AVAILABLE, DOMAIN_NAME_CREATE_SPAN,
+    invalid_request_input, DEFAULT_SECURITY_POLICY, DOMAIN_NAME_AVAILABLE, DOMAIN_NAME_CREATE_SPAN,
     DOMAIN_NAME_MIGRATION_SPAN, DOMAIN_NAME_UPDATING, EDGE_DISTRIBUTION_HOSTED_ZONE_ID,
     IPV4_ADDRESS_TYPE, MAX_POLICY_CHARS, MAX_STRING_CHARS,
 };
@@ -684,16 +684,24 @@ async fn a_patch_this_operation_cannot_apply_is_refused_and_changes_nothing() {
         );
     }
 
-    // A path the resource has no updateable member for is refused with the fixed sentence
-    // and the path the request sent, and nothing else.
+    // A path the resource has no updateable member for is refused as request input: the
+    // path the request sent and then the fixed sentence, and nothing else. The sentence is
+    // written out here rather than read off the service's own constant, so a change of
+    // wording is caught rather than followed; the constant is asserted to agree with it.
     for path in ["/domainName", "/nosuchmember", "/endpointConfiguration/zzz"] {
+        let expected = format!("{path} Invalid request input");
+        assert_eq!(
+            invalid_request_input(path),
+            expected,
+            "case the service constant for {path}: expected {expected:?}, got {:?}",
+            invalid_request_input(path)
+        );
         let answer = update(&gateway, name, vec![replace(path, "x")]).await;
         let message = answer.body["message"].as_str().unwrap_or_default();
         assert_eq!(
-            message,
-            invalid_patch_path(path),
-            "case the message of the unsupported path {path}: expected the fixed sentence \
-             and the path, got {message:?}"
+            message, expected,
+            "case the message of the unsupported path {path}: expected the path and the \
+             fixed sentence, got {message:?}"
         );
     }
 }

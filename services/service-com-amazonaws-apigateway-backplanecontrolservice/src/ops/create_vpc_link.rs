@@ -151,7 +151,7 @@ fn bound_input(input: &CreateVpcLinkInput) -> Result<(), String> {
         MAX_COLLECTION_ENTRIES,
     )?;
     if input.target_arns.is_empty() {
-        return Err("targetArns must name at least one target".to_string());
+        return Err(crate::state::VPC_LINK_NEEDS_A_TARGET.to_string());
     }
     for target in &input.target_arns {
         bound_chars("a targetArns entry", target, MAX_STRING_CHARS)?;

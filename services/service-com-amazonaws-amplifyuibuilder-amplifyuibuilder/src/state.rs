@@ -1323,11 +1323,12 @@ pub const DUPLICATE_ITEM_NAME_MESSAGE: &str = "Item name already exists";
 /// The message of the wrong-scope refusal — an id that resolves, but under
 /// another app or backend environment than the one the request addressed.
 ///
-/// Recorded behaviour: the message contains the fixed phrase "does not belong to
-/// that app or environment", which names no ids; it is what separates a scope
-/// violation from an ordinary malformed-parameter rejection, both untyped 400s.
+/// Recorded behaviour: ONE fixed sentence, which names no ids and no resource
+/// kind — it reads the same whichever of this service's resources the id
+/// resolved under — and is what separates a scope violation from an ordinary
+/// malformed-parameter rejection, both untyped 400s.
 pub const WRONG_SCOPE_MESSAGE: &str =
-    "The item specified does not belong to that app or environment";
+    "The item requests does not belong to that app or environment";
 
 /// The `ResourceNotFoundException` payload a reporting or updating call answers
 /// for an id that names no resource in the app environment the request

@@ -146,10 +146,10 @@ use super::types::*;
 
 use crate::state::{
     edge_distribution_domain_name, patch_enum_string, patch_optional_string, patch_security_policy,
-    patch_string_set, regional_endpoint_domain_name, DomainNameEntry, Patch, PatchFailure,
-    PatchOpKind, DOMAIN_NAME_MIGRATION_SPAN, DOMAIN_NAME_UPDATING, EDGE_DISTRIBUTION_HOSTED_ZONE_ID,
-    MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS, MAX_STRING_CHARS, PRIVATE_ENDPOINT_TYPE,
-    REGIONAL_ENDPOINT_TYPE,
+    patch_string_set, regional_endpoint_domain_name, DomainNameEntry, InvalidPathRefusal, Patch,
+    PatchFailure, PatchOpKind, DOMAIN_NAME_MIGRATION_SPAN, DOMAIN_NAME_UPDATING,
+    EDGE_DISTRIBUTION_HOSTED_ZONE_ID, MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS, MAX_STRING_CHARS,
+    PRIVATE_ENDPOINT_TYPE, REGIONAL_ENDPOINT_TYPE,
 };
 // The edge-optimized endpoint type, under the name this file reads it by: the crate holds
 // that one value as the type a create takes when the request names none.
@@ -159,6 +159,12 @@ use crate::state::DEFAULT_ENDPOINT_TYPE as EDGE_ENDPOINT_TYPE;
 // arm for: one per updateable member of the `DomainName` shape, the
 // `mutualTlsAuthentication` and `endpointConfiguration` sub-members included.
 //
+// A path this operation has no arm for is refused as REQUEST INPUT: the pointer the
+// request sent and then the fixed `Invalid request input`, with no patchable set offered.
+// That is what `UpdateDomainName` answers for the custom domain name's own `/domainName`,
+// and so for every other pointer it cannot apply.
+const INVALID_PATH: InvalidPathRefusal = InvalidPathRefusal::PathThenInvalidInput;
+
 // `domainName`, `domainNameId`, `domainNameArn`, `certificateUploadDate`,
 // `distributionDomainName`, `distributionHostedZoneId`, `regionalDomainName`,
 // `regionalHostedZoneId`, `domainNameStatus` and `domainNameStatusMessage` are the
@@ -547,7 +553,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The list is read BEFORE the store lock is taken, so a malformed patch never
         // reaches the records at all.
         let patches =
-            crate::state::parse_patches(input.patch_operations.as_ref()).map_err(patch_failure)?;
+            crate::state::parse_patches_refused_with(input.patch_operations.as_ref(), INVALID_PATH)
+                .map_err(patch_failure)?;
         let region = crate::state::request_region(ctx.parts());
         // The two members together address one record: a `domainNameId` is "supported
         // only for private custom domain names", and a private one needs it because

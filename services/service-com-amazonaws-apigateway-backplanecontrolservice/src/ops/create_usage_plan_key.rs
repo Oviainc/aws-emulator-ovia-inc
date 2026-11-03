@@ -235,10 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateUsagePlanKeyErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(crate::state::usage_plan_key_already_exists(
-                        &input.usage_plan_id,
-                        &input.key_id,
-                    )),
+                    message: Some(crate::state::USAGE_PLAN_KEY_ALREADY_EXISTS.to_string()),
                 },
             )
             .into());

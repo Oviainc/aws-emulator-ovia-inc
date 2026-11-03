@@ -1150,11 +1150,17 @@ pub fn invalid_usage_plan_key_type() -> String {
 
 /// The `ConflictException` message for a key already metered by the plan.
 ///
-/// Built from the request, for the reason [`no_such_rest_api`] gives: API Gateway states
-/// no fixed sentence here, so the message names the pair it refused.
-pub fn usage_plan_key_already_exists(usage_plan_id: &str, key_id: &str) -> String {
-    format!("API Key {key_id} already in Usage Plan {usage_plan_id}")
-}
+/// A SENTENCE OF ITS OWN, like [`INVALID_REST_API_IDENTIFIER`]: API Gateway states one
+/// fixed sentence for this conflict and quotes back neither the plan nor the key, so the
+/// pair the caller already named in the request is not repeated into the message.
+pub const USAGE_PLAN_KEY_ALREADY_EXISTS: &str = "API Key is already subscribed to Usage Plan";
+
+/// The `ConflictException` message for a status code the addressed method already answers
+/// a response for.
+///
+/// A SENTENCE OF ITS OWN, like [`USAGE_PLAN_KEY_ALREADY_EXISTS`]: it has no variable part,
+/// so neither the status code nor the verb the caller sent is quoted back.
+pub const METHOD_RESPONSE_ALREADY_EXISTS: &str = "Response already exists for this resource";
 
 /// The `LimitExceededException` message for a plan that already meters as many API keys
 /// as this emulator stores for one plan; see [`MAX_USAGE_PLAN_KEYS_PER_PLAN`].
@@ -2657,6 +2663,10 @@ impl SupportedPatchPaths {
 pub enum InvalidPathRefusal {
     /// The fixed sentence and the path the request sent, and nothing else.
     PathOnly,
+    /// The path the request sent and then the service's fixed `Invalid request input` —
+    /// the wording of an operation that holds a patch path against the request as INPUT
+    /// rather than against the resource's patchable set, so it offers no set at all.
+    PathThenInvalidInput,
     /// The path quoted, the `op` of the same `patchOperations` entry, and the paths that
     /// op may name on the resource — read from the resource's own [`SupportedPatchPaths`]
     /// table, in the order the service itself prints them.
@@ -2684,6 +2694,7 @@ impl InvalidPathRefusal {
     fn message(self, path: &str, op: PatchOpKind, unsupported_op: &str) -> String {
         match self {
             Self::PathOnly => invalid_patch_path(path),
+            Self::PathThenInvalidInput => invalid_request_input(path),
             Self::PathOpAndSupported(supported) => match supported.for_op(op) {
                 // The two spaces after `path` are the service's own, as is the bracketed,
                 // comma-separated list.
@@ -3001,6 +3012,17 @@ impl Patch {
 /// same sentence for the same kind of mistake on every operation that words it this way.
 pub fn invalid_patch_path(path: &str) -> String {
     format!("Invalid patch path {path}")
+}
+
+/// The `BadRequestException` message for a patch path refused as REQUEST INPUT: the path
+/// exactly as the request spelled it, then API Gateway's fixed `Invalid request input`.
+///
+/// This is the wording of [`InvalidPathRefusal::PathThenInvalidInput`] — the sentence a
+/// recorded refusal of a `replace` of the custom domain name's own `/domainName` shows
+/// (`/domainName Invalid request input`). It carries no enumeration, because an operation
+/// that words it this way publishes no patchable set in the refusal.
+pub fn invalid_request_input(path: &str) -> String {
+    format!("{path} Invalid request input")
 }
 
 /// The `BadRequestException` message for a patch path that names a NESTED structure of a
@@ -4216,6 +4238,16 @@ pub const INVALID_MODEL_SCHEMA: &str = "Invalid model specified: Validation Resu
 /// link operation and a `resourceArn` naming one alike. One copy, so no two of them word
 /// the same failure differently.
 pub const NO_SUCH_VPC_LINK: &str = "Invalid Vpc Link identifier specified";
+
+/// The `BadRequestException` message for a `CreateVpcLink` whose `targetArns` names no
+/// target: a VPC link reaches a VPC through a load balancer, so a link with no target
+/// reaches nothing.
+///
+/// API Gateway states a FIXED sentence here and quotes back neither the member name nor
+/// the (empty) value it received. `targetArns` is `@required` on the request shape, so a
+/// request that leaves the member out never reaches this sentence: the framework refuses
+/// it as a missing required member first.
+pub const VPC_LINK_NEEDS_A_TARGET: &str = "Need at least one target arn to create a vpc link";
 
 /// The `BadRequestException` message for a VPC link an `Integration` of some API still
 /// reaches through its `connectionId`, which is what `DeleteVpcLink` refuses while the

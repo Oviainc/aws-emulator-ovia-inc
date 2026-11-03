@@ -88,3 +88,6 @@ mod theme_update;
 
 #[path = "all/theme_updates.rs"]
 mod theme_updates;
+
+#[path = "all/wrong_scope_sentence.rs"]
+mod wrong_scope_sentence;

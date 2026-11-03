@@ -76,6 +76,8 @@ mod execute_api_data_plane;
 mod flush_stage_authorizers_cache;
 #[path = "all/flush_stage_cache.rs"]
 mod flush_stage_cache;
+#[path = "all/fixed_refusal_sentences.rs"]
+mod fixed_refusal_sentences;
 #[path = "all/gateway_response.rs"]
 mod gateway_response;
 #[path = "all/gateway_response_collection.rs"]

@@ -323,7 +323,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if method.method_responses.contains_key(&input.status_code) {
             return Err(PutMethodResponseErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some("Method response already exists for this method".to_string()),
+                    message: Some(crate::state::METHOD_RESPONSE_ALREADY_EXISTS.to_string()),
                 },
             )
             .into());
