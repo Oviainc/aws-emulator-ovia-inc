@@ -65,6 +65,8 @@ mod resource_tagging;
 mod state_roundtrip;
 #[path = "all/update_glossary.rs"]
 mod update_glossary;
+#[path = "all/update_glossary_term.rs"]
+mod update_glossary_term;
 #[path = "all/update_project.rs"]
 mod update_project;
 #[path = "all/user_profiles.rs"]

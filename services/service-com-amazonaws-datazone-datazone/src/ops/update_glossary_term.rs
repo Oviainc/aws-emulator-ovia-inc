@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGlossaryTerm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGlossaryTerm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGlossaryTerm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! PATCHES a PERSISTED business glossary term of a persisted domain: every member the
+//! request carries replaces the stored value, every member it omits leaves the stored
+//! value exactly as it was, and the answer is read off the record that was written — so
+//! the next `GetGlossaryTerm` reports the same thing.
+//!
+//! The documented prerequisites are enforced against the store, not assumed: the term
+//! must be one of the named domain's, a `glossaryIdentifier` the request carries must
+//! name a glossary of that same domain, the resulting name must be unique within the
+//! glossary the term then belongs to, and every term a `termRelations` names must be a
+//! term stored in the same domain. `GlossaryTermStatus` has no DELETED member
+//! (smithy_query shape="GlossaryTermStatus"): a deleted term is gone from the store, so
+//! a call naming one is answered as absent.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +188,208 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGlossaryTerm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGlossaryTermErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGlossaryTerm"))
+        use crate::state::{
+            caller_principal, now_ms, stored_term_relations, term_usage_restrictions, ResourceKind,
+            GLOSSARY_TERM_STATUS_DISABLED, GLOSSARY_TERM_STATUS_ENABLED,
+        };
+
+        // `GlossaryTermStatus` is DISABLED | ENABLED (smithy_query
+        // shape="GlossaryTermStatus"). The enum is modelled, so the boundary validator
+        // has already refused anything outside it; a value that reached here nonetheless
+        // names a status this service does not define, which is a bad request and not a
+        // missing implementation.
+        if let Some(status) = input.status.as_deref() {
+            if status != GLOSSARY_TERM_STATUS_ENABLED && status != GLOSSARY_TERM_STATUS_DISABLED {
+                return Err(UpdateGlossaryTermErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "status must be one of {GLOSSARY_TERM_STATUS_DISABLED}, \
+                             {GLOSSARY_TERM_STATUS_ENABLED}"
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateGlossaryTermErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // A request's `termRelations` in the store's form, taken BEFORE the state reads
+        // so the check below and the write further down use the one value.
+        let requested_relations = input
+            .term_relations
+            .map(|relations| stored_term_relations(Some(relations)));
+
+        // Every documented prerequisite is read under one lock, before anything is
+        // written: a refused patch must leave the stored term exactly as it was.
+        let target_glossary = {
+            // A term is addressed by its domain and its own id, so a domain that is gone
+            // — or already on its way out — holds no term to patch, and a term of
+            // another domain is as absent here as one nothing created. This operation
+            // DOES model `ResourceNotFoundException` (smithy_query
+            // operation="UpdateGlossaryTerm"), so that is the refusal.
+            let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
+                UpdateGlossaryTermErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: ResourceKind::Domain.not_found_message(),
+                    },
+                )
+            })?;
+            let term = domain.glossary_terms.get(&input.identifier).ok_or_else(|| {
+                UpdateGlossaryTermErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: ResourceKind::GlossaryTerm.not_found_message(),
+                    },
+                )
+            })?;
+
+            // `glossaryIdentifier` is a patchable member like any other: the request
+            // carrying one asks for the term to be an entry of THAT glossary, and a
+            // request that carries none leaves the term where it is. Either way the
+            // glossary has to be one of this domain's — a term cannot be an entry of a
+            // glossary the domain does not hold.
+            let target_glossary = input
+                .glossary_identifier
+                .clone()
+                .unwrap_or_else(|| term.glossary_id.clone());
+            if !domain.glossaries.contains_key(&target_glossary) {
+                return Err(UpdateGlossaryTermErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: ResourceKind::Glossary.not_found_message(),
+                    },
+                )
+                .into());
+            }
+
+            // "New name must not conflict with existing terms in the same glossary": a
+            // term's name is unique within the glossary it is an entry of — the very
+            // uniqueness scope `CreateGlossaryTerm` enforces — so the patch is checked
+            // against the name and the glossary it LEAVES the term with, whether it
+            // renames the term, re-points it or both. The term re-asserting its own name
+            // is not a clash with itself, and the same name under another glossary is a
+            // different term.
+            let target_name = input.name.as_deref().unwrap_or(&term.name);
+            if let Some(clash) = domain.glossary_terms.values().find(|other| {
+                other.glossary_id == target_glossary
+                    && other.name == target_name
+                    && other.id != input.identifier
+            }) {
+                return Err(UpdateGlossaryTermErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "Glossary term {} already uses this name in glossary {}",
+                            clash.id, target_glossary
+                        ),
+                    },
+                )
+                .into());
+            }
+
+            // A relation points at ANOTHER TERM, so every id a `termRelations` names has
+            // to resolve to a term of this domain: a relation to something that is not a
+            // term would otherwise be reported back as one.
+            if requested_relations.as_ref().is_some_and(|relations| {
+                relations
+                    .related_term_ids()
+                    .any(|related| !domain.glossary_terms.contains_key(related))
+            }) {
+                return Err(UpdateGlossaryTermErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: ResourceKind::GlossaryTerm.not_found_message(),
+                    },
+                )
+                .into());
+            }
+
+            target_glossary
+        };
+
+        // Derived from the caller's own credential scope, never from the request body.
+        let principal = caller_principal(ctx);
+        // The domain and the term were both found under this same lock a few lines up,
+        // so they are still there; an impossible disappearance is reported as a server
+        // fault rather than answered as though the patch had been applied.
+        let domain = store
+            .domains
+            .get_mut(&input.domain_identifier)
+            .ok_or_else(|| {
+                UpdateGlossaryTermErrorModeled::InternalServerException(InternalServerException {
+                    message: "the domain disappeared while its glossary term was being updated"
+                        .to_string(),
+                })
+            })?;
+        let term = domain
+            .glossary_terms
+            .get_mut(&input.identifier)
+            .ok_or_else(|| {
+                UpdateGlossaryTermErrorModeled::InternalServerException(InternalServerException {
+                    message: "the glossary term disappeared while it was being updated"
+                        .to_string(),
+                })
+            })?;
+
+        // PATCH semantics: a member the request carries replaces the stored value, a
+        // member it omits leaves the stored value untouched. `createdBy` and `createdAt`
+        // belong to the create — this operation takes neither, so each is reported
+        // exactly as stored.
+        term.glossary_id = target_glossary.clone();
+        if let Some(name) = input.name {
+            term.name = name;
+        }
+        if let Some(short_description) = input.short_description {
+            term.short_description = Some(short_description);
+        }
+        if let Some(long_description) = input.long_description {
+            term.long_description = Some(long_description);
+        }
+        // Checked against its modelled members above, so a status the request carries is
+        // stored as it stands.
+        if let Some(status) = input.status {
+            term.status = status;
+        }
+        if let Some(relations) = requested_relations {
+            term.term_relations = relations;
+        }
+        // The update is what sets `updatedBy`/`updatedAt`, which `GetGlossaryTerm`
+        // reports as absent until something updates the term. The operation is
+        // `@idempotent` and takes no token: a repeat of the same patch reaches the same
+        // stored state, so there is no second resource for a retry to leave behind.
+        term.updated_by = Some(principal);
+        term.updated_at_ms = Some(now);
+
+        // Read off the record that was just written, so a 200 can never report a term
+        // this call did not persist. The restriction is the owning GLOSSARY's, by the
+        // rule `crate::state::term_usage_restrictions` states.
+        let restrictions = term_usage_restrictions(domain, &target_glossary);
+        Ok(term_output(&domain.glossary_terms[&input.identifier], restrictions))
+    }
+}
+
+/// Render a stored glossary term as this operation's response.
+///
+/// Every member is read off the stored record, so the answer and the next
+/// `GetGlossaryTerm` cannot disagree. `usage_restrictions` is the owning glossary's,
+/// resolved by `crate::state::term_usage_restrictions`.
+fn term_output(
+    term: &crate::state::GlossaryTerm,
+    usage_restrictions: Option<Vec<String>>,
+) -> UpdateGlossaryTermOutput {
+    UpdateGlossaryTermOutput {
+        id: term.id.clone(),
+        domain_id: term.domain_id.clone(),
+        glossary_id: term.glossary_id.clone(),
+        name: term.name.clone(),
+        status: term.status.clone(),
+        short_description: term.short_description.clone(),
+        long_description: term.long_description.clone(),
+        term_relations: crate::state::term_relations_output(&term.term_relations),
+        usage_restrictions,
     }
 }
