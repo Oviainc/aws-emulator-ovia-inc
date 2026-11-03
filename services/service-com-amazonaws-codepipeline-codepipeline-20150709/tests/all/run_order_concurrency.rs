@@ -8,12 +8,15 @@
 //! so their `[startTime, lastUpdateTime]` windows overlap — while an action of a higher
 //! run order starts only once EVERY action of the run order before it has finished, so
 //! its window overlaps none of theirs. Which run order an action belongs to is the one
-//! it declares, defaulted to 1 where it declares none.
+//! it declares, defaulted to 1 where it declares none — the position an action is
+//! declared at and the name it carries decide nothing.
 //!
 //! The rows differ along what the rule generalises over: how many actions share a run
 //! order, how many run orders a stage declares, whether the order is declared or
-//! defaulted, and which values the orders take (contiguous or not, starting at 1 or not,
-//! and both published bounds of `ActionRunOrder`'s `@range(min: 1, max: 999)`).
+//! defaulted, which values the orders take (contiguous or not, starting at 1 or not,
+//! and both published bounds of `ActionRunOrder`'s `@range(min: 1, max: 999)`), and
+//! whether the declaration order and the alphabetical order of the names AGREE with the
+//! declared run orders or contradict them.
 //!
 //! The harness is the execution plane's own (`tests/all/execution_engine.rs`), so every
 //! assertion here goes through the router, over the wire the service speaks.
@@ -112,6 +115,171 @@ async fn windows(
         collected.insert(name, (start, end));
     }
     collected
+}
+
+/// The bytes the source action of this suite's pipelines publishes, and so the bytes
+/// every deploy action of the acting stage delivers.
+const SOURCE_BYTES: &[u8] = b"the source bytes";
+
+/// One declared action of the acting stage: the name it is declared under and the run
+/// order it declares (`None` where it declares none).
+type Declared = (&'static str, Option<i64>);
+
+/// Create `pipeline` with a source stage and one acting "Deploy" stage declaring
+/// `declared` IN THE GIVEN ORDER, start it, and answer the execution the start reported.
+async fn run_declared(emulator: &Emulator, pipeline: &str, declared: &[Declared]) -> String {
+    emulator.bucket(&artifact_bucket(pipeline)).await;
+    emulator.bucket("source-bucket").await;
+    emulator.bucket("deploy-bucket").await;
+    emulator
+        .put_object("source-bucket", "source.zip", SOURCE_BYTES)
+        .await;
+    let actions: Vec<Value> = declared
+        .iter()
+        .map(|(name, order)| deploy_action(name, *order))
+        .collect();
+    emulator
+        .ok(
+            "CreatePipeline",
+            &declaration(
+                pipeline,
+                json!([
+                    source_stage("source-bucket", "source.zip", "SourceArtifact"),
+                    {"name": "Deploy", "actions": actions},
+                ]),
+                None,
+            ),
+        )
+        .await;
+    let started = emulator
+        .ok("StartPipelineExecution", &json!({"name": pipeline}))
+        .await;
+    started["pipelineExecutionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{pipeline}: the start reports an execution id"))
+        .to_string()
+}
+
+#[tokio::test]
+async fn which_action_runs_first_is_decided_by_run_order_and_not_by_declaration_order() {
+    // Every row declares its actions so that BOTH the position in `stages[].actions[]`
+    // and the alphabetical order of the names disagree with the declared run orders: the
+    // action that must run first is declared last and named last. The rows differ along
+    // how many actions share a run order, how many run orders there are, whether an order
+    // is declared or defaulted, and which values the orders take.
+    let cases: Vec<(&str, Vec<Declared>)> = vec![
+        (
+            "two run orders declared in descending order",
+            vec![("Bravo", Some(2)), ("Alpha", Some(1))],
+        ),
+        (
+            "a shared run order declared after the later one",
+            vec![("Zulu", Some(2)), ("Bravo", Some(1)), ("Alpha", Some(1))],
+        ),
+        (
+            "three run orders declared in reverse",
+            vec![("Charlie", Some(3)), ("Bravo", Some(2)), ("Alpha", Some(1))],
+        ),
+        (
+            "a later run order declared between two sharing one",
+            vec![("Bravo", Some(1)), ("Zulu", Some(4)), ("Alpha", Some(1))],
+        ),
+        (
+            "a defaulted order runs before a declared later one declared first",
+            vec![("Bravo", Some(8)), ("Alpha", None)],
+        ),
+        (
+            "ActionRunOrder's published bounds (@range min 1, max 999), declared high first",
+            vec![("Bravo", Some(999)), ("Alpha", Some(1))],
+        ),
+    ];
+
+    for (index, (case, declared)) in cases.iter().enumerate() {
+        let emulator = Emulator::new();
+        let pipeline = format!("declared-against-order-{index}");
+        let execution = run_declared(&emulator, &pipeline, declared).await;
+
+        let answer = wait_for_terminal(&emulator, &pipeline, &execution).await;
+        assert_eq!(
+            answer["pipelineExecution"]["status"].as_str(),
+            Some("Succeeded"),
+            "case {case:?}: every action's work is work this engine performs, got {answer}"
+        );
+
+        // Each action performed its own work, whatever position it was declared at.
+        for (name, _) in declared {
+            let key = format!("delivered/{name}");
+            let (status, bytes) = emulator.get_object("deploy-bucket", &key).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: {key} must have been delivered, got {status}"
+            );
+            assert_eq!(
+                bytes, SOURCE_BYTES,
+                "case {case:?}: {key} must carry the source bytes"
+            );
+        }
+
+        let reported = windows(&emulator, &pipeline, &execution).await;
+        let mut groups: BTreeMap<i64, Vec<Window>> = BTreeMap::new();
+        for (name, order) in declared {
+            let (start, end) = *reported.get(*name).unwrap_or_else(|| {
+                panic!("case {case:?}: the action {name} has no record, got {reported:?}")
+            });
+            groups
+                .entry(order.unwrap_or(DEFAULT_RUN_ORDER))
+                .or_default()
+                .push(((*name).to_string(), start, end));
+        }
+
+        // The actions SHARING a run order start together, however far apart they are
+        // declared and whatever their names sort like.
+        for (order, members) in &groups {
+            let earliest = members
+                .iter()
+                .map(|(_, start, _)| *start)
+                .fold(f64::MAX, f64::min);
+            for (name, start, _) in members {
+                assert!(
+                    (*start - earliest).abs() <= SAME_INSTANT,
+                    "case {case:?}: run order {order}: {name} must start with the rest of its \
+                     run order (at {earliest}), got {start}"
+                );
+            }
+        }
+
+        // Between any two run orders, the LOWER one is the one that ran first and the
+        // higher one started only after every action of it had finished — which is the
+        // opposite of the order in which these actions are declared.
+        let ordered: Vec<(i64, Vec<Window>)> = groups.into_iter().collect();
+        for (position, (earlier_order, earlier)) in ordered.iter().enumerate() {
+            let finished = earlier
+                .iter()
+                .map(|(_, _, end)| *end)
+                .fold(f64::MIN, f64::max);
+            for (later_order, later) in &ordered[position + 1..] {
+                for (name, start, _) in later {
+                    assert!(
+                        *start - finished >= STEP_FLOOR,
+                        "case {case:?}: run order {later_order}: {name} must start at least \
+                         {STEP_FLOOR}s after run order {earlier_order} finished (at {finished}), \
+                         got {start}"
+                    );
+                }
+                // And so no window of the two run orders overlaps, pair by pair.
+                for (name, _, end) in earlier {
+                    for (other, other_start, _) in later {
+                        assert!(
+                            *other_start > *end,
+                            "case {case:?}: the window of {other} (run order {later_order}, \
+                             from {other_start}) must not overlap {name} (run order \
+                             {earlier_order}, until {end})"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]
