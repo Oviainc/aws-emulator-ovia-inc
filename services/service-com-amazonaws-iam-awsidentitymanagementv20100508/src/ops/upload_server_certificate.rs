@@ -237,29 +237,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // here. Nothing refuses a certificate whose validity window has already lapsed —
         // that window is REPORTED, through `Expiration`, which is what a client reads to
         // see it has.
-        let certificate =
-            X509Certificate::from_pem(input.certificate_body.as_bytes()).map_err(|_| {
-                malformed(
-                    "CertificateBody",
-                    "the value must be one PEM-encoded X.509 certificate",
-                )
-            })?;
+        let certificate = X509Certificate::from_pem(input.certificate_body.as_bytes())
+            .map_err(|_| unparseable_certificate())?;
         // "Typically a concatenation of the PEM-encoded public key certificates of the
         // chain" (`$CertificateChain`), so a chain is one or more certificates in the same
-        // encoding.
+        // encoding — refused, when it is not, with the one sentence this operation words
+        // an unreadable certificate with.
         if let Some(chain) = input.certificate_chain.as_deref() {
-            let chain = X509Certificate::load_pem_chain(chain.as_bytes()).map_err(|_| {
-                malformed(
-                    "CertificateChain",
-                    "the value must be PEM-encoded X.509 certificates",
-                )
-            })?;
+            let chain = X509Certificate::load_pem_chain(chain.as_bytes())
+                .map_err(|_| unparseable_certificate())?;
             if chain.is_empty() {
-                return Err(malformed(
-                    "CertificateChain",
-                    "the value must carry at least one PEM-encoded X.509 certificate",
-                )
-                .into());
+                return Err(unparseable_certificate().into());
             }
         }
         // "The contents of the private key in PEM-encoded format" (`$PrivateKey`), which
@@ -410,11 +398,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled refusal of material that is not what its member says it is: "the
+/// The modelled refusal of CERTIFICATE material this operation cannot read: "the
 /// certificate was malformed … the error message describes the specific error"
-/// (`MalformedCertificateException`), worded as this service words the refusal of an input
-/// member's value — `Invalid <member>: <what the value has to be>`, the form
+/// (`MalformedCertificateException`), whose fixed text for this operation is `Unable to
+/// parse certificate. Please ensure the certificate is in PEM format.`
+///
+/// Entirely fixed: it carries nothing of the request and names no member, so the body and
+/// the chain — both of them certificates in the same encoding — are refused alike, as is a
+/// body whose certificate parses but states no public key the operation can read. That is
+/// this operation's own wording: `UploadSigningCertificate` refuses an unreadable
+/// certificate with a sentence naming the value it was sent, so the two are separate
+/// templates even though both answer `MalformedCertificateException`.
+fn unparseable_certificate() -> UploadServerCertificateErrorModeled {
+    UploadServerCertificateErrorModeled::MalformedCertificateException(
+        MalformedCertificateException {
+            message: Some(
+                "Unable to parse certificate. Please ensure the certificate is in PEM format."
+                    .to_string(),
+            ),
+        },
+    )
+}
+
+/// The modelled refusal of a `PrivateKey` whose structure this operation cannot read,
+/// worded as this service words the refusal of an input member's value —
+/// `Invalid <member>: <what the value has to be>`, the form
 /// `CreateOpenIDConnectProvider`'s `InvalidInputException` uses.
+///
+/// Kept separate from [`unparseable_certificate`]: the key is not a certificate, and the
+/// sentence IAM answers for unreadable key material is not the one it answers for an
+/// unreadable certificate.
 fn malformed(member: &str, reason: &str) -> UploadServerCertificateErrorModeled {
     UploadServerCertificateErrorModeled::MalformedCertificateException(
         MalformedCertificateException {
@@ -476,11 +489,7 @@ fn check_key_pair(
         return Err(mismatched().into());
     }
     let Some(public) = spki.subject_public_key.as_bytes() else {
-        return Err(malformed(
-            "CertificateBody",
-            "the certificate must carry a whole number of public key bytes",
-        )
-        .into());
+        return Err(unparseable_certificate().into());
     };
     // A document that states its own public key is compared directly, so a key of another
     // pair is refused whatever algorithm the pair is of.
@@ -490,12 +499,8 @@ fn check_key_pair(
     if algorithm == oid::RSA_ENCRYPTION {
         // RFC 8017 appendix A.1: an `RSAPrivateKey` repeats the modulus and the public
         // exponent of the `RSAPublicKey` it belongs to, verbatim.
-        let public = ::pkcs1::RsaPublicKey::from_der(public).map_err(|_| {
-            malformed(
-                "CertificateBody",
-                "the certificate must carry an RSA public key for its RSA algorithm",
-            )
-        })?;
+        let public =
+            ::pkcs1::RsaPublicKey::from_der(public).map_err(|_| unparseable_certificate())?;
         let private = ::pkcs1::RsaPrivateKey::from_der(key).map_err(|_| unreadable())?;
         if private.modulus.as_bytes() != public.modulus.as_bytes()
             || private.public_exponent.as_bytes() != public.public_exponent.as_bytes()

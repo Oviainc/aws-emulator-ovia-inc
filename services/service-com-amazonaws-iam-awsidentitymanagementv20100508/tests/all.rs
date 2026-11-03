@@ -47,6 +47,8 @@ mod boundary_refusal_message_wording;
 mod change_password;
 #[path = "all/composed_condition_context.rs"]
 mod composed_condition_context;
+#[path = "all/conflict_and_certificate_refusal_wording.rs"]
+mod conflict_and_certificate_refusal_wording;
 #[path = "all/credential_report_generation.rs"]
 mod credential_report_generation;
 #[path = "all/custom_policy_context_keys.rs"]

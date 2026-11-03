@@ -200,15 +200,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Uploads an X.509 signing certificate" (this operation's documentation), so a
         // `CertificateBody` that is not one "was malformed" — the modelled
-        // `MalformedCertificateException`, which is how `UploadServerCertificate` refuses
-        // the same member. The certificate is read here, before anything is written, and
-        // the DER it decodes to is what tells a repeat upload from a fresh one below.
+        // `MalformedCertificateException`. The certificate is read here, before anything
+        // is written, and the DER it decodes to is what tells a repeat upload from a
+        // fresh one below.
         let Some(uploaded_der) = certificate_der(&input.certificate_body) else {
-            return Err(malformed(
-                "CertificateBody",
-                "the value must be one PEM-encoded X.509 certificate",
-            )
-            .into());
+            return Err(malformed(&input.certificate_body).into());
         };
 
         // A mutation: the operation "uploads an X.509 signing certificate and associates
@@ -433,20 +429,25 @@ fn certificate_der(certificate_body: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
-/// The modelled refusal of material that is not what its member says it is: "the
+/// The modelled refusal of a `CertificateBody` that is not an X.509 certificate: "the
 /// certificate was malformed … the error message describes the specific error"
-/// (`MalformedCertificateException`), worded as this service words the refusal of an
-/// input member's value — `Invalid <member>: <what the value has to be>`, the form
-/// `UploadServerCertificate` refuses the same member with.
+/// (`MalformedCertificateException`), whose fixed text for this operation is
+/// `Certificate ` and ` is malformed.` around the value the request supplied.
+///
+/// The value is QUOTED back, because what the caller has to correct is the material it
+/// sent and IAM's sentence for this operation names it. That is this operation's own
+/// wording: `UploadServerCertificate` refuses an unreadable certificate with a sentence
+/// of its own, carrying nothing of the request, so the two are separate templates even
+/// though both answer `MalformedCertificateException`.
 ///
 /// The other modelled refusal of the body, `InvalidCertificateException`, is not reached:
 /// a body that cannot be read as a certificate at all is the malformed case, and nothing
 /// beyond the encoding is judged here, so no request arrives at a refusal that would be
 /// "invalid" rather than malformed.
-fn malformed(member: &str, reason: &str) -> UploadSigningCertificateErrorModeled {
+fn malformed(certificate_body: &str) -> UploadSigningCertificateErrorModeled {
     UploadSigningCertificateErrorModeled::MalformedCertificateException(
         MalformedCertificateException {
-            message: Some(format!("Invalid {member}: {reason}")),
+            message: Some(format!("Certificate {certificate_body} is malformed.")),
         },
     )
 }

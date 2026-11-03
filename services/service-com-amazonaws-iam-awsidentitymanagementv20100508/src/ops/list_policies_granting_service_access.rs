@@ -189,15 +189,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An ARN that is not a user's, a group's or a role's names no identity whose
         // policies could be listed, which is an invalid input rather than a missing
-        // entity — the refusal `GetContextKeysForPrincipalPolicy` and
-        // `SimulatePrincipalPolicy` answer for the same ARN.
+        // entity. The sentence is this operation's own fixed text for an `Arn` it cannot
+        // act on — `Invalid Entity Arn: ` and ` is not supported.` around the value the
+        // request supplied — not the one the other operations taking a principal ARN
+        // answer: IAM words that refusal per operation, and which sentence a caller sees
+        // is part of the wire contract of the operation it called.
         if crate::state::parse_entity_arn(&input.arn).is_none() {
             return Err(
                 ListPoliciesGrantingServiceAccessErrorModeled::InvalidInputException(
                     InvalidInputException {
                         message: Some(format!(
-                            "ARN {} is not valid: Arn must be the ARN of an IAM user, group \
-                             or role",
+                            "Invalid Entity Arn: {} is not supported.",
                             input.arn
                         )),
                     },

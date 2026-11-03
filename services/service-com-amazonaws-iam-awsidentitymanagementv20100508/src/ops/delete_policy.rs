@@ -255,9 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeletePolicyErrorModeled::DeleteConflictException(
                 DeleteConflictException {
                     message: Some(
-                        "Cannot delete a policy with non-default versions. Delete the \
-                         non-default versions first."
-                            .to_string(),
+                        crate::state::DELETE_CONFLICT_DELETE_POLICY_VERSIONS.to_string(),
                     ),
                 },
             )

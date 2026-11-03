@@ -265,8 +265,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // text IAM words that class of blocking dependent with
         // (`crate::state::DELETE_CONFLICT_*`): no count, no policy name and no profile
         // name, so the refusal says what class of thing to remove and nothing about the
-        // account's shape. The order is the order this operation's own documentation
-        // lists the items to remove in.
+        // account's shape. Several of them can block one delete, and IAM names exactly
+        // one: the order is the fixed precedence the constants' own documentation
+        // states — the instance profile that holds the role (a binding kept by a separate
+        // resource) first, then the managed policies attached to the role, then the
+        // policies embedded in it.
         let attached = store
             .role_attached_policies
             .get(&key)
@@ -276,12 +279,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&key)
             .map_or(0, ::std::collections::BTreeMap::len);
         let profiles = store.instance_profiles_holding_role(&key);
-        let blocker = if embedded > 0 {
-            Some(crate::state::DELETE_CONFLICT_DELETE_POLICIES)
+        let blocker = if !profiles.is_empty() {
+            Some(crate::state::DELETE_CONFLICT_REMOVE_ROLES_FROM_INSTANCE_PROFILE)
         } else if attached > 0 {
             Some(crate::state::DELETE_CONFLICT_DETACH_POLICIES)
-        } else if !profiles.is_empty() {
-            Some(crate::state::DELETE_CONFLICT_REMOVE_ROLES_FROM_INSTANCE_PROFILE)
+        } else if embedded > 0 {
+            Some(crate::state::DELETE_CONFLICT_DELETE_POLICIES)
         } else {
             None
         };

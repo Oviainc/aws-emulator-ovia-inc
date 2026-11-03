@@ -5349,21 +5349,40 @@ pub fn policy_not_attachable(arn: &str) -> String {
 
 /// The message IAM refuses an attach or a permissions-boundary put with when the policy
 /// the `PolicyArn` resolves to EXISTS but reports `IsAttachable` false — the
-/// `PolicyNotAttachableException` message, whose fixed text is `Policy ` and ` is not
-/// attachable.` around the ARN the request supplied.
+/// `PolicyNotAttachableException` message, whose fixed text is `Cannot attach AWS reserved
+/// policy to an IAM ` and `.` around the KIND of identity the policy would have been
+/// attached to (`role`, `user`, `group`).
+///
+/// A policy a reader reports as not attachable is one AWS RESERVES: it is published in
+/// AWS's own namespace under the path reserved for service-linked roles, so it belongs to
+/// that role alone ([`AwsManagedPolicy::is_attachable`]) and no identity of this account
+/// may take it, as a permissions policy or as a permissions boundary. What the refusal
+/// states is that reservation — not a property of the ARN the request supplied — so the
+/// sentence carries nothing of the policy, and the only value in it is the kind of
+/// identity the call addressed.
 ///
 /// Distinct from [`policy_not_attachable`], which is the `NoSuchEntityException` text for
 /// an ARN that resolves to NOTHING: here the policy is one the account can read, and what
-/// the refusal says is that this policy may not take part in an attachment. The two names
-/// are deliberately unalike, because the error classes are: picking one at a call site
-/// picks the error code a client branches on. ONE wording, shared by the three attach calls
-/// and the two boundary puts
+/// the refusal says is why it may not take part in an attachment. The two names are
+/// deliberately unalike, because the error classes are: picking one at a call site picks
+/// the error code a client branches on. ONE wording, shared by the three attach calls and
+/// the two boundary puts
 /// ([`ComAmazonawsIamAwsidentitymanagementv20100508State::policy_is_attachable`] is the
 /// one decision behind them), so a caller matching IAM's text sees one sentence whichever
 /// operation it reached the policy through.
-pub fn policy_cannot_be_attached(arn: &str) -> String {
-    format!("Policy {arn} is not attachable.")
+pub fn aws_reserved_policy_refusal(entity_kind: &str) -> String {
+    format!("Cannot attach AWS reserved policy to an IAM {entity_kind}.")
 }
+
+/// The kind of IAM identity [`aws_reserved_policy_refusal`] names for an operation acting
+/// on a role, a user and a group — IAM's own words for the entity types a managed policy
+/// can be attached to or bound on (`Policy$IsAttachable`: "the policy can be attached to
+/// an IAM user, group, or role").
+pub const IDENTITY_KIND_ROLE: &str = "role";
+/// The identity kind [`aws_reserved_policy_refusal`] names for a user.
+pub const IDENTITY_KIND_USER: &str = "user";
+/// The identity kind [`aws_reserved_policy_refusal`] names for a group.
+pub const IDENTITY_KIND_GROUP: &str = "group";
 
 /// The message IAM refuses an operation addressed by a `PolicyArn` and a `VersionId`
 /// with when the policy that ARN resolves to carries no such version — the
@@ -5405,6 +5424,13 @@ pub fn boundary_scope_not_attachable(arn: &str) -> String {
 /// ("The error message describes these entities" — the CLASS, not their names), so a
 /// client branching on the sentence to decide whether to detach, to delete or to remove a
 /// membership and retry sees the same text whichever entity kind it addressed.
+///
+/// Where SEVERAL classes block one delete, IAM names exactly one of them, and which one
+/// follows a fixed precedence: a binding held by a SEPARATE resource (the instance
+/// profile that holds a role) comes first, then a managed policy ATTACHED to the entity,
+/// then a policy EMBEDDED in it — the dependents furthest from the entity before the ones
+/// inside it. Each delete handler checks in that order, so the caller is told to remove
+/// the same dependent IAM would name.
 pub const DELETE_CONFLICT_DETACH_POLICIES: &str =
     "Cannot delete entity, must detach all policies first.";
 
@@ -5433,6 +5459,19 @@ pub const DELETE_CONFLICT_DELETE_SIGNING_CERTIFICATES: &str =
 /// How IAM refuses a delete whose user still has a console password.
 pub const DELETE_CONFLICT_DELETE_LOGIN_PROFILE: &str =
     "Cannot delete entity, must delete login profile first.";
+
+/// How IAM refuses a `DeletePolicy` whose managed policy still carries a version other
+/// than its default: three sentences of entirely fixed text, which state the condition,
+/// what the caller has to do about it and what this call does with the default version.
+///
+/// A managed policy's versions are the subordinate entities of the policy itself, so the
+/// refusal is worded about the VERSIONS rather than with the
+/// `Cannot delete entity, must … first.` sentence the entity deletes answer — IAM words
+/// each class of blocking dependent its own way, and this class is the policy's own
+/// version history.
+pub const DELETE_CONFLICT_DELETE_POLICY_VERSIONS: &str =
+    "This policy has more than one version. Before you delete a policy, you must delete \
+     the policy's versions. The default version is deleted with the policy.";
 
 /// The message IAM refuses an add of a role to an instance profile that already holds one
 /// with — the fixed text `Cannot exceed quota for InstanceSessionsPerInstanceProfile: `

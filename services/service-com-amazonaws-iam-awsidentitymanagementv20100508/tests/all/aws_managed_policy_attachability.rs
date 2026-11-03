@@ -17,10 +17,11 @@
 //!    client resolves BY NAME, each at the path, ARN and attachability AWS publishes for
 //!    it;
 //! 2. `Policy$IsAttachable` is a report of whether that policy may be attached to an
-//!    identity: a policy reported as not attachable is refused by every operation that
-//!    would attach it or make it an identity's permissions boundary (400
-//!    `PolicyNotAttachable`, nothing persisted), and one reported as attachable is
-//!    accepted by all of them.
+//!    identity: a policy reported as not attachable is one AWS reserves, so it is refused
+//!    by every operation that would attach it or make it an identity's permissions
+//!    boundary (400 `PolicyNotAttachable`, IAM's fixed sentence for that reservation
+//!    naming the identity kind the call addressed, nothing persisted), and one reported as
+//!    attachable is accepted by all of them.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: the
 //! policy's path (the account root, `/service-role/`, the path reserved for
@@ -185,6 +186,16 @@ impl Use {
             Use::AttachGroup => "AttachGroupPolicy",
             Use::BoundRole => "PutRolePermissionsBoundary",
             Use::BoundUser => "PutUserPermissionsBoundary",
+        }
+    }
+
+    /// The kind of IAM identity IAM names in the refusal of a policy it reserves — the
+    /// identity this use would have put the policy on.
+    fn identity_kind(self) -> &'static str {
+        match self {
+            Use::AttachRole | Use::BoundRole => "role",
+            Use::AttachUser | Use::BoundUser => "user",
+            Use::AttachGroup => "group",
         }
     }
 
@@ -462,7 +473,10 @@ async fn a_policy_that_is_not_attachable_is_refused_by_every_use() {
             );
             assert_eq!(
                 element(&body, "Message"),
-                format!("Policy {policy_arn} is not attachable."),
+                format!(
+                    "Cannot attach AWS reserved policy to an IAM {}.",
+                    which.identity_kind()
+                ),
                 "case {case:?} through {action}: expected IAM's fixed text, got {:?}",
                 element(&body, "Message")
             );

@@ -236,6 +236,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        let carries_attachments = store
+            .group_attached_policies
+            .get(&key)
+            .is_some_and(|attached| !attached.is_empty());
+        if carries_attachments {
+            return Err(DeleteGroupErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some(crate::state::DELETE_CONFLICT_DETACH_POLICIES.to_string()),
+                },
+            )
+            .into());
+        }
         let embeds_policies = store
             .group_inline_policies
             .get(&key)
@@ -244,20 +256,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteGroupErrorModeled::DeleteConflictException(
                 DeleteConflictException {
                     message: Some(crate::state::DELETE_CONFLICT_DELETE_POLICIES.to_string()),
-                },
-            )
-            .into());
-        }
-        let carries_attachments = store
-            .group_attached_policies
-            .get(&key)
-            .is_some_and(|attached| !attached.is_empty());
-        if carries_attachments {
-            return Err(DeleteGroupErrorModeled::DeleteConflictException(
-                DeleteConflictException {
-                    message: Some(
-                        crate::state::DELETE_CONFLICT_DETACH_POLICIES.to_string(),
-                    ),
                 },
             )
             .into());

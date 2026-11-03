@@ -264,11 +264,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // policy that is published but NOT attachable is refused, and the flag a
         // reader of that policy reports (`Policy$IsAttachable`) is the one decision
         // behind it (`crate::state::policy_is_attachable`), so a client that
-        // pre-screens a policy ARN on that flag and IAM agree.
+        // pre-screens a policy ARN on that flag and IAM agree. Such a policy is one AWS
+        // RESERVES, which is what the refusal states, in the one sentence this service
+        // words that reservation with (`crate::state::aws_reserved_policy_refusal`),
+        // naming the kind of identity this call addressed.
         if !store.policy_is_attachable(&input.policy_arn) {
             return Err(AttachGroupPolicyErrorModeled::PolicyNotAttachableException(
                 PolicyNotAttachableException {
-                    message: Some(crate::state::policy_cannot_be_attached(&input.policy_arn)),
+                    message: Some(crate::state::aws_reserved_policy_refusal(
+                        crate::state::IDENTITY_KIND_GROUP,
+                    )),
                 },
             )
             .into());

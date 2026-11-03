@@ -216,7 +216,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // IAM refuses to delete an entity that still has dependents: the caller
         // must delete them first, so the user is never half-deleted and nothing is
-        // removed behind the caller's back.
+        // removed behind the caller's back. Several classes can block one delete and IAM
+        // names exactly one, in the fixed precedence the delete-conflict constants'
+        // documentation states: a managed policy ATTACHED to the user before a policy
+        // EMBEDDED in it.
+        //
+        // An attached managed policy is a dependent: this operation's own documentation
+        // lists "Attached managed policies (DetachUserPolicy)" among the items to remove
+        // before deleting a user, so a user that still carries one is refused rather than
+        // having the attachment dropped behind the caller's back. `AttachUserPolicy` is
+        // what fills that map.
+        let has_attached_policies = store
+            .user_attached_policies
+            .get(&key)
+            .is_some_and(|attached| !attached.is_empty());
+        if has_attached_policies {
+            return Err(DeleteUserErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some(crate::state::DELETE_CONFLICT_DETACH_POLICIES.to_string()),
+                },
+            )
+            .into());
+        }
+        // So is a policy the user EMBEDS, refused the same way rather than
+        // cascade-deleted: `PutUserPolicy` is what fills that map.
         let has_inline_policies = store
             .user_inline_policies
             .get(&key)
@@ -225,25 +248,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteUserErrorModeled::DeleteConflictException(
                 DeleteConflictException {
                     message: Some(crate::state::DELETE_CONFLICT_DELETE_POLICIES.to_string()),
-                },
-            )
-            .into());
-        }
-        // An attached managed policy is a dependent too: this operation's own
-        // documentation lists "Attached managed policies (DetachUserPolicy)" among
-        // the items to remove before deleting a user, so a user that still carries
-        // one is refused rather than having the attachment dropped behind the
-        // caller's back. `AttachUserPolicy` is what fills that map.
-        let has_attached_policies = store
-            .user_attached_policies
-            .get(&key)
-            .is_some_and(|attached| !attached.is_empty());
-        if has_attached_policies {
-            return Err(DeleteUserErrorModeled::DeleteConflictException(
-                DeleteConflictException {
-                    message: Some(
-                        crate::state::DELETE_CONFLICT_DETACH_POLICIES.to_string(),
-                    ),
                 },
             )
             .into());
