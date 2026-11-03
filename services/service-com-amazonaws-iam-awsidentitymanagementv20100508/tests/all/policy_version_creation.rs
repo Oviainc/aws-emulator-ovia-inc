@@ -272,13 +272,16 @@ async fn each_create_adds_the_next_version_carrying_the_document_it_was_given() 
             );
         }
 
+        // The listing reports a policy's versions NEWEST FIRST, so the run of creates
+        // is expected back in the reverse of the order it ran in.
         let expected_ids: Vec<String> = (1..=case.creates.len() + 1)
+            .rev()
             .map(|number| format!("v{number}"))
             .collect();
         let (listed, defaults, default_version) = versions_and_default(&router, &arn).await;
         assert_eq!(
             listed, expected_ids,
-            "case {name:?}: the policy must carry every created version, in version order, got \
+            "case {name:?}: the policy must carry every created version, newest first, got \
              {listed:?}"
         );
         assert_eq!(
@@ -330,7 +333,7 @@ async fn the_next_version_is_numbered_past_the_greatest_the_policy_holds() {
     let (listed, _, _) = versions_and_default(&router, &arn).await;
     assert_eq!(
         listed,
-        vec!["v1", "v2", "v3", "v4", "v5"],
+        vec!["v5", "v4", "v3", "v2", "v1"],
         "the fixture policy must carry a contiguous run, got {listed:?}"
     );
 
@@ -368,7 +371,7 @@ async fn the_next_version_is_numbered_past_the_greatest_the_policy_holds() {
     let (listed, _, _) = versions_and_default(&router, &arn).await;
     assert_eq!(
         listed,
-        vec!["v1", "v5", "v6", "v7"],
+        vec!["v7", "v6", "v5", "v1"],
         "the policy must carry the versions it was left with plus the new ones, got {listed:?}"
     );
 }
@@ -924,7 +927,7 @@ async fn a_signed_create_is_decided_against_the_callers_identity_policies() {
                 let (listed, _, default_version) = versions_and_default(&router, &arn).await;
                 assert_eq!(
                     (listed, default_version),
-                    (vec!["v1".to_string(), "v2".to_string()], "v2".to_string()),
+                    (vec!["v2".to_string(), "v1".to_string()], "v2".to_string()),
                     "case {case:?}: the served create must add the next version and make it \
                      operative"
                 );

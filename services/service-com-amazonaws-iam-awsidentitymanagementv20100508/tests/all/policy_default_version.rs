@@ -253,6 +253,9 @@ async fn each_call_makes_the_named_held_version_the_only_operative_one() {
             .iter()
             .map(|(version_id, _)| version_id.clone())
             .collect();
+        // The listing reports a policy's versions NEWEST FIRST, the reverse of the
+        // order the creates above added them in.
+        let listed_order: Vec<String> = version_ids.iter().rev().cloned().collect();
 
         // Where the default sits before any set: the last create's version when the
         // creates asked for it, else the `v1` the policy was created with.
@@ -284,22 +287,22 @@ async fn each_call_makes_the_named_held_version_the_only_operative_one() {
                 after.default_version_id
             );
             assert_eq!(
-                after.version_ids, version_ids,
+                after.version_ids, listed_order,
                 "case {name:?}: the set must leave the policy carrying the versions it \
-                 carried, expected {version_ids:?}, got {:?}",
+                 carried, newest first, expected {listed_order:?}, got {:?}",
                 after.version_ids
             );
             // Exactly one version is operative, and it is the one the call named: the
             // flags are read in the listing's own order, which is the order of
-            // `version_ids`.
-            let expected_flags: Vec<String> = version_ids
+            // `listed_order`.
+            let expected_flags: Vec<String> = listed_order
                 .iter()
                 .map(|version_id| (version_id == operative).to_string())
                 .collect();
             assert_eq!(
                 after.default_flags, expected_flags,
                 "case {name:?}: expected {operative} alone to be flagged as the default, \
-                 got {:?} for {version_ids:?}",
+                 got {:?} for {listed_order:?}",
                 after.default_flags
             );
             assert_eq!(

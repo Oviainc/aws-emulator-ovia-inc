@@ -239,27 +239,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An ARN this service can resolve no policy under "referenced a resource
             // entity that does not exist" — the refusal this operation models for a
             // policy it cannot report, whichever namespace the ARN is in, since a code
-            // outside its modelled set is one no SDK has a branch for.
+            // outside its modelled set is one no SDK has a branch for. The sentence is
+            // the attachability one (`crate::state::policy_not_attachable`): what this
+            // call addresses is the policy's VERSIONS, including the one in force for
+            // the identities the policy is attached to, so its `PolicyArn` resolves
+            // through the same check as the rest of that family and the caller cannot
+            // tell "this ARN names nothing" from "it names something no version can be
+            // reported for".
             return Err(ListPolicyVersionsErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(crate::state::policy_not_found(&input.policy_arn)),
+                    message: Some(crate::state::policy_not_attachable(&input.policy_arn)),
                 },
             )
             .into());
         };
 
-        // ONE enumeration order over the policy's versions: ascending by version
-        // number, the order they were created in (`crate::state::policy_version_page_key`),
-        // which is what lets a single `Marker` page over them the way the model binds
-        // them (`paginated { inputToken: Marker, outputToken: Marker }`).
-        let mut ordered: Vec<(String, PolicyVersion)> = resolved
-            .versions
-            .values()
-            .map(|version| {
+        // ONE enumeration order over the policy's versions: NEWEST FIRST, the reverse
+        // of the order they were created in, with each version's
+        // `IsDefaultVersion` taken from the policy's stored default-version id
+        // (`crate::state::ManagedPolicy::versions_newest_first`). The page keys that
+        // order carries are what lets a single `Marker` page over it the way the model
+        // binds it (`paginated { inputToken: Marker, outputToken: Marker }`).
+        let ordered: Vec<(String, PolicyVersion)> = resolved
+            .versions_newest_first()
+            .into_iter()
+            .map(|(key, version)| {
                 (
-                    crate::state::policy_version_page_key(
-                        version.version_id.as_deref().unwrap_or_default(),
-                    ),
+                    key,
                     // "The policy document … is not returned in the response to the
                     // CreatePolicyVersion or ListPolicyVersions operations"
                     // (`PolicyVersion$Document`), so this listing reports the version's
@@ -267,12 +273,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // content — which `GetPolicyVersion` serves.
                     PolicyVersion {
                         document: None,
-                        ..version.clone()
+                        ..version
                     },
                 )
             })
             .collect();
-        ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         let mut versions = Vec::new();
         let mut is_truncated = false;

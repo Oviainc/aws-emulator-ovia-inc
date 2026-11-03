@@ -231,7 +231,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holds for a policy a request cannot be served from.
         match resolved.versions.get(&input.version_id) {
             Some(version) => Ok(GetPolicyVersionOutput {
-                policy_version: Some(version.clone()),
+                policy_version: Some(PolicyVersion {
+                    // `PolicyVersion$IsDefaultVersion` "specifies whether the policy
+                    // version is set as the policy's default version", so the flag is
+                    // taken from the policy's stored default-version id — the one
+                    // reading of which version is operative
+                    // (`crate::state::ManagedPolicy::default_version_id`) every reader
+                    // of a policy's versions reports from, so this reader and the
+                    // listing cannot flag different versions.
+                    is_default_version: resolved.default_version_id() == input.version_id,
+                    ..version.clone()
+                }),
             }),
             None => Err(GetPolicyVersionErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

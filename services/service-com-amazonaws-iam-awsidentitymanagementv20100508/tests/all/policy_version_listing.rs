@@ -10,10 +10,12 @@
 //!
 //! The rule being asserted: the listing reports the versions the policy its
 //! `PolicyArn` RESOLVES to carries — the account's own policies and AWS's catalog
-//! alike — in one total order (ascending by version number), withholds each
-//! version's `Document`, honours `MaxItems` as a real page size with an opaque
-//! `Marker` a follow-up call resumes strictly after, and refuses an ARN that names
-//! no readable policy by its kind.
+//! alike — in one total order (NEWEST FIRST: descending by version number, so the
+//! most recently created version is the first member and `v1` the last), flags as
+//! the default exactly the version the policy's stored default-version id names,
+//! withholds each version's `Document`, honours `MaxItems` as a real page size with
+//! an opaque `Marker` a follow-up call resumes strictly after, and refuses an ARN
+//! that names no readable policy by its kind.
 //!
 //! Each suite is a TABLE whose rows differ along what that rule generalises over:
 //! how many versions a policy carries, which of them is the default, whether the
@@ -101,7 +103,8 @@ fn version_number(version_id: &str) -> u64 {
 /// can be arranged at any version numbers — including the sparse numbering only a run of
 /// deletes reaches, and `DeletePolicyVersion` is still a scaffolded 501 with its own stub
 /// issue. Answers every version identifier the policy
-/// then carries, in the order the listing must report them: ascending by version number.
+/// then carries, in the order the listing must report them: descending by version
+/// number, the newest created first.
 fn seed_versions(
     engine: &engine::InMemoryEngine,
     policy_name: &str,
@@ -140,7 +143,7 @@ fn seed_versions(
          policy carries"
     );
     let mut ordered: Vec<String> = held.versions.keys().cloned().collect();
-    ordered.sort_by_key(|version_id| version_number(version_id));
+    ordered.sort_by_key(|version_id| std::cmp::Reverse(version_number(version_id)));
     ordered
 }
 
@@ -152,8 +155,8 @@ struct VersionsCase {
     default_version_id: &'static str,
 }
 
-/// RULE: the listing reports every version the policy carries, in ascending version
-/// order, flags exactly the default one, and withholds the document — which
+/// RULE: the listing reports every version the policy carries, newest created
+/// first, flags exactly the default one, and withholds the document — which
 /// `GetPolicyVersion` still serves.
 ///
 /// Rows: the lone version a create minted, a contiguous run, a run whose default is
@@ -201,8 +204,7 @@ async fn the_listing_reports_every_version_in_order_and_withholds_the_document()
         assert_eq!(
             elements(&body, "VersionId"),
             expected,
-            "case {name:?}: the listing must report every version in ascending version \
-             order, got {:?}",
+            "case {name:?}: the listing must report every version newest first, got {:?}",
             elements(&body, "VersionId")
         );
         assert_eq!(
@@ -355,7 +357,7 @@ async fn the_listing_pages_through_every_version_exactly_once() {
         }
         assert_eq!(
             seen, expected,
-            "case MaxItems={page_size}: every version exactly once, in version order, got \
+            "case MaxItems={page_size}: every version exactly once, newest first, got \
              {seen:?}"
         );
     }
@@ -468,7 +470,7 @@ async fn a_marker_this_collection_did_not_issue_is_refused() {
     assert_eq!(
         elements(&page, "VersionId"),
         expected[..2],
-        "the first page must carry the first two versions: {page}"
+        "the first page must carry the two newest versions: {page}"
     );
     let marker = element(&page, "Marker");
     {
@@ -579,6 +581,16 @@ async fn an_arn_naming_no_readable_policy_is_refused_by_its_kind() {
             case.arn,
             case.code
         );
+        // A policy whose versions cannot be reported is worded the way IAM words an
+        // unresolvable `PolicyArn` for the family this listing belongs to: the fixed
+        // text around the ARN the request supplied, echoed byte for byte.
+        if case.code == "NoSuchEntity" {
+            assert_eq!(
+                element(&body, "Message"),
+                format!("Policy {} does not exist or is not attachable.", case.arn),
+                "case {name:?}: the refusal must carry IAM's sentence for this family: {body}"
+            );
+        }
     }
 }
 
@@ -625,5 +637,223 @@ async fn listing_changes_nothing_a_later_caller_sees() {
             status, 200,
             "case {version_id:?}: the version must still be readable, got {status}: {read}"
         );
+    }
+}
+
+/// One policy driven to a version set through the API alone, and the version that is
+/// operative once every call has run.
+struct WireCase {
+    name: &'static str,
+    policy_name: &'static str,
+    /// One row per `CreatePolicyVersion` after the create that minted `v1`: whether it
+    /// asked to become the operative version (`CreatePolicyVersion$SetAsDefault`,
+    /// default false).
+    creates: &'static [bool],
+    /// The version a `SetDefaultPolicyVersion` call then selects, when the row makes
+    /// one.
+    then_set_default: Option<&'static str>,
+    /// The version the policy's default-version id must name afterwards.
+    operative: &'static str,
+}
+
+/// RULE: a reader of a managed policy's versions reports them NEWEST FIRST — the most
+/// recently created version is the first member and `v1` the last, on every page of a
+/// `Marker` walk — and flags as the default exactly the version the policy's stored
+/// default-version id names, whatever position that version holds in the list.
+///
+/// Every version here is created over the wire, so the order and the flag are asserted
+/// against what the operations themselves persisted rather than against a seeded store.
+/// Rows differ along the version count (one up to the published per-policy quota),
+/// along which version ends up operative (the oldest, one in the middle, the newest)
+/// and along how it got there (a create asking for it, a create that did not, and a
+/// later set moving it backwards) — a create without `SetAsDefault` must leave the
+/// default where it stood.
+#[tokio::test]
+async fn the_listing_is_newest_first_and_flags_the_stored_default() {
+    // "A managed policy can have up to five versions" — the longest row sits exactly on
+    // that quota (`crate::state::MAX_POLICY_VERSIONS`).
+    let quota = state::MAX_POLICY_VERSIONS;
+    let cases = [
+        WireCase {
+            name: "the lone version the create minted",
+            policy_name: "WireOnlyV1",
+            creates: &[],
+            then_set_default: None,
+            operative: "v1",
+        },
+        WireCase {
+            name: "a second version that did not ask to be operative",
+            policy_name: "WireSecondNotDefault",
+            creates: &[false],
+            then_set_default: None,
+            operative: "v1",
+        },
+        WireCase {
+            name: "a second version that asked to be operative",
+            policy_name: "WireSecondDefault",
+            creates: &[true],
+            then_set_default: None,
+            operative: "v2",
+        },
+        WireCase {
+            name: "a full policy whose newest create took the default",
+            policy_name: "WireFullNewestDefault",
+            creates: &[false, false, false, true],
+            then_set_default: None,
+            operative: "v5",
+        },
+        WireCase {
+            name: "a full policy whose default was set back to the middle",
+            policy_name: "WireFullMiddleDefault",
+            creates: &[true, true, true, true],
+            then_set_default: Some("v3"),
+            operative: "v3",
+        },
+        WireCase {
+            name: "a full policy whose default never moved off the oldest version",
+            policy_name: "WireFullOldestDefault",
+            creates: &[false, false, false, false],
+            then_set_default: None,
+            operative: "v1",
+        },
+    ];
+
+    for case in &cases {
+        let name = case.name;
+        let (router, _engine) = router_with_engine();
+        let arn = create_policy(&router, case.policy_name).await;
+        let held_versions = case.creates.len() + 1;
+        assert!(
+            held_versions <= quota,
+            "case {name:?}: the row must stay inside the published quota of {quota}, asks \
+             for {held_versions}"
+        );
+
+        for (index, set_as_default) in case.creates.iter().enumerate() {
+            let flag = set_as_default.to_string();
+            let document = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::wire-{index}/*"}}]}}"#
+            );
+            let (status, body) = call(
+                &router,
+                "CreatePolicyVersion",
+                &[
+                    ("PolicyArn", &arn),
+                    ("PolicyDocument", &document),
+                    ("SetAsDefault", &flag),
+                ],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {name:?}: the create of version {} must succeed, got {status}: {body}",
+                index + 2
+            );
+        }
+        if let Some(operative) = case.then_set_default {
+            let (status, body) = call(
+                &router,
+                "SetDefaultPolicyVersion",
+                &[("PolicyArn", &arn), ("VersionId", operative)],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {name:?}: the set of {operative:?} must succeed, got {status}: {body}"
+            );
+        }
+
+        // What the policy itself publishes as its operative version: the one the flag
+        // in the listing has to follow.
+        let (status, metadata) = call(&router, "GetPolicy", &[("PolicyArn", &arn)]).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: GetPolicy must succeed, got {status}: {metadata}"
+        );
+        assert_eq!(
+            element(&metadata, "DefaultVersionId"),
+            case.operative,
+            "case {name:?}: the fixture must leave {:?} operative: {metadata}",
+            case.operative
+        );
+
+        let newest_first: Vec<String> = (1..=case.creates.len() + 1)
+            .rev()
+            .map(|number| format!("v{number}"))
+            .collect();
+        let expected_flags: Vec<String> = newest_first
+            .iter()
+            .map(|version_id| (version_id == case.operative).to_string())
+            .collect();
+
+        let body = listed(&router, &arn, &[]).await;
+        assert_eq!(
+            elements(&body, "VersionId"),
+            newest_first,
+            "case {name:?}: expected the versions newest first as {newest_first:?}, got {:?}",
+            elements(&body, "VersionId")
+        );
+        assert_eq!(
+            elements(&body, "IsDefaultVersion"),
+            expected_flags,
+            "case {name:?}: expected {:?} alone flagged as the default ({expected_flags:?}), \
+             got {:?}",
+            case.operative,
+            elements(&body, "IsDefaultVersion")
+        );
+
+        // The same order and the same flag on every page of a walk at the smallest page
+        // size the model admits: a client taking the first member of page one reads the
+        // newest version, not the oldest.
+        let mut walked: Vec<String> = Vec::new();
+        let mut flags: Vec<String> = Vec::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let mut params = vec![("MaxItems", "1")];
+            if let Some(token) = &marker {
+                params.push(("Marker", token.as_str()));
+            }
+            let page = listed(&router, &arn, &params).await;
+            walked.extend(elements(&page, "VersionId"));
+            flags.extend(elements(&page, "IsDefaultVersion"));
+            marker = match element(&page, "IsTruncated").as_str() {
+                "true" => Some(element(&page, "Marker")),
+                _ => None,
+            };
+            if marker.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            walked, newest_first,
+            "case {name:?}: a MaxItems=1 walk must hand out the versions newest first, got \
+             {walked:?}"
+        );
+        assert_eq!(
+            flags, expected_flags,
+            "case {name:?}: the default flag must travel with its version across the pages, \
+             got {flags:?}"
+        );
+
+        // The reader that serves a single version tells the same story about which one
+        // is operative, so the two readers cannot disagree.
+        for (version_id, flag) in newest_first.iter().zip(&expected_flags) {
+            let (status, read) = call(
+                &router,
+                "GetPolicyVersion",
+                &[("PolicyArn", &arn), ("VersionId", version_id)],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {name:?} {version_id:?}: the listed version must be readable, got \
+                 {status}: {read}"
+            );
+            assert_eq!(
+                &element(&read, "IsDefaultVersion"),
+                flag,
+                "case {name:?} {version_id:?}: expected IsDefaultVersion {flag:?}, got {read}"
+            );
+        }
     }
 }

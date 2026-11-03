@@ -512,22 +512,11 @@ fn role_detail(store: &IamStore, role_key: &str, role: &Role) -> RoleDetail {
 /// `ManagedPolicyDetail` carries `Description` and a `PolicyVersionList` whose
 /// versions carry their documents, which is what makes this report the snapshot of the
 /// account's permissions its own documentation describes; the versions are ordered the
-/// way `ListPolicyVersions` enumerates them (ascending by version number,
-/// `crate::state::policy_version_page_key`).
+/// way `ListPolicyVersions` enumerates them (newest created first, each flagged as the
+/// default exactly when the policy's stored default-version id names it —
+/// `crate::state::ManagedPolicy::versions_newest_first`).
 fn managed_policy_detail(resolved: &crate::state::ManagedPolicy) -> ManagedPolicyDetail {
-    let mut ordered: Vec<(String, PolicyVersion)> = resolved
-        .versions
-        .values()
-        .map(|version| {
-            (
-                crate::state::policy_version_page_key(
-                    version.version_id.as_deref().unwrap_or_default(),
-                ),
-                version.clone(),
-            )
-        })
-        .collect();
-    ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let ordered = resolved.versions_newest_first();
     let policy = &resolved.policy;
     ManagedPolicyDetail {
         policy_name: policy.policy_name.clone(),

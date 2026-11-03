@@ -188,7 +188,8 @@ struct DeleteCase {
     default_version: &'static str,
     /// The versions the suite deletes, in the order it issues the deletes.
     deletes: &'static [&'static str],
-    /// The versions the policy must carry afterwards, in version order.
+    /// The versions the policy must carry afterwards, newest first — the order the
+    /// listing reports them in.
     remaining: &'static [&'static str],
 }
 
@@ -246,7 +247,7 @@ async fn a_delete_removes_exactly_the_version_it_names() {
             creates: &[(1, false), (2, true), (3, false)],
             default_version: "v3",
             deletes: &["v2", "v4"],
-            remaining: &["v1", "v3"],
+            remaining: &["v3", "v1"],
         },
         DeleteCase {
             name: "every version but the operative one",
@@ -314,8 +315,8 @@ async fn a_delete_removes_exactly_the_version_it_names() {
                 .iter()
                 .map(|version_id| version_id.to_string())
                 .collect::<Vec<String>>(),
-            "case {name:?}: the policy must carry the versions no delete named, in version \
-             order, got {remaining:?}"
+            "case {name:?}: the policy must carry the versions no delete named, newest \
+             first, got {remaining:?}"
         );
         for (version_id, document) in &documents {
             if case.deletes.contains(&version_id.as_str()) {
@@ -496,7 +497,7 @@ async fn a_version_the_policy_does_not_carry_is_a_missing_entity() {
         );
         assert_eq!(
             listed_versions(&router, &arn).await,
-            vec!["v1", "v2"],
+            vec!["v2", "v1"],
             "case {name:?}: a refused delete must leave the policy's versions as they were"
         );
     }
@@ -616,7 +617,7 @@ async fn an_arn_naming_no_account_policy_is_refused_by_its_kind() {
         // The held policy is untouched by every row, whichever way the row was refused.
         assert_eq!(
             listed_versions(&router, &held).await,
-            vec!["v1", "v2"],
+            vec!["v2", "v1"],
             "case {name:?}: a refused delete must leave the account's policies as they were"
         );
     }

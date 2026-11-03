@@ -59,13 +59,19 @@ struct PolicyCall {
 }
 
 /// The operations whose subject is the ATTACHMENT of a managed policy to an entity: two
-/// of the three attach calls and the reporting half that lists the entities a policy is
-/// attached to. `AttachGroupPolicy` is covered, with every other operation addressed by a
-/// `PolicyArn`, by `tests/all/policy_arn_absence_wording.rs`; the detach calls are not
-/// here because they report an absent ATTACHMENT rather than an absent policy.
+/// of the three attach calls, the reporting half that lists the entities a policy is
+/// attached to, and the listing of the policy's versions, which reports the one in force
+/// for those entities. `AttachGroupPolicy` is covered, with every other operation
+/// addressed by a `PolicyArn`, by `tests/all/policy_arn_absence_wording.rs`; the detach
+/// calls are not here because they report an absent ATTACHMENT rather than an absent
+/// policy.
 const ATTACHMENT_FAMILY: &[PolicyCall] = &[
     PolicyCall {
         action: "ListEntitiesForPolicy",
+        entity: None,
+    },
+    PolicyCall {
+        action: "ListPolicyVersions",
         entity: None,
     },
     PolicyCall {
@@ -84,10 +90,6 @@ const ATTACHMENT_FAMILY: &[PolicyCall] = &[
 const RESOURCE_FAMILY: &[PolicyCall] = &[
     PolicyCall {
         action: "GetPolicy",
-        entity: None,
-    },
-    PolicyCall {
-        action: "ListPolicyVersions",
         entity: None,
     },
     PolicyCall {

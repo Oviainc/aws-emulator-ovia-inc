@@ -8,10 +8,10 @@
 //! request supplied as its only variable part, echoed byte for byte. `CreatePolicyVersion`
 //! writes the version that takes effect for the identities the policy is attached to, so
 //! it belongs to the ATTACHMENT family and words the miss `Policy ` + ` does not exist or
-//! is not attachable.` — the sentence the attach calls and `ListEntitiesForPolicy` answer —
-//! and NOT the `Policy ` + ` was not found.` an operation acting on the policy RESOURCE
-//! (`GetPolicy`, `DeletePolicy`, `ListPolicyVersions`, `ListPolicyTags`) answers; the
-//! status is 404 and the awsQuery code `NoSuchEntity`
+//! is not attachable.` — the sentence the attach calls, `ListEntitiesForPolicy` and the
+//! listing of a policy's versions answer — and NOT the `Policy ` + ` was not found.` an
+//! operation acting on the policy RESOURCE (`GetPolicy`, `DeletePolicy`, `ListPolicyTags`)
+//! answers; the status is 404 and the awsQuery code `NoSuchEntity`
 //! (`smithy_query(query="operation", operation="CreatePolicyVersion")`: `NoSuchEntityException`,
 //! awsQueryError `NoSuchEntity` / 404), and the refused call writes nothing.
 //!
@@ -231,9 +231,10 @@ fn unresolvable_arns(account: &str, released: &str) -> Vec<(&'static str, String
 
 /// RULE: `CreatePolicyVersion` refuses a `PolicyArn` that resolves to no managed policy
 /// with 404 `NoSuchEntity` whose message is the ARN exactly as supplied between the
-/// ATTACHMENT family's fixed text — the same sentence the attach calls and
-/// `ListEntitiesForPolicy` answer — while the operations acting on the policy RESOURCE
-/// keep their own ` was not found.` sentence for the very same ARNs.
+/// ATTACHMENT family's fixed text — the same sentence the attach calls,
+/// `ListEntitiesForPolicy` and `ListPolicyVersions` answer — while the operations acting
+/// on the policy RESOURCE keep their own ` was not found.` sentence for the very same
+/// ARNs.
 #[tokio::test]
 async fn an_unresolvable_policy_arn_is_refused_with_the_attachment_family_sentence() {
     let (router, held, released) = fixture().await;
@@ -246,11 +247,11 @@ async fn an_unresolvable_policy_arn_is_refused_with_the_attachment_family_senten
         ("AttachRolePolicy", Some(("RoleName", ROLE_NAME))),
         ("AttachUserPolicy", Some(("UserName", USER_NAME))),
         ("ListEntitiesForPolicy", None),
+        ("ListPolicyVersions", None),
     ];
     // The operations acting on the policy RESOURCE, which must keep the other sentence.
     let resource_family: &[(&str, Option<(&str, &str)>)] = &[
         ("GetPolicy", None),
-        ("ListPolicyVersions", None),
         ("ListPolicyTags", None),
         ("DeletePolicy", None),
     ];

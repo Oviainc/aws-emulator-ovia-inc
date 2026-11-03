@@ -9,7 +9,8 @@
 //! and ` was not found.` for the operations acting on the policy RESOURCE (read and
 //! write alike), `Policy ` and ` does not exist or is not attachable.` for the operations
 //! whose subject is the ATTACHMENT of that policy to an entity, among them the create of
-//! the version that takes effect for the identities the policy is attached to. The
+//! the version that takes effect for the identities the policy is attached to and the
+//! listing of those versions. The
 //! sentence belongs to the family, not to the handler, so no operation may compose one of
 //! its own.
 //!
@@ -77,7 +78,8 @@ enum Family {
     Resource,
     /// The operations whose subject is whether the policy can be, or already is,
     /// attached to an entity — among them the create of the version that takes effect for
-    /// the identities it is attached to.
+    /// the identities it is attached to, and the listing of the policy's versions, which
+    /// reports which one that is.
     Attachment,
 }
 
@@ -115,7 +117,7 @@ const POLICY_ARN_CALLS: &[PolicyArnCall] = &[
     },
     PolicyArnCall {
         action: "ListPolicyVersions",
-        family: Family::Resource,
+        family: Family::Attachment,
         extra: &[],
     },
     PolicyArnCall {

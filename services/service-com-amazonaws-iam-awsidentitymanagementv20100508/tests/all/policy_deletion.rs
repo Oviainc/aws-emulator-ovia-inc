@@ -196,9 +196,11 @@ async fn deleting_an_arn_the_account_holds_no_policy_under_is_not_found() {
         customer_policy_arn("/", "HELD"),
     ];
     for candidate in absent {
-        // The wording is IAM's for this error class and is the same whichever
-        // operation resolved the ARN, so a delete, a read and a version listing
-        // describe the same missing policy identically.
+        // The code and the status are IAM's for this error class whichever operation
+        // resolved the ARN; the SENTENCE belongs to the operation's family, so the
+        // delete and the read of the policy resource word the absence one way and the
+        // version listing, whose subject is the versions in force for the identities
+        // the policy is attached to, words it the attachment family's way.
         for action in ["DeletePolicy", "GetPolicy", "ListPolicyVersions"] {
             let (status, body) = call(&router, action, &[("PolicyArn", candidate.as_str())]).await;
             assert_eq!(
@@ -213,11 +215,17 @@ async fn deleting_an_arn_the_account_holds_no_policy_under_is_not_found() {
                  got {body}"
             );
             let message = element(&body, "Message");
-            // Fixed text `Policy ` and ` was not found.`, with the ARN taken from the
-            // request.
+            // Fixed text `Policy ` and ` was not found.` for the policy resource, and
+            // `Policy ` and ` does not exist or is not attachable.` for the version
+            // listing, with the ARN taken from the request.
+            let expected = match action {
+                "ListPolicyVersions" => {
+                    format!("Policy {candidate} does not exist or is not attachable.")
+                }
+                _ => format!("Policy {candidate} was not found."),
+            };
             assert_eq!(
-                message,
-                format!("Policy {candidate} was not found."),
+                message, expected,
                 "case {candidate:?}: expected IAM's wording for a policy {action} could not \
                  find, got {message:?}"
             );

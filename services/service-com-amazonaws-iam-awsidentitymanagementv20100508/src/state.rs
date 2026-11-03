@@ -863,7 +863,7 @@ impl ManagedPolicy {
     /// Version identifiers are assigned in sequence — the first one a policy carries
     /// is [`FIRST_POLICY_VERSION_ID`], which is what this answers for a policy
     /// holding no version — so the number is also the creation order every reader of
-    /// a policy's versions enumerates them in
+    /// a policy's versions enumerates them in reverse of
     /// ([`policy_version_page_key`]). Taking it one past the GREATEST held number,
     /// rather than from the count, is what keeps a new version from reusing the
     /// identifier of one the policy still carries after an earlier version was
@@ -876,6 +876,54 @@ impl ManagedPolicy {
             .max()
             .unwrap_or(0);
         format!("v{}", highest + 1)
+    }
+
+    /// The identifier of the version in force on this policy: "the default version
+    /// is the operative version … the version that is used for all principals"
+    /// (`SetDefaultPolicyVersion`).
+    ///
+    /// ONE reading of which version is the default, consulted by every reader that
+    /// reports or applies it, so a flag a listing reports and the document an
+    /// attachment grants cannot name different versions. A record whose default is
+    /// not recorded is read at the version every policy is created with
+    /// ([`FIRST_POLICY_VERSION_ID`]), the one it would be in force at.
+    pub fn default_version_id(&self) -> &str {
+        self.policy
+            .default_version_id
+            .as_deref()
+            .unwrap_or(FIRST_POLICY_VERSION_ID)
+    }
+
+    /// This policy's versions in the ONE order every reader of them enumerates them
+    /// in — newest created first ([`policy_version_page_key`]) — each paired with
+    /// the page key that names its POSITION in that order, and each carrying the
+    /// default flag ([`Self::default_version_id`]) decides.
+    ///
+    /// `PolicyVersion$IsDefaultVersion` "specifies whether the policy version is set
+    /// as the policy's default version", so the flag is derived here from the
+    /// policy's stored default-version id rather than from a version's position in
+    /// the list or from a copy of the flag held beside it: exactly one version of a
+    /// policy carries it, whichever one the last `SetDefaultPolicyVersion` (or a
+    /// `CreatePolicyVersion` asked to set it) selected. The page keys are what lets a
+    /// single `Marker` page over this order.
+    pub fn versions_newest_first(&self) -> Vec<(String, PolicyVersion)> {
+        let default_version_id = self.default_version_id();
+        let mut ordered: Vec<(String, PolicyVersion)> = self
+            .versions
+            .values()
+            .map(|version| {
+                let version_id = version.version_id.as_deref().unwrap_or_default();
+                (
+                    policy_version_page_key(version_id),
+                    PolicyVersion {
+                        is_default_version: version_id == default_version_id,
+                        ..version.clone()
+                    },
+                )
+            })
+            .collect();
+        ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
+        ordered
     }
 }
 
@@ -2744,13 +2792,12 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// two cannot read one policy differently.
     pub fn default_version_document(&self, policy_arn: &str) -> Option<String> {
         let policy = self.resolve_policy(policy_arn)?;
-        let default = policy
-            .policy
-            .default_version_id
-            .unwrap_or_else(|| FIRST_POLICY_VERSION_ID.to_string());
+        // The one reading of which version is in force
+        // ([`ManagedPolicy::default_version_id`]), so what an attachment grants is the
+        // version a reader of the policy flags as its default.
         policy
             .versions
-            .get(&default)
+            .get(policy.default_version_id())
             .and_then(|version| version.document.clone())
     }
 
@@ -4042,21 +4089,27 @@ pub fn service_last_accessed_entities_marker_scope(
 }
 
 /// The page key of ONE policy version in the order a reader of a managed policy's
-/// versions enumerates them: the version NUMBER, zero padded, followed by the
-/// version identifier itself.
+/// versions enumerates them — NEWEST FIRST: the COMPLEMENT of the version NUMBER,
+/// zero padded, followed by the version identifier itself.
 ///
-/// A version identifier is `v` then a number then an optional dotted suffix
-/// (`policyVersionIdType`'s pattern `^v[1-9][0-9]*(\.[A-Za-z0-9-]*)?$`), so the
-/// identifiers alone do not sort in version order — `v10` precedes `v2` byte by
-/// byte. Padding the number to [`POLICY_VERSION_KEY_DIGITS`] digits makes the byte
-/// order of these keys the numeric order, which is the order the versions were
-/// created in, and appending the identifier keeps the key unique when two
-/// identifiers carry the same number with different suffixes. The byte order IS the
-/// enumeration order, which is what lets a reader resume strictly after the key a
-/// `Marker` names even when the version it named has since been deleted.
+/// A policy's versions are reported most recently created first, so the greatest
+/// version number is the first member of the list and [`FIRST_POLICY_VERSION_ID`]
+/// the last. A version identifier is `v` then a number then an optional dotted
+/// suffix (`policyVersionIdType`'s pattern `^v[1-9][0-9]*(\.[A-Za-z0-9-]*)?$`), so
+/// the identifiers alone do not sort in version order — `v10` precedes `v2` byte by
+/// byte. Taking the number's complement within `u64` and padding it to
+/// [`POLICY_VERSION_KEY_DIGITS`] digits makes the byte order of these keys the
+/// DESCENDING numeric order, the reverse of the order the versions were created in,
+/// and appending the identifier keeps the key unique when two identifiers carry the
+/// same number with different suffixes. The byte order IS the enumeration order,
+/// which is what lets a reader resume strictly after the key a `Marker` names even
+/// when the version it named has since been deleted.
 pub fn policy_version_page_key(version_id: &str) -> String {
-    let number = policy_version_number(version_id);
-    format!("{number:0width$}:{version_id}", width = POLICY_VERSION_KEY_DIGITS)
+    let descending = u64::MAX - policy_version_number(version_id);
+    format!(
+        "{descending:0width$}:{version_id}",
+        width = POLICY_VERSION_KEY_DIGITS
+    )
 }
 
 /// The NUMBER a policy version identifier carries: the digit run after the leading
@@ -5338,11 +5391,12 @@ pub fn open_id_connect_provider_cannot_be_found(arn: &str) -> String {
 /// whether a managed policy can be, or already is, attached to an entity (`AttachRolePolicy`,
 /// `AttachUserPolicy`, `AttachGroupPolicy`, `ListEntitiesForPolicy`), together with
 /// `CreatePolicyVersion`, which writes the version that takes effect for the identities the
-/// policy is attached to and so resolves its `PolicyArn` through the same attachability
-/// check — from a plain read, tag or delete of the policy resource itself, which reports the
-/// same absence as [`policy_not_found`]. Such a call cannot tell "this ARN names nothing"
-/// from "it names something that cannot take part in an attachment", and its wording says
-/// so.
+/// policy is attached to, and `ListPolicyVersions`, which reports those versions and which
+/// of them is in force for them — both resolve their `PolicyArn` through the same
+/// attachability check — from a plain read, tag or delete of the policy resource itself,
+/// which reports the same absence as [`policy_not_found`]. Such a call cannot tell "this ARN
+/// names nothing" from "it names something that cannot take part in an attachment", and its
+/// wording says so.
 pub fn policy_not_attachable(arn: &str) -> String {
     format!("Policy {arn} does not exist or is not attachable.")
 }

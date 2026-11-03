@@ -329,8 +329,10 @@ struct MissCase {
 
 /// RULE 2: a read addressed by a `PolicyArn` it resolves no policy under is refused
 /// with a code its model DECLARES — the missing entity `NoSuchEntity` names, carrying
-/// IAM's fixed `Policy <arn> was not found.` text, for every ARN that is a
-/// managed policy's, in the account's namespace or in AWS's; an invalid input for a
+/// its operation family's fixed text (`Policy <arn> was not found.` for a read of the
+/// policy resource, `Policy <arn> does not exist or is not attachable.` for the listing
+/// of the versions in force for the identities it is attached to), for every ARN that is
+/// a managed policy's, in the account's namespace or in AWS's; an invalid input for a
 /// value that is not a managed-policy ARN at all.
 #[tokio::test]
 async fn an_unresolvable_policy_arn_is_refused_with_a_modelled_code() {
@@ -416,9 +418,15 @@ async fn an_unresolvable_policy_arn_is_refused_with_a_modelled_code() {
                 case.arn, case.code
             );
             if case.code == "NoSuchEntity" {
+                let expected = match action {
+                    "ListPolicyVersions" => {
+                        format!("Policy {} does not exist or is not attachable.", case.arn)
+                    }
+                    _ => format!("Policy {} was not found.", case.arn),
+                };
                 assert_eq!(
                     element(&body, "Message"),
-                    format!("Policy {} was not found.", case.arn),
+                    expected,
                     "case {name:?}: {action} must word the absence as IAM does, got {:?}",
                     element(&body, "Message")
                 );
