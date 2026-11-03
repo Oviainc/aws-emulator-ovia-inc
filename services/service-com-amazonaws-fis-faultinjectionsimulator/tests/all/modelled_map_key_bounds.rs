@@ -505,8 +505,8 @@ async fn run(site: Site, case: &str, key: &str) {
                 return;
             }
             assert_eq!(
-                answer.status, 200,
-                "case {case:?}: expected HTTP 200 from TagResource, got {} with {:?}",
+                answer.status, 204,
+                "case {case:?}: expected HTTP 204 from TagResource, got {} with {:?}",
                 answer.status, answer.body
             );
             assert_carries(site, case, key, &stored);

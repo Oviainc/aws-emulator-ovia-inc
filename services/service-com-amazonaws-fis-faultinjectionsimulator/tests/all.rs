@@ -83,6 +83,8 @@ mod start_experiment_replay;
 mod start_experiment_token_normalization;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging_response_envelope.rs"]
+mod tagging_response_envelope;
 #[path = "all/target_account_configuration_description.rs"]
 mod target_account_configuration_description;
 #[path = "all/target_account_configuration_errors.rs"]

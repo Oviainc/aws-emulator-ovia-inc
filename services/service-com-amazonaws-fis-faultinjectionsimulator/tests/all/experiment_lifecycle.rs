@@ -64,7 +64,7 @@ pub(crate) const WAIT_DURATION: &str = "PT5M";
 
 /// A SigV4 credential scope naming this service, for `region`. The service field is what
 /// routes the request to fis; the region field is what a minted ARN names.
-fn signed_for(region: &str) -> String {
+pub(crate) fn signed_for(region: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/fis/aws4_request, \
          SignedHeaders=host, Signature=abc"

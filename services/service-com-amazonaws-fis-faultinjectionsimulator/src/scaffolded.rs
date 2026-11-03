@@ -177,6 +177,68 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic `BadRequestException` error shape.
+static BAD_REQUEST_EXCEPTION_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#BadRequestException$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `BadRequestException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the shape
+/// is not in this service's model, so it must not collide with a modelled one.
+///
+/// This is the shape the ARN layer of a TAG operation refuses with. It is distinct from
+/// [`ValidationException`] on purpose: a client branches on the error code, and the code
+/// this service answers for a `resourceArn` it will not accept is not the one it answers
+/// for a member that broke a modelled constraint.
+pub static BAD_REQUEST_EXCEPTION_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#BadRequestException",
+        "smithy.framework",
+        "BadRequestException",
+    ),
+    ShapeType::Structure,
+    &[&BAD_REQUEST_EXCEPTION_MESSAGE],
+);
+
+/// The payload of a `BadRequestException`: why the value was not accepted.
+#[derive(Debug, Clone)]
+pub struct BadRequestException {
+    pub message: String,
+}
+
+impl BadRequestException {
+    /// A `BadRequestException` carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for BadRequestException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BadRequestException: {}", self.message)
+    }
+}
+
+impl std::error::Error for BadRequestException {}
+
+impl SerializableStruct for BadRequestException {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&BAD_REQUEST_EXCEPTION_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// The `message` member of the synthetic `InternalFailure` error shape.
 static INTERNAL_FAILURE_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
@@ -253,6 +315,14 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// The caller-supplied ARN this operation addresses its resource by was not accepted.
+    /// Renders as HTTP 400 with the error code `BadRequestException`.
+    ///
+    /// The tagging surface resolves its `resourceArn` ahead of the modelled constraint
+    /// walk and of any lookup, and reports a value it cannot address through its own code
+    /// rather than through the modelled `ValidationException` — see
+    /// [`Scaffolded::bad_request`].
+    BadRequestException(BadRequestException),
     /// The emulator itself could not serve the request. Renders as HTTP 500 with the
     /// error code `InternalFailure`.
     ///
@@ -287,6 +357,19 @@ impl<E> Scaffolded<E> {
         Self::ValidationException(ValidationException::new(message))
     }
 
+    /// Refuse a caller-supplied ARN this service will not accept, with HTTP 400
+    /// `BadRequestException`.
+    ///
+    /// Reach for this where the refusal is the ARN LAYER's rather than the modelled
+    /// constraint walk's: the value is resolved before any lookup, so an ARN that could
+    /// not name a resource of this service is refused without the store being consulted,
+    /// and the code a client branches on is the one this service's tagging surface
+    /// answers. Everything else a handler refuses about the request keeps
+    /// [`Scaffolded::validation`].
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::BadRequestException(BadRequestException::new(message))
+    }
+
     /// Report that the emulator itself could not serve the request, with HTTP 500
     /// `InternalFailure`.
     ///
@@ -304,6 +387,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::BadRequestException(e) => write!(f, "{e}"),
             Self::InternalFailure(e) => write!(f, "{e}"),
         }
     }
@@ -317,6 +401,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::BadRequestException(e) => e.source(),
             Self::InternalFailure(e) => e.source(),
         }
     }
@@ -332,6 +417,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::BadRequestException(e) => e,
             Self::InternalFailure(e) => e,
         }
     }
@@ -341,6 +427,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::BadRequestException(_) => &BAD_REQUEST_EXCEPTION_SCHEMA,
             Self::InternalFailure(_) => &INTERNAL_FAILURE_SCHEMA,
         }
     }
@@ -354,6 +441,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            Self::BadRequestException(_) => "BadRequestException",
             Self::InternalFailure(_) => "InternalFailure",
         }
     }
@@ -367,6 +455,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            Self::BadRequestException(_) => 400,
             Self::InternalFailure(_) => 500,
         }
     }
@@ -380,6 +469,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            Self::BadRequestException(_) => None,
             Self::InternalFailure(_) => None,
         }
     }

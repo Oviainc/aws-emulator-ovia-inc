@@ -4,12 +4,13 @@
 //!
 //! The rule under test is the REMOVING half of FIS's tagging surface: a call names its
 //! resource by ARN and the tag keys to remove in the query string, the ARN is resolved in
-//! this service's OWN namespace (an ARN addressing nothing here is a bad request, an ARN
-//! naming a resource of this service the store holds no record of is a miss), and
-//! otherwise EXACTLY the keys the request names leave that resource's own tag map — a key
+//! this service's OWN namespace (an ARN this service could not have issued is a bad
+//! request, an ARN naming a resource of this service the store holds no record of is a
+//! miss), and otherwise EXACTLY the keys the request names leave that resource's own tag map — a key
 //! it does not carry is nothing to remove rather than a failure, a key the request does
 //! not name keeps the value it had, a request naming no key removes nothing, and nothing
-//! else about the record changes. The tags a call leaves are the tags `ListTagsForResource`
+//! else about the record changes. A successful removal answers 204 No Content. The tags a
+//! call leaves are the tags `ListTagsForResource`
 //! and the resource's own reader report, which is what makes the removal persisted rather
 //! than acknowledged.
 //!
@@ -33,7 +34,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::experiment_lifecycle::{emulator, send, Answer, FALLBACK_REGION};
 use crate::resource_tagging::{
     generated, label, new_resource, new_template, pairs, read_resource, tag_map, tag_resource,
-    tags_of, unaddressable_arns, without_tags, Kind, ACCOUNT_ID, TAGS_PER_RESOURCE,
+    tags_of, unaddressable_arns, unminted_arns, without_tags, Kind, TAGS_PER_RESOURCE,
     TAG_KEY_CEILING,
 };
 
@@ -202,11 +203,11 @@ fn removal_rows() -> Vec<Row> {
     ]
 }
 
-/// Every answer `UntagResource` gives on success: HTTP 200 carrying no members.
+/// Every answer `UntagResource` gives on success: HTTP 204 carrying no members.
 fn assert_empty_success(answer: &Answer, case: &str) {
     assert_eq!(
-        answer.status, 200,
-        "case {case:?}: expected HTTP 200 from UntagResource, got {} with {:?}",
+        answer.status, 204,
+        "case {case:?}: expected HTTP 204 from UntagResource, got {} with {:?}",
         answer.status, answer.body
     );
     let empty = match &answer.body {
@@ -311,8 +312,8 @@ async fn a_removed_key_can_be_applied_again() {
         )
         .await;
         assert_eq!(
-            applied.status, 200,
-            "case {case:?}: expected HTTP 200 from TagResource, got {} with {:?}",
+            applied.status, 204,
+            "case {case:?}: expected HTTP 204 from TagResource, got {} with {:?}",
             applied.status, applied.body
         );
         let carried = tags_of(&read_resource(&router, &resource, &case).await, &case);
@@ -359,8 +360,8 @@ async fn an_arn_this_service_cannot_address_is_a_bad_request() {
         );
         assert_eq!(
             answer.error_code(),
-            "ValidationException",
-            "case {case:?}: expected ValidationException for {arn:?}, got {:?}",
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException for {arn:?}, got {:?}",
             answer.body
         );
 
@@ -400,23 +401,8 @@ async fn an_arn_naming_no_record_is_a_miss_and_writes_nothing() {
         deleted.status, deleted.body
     );
 
-    let misses = vec![
-        (
-            "an experiment-template id no call minted",
-            format!(
-                "arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment-template/EXTZZZZZZZZZZZZ"
-            ),
-        ),
-        (
-            "an experiment id no call minted",
-            format!("arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment/EXPZZZZZZZZZZZZ"),
-        ),
-        (
-            "an experiment-template id of a shape this service never mints",
-            format!("arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment-template/not-an-id"),
-        ),
-        ("a template that has since been deleted", deleted_arn),
-    ];
+    let mut misses = unminted_arns();
+    misses.push(("a template that has since been deleted", deleted_arn));
 
     for (case, arn) in misses {
         for (named, removal) in [

@@ -2574,7 +2574,9 @@ fn format_id(prefix: &str, seq: u64) -> String {
 ///
 /// The boundary validator refuses a modelled id member that is empty or carries
 /// whitespace, so this is for a value the model does not constrain beyond that — a
-/// `nextToken`, which a paginated list carries a resource id in.
+/// `nextToken`, which a paginated list carries a resource id in, and the resource segment
+/// of a caller-supplied ARN ([`tagged_resource`]), which has to be an id this service
+/// could have issued before there is any record to look for.
 pub fn is_minted_id(value: &str, prefix: &str) -> bool {
     let Some(suffix) = value.strip_prefix(prefix) else {
         return false;
@@ -3010,51 +3012,67 @@ pub enum TaggedResource<'a> {
     Experiment(&'a str),
 }
 
-/// Which taggable resource the caller-supplied ARN `resource_arn` names, or the
-/// `ValidationException` that refuses the value.
+/// Which taggable resource the caller-supplied ARN `resource_arn` names, or `None` when
+/// the value is not an ARN this service could have issued for a resource that carries
+/// tags — the refusal [`INVALID_RESOURCE_ARN`] words.
 ///
 /// A `resourceArn` is modelled only as a string within `@length(20..2048)`,
-/// `pattern ^[\S]+$`, so WHICH resources this service can address by ARN is a server-side
-/// rule. A value that is not a well-formed ARN, one whose vendor field is another
-/// service's namespace, and one naming a resource type this service holds no tags for all
-/// name nothing in this namespace, which is a bad REQUEST rather than a resource that
-/// happens to be missing.
+/// `pattern ^[\S]+$`, so WHICH values this service accepts as an ARN is a server-side
+/// rule, and the tagging surface applies it to the WHOLE ARN before any lookup: the value
+/// has to parse as an ARN, carry this service's vendor field, name one of the two resource
+/// types that hold caller tags, and carry a resource id of the form this service MINTS for
+/// that type ([`is_minted_id`]). A value failing any of those could not name a resource of
+/// this service at all, which is a bad REQUEST rather than a resource that happens to be
+/// missing — and an ARN that satisfies all of them but names no stored record is the miss
+/// [`tagged_resource_not_found`] words.
 ///
 /// The ARN's `region` and `account` segments are NOT a second key: the id is what names a
 /// record here, exactly as `GetExperimentTemplate` and `GetExperiment` resolve one, and
 /// this store holds the account's records rather than a set of them per Region.
-pub fn tagged_resource(resource_arn: &str) -> Result<TaggedResource<'_>, ValidationException> {
-    let Some(arn) = ::service_common::arn::parse(resource_arn) else {
-        return Err(invalid_input(
-            "Value for resourceArn is not a valid ARN.".to_string(),
-        ));
-    };
-    let id = |resource_type: &str| {
-        ::service_common::arn::resource_id_of_type(resource_arn, resource_type)
-            .filter(|id| !id.is_empty())
-    };
-    if arn.vendor == ARN_SERVICE {
-        if let Some(id) = id(TEMPLATE_RESOURCE) {
-            return Ok(TaggedResource::ExperimentTemplate(id));
-        }
-        if let Some(id) = id(EXPERIMENT_RESOURCE) {
-            return Ok(TaggedResource::Experiment(id));
-        }
+pub fn tagged_resource(resource_arn: &str) -> Option<TaggedResource<'_>> {
+    let arn = ::service_common::arn::parse(resource_arn)?;
+    if arn.vendor != ARN_SERVICE {
+        return None;
     }
-    Err(invalid_input(format!(
-        "Value for resourceArn does not name a taggable {ARN_SERVICE} resource: \
-         a tag belongs to an {EXPERIMENT_RESOURCE} or an {TEMPLATE_RESOURCE}."
-    )))
+    let id = |resource_type: &str, prefix: &str| {
+        ::service_common::arn::resource_id_of_type(resource_arn, resource_type)
+            .filter(|id| is_minted_id(id, prefix))
+    };
+    if let Some(id) = id(TEMPLATE_RESOURCE, TEMPLATE_ID_PREFIX) {
+        return Some(TaggedResource::ExperimentTemplate(id));
+    }
+    if let Some(id) = id(EXPERIMENT_RESOURCE, EXPERIMENT_ID_PREFIX) {
+        return Some(TaggedResource::Experiment(id));
+    }
+    None
 }
+
+/// What a tagging call answers for a `resourceArn` it will not accept: fixed text, naming
+/// neither the member nor the value nor the resource type it was looking for.
+///
+/// The refusal is the ARN LAYER's — the value is judged before any lookup, so there is no
+/// resource to name — and it is the SAME sentence for every way an ARN can fail
+/// [`tagged_resource`], which is what makes a client's branch on it a branch on "this ARN
+/// is not one of ours" rather than on which field of it was wrong.
+pub const INVALID_RESOURCE_ARN: &str = "Invalid input resource arn";
+
+/// What a tagging call answers for an ARN it accepts naming a resource this store holds no
+/// record of: fixed text that names no resource type and interpolates nothing.
+///
+/// The tagging surface addresses its resource by ARN rather than by a typed id, so it
+/// words a miss GENERICALLY — unlike each resource's own reader
+/// ([`template_not_found`], [`experiment_not_found`]), which was asked for a resource of
+/// one named kind and says so.
+pub const TAGGED_RESOURCE_NOT_FOUND: &str = "Resource was not found";
 
 /// The `ResourceNotFoundException` for a `resourceArn` this store holds no record for.
 ///
-/// Each kind answers through the resolver its OWN operations use, so a tag call and a read
-/// of the same resource cannot disagree about a miss.
-pub fn tagged_resource_not_found(resource: TaggedResource<'_>) -> ResourceNotFoundException {
-    match resource {
-        TaggedResource::ExperimentTemplate(_) => template_not_found(),
-        TaggedResource::Experiment(id) => experiment_not_found(id),
+/// Takes no argument: the message is the constant [`TAGGED_RESOURCE_NOT_FOUND`], so a tag
+/// write, a tag removal and a tag read of the same ARN cannot word one miss three ways,
+/// and nothing of the request is echoed back.
+pub fn tagged_resource_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(TAGGED_RESOURCE_NOT_FOUND.to_string()),
     }
 }
 

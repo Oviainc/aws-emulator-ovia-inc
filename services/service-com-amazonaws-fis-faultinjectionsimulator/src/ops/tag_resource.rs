@@ -50,18 +50,22 @@
 //!
 //! ## Output
 //!
-//! The response carries no members: the applied tags are read back through the resource's
-//! own reader (`GetExperimentTemplate`, `GetExperiment`), which reports the tag map this
-//! call left on the record.
+//! The response carries no members and the success is bodyless: the applied tags are read
+//! back through `ListTagsForResource` or the resource's own reader
+//! (`GetExperimentTemplate`, `GetExperiment`), which reports the tag map this call left on
+//! the record. The model's default success code is 200, but a successful tag completes
+//! with **HTTP 204 No Content**, which is the status FIS answers for an output shape with
+//! nothing in it.
 //!
 //! ## Errors
 //!
-//! The operation shape lists none, so both refusals below are shapes this SERVICE models,
-//! widened in through `extra_errors`:
+//! The operation shape lists none, so the refusals below are shapes this SERVICE models,
+//! widened in through `extra_errors`, plus the ARN layer's own bad request:
 //!
-//! * `ValidationException` (HTTP 400) — the `resourceArn` is not a well-formed ARN of this
-//!   service naming a resource that carries tags, a tag key is outside `TagKey`'s modelled
-//!   bounds, or the request would leave the resource with more tags than a `TagMap` holds.
+//! * `BadRequestException` (HTTP 400) — the `resourceArn` is not an ARN this service could
+//!   have issued for a resource that carries tags (`crate::state::tagged_resource`).
+//! * `ValidationException` (HTTP 400) — a tag key is outside `TagKey`'s modelled bounds, or
+//!   the request would leave the resource with more tags than a `TagMap` holds.
 //! * `ResourceNotFoundException` (HTTP 404) — the ARN names a resource of this service
 //!   that the store holds no record of.
 
@@ -77,10 +81,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-fis-faultinjectionsimul
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `TagResourceError` alias below. This operation shape lists NO errors,
-// so the two this service models for every operation that resolves and validates caller
-// input are widened in through `extra_errors`: `ValidationException` for a `resourceArn`
-// or a tag this service cannot accept, and `ResourceNotFoundException` for an ARN naming a
-// resource the store does not hold.
+// so the two this service models for a request it will not store are widened in through
+// `extra_errors`: `ValidationException` for a TAG this service cannot accept, and
+// `ResourceNotFoundException` for an ARN naming a resource the store does not hold. The
+// third refusal — the ARN layer's `BadRequestException` for a `resourceArn` this service
+// could not have issued — is no shape in this model at all and travels through the error
+// channel's own variant (`crate::scaffolded::Scaffolded::bad_request`).
 #[smithy_macros::operation_error(
     "com.amazonaws.fis#TagResource",
     extra_errors = ["ValidationException", "ResourceNotFoundException"]
@@ -135,7 +141,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,
@@ -152,10 +158,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // WHICH resource the ARN names is a property of the request, so it is read before
-        // the store is reached: an ARN that addresses nothing in this service's namespace
-        // is a bad request rather than a missing resource.
-        let resource = crate::state::tagged_resource(&input.resource_arn)
-            .map_err(TagResourceErrorModeled::ValidationException)?;
+        // the store is reached: an ARN that could not name a resource of this service is a
+        // bad request rather than a missing resource, and it is the ARN layer's own code
+        // that says so.
+        let Some(resource) = crate::state::tagged_resource(&input.resource_arn) else {
+            return Err(crate::scaffolded::Scaffolded::bad_request(
+                crate::state::INVALID_RESOURCE_ARN,
+            ));
+        };
 
         // A map's KEY target is not reached by the boundary validator (its VALUE target
         // is), so `TagKey`'s modelled bounds are enforced here.
@@ -170,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(tags) = store.tags_mut(resource) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::tagged_resource_not_found(resource),
+                crate::state::tagged_resource_not_found(),
             )
             .into());
         };

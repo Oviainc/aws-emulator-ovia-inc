@@ -161,23 +161,26 @@ impl Site {
         !matches!(self, Self::PathId | Self::QueryTemplateId)
     }
 
-    /// Whether a value of exactly this site's ceiling is ADMITTED (HTTP 200). The other
-    /// sites answer something else for a reason of their own at that length — a parameter
+    /// The status a value of exactly this site's ceiling is ADMITTED with, or `None` when
+    /// this site answers something else at that length. The other sites answer something
+    /// else for a reason of their own — a parameter
     /// name no published entry takes, a `roleArn` that is not a role ARN, an id naming no
     /// record — which is still not a length refusal, and that is all those rows assert.
-    fn accepts_at_ceiling(self) -> bool {
-        matches!(
-            self,
+    /// `TagResource` is the one admitting site whose success is bodyless, so it answers
+    /// 204 No Content rather than 200.
+    fn admitted_status(self) -> Option<u16> {
+        match self {
+            Self::AppliedTagKey => Some(204),
             Self::TemplateTagKey
-                | Self::ExperimentTagKey
-                | Self::AppliedTagKey
-                | Self::TargetResourceTagKey
-                | Self::TargetName
-                | Self::ActionName
-                | Self::UpdatedActionName
-                | Self::Description
-                | Self::ClientToken
-        )
+            | Self::ExperimentTagKey
+            | Self::TargetResourceTagKey
+            | Self::TargetName
+            | Self::ActionName
+            | Self::UpdatedActionName
+            | Self::Description
+            | Self::ClientToken => Some(200),
+            _ => None,
+        }
     }
 }
 
@@ -456,9 +459,9 @@ async fn a_value_at_its_members_length_maximum_is_no_length_refusal() {
             "case {case:?}: a value AT its ceiling is no length refusal, got {:?}",
             answer.body
         );
-        if site.accepts_at_ceiling() {
+        if let Some(admitted) = site.admitted_status() {
             assert_eq!(
-                answer.status, 200,
+                answer.status, admitted,
                 "case {case:?}: a value at its published ceiling is accepted, got {} with \
                  {:?}",
                 answer.status, answer.body

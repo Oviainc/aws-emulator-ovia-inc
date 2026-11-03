@@ -3,16 +3,17 @@
 //! `TagResource`, end to end over HTTP.
 //!
 //! The rule under test is the one FIS's tagging surface states: a call that applies tags
-//! names its resource by ARN, and that ARN is resolved in this service's OWN namespace —
-//! a value that is not a well-formed ARN, one of another vendor, and one naming a resource
-//! type this service holds no caller tags for address nothing here and are refused as bad
-//! requests (400 `ValidationException`), an ARN naming a resource of this service the
-//! store holds no record of is a miss (404 `ResourceNotFoundException`), and otherwise the
-//! request's tags are MERGED onto that resource's own tag map — a key it already carries
-//! takes the new value, a key the request does not name keeps the value it had, and
-//! nothing else about the record changes. The tags a call leaves are the tags that
-//! resource's own reader reports, which is what makes the write persisted rather than
-//! acknowledged.
+//! names its resource by ARN, and that ARN is resolved in this service's OWN namespace — a
+//! value that is not an ARN this service could have ISSUED for a resource carrying caller
+//! tags (not an ARN at all, another vendor's, a resource type this service holds no caller
+//! tags for, or a resource id outside the form this service mints) addresses nothing here
+//! and is refused as a bad request (400 `BadRequestException`), an ARN naming a resource of
+//! this service the store holds no record of is a miss (404 `ResourceNotFoundException`),
+//! and otherwise the request's tags are MERGED onto that resource's own tag map — a key it
+//! already carries takes the new value, a key the request does not name keeps the value it
+//! had, and nothing else about the record changes. A successful application answers 204 No
+//! Content. The tags a call leaves are the tags that resource's own reader reports, which
+//! is what makes the write persisted rather than acknowledged.
 //!
 //! The rows below differ along everything that rule generalises over: WHICH kind of
 //! resource is tagged (an experiment template and an experiment, the two records of this
@@ -55,6 +56,17 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/fis-tagging-suite";
 
 /// The account id every ARN this emulator mints carries.
 pub(crate) const ACCOUNT_ID: &str = "000000000000";
+
+/// How many characters follow the `EXT`/`EXP` prefix of an id this service mints (FIS's
+/// own `ID_SUFFIX_LEN`), spelled out here rather than imported so a changed id form fails
+/// this suite.
+pub(crate) const ID_SUFFIX_LEN: usize = 12;
+
+/// A minted-SHAPE experiment-template id: the `EXT` prefix plus [`ID_SUFFIX_LEN`]
+/// characters of the upper-case base-36 alphabet `format_id` writes.
+pub(crate) fn template_id_shaped(suffix: &str) -> String {
+    format!("EXT{suffix}")
+}
 
 /// A wait inside the 1..720 minutes FIS documents for `aws:fis:wait`'s `duration`.
 const WAIT_DURATION: &str = "PT5M";
@@ -391,8 +403,8 @@ async fn applied_tags_are_merged_onto_the_resource_its_reader_reports() {
             for (index, apply) in row.applies.iter().enumerate() {
                 let answer = tag_resource(&router, &resource.arn, &tag_map(apply)).await;
                 assert_eq!(
-                    answer.status, 200,
-                    "case {case:?} call {index}: expected HTTP 200 from TagResource, got {} \
+                    answer.status, 204,
+                    "case {case:?} call {index}: expected HTTP 204 from TagResource, got {} \
                      with {:?}",
                     answer.status, answer.body
                 );
@@ -417,7 +429,13 @@ async fn applied_tags_are_merged_onto_the_resource_its_reader_reports() {
 }
 
 /// An ARN that addresses nothing in this service's namespace, with the reason it does not.
+///
+/// The last rows are about the resource ID: a tag call accepts only an ARN this service
+/// could have ISSUED, so an id outside the form it mints (the type's `EXT`/`EXP` prefix
+/// plus [`ID_SUFFIX_LEN`] upper-case base-36 characters) names nothing here, exactly as a
+/// resource type it holds no tags for does.
 pub(crate) fn unaddressable_arns() -> Vec<(&'static str, String)> {
+    let digits = "0".repeat(ID_SUFFIX_LEN);
     vec![
         (
             "a value that is not an ARN at all",
@@ -457,6 +475,69 @@ pub(crate) fn unaddressable_arns() -> Vec<(&'static str, String)> {
             "a fis experiment ARN naming no id",
             format!("arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment/"),
         ),
+        (
+            "a fis experiment-template id of a shape this service never mints",
+            format!("arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment-template/not-an-id"),
+        ),
+        (
+            "a fis experiment-template ARN carrying an experiment's id prefix",
+            format!(
+                "arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment-template/EXP{digits}"
+            ),
+        ),
+        (
+            "a fis experiment ARN carrying a template's id prefix",
+            format!("arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment/EXT{digits}"),
+        ),
+        (
+            "an id whose suffix is one character short of the minted width",
+            format!(
+                "arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment-template/{}",
+                template_id_shaped(&"0".repeat(ID_SUFFIX_LEN - 1))
+            ),
+        ),
+        (
+            "an id whose suffix is one character past the minted width",
+            format!(
+                "arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment-template/{}",
+                template_id_shaped(&"0".repeat(ID_SUFFIX_LEN + 1))
+            ),
+        ),
+        (
+            "an id whose suffix is lower case, which the minted alphabet is not",
+            format!(
+                "arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment-template/{}",
+                template_id_shaped(&"z".repeat(ID_SUFFIX_LEN))
+            ),
+        ),
+        (
+            "an id whose suffix carries a character outside the minted alphabet",
+            format!(
+                "arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment-template/{}",
+                template_id_shaped(&format!("{}-", "0".repeat(ID_SUFFIX_LEN - 1)))
+            ),
+        ),
+    ]
+}
+
+/// An ARN this service CAN address whose record the store does not hold: an id of the form
+/// it mints that no call ever minted, for each kind of taggable resource.
+pub(crate) fn unminted_arns() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "an experiment-template id no call minted",
+            format!(
+                "arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment-template/{}",
+                template_id_shaped(&"Z".repeat(ID_SUFFIX_LEN))
+            ),
+        ),
+        (
+            "an experiment id no call minted",
+            format!(
+                "arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment/EXP{}",
+                "Z".repeat(ID_SUFFIX_LEN)
+            ),
+        ),
     ]
 }
 
@@ -490,21 +571,8 @@ async fn an_arn_naming_no_record_is_a_miss_and_writes_nothing() {
         deleted.status, deleted.body
     );
 
-    let misses = vec![
-        (
-            "an experiment-template id no call minted",
-            format!("arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment-template/EXTZZZZZZZZZZZZ"),
-        ),
-        (
-            "an experiment id no call minted",
-            format!("arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment/EXPZZZZZZZZZZZZ"),
-        ),
-        (
-            "an experiment-template id of a shape this service never mints",
-            format!("arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment-template/not-an-id"),
-        ),
-        ("a template that has since been deleted", deleted_arn),
-    ];
+    let mut misses = unminted_arns();
+    misses.push(("a template that has since been deleted", deleted_arn));
 
     for (case, arn) in misses {
         let answer = tag_resource(&router, &arn, &tag_map(&pairs(&[("Env", "test")]))).await;
@@ -531,19 +599,22 @@ async fn an_arn_naming_no_record_is_a_miss_and_writes_nothing() {
     );
 }
 
-/// One refused request: the ARN it names (`None` for the suite's own live resource) and
-/// the tags it carries.
+/// One refused request: the ARN it names (`None` for the suite's own live resource), the
+/// tags it carries and the error code the refusal answers with.
 struct Refusal {
     case: String,
     arn: Option<String>,
     tags: Vec<(String, String)>,
+    code: &'static str,
 }
 
 /// A request the service refuses: an ARN it cannot address, a tag key outside `TagKey`'s
 /// bounds, and a request that would leave the resource with more tags than a `TagMap`
-/// holds. Every one answers 400 `ValidationException` and leaves the stored tags alone.
+/// holds. Every one answers HTTP 400 and leaves the stored tags alone — under the ARN
+/// layer's `BadRequestException` for a `resourceArn` this service could not have issued,
+/// and under the modelled `ValidationException` for a request whose TAGS it will not take.
 #[tokio::test]
-async fn a_refused_tag_call_answers_validation_and_writes_nothing() {
+async fn a_refused_tag_call_answers_its_own_code_and_writes_nothing() {
     let stored = pairs(&[("Suite", "tagging"), ("Env", "test")]);
     let key_past_ceiling = "k".repeat(TAG_KEY_CEILING + 1);
 
@@ -553,22 +624,26 @@ async fn a_refused_tag_call_answers_validation_and_writes_nothing() {
             case: case.to_string(),
             arn: Some(arn),
             tags: pairs(&[("Env", "prod")]),
+            code: "BadRequestException",
         })
         .collect();
     cases.push(Refusal {
         case: "a tag key one character past TagKey's ceiling".to_string(),
         arn: None,
         tags: vec![(key_past_ceiling, "x".to_string())],
+        code: "ValidationException",
     });
     cases.push(Refusal {
         case: "an empty tag key, which TagKey's pattern does not admit".to_string(),
         arn: None,
         tags: vec![(String::new(), "x".to_string())],
+        code: "ValidationException",
     });
     cases.push(Refusal {
         case: "one tag past the most a resource carries".to_string(),
         arn: None,
         tags: generated(TAGS_PER_RESOURCE, "over"),
+        code: "ValidationException",
     });
     cases.push(Refusal {
         case: "a request mixing an admissible key with an over-long one".to_string(),
@@ -577,9 +652,16 @@ async fn a_refused_tag_call_answers_validation_and_writes_nothing() {
             ("Env".to_string(), "prod".to_string()),
             ("k".repeat(TAG_KEY_CEILING + 1), "x".to_string()),
         ],
+        code: "ValidationException",
     });
 
-    for Refusal { case, arn, tags } in cases {
+    for Refusal {
+        case,
+        arn,
+        tags,
+        code,
+    } in cases
+    {
         // One emulator per case, so the "nothing was written" assertion is about this
         // case's call alone.
         let router = emulator();
@@ -600,8 +682,8 @@ async fn a_refused_tag_call_answers_validation_and_writes_nothing() {
         );
         assert_eq!(
             answer.error_code(),
-            "ValidationException",
-            "case {case:?}: expected ValidationException for {target:?}, got {:?}",
+            code,
+            "case {case:?}: expected {code} for {target:?}, got {:?}",
             answer.body
         );
 

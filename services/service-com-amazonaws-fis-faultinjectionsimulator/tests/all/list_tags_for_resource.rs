@@ -33,7 +33,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::experiment_lifecycle::{emulator, send, Answer, FALLBACK_REGION};
 use crate::resource_tagging::{
     generated, label, new_resource, new_template, pairs, read_resource, tag_map, tag_resource,
-    tags_of, unaddressable_arns, Kind, Resource, Row, ACCOUNT_ID, TAGS_PER_RESOURCE,
+    tags_of, unaddressable_arns, unminted_arns, Kind, Resource, Row, TAGS_PER_RESOURCE,
     TAG_KEY_CEILING, TAG_VALUE_CEILING,
 };
 
@@ -147,8 +147,8 @@ async fn a_tag_read_reports_the_tags_the_resource_persists() {
             for (index, apply) in row.applies.iter().enumerate() {
                 let answer = tag_resource(&router, &resource.arn, &tag_map(apply)).await;
                 assert_eq!(
-                    answer.status, 200,
-                    "case {case:?} call {index}: expected HTTP 200 from TagResource, got {} \
+                    answer.status, 204,
+                    "case {case:?} call {index}: expected HTTP 204 from TagResource, got {} \
                      with {:?}",
                     answer.status, answer.body
                 );
@@ -218,8 +218,8 @@ async fn an_arn_this_service_cannot_address_is_a_bad_request() {
         );
         assert_eq!(
             answer.error_code(),
-            "ValidationException",
-            "case {case:?}: expected ValidationException for {arn:?}, got {:?}",
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException for {arn:?}, got {:?}",
             answer.body
         );
     }
@@ -254,23 +254,8 @@ async fn an_arn_naming_no_record_is_a_miss() {
         deleted.status, deleted.body
     );
 
-    let misses = vec![
-        (
-            "an experiment-template id no call minted",
-            format!(
-                "arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment-template/EXTZZZZZZZZZZZZ"
-            ),
-        ),
-        (
-            "an experiment id no call minted",
-            format!("arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment/EXPZZZZZZZZZZZZ"),
-        ),
-        (
-            "an experiment-template id of a shape this service never mints",
-            format!("arn:aws:fis:{FALLBACK_REGION}:{ACCOUNT_ID}:experiment-template/not-an-id"),
-        ),
-        ("a template that has since been deleted", deleted_arn),
-    ];
+    let mut misses = unminted_arns();
+    misses.push(("a template that has since been deleted", deleted_arn));
 
     for (case, arn) in misses {
         let answer = list_tags(&router, &arn).await;

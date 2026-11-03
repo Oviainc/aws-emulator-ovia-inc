@@ -6,7 +6,7 @@
 //! The REMOVING half of the one tag map `TagResource` merges into, `ListTagsForResource`
 //! reports and the resource's own reader (`GetExperimentTemplate`, `GetExperiment`)
 //! carries, resolved through the same namespace resolver a tag call uses
-//! ([`crate::state::tagged_resource`]): an ARN that addresses nothing here is a bad
+//! ([`crate::state::tagged_resource`]): an ARN this service could not have issued is a bad
 //! request, an ARN naming a resource of this service the store holds no record of is a
 //! miss, and otherwise exactly the named keys leave that resource's tag map. A key the
 //! resource does not carry is nothing to remove rather than a failure, so the call is
@@ -62,17 +62,19 @@
 //!
 //! ## Output
 //!
-//! The response carries no members: the tags the call left are read back through
-//! `ListTagsForResource` or the resource's own reader.
+//! The response carries no members and the success is bodyless: the tags the call left are
+//! read back through `ListTagsForResource` or the resource's own reader. The model's
+//! default success code is 200, but a successful removal completes with **HTTP 204 No
+//! Content**, as a tag write of the same resource does.
 //!
 //! ## Errors
 //!
-//! The operation shape lists none, so both refusals below are shapes this SERVICE models,
-//! widened in through `extra_errors` — the same two a tag write or a tag read of the same
-//! resource answers, so the three cannot disagree about which ARNs this service addresses:
+//! The operation shape lists none, so the refusals below are this SERVICE's own — the same
+//! ones a tag write or a tag read of the same resource answers, so the three cannot
+//! disagree about which ARNs this service addresses:
 //!
-//! * `ValidationException` (HTTP 400) — the `resourceArn` is not a well-formed ARN of this
-//!   service naming a resource that carries tags.
+//! * `BadRequestException` (HTTP 400) — the `resourceArn` is not an ARN this service could
+//!   have issued for a resource that carries tags.
 //! * `ResourceNotFoundException` (HTTP 404) — the ARN names a resource of this service
 //!   that the store holds no record of.
 
@@ -88,17 +90,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-fis-faultinjectionsimul
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `UntagResourceError` alias below. This operation shape lists NO
-// errors, so the two this service models for every operation that resolves
-// caller-supplied input are widened in through `extra_errors`:
-// `ValidationException` for a `resourceArn` this service cannot address, and
-// `ResourceNotFoundException` for an ARN naming a resource the store does not hold.
+// errors, so the one this service models for an ARN naming a resource the store does not
+// hold is widened in through `extra_errors`. The OTHER refusal this operation answers —
+// the ARN layer's `BadRequestException` for a `resourceArn` this service could not have
+// issued — is no shape in this model at all and travels through the error channel's own
+// variant (`crate::scaffolded::Scaffolded::bad_request`).
 #[smithy_macros::operation_error(
     "com.amazonaws.fis#UntagResource",
-    extra_errors = ["ValidationException", "ResourceNotFoundException"]
+    extra_errors = ["ResourceNotFoundException"]
 )]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
-    ValidationException(ValidationException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -146,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,
@@ -163,15 +165,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // WHICH resource the ARN names is a property of the request, so it is read before
-        // the store is reached: an ARN that addresses nothing in this service's namespace
-        // is a bad request rather than a missing resource.
-        let resource = crate::state::tagged_resource(&input.resource_arn)
-            .map_err(UntagResourceErrorModeled::ValidationException)?;
+        // the store is reached: an ARN that could not name a resource of this service is a
+        // bad request rather than a missing resource.
+        let Some(resource) = crate::state::tagged_resource(&input.resource_arn) else {
+            return Err(crate::scaffolded::Scaffolded::bad_request(
+                crate::state::INVALID_RESOURCE_ARN,
+            ));
+        };
 
         let mut store = state.lock();
         let Some(tags) = store.tags_mut(resource) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::tagged_resource_not_found(resource),
+                crate::state::tagged_resource_not_found(),
             )
             .into());
         };
