@@ -59,12 +59,15 @@ pub type TagSet = BTreeMap<String, String>;
 /// returns a response with a TableStatus of CREATING. After the table is created,
 /// DynamoDB sets the TableStatus to ACTIVE" — so a table is reported `CREATING`
 /// (then `DELETING`) for a span rather than flipping instantly. Real AWS takes as
-/// long as it takes; this emulator CHOOSES 500 ms: non-zero, so a caller that acts
-/// immediately after the call still observes the transient status and the state
-/// errors that go with it, and short enough that a client's waiter settles quickly.
-/// The due instant is stored on the table and materialised when a later request
-/// reads it — nothing sleeps.
-pub const STATUS_TRANSITION: Duration = Duration::from_millis(500);
+/// long as it takes and the model states no figure, so the span is this emulator's:
+/// it is the ONE span every clock-owed transition of this project takes, three
+/// seconds, which is long enough that a caller walking a whole sequence of calls
+/// after the one that started the transition still observes the transient status and
+/// the state errors that go with it — a `DELETING` table stays describable while the
+/// caller polls it and retries the delete — rather than vanishing between two of its
+/// own requests. The due instant is stored on the table and materialised when a later
+/// request reads it: nothing sleeps for it.
+pub const STATUS_TRANSITION: Duration = Duration::from_secs(3);
 
 /// The maximum size of one item, 400 KB ("Service, Account, and Table Quotas" in the
 /// Amazon DynamoDB Developer Guide: "The maximum item size in DynamoDB is 400 KB").

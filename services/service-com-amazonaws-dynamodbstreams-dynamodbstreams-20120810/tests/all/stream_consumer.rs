@@ -21,7 +21,7 @@ use streams::ops::types::{AttributeValue, KeySchemaElement};
 use streams::state::{
     AttributeMap, ComAmazonawsDynamodbstreamsDynamodbstreams20120810State as StreamsState,
     OperationType, RecordAppend, RegistrationRejected, StreamRegistration, StreamViewType,
-    MAX_LIVE_ITERATORS, MAX_STREAMS_PER_TABLE,
+    MAX_LIVE_ITERATORS, MAX_STREAMS_PER_TABLE, STREAM_DISABLE_DELAY,
 };
 
 /// A SigV4 credential scope naming `dynamodb`, which is how both DynamoDB and
@@ -1192,10 +1192,14 @@ async fn a_shard_iterator_is_classified_by_whether_this_service_minted_it() {
 /// above do.
 #[tokio::test]
 async fn a_disabled_stream_is_deleted_after_the_documented_day() {
+    // The window runs from the instant the stream REACHES `DISABLED`, which is one
+    // `STREAM_DISABLE_DELAY` after the disable was requested, so a row that straddles
+    // the bound is named relative to that span rather than by a bare second.
+    let span = STREAM_DISABLE_DELAY.as_secs();
     for (case, disabled_seconds_ago, still_registered) in [
         ("disabled a minute ago", 60_u64, true),
-        ("disabled just inside 24h", 24 * 60 * 60 - 10, true),
-        ("disabled just past 24h", 24 * 60 * 60 + 1, false),
+        ("disabled just inside 24h", 24 * 60 * 60 - span - 10, true),
+        ("disabled just past 24h", 24 * 60 * 60 + span + 1, false),
         ("disabled 25h ago", 25 * 60 * 60, false),
     ] {
         let (engine, router) = build();

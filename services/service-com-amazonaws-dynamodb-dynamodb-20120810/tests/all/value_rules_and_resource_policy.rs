@@ -1067,7 +1067,10 @@ async fn a_policy_attached_at_create_time_is_enforced_from_the_first_request() {
         }),
     )
     .await;
-    std::thread::sleep(std::time::Duration::from_millis(900));
+    // The table has to be `ACTIVE` before the data plane serves it ("You can perform
+    // read and write operations only on an ACTIVE table"), so the wait is the SPAN the
+    // creation takes rather than a literal that a change to that span invalidates.
+    std::thread::sleep(STATUS_TRANSITION + std::time::Duration::from_millis(400));
     ok(
         &router,
         "PutItem",

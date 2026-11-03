@@ -178,6 +178,9 @@ mod time_to_live;
 #[path = "all/transactional_undefined_expression_tokens.rs"]
 mod transactional_undefined_expression_tokens;
 
+#[path = "all/transitional_status_span.rs"]
+mod transitional_status_span;
+
 #[path = "all/undefined_expression_tokens.rs"]
 mod undefined_expression_tokens;
 

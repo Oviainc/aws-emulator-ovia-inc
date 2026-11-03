@@ -41,20 +41,23 @@ pub const RECORD_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 ///
 /// DynamoDB enables a stream asynchronously, which is why the model documents
 /// `StreamStatus` `ENABLING` ("Streams is currently being enabled on the DynamoDB
-/// table") beside `ENABLED`. The real wait is not documented, so this is a CHOSEN
-/// span inside the emulator's 250–750 ms band: short enough not to slow a caller
-/// down, long enough that a caller which describes the stream immediately still
-/// observes the transient status.
-pub const STREAM_ENABLE_DELAY: Duration = Duration::from_millis(500);
+/// table") beside `ENABLED`. The real wait is not documented, so the span is this
+/// emulator's: it is the ONE span every clock-owed transition of this project takes,
+/// three seconds, which is long enough that a caller walking a whole sequence of
+/// calls after the one that registered the stream still observes the transient
+/// status rather than having it settle between two of its own requests. It is also
+/// never shorter than the table's own transition
+/// (`service_com_amazonaws_dynamodb_dynamodb_20120810::state::STATUS_TRANSITION`),
+/// which the seam that registers a stream asserts at compile time.
+pub const STREAM_ENABLE_DELAY: Duration = Duration::from_secs(3);
 
 /// How long after a disable request a stream reports `DISABLED` instead of
 /// `DISABLING`.
 ///
-/// The mirror of [`STREAM_ENABLE_DELAY`], for the same reason and over the same
-/// CHOSEN span: the model documents `StreamStatus` `DISABLING` ("Streams is
-/// currently being disabled on the DynamoDB table") beside `DISABLED`, so a
-/// caller that describes the stream straight after the call still observes the
-/// transient status.
+/// The mirror of [`STREAM_ENABLE_DELAY`], over the same span: the model documents
+/// `StreamStatus` `DISABLING` ("Streams is currently being disabled on the DynamoDB
+/// table") beside `DISABLED`, so a caller that describes the stream straight after the
+/// call — or anywhere inside the span — still observes the transient status.
 pub const STREAM_DISABLE_DELAY: Duration = STREAM_ENABLE_DELAY;
 
 /// The most records one `GetRecords` call may return.

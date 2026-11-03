@@ -36,9 +36,12 @@ const REGION: &str = "us-west-2";
 const ACCOUNT: &str = "000000000000";
 
 /// Long enough that a created table has become `ACTIVE`: "You can perform read and
-/// write operations only on an ACTIVE table", and a created one is `CREATING` for
-/// one DynamoDB status transition (500 ms).
-const PAST_THE_TABLE_TRANSITION: Duration = Duration::from_millis(800);
+/// write operations only on an ACTIVE table", and a created one is `CREATING` for one
+/// DynamoDB status transition. Read from that service's own constant rather than
+/// written down, so a change to the span cannot leave this wait short.
+const PAST_THE_TABLE_TRANSITION: Duration =
+    service_com_amazonaws_dynamodb_dynamodb_20120810::state::STATUS_TRANSITION
+        .saturating_add(Duration::from_millis(400));
 
 /// The three services this chain runs through, mounted on ONE engine exactly as
 /// `core/router/src/lib.rs` mounts them. Request authentication is off, as in every
