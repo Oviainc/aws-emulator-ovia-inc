@@ -29,5 +29,7 @@ mod resource_not_found;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_resource_resource_kinds.rs"]
+mod tag_resource_resource_kinds;
 #[path = "all/versioned_resource_responses.rs"]
 mod versioned_resource_responses;
