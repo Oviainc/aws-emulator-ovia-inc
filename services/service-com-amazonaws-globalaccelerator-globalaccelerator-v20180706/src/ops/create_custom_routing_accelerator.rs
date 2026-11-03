@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCustomRoutingAccelerator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCustomRoutingAccelerator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints and PERSISTS a custom routing accelerator in [`crate::state`]: a new ARN, the
+//! DNS name the model's naming convention describes, two allocated static IPv4
+//! addresses, `Enabled` defaulting to true, and a deployment that settles from
+//! `IN_PROGRESS` to `DEPLOYED`. Repeating the call with the same `IdempotencyToken`
+//! returns the accelerator that token already minted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCustomRoutingAccelerator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A custom routing accelerator lives apart from a standard one: it is reached only
+//! through the custom-routing operations, so it is held in its own map and
+//! `DescribeAccelerator`/`ListAccelerators` do not answer with it.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +175,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCustomRoutingAccelerator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCustomRoutingAcceleratorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCustomRoutingAccelerator"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateCustomRoutingAcceleratorErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Global Accelerator store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let invalid = |message: String| -> CreateCustomRoutingAcceleratorError {
+            CreateCustomRoutingAcceleratorErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        crate::state::validate_custom_routing_accelerator_name(&input.name).map_err(invalid)?;
+
+        // "For a custom routing accelerator, the value must be IPV4", so the other
+        // `IpAddressType` the enum offers is refused and an absent one takes IPV4.
+        let ip_address_type =
+            crate::state::resolve_custom_routing_ip_address_type(input.ip_address_type)
+                .map_err(invalid)?;
+
+        // The BYOIP path of `IpAddresses`: "you can assign one IPv4 address from your
+        // range to it. Global Accelerator assigns you a second static IPv4 address from
+        // an Amazon IP address range." So supplied addresses lead the IPv4 set and the
+        // service allocates the remainder of the two.
+        let byoip = input.ip_addresses.unwrap_or_default();
+        crate::state::validate_static_ipv4_addresses(&byoip).map_err(invalid)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let token_key =
+            crate::state::custom_routing_accelerator_idempotency_key(&input.idempotency_token);
+        // A replay returns the accelerator the token already minted. SIMPLIFICATION, as
+        // on `CreateAccelerator`: the replayed request's other members are not compared
+        // with the stored record, so a token reused with DIFFERENT parameters replays
+        // rather than being refused as a conflict.
+        if let Some(minted) = store.idempotency.get(&token_key) {
+            if let Some(existing) = store.custom_routing_accelerators.get(minted) {
+                return Ok(CreateCustomRoutingAcceleratorOutput {
+                    accelerator: Some(existing.to_custom_routing_wire(now)),
+                });
+            }
+        }
+
+        // The per-account quota bounds this store: a create past it is refused rather
+        // than growing resident state without limit. The quota is applied to this
+        // accelerator KIND, since a custom routing accelerator and a standard one are
+        // distinct resources created by distinct operations. Stale idempotency records
+        // (whose resource was deleted) are released first, so the token map stays
+        // bounded by the number of live resources too.
+        store.prune_idempotency();
+        if store.custom_routing_accelerators.len() >= crate::state::MAX_ACCELERATORS_PER_ACCOUNT {
+            return Err(CreateCustomRoutingAcceleratorErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::accelerator_quota_exceeded_message()),
+                },
+            )
+            .into());
+        }
+
+        let uuid = store.mint_uuid();
+        let (arn, label) = crate::state::mint_accelerator(&uuid);
+        let mut ipv4_addresses = byoip;
+        while ipv4_addresses.len() < 2 {
+            let allocated = store.allocate_ipv4();
+            ipv4_addresses.push(allocated);
+        }
+
+        let record = crate::state::StoredAccelerator {
+            arn: arn.clone(),
+            name: input.name,
+            ip_address_type,
+            ip_sets: vec![crate::state::StoredIpSet::new(
+                crate::state::IP_FAMILY_IPV4,
+                ipv4_addresses,
+            )],
+            dns_name: crate::state::dns_name(&label),
+            // A custom routing accelerator is IPv4-only, and only a dual-stack
+            // accelerator has a second DNS name.
+            dual_stack_dns_name: None,
+            // "The default value is true" (`CreateCustomRoutingAccelerator$Enabled`).
+            enabled: input.enabled.unwrap_or(true),
+            created_time: now,
+            last_modified_time: now,
+            deployed_at: now + crate::state::DEPLOYMENT_SETTLE,
+            tags: crate::state::tags_to_pairs(input.tags),
+            listener_arns: Vec::new(),
+        };
+        let accelerator = record.to_custom_routing_wire(now);
+
+        store.accelerator_attributes.insert(
+            arn.clone(),
+            crate::state::StoredAcceleratorAttributes::default(),
+        );
+        store.idempotency.insert(token_key, arn.clone());
+        store.custom_routing_accelerators.insert(arn, record);
+
+        Ok(CreateCustomRoutingAcceleratorOutput {
+            accelerator: Some(accelerator),
+        })
     }
 }

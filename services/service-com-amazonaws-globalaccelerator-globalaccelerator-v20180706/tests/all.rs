@@ -15,6 +15,8 @@
 mod accelerator_attributes;
 #[path = "all/accelerator_lifecycle.rs"]
 mod accelerator_lifecycle;
+#[path = "all/custom_routing_accelerators.rs"]
+mod custom_routing_accelerators;
 #[path = "all/endpoint_groups.rs"]
 mod endpoint_groups;
 #[path = "all/error_message_member.rs"]

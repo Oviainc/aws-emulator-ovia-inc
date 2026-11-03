@@ -18,8 +18,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Accelerator, AcceleratorAttributes, EndpointConfiguration, EndpointDescription, EndpointGroup,
-    IpAddressDetail, IpSet, Listener, PortOverride, PortRange, Tag,
+    Accelerator, AcceleratorAttributes, CustomRoutingAccelerator, EndpointConfiguration,
+    EndpointDescription, EndpointGroup, IpAddressDetail, IpSet, Listener, PortOverride, PortRange,
+    Tag,
 };
 
 /// `AcceleratorStatus` values, from the model enum of the same name
@@ -93,7 +94,16 @@ pub const ACCELERATOR_NAME_MAX_LEN: usize = 64;
 /// A create past it is refused with the modelled `LimitExceededException` — which is
 /// also what bounds this store's resident size, so a caller cannot grow it without
 /// limit.
+///
+/// Applied PER accelerator kind, because a standard accelerator and a custom routing
+/// one are distinct resources created by distinct operations: neither create's quota is
+/// consumed by the other kind's resources.
 pub const MAX_ACCELERATORS_PER_ACCOUNT: usize = 20;
+
+/// The kinds of accelerator this service holds — standard and custom routing — each
+/// bounded by [`MAX_ACCELERATORS_PER_ACCOUNT`]. Only [`MAX_IDEMPOTENCY_RECORDS`] needs
+/// the count, to bound the tokens BOTH kinds' creates can leave behind.
+pub const ACCELERATOR_KINDS: usize = 2;
 
 /// Listeners per accelerator: the service's documented default quota ("Listeners per
 /// accelerator: 10", AWS Global Accelerator service quotas). Refused the same way.
@@ -123,9 +133,11 @@ pub const MAX_PORT_OVERRIDES_PER_ENDPOINT_GROUP: usize = 10;
 /// The most idempotency records the store can hold: one per resource that can exist.
 /// [`ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State::prune_idempotency`]
 /// keeps the invariant that every record points at a LIVE resource, so the map is
-/// bounded by the two quotas above rather than by how many tokens a caller has ever
-/// sent.
-pub const MAX_IDEMPOTENCY_RECORDS: usize = MAX_ACCELERATORS_PER_ACCOUNT
+/// bounded by the quotas above — the accelerators of both kinds the account may hold,
+/// and the listeners and endpoint groups each of them may hold — rather than by how
+/// many tokens a caller has ever sent.
+pub const MAX_IDEMPOTENCY_RECORDS: usize = ACCELERATOR_KINDS
+    * MAX_ACCELERATORS_PER_ACCOUNT
     * (1 + MAX_LISTENERS_PER_ACCELERATOR + MAX_ENDPOINT_GROUPS_PER_ACCELERATOR);
 
 /// The largest page any list returns, and the page it returns when the caller names
@@ -247,6 +259,14 @@ impl StoredIpSet {
 }
 
 /// An accelerator, as persisted.
+///
+/// The same record serves both kinds of accelerator the service has — a standard one
+/// and a custom routing one — because they carry the same attributes; which kind a
+/// record is, is the map it lives in
+/// ([`GlobalAcceleratorState::accelerators`] or
+/// [`GlobalAcceleratorState::custom_routing_accelerators`]), since each kind is served
+/// by its OWN operations: a custom routing accelerator is not described, listed,
+/// updated or deleted through the standard ones, and vice versa.
 #[derive(Debug, Clone)]
 pub struct StoredAccelerator {
     /// `AcceleratorArn` — also this record's key in [`GlobalAcceleratorState::accelerators`].
@@ -278,6 +298,26 @@ impl StoredAccelerator {
             STATUS_IN_PROGRESS
         } else {
             STATUS_DEPLOYED
+        }
+    }
+
+    /// This record as the modelled `CustomRoutingAccelerator`.
+    ///
+    /// The same record, projected through the shape the custom-routing operations
+    /// answer with: it carries no `DualStackDnsName` and no `Events`, and its
+    /// `Status` is a `CustomRoutingAcceleratorStatus`, whose values are the same
+    /// `DEPLOYED`/`IN_PROGRESS` pair [`Self::status`] reports.
+    pub fn to_custom_routing_wire(&self, now: SystemTime) -> CustomRoutingAccelerator {
+        CustomRoutingAccelerator {
+            accelerator_arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            ip_address_type: Some(self.ip_address_type.clone()),
+            enabled: Some(self.enabled),
+            ip_sets: Some(self.ip_sets.iter().map(StoredIpSet::to_wire).collect()),
+            dns_name: Some(self.dns_name.clone()),
+            status: Some(self.status(now).to_string()),
+            created_time: Some(to_date_time(self.created_time)),
+            last_modified_time: Some(to_date_time(self.last_modified_time)),
         }
     }
 
@@ -494,13 +534,20 @@ pub struct ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State {
     /// Accelerators by `AcceleratorArn`. `BTreeMap` so list pagination has a
     /// stable total order to resume in.
     pub accelerators: BTreeMap<String, StoredAccelerator>,
+    /// Custom routing accelerators by `AcceleratorArn`, held apart from the standard
+    /// ones for the reason [`StoredAccelerator`] gives: each kind is reached only
+    /// through its own operations.
+    pub custom_routing_accelerators: BTreeMap<String, StoredAccelerator>,
     /// Listeners by `ListenerArn`; the parent's `listener_arns` holds the
     /// per-accelerator order.
     pub listeners: BTreeMap<String, StoredListener>,
     /// Endpoint groups by `EndpointGroupArn`; the parent listener's
     /// `endpoint_group_arns` holds the per-listener order.
     pub endpoint_groups: BTreeMap<String, StoredEndpointGroup>,
-    /// Flow-log attributes by `AcceleratorArn`.
+    /// Flow-log attributes by `AcceleratorArn`, for an accelerator of either kind:
+    /// `AcceleratorAttributes` and `CustomRoutingAcceleratorAttributes` carry the same
+    /// three flow-log members, and an `AcceleratorArn` identifies one accelerator
+    /// whichever kind it is.
     pub accelerator_attributes: BTreeMap<String, StoredAcceleratorAttributes>,
     /// `<kind>:<scope>:<IdempotencyToken>` -> the ARN that token already minted, so a
     /// repeated create returns the same resource instead of a second one. The scope is
@@ -581,6 +628,7 @@ impl ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State {
     pub fn prune_idempotency(&mut self) {
         let Self {
             accelerators,
+            custom_routing_accelerators,
             listeners,
             endpoint_groups,
             idempotency,
@@ -588,6 +636,7 @@ impl ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State {
         } = self;
         idempotency.retain(|_, minted| {
             accelerators.contains_key(minted)
+                || custom_routing_accelerators.contains_key(minted)
                 || listeners.contains_key(minted)
                 || endpoint_groups.contains_key(minted)
         });
@@ -626,6 +675,16 @@ pub fn ipv4_set_index(ip_sets: &[StoredIpSet]) -> Option<usize> {
 /// An `IdempotencyToken` key for the accelerator creates.
 pub fn accelerator_idempotency_key(token: &str) -> String {
     format!("accelerator:{token}")
+}
+
+/// An `IdempotencyToken` key for `CreateCustomRoutingAccelerator`.
+///
+/// Account-scoped like [`accelerator_idempotency_key`], but under its OWN kind: the
+/// token identifies one create request, and the same token sent to the standard create
+/// is a different request against a different resource kind, so neither may replay the
+/// other's accelerator.
+pub fn custom_routing_accelerator_idempotency_key(token: &str) -> String {
+    format!("custom-routing-accelerator:{token}")
 }
 
 /// An `IdempotencyToken` key for the listener creates.
@@ -704,35 +763,92 @@ pub fn mint_endpoint_group_arn(listener_arn: &str, uuid: &str) -> String {
     format!("{listener_arn}/endpoint-group/{id}")
 }
 
+/// Which punctuation an accelerator name may carry — the ONE way the two accelerator
+/// kinds' documented name rules differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamePunctuation {
+    /// `CreateAccelerator$Name`: "alphanumeric characters, periods (.), or hyphens (-)".
+    PeriodsAndHyphens,
+    /// `CreateCustomRoutingAccelerator$Name`: "only alphanumeric characters or
+    /// hyphens (-)".
+    HyphensOnly,
+}
+
 /// Refuse a name the real service refuses.
 ///
-/// The rule is the model's own doc for `CreateAccelerator$Name` /
-/// `Accelerator$Name`: "The name can have a maximum of 64 characters, must
-/// contain only alphanumeric characters, periods (.), or hyphens (-), and must
-/// not begin or end with a hyphen or period." Returns the message to put on an
-/// `InvalidArgumentException`.
-pub fn validate_accelerator_name(name: &str) -> Result<(), String> {
+/// One rule for both accelerator kinds: at most [`ACCELERATOR_NAME_MAX_LEN`]
+/// characters, only alphanumerics and the punctuation `punctuation` admits, and never
+/// that punctuation at either end. Returns the message to put on an
+/// `InvalidArgumentException`, which states the rule the name broke.
+fn validate_name(name: &str, punctuation: NamePunctuation) -> Result<(), String> {
+    let (allowed, edge_names) = match punctuation {
+        NamePunctuation::PeriodsAndHyphens => (
+            "alphanumeric characters, periods (.), or hyphens (-)",
+            "a hyphen or period",
+        ),
+        NamePunctuation::HyphensOnly => ("alphanumeric characters or hyphens (-)", "a hyphen"),
+    };
     let bad = |reason: &str| {
         Err(format!(
             "Name {reason}: a name can have a maximum of {ACCELERATOR_NAME_MAX_LEN} characters, \
-             must contain only alphanumeric characters, periods (.), or hyphens (-), and must not \
-             begin or end with a hyphen or period"
+             must contain only {allowed}, and must not begin or end with {edge_names}"
         ))
+    };
+    let is_edge = |c: char| match punctuation {
+        NamePunctuation::PeriodsAndHyphens => c == '-' || c == '.',
+        NamePunctuation::HyphensOnly => c == '-',
     };
     if name.chars().count() > ACCELERATOR_NAME_MAX_LEN {
         return bad("is too long");
     }
     if !name
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        .all(|c| c.is_ascii_alphanumeric() || is_edge(c))
     {
         return bad("contains an unsupported character");
     }
-    let edge = |c: char| c == '-' || c == '.';
-    if name.starts_with(edge) || name.ends_with(edge) {
-        return bad("begins or ends with a hyphen or period");
+    if name.starts_with(is_edge) || name.ends_with(is_edge) {
+        return bad(&format!("begins or ends with {edge_names}"));
     }
     Ok(())
+}
+
+/// Refuse a standard accelerator's name the real service refuses.
+///
+/// The rule is the model's own doc for `CreateAccelerator$Name` /
+/// `Accelerator$Name`: "The name can have a maximum of 64 characters, must
+/// contain only alphanumeric characters, periods (.), or hyphens (-), and must
+/// not begin or end with a hyphen or period."
+pub fn validate_accelerator_name(name: &str) -> Result<(), String> {
+    validate_name(name, NamePunctuation::PeriodsAndHyphens)
+}
+
+/// Refuse a custom routing accelerator's name the real service refuses.
+///
+/// The rule is the model's own doc for `CreateCustomRoutingAccelerator$Name`: "The name
+/// can have a maximum of 64 characters, must contain only alphanumeric characters or
+/// hyphens (-), and must not begin or end with a hyphen." A period, which a standard
+/// accelerator's name may carry, is NOT in this set.
+pub fn validate_custom_routing_accelerator_name(name: &str) -> Result<(), String> {
+    validate_name(name, NamePunctuation::HyphensOnly)
+}
+
+/// The `IpAddressType` a custom routing accelerator ends up with.
+///
+/// "The IP address type that an accelerator supports. For a custom routing accelerator,
+/// the value must be IPV4" (`CreateCustomRoutingAccelerator$IpAddressType`), so the
+/// other value the enum offers is refused rather than stored, and a request that names
+/// no type gets [`IP_ADDRESS_TYPE_IPV4`] — the only type this kind supports. Returns
+/// the message for an `InvalidArgumentException`.
+pub fn resolve_custom_routing_ip_address_type(supplied: Option<String>) -> Result<String, String> {
+    match supplied {
+        None => Ok(IP_ADDRESS_TYPE_IPV4.to_string()),
+        Some(value) if value == IP_ADDRESS_TYPE_IPV4 => Ok(value),
+        Some(value) => Err(format!(
+            "IpAddressType {value} is not supported: for a custom routing accelerator, the IP \
+             address type must be {IP_ADDRESS_TYPE_IPV4}"
+        )),
+    }
 }
 
 /// A single `PortRange`, validated.
@@ -932,6 +1048,16 @@ pub fn validate_static_ipv4_addresses(addresses: &[String]) -> Result<(), String
         }
     }
     Ok(())
+}
+
+/// The message a create states when the account already holds as many accelerators of
+/// that kind as [`MAX_ACCELERATORS_PER_ACCOUNT`] allows.
+///
+/// One place for the wording so both accelerator creates state the quota they refused
+/// against alike, with the limit interpolated from the constant rather than written
+/// into the sentence.
+pub fn accelerator_quota_exceeded_message() -> String {
+    format!("the account already holds the maximum of {MAX_ACCELERATORS_PER_ACCOUNT} accelerators")
 }
 
 /// The message for a refusal that names an accelerator the store does not hold.

@@ -228,10 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.accelerators.len() >= crate::state::MAX_ACCELERATORS_PER_ACCOUNT {
             return Err(CreateAcceleratorErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "the account already holds the maximum of {} accelerators",
-                        crate::state::MAX_ACCELERATORS_PER_ACCOUNT
-                    )),
+                    message: Some(crate::state::accelerator_quota_exceeded_message()),
                 },
             )
             .into());
