@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeNatGateways
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeNatGateways`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeNatGateways::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +75,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::borrow::Cow;
+use std::collections::HashSet;
+
+use crate::state::{
+    CompiledFilter, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
+    MAX_RESOURCE_IDS, MatchBudget, TAG_FILTER_PREFIX,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -151,18 +150,240 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeNatGateways` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeNatGatewaysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — the NAT
+        // gateways of the account are reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "If you have the required permissions, the error response is DryRunOperation"
+        // (`DescribeNatGatewaysRequest$DryRun`). Every caller of this emulator is permitted,
+        // so a dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+
+        // "The token returned from a previous paginated request"
+        // (`DescribeNatGatewaysRequest$NextToken`) — a token this service did not mint is
+        // refused rather than read as an id, and it is refused before the store is read, so
+        // whether a bogus token is caught never depends on what the store holds.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // Matching cost is filters x values x value length x stored gateways, and the model
+        // bounds none of them (`FilterList` and `Filter$Values` carry no `@length`), so
+        // every request-controlled factor is capped HERE, before any work proportional to it
+        // is done and before the store is locked — the same ceilings every other describe of
+        // this crate enforces, from `crate::state`.
+        let filters: &[Filter] = input.filter.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not document is NOT refused: it names no
+        // attribute of a NAT gateway, so it compares against no value and selects no gateway
+        // — the answer a NAT gateway read was recorded giving a name outside its catalog,
+        // which is also what the matcher already does for an attribute a gateway carries
+        // nothing for (see [`filter_values`]). What is bounded here is only the SIZE of the
+        // comparison the request asks for.
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so a value's size is bounded
+            // here too.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            compiled.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // The id selector is caller-sized as well, and every entry is resolved against the
+        // store, so it is capped the way every other EC2 operation of this crate caps a
+        // resource-id list.
+        let requested: &[String] = input.nat_gateway_ids.as_deref().unwrap_or_default();
+        if requested.len() > MAX_RESOURCE_IDS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "NatGatewayIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested.len()
+            )));
+        }
+
+        let mut store = state.lock();
+        // The clock-owed moves this read is allowed to apply — the same call every other
+        // describe of this crate makes: an address `AssociateNatGatewayAddress` answered as
+        // `associating` has `succeeded` once its due instant has passed, whether or not
+        // anybody called, so applying it here changes nothing a later caller would not have
+        // seen anyway.
+        store.materialize_due_transitions();
+
+        // "The IDs of the NAT gateways" (`DescribeNatGatewaysRequest$NatGatewayIds`): an id
+        // that names no NAT gateway of the account is an error, not an absent row — resolved
+        // through the one place the NAT gateway family resolves an id
+        // ([`crate::state::require_known_nat_gateway`]), so a value that is not a NAT gateway
+        // id at all is never reported as "no such NAT gateway".
+        for nat_gateway_id in requested {
+            crate::state::require_known_nat_gateway(&store, nat_gateway_id)?;
+        }
+
+        // "The default is to describe all your NAT gateways. Alternatively, you can specify
+        // specific NAT gateway IDs or filter the results" (`DescribeNatGateways`): the ids
+        // named narrow the store, and then every filter must hold ("If you specify multiple
+        // filters, the filters are joined with an AND" — `Filter`). A set, so narrowing costs
+        // one lookup per gateway rather than a scan of the asked-for list.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeNatGateways"))
+        // Every comparison is charged to ONE budget, so the product of stored gateways,
+        // filters, values and value length is bounded however the caller combines them —
+        // which is also what bounds how long this holds the store's lock.
+        let wanted: HashSet<&str> = requested.iter().map(String::as_str).collect();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<&NatGateway> = Vec::new();
+        for gateway in store.nat_gateways.values() {
+            if budget.exhausted() {
+                break;
+            }
+            if !wanted.is_empty()
+                && !wanted.contains(gateway.nat_gateway_id.as_deref().unwrap_or_default())
+            {
+                continue;
+            }
+            if crate::state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(gateway, name)
+            }) {
+                selected.push(gateway);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them or page with MaxResults"
+                ),
+            ));
+        }
+
+        // Page in `NatGatewayId` order, which the cursor below names a position in. The store
+        // is an ordered map, so its iteration order already satisfies this sort; doing it
+        // here establishes the invariant the cursor depends on at the point of use rather
+        // than inheriting it from the container `crate::state` happens to hold.
+        selected.sort_by(|left, right| left.nat_gateway_id.cmp(&right.nat_gateway_id));
+
+        // "The maximum number of items to return for this request"
+        // (`DescribeNatGatewaysRequest$MaxResults`). A request that names none gets the
+        // largest page the model publishes, so the `NextToken` path below behaves the same
+        // whether or not a page size was asked for. The model's `range 5..1000` has already
+        // refused anything outside it; the floor of [`MIN_MAX_RESULTS`] is applied anyway,
+        // because a page size of zero would mint a token for a page that carried nothing and
+        // leave a paging client in a loop that never advances.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .max(MIN_MAX_RESULTS);
+
+        // The page and the token that follows it, through the one definition of EC2 paging
+        // ([`crate::state::page_from_cursor`]): the cursor names the gateway this page ends
+        // at, and "this value is null when there are no more items to return"
+        // (`DescribeNatGatewaysResult$NextToken`) is a token only while a further gateway
+        // follows the page.
+        let (page, next_token) = crate::state::page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            crate::state::PageTokenRule::WhenAnotherItemFollows,
+            |gateway| gateway.nat_gateway_id.as_deref().unwrap_or_default(),
+        );
+
+        Ok(DescribeNatGatewaysOutput {
+            nat_gateways: Some(page.iter().map(|gateway| (*gateway).clone()).collect()),
+            next_token,
+        })
+    }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`DescribeNatGatewaysMaxResults`, `range 5..1000`), which is also the most EC2 returns in
+/// one page.
+const DEFAULT_MAX_RESULTS: usize = 1000;
+
+/// The smallest page this operation will serve: the minimum of the same published range
+/// (`DescribeNatGatewaysMaxResults`, `range 5..1000`). The boundary validator refuses
+/// anything below it, so this is the floor that keeps a page of zero — which would mint a
+/// token for a page carrying nothing — unreachable however the request is read.
+const MIN_MAX_RESULTS: usize = 5;
+
+/// The tag filter whose values are the KEYS a gateway carries, rather than one key's value:
+/// "the key of a tag assigned to the resource … regardless of the tag value"
+/// (`DescribeNatGatewaysRequest$Filter`).
+const TAG_KEY_FILTER: &str = "tag-key";
+
+/// The values the EC2 filter `name` compares against this NAT gateway.
+///
+/// The arms below ARE the catalog this operation documents — `nat-gateway-id`, `state`,
+/// `subnet-id`, `vpc-id`, `tag:<key>` and `tag-key`, from
+/// `DescribeNatGatewaysRequest$Filter`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeNatGatewaysRequest",member="Filter",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact. A name
+/// outside the catalog, and a documented name naming an attribute this gateway does not
+/// carry, both compare against NO values and so select nothing — the answer `subnet-id`
+/// gives for a gateway stored without one.
+fn filter_values<'a>(gateway: &'a NatGateway, name: &str) -> Vec<Cow<'a, str>> {
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return gateway
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "nat-gateway-id" => text(gateway.nat_gateway_id.as_deref()),
+        "state" => text(gateway.state.as_deref()),
+        "subnet-id" => text(gateway.subnet_id.as_deref()),
+        "vpc-id" => text(gateway.vpc_id.as_deref()),
+        TAG_KEY_FILTER => gateway
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        // A name this operation documents no filter for: it names nothing about a NAT
+        // gateway, so it compares against no value and can only narrow a result, never
+        // widen one.
+        _ => Vec::new(),
     }
 }

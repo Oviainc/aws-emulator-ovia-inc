@@ -17,6 +17,13 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `DescribeNatGateways` reports out of the NAT gateway store: every member a stored
+// gateway holds, how the id list, the documented filters and the page size narrow it, what it
+// refuses, and the address status the clock owes a gateway it is read through. Declared beside
+// `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail of
+// this file are where every new ec2 suite inserts its lines.
+#[path = "all/describe_nat_gateways.rs"]
+mod describe_nat_gateways;
 // The FIXED TEXT of a refusal's message, per class: the sentence the service words that error
 // class with, with only the variable parts it interpolates from the request and the store —
 // no restatement of the rule the value missed, no identifier out of the account's own state,
