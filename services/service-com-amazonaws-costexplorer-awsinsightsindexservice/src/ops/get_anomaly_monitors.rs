@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAnomalyMonitors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAnomalyMonitors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAnomalyMonitors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +105,13 @@ impl From<GetAnomalyMonitorsErrorModeled> for GetAnomalyMonitorsError {
     }
 }
 
+/// The page a request that names no `MaxResults` gets: every monitor the filter admits.
+///
+/// `PageSize` carries no modelled range and the operation documents no default page size,
+/// so a request that asks for no page size is answered with the whole result in one page
+/// rather than cut at a size this emulator invented.
+const UNPAGED: usize = usize::MAX;
+
 /// The `GetAnomalyMonitors` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -150,18 +148,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAnomalyMonitors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAnomalyMonitorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAnomalyMonitors"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Only reachable when this service was mounted on an engine that holds no
+            // store for it, so there are no monitors to report and the operation genuinely
+            // cannot be served here.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // A page resumes at the ARN its cursor names. An unreadable cursor is the one
+        // failure this operation models for the member.
+        let resume_at = match input.next_page_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_next_token(token).ok_or_else(|| {
+                GetAnomalyMonitorsErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: Some(
+                            "The pagination token is invalid. Try again without a pagination \
+                             token."
+                                .to_string(),
+                        ),
+                    },
+                )
+            })?),
+        };
+
+        let page_size = match input.max_results {
+            None => UNPAGED,
+            Some(requested) => usize::try_from(requested)
+                .ok()
+                .filter(|size| *size >= 1)
+                .ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation(format!(
+                        "MaxResults {requested} is not a page size; it must be at least 1"
+                    ))
+                })?,
+        };
+
+        // "You can filter using a list of cost anomaly monitor Amazon Resource Names
+        // (ARNs)": a list that names no ARN filters nothing out.
+        let filter = input
+            .monitor_arn_list
+            .as_deref()
+            .filter(|arns| !arns.is_empty());
+
+        let store = state.lock();
+        if let Some(arns) = filter {
+            // The filter names resources, so an ARN the account holds no monitor for is a
+            // 404 rather than a page that silently omits it.
+            for arn in arns {
+                if !store.anomaly_monitors.contains_key(arn) {
+                    return Err(GetAnomalyMonitorsErrorModeled::UnknownMonitorException(
+                        UnknownMonitorException {
+                            message: Some(format!(
+                                "The cost anomaly monitor {arn} does not exist for the account."
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // One stable total order (the ARN ordering the registry is keyed on) is what makes
+        // the cursor resolvable: the next page is "everything at or after this ARN", so a
+        // monitor created or deleted between pages neither duplicates nor skips the rest.
+        let mut selected = store
+            .anomaly_monitors
+            .range::<String, _>(resume_at.as_ref().map_or(
+                (::std::ops::Bound::Unbounded, ::std::ops::Bound::Unbounded),
+                |from| (::std::ops::Bound::Included(from), ::std::ops::Bound::Unbounded),
+            ))
+            .map(|(_, monitor)| monitor)
+            .filter(|monitor| filter.is_none_or(|arns| arns.contains(&monitor.arn)));
+
+        let mut anomaly_monitors = Vec::new();
+        for monitor in selected.by_ref().take(page_size) {
+            anomaly_monitors.push(monitor.to_anomaly_monitor());
+        }
+        // A cursor is issued only when a monitor the filter admits is left over, so the
+        // last page of a result carries none.
+        let next_page_token = selected
+            .next()
+            .map(|monitor| crate::state::encode_next_token(&monitor.arn));
+        drop(store);
+
+        Ok(GetAnomalyMonitorsOutput {
+            anomaly_monitors,
+            next_page_token,
+        })
     }
 }

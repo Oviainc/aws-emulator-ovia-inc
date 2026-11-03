@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAnomalyMonitor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAnomalyMonitor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAnomalyMonitor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +138,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAnomalyMonitor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAnomalyMonitorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAnomalyMonitor"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Only reachable when this service was mounted on an engine that holds no
+            // store for it, so the monitor cannot be persisted and the operation
+            // genuinely cannot be served here.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        let monitor = input.anomaly_monitor;
+        // The monitor's type, dimension and specification have to hold together. The model
+        // declares no client-input error for this operation, so a combination its schema
+        // admits but its documentation forbids is refused through the 400
+        // `ValidationException` channel.
+        crate::state::validate_anomaly_monitor(&monitor)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // `MonitorArn`, `CreationDate`, `LastUpdatedDate`, `LastEvaluatedDate` and
+        // `DimensionalValueCount` are members the SERVICE owns — the ARN is minted here and
+        // the dates are this service's own clock readings — so whatever a caller put in
+        // them is not stored.
+        let created_at = crate::state::now_year_month_day();
+        let mut store = state.lock();
+        // Admission before any write, so a refused create leaves the registry exactly as
+        // it was.
+        if store.anomaly_monitors.len() >= crate::state::MAX_ANOMALY_MONITORS {
+            return Err(CreateAnomalyMonitorErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} cost anomaly monitors for this account",
+                        crate::state::MAX_ANOMALY_MONITORS
+                    )),
+                },
+            )
+            .into());
+        }
+        let arn = ::engine::emulator_arn(
+            "ce",
+            "",
+            &format!("anomalymonitor/{}", store.next_resource_id()),
+        );
+        store.anomaly_monitors.insert(
+            arn.clone(),
+            crate::state::AnomalyMonitorRecord {
+                arn: arn.clone(),
+                monitor_name: monitor.monitor_name,
+                monitor_type: monitor.monitor_type,
+                monitor_dimension: monitor.monitor_dimension,
+                monitor_specification: monitor.monitor_specification,
+                creation_date: created_at.clone(),
+                // A monitor nobody has updated was last written when it was created.
+                last_updated_date: created_at,
+                last_evaluated_date: None,
+                resource_tags: input.resource_tags.unwrap_or_default(),
+            },
+        );
+        drop(store);
+
+        Ok(CreateAnomalyMonitorOutput { monitor_arn: arn })
     }
 }

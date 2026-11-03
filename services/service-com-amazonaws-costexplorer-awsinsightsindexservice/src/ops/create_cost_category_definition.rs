@@ -213,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = ::engine::emulator_arn(
             "ce",
             "",
-            &format!("costcategory/{}", store.next_definition_id()),
+            &format!("costcategory/{}", store.next_resource_id()),
         );
         store.cost_categories.insert(
             arn.clone(),

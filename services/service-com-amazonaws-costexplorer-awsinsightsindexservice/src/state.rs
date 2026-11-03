@@ -8,6 +8,11 @@
 //! `DeleteCostCategoryDefinition`, so none of those five operations derives identity or
 //! content of its own.
 //!
+//! The cost anomaly MONITOR registry lives here for the same reason: `CreateAnomalyMonitor`
+//! writes it and `GetAnomalyMonitors` reports it, and the anomaly subscription and tagging
+//! operations resolve a monitor ARN against it, so the monitor's identity and content are
+//! derived in exactly one place.
+//!
 //! The billing-date helpers and the pagination cursor codec also live here rather than in
 //! one operation's file: all five operations have to agree on what a `ZonedDateTime`
 //! means, and duplicating that across five handlers is how they would drift apart.
@@ -19,8 +24,8 @@ use aws_smithy_types::date_time::{DateTime, Format};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    CostCategory, CostCategoryProcessingStatus, CostCategoryReference, CostCategoryRule,
-    CostCategorySplitChargeRule, ResourceTag,
+    AnomalyMonitor, CostCategory, CostCategoryProcessingStatus, CostCategoryReference,
+    CostCategoryRule, CostCategorySplitChargeRule, Expression, ResourceTag,
 };
 
 /// How long a definition's Cost Explorer component reports `PROCESSING` before it
@@ -104,6 +109,16 @@ impl Timestamp {
 /// handler must never panic.
 pub fn now_zoned_date_time() -> String {
     Timestamp::now().to_zoned_date_time().unwrap_or_default()
+}
+
+/// The current instant as a `YearMonthDay` member — the shape the anomaly monitor dates
+/// target.
+///
+/// `YearMonthDay`'s pattern, `^(\d{4}-\d{2}-\d{2})(T\d{2}:\d{2}:\d{2}Z)?$`, admits the
+/// same seconds-precision RFC-3339 reading with a `Z` suffix that `ZonedDateTime`'s does,
+/// so ONE renderer serves both shapes rather than two that could drift.
+pub fn now_year_month_day() -> String {
+    now_zoned_date_time()
 }
 
 /// Split a `ZonedDateTime` into its civil part and the UTC offset it declares, in
@@ -272,15 +287,16 @@ pub fn effective_on_or_now(value: Option<&str>) -> Result<Timestamp, String> {
 // Identity
 // ---------------------------------------------------------------------------
 
-/// Mint the resource id a cost category ARN carries.
+/// Mint the resource id a Cost Explorer ARN carries — a cost category's or a cost anomaly
+/// monitor's.
 ///
-/// Shaped like the UUID a Cost Explorer cost category ARN carries (8-4-4-4-12 hex), and
-/// built as an RFC 9562 VERSION 8 (custom) UUID: the 16 bytes are a SHA-256 of this
-/// registry's own monotonic sequence number and the creation instant in nanoseconds, so
-/// every definition this process creates gets a distinct id and no caller input reaches
-/// it. Version 8 is what RFC 9562 reserves for a vendor-defined construction, so the
-/// value does not claim to be random (version 4) or name-based (version 5).
-pub fn mint_definition_id(sequence: u64) -> String {
+/// Shaped like the UUID those ARNs carry (8-4-4-4-12 hex), and built as an RFC 9562
+/// VERSION 8 (custom) UUID: the 16 bytes are a SHA-256 of this service's own monotonic
+/// sequence number and the creation instant in nanoseconds, so every resource this process
+/// creates gets a distinct id and no caller input reaches it. Version 8 is what RFC 9562
+/// reserves for a vendor-defined construction, so the value does not claim to be random
+/// (version 4) or name-based (version 5).
+pub fn mint_resource_id(sequence: u64) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos());
@@ -466,6 +482,207 @@ impl CostCategoryDefinition {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cost anomaly monitors
+// ---------------------------------------------------------------------------
+
+/// The `MonitorType` value of an Amazon Web Services managed monitor (model enum
+/// `MonitorType`).
+pub const MONITOR_TYPE_DIMENSIONAL: &str = "DIMENSIONAL";
+
+/// The `MonitorType` value of a customer managed monitor (model enum `MonitorType`).
+pub const MONITOR_TYPE_CUSTOM: &str = "CUSTOM";
+
+/// The `MonitorDimension` values a managed monitor analyses on its own, with no
+/// `MonitorSpecification` to narrow them.
+///
+/// From `AnomalyMonitor$MonitorSpecification`: "If MonitorDimension is SERVICE or
+/// LINKED_ACCOUNT, do not specify this field".
+pub const SELF_SUFFICIENT_MONITOR_DIMENSIONS: &[&str] = &["SERVICE", "LINKED_ACCOUNT"];
+
+/// The `MonitorDimension` value whose managed monitor is configured by a tag key.
+///
+/// From `AnomalyMonitor$MonitorSpecification`: "If MonitorDimension is TAG, set this field
+/// to `{ "Tags": { "Key": "your tag key" } }`".
+pub const MONITOR_DIMENSION_TAG: &str = "TAG";
+
+/// The `MonitorDimension` value whose managed monitor is configured by a cost category
+/// key.
+///
+/// From `AnomalyMonitor$MonitorSpecification`: "If MonitorDimension is COST_CATEGORY, set
+/// this field to `{ "CostCategories": { "Key": "your cost category key" } }`".
+pub const MONITOR_DIMENSION_COST_CATEGORY: &str = "COST_CATEGORY";
+
+/// The `Dimensions$Key` a customer managed monitor's specification may select on.
+///
+/// From `AnomalyMonitor$MonitorSpecification`, which gives exactly one `Dimensions` form
+/// for a customer managed monitor: "To track linked accounts, set this field to `{
+/// "Dimensions": { "Key": "LINKED_ACCOUNT", "Values": [ "your list of up to 10 account
+/// IDs" ] } }`".
+pub const CUSTOM_MONITOR_DIMENSION_KEY: &str = "LINKED_ACCOUNT";
+
+/// Whether an `Expression` selects any costs at all: a specification that names none of
+/// the selectors the shape carries configures nothing.
+fn expression_selects_anything(expression: &Expression) -> bool {
+    expression.dimensions.is_some()
+        || expression.tags.is_some()
+        || expression.cost_categories.is_some()
+        || expression.product_attributes.is_some()
+        || expression.and.is_some()
+        || expression.or.is_some()
+        || expression.not.is_some()
+}
+
+/// Check an `AnomalyMonitor` against the combination rules its own members document,
+/// returning the refusal text when it breaks one.
+///
+/// The rules come from `AnomalyMonitor$MonitorType`, `$MonitorDimension` and
+/// `$MonitorSpecification`: a managed (`DIMENSIONAL`) monitor names the dimension it
+/// analyses, and carries a specification only for the two dimensions that need a key to be
+/// configured, while a customer managed (`CUSTOM`) monitor names no dimension and is
+/// configured entirely by its specification. The model expresses none of this, so a
+/// combination its schema admits but its documentation forbids is refused here.
+///
+/// Shared by every operation that accepts a whole `AnomalyMonitor`, so create and update
+/// cannot drift apart on it.
+pub fn validate_anomaly_monitor(monitor: &AnomalyMonitor) -> Result<(), String> {
+    let specification = monitor.monitor_specification.as_ref();
+    match monitor.monitor_type.as_str() {
+        MONITOR_TYPE_DIMENSIONAL => {
+            let Some(dimension) = monitor.monitor_dimension.as_deref() else {
+                return Err(format!(
+                    "MonitorDimension is required for a {MONITOR_TYPE_DIMENSIONAL} monitor"
+                ));
+            };
+            if SELF_SUFFICIENT_MONITOR_DIMENSIONS.contains(&dimension) {
+                if specification.is_some() {
+                    return Err(format!(
+                        "MonitorSpecification must not be specified when MonitorDimension is \
+                         {dimension}"
+                    ));
+                }
+                return Ok(());
+            }
+            // The remaining two dimensions are each configured by one key, so the
+            // specification must carry that key and nothing else can stand in for it.
+            let configured_key = match dimension {
+                MONITOR_DIMENSION_TAG => specification
+                    .and_then(|expression| expression.tags.as_ref())
+                    .and_then(|tags| tags.key.as_deref()),
+                MONITOR_DIMENSION_COST_CATEGORY => specification
+                    .and_then(|expression| expression.cost_categories.as_ref())
+                    .and_then(|categories| categories.key.as_deref()),
+                // Unreachable: `MonitorDimension` is a modelled enum, so the boundary
+                // validator has already refused anything outside it. Refused rather than
+                // admitted so a dimension added to the model later cannot be stored with
+                // no rule applied to it.
+                other => {
+                    return Err(format!(
+                        "MonitorDimension {other} is not a dimension this service can monitor"
+                    ))
+                }
+            };
+            let selector = if dimension == MONITOR_DIMENSION_TAG {
+                "Tags"
+            } else {
+                "CostCategories"
+            };
+            match configured_key {
+                Some(key) if !key.is_empty() => Ok(()),
+                _ => Err(format!(
+                    "MonitorSpecification must specify {selector} with a Key when \
+                     MonitorDimension is {dimension}"
+                )),
+            }
+        }
+        MONITOR_TYPE_CUSTOM => {
+            if let Some(dimension) = monitor.monitor_dimension.as_deref() {
+                return Err(format!(
+                    "MonitorDimension must not be specified for a {MONITOR_TYPE_CUSTOM} monitor, \
+                     got {dimension}"
+                ));
+            }
+            let Some(specification) = specification else {
+                return Err(format!(
+                    "MonitorSpecification is required for a {MONITOR_TYPE_CUSTOM} monitor"
+                ));
+            };
+            if !expression_selects_anything(specification) {
+                return Err(format!(
+                    "MonitorSpecification must select the costs a {MONITOR_TYPE_CUSTOM} monitor \
+                     analyzes"
+                ));
+            }
+            match specification
+                .dimensions
+                .as_ref()
+                .and_then(|dimensions| dimensions.key.as_deref())
+            {
+                Some(key) if key != CUSTOM_MONITOR_DIMENSION_KEY => Err(format!(
+                    "MonitorSpecification Dimensions Key must be {CUSTOM_MONITOR_DIMENSION_KEY} \
+                     for a {MONITOR_TYPE_CUSTOM} monitor, got {key}"
+                )),
+                _ => Ok(()),
+            }
+        }
+        // Unreachable for the same reason as the dimension arm above: `MonitorType` is a
+        // modelled enum.
+        other => Err(format!(
+            "MonitorType {other} is not a monitor type this service can create"
+        )),
+    }
+}
+
+/// A stored cost anomaly detection monitor: everything `GetAnomalyMonitors` reports, and
+/// what the subscription and tagging surfaces resolve a monitor ARN against.
+#[derive(Debug, Clone)]
+pub struct AnomalyMonitorRecord {
+    /// The generated ARN this monitor is registered under.
+    pub arn: String,
+    /// The caller-chosen monitor name.
+    pub monitor_name: String,
+    /// `MonitorType` as the caller sent it: `DIMENSIONAL` or `CUSTOM`.
+    pub monitor_type: String,
+    /// The dimension a managed monitor analyses; absent on a customer managed one.
+    pub monitor_dimension: Option<String>,
+    /// The expression that controls which costs the monitor analyses, when it has one.
+    pub monitor_specification: Option<Expression>,
+    /// When the monitor was created, as a `YearMonthDay`.
+    pub creation_date: String,
+    /// When the monitor was last written, as a `YearMonthDay`.
+    pub last_updated_date: String,
+    /// When the monitor last evaluated for anomalies, as a `YearMonthDay`.
+    ///
+    /// `None` until an evaluation has happened. Nothing in this emulator evaluates cost
+    /// data, so it stays `None` and the member is OMITTED rather than reported as the
+    /// creation date, which would claim an evaluation that never ran.
+    pub last_evaluated_date: Option<String>,
+    /// Resource tags supplied at create time, kept here so the tagging operations report
+    /// the tags the monitor was created with.
+    pub resource_tags: Vec<ResourceTag>,
+}
+
+impl AnomalyMonitorRecord {
+    /// The `AnomalyMonitor` structure the read operations answer with.
+    pub fn to_anomaly_monitor(&self) -> AnomalyMonitor {
+        AnomalyMonitor {
+            monitor_arn: Some(self.arn.clone()),
+            monitor_name: self.monitor_name.clone(),
+            creation_date: Some(self.creation_date.clone()),
+            last_updated_date: Some(self.last_updated_date.clone()),
+            last_evaluated_date: self.last_evaluated_date.clone(),
+            monitor_type: self.monitor_type.clone(),
+            monitor_dimension: self.monitor_dimension.clone(),
+            monitor_specification: self.monitor_specification.clone(),
+            // "The value for evaluated dimensions": how many dimension values the monitor
+            // has evaluated. Nothing here evaluates cost data, so no dimension value has
+            // been evaluated and the count is the member's own default of zero rather than
+            // a number derived from the request.
+            dimensional_value_count: 0,
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-costexplorer-awsinsightsindexservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCostexplorerAwsinsightsindexserviceState {
@@ -482,9 +699,18 @@ pub struct ComAmazonawsCostexplorerAwsinsightsindexserviceState {
     /// [`MAX_ENDED_COST_CATEGORIES`] ended ones are retained, so the store cannot grow
     /// without limit however many create/delete cycles a caller runs.
     pub cost_categories: BTreeMap<String, CostCategoryDefinition>,
-    /// How many definitions this registry has minted, so the next id is distinct from
-    /// every previous one.
-    pub definitions_minted: u64,
+    /// Every cost anomaly detection monitor this account holds, keyed by its ARN.
+    ///
+    /// A `BTreeMap` so the read side has one stable, total order to paginate over, exactly
+    /// as the cost category registry above does.
+    ///
+    /// BOUNDED at [`MAX_ANOMALY_MONITORS`] entries, refused by Create past that, so the
+    /// store cannot grow without limit however many monitors a caller creates.
+    pub anomaly_monitors: BTreeMap<String, AnomalyMonitorRecord>,
+    /// How many resource ids this service has minted — cost category definitions and
+    /// anomaly monitors share the counter, so every id it hands out is distinct from every
+    /// previous one whatever kind of resource asked for it.
+    pub resources_minted: u64,
 }
 
 /// The number of cost category definitions that may be in effect at once.
@@ -493,6 +719,15 @@ pub struct ComAmazonawsCostexplorerAwsinsightsindexserviceState {
 /// `ServiceQuotaExceededException` (HTTP 402, "You've reached the limit on the number of
 /// resources you can create") is the error Create and Update model for reaching it.
 pub const MAX_LIVE_COST_CATEGORIES: usize = 50;
+
+/// How many cost anomaly detection monitors an account may hold.
+///
+/// This service's model documents no number for it, so the bound is CHOSEN: it is what
+/// keeps the registry from growing without limit however many monitors a caller creates,
+/// and it is high enough that no ordinary use reaches it. `LimitExceededException` (HTTP
+/// 400) is the only failure `CreateAnomalyMonitor` models, so that is what a create past
+/// the bound is refused with.
+pub const MAX_ANOMALY_MONITORS: usize = 100;
 
 /// How many ENDED (tombstoned) definitions the registry retains.
 ///
@@ -523,10 +758,10 @@ impl ComAmazonawsCostexplorerAwsinsightsindexserviceState {
             .count()
     }
 
-    /// The id for the next definition this registry mints, advancing the sequence.
-    pub fn next_definition_id(&mut self) -> String {
-        self.definitions_minted = self.definitions_minted.wrapping_add(1);
-        mint_definition_id(self.definitions_minted)
+    /// The id for the next resource this service mints, advancing the shared sequence.
+    pub fn next_resource_id(&mut self) -> String {
+        self.resources_minted = self.resources_minted.wrapping_add(1);
+        mint_resource_id(self.resources_minted)
     }
 
     /// Release ended definitions the retention policy no longer keeps: first those whose
