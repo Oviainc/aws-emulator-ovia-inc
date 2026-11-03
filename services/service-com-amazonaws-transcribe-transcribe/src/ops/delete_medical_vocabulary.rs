@@ -208,12 +208,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     return Err(DeleteMedicalVocabularyErrorModeled::BadRequestException(
                         BadRequestException {
-                            message: Some(format!(
-                                "The custom medical vocabulary {name} is in the \
-                                 {vocabulary_state} state and can't be deleted. Wait \
-                                 until it is no longer being processed and try your \
-                                 request again.",
-                                name = input.vocabulary_name,
+                            // This family's own fixed sentence for that condition, from
+                            // the one home every family's refusals are worded in
+                            // (`crate::state::not_deletable_message`): it names neither
+                            // the vocabulary asked about nor its state.
+                            message: Some(crate::state::not_deletable_message(
+                                crate::state::KIND_MEDICAL_VOCABULARY,
                             )),
                         },
                     )

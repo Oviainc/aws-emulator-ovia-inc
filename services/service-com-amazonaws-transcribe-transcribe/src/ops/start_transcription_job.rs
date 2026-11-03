@@ -261,6 +261,17 @@ impl From<StartTranscriptionJobErrorModeled> for StartTranscriptionJobError {
     }
 }
 
+/// How this service refuses a start whose request says nothing about the language of
+/// its media — none of `LanguageCode`, `IdentifyLanguage` and
+/// `IdentifyMultipleLanguages`, the three members the operation documents as the ways
+/// of saying it ("you must include one of LanguageCode, IdentifyLanguage, or
+/// IdentifyMultipleLanguages in your request").
+///
+/// Entirely FIXED text: no part of it comes from the request, so neither the job name
+/// nor a member name appears in it.
+const MISSING_LANGUAGE_MESSAGE: &str = "The language code is missing. Either add a \
+     language code or turn on language identification.";
+
 /// The `StartTranscriptionJob` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -335,11 +346,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "you must include one of LanguageCode, IdentifyLanguage, or
         // IdentifyMultipleLanguages in your request. If you include more than one of
-        // these parameters, your transcription job fails."
+        // these parameters, your transcription job fails." The two halves of that rule
+        // are two different refusals: a request that names NONE of them says nothing
+        // about the language of its media, which the service refuses with its own fixed
+        // sentence, while one that names more than one asks for determinations that
+        // contradict each other.
         let language_specifiers = usize::from(input.language_code.is_some())
             + usize::from(input.identify_language == Some(true))
             + usize::from(input.identify_multiple_languages == Some(true));
-        if language_specifiers != 1 {
+        if language_specifiers == 0 {
+            return Err(bad_request(MISSING_LANGUAGE_MESSAGE));
+        }
+        if language_specifiers > 1 {
             return Err(bad_request(
                 "Your request must include exactly one of LanguageCode, IdentifyLanguage, or \
                  IdentifyMultipleLanguages. Correct your request and try again.",

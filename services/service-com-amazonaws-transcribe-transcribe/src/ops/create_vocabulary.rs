@@ -289,10 +289,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             crate::state::ContentSource::Neither => {
-                return Err(bad_request(
-                    "Your request must include either Phrases or VocabularyFileUri. Add the \
-                     terms of your custom vocabulary and try your request again.",
-                ))
+                return Err(bad_request(crate::state::missing_content_source_message(
+                    crate::state::VOCABULARY_FILE_MEMBER,
+                )))
             }
             crate::state::ContentSource::Both => {
                 return Err(bad_request(
@@ -335,8 +334,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(CreateVocabularyErrorModeled::ConflictException(
                     ConflictException {
                         // As `CreateVocabularyFilter`: the kind, not the caller's name.
-                        message: Some(crate::state::name_already_exists_message(
-                            crate::state::KIND_VOCABULARY,
+                        // Which of this service's two conflict sentences the refusal
+                        // carries depends on whether the name is claimed by a create
+                        // still being served or held by a resource that is already
+                        // there (see
+                        // [`crate::state::ComAmazonawsTranscribeTranscribeState::name_conflict_message`]).
+                        message: Some(store.name_conflict_message(
+                            crate::state::ResourceFamily::Vocabulary,
+                            &region,
+                            &input.vocabulary_name,
                         )),
                     },
                 )
@@ -417,8 +423,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the request: what is served is what was persisted.
             let content = record.phrases.clone();
             store.vocabularies.insert(&region, &name, record);
+            // This create is not finished: the file the terms are served from is
+            // written below, so until then the name is claimed by a request still
+            // being served rather than held by a resource that is simply there.
+            store.claim_name(crate::state::ResourceFamily::Vocabulary, &region, &name);
             (output, name, content)
         };
+
+        // The claim the insert recorded is owned from here on, so it is released
+        // whichever way this create ends (`crate::state::NameClaim`).
+        let claim = crate::state::NameClaim::held(
+            &state,
+            crate::state::ResourceFamily::Vocabulary,
+            &region,
+            &name,
+        );
 
         // The terms this vocabulary is built from are stored as the text file its
         // `DownloadUri` names, so a client that reads that location once the build is
@@ -433,6 +452,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &content,
         )
         .await;
+
+        // Nothing of this create is outstanding any more, so the name is now held by
+        // the vocabulary it recorded rather than claimed by a request being served.
+        drop(claim);
 
         Ok(output)
     }

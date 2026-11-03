@@ -208,11 +208,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     return Err(DeleteVocabularyErrorModeled::BadRequestException(
                         BadRequestException {
-                            message: Some(format!(
-                                "The custom vocabulary {name} is in the {vocabulary_state} \
-                                 state and can't be deleted. Wait until it is no longer \
-                                 being processed and try your request again.",
-                                name = input.vocabulary_name,
+                            // The family's own fixed sentence for that condition: it
+                            // names neither the vocabulary asked about nor the state it
+                            // is in (`crate::state::not_deletable_message`).
+                            message: Some(crate::state::not_deletable_message(
+                                crate::state::KIND_VOCABULARY,
                             )),
                         },
                     )

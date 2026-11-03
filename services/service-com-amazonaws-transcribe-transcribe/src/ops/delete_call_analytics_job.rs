@@ -195,13 +195,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // non-terminal state (such as IN PROGRESS)" (`BadRequestException`'s own
             // documentation): a job the service is still working on is not deletable.
             if !crate::state::is_terminal_job_status(&record.status) {
-                let (name, status) = (record.name.clone(), record.status.clone());
                 return Err(DeleteCallAnalyticsJobErrorModeled::BadRequestException(
                     BadRequestException {
-                        message: Some(format!(
-                            "The Call Analytics job {name} is in the {status} state and can't \
-                             be deleted. Wait until it is no longer being processed and try \
-                             your request again."
+                        // The job families' own fixed sentence for that condition
+                        // (`crate::state::not_deletable_message`): it names neither the
+                        // job asked about nor the status it is in.
+                        message: Some(crate::state::not_deletable_message(
+                            crate::state::KIND_JOB,
                         )),
                     },
                 )

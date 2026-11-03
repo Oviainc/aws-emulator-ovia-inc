@@ -274,10 +274,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             crate::state::ContentSource::Neither => {
-                return Err(bad_request(
-                    "Your request must include either Words or VocabularyFilterFileUri. Add \
-                     the words of your custom vocabulary filter and try your request again.",
-                ))
+                return Err(bad_request(crate::state::missing_content_source_message(
+                    crate::state::VOCABULARY_FILTER_FILE_MEMBER,
+                )))
             }
             crate::state::ContentSource::Both => {
                 return Err(bad_request(
@@ -320,11 +319,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(CreateVocabularyFilterErrorModeled::ConflictException(
                     ConflictException {
-                        // The service's own text names the resource KIND and does not
-                        // echo the name asked for — see
-                        // [`crate::state::name_already_exists_message`].
-                        message: Some(crate::state::name_already_exists_message(
-                            crate::state::KIND_VOCABULARY_FILTER,
+                        // The service's own texts name the resource KIND and do not
+                        // echo the name asked for; which of the two a collision
+                        // carries depends on whether the name is claimed by a create
+                        // still being served — see
+                        // [`crate::state::ComAmazonawsTranscribeTranscribeState::name_conflict_message`].
+                        message: Some(store.name_conflict_message(
+                            crate::state::ResourceFamily::VocabularyFilter,
+                            &region,
+                            &input.vocabulary_filter_name,
                         )),
                     },
                 )
@@ -395,8 +398,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the request: what is served is what was persisted.
             let content = record.words.clone();
             store.vocabulary_filters.insert(&region, &name, record);
+            // This create is not finished: the file the words are served from is
+            // written below, so until then the name is claimed by a request still
+            // being served rather than held by a resource that is simply there.
+            store.claim_name(
+                crate::state::ResourceFamily::VocabularyFilter,
+                &region,
+                &name,
+            );
             (output, name, content)
         };
+
+        // The claim the insert recorded is owned from here on, so it is released
+        // whichever way this create ends (`crate::state::NameClaim`).
+        let claim = crate::state::NameClaim::held(
+            &state,
+            crate::state::ResourceFamily::VocabularyFilter,
+            &region,
+            &name,
+        );
 
         // The words this filter was built from are stored as the text file its
         // `DownloadUri` names, so a client that reads that location gets them back
@@ -411,6 +431,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &content,
         )
         .await;
+
+        // Nothing of this create is outstanding any more, so the name is now held by
+        // the filter it recorded rather than claimed by a request being served.
+        drop(claim);
 
         Ok(output)
     }

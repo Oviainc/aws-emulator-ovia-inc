@@ -278,16 +278,17 @@ async fn a_finished_medical_job_is_deleted_and_one_still_being_processed_is_refu
     }
 
     // Every row is IN_PROGRESS from the moment it is started — a non-terminal status —
-    // so a delete of it is refused rather than performed, and the refusal names the
-    // state the job is in.
+    // so a delete of it is refused rather than performed, with the job families' own
+    // fixed sentence for that condition (which carries no request or state value).
     for (case, request) in &rows {
         let name = job_name(request);
         let refused = delete(&transcribe, &name).await;
         refused.refused(case, CLIENT_ERROR_STATUS, ABSENT_CODE);
         let message = refused.error_message(case);
-        assert!(
-            message.contains(RUNNING_STATUS),
-            "case {case:?}: the refusal must name the state the job is in, got {message:?}"
+        assert_eq!(
+            message, "The job couldn't be deleted. Make sure it exists and isn't pending.",
+            "case {case:?}: expected the job family's non-terminal delete refusal, got \
+             {message:?}"
         );
 
         // The refusal left the record exactly where it was.

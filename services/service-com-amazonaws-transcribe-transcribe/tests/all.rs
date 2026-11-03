@@ -119,6 +119,8 @@ mod medical_vocabulary_delete;
 mod medical_vocabulary_updates;
 #[path = "all/queued_jobs_hold_no_concurrency_slot.rs"]
 mod queued_jobs_hold_no_concurrency_slot;
+#[path = "all/refusal_sentences.rs"]
+mod refusal_sentences;
 #[path = "all/regional_resource_scoping.rs"]
 mod regional_resource_scoping;
 #[path = "all/reserved_tag_keys.rs"]

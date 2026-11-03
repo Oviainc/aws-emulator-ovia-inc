@@ -253,10 +253,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             crate::state::ContentSource::Neither => {
-                return Err(bad_request(
-                    "Your request must include either Phrases or VocabularyFileUri. Add the \
-                     terms of your custom vocabulary and try your request again.",
-                ))
+                return Err(bad_request(crate::state::missing_content_source_message(
+                    crate::state::VOCABULARY_FILE_MEMBER,
+                )))
             }
             crate::state::ContentSource::Both => {
                 return Err(bad_request(

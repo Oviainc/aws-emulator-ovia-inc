@@ -18,6 +18,11 @@
 //! reads back `COMPLETED` and is still refused deletion for a status it had left (or
 //! the reverse).
 //!
+//! The refusals themselves carry no status — this service words both of them as fixed
+//! sentences — so what the two operations are held to agreeing on here is WHICH answer
+//! each gives: while the read reports a non-terminal status the delete refuses, and
+//! once the read reports the terminal one the same delete goes through.
+//!
 //! Asserted over a table whose rows vary along what the rule generalises over: what
 //! the request asked for (an explicit language against automatic identification, where
 //! the output goes, which transcripts the job was asked to produce, whether it deferred
@@ -163,26 +168,15 @@ impl Row {
     }
 }
 
-/// The status a `DeleteTranscriptionJob` refusal names, out of the sentence the
-/// service words it with ("The transcription job <name> is in the <status> state and
-/// can't be deleted. …").
-fn refused_status(case: &str, message: &str) -> String {
-    let after = message
-        .split_once(" is in the ")
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: the refusal must name the state it refused for, got {message:?}")
-        })
-        .1;
-    after
-        .split_once(" state")
-        .unwrap_or_else(|| panic!("case {case:?}: unexpected refusal wording {message:?}"))
-        .0
-        .to_string()
-}
+/// How this service refuses a delete of a job it has not finished working on: the job
+/// families' own fixed sentence for that condition, which names neither the job asked
+/// about nor the status it is in.
+const NOT_DELETABLE: &str = "The job couldn't be deleted. Make sure it exists and isn't \
+     pending.";
 
-/// A job still being processed is refused deletion for the very status the read
-/// operation reports for it: the two go through one lookup, so neither can see a
-/// status the other has already left behind.
+/// A job still being processed is refused deletion while the read operation reports it
+/// as such: the two go through one lookup, so neither can see a status the other has
+/// already left behind.
 #[tokio::test]
 async fn a_read_and_a_delete_see_the_same_non_terminal_status() {
     for row in rows() {
@@ -200,10 +194,10 @@ async fn a_read_and_a_delete_see_the_same_non_terminal_status() {
             row.case, row.first_status
         );
 
-        // The delete is refused, and the status it refused for is bracketed by the
-        // reads either side of it: the clock only moves a job forward, so a delete
-        // that had NOT materialised what the clock owed would name a status older
-        // than the earlier read's.
+        // The delete is refused for the non-terminal status the reads either side of it
+        // bracket: the clock only moves a job forward, so a delete that had NOT
+        // materialised what the clock owed would be refusing for a status older than the
+        // earlier read's.
         let refusal = transcribe
             .call_in_region(
                 "DeleteTranscriptionJob",
@@ -213,23 +207,22 @@ async fn a_read_and_a_delete_see_the_same_non_terminal_status() {
             .await;
         refusal.refused(row.case, 400, "BadRequestException");
         let message = refusal.error_message(row.case);
-        assert!(
-            message.contains(row.name),
-            "case {:?}: the refusal must name the job it refused, got {message:?}",
+        assert_eq!(
+            message, NOT_DELETABLE,
+            "case {:?}: expected the job family's non-terminal delete refusal, got \
+             {message:?}",
             row.case
         );
-        let refused = refused_status(row.case, &message);
+        assert!(
+            !message.contains(row.name),
+            "case {:?}: the refusal must not echo the job name, got {message:?}",
+            row.case
+        );
         let after = row.reported_status(&transcribe, row.case).await;
         assert!(
-            rank(row.case, &before) <= rank(row.case, &refused)
-                && rank(row.case, &refused) <= rank(row.case, &after),
-            "case {:?}: the delete must refuse for the status the reads either side of \
-             it saw, got {before:?} then {refused:?} then {after:?}",
-            row.case
-        );
-        assert_ne!(
-            refused, "COMPLETED",
-            "case {:?}: a delete refusal is for a non-terminal status, got {refused:?}",
+            rank(row.case, &before) <= rank(row.case, &after),
+            "case {:?}: the clock only moves a job forward, got {before:?} then \
+             {after:?}",
             row.case
         );
     }

@@ -443,13 +443,16 @@ async fn a_medical_scribe_job_the_service_is_still_working_on_is_not_deletable()
             .ok(case);
 
         // Straight after the start the job is IN_PROGRESS — a non-terminal status, so
-        // the delete is refused and the record survives it.
+        // the delete is refused and the record survives it. The refusal is the job
+        // families' own fixed sentence for that condition, which carries neither the
+        // name asked about nor the status the job is in.
         let refused = delete(&transcribe, &name).await;
         refused.refused(case, 400, "BadRequestException");
         let message = refused.error_message(case);
-        assert!(
-            message.contains("IN_PROGRESS"),
-            "case {case:?}: the refusal must name the state it refused for, got {message:?}"
+        assert_eq!(
+            message, "The job couldn't be deleted. Make sure it exists and isn't pending.",
+            "case {case:?}: expected the job family's non-terminal delete refusal, got \
+             {message:?}"
         );
 
         let survived = get(&transcribe, &name).await;

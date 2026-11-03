@@ -277,9 +277,10 @@ async fn a_start_the_object_store_answers_for_is_listed_read_and_deletable() {
         "case {case:?}: the stored job must read back under its name, got {job:?}"
     );
 
-    // A delete while the service is still working on it reports its STATE: a different
-    // fact from absence, about a job that does exist.
-    let status = job["TranscriptionJobStatus"].as_str().unwrap_or_default();
+    // A delete while the service is still working on it is refused with the job
+    // families' own fixed sentence for that condition: a different fact from absence,
+    // about a job that does exist, and one the sentence states without naming the job
+    // or the status it is in.
     let refused = call(
         &emulator,
         "DeleteTranscriptionJob",
@@ -289,13 +290,9 @@ async fn a_start_the_object_store_answers_for_is_listed_read_and_deletable() {
     refused.refused(case, 400, "BadRequestException");
     let message = refused.error_message(case);
     assert_eq!(
-        message,
-        format!(
-            "The transcription job {name} is in the {status} state and can't be deleted. \
-             Wait until it is no longer being processed and try your request again."
-        ),
-        "case {case:?}: expected the delete of a job still being processed to report its \
-         state, got {message:?}"
+        message, "The job couldn't be deleted. Make sure it exists and isn't pending.",
+        "case {case:?}: expected the job family's non-terminal delete refusal, got \
+         {message:?}"
     );
 
     // Once the job has settled, the delete succeeds — and then the name names nothing

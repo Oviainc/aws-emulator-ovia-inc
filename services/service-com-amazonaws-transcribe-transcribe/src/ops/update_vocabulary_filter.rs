@@ -239,10 +239,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             crate::state::ContentSource::Neither => {
-                return Err(bad_request(
-                    "Your request must include either Words or VocabularyFilterFileUri. Add \
-                     the words of your custom vocabulary filter and try your request again.",
-                ))
+                return Err(bad_request(crate::state::missing_content_source_message(
+                    crate::state::VOCABULARY_FILTER_FILE_MEMBER,
+                )))
             }
             crate::state::ContentSource::Both => {
                 return Err(bad_request(

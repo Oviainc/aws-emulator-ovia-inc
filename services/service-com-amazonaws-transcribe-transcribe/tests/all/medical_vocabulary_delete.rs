@@ -282,7 +282,8 @@ async fn deleting_a_record_whose_build_is_still_pending_is_refused() {
         );
 
         // Straight after the create the build is still owed, so the record is
-        // `PENDING` and the delete is refused for its state.
+        // `PENDING` and the delete is refused with this family's own fixed sentence for
+        // that condition, which names neither the vocabulary nor the state it is in.
         let reply = transcribe
             .call(
                 "DeleteMedicalVocabulary",
@@ -291,12 +292,14 @@ async fn deleting_a_record_whose_build_is_still_pending_is_refused() {
             .await;
         reply.refused(case, 400, "BadRequestException");
         let message = reply.error_message(case);
-        for expected in [row.name.as_str(), "PENDING", "can't be deleted"] {
-            assert!(
-                message.contains(expected),
-                "case {case:?}: the refusal must name {expected:?}, got {message:?}"
-            );
-        }
+        assert_eq!(
+            message,
+            "The medical vocabulary that you\u{2019}re trying to delete isn't in the \
+             READY or FAILED state. Try your request again when the medical vocabulary \
+             state is READY or FAILED.",
+            "case {case:?}: expected this family's non-terminal delete refusal, got \
+             {message:?}"
+        );
 
         // Refused, so nothing was removed: the record is still readable and still
         // listed.

@@ -150,7 +150,7 @@
 //! modelled `FAILED` state with that `FailureReason`. With no Amazon S3 mounted to ask,
 //! nothing is known about the media and nothing is refused or failed on an assumption.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -1158,6 +1158,49 @@ pub fn name_already_exists_message(kind: &str) -> String {
     format!("The requested {kind} name already exists. Use a different {kind} name.")
 }
 
+/// How this service words "that name is already being claimed by a create this
+/// emulator has not finished serving" — a collision with another CREATE rather than
+/// with a resource that is already there.
+///
+/// The service words the two collisions differently: a create that loses the name to a
+/// request still in flight gets this service's GENERIC sentence, the one its job
+/// families carry, whichever family the create belongs to, while a create that
+/// collides with a resource whose own create has already been answered gets that
+/// family's own sentence ([`name_already_exists_message`]). Which of the two a refusal
+/// carries is therefore decided by whether the claim on the name is still open
+/// ([`ComAmazonawsTranscribeTranscribeState::name_conflict_message`]), never by the
+/// family alone.
+///
+/// Entirely FIXED text: no part of it comes from the request.
+pub fn contended_name_claim_message() -> String {
+    name_already_exists_message(KIND_JOB)
+}
+
+/// How this service refuses a DELETE of a resource of `kind` whose processing has not
+/// finished — "This can occur when the entity you're trying to delete doesn't exist or
+/// if it's in a non-terminal state (such as IN PROGRESS)" (`BadRequestException`'s own
+/// documentation).
+///
+/// Entirely FIXED text, like the other refusals of this service: neither the name the
+/// caller asked about nor the state the resource is in appears in it. The wording is a
+/// property of the FAMILY, as it is for [`not_found_message`]: the vocabulary families
+/// name the two states a build has finished in — the terminal values of the
+/// `VocabularyState` enum ([`is_terminal_vocabulary_state`]), which both of those
+/// families' records carry — while the job families say only that the job is not
+/// finished.
+pub fn not_deletable_message(kind: &str) -> String {
+    if kind == KIND_VOCABULARY || kind == KIND_MEDICAL_VOCABULARY {
+        return format!(
+            "The {kind} that you\u{2019}re trying to delete isn't in the {ready} or \
+             {failed} state. Try your request again when the {kind} state is {ready} \
+             or {failed}.",
+            ready = VOCABULARY_STATE_READY,
+            failed = VOCABULARY_STATE_FAILED,
+        );
+    }
+    format!("The {kind} couldn't be deleted. Make sure it exists and isn't pending.")
+}
+
 /// How this service refuses a `Settings` toggle and the value that qualifies it when
 /// only one of the two is in the request, or `None` when the pair holds together.
 ///
@@ -1745,6 +1788,51 @@ impl SequencedFamily {
     }
 }
 
+/// The open claim a create holds on the name it recorded, released however that create
+/// ends.
+///
+/// A create takes the claim under the same lock as the insert
+/// ([`ComAmazonawsTranscribeTranscribeState::claim_name`]) and hands the guard the rest
+/// of its own work: dropping it releases the claim, so a create whose future is
+/// abandoned before it reaches its answer — a caller that went away mid-request — leaves
+/// no claim behind, and the store holds at most one entry per create actually in
+/// flight.
+pub struct NameClaim {
+    state: ::engine::ServiceState<ComAmazonawsTranscribeTranscribeState>,
+    family: ResourceFamily,
+    region: String,
+    name: String,
+}
+
+impl NameClaim {
+    /// Take ownership of the claim [`ComAmazonawsTranscribeTranscribeState::claim_name`]
+    /// has just recorded for `name` of `family` in `region`.
+    ///
+    /// Called with the store lock RELEASED and with no await in between, so the claim
+    /// is never left unowned.
+    pub fn held(
+        state: &::engine::ServiceState<ComAmazonawsTranscribeTranscribeState>,
+        family: ResourceFamily,
+        region: &str,
+        name: &str,
+    ) -> Self {
+        Self {
+            state: state.clone(),
+            family,
+            region: region.to_string(),
+            name: name.to_string(),
+        }
+    }
+}
+
+impl Drop for NameClaim {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .release_name_claim(self.family, &self.region, &self.name);
+    }
+}
+
 /// Per-service state for com-amazonaws-transcribe-transcribe. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsTranscribeTranscribeState {
@@ -1800,6 +1888,20 @@ pub struct ComAmazonawsTranscribeTranscribeState {
     /// established in the same clock tick, and the sequences one family mints are
     /// exactly `1..=`[`Self::minted_sequences`] of that family.
     next_sequence: BTreeMap<SequencedFamily, u64>,
+    /// The name claims of creates this emulator has not FINISHED serving, keyed by the
+    /// claiming family's ARN `<type>` segment, the Region and the name.
+    ///
+    /// A create that claims a free name is not done once the record is in the store: it
+    /// still has the work the resource it just recorded needs before the create is
+    /// answered (the text file a custom vocabulary's reported download location
+    /// serves). Another create of the same name arriving inside that window collides
+    /// with a request still being served rather than with a resource that is already
+    /// there, and this service words those two refusals differently
+    /// ([`contended_name_claim_message`] against [`name_already_exists_message`]), so
+    /// the open claims are held here for exactly as long as the create holding one is
+    /// still being served — [`Self::claim_name`] on the insert, released by the
+    /// [`NameClaim`] guard that create then owns.
+    open_name_claims: BTreeSet<(&'static str, String, String)>,
 }
 
 impl ComAmazonawsTranscribeTranscribeState {
@@ -1826,6 +1928,53 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// record cannot invalidate a cursor already handed out.
     pub fn minted_sequences(&self, family: SequencedFamily) -> u64 {
         self.next_sequence.get(&family).copied().unwrap_or_default()
+    }
+
+    /// Record that the create being served is claiming `name` for `family` in `region`,
+    /// and is not finished yet.
+    ///
+    /// Called under the same lock as the insert of the record itself, so the claim and
+    /// the record become visible to another caller together. The create then owns a
+    /// [`NameClaim`] that releases it; see [`Self::open_name_claims`] for why the window
+    /// is held at all.
+    pub fn claim_name(&mut self, family: ResourceFamily, region: &str, name: &str) {
+        self.open_name_claims.insert((
+            family.resource_type(),
+            region.to_string(),
+            name.to_string(),
+        ));
+    }
+
+    /// Record that the create which claimed `name` for `family` in `region` has
+    /// finished: the name is now held by a resource that is simply there.
+    pub fn release_name_claim(&mut self, family: ResourceFamily, region: &str, name: &str) {
+        self.open_name_claims.remove(&(
+            family.resource_type(),
+            region.to_string(),
+            name.to_string(),
+        ));
+    }
+
+    /// How a create that finds `name` of `family` already taken in `region` is refused:
+    /// the service's generic sentence while the claim on that name belongs to a create
+    /// still being served, and the family's own sentence once that create has finished.
+    ///
+    /// Read under the lock that found the name taken, so the refusal a racing create
+    /// gets and the state that decided it are one observation.
+    pub fn name_conflict_message(
+        &self,
+        family: ResourceFamily,
+        region: &str,
+        name: &str,
+    ) -> String {
+        if self.open_name_claims.contains(&(
+            family.resource_type(),
+            region.to_string(),
+            name.to_string(),
+        )) {
+            return contended_name_claim_message();
+        }
+        name_already_exists_message(family.kind())
     }
 
     /// The transcription job named `name`, through the shared lookup ([`record_mut`]),
@@ -3813,6 +3962,36 @@ pub enum ContentSource<'a> {
     /// Both members carry content, which the two operations document as an error.
     Both,
 }
+
+/// How this service words "your request says nowhere the terms come from", for the
+/// operation whose file member is `file_member` ([`VOCABULARY_FILE_MEMBER`] or
+/// [`VOCABULARY_FILTER_FILE_MEMBER`]).
+///
+/// Entirely FIXED text per member pair: no part of either sentence comes from the
+/// request, so neither carries the name the caller asked for. The two pairs word the
+/// condition differently, so the text is looked up per pair here rather than composed
+/// from the member names at each call site — the same reason [`not_found_message`]
+/// looks its text up per family. Single-homed because the create and the update of
+/// each family publish the SAME pair of alternatives and refuse a request that names
+/// neither of them alike.
+pub fn missing_content_source_message(file_member: &str) -> &'static str {
+    match file_member {
+        VOCABULARY_FILTER_FILE_MEMBER => FILTER_WORDS_REQUIRED_MESSAGE,
+        _ => VOCABULARY_TERMS_REQUIRED_MESSAGE,
+    }
+}
+
+/// How this service refuses a `CreateVocabulary`/`UpdateVocabulary` naming neither
+/// `Phrases` nor `VocabularyFileUri`. See [`missing_content_source_message`].
+pub const VOCABULARY_TERMS_REQUIRED_MESSAGE: &str =
+    "Either Phrases or VocabularyFileUri field should be provided.";
+
+/// How this service refuses a `CreateVocabularyFilter`/`UpdateVocabularyFilter` naming
+/// neither `Words` nor `VocabularyFilterFileUri`. See
+/// [`missing_content_source_message`].
+pub const FILTER_WORDS_REQUIRED_MESSAGE: &str = "You need to provide either the Words \
+     field or the VocabularyFilterFileUri field. Provide one of the fields and try \
+     your request again.";
 
 /// Which of the two alternatives a request chose.
 ///
