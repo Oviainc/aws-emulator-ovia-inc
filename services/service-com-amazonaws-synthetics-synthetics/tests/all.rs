@@ -21,6 +21,8 @@ mod canary_lifecycle;
 mod client_error_message_wording;
 #[path = "all/group_deletion.rs"]
 mod group_deletion;
+#[path = "all/group_disassociation.rs"]
+mod group_disassociation;
 #[path = "all/group_lifecycle.rs"]
 mod group_lifecycle;
 #[path = "all/group_membership.rs"]
