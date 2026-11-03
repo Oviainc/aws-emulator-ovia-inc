@@ -42,6 +42,15 @@ pub struct ValidationException {
     pub message: Option<String>,
 }
 
+// Reached by every operation that names a notification rule by ARN: the resource-based
+// authorization check each of them applies answers with this shape, so it lives here
+// rather than beside one operation.
+#[smithy_macros::smithy(shape = "com.amazonaws.codestarnotifications#AccessDeniedException")]
+#[derive(Debug, Clone, Default)]
+pub struct AccessDeniedException {
+    pub message: Option<String>,
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.codestarnotifications#EventTypeSummary")]
 #[derive(Debug, Clone, Default)]
 pub struct EventTypeSummary {

@@ -60,9 +60,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codestarnotifications-c
 // here — hence the `UnsubscribeError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codestarnotifications#Unsubscribe")]
+//
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models the
+// shape (`@httpError 403`, "you do not have sufficient permissions") and it is the answer
+// the resource-based authorization check gives an `Arn` that names no notification rule,
+// which every operation addressing a rule by ARN applies before it looks one up.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codestarnotifications#Unsubscribe",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum UnsubscribeErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ValidationException(ValidationException),
 }
 
@@ -86,6 +95,15 @@ impl From<UnsubscribeErrorModeled> for UnsubscribeError {
 fn invalid(message: impl Into<String>) -> UnsubscribeError {
     UnsubscribeErrorModeled::ValidationException(ValidationException {
         message: Some(message.into()),
+    })
+    .into()
+}
+
+/// HTTP 403 `AccessDeniedException`: the caller is not authorized for the resource the
+/// request named, stated in this service's one text for the class.
+fn not_authorized(arn: &str) -> UnsubscribeError {
+    UnsubscribeErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(crate::state::not_authorized_for(arn)),
     })
     .into()
 }
@@ -129,6 +147,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state as st;
 
         let region = st::request_region(ctx.parts());
+
+        // Resource authorization comes FIRST, before any lookup: an `Arn` outside the
+        // notification-rule form names no resource of this service, so nothing can
+        // authorize the caller for it.
+        if !st::is_notification_rule_arn(&input.arn) {
+            return Err(not_authorized(&input.arn));
+        }
 
         let Some(state) = st::service_state(&*self.engine) else {
             // This service's store is the shared `InMemoryEngine`. Mounted on any other

@@ -165,9 +165,9 @@ fn target_json((target_type, address): &(&str, &str)) -> Value {
 }
 
 /// The table every create/describe assertion runs over. The rows differ in detail type,
-/// status (absent / both values), event-type count and whether the id is in the seeded
-/// catalog, target count (including the modelled minimum of zero) and type, and tag
-/// count — the dimensions the create-then-read rule generalises over.
+/// status (absent / both values), event-type count and owning service, target count
+/// (including the modelled minimum of zero) and type, and tag count — the dimensions the
+/// create-then-read rule generalises over.
 const RULE_CASES: &[RuleCase] = &[
     RuleCase {
         label: "codecommit, FULL, default status, one SNS target, one tag",
@@ -207,20 +207,19 @@ const RULE_CASES: &[RuleCase] = &[
         tags: &[("Team", "platform"), ("env", "prod")],
     },
     RuleCase {
-        label: "an event type id the seeded catalog does not hold",
-        name: "future-events",
+        label: "codedeploy, BASIC, default status, one SNS target, no tags",
+        name: "deploy-events",
         resource: "arn:aws:codedeploy:us-east-1:123456789012:application:app",
         detail_type: "BASIC",
         status: None,
-        event_type_ids: &["codedeploy-application-deployment-not-in-the-catalog"],
+        event_type_ids: &["codedeploy-application-deployment-succeeded"],
         targets: &[("SNS", "arn:aws:sns:us-east-1:123456789012:deploys")],
         tags: &[],
     },
 ];
 
-/// A rule that was created is readable, member for member, from the store — and a
-/// catalogued event type id resolves to its service and resource type while an
-/// uncatalogued one reports nothing but the id the rule stores.
+/// A rule that was created is readable, member for member, from the store — and every
+/// event type id it carries resolves to the catalog's own service and resource type.
 #[tokio::test]
 async fn a_created_rule_describes_exactly_what_was_created() {
     let emulator = Emulator::new();
@@ -363,23 +362,18 @@ async fn a_created_rule_describes_exactly_what_was_created() {
             let catalogued = codestar::state::EVENT_TYPE_CATALOG
                 .iter()
                 .any(|entry| entry.event_type_id == *id);
-            if catalogued {
-                assert!(
-                    !string(summary, "ServiceName").is_empty()
-                        && !string(summary, "ResourceType").is_empty()
-                        && !string(summary, "EventTypeName").is_empty(),
-                    "case {:?}: a catalogued event type resolves every member, got {summary}",
-                    case.label
-                );
-            } else {
-                assert!(
-                    summary.get("ServiceName").is_none()
-                        && summary.get("ResourceType").is_none()
-                        && summary.get("EventTypeName").is_none(),
-                    "case {:?}: an uncatalogued event type reports nothing but its id, got {summary}",
-                    case.label
-                );
-            }
+            assert!(
+                catalogued,
+                "case {:?}: a stored event type id is one the service publishes, got {id:?}",
+                case.label
+            );
+            assert!(
+                !string(summary, "ServiceName").is_empty()
+                    && !string(summary, "ResourceType").is_empty()
+                    && !string(summary, "EventTypeName").is_empty(),
+                "case {:?}: a catalogued event type resolves every member, got {summary}",
+                case.label
+            );
         }
     }
 }

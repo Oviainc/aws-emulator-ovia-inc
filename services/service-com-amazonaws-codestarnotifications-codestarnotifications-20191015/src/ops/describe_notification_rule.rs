@@ -65,6 +65,9 @@
 //! * `ResourceNotFoundException` (HTTP 404) — CodeStar Notifications can't find a resource
 //!   that matches the provided ARN.
 //! * `ValidationException` (HTTP 400) — One or more parameter values are not valid.
+//! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below):
+//!   the answer the resource-based authorization check gives an `Arn` that names no
+//!   notification rule of this service.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -80,9 +83,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codestarnotifications-c
 // here — hence the `DescribeNotificationRuleError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codestarnotifications#DescribeNotificationRule")]
+//
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models the
+// shape (`@httpError 403`, "you do not have sufficient permissions") and it is the answer
+// the resource-based authorization check gives an `Arn` that names no notification rule,
+// which this operation applies before any lookup — deliberately distinct from the 404 it
+// answers for a well-formed ARN no rule holds.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codestarnotifications#DescribeNotificationRule",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum DescribeNotificationRuleErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
@@ -100,6 +113,15 @@ impl From<DescribeNotificationRuleErrorModeled> for DescribeNotificationRuleErro
     fn from(modeled: DescribeNotificationRuleErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// HTTP 403 `AccessDeniedException`: the caller is not authorized for the resource the
+/// request named, stated in this service's one text for the class.
+fn not_authorized(arn: &str) -> DescribeNotificationRuleError {
+    DescribeNotificationRuleErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(crate::state::not_authorized_for(arn)),
+    })
+    .into()
 }
 
 /// The `DescribeNotificationRule` operation.
@@ -141,6 +163,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state as st;
 
         let region = st::request_region(ctx.parts());
+
+        // Resource authorization comes FIRST, before any lookup: an `Arn` outside the
+        // notification-rule form names no resource of this service, so nothing can
+        // authorize the caller for it. A well-formed ARN no rule holds is the 404 below.
+        if !st::is_notification_rule_arn(&input.arn) {
+            return Err(not_authorized(&input.arn));
+        }
 
         let Some(state) = st::service_state(&*self.engine) else {
             // This service's store is the shared `InMemoryEngine`. Mounted on any other

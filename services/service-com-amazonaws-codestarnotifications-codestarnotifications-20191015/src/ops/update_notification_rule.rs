@@ -68,9 +68,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codestarnotifications-c
 // here — hence the `UpdateNotificationRuleError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codestarnotifications#UpdateNotificationRule")]
+//
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models the
+// shape (`@httpError 403`, "you do not have sufficient permissions") and it is the answer
+// the resource-based authorization check gives an `Arn` that names no notification rule,
+// which every operation addressing a rule by ARN applies before it looks one up.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codestarnotifications#UpdateNotificationRule",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum UpdateNotificationRuleErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ConfigurationException(ConfigurationException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
@@ -89,6 +98,15 @@ impl From<UpdateNotificationRuleErrorModeled> for UpdateNotificationRuleError {
     fn from(modeled: UpdateNotificationRuleErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// HTTP 403 `AccessDeniedException`: the caller is not authorized for the resource the
+/// request named, stated in this service's one text for the class.
+fn not_authorized(arn: &str) -> UpdateNotificationRuleError {
+    UpdateNotificationRuleErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(crate::state::not_authorized_for(arn)),
+    })
+    .into()
 }
 
 /// HTTP 400 `ValidationException`: "One or more parameter values are not valid."
@@ -148,6 +166,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = st::request_region(ctx.parts());
 
+        // Resource authorization comes FIRST, before any lookup: an `Arn` outside the
+        // notification-rule form names no resource of this service, so nothing can
+        // authorize the caller for it.
+        if !st::is_notification_rule_arn(&input.arn) {
+            return Err(not_authorized(&input.arn));
+        }
+
+        if let Some(event_type_ids) = input.event_type_ids.as_deref() {
+            // The same catalog the create path resolves against: a rule cannot be
+            // re-pointed at an event the service does not publish either.
+            if let Some(reason) = st::event_type_ids_violation(event_type_ids) {
+                return Err(invalid(reason));
+            }
+        }
         if let Some(detail_type) = input.detail_type.as_deref() {
             if let Some(reason) = st::enum_violation("DetailType", detail_type, DETAIL_TYPE_VALUES)
             {

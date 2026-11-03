@@ -30,11 +30,8 @@ pub struct CreateNotificationRuleOutput {
     pub arn: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codestarnotifications#AccessDeniedException")]
-#[derive(Debug, Clone, Default)]
-pub struct AccessDeniedException {
-    pub message: Option<String>,
-}
+// `AccessDeniedException` is declared in `shared_types`: more than one operation of this
+// service answers with it.
 
 #[smithy_macros::smithy(shape = "com.amazonaws.codestarnotifications#ResourceAlreadyExistsException")]
 #[derive(Debug, Clone, Default)]

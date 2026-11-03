@@ -378,11 +378,137 @@ pub fn notification_rule_arn(region: &str, id: &str) -> String {
 /// with ([`notification_rule_arn`] is what writes that segment).
 ///
 /// A value carrying no such segment has no id inside it, so it names the rule by itself:
-/// the member is modelled `NotificationRuleArn`, so a request that reaches a handler at
-/// all matched that shape's pattern, and nothing is parsed out of a value that did not.
+/// every handler answers a value outside the rule-ARN form before it looks a rule up (see
+/// [`is_notification_rule_arn`]), so nothing is parsed out of a value that did not.
 pub fn rule_id_of_arn(arn: &str) -> &str {
     arn.split_once("notificationrule/")
         .map_or(arn, |(_, id)| id)
+}
+
+/// Whether `arn` names a notification rule of THIS service — the form
+/// `NotificationRuleArn` describes
+/// (`^arn:aws[^:\s]*:codestar-notifications:[^:\s]+:\d{12}:notificationrule\/(.*\S)?$`):
+/// the `arn` prefix, an `aws` partition, this service's namespace, a non-empty region, a
+/// twelve-digit account, and a resource opening on `notificationrule/`.
+///
+/// This is the form the resource-based authorization check every operation that names a
+/// rule by ARN applies FIRST: a value outside it identifies no rule of this service, so
+/// no policy can grant the caller access to it. The six fields are compared one by one
+/// rather than matched with an expression engine — the shape is a fixed field list, not a
+/// language.
+pub fn is_notification_rule_arn(arn: &str) -> bool {
+    // The resource segment may itself contain colons, so only the five fields before it
+    // are split off; each of those therefore holds no colon by construction.
+    let mut segments = arn.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some("codestar-notifications"),
+        Some(region),
+        Some(account),
+        Some(resource),
+    ) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    )
+    else {
+        return false;
+    };
+    let unbroken = |field: &str| !field.is_empty() && !field.contains(char::is_whitespace);
+    if !partition
+        .strip_prefix("aws")
+        .is_some_and(|rest| !rest.contains(char::is_whitespace))
+    {
+        return false;
+    }
+    if !unbroken(region) {
+        return false;
+    }
+    if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Some(id) = resource.strip_prefix("notificationrule/") else {
+        return false;
+    };
+    // `(.*\S)?`: the id is either empty or ends on a non-whitespace character, and `.`
+    // spans no line break.
+    id.is_empty() || (!id.contains('\n') && id.ends_with(|c: char| !c.is_whitespace()))
+}
+
+/// How this service states that the caller is not authorized for the resource a request
+/// named: fixed text either side of the ARN exactly as submitted.
+///
+/// The only variable part is the submitted value, which is what makes the message
+/// actionable — a caller reading it learns which resource it named — and the one thing
+/// this service knows about a value that identifies no resource of its own.
+pub fn not_authorized_for(arn: &str) -> String {
+    format!(
+        "You don't have sufficient permissions to perform operations on the following \
+         resource: {arn}. For more information, see the notifications feature \
+         documentation in the user guide for the Developer Tools console."
+    )
+}
+
+/// How the TAGGING paths state that no resource matches the ARN a request named: the
+/// whole submitted ARN, which is how those operations address the resource.
+pub fn no_resource_with_arn(arn: &str) -> String {
+    format!(
+        "The following resource ARN was not found: {arn}. Make sure that the resource ARN \
+         is correct and then try again."
+    )
+}
+
+/// The ARN service namespaces of the resources a notification rule can be created for.
+///
+/// The service — not the model — restricts the type: `NotificationRuleResource`'s pattern
+/// (`smithy_query(query="shape",shape="NotificationRuleResource")`) accepts ANY service's
+/// ARN, while the member documents "Supported resources include pipelines in
+/// CodePipeline, repositories in CodeCommit, and build projects in CodeBuild" and the
+/// refusal below names the four services. These are those four, as an ARN spells them.
+pub const SUPPORTED_RESOURCE_SERVICES: &[&str] =
+    &["codebuild", "codecommit", "codedeploy", "codepipeline"];
+
+/// The text this service refuses a `Resource` of an unsupported type with: ONE constant
+/// for the class, interpolating nothing — it states which resource types are valid and
+/// nothing of the request.
+pub const UNSUPPORTED_RESOURCE_TYPE: &str =
+    "The resource ARN is not valid. The ARN must be a supported AWS CodeStar \
+     Notifications resource type. Valid resource types include AWS CodeBuild, AWS \
+     CodeCommit, AWS CodeDeploy and AWS CodePipeline resources.";
+
+/// Whether `resource` names a resource of a type this service supports: its ARN's service
+/// segment is one of [`SUPPORTED_RESOURCE_SERVICES`].
+pub fn resource_type_is_supported(resource: &str) -> bool {
+    resource
+        .split(':')
+        .nth(2)
+        .is_some_and(|service| SUPPORTED_RESOURCE_SERVICES.contains(&service))
+}
+
+/// Refuse an `EventTypeIds` list holding an id the service does not publish, returning
+/// the reason each handler words in its own modelled error.
+///
+/// Every entry resolves through [`EVENT_TYPE_CATALOG`] — the same catalog
+/// `ListEventTypes` reports — so a rule can only ever be wired to an event that exists.
+///
+/// The text is the service's own for the class: fixed either side of ONE slot, the first
+/// id of the submitted list that did not resolve. The wording spans both paths that carry
+/// the member ("created or modified"), which is why it is stated once here.
+pub fn event_type_ids_violation(event_type_ids: &[String]) -> Option<String> {
+    let unresolvable = event_type_ids.iter().find(|id| {
+        !EVENT_TYPE_CATALOG
+            .iter()
+            .any(|entry| entry.event_type_id == id.as_str())
+    })?;
+    Some(format!(
+        "The notification rule cannot be created or modified because the following \
+         notification event type ID is not valid: {unresolvable}. For more information, \
+         see the AWS CodeStar Notifications API Reference."
+    ))
 }
 
 /// The text this service answers a rule-name conflict with: ONE constant for the class,
@@ -574,6 +700,15 @@ pub fn enum_violation(member: &str, value: &str, allowed: &[&str]) -> Option<Str
 /// (`Targets`: `@length(min: 0, max: 10)`).
 pub const MAX_TARGETS_PER_RULE: usize = 10;
 
+/// The most tags one notification rule holds at once.
+///
+/// `Tags` carries no modelled length, and tagging is the one path by which a caller can
+/// grow a stored rule without creating another resource, so this service caps it: the
+/// figure is CHOSEN to bound that growth, not to reproduce an AWS quota, and the model
+/// declares `LimitExceededException` for exactly this class ("Limits apply to accounts,
+/// notification rules, notifications, resources, and targets").
+pub const MAX_TAGS_PER_RULE: usize = 50;
+
 /// Turn the wire `Target` list into the rule's stored targets: every target must carry
 /// both of its members, and an address appears once (a repeated address is one
 /// subscription, with the type last given for it).
@@ -650,9 +785,12 @@ pub struct EventTypeCatalogEntry {
 /// (<https://docs.aws.amazon.com/codestar-notifications/latest/userguide/concepts.html#concepts-api>),
 /// whose "Event type" column is the `EventTypeName` the API reports and whose resource
 /// types are the capitalised singular nouns (`Repository`, `Project`, `Application`,
-/// `Pipeline`) `ListEventTypes` answers with. It is a subset of that list, which is why
-/// an id the catalog does not hold is still accepted and stored (see
-/// [`resolve_event_type`]).
+/// `Pipeline`) `ListEventTypes` answers with.
+///
+/// This is the ONE set of event types the service publishes: `ListEventTypes` reports it,
+/// and an `EventTypeIds` entry it does not hold names no event, so the create and update
+/// paths refuse it ([`event_type_ids_violation`]) rather than storing a rule that could
+/// never fire.
 pub const EVENT_TYPE_CATALOG: &[EventTypeCatalogEntry] = &[
     entry("codecommit-repository-comments-on-commits", "CodeCommit", "Repository", "Comments: On commits"),
     entry("codecommit-repository-comments-on-pull-requests", "CodeCommit", "Repository", "Comments: On pull requests"),
@@ -712,8 +850,9 @@ const fn entry(
 ///
 /// For a catalogued id every member is reported from the catalog entry, verbatim: the
 /// name and resource type are the service's own published values, never rendered from
-/// the id. For an id the catalog does not hold, the id — the one fact the rule stores —
-/// is returned and nothing else is invented.
+/// the id. For an id the catalog does not hold, the id — the one fact that would be
+/// known about it — is returned and nothing else is invented; the create and update paths
+/// refuse such an id ([`event_type_ids_violation`]), so no stored rule carries one.
 pub fn resolve_event_type(event_type_id: &str) -> ResolvedEventType {
     let Some(found) = EVENT_TYPE_CATALOG
         .iter()

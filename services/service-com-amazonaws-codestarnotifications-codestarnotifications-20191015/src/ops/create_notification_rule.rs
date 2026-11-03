@@ -11,6 +11,12 @@
 //! only — the request's SigV4 scope is where the ARN's region and the rule's
 //! `CreatedBy` principal come from.
 //!
+//! Two input rules the MODEL cannot express are applied here, before anything is
+//! inserted: `Resource` must name a resource of a type this service supports, and every
+//! `EventTypeIds` entry must be an event type the service publishes (see
+//! [`crate::state::SUPPORTED_RESOURCE_SERVICES`] and
+//! [`crate::state::event_type_ids_violation`]).
+//!
 //! ---
 //!
 //! # Modeled contract for `CreateNotificationRule`
@@ -197,8 +203,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(invalid(reason));
         }
+        // The resource a rule fires for must be of a type this service supports: the
+        // modelled pattern accepts any service's ARN, so the type restriction is the
+        // service's and is enforced here, with the service's own fixed text.
+        if !st::resource_type_is_supported(&input.resource) {
+            return Err(invalid(st::UNSUPPORTED_RESOURCE_TYPE));
+        }
+        // And every event type must be one the service publishes, so a rule cannot be
+        // created wired to an event that does not exist.
+        if let Some(reason) = st::event_type_ids_violation(&input.event_type_ids) {
+            return Err(invalid(reason));
+        }
         let targets = st::rule_targets_from(&input.targets).map_err(misconfigured)?;
         let tags = st::rule_tags_from(input.tags.as_ref()).map_err(invalid)?;
+        // A rule holds a bounded number of tags, for the same reason the store holds a
+        // bounded number of rules: tagging is caller-driven growth of a stored resource.
+        if tags.len() > st::MAX_TAGS_PER_RULE {
+            return Err(
+                CreateNotificationRuleErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "A notification rule holds at most {} tags",
+                            st::MAX_TAGS_PER_RULE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
 
         // The parameters this token is allowed to replay: anything else under the same
         // token is the "repeated with a changed parameter" the member documents.

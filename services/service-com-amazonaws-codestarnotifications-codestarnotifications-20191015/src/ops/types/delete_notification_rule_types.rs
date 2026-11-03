@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-codestarnotifications-codestarnotifications-20191015.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codestarnotifications#DeleteNotificationRuleRequest")]
+// `skip_validation = ["Arn"]`: the same member, the same reason as
+// `DescribeNotificationRuleRequest` — a value outside the notification-rule ARN form is
+// refused by the handler's resource-authorization check (403 `AccessDeniedException`),
+// not by the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.codestarnotifications#DeleteNotificationRuleRequest",
+    skip_validation = ["Arn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DeleteNotificationRuleInput {
     pub arn: String,

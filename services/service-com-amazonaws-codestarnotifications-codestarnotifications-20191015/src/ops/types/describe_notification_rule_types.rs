@@ -11,7 +11,17 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-codestarnotifications-codestarnotifications-20191015.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codestarnotifications#DescribeNotificationRuleRequest")]
+// `skip_validation = ["Arn"]`: AWS does not enforce `NotificationRuleArn`'s `@pattern` at
+// the boundary for this member. A value outside the notification-rule ARN form fails the
+// service's resource-based authorization check FIRST — recorded behaviour is 403
+// `AccessDeniedException`, deliberately distinct from the 404 a well-formed ARN no rule
+// holds gets — so the member's form is judged in the handler, which is the only place
+// that answer can be given. The note is the same on every input of this service that
+// names a rule by ARN.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.codestarnotifications#DescribeNotificationRuleRequest",
+    skip_validation = ["Arn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DescribeNotificationRuleInput {
     pub arn: String,
