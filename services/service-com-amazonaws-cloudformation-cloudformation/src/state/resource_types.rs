@@ -21,9 +21,14 @@
 //!
 //! ## What the recognised set is
 //!
-//! Three disjoint cases, in the order [`is_recognized`] decides them:
+//! Four disjoint cases, in the order [`is_recognized`] decides them:
 //!
-//! 1. **`AWS::<Namespace>::<Resource>`** — a resource type Amazon Web Services publishes,
+//! 1. **A type CloudFormation itself serves** — [`BUILT_IN_RESOURCE_TYPES`]: a type whose
+//!    deployment calls no owning service at all, because CloudFormation is the service that
+//!    owns it. Such a type is recognised without being registered or activated and without
+//!    being published in the resource reference, so it is decided before the catalogue is
+//!    consulted.
+//! 2. **`AWS::<Namespace>::<Resource>`** — a resource type Amazon Web Services publishes,
 //!    which is [`AWS_RESOURCE_TYPES`] below: the catalogue of type names, taken from the
 //!    "AWS resource and property types reference" of the CloudFormation User Guide, which
 //!    is where the set of types a template may declare is published (the service's Smithy
@@ -32,12 +37,12 @@
 //!    template spells here but that publishes no resource types — Amazon Simple Workflow
 //!    Service creates its domains only through its own `RegisterDomain` API — simply has
 //!    no entry, which is what makes every type under it unrecognised.
-//! 2. **A custom resource** — `Custom::<Name>` ("Custom::*String*. The resource type name
+//! 3. **A custom resource** — `Custom::<Name>` ("Custom::*String*. The resource type name
 //!    can be up to 60 characters and can include alphanumeric characters and these
 //!    characters: `_@-`") or the generic `AWS::CloudFormation::CustomResource`. A custom
 //!    resource names no registered type: it is backed by the `ServiceToken` its own
 //!    properties carry, so CloudFormation accepts any such name.
-//! 3. **Anything else** — `<Org>::<Service>::<Resource>`, a third-party public extension
+//! 4. **Anything else** — `<Org>::<Service>::<Resource>`, a third-party public extension
 //!    or a private one — is recognised only once this account's registry holds it, and no
 //!    registry WRITER exists yet: `RegisterType`, `ActivateType` and
 //!    `PublishType` are all still scaffold stubs with their own issues
@@ -85,6 +90,29 @@ const AWS_NAMESPACE_PREFIX: &str = "AWS::";
 /// The namespace of a custom resource: "Custom::*String*", where the name is the author's
 /// own.
 const CUSTOM_NAMESPACE_PREFIX: &str = "Custom::";
+
+/// The inert record the AWS Cloud Development Kit writes a synthesized stack's version
+/// report into: "the CDK collects…the versions of…libraries used…by adding a resource of
+/// type `AWS::CDK::Metadata` to the stack" (AWS CDK Developer Guide, "Version reporting"),
+/// whose only property is the `Analytics` string that report is encoded into.
+pub const CDK_METADATA: &str = "AWS::CDK::Metadata";
+
+/// The resource types CloudFormation SERVES ITSELF: a deployment of one calls no owning
+/// service, so there is nothing to register or activate and the resource reference does not
+/// publish it among a service's types.
+///
+/// `AWS::CDK::Metadata` is one: the CDK adds it to every stack it synthesizes unless version
+/// reporting is turned off, and CloudFormation accepts and deploys it in any account, which
+/// is what lets a stack the CDK produced deploy at all. There is no resource outside the
+/// stack for it to be — the version report IS the resource — so it is left declared-only
+/// like a catalogued type this emulator provisions nothing for
+/// ([`super::provisioning`]): it is recorded under the type the template declared, reaches
+/// the deployment's own terminal resource status, takes an `Analytics` change in place and
+/// is removed with the stack.
+///
+/// A LIST, so a further type CloudFormation serves itself is one entry rather than another
+/// branch, and [`is_recognized`] is the one place the case is decided.
+pub const BUILT_IN_RESOURCE_TYPES: &[&str] = &[CDK_METADATA];
 
 /// The generic spelling of a custom resource, documented beside `Custom::String`: "The
 /// resource type name you specify … `AWS::CloudFormation::CustomResource`".
@@ -905,14 +933,22 @@ fn is_custom_resource(resource_type: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || CUSTOM_RESOURCE_NAME_PUNCTUATION.contains(&c))
 }
 
+/// Whether `resource_type` is one CloudFormation serves itself
+/// ([`BUILT_IN_RESOURCE_TYPES`]).
+///
+/// Compared byte for byte, like every other case: a resource type is case SENSITIVE.
+fn is_built_in(resource_type: &str) -> bool {
+    BUILT_IN_RESOURCE_TYPES.contains(&resource_type)
+}
+
 /// Whether a template may declare a resource of type `resource_type`.
 ///
-/// The three cases of the module documentation: a published `AWS::` type, a custom
-/// resource, or an extension this account's registry holds — and no registry WRITER exists
-/// yet, so the third case is empty and a third-party or private type is refused until one
-/// does.
+/// The four cases of the module documentation: a type CloudFormation serves itself, a
+/// published `AWS::` type, a custom resource, or an extension this account's registry holds
+/// — and no registry WRITER exists yet, so the last case is empty and a third-party or
+/// private type is refused until one does.
 pub fn is_recognized(resource_type: &str) -> bool {
-    if is_custom_resource(resource_type) {
+    if is_built_in(resource_type) || is_custom_resource(resource_type) {
         return true;
     }
     // `AWS::` is Amazon Web Services' own namespace, and the catalogue is what it holds.
@@ -1068,6 +1104,35 @@ mod tests {
                 message, *expected,
                 "case {types:?}: expected {expected:?}, got {message:?}"
             );
+        }
+    }
+
+    /// A type CloudFormation serves itself is recognised without the catalogue carrying it,
+    /// and a near miss of one is not.
+    #[test]
+    fn a_built_in_type_is_recognized_and_a_near_miss_is_not() {
+        for resource_type in BUILT_IN_RESOURCE_TYPES {
+            assert!(
+                is_recognized(resource_type),
+                "type {resource_type:?}: expected a type CloudFormation serves itself to be \
+                 recognized, it is not"
+            );
+            assert!(
+                !is_published(resource_type),
+                "type {resource_type:?}: expected the published catalogue not to carry a type \
+                 CloudFormation serves itself, it does"
+            );
+            for near_miss in [
+                format!("{resource_type}Nope"),
+                resource_type.to_ascii_lowercase(),
+                format!("{resource_type}s"),
+            ] {
+                assert!(
+                    !is_recognized(&near_miss),
+                    "type {near_miss:?}: expected a near miss of a built-in type to be \
+                     unrecognized, it is recognized"
+                );
+            }
         }
     }
 

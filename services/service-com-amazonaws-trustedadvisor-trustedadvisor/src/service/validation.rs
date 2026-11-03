@@ -318,6 +318,9 @@ fn subject(violation: &Violation, collections: &RenderedCollections) -> String {
     let Some(stored) = violation.value.as_deref() else {
         return "Value null".to_string();
     };
+    // The same answer for a member this service's own list names, which is what the walk
+    // withholds the value of: a value that reached here with the member still named keeps
+    // no more of itself in the clause than one the walk had already dropped.
     if is_sensitive(&violation.path) {
         return "Value".to_string();
     }

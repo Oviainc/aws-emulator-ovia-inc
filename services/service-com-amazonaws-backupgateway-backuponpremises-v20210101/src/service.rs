@@ -141,6 +141,8 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
         // missing value.
         _ if violation.sensitive => "Value".to_string(),
         (_, None) => "Value null".to_string(),
+        // A `@sensitive` member this service recognises names itself and nothing of what
+        // it held, for a value that reached here with the member still named.
         (_, Some(_)) if names_a_sensitive_member(&violation.path) => "Value".to_string(),
         (_, Some(shown)) => format!("Value '{shown}'"),
     };
