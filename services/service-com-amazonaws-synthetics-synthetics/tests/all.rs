@@ -43,3 +43,5 @@ mod server_side_validation;
 mod state_roundtrip;
 #[path = "all/tag_write_path.rs"]
 mod tag_write_path;
+#[path = "all/untag_resource_scope.rs"]
+mod untag_resource_scope;

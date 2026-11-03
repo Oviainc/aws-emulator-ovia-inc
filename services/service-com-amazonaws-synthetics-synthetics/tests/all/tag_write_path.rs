@@ -43,14 +43,17 @@ const RESOURCE_NOT_FOUND: &str = "Resource was not found";
 
 /// Which collection a row's resource lives in. `ResourceArn`'s pattern admits exactly
 /// these two (`…:\d{12}:(canary|group):[0-9a-z_\-]+$`).
+///
+/// `pub(crate)` with the tag helpers below because the sibling untag suite drives the same
+/// two routes rather than growing a second harness for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Canary,
     Group,
 }
 
 impl Kind {
-    fn case(self) -> &'static str {
+    pub(crate) fn case(self) -> &'static str {
         match self {
             Self::Canary => "canary",
             Self::Group => "group",
@@ -59,7 +62,7 @@ impl Kind {
 }
 
 /// Owned key/value pairs from literals, so a table row reads as the tags it applies.
-fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
     entries
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -67,7 +70,7 @@ fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 /// `pairs` as the JSON object a `TagMap` is on the wire.
-fn tag_map(entries: Vec<(String, String)>) -> Value {
+pub(crate) fn tag_map(entries: Vec<(String, String)>) -> Value {
     Value::Object(
         entries
             .into_iter()
@@ -80,7 +83,7 @@ fn tag_map(entries: Vec<(String, String)>) -> Value {
 ///
 /// `TagKey` is `length 1..128, pattern ^(?!aws:)[a-zA-Z+-=._:/]+$` (the `+-=` range spans
 /// `+ , - . / 0-9 : ; < =`, so digits are in the alphabet).
-fn full_tag_set() -> Vec<(String, String)> {
+pub(crate) fn full_tag_set() -> Vec<(String, String)> {
     (0..MAX_TAGS)
         .map(|index| (format!("key{index}"), format!("value{index}")))
         .collect()
@@ -88,7 +91,11 @@ fn full_tag_set() -> Vec<(String, String)> {
 
 /// `POST /tags/{ResourceArn}` — the `TagResource` route
 /// (`smithy_query(query="operation",operation="TagResource")`).
-async fn tag(aws: &Synthetics, resource_arn: &str, tags: Vec<(String, String)>) -> Answer {
+pub(crate) async fn tag(
+    aws: &Synthetics,
+    resource_arn: &str,
+    tags: Vec<(String, String)>,
+) -> Answer {
     aws.call(
         "POST",
         &format!("/tags/{resource_arn}"),
@@ -100,7 +107,7 @@ async fn tag(aws: &Synthetics, resource_arn: &str, tags: Vec<(String, String)>) 
 /// `DELETE /tags/{ResourceArn}?tagKeys=…` — the `UntagResource` route, whose `TagKeys`
 /// member is bound to the repeated `tagKeys` query parameter
 /// (`smithy_query(query="operation",operation="UntagResource")`).
-async fn untag(aws: &Synthetics, resource_arn: &str, keys: &[String]) -> Answer {
+pub(crate) async fn untag(aws: &Synthetics, resource_arn: &str, keys: &[String]) -> Answer {
     let query = keys
         .iter()
         .map(|key| format!("tagKeys={key}"))
@@ -111,12 +118,12 @@ async fn untag(aws: &Synthetics, resource_arn: &str, keys: &[String]) -> Answer 
 }
 
 /// `GET /tags/{ResourceArn}` — the `ListTagsForResource` route.
-async fn list_tags(aws: &Synthetics, resource_arn: &str) -> Answer {
+pub(crate) async fn list_tags(aws: &Synthetics, resource_arn: &str) -> Answer {
     aws.call("GET", &format!("/tags/{resource_arn}"), None).await
 }
 
 /// Assert a 200, naming the case on failure.
-fn expect_ok(case: &str, answer: &Answer) {
+pub(crate) fn expect_ok(case: &str, answer: &Answer) {
     assert_eq!(
         answer.status, 200,
         "case {case}: expected 200, got {} ({:?})",
@@ -131,7 +138,7 @@ fn expect_ok(case: &str, answer: &Answer) {
 /// carries no ARN member, so a canary's is the `ResourceArn` form its own documentation
 /// states — `arn:aws:synthetics:Region:account-id:canary:canary-name`
 /// (`smithy_query(query="doc",shape="TagResourceRequest",member="ResourceArn")`).
-async fn seed(
+pub(crate) async fn seed(
     aws: &Synthetics,
     kind: Kind,
     name: &str,
@@ -167,7 +174,12 @@ async fn seed(
 }
 
 /// The resource's own tag member, read back through the implemented reader for its kind.
-async fn tags_on_the_resource(aws: &Synthetics, kind: Kind, name: &str, arn: &str) -> Value {
+pub(crate) async fn tags_on_the_resource(
+    aws: &Synthetics,
+    kind: Kind,
+    name: &str,
+    arn: &str,
+) -> Value {
     let read = match kind {
         Kind::Canary => aws.get(name).await,
         Kind::Group => aws.call("GET", &format!("/group/{arn}"), None).await,
