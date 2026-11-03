@@ -1,0 +1,57 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: bedrock-agent-runtime.concurrent-create-invocation-same-id-race bedrock-agent-runtime.concurrent-create-invocation-same-id-single-winner bedrock-agent-runtime.concurrent-end-session-single-winner bedrock-agent-runtime.concurrent-put-invocation-step-same-id-consistent-winner
+Issue-Shape-Id: com.amazonaws.bedrockagentruntime#AmazonBedrockAgentRunTimeService
+Issue-Key: bedrock-agent-runtime.concurrent-create-invocation-same-id-race|run#15|AssertionError|assert all(message == expected_message for _, _, message in failures), (
+Issue-Key: bedrock-agent-runtime.concurrent-create-invocation-same-id-single-winner|run#17|AssertionError|assert messages == {expected_message}, f"expected only {expected_message!r}, got {messages}"
+Issue-Key: bedrock-agent-runtime.concurrent-end-session-single-winner|run#13|AssertionError|assert all(message == "Cannot end a terminated session" for _, _, message in failures), (
+Issue-Key: bedrock-agent-runtime.concurrent-put-invocation-step-same-id-consistent-winner|run#19|AssertionError|assert all(message == expected_message for message in failure_messages), (
+Issue-Commit: fb8daf436f9fd9e940d981e3a914142bad2da5ee
+
+# bedrock-agent-runtime: three re-worded ConflictException messages on the concurrent (race) refusal paths of CreateInvocation, EndSession and PutInvocationStep
+
+> _Note: this issue was identified against the code base at commit `fb8daf436f9fd9e940d981e3a914142bad2da5ee`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateInvocation
+
+## Description
+THREE distinct net-new root causes, all reached through bedrock-agent-runtime concurrency behavioral checks. All three are conflict-path refusals where the emulator returns the right HTTP status and the right error code but an emulator-authored Message instead of the service's. Smithy model consulted: services/service-com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice/smithy-model/com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice.json.
+
+Relationship to already-open issues: the open issue 20261029T171944Z-bedrock-agent-runtime-ten-net-new-causes-session.md describes the SAME three wordings as reached through the sequential checks (its Causes 1, 3 and 5) but carries only those sequential checks' replay keys; it does not carry the four concurrency checks listed here, so these failures are not covered by it and a fix validated only against that issue's trace list will leave these four checks red. The open issue 20261023T004328Z-bedrock-agent-runtime-retrieve-optimizeprompt-getagentmemory-deleteagentmemory-and.md is about operations that answer NotImplemented and does not apply — all three operations below DO answer, and answer with the wrong message.
+
+=== Cause 1 of 3: CreateInvocation's duplicate-invocationId ConflictException is re-worded (race path) ===
+AWS: Smithy: CreateInvocation is PUT /sessions/{sessionIdentifier}/invocations/ (success 201), @idempotent, invocationId -> Uuid, and models ConflictException @httpError 409. Recorded behavior: when N callers race CreateInvocation with ONE client-supplied invocationId, exactly one wins (201, echoing the requested invocationId) and every loser is refused 409 ConflictException with Message `Invocation with ID <invocationId> already exists`. Message template: the fixed text is `Invocation with ID ` ... ` already exists`; the only variable part is <invocationId>, taken from the request. The message carries NO session identifier and NO trailing period.
+Emulator: the single-winner/loser split and the ConflictException code are correct, but every loser's Message is `Invocation <invocationId> already exists in session <sessionId>.` — different fixed text, an extra state-derived session-id clause, and a trailing period.
+Why: a client that matches on the refusal text to tell a duplicate-invocation replay apart from other 409s (retry/dedupe logic around a racing worker pool) never matches, and the message discloses the session id AWS deliberately keeps out of it.
+Fix: the CreateInvocation handler's conflict branch in the bedrock-agent-runtime crate (src/ops/create_invocation.rs) — word the ConflictException as AWS does, with the invocationId as the only interpolated value.
+Traces: bedrock-agent-runtime.concurrent-create-invocation-same-id-race, bedrock-agent-runtime.concurrent-create-invocation-same-id-single-winner.
+
+=== Cause 2 of 3: EndSession's already-ended ConflictException is re-worded and leaks the stored session status (race path) ===
+AWS: Smithy: EndSession is PATCH /sessions/{sessionIdentifier} (success 200), @idempotent, and models ConflictException @httpError 409. Recorded behavior: when N callers race EndSession on one ACTIVE session, exactly one transitions it ACTIVE->ENDED (200, sessionStatus ENDED) and every loser is refused 409 ConflictException with Message `Cannot end a terminated session` — the message is ENTIRELY fixed text, with no variable part at all: no session id, no status name, no trailing period.
+Emulator: the winner/loser split and the ConflictException code are correct, but every loser's Message is `Session <sessionId> has status ENDED and cannot be ended.` — wholly different wording, and it interpolates both the session id from the request and the stored status from state.
+Why: the refusal for a losing concurrent EndSession is unrecognisable to a client matching AWS's text, and the emulator discloses stored session state in a message AWS keeps opaque.
+Fix: the EndSession handler's terminal-state conflict branch (src/ops/end_session.rs) — emit the fixed-text refusal with no interpolation.
+Traces: bedrock-agent-runtime.concurrent-end-session-single-winner.
+
+=== Cause 3 of 3: PutInvocationStep's duplicate-step ConflictException is re-worded and asserts a content comparison AWS never mentions (race path) ===
+AWS: Smithy: PutInvocationStep is PUT /sessions/{sessionIdentifier}/invocationSteps/ (success 201), @idempotent, with required invocationIdentifier/invocationStepTime/payload and an optional client-supplied invocationStepId -> Uuid; it models ConflictException @httpError 409. Recorded behavior: when N callers race PutInvocationStep with one invocationStepId under one invocation but different payloads, exactly one write wins and every loser is refused 409 ConflictException with Message `Combination of Invocation with ID <invocationIdentifier> and Invcoation Step with ID <invocationStepId> already exists`. Message template: the fixed text is `Combination of Invocation with ID ` / ` and Invcoation Step with ID ` / ` already exists` — including AWS's own misspelling `Invcoation`, which is part of the fixed text and must be reproduced verbatim; the variable parts are the two ids, both taken from the request. The conflict is keyed on the ids alone: the message says nothing about payload content.
+Emulator: the winner/loser split and the ConflictException code are correct, but every loser's Message is `Invocation step <stepId> already exists in invocation <invocationId> with different content.` — different fixed text, reversed id order, and a `with different content` clause asserting a content comparison AWS's refusal never mentions.
+Why: a client racing step writes cannot recognise the refusal, and the emulator's message advertises a content-sensitive conflict rule rather than the service's id-keyed one, so code written against the emulator mis-handles an identical-payload retry.
+Fix: the PutInvocationStep handler's conflict branch (src/ops/put_invocation_step.rs) — word the ConflictException as AWS does, keyed on (invocationIdentifier, invocationStepId) with no payload comparison in the text.
+Traces: bedrock-agent-runtime.concurrent-put-invocation-step-same-id-consistent-winner.
+
+## Evidence
+Cause 1 — bedrock-agent-runtime.concurrent-create-invocation-same-id-race: 10 concurrent CreateInvocation calls with one invocationId; expected every one of the 9 losers to carry Message 'Invocation with ID <invocationId> already exists'; actual, for all 9: 'Invocation <invocationId> already exists in session <sessionId>.' (observed run: invocationId 2db5d596-720a-4543-95d9-bcb69afd007a, session 95848b75-ef3a-4c41-88fc-3376e995980b). bedrock-agent-runtime.concurrent-create-invocation-same-id-single-winner shows the identical divergence (observed run: invocationId 63e6dd6e-960c-4976-a075-a471c832f271). Error code ConflictException and the 1-winner/9-loser split matched; the ids are per-run values filling the template — the divergence is the fixed text plus the extra session clause and trailing period.
+
+Cause 2 — bedrock-agent-runtime.concurrent-end-session-single-winner: 6 concurrent EndSession calls on one ACTIVE session; expected every one of the 5 losers to carry Message 'Cannot end a terminated session'; actual, for all 5: ('error', 'ConflictException', 'Session <sessionId> has status ENDED and cannot be ended.') (observed run: session 9179acd9-90be-4f96-abc4-bd888d3412d8). AWS's message has no variable part at all, so the session id and the status name are both additions.
+
+Cause 3 — bedrock-agent-runtime.concurrent-put-invocation-step-same-id-consistent-winner: 6 concurrent PutInvocationStep calls with one invocationStepId and differing payloads; expected every one of the 5 losers to carry Message 'Combination of Invocation with ID <invocationIdentifier> and Invcoation Step with ID <invocationStepId> already exists'; actual, for all 5: 'Invocation step <stepId> already exists in invocation <invocationId> with different content.' (observed run: invocation 7394e910-2ff1-4a5e-b5ab-5a6f69d9c692, step 852bc24d-0111-4520-8a37-9bcfa0c3b14a). Error code ConflictException, the single-winner split and the read-back consistency all matched.
+
+## Steps to Reproduce
+Cause 1: client = boto3.client('bedrock-agent-runtime'); sid = client.create_session()['sessionId']; inv = str(uuid.uuid4()); from a ThreadPoolExecutor with 10 workers call client.create_invocation(sessionIdentifier=sid, invocationId=inv) concurrently -> one call returns 201 echoing inv, the other nine raise ConflictException; inspect exc.response['Error']['Message'] on the losers (expect 'Invocation with ID <inv> already exists').
+
+Cause 2: sid = client.create_session()['sessionId']; from a ThreadPoolExecutor with 6 workers call client.end_session(sessionIdentifier=sid) concurrently -> one call returns sessionStatus ENDED, the other five raise ConflictException; inspect the losers' Message (expect exactly 'Cannot end a terminated session').
+
+Cause 3: sid = client.create_session()['sessionId']; inv = str(uuid.uuid4()); client.create_invocation(sessionIdentifier=sid, invocationId=inv); step = str(uuid.uuid4()); from a ThreadPoolExecutor with 6 workers call client.put_invocation_step(sessionIdentifier=sid, invocationIdentifier=inv, invocationStepId=step, invocationStepTime=datetime(2024,1,1,tzinfo=utc), payload={'contentBlocks':[{'text': f'racer-{i}'}]}) concurrently with a distinct payload per worker -> one call succeeds, the other five raise ConflictException; inspect the losers' Message (expect 'Combination of Invocation with ID <inv> and Invcoation Step with ID <step> already exists', with 'Invcoation' spelled exactly that way).
