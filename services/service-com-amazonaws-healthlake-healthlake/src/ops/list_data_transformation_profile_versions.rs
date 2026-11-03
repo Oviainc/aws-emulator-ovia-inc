@@ -166,7 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before its versions are reported.
         let store = state.lock();
         let Some(profile) = store.profiles.get(&input.profile_id) else {
-            return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+            return Err(not_found(crate::state::profile_not_found_message(
+                &input.profile_id,
+            )));
         };
 
         // "All versions ... (DRAFT and published), in reverse chronological
@@ -244,12 +246,11 @@ fn validation(message: &str) -> ListDataTransformationProfileVersionsError {
     .into()
 }
 
-/// This operation's 404, worded without quoting the requested identifier — the
-/// wording this service's not-found text uses.
-fn not_found(message: &str) -> ListDataTransformationProfileVersionsError {
+/// This operation's 404, stating which profile the service does not hold.
+fn not_found(message: String) -> ListDataTransformationProfileVersionsError {
     ListDataTransformationProfileVersionsErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: Some(message.to_string()),
+            message: Some(message),
         },
     )
     .into()

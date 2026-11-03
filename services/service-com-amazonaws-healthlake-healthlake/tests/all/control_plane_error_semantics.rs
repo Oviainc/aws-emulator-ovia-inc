@@ -29,10 +29,11 @@ use crate::fhir_datastore_lifecycle::{error_code, error_message, HealthLake, PAS
 /// `service_com_amazonaws_healthlake_healthlake::state` spells it. Read from the
 /// crate rather than retyped, so the test and the service cannot drift.
 const NOT_FOUND: &str = service_com_amazonaws_healthlake_healthlake::state::DATASTORE_NOT_FOUND_MESSAGE;
-/// The fixed sentence this service refuses a data transformation profile no record
-/// holds with.
-const PROFILE_NOT_FOUND: &str =
-    service_com_amazonaws_healthlake_healthlake::state::PROFILE_NOT_FOUND_MESSAGE;
+/// The sentence this service refuses a data transformation profile no record holds
+/// with, naming the profile it could not find.
+fn profile_not_found(profile_id: &str) -> String {
+    service_com_amazonaws_healthlake_healthlake::state::profile_not_found_message(profile_id)
+}
 
 /// The enum clause this service states for `path` and `allowed`: the member and
 /// the permitted set, with no echo of the rejected value.
@@ -49,8 +50,8 @@ pub(crate) fn enum_envelope(path: &str, allowed: &[&str]) -> String {
 }
 
 /// Assert that `payload` is this service's not-found answer for `request_value`:
-/// `expected`, the fixed text of the resource that was addressed, and no echo of what
-/// was asked for.
+/// `expected`, the sentence of the resource that was addressed, and no echo of what
+/// was asked for beyond what that sentence names.
 fn assert_not_found(
     case: &str,
     status: u16,
@@ -70,12 +71,12 @@ fn assert_not_found(
     let message = error_message(payload);
     assert_eq!(
         message, expected,
-        "case {case:?}: the not-found text is fixed, expected {expected:?}, got {message:?}"
+        "case {case:?}: expected the sentence {expected:?}, got {message:?}"
     );
-    // The fixed sentence is short and shares letters with any input, so the
-    // echo check only applies to a value long enough that its presence would be
-    // unambiguous.
-    if request_value.len() >= 8 {
+    // A sentence is short and shares letters with any input, so the echo check only
+    // applies to a value long enough that its presence would be unambiguous — and
+    // only where the resource's own sentence does not name it.
+    if request_value.len() >= 8 && !expected.contains(request_value) {
         assert!(
             !message.contains(request_value),
             "case {case:?}: the not-found text must not quote {request_value:?}, got {message:?}"
@@ -147,36 +148,36 @@ async fn the_not_found_text_is_fixed_and_quotes_no_requested_identifier() {
     // another region, in another account, and in another partition.
     let parts: Vec<&str> = real_arn.split(':').collect();
     assert_eq!(parts.len(), 6, "a data store ARN has six fields: {real_arn}");
-    let arn_cases: Vec<(String, &str)> = vec![
+    let arn_cases: Vec<(String, String)> = vec![
         (
             format!(
                 "arn:aws:healthlake:us-east-1:000000000000:dataTransformationProfile/{}",
                 "deadbeefdeadbeefdeadbeefdeadbeef"
             ),
-            PROFILE_NOT_FOUND,
+            profile_not_found("deadbeefdeadbeefdeadbeefdeadbeef"),
         ),
         (
             "arn:aws:healthlake:us-east-1:000000000000:datastore/fhir/00000000000000000000000000000000"
                 .to_string(),
-            NOT_FOUND,
+            NOT_FOUND.to_string(),
         ),
         (
             format!(
                 "arn:aws:healthlake:eu-west-1:{}:datastore/fhir/{real}",
                 parts[4]
             ),
-            NOT_FOUND,
+            NOT_FOUND.to_string(),
         ),
         (
             format!("arn:aws:healthlake:{}:210987654321:datastore/fhir/{real}", parts[3]),
-            NOT_FOUND,
+            NOT_FOUND.to_string(),
         ),
         (
             format!(
                 "arn:aws-us-gov:healthlake:{}:{}:datastore/fhir/{real}",
                 parts[3], parts[4]
             ),
-            NOT_FOUND,
+            NOT_FOUND.to_string(),
         ),
     ];
     for (arn, expected) in &arn_cases {

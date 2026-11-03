@@ -152,13 +152,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // tagging operations share: it refuses an ARN that names no resource
         // this service still holds — including a data store that has reached
         // the terminal `DELETED` status, which every operation that would
-        // change it answers for as gone — and this service's not-found texts
-        // name no identifier.
+        // change it answers for as gone. A data store's not-found text names no
+        // identifier; a profile's names the profile.
         let mut target = store
             .tags_for_mutation(&input.resource_arn)
             .map_err(|not_found| {
                 UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(not_found.to_string()),
+                    message: Some(not_found),
                 })
             })?;
 

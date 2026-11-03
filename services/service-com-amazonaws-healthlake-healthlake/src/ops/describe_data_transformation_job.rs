@@ -173,16 +173,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // never recomputed per call.
         store.settle_transformation_jobs();
 
-        // The not-found answer is this service's FIXED text: it names no
-        // identifier, so a well-formed `JobId` no job carries reads the same
-        // whatever the caller asked about.
+        // The not-found answer NAMES the job the request asked about, through
+        // the one template every transformation-job not-found path in this crate
+        // states, so a caller describing several jobs can tell which one was
+        // missing.
         let Some(job) = store.transformation_jobs.get(&input.job_id) else {
             return Err(
                 DescribeDataTransformationJobErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(
-                            crate::state::TRANSFORMATION_JOB_NOT_FOUND_MESSAGE.to_string(),
-                        ),
+                        message: Some(crate::state::transformation_job_not_found_message(
+                            &input.job_id,
+                        )),
                     },
                 )
                 .into(),

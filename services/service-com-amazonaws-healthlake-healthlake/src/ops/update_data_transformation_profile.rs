@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(profile) = store.profiles.get(&input.profile_id) else {
-            return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+            return Err(not_found(draft_not_found(&input.profile_id)));
         };
 
         // The new DRAFT content is RETAINED alongside every version this profile
@@ -219,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // been decided against the store as it stands. The same lock has been held
         // throughout, so this is the record the ceilings were charged against.
         let Some(profile) = store.profiles.get_mut(&input.profile_id) else {
-            return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+            return Err(not_found(draft_not_found(&input.profile_id)));
         };
 
         // "The update replaces all existing DRAFT content": the DRAFT's mapping
@@ -256,12 +256,21 @@ fn validation(message: impl Into<String>) -> UpdateDataTransformationProfileErro
     .into()
 }
 
-/// This operation's 404, worded without quoting the requested identifier — the
-/// wording this service's not-found text uses.
-fn not_found(message: &str) -> UpdateDataTransformationProfileError {
+/// The sentence an update refuses an unresolved profile with: this write edits the
+/// DRAFT, so the version it resolved is [`crate::state::DRAFT_PROFILE_VERSION`] and
+/// the refusal names it beside the requested `ProfileId`.
+fn draft_not_found(profile_id: &str) -> String {
+    crate::state::profile_version_not_found_message(
+        profile_id,
+        crate::state::DRAFT_PROFILE_VERSION,
+    )
+}
+
+/// This operation's 404, stating the profile and the version the write resolved.
+fn not_found(message: String) -> UpdateDataTransformationProfileError {
     UpdateDataTransformationProfileErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: Some(message.to_string()),
+            message: Some(message),
         },
     )
     .into()

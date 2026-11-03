@@ -234,7 +234,7 @@ impl<Eng: Send + Sync + 'static> RestTagging<Eng> {
                 );
                 json_response(SUCCESS_STATUS, &::serde_json::Value::Object(body))
             }
-            Err(not_found) => resource_not_found(not_found),
+            Err(not_found) => resource_not_found(&not_found),
         }
     }
 
@@ -255,7 +255,7 @@ impl<Eng: Send + Sync + 'static> RestTagging<Eng> {
         store.settle_lifecycle();
         let mut target = match store.tags_for_mutation(resource_arn) {
             Ok(target) => target,
-            Err(not_found) => return resource_not_found(not_found),
+            Err(not_found) => return resource_not_found(&not_found),
         };
         match target.merge(requested) {
             Ok(()) => empty_response(),
@@ -277,7 +277,7 @@ impl<Eng: Send + Sync + 'static> RestTagging<Eng> {
         store.settle_lifecycle();
         let mut target = match store.tags_for_mutation(resource_arn) {
             Ok(target) => target,
-            Err(not_found) => return resource_not_found(not_found),
+            Err(not_found) => return resource_not_found(&not_found),
         };
         target.remove_keys(requested);
         empty_response()
@@ -514,8 +514,8 @@ fn validation_exception(message: &str) -> RtResponse {
 }
 
 /// The modelled `ResourceNotFoundException`, at the HTTP 404 its `@httpError` names,
-/// stating the fixed sentence the state resolver reported — the same sentence the
-/// awsJson tagging operations answer with, which quotes no requested identifier.
+/// stating the sentence the state resolver reported — the same sentence the awsJson
+/// tagging operations answer with.
 fn resource_not_found(message: &str) -> RtResponse {
     modelled_error(404, "ResourceNotFoundException", message)
 }

@@ -69,3 +69,53 @@ pub struct CreateDataTransformationProfileOutput {
     pub last_updated_at: ::aws_smithy_types::DateTime,
 }
 
+/// The `ProfileStatus` member a create reply carries: the status of the profile the
+/// call minted.
+///
+/// Declared here, beside the modelled `CreateDataTransformationProfileResponse`
+/// members, because this model snapshot does not declare it while the service
+/// answers the create with it — so a caller learns the new profile's status from
+/// the reply instead of having to read the profile back. The member schema carries
+/// the wire name, which is what the JSON codec emits the key from; the index
+/// follows the six modelled members of the response.
+static PROFILE_STATUS_MEMBER: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.healthlake#CreateDataTransformationProfileResponse$ProfileStatus",
+            "com.amazonaws.healthlake",
+            "ProfileStatus",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "ProfileStatus",
+        6,
+    );
+
+/// What a create answers: every modelled member of
+/// `CreateDataTransformationProfileResponse`, plus `ProfileStatus`.
+///
+/// The modelled half IS the generated shape, serialized by its own generated
+/// implementation against the generated schema, so no modelled member is
+/// re-described here.
+#[derive(Debug, Clone)]
+pub struct CreatedProfile {
+    /// The modelled response: `ProfileId`, `Version`, `SourceFormat`,
+    /// `TargetFormat`, `ProfileName` and `LastUpdatedAt`.
+    pub modelled: CreateDataTransformationProfileOutput,
+    /// The minted profile's status, read off the record this reply is about
+    /// ([`crate::state::DataTransformationProfile::status`]).
+    pub profile_status: String,
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for CreatedProfile {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        ::aws_smithy_schema::serde::SerializableStruct::serialize_members(
+            &self.modelled,
+            serializer,
+        )?;
+        serializer.write_string(&PROFILE_STATUS_MEMBER, self.profile_status.as_str())
+    }
+}
+

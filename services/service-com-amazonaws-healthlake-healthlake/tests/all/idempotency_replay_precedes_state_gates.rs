@@ -27,8 +27,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_healthlake_healthlake::state::{
-    datastore_in_transition_message, DatastoreAction, DatastoreStatus, DATASTORE_NOT_FOUND_MESSAGE,
-    PROFILE_NOT_FOUND_MESSAGE,
+    datastore_in_transition_message, profile_not_found_message, DatastoreAction, DatastoreStatus,
+    DATASTORE_NOT_FOUND_MESSAGE,
 };
 
 use crate::fhir_datastore_lifecycle::{
@@ -364,9 +364,10 @@ async fn a_transformation_start_replays_its_token_once_its_profile_is_gone() {
         "ResourceNotFoundException",
         "the refusal must be ResourceNotFoundException, got {payload}"
     );
+    let expected = profile_not_found_message(&profile_id);
     assert_eq!(
         error_message(&payload),
-        PROFILE_NOT_FOUND_MESSAGE,
-        "the refusal must state {PROFILE_NOT_FOUND_MESSAGE:?}, got {payload}"
+        expected,
+        "the refusal must state {expected:?}, got {payload}"
     );
 }

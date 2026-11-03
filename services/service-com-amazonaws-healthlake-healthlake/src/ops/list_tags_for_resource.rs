@@ -163,13 +163,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `GET /tags/{ResourceArn}` reports from): it requires the stored
         // record's own ARN to equal the one the caller handed in, so an ARN
         // naming another partition, region or account resolves to nothing even
-        // when its id segment happens to match a local one, and this service's
-        // not-found texts name no identifier.
-        let tags = store.tags_for_report(&input.resource_arn).map_err(|not_found| {
-            ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(not_found.to_string()),
-            })
-        })?;
+        // when its id segment happens to match a local one. A data store's
+        // not-found text names no identifier; a profile's names the profile.
+        let tags = store
+            .tags_for_report(&input.resource_arn)
+            .map_err(|not_found| {
+                ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(not_found),
+                    },
+                )
+            })?;
 
         Ok(ListTagsForResourceOutput { tags: Some(tags) })
     }

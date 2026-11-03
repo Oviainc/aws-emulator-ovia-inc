@@ -226,10 +226,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The profile the conversion runs against, with the name and the
         // version resolved as they stand NOW and stored on the job — see the
-        // module docs. A profile no record holds is this service's fixed
-        // not-found sentence, which quotes nothing from the request.
+        // module docs. A profile no record holds is refused with the template
+        // every profile not-found path in this crate states, naming the
+        // requested profile.
         let Some(profile) = store.profiles.get(&input.profile_id) else {
-            return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+            return Err(not_found(crate::state::profile_not_found_message(
+                &input.profile_id,
+            )));
         };
         let profile_name = profile.name.clone();
         let profile_version = profile
@@ -302,11 +305,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// This operation's 404, worded without quoting the requested identifier — the
+/// This operation's 404, stating which resource the service does not hold — the
 /// wording every not-found path in this crate uses.
-fn not_found(message: &str) -> StartDataTransformationJobError {
+fn not_found(message: String) -> StartDataTransformationJobError {
     StartDataTransformationJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(message.to_string()),
+        message: Some(message),
     })
     .into()
 }

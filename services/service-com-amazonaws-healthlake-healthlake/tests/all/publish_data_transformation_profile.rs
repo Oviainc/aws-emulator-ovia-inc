@@ -29,8 +29,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_healthlake_healthlake::scaffolded::wire_http_status;
 use service_com_amazonaws_healthlake_healthlake::state::{
-    MAX_PROFILE_RETAINED_BYTES, MAX_PROFILE_VERSION, PROFILE_NOT_FOUND_MESSAGE,
-    PROFILE_VERSION_NOT_FOUND_MESSAGE,
+    MAX_PROFILE_RETAINED_BYTES, MAX_PROFILE_VERSION, profile_version_not_found_message,
 };
 
 use crate::data_transformation_profile::{
@@ -567,23 +566,19 @@ async fn refused_publishes_publish_nothing() {
             );
         }
 
-        // Nothing was published, so an omitted `ProfileVersion` still resolves to no
-        // latest published version at all.
-        let (status, code, payload) = healthlake
-            .refused_body(
+        // Nothing was published, so a read naming no version still resolves to the
+        // DRAFT — the content the refused publish left untouched.
+        let unpublished = healthlake
+            .ok(
                 case,
                 "GetDataTransformationProfile",
                 &json!({ "ProfileId": profile_id }),
             )
             .await;
         assert_eq!(
-            (status, code.as_str(), modelled_message(&payload)),
-            (
-                wire_http_status(404),
-                "ResourceNotFoundException",
-                Some(PROFILE_VERSION_NOT_FOUND_MESSAGE)
-            ),
-            "case {case:?}: a refused publish leaves the profile unpublished, got {payload}"
+            unpublished["Version"].as_i64(),
+            Some(0),
+            "case {case:?}: a refused publish leaves the profile unpublished, got {unpublished}"
         );
 
         let draft = healthlake
@@ -600,8 +595,8 @@ async fn refused_publishes_publish_nothing() {
         );
     }
 
-    // The two 404 rows state this service's own fixed sentences, each about the thing
-    // that was missing.
+    // The two 404 rows state the sentence of the version each publish resolved: a
+    // publish promotes a VERSION, so each names the one it could not find.
     let (_, _, unknown_profile) = healthlake
         .refused_body(
             "an unknown profile",
@@ -611,8 +606,11 @@ async fn refused_publishes_publish_nothing() {
         .await;
     assert_eq!(
         modelled_message(&unknown_profile),
-        Some(PROFILE_NOT_FOUND_MESSAGE),
-        "an unknown profile states this service's fixed not-found sentence, got {unknown_profile}"
+        Some(
+            profile_version_not_found_message("ffffffffffffffffffffffffffffffff", 0).as_str()
+        ),
+        "an unknown profile is named beside the DRAFT the publish resolved, \
+         got {unknown_profile}"
     );
     let (_, _, unknown_version) = healthlake
         .refused_body(
@@ -623,8 +621,8 @@ async fn refused_publishes_publish_nothing() {
         .await;
     assert_eq!(
         modelled_message(&unknown_version),
-        Some(PROFILE_VERSION_NOT_FOUND_MESSAGE),
-        "a version the profile lacks states its own sentence, got {unknown_version}"
+        Some(profile_version_not_found_message(&profile_id, 7).as_str()),
+        "a version the profile lacks is named in its own sentence, got {unknown_version}"
     );
 
     // A publish still works after every refusal above, and it is version 1: none of

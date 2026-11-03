@@ -70,10 +70,16 @@
 //! (`aws_smithy_schema_server::validate`, the same call the centralized sequence makes)
 //! what the request violates and renders those violations with the framework's own
 //! `envelope` — the `N validation error(s) detected: Value '…' at '…' failed to satisfy
-//! constraint: …` sentence AWS itself returns — into the modelled `Message`. Any request
+//! constraint: …` sentence AWS itself returns — into the modelled `Message`, and into
+//! the framework's lowercase `message` beside it, which is the key this service's
+//! data-transformation endpoint carries that same sentence under. Any request
 //! the model accepts is handed straight to the generated operation. The rules enforced
-//! are therefore exactly the model's — nothing about a constraint is restated here — and
-//! only the BODY of the refusal changes.
+//! are therefore exactly the model's — nothing about a constraint is restated here —
+//! with two reconciliations the recorded wire requires, each in ONE place: the
+//! `SourceFormat` clause names the value set the service's own refusal REPORTS, which
+//! the snapshot's enum lags ([`reported_violations`]), and a member whose `@pattern`
+//! requires an ARN that was handed a value which is not an ARN at all is answered by
+//! the ARN parser rather than by the member's pattern ([`arn_syntax_message`]).
 //!
 //! Two things the gate deliberately does not touch: authentication, which the router
 //! settles before any operation runs and reads off the MODELLED operation the routing
@@ -93,6 +99,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema_server::{validate, ProtocolError};
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
@@ -113,20 +120,68 @@ const VALIDATION_EXCEPTION_MODELED_STATUS: u16 = 400;
 /// How this service states a set of constraint violations the framework refused
 /// before any handler ran.
 ///
-/// The code is [`VALIDATION_EXCEPTION_CODE`] and the message is the AWS
-/// `N validation error(s) detected` envelope — the same framing the framework
-/// renders — with ONE difference, in the enum clause: see [`clause_for`].
+/// The code is [`VALIDATION_EXCEPTION_CODE`] and the message is [`refusal_message`].
 ///
 /// This is the FALLBACK wording, for a refusal that reaches
 /// [`Service::override_refusal`]: a constraint refusal of an operation this crate serves
 /// is answered earlier, and from the MODELLED error shape, by
 /// [`ModeledInputValidation`] — which words it with the same
-/// [`validation_envelope`], so the two cannot say different things.
+/// [`refusal_message`], so the two cannot say different things.
 fn refused_for(violations: &[Violation]) -> Refused {
     Refused {
         code: VALIDATION_EXCEPTION_CODE.to_string(),
-        message: validation_envelope(violations),
+        message: refusal_message(&reported_violations(violations.to_vec())),
     }
+}
+
+/// The member path of a `SourceFormat` member, as a violation path spells a member
+/// name (lowerCamel; the member is spelled the same in every input of this service
+/// that carries it).
+const SOURCE_FORMAT_PATH: &str = "sourceFormat";
+
+/// The prefix an ARN starts with — and the prefix the `@pattern` of a member that
+/// requires an ARN starts with, which is how such a member is recognised.
+const ARN_PREFIX: &str = "arn:";
+
+/// How this service words a request the model refused before any handler ran.
+///
+/// The `N validation error(s) detected` envelope ([`validation_envelope`]), EXCEPT
+/// where a member whose `@pattern` requires an ARN was handed a value that is not an
+/// ARN at all: the service PARSES such a value before any member pattern is checked,
+/// so the caller is answered with the ARN parser's own refusal — see
+/// [`arn_syntax_message`].
+///
+/// `pub(crate)` because the non-RPC surfaces and any handler re-stating a modelled
+/// constraint of its own have to answer in the SAME words.
+pub(crate) fn refusal_message(violations: &[Violation]) -> String {
+    arn_syntax_message(violations).unwrap_or_else(|| validation_envelope(violations))
+}
+
+/// The ARN parser's refusal for the first violation of an ARN-shaped member whose
+/// value does not begin with `arn:`, or `None` when no violation is one.
+///
+/// A member is ARN-shaped when the `@pattern` it failed requires the value to start
+/// with [`ARN_PREFIX`], which is read off the violated pattern itself — so every ARN
+/// member of this service is covered and no member list is restated here. The
+/// rejected value is the string the parser could not parse, so it is echoed as the
+/// parser echoes it (already bounded: the framework elides an echoed value).
+///
+/// The parse is what the service does with a WELL-FORMED request's ARN, so this
+/// answers only when that pattern is the sole rule the request broke: a value that
+/// also breaks another declared rule — its `@length`, say — is refused by that rule,
+/// which the validation framework answers before any ARN is parsed.
+fn arn_syntax_message(violations: &[Violation]) -> Option<String> {
+    let [violation] = violations else {
+        return None;
+    };
+    let ViolationKind::Pattern(pattern) = &violation.kind else {
+        return None;
+    };
+    let requires_arn = unanchored(pattern).starts_with(ARN_PREFIX);
+    let value = violation.value.as_deref()?;
+    (requires_arn && !value.starts_with(ARN_PREFIX)).then(|| {
+        format!("com.amazon.arn.ARNSyntaxException: ARNs must start with '{ARN_PREFIX}': {value}")
+    })
 }
 
 /// `1 validation error detected: <clause>` / `N validation errors detected:
@@ -148,13 +203,19 @@ pub(crate) fn validation_envelope(violations: &[Violation]) -> String {
 
 /// One violation as this service states it.
 ///
-/// A value outside an enumerated type's value set is the one class whose clause
-/// states the member and the permitted set ALONE — `Value at '<member>' failed
-/// to satisfy constraint: Member must satisfy enum value set: [...]` — with no
-/// echo of what the caller sent: an unknown enum name never becomes a value of
-/// the modelled type, so there is no value for the refusal to quote. Every
-/// other class (length, range, pattern, uniqueness, absence) keeps the
-/// framework's own clause, which quotes the offending value as AWS does.
+/// Two classes state the member and the requirement ALONE, with no echo of what the
+/// caller sent:
+///
+/// * a value outside an enumerated type's value set — an unknown enum name never
+///   becomes a value of the modelled type, so there is no value for the refusal to
+///   quote, and what the caller needs is the permitted set; and
+/// * a value outside a member's `@pattern` — the value is the thing the pattern
+///   rejected, and what the caller needs is the pattern, stated as the member
+///   declares it but WITHOUT the `^`/`$` anchors, which say where the pattern is
+///   applied rather than what it admits.
+///
+/// Every other class (length, range, uniqueness, absence) keeps the framework's own
+/// clause, which quotes the offending value as AWS does.
 fn clause_for(violation: &Violation) -> String {
     match &violation.kind {
         ViolationKind::EnumValue(allowed) => format!(
@@ -162,11 +223,62 @@ fn clause_for(violation: &Violation) -> String {
             violation.path,
             allowed.join(", ")
         ),
+        ViolationKind::Pattern(pattern) => format!(
+            "Value at '{}' failed to satisfy constraint: Member must satisfy regular expression \
+             pattern: {}",
+            violation.path,
+            unanchored(pattern)
+        ),
         // `ViolationKind` is `#[non_exhaustive]`: anything else — including a
         // class added later — keeps the framework's wording rather than being
         // dropped or reworded on no evidence.
         _ => violation.message(),
     }
+}
+
+/// `pattern` without the `^` and `$` a Smithy `@pattern` anchors it with.
+///
+/// The pair is dropped only when BOTH ends carry it — what the service states is the
+/// expression the value as a whole must match, and an expression anchored at one end
+/// only does not describe that — which is the rule the shared renderer in
+/// `services/common` states for the services already migrated to it. This service
+/// states it locally, as its sibling services still do.
+fn unanchored(pattern: &str) -> &str {
+    match pattern.strip_prefix('^').and_then(|body| body.strip_suffix('$')) {
+        Some(inner) => inner,
+        None => pattern,
+    }
+}
+
+/// `violations` with the `SourceFormat` enum clause stating the value set this
+/// service REPORTS ([`crate::state::REPORTED_SOURCE_FORMATS`]).
+///
+/// The on-disk model snapshot's `SourceFormat` enum lags the service, so the clause
+/// the framework words from the snapshot names fewer formats than the service's own
+/// refusal does, and a caller correcting its request from the refusal would not learn
+/// what to send. Only the SENTENCE is reconciled: the constraint enforced is still
+/// the model's, walked by the framework.
+fn reported_violations(violations: Vec<Violation>) -> Vec<Violation> {
+    violations
+        .into_iter()
+        .map(|mut violation| {
+            if is_source_format_enum(&violation) {
+                violation.kind = ViolationKind::EnumValue(
+                    crate::state::REPORTED_SOURCE_FORMATS
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect(),
+                );
+            }
+            violation
+        })
+        .collect()
+}
+
+/// Whether `violation` is a value outside the `SourceFormat` member's enum.
+fn is_source_format_enum(violation: &Violation) -> bool {
+    violation.path == SOURCE_FORMAT_PATH
+        && matches!(violation.kind, ViolationKind::EnumValue(_))
 }
 
 /// The message this service answers a value outside `allowed` at the member
@@ -181,6 +293,51 @@ pub(crate) fn enum_violation_message(path: &str, allowed: &[&str]) -> String {
         value: None,
         sensitive: false,
     }])
+}
+
+/// The body a constraint refusal of this service carries: the modelled
+/// `ValidationException` and, beside it, the same sentence under the framework's
+/// lowercase `message` key.
+///
+/// The modelled `ValidationException` of this service declares one member, `Message`
+/// (`smithy_query(query="shape",shape="ValidationException")`), and that is what an
+/// SDK deserialising the modelled shape reads. The recorded wire shows a constraint
+/// refusal arriving in the modelled `Message` on this service's control-plane
+/// endpoint and in the framework's lowercase `message` on its data-transformation
+/// endpoint, which this emulator serves from the same listener. So a refusal carries
+/// ONE sentence under BOTH keys: every client path reads the reason, and the two can
+/// never state different ones. The lowercase member is the one
+/// [`crate::scaffolded::VALIDATION_EXCEPTION_MESSAGE`] declares, so this crate holds
+/// a single schema for it.
+struct ConstraintRefusal {
+    /// The modelled shape, holding the sentence in its `Message` member.
+    modelled: crate::ops::types::ValidationException,
+}
+
+impl ConstraintRefusal {
+    /// The refusal that states `message`.
+    fn new(message: String) -> Self {
+        Self {
+            modelled: crate::ops::types::ValidationException {
+                message: Some(message),
+            },
+        }
+    }
+
+    /// The sentence, as both members carry it.
+    fn message(&self) -> &str {
+        self.modelled.message.as_deref().unwrap_or_default()
+    }
+}
+
+impl SerializableStruct for ConstraintRefusal {
+    fn serialize_members(&self, serializer: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        SerializableStruct::serialize_members(&self.modelled, serializer)?;
+        serializer.write_string(
+            &crate::scaffolded::VALIDATION_EXCEPTION_MESSAGE,
+            self.message(),
+        )
+    }
 }
 
 /// The `com-amazonaws-healthlake-healthlake` emulated service: the generated [`ServiceDefinition`] plus
@@ -329,21 +486,19 @@ fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dy
 }
 
 /// `Some(response)` when `Op`'s input violates a rule the model declares: this service's
-/// modelled `ValidationException`, with its `Message` member carrying the
-/// constraint-violation envelope.
+/// modelled `ValidationException`, with the constraint-violation sentence in its
+/// `Message` member and in the framework's lowercase `message` beside it.
 ///
 /// `None` when the request satisfies the model, or when it failed to READ for a reason
-/// that is not a constraint violation — an unparseable body is a protocol failure, and
+/// that is not a constraint violation: an unparseable body is a protocol failure, and
 /// the framework words those per protocol.
 fn refuse_invalid_input<Op: Operation>(svc: &dyn Service, req: &RtRequest) -> Option<RtResponse> {
     let protocol = svc.definition().protocol();
-    let violations = model_violations::<Op>(protocol, req)?;
-    // The envelope AWS itself returns for a constraint failure, built from the member
+    let violations = reported_violations(model_violations::<Op>(protocol, req)?);
+    // The sentence AWS itself returns for a constraint failure, built from the member
     // path, the offending value and the violated constraint by the framework's own
     // renderer — the same text the generic 400 carried, now in the modelled member.
-    let error = crate::ops::types::ValidationException {
-        message: Some(validation_envelope(&violations)),
-    };
+    let error = ConstraintRefusal::new(refusal_message(&violations));
     protocol
         .serialize_error(
             &error,

@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use service_com_amazonaws_healthlake_healthlake::scaffolded::wire_http_status;
 use service_com_amazonaws_healthlake_healthlake::state::{
-    MAX_PROFILE_VERSION, PROFILE_NOT_FOUND_MESSAGE,
+    MAX_PROFILE_VERSION, profile_not_found_message,
 };
 
 use crate::data_transformation_profile::{
@@ -775,10 +775,10 @@ async fn refused_listings_report_nothing() {
         (
             wire_http_status(404),
             "ResourceNotFoundException",
-            Some(PROFILE_NOT_FOUND_MESSAGE)
+            Some(profile_not_found_message(&"0".repeat(32)).as_str())
         ),
-        "case {case:?}: listing a profile no record holds is refused with this service's \
-         not-found sentence, got {payload}"
+        "case {case:?}: listing a profile no record holds is refused with the sentence \
+         naming that profile, got {payload}"
     );
 
     // Each bad request on a profile that DOES exist, so what is refused is the

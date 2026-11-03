@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_healthlake_healthlake::scaffolded::wire_http_status;
 use service_com_amazonaws_healthlake_healthlake::state::{
-    PROFILE_NOT_FOUND_MESSAGE, PROFILE_VERSION_NOT_FOUND_MESSAGE,
+    profile_version_not_found_message,
 };
 
 use crate::data_transformation_profile::{
@@ -266,24 +266,19 @@ async fn update_replaces_the_whole_draft_and_get_reads_it_back() {
             "case {case:?}: the stored SourceFormat survives an update, got {draft}"
         );
 
-        // An update writes the DRAFT and publishes nothing, so the profile still has
-        // no latest published version — which is what an omitted `ProfileVersion`
-        // resolves to.
-        let (status, code, payload) = healthlake
-            .refused_body(
+        // An update writes the DRAFT and publishes nothing, so a read naming no
+        // version still resolves to that DRAFT — the content this update wrote.
+        let unpublished = healthlake
+            .ok(
                 case,
                 "GetDataTransformationProfile",
                 &json!({ "ProfileId": profile_id }),
             )
             .await;
         assert_eq!(
-            (status, code.as_str(), modelled_message(&payload)),
-            (
-                wire_http_status(404),
-                "ResourceNotFoundException",
-                Some(PROFILE_VERSION_NOT_FOUND_MESSAGE)
-            ),
-            "case {case:?}: an update publishes no version, got {payload}"
+            unpublished, draft,
+            "case {case:?}: an update publishes no version, so the DRAFT is what a read \
+             naming none serves, got {unpublished}"
         );
     }
 }
@@ -549,10 +544,14 @@ async fn refused_updates_leave_the_draft_untouched() {
             );
         }
         if expected_code == Some("ResourceNotFoundException") {
+            // An update edits the DRAFT, so the version it resolved is 0 and the
+            // refusal names the profile beside it.
+            let named = string_at(&request, "ProfileId");
             assert_eq!(
                 modelled_message(&payload),
-                Some(PROFILE_NOT_FOUND_MESSAGE),
-                "case {case:?}: an unknown profile states this service's fixed not-found sentence"
+                Some(profile_version_not_found_message(&named, 0).as_str()),
+                "case {case:?}: an unknown profile is named beside the DRAFT the update \
+                 resolved, got {payload}"
             );
         }
 

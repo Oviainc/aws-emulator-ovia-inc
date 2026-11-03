@@ -4,9 +4,9 @@
 //! operation whose input declares that member.
 //!
 //! The rule under test: a refusal of a value outside a modelled enum's value set is
-//! this service's ONE enum clause — the member and the permitted set alone, with no
-//! echo of what the caller sent — whichever operation refuses it, and whether the
-//! boundary validator or a handler re-stating that same constraint is the one
+//! this service's ONE enum clause — the member and the value set the service REPORTS,
+//! with no echo of what the caller sent — whichever operation refuses it, and whether
+//! the boundary validator or a handler re-stating that same constraint is the one
 //! answering. A value the enum DOES declare is served.
 //!
 //! The rows differ along what the rule generalises over: the FORM of the rejected
@@ -14,8 +14,9 @@
 //! unicode look-alikes, a numeric string, a member of a DIFFERENT modelled enum of
 //! this service, and an over-long string) and the OPERATION refusing it — the
 //! create, the listing and the publish, which are every operation whose input
-//! carries `SourceFormat`. The permitted set itself is read from the generated
-//! `SOURCE_FORMAT_VALUES`, so the expectation cannot drift from the model.
+//! carries `SourceFormat`. The reported set itself is read from
+//! `state::REPORTED_SOURCE_FORMATS` and the accepted one from the generated
+//! `SOURCE_FORMAT_VALUES`, so neither expectation is written out here.
 //!
 //! Each refusal is asserted twice over: once at the handler, called directly with a
 //! typed input, which is the only caller that reaches the handler's own re-statement
@@ -51,6 +52,7 @@ use healthlake::ops::types::{
     PublishDataTransformationProfileInput, SOURCE_FORMAT_VALUES,
 };
 use healthlake::scaffolded::Scaffolded;
+use healthlake::state::REPORTED_SOURCE_FORMATS;
 
 use crate::control_plane_error_semantics::enum_envelope;
 use crate::data_transformation_profile::{
@@ -64,23 +66,30 @@ use crate::fhir_datastore_lifecycle::{error_code, string_at};
 /// operation="CreateDataTransformationProfile,ListDataTransformationProfiles,PublishDataTransformationProfile")`).
 const SOURCE_FORMAT_PATH: &str = "sourceFormat";
 
-/// The success status the model gives `CreateDataTransformationProfile`
-/// (`@http(code: 201)`).
-const CREATE_SUCCESS_STATUS: u16 = 201;
+/// The success status this service answers `CreateDataTransformationProfile` with:
+/// awsJson1_0 binds nothing to the transport, so the operation's `@http(code: 201)`
+/// is inert and a success is the protocol's 200.
+const CREATE_SUCCESS_STATUS: u16 = 200;
 
 /// The forms a value outside the modelled `SourceFormat` set can take. The rule
 /// generalises over the value, so the rows differ along its form alone — including
 /// a value that IS a member of another modelled enum of this service
 /// (`TargetFormat`'s `FHIR_R4`), which is what makes "outside THIS member's set"
 /// the thing under test.
+///
+/// `HL7V2` is deliberately among them: it is a format the service's own refusal
+/// REPORTS, so this row pins what the emulator does with it — the constraint the
+/// boundary walk enforces is the model snapshot's enum, which omits it, so the value
+/// is refused and the refusal names it among the reported set. The snapshot is what
+/// would have to grow for it to be accepted; nothing here decides that quietly.
 fn rejected_source_formats() -> Vec<String> {
     let mut cases: Vec<String> = [
-        "HL7V2", "ccda", "csv", " CSV", "CSV ", "", "ⅭⅭⅮⅯ", "4", "FHIR_R4", "CCDA,CSV",
+        "HL7V2", "HL7", "ccda", "csv", " CSV", "CSV ", "", "ⅭⅭⅮⅯ", "4", "FHIR_R4", "CCDA,CSV",
     ]
     .iter()
     .map(|case| (*case).to_string())
     .collect();
-    // Longer than any value the enum declares, so length is not what tells it apart.
+    // Longer than any value the set declares, so length is not what tells it apart.
     cases.push("X".repeat(300));
     cases
 }
@@ -138,10 +147,7 @@ impl Handlers {
         &self,
         source_format: &str,
         profile_name: &str,
-    ) -> Result<
-        healthlake::ops::types::CreateDataTransformationProfileOutput,
-        CreateDataTransformationProfileError,
-    > {
+    ) -> Result<healthlake::ops::types::CreatedProfile, CreateDataTransformationProfileError> {
         CreateDataTransformationProfile::new(Arc::clone(&self.engine))
             .handle(
                 CreateDataTransformationProfileInput {
@@ -258,7 +264,7 @@ fn publish_refusal(case: &str, error: &PublishDataTransformationProfileError) ->
 /// `message` is this service's enum clause for `SourceFormat` and quotes nothing the
 /// caller sent.
 fn assert_enum_clause(case: &str, operation: &str, message: &str) {
-    let expected = enum_envelope(SOURCE_FORMAT_PATH, SOURCE_FORMAT_VALUES);
+    let expected = enum_envelope(SOURCE_FORMAT_PATH, REPORTED_SOURCE_FORMATS);
     assert_eq!(
         message, expected,
         "case {case:?}: {operation} must state the service's enum clause, expected \
@@ -335,12 +341,12 @@ async fn every_handler_that_restates_the_source_format_enum_states_one_clause() 
                 panic!("case {source_format:?}: a modelled format must be served, got {error:?}")
             });
         assert_eq!(
-            created.source_format, *source_format,
+            created.modelled.source_format, *source_format,
             "case {source_format:?}: the created profile reports the requested format, got {:?}",
-            created.source_format
+            created.modelled.source_format
         );
         let published = handlers
-            .publish(&created.profile_id, source_format)
+            .publish(&created.modelled.profile_id, source_format)
             .await
             .unwrap_or_else(|error| {
                 panic!("case {source_format:?}: the minted profile must publish, got {error:?}")
@@ -462,7 +468,7 @@ async fn the_wire_states_the_same_clause_for_every_operation_and_mints_nothing()
         "the control profile must still report the format it was created with, got {draft}"
     );
 
-    // A create at the modelled success status, for each value the enum declares:
+    // A create at the protocol's success status, for each value the enum declares:
     // the refusals above are about the value, not about the operation.
     for source_format in SOURCE_FORMAT_VALUES {
         let (status, payload) = healthlake

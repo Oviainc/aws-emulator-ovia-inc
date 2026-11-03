@@ -169,12 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused anything else; this re-states the rule for the reason the create
         // and the publish re-state it, because a format this service cannot convert
         // from describes no profile and so can never select one. It answers in the
-        // SAME words as the validator — member and permitted set, no echo of the
-        // rejected value.
+        // SAME words as the validator — member and the value set the service
+        // reports, no echo of the rejected value.
         if !SOURCE_FORMAT_VALUES.contains(&input.source_format.as_str()) {
             return Err(validation(crate::service::enum_violation_message(
                 SOURCE_FORMAT_PATH,
-                SOURCE_FORMAT_VALUES,
+                crate::state::REPORTED_SOURCE_FORMATS,
             )));
         }
 

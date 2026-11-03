@@ -19,6 +19,8 @@ mod data_transformation_job;
 mod data_transformation_job_listing;
 #[path = "all/data_transformation_profile.rs"]
 mod data_transformation_profile;
+#[path = "all/data_transformation_refusal_wording.rs"]
+mod data_transformation_refusal_wording;
 #[path = "all/datastore_action_gate.rs"]
 mod datastore_action_gate;
 #[path = "all/datastore_backup_restore_window.rs"]

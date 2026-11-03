@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_healthlake_healthlake::state::{
-    DATASTORE_NOT_FOUND_MESSAGE, PROFILE_NOT_FOUND_MESSAGE,
+    profile_not_found_message, DATASTORE_NOT_FOUND_MESSAGE,
 };
 
 use crate::fhir_datastore_lifecycle::error_code;
@@ -49,11 +49,11 @@ const MAX_TAG_KEY_LEN: usize = 128;
 const MAX_TAG_VALUE_LEN: usize = 256;
 
 /// One taggable resource under test: the label it reports itself under, its ARN, and
-/// the fixed sentence a request naming a resource of its kind that is not held states.
+/// the sentence a request naming a resource of its kind that is not held states.
 struct Resource {
     case: &'static str,
     arn: String,
-    not_found: &'static str,
+    not_found: String,
 }
 
 /// `arn` as a client puts it in a path: an `@httpLabel` is one path segment, so the
@@ -120,12 +120,12 @@ async fn resources(service: &HealthLake) -> Vec<Resource> {
         Resource {
             case: "a data transformation profile ARN",
             arn: crate::resource_tagging::profile_arn(&datastore, &profile),
-            not_found: PROFILE_NOT_FOUND_MESSAGE,
+            not_found: profile_not_found_message(&profile),
         },
         Resource {
             case: "a FHIR data store ARN",
             arn: datastore,
-            not_found: DATASTORE_NOT_FOUND_MESSAGE,
+            not_found: DATASTORE_NOT_FOUND_MESSAGE.to_string(),
         },
     ]
 }
@@ -436,32 +436,32 @@ async fn an_arn_whose_resource_is_not_held_is_refused_with_the_modelled_not_foun
     let fields: Vec<&str> = live.split(':').collect();
     let (region, account) = (fields[3], fields[4]);
     // Rows span the ways an ARN can name a resource this service does not hold, in
-    // EITHER resource form, each paired with the fixed sentence of the resource it
+    // EITHER resource form, each paired with the sentence of the resource it
     // names. The REST `ResourceArn` member targets a plain `String`, so an ARN of
     // neither form reaches the handler too and is answered the same way.
-    let rows: Vec<(&str, String, &str)> = vec![
+    let rows: Vec<(&str, String, String)> = vec![
         (
             "a profile id nothing was minted under",
             format!(
                 "arn:aws:healthlake:{region}:{account}:dataTransformationProfile/\
                  0123456789abcdef0123456789abcdef"
             ),
-            PROFILE_NOT_FOUND_MESSAGE,
+            profile_not_found_message("0123456789abcdef0123456789abcdef"),
         ),
         (
             "the live resource in another region",
             live.replacen(region, "eu-west-1", 1),
-            resources[0].not_found,
+            resources[0].not_found.clone(),
         ),
         (
             "the live resource in another account",
             live.replacen(account, "210987654321", 1),
-            resources[0].not_found,
+            resources[0].not_found.clone(),
         ),
         (
             "the live resource in another partition",
             live.replacen("arn:aws:", "arn:aws-cn:", 1),
-            resources[0].not_found,
+            resources[0].not_found.clone(),
         ),
         (
             "a data store id nothing was minted under",
@@ -469,17 +469,17 @@ async fn an_arn_whose_resource_is_not_held_is_refused_with_the_modelled_not_foun
                 "arn:aws:healthlake:{region}:{account}:datastore/fhir/\
                  00000000000000000000000000000000"
             ),
-            DATASTORE_NOT_FOUND_MESSAGE,
+            DATASTORE_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "an ARN of neither resource form",
             format!("arn:aws:healthlake:{region}:{account}:somethingElse/abc"),
-            DATASTORE_NOT_FOUND_MESSAGE,
+            DATASTORE_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "a value that is not an ARN at all",
             "not-an-arn".to_string(),
-            DATASTORE_NOT_FOUND_MESSAGE,
+            DATASTORE_NOT_FOUND_MESSAGE.to_string(),
         ),
     ];
 
@@ -514,12 +514,12 @@ async fn an_arn_whose_resource_is_not_held_is_refused_with_the_modelled_not_foun
             let message = answered.get("Message").and_then(Value::as_str);
             assert_eq!(
                 message,
-                Some(*expected_message),
+                Some(expected_message.as_str()),
                 "case {case:?}: {label} must state {expected_message:?}, got {message:?}"
             );
             assert!(
                 !answered.to_string().contains(arn.as_str()),
-                "case {case:?}: {label} must quote nothing from the request, got {answered}"
+                "case {case:?}: {label} must quote no ARN from the request, got {answered}"
             );
         }
     }

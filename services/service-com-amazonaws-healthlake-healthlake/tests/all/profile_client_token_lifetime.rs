@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use service_com_amazonaws_healthlake_healthlake::scaffolded::wire_http_status;
 use service_com_amazonaws_healthlake_healthlake::state::{
-    MAX_PROFILE_CLIENT_TOKENS, PROFILE_NOT_FOUND_MESSAGE,
+    MAX_PROFILE_CLIENT_TOKENS, profile_version_not_found_message,
 };
 
 use crate::data_transformation_profile::{
@@ -107,7 +107,8 @@ fn create_request(row: &Row, token: &str, profile_name: &str) -> Value {
 }
 
 /// Read a profile's DRAFT back, or `None` when no record holds that id — asserting
-/// that a missing one is refused with this service's fixed profile not-found answer.
+/// that a missing one is refused with the version this read NAMED, named in the
+/// sentence beside the profile.
 async fn read_draft(healthlake: &Profiles, case: &str, profile_id: &str) -> Option<Value> {
     let (status, payload) = healthlake
         .call(
@@ -118,11 +119,12 @@ async fn read_draft(healthlake: &Profiles, case: &str, profile_id: &str) -> Opti
     if (200..300).contains(&status) {
         return Some(payload);
     }
+    let expected = profile_version_not_found_message(profile_id, 0);
     assert_eq!(
         (status, modelled_message(&payload)),
-        (wire_http_status(404), Some(PROFILE_NOT_FOUND_MESSAGE)),
-        "case {case:?}: a profile no record holds is refused with this service's \
-         not-found sentence, got {payload}"
+        (wire_http_status(404), Some(expected.as_str())),
+        "case {case:?}: a profile no record holds is refused with the sentence naming \
+         it, got {payload}"
     );
     None
 }
@@ -216,7 +218,7 @@ async fn a_deleted_profiles_client_token_is_free_again() {
                 .call("CreateDataTransformationProfile", &reuse)
                 .await;
             assert_eq!(
-                status, 201,
+                status, 200,
                 "case {case:?} / {probe}: a create carrying the token of a deleted \
                  profile is accepted, got {status}: {payload}"
             );

@@ -199,17 +199,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused anything else; this re-states the rule for the reason the create
         // re-states it, because a format this service cannot convert from must never
         // name a version it publishes. It answers in the SAME words as the validator
-        // — member and permitted set, no echo of the rejected value.
+        // — member and the value set the service reports, no echo of the rejected
+        // value.
         if !SOURCE_FORMAT_VALUES.contains(&input.source_format.as_str()) {
             return Err(validation(crate::service::enum_violation_message(
                 SOURCE_FORMAT_PATH,
-                SOURCE_FORMAT_VALUES,
+                crate::state::REPORTED_SOURCE_FORMATS,
             )));
         }
 
+        // Which version's content this call promotes: "If you omit this parameter, the
+        // service publishes the current DRAFT version", and `FromExistingVersion` names
+        // "a previously published version to republish as the new latest version" — the
+        // rollback case. The content is COPIED either way, so the version it came from
+        // is left exactly as it was. Resolved before the profile is looked up, because
+        // it is read from the request alone and it is the version a refusal names.
+        let from_version = input
+            .from_existing_version
+            .unwrap_or(crate::state::DRAFT_PROFILE_VERSION);
+
         let mut store = state.lock();
+        // This write publishes a particular VERSION of the profile, so a profile no
+        // record holds is refused for that version — the one this call would have
+        // copied — rather than for the profile alone.
         let Some(profile) = store.profiles.get(&input.profile_id) else {
-            return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+            return Err(not_found(crate::state::profile_version_not_found_message(
+                &input.profile_id,
+                from_version,
+            )));
         };
 
         // `SourceFormat` is "the source data format of the profile", so a call naming
@@ -222,16 +239,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // Which version's content this call promotes: "If you omit this parameter, the
-        // service publishes the current DRAFT version", and `FromExistingVersion` names
-        // "a previously published version to republish as the new latest version" — the
-        // rollback case. The content is COPIED either way, so the version it came from
-        // is left exactly as it was.
-        let from_version = input
-            .from_existing_version
-            .unwrap_or(crate::state::DRAFT_PROFILE_VERSION);
         let Some(source) = profile.version(from_version) else {
-            return Err(not_found(crate::state::PROFILE_VERSION_NOT_FOUND_MESSAGE));
+            return Err(not_found(crate::state::profile_version_not_found_message(
+                &input.profile_id,
+                from_version,
+            )));
         };
         let mapping = source.mapping.clone();
 
@@ -274,7 +286,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The profile this call writes, now that every refusal it could answer has
         // been decided against the store as it stands.
         let Some(profile) = store.profiles.get_mut(&input.profile_id) else {
-            return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+            return Err(not_found(crate::state::profile_version_not_found_message(
+                &input.profile_id,
+                from_version,
+            )));
         };
 
         // The snapshot exists from this instant — nothing here outlives its own call —
@@ -313,12 +328,12 @@ fn validation(message: impl Into<String>) -> PublishDataTransformationProfileErr
     .into()
 }
 
-/// This operation's 404, worded without quoting the requested identifier — the
-/// wording this service's not-found text uses.
-fn not_found(message: &str) -> PublishDataTransformationProfileError {
+/// This operation's 404, stating which profile — and, for the version it resolved
+/// to publish from, which version of it — the service does not hold.
+fn not_found(message: String) -> PublishDataTransformationProfileError {
     PublishDataTransformationProfileErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: Some(message.to_string()),
+            message: Some(message),
         },
     )
     .into()

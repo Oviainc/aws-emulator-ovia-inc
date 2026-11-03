@@ -49,9 +49,10 @@ const DATA_ACCESS_ROLE_ARN: &str = "arn:aws:iam::111122223333:role/HealthLakeTra
 /// profile not existing rather than for the identifier's shape.
 const UNHELD_PROFILE_ID: &str = "ffffffffffffffffffffffffffffffff";
 
-/// The success status the model gives `CreateDataTransformationProfile`
-/// (`@http(code: 201)`), which this service answers on the wire.
-const CREATE_SUCCESS_STATUS: u16 = 201;
+/// The success status this service answers `CreateDataTransformationProfile` with:
+/// awsJson1_0 binds nothing to the transport, so the operation's `@http(code: 201)`
+/// is inert on the wire and a success is the protocol's 200.
+const CREATE_SUCCESS_STATUS: u16 = 200;
 
 /// One row: how the second call's body differs from the body that minted the
 /// record, named by its case.

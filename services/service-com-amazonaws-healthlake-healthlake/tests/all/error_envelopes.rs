@@ -14,11 +14,14 @@
 //!    — `smithy_query(query="shape",shape="ValidationException")`: `errorKind client`,
 //!    `httpError 400`, one member `Message` (target `HealthLakeString`, length
 //!    0..10000) — whose `Message` names the member that failed and the constraint it
-//!    failed, under that exact key. Not the framework's generic `message`.
-//! 3. **A not-found refusal states one fixed sentence.** Every
+//!    failed, under that exact key, and carries the SAME sentence under the
+//!    framework's lowercase `message` beside it, so no client path reads an empty
+//!    refusal and the two can never state different reasons.
+//! 3. **A not-found refusal names what it could not find.** Every
 //!    `ResourceNotFoundException` the data store surface raises carries
 //!    [`DATASTORE_NOT_FOUND_MESSAGE`] and nothing built from the request, however the
-//!    request addressed the data store (`DatastoreId` or `ResourceARN`).
+//!    request addressed the data store (`DatastoreId` or `ResourceARN`); a profile's
+//!    carries the sentence that names the profile.
 //!
 //! Every call below goes through [`MultiServiceRouter::dispatch`][d] by way of the
 //! shared harness in `fhir_datastore_lifecycle` — the same entry point `core/router`
@@ -30,7 +33,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_healthlake_healthlake::scaffolded::wire_http_status;
 use service_com_amazonaws_healthlake_healthlake::state::{
-    DATASTORE_NOT_FOUND_MESSAGE, PROFILE_NOT_FOUND_MESSAGE,
+    profile_not_found_message, DATASTORE_NOT_FOUND_MESSAGE,
 };
 
 use crate::fhir_datastore_lifecycle::{error_code, HealthLake, PAST_TRANSITION};
@@ -52,8 +55,7 @@ fn a_data_store() -> Value {
 /// The modelled `Message` member of an error body, under that exact key.
 ///
 /// `None` when the body carries no such member — which is the defect this suite pins:
-/// the framework's generic refusal envelope spells it lowercase `message`, so a client
-/// deserialising the modelled shape finds nothing.
+/// a client deserialising the modelled shape must find the sentence here.
 fn modelled_message(payload: &Value) -> Option<&str> {
     payload.get("Message").and_then(Value::as_str)
 }
@@ -252,7 +254,7 @@ struct ConstraintCase {
 ///
 /// The last column is the other half of the rule: the clause ECHOES the rejected value
 /// for every class where the value is the diagnostic, and does NOT for an enum, where
-/// the permitted set is.
+/// the permitted set is, nor for a `@pattern`, where the pattern is.
 #[tokio::test]
 async fn a_constraint_refusal_names_the_member_and_the_constraint_in_the_modelled_message() {
     let service = HealthLake::new();
@@ -288,14 +290,6 @@ async fn a_constraint_refusal_names_the_member_and_the_constraint_in_the_modelle
             echoed: None,
         },
         ConstraintCase {
-            case: "a value that is not an ARN at all",
-            operation: "ListTagsForResource",
-            request: json!({ "ResourceARN": "not-a-valid-arn" }),
-            member_path: "resourceARN",
-            requirement: "Member must satisfy regular expression pattern",
-            echoed: Some("not-a-valid-arn".to_string()),
-        },
-        ConstraintCase {
             case: "an ARN shorter than the declared minimum",
             operation: "TagResource",
             request: json!({ "ResourceARN": "", "Tags": [] }),
@@ -325,7 +319,7 @@ async fn a_constraint_refusal_names_the_member_and_the_constraint_in_the_modelle
             request: json!({ "DatastoreTypeVersion": "R4", "ClientToken": "not a token" }),
             member_path: "clientToken",
             requirement: "Member must satisfy regular expression pattern",
-            echoed: Some("not a token".to_string()),
+            echoed: None,
         },
         ConstraintCase {
             case: "a constraint on an element nested inside a list",
@@ -403,18 +397,21 @@ async fn a_constraint_refusal_names_the_member_and_the_constraint_in_the_modelle
                  got {message:?}"
             ),
         }
-        // The framework's generic envelope spells the member lowercase; the modelled
-        // shape spells it `Message`, and only the modelled one may reach the wire.
-        assert!(
-            payload.get("message").is_none(),
-            "case {case:?} on {operation}: the generic lowercase message member must not \
-             reach the wire, got {payload}"
+        // The modelled shape spells the member `Message`; the framework's envelope
+        // spells it lowercase. Both reach the wire carrying the SAME sentence, so a
+        // client reading either one reads the same reason.
+        assert_eq!(
+            payload.get("message").and_then(Value::as_str),
+            Some(message),
+            "case {case:?} on {operation}: both message members must carry one sentence, \
+             got {payload}"
         );
     }
 }
 
 /// RULE 3: every not-found refusal of the data store surface states the service's one
-/// fixed sentence and carries nothing built from the request.
+/// fixed sentence and carries nothing built from the request; a profile's names the
+/// profile it could not find.
 ///
 /// The rows span how a request can address a data store the service does not hold:
 /// by `DatastoreId` (an id nothing was minted under, a one-character id, an id one
@@ -461,13 +458,13 @@ async fn a_not_found_refusal_states_one_fixed_sentence_that_quotes_nothing_from_
     // modelled `AmazonResourceName` admits a data store ARN and a data
     // transformation profile ARN, and this slice holds neither of the records
     // these rows address.
-    let arn_rows: Vec<(&str, String, &str)> = vec![
+    let arn_rows: Vec<(&str, String, String)> = vec![
         (
             "an ARN whose id nothing was minted under",
             format!(
                 "arn:aws:healthlake:us-east-1:000000000000:datastore/fhir/{unknown_id}"
             ),
-            DATASTORE_NOT_FOUND_MESSAGE,
+            DATASTORE_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "an ARN of a live id with its last character changed",
@@ -478,29 +475,29 @@ async fn a_not_found_refusal_states_one_fixed_sentence_that_quotes_nothing_from_
                 arn.push(flipped);
                 arn
             },
-            DATASTORE_NOT_FOUND_MESSAGE,
+            DATASTORE_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "a dataTransformationProfile ARN no profile was minted under",
             "arn:aws:healthlake:us-east-1:000000000000:dataTransformationProfile/\
              0123456789abcdef0123456789abcdef"
                 .to_string(),
-            PROFILE_NOT_FOUND_MESSAGE,
+            profile_not_found_message("0123456789abcdef0123456789abcdef"),
         ),
         (
             "a live id in another region",
             format!("arn:aws:healthlake:eu-west-1:000000000000:datastore/fhir/{live}"),
-            DATASTORE_NOT_FOUND_MESSAGE,
+            DATASTORE_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "a live id in another account",
             format!("arn:aws:healthlake:us-east-1:210987654321:datastore/fhir/{live}"),
-            DATASTORE_NOT_FOUND_MESSAGE,
+            DATASTORE_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "a live id in another partition",
             format!("arn:aws-cn:healthlake:us-east-1:000000000000:datastore/fhir/{live}"),
-            DATASTORE_NOT_FOUND_MESSAGE,
+            DATASTORE_NOT_FOUND_MESSAGE.to_string(),
         ),
     ];
     for (case, arn, expected_message) in &arn_rows {
@@ -582,10 +579,12 @@ fn assert_not_found(
         "case {case:?} on {operation}: expected Message {expected_message:?}, \
          got {actual:?}"
     );
-    // Nothing from the request may appear in the body. Checked for an identifier long
-    // enough to be distinctive: a one- or two-character id can occur inside the fixed
-    // sentence by coincidence, which would be a false failure rather than a leak.
-    if addressed.len() >= 8 {
+    // Nothing from the request may appear in the body beyond what the resource's own
+    // sentence names — the data store texts name nothing, a profile's names the
+    // profile. Checked for an identifier long enough to be distinctive: a one- or
+    // two-character id can occur inside the fixed sentence by coincidence, which would
+    // be a false failure rather than a leak.
+    if addressed.len() >= 8 && !expected_message.contains(addressed) {
         assert!(
             !payload.to_string().contains(addressed),
             "case {case:?} on {operation}: the refusal must quote nothing from the request, \

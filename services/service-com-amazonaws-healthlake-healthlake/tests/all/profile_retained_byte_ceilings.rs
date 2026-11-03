@@ -71,6 +71,11 @@ const SOURCE_FORMAT: &str = "CSV";
 /// FHIR_R4".
 const TARGET_FORMAT: &str = "FHIR_R4";
 
+/// The status this service answers a served call with: awsJson1_0 binds nothing to
+/// the transport, so every operation succeeds with 200 — the create's modelled
+/// `@http(code: 201)` is inert on the wire.
+const SERVED_STATUS: u16 = 200;
+
 /// A mapping whose keys and values hold EXACTLY `bytes` bytes together, from the
 /// shared profile harness, with the size this suite's rows depend on re-asserted
 /// here: a row that must sit ON a ceiling is only a test of the ceiling if its
@@ -111,8 +116,8 @@ async fn create_subject(service: &HealthLake, case: &str, bytes: usize) -> Strin
         )
         .await;
     assert_eq!(
-        status, 201,
-        "case {case:?}: the subject create must answer its modelled 201, got {status}: {created}"
+        status, 200,
+        "case {case:?}: the subject create must answer the protocol's 200, got {status}: {created}"
     );
     string_at(&created, "ProfileId")
 }
@@ -235,15 +240,6 @@ impl Charge {
         }
     }
 
-    /// The status this call answers when it is served, as its own model binds it:
-    /// a create is `@http(code: 201)`, the other two 200.
-    fn served_status(self) -> u16 {
-        match self {
-            Self::Create => 201,
-            Self::Update | Self::Publish => 200,
-        }
-    }
-
     /// The modelled error this operation refuses a capacity it cannot retain with:
     /// the quota-shaped error where it declares one, and the throttling-shaped one
     /// where it does not — the same choice the sibling writes that charge a
@@ -348,8 +344,7 @@ async fn every_write_that_retains_profile_content_charges_the_store_wide_ceiling
                 }
                 Fill::WellInside => {
                     assert_eq!(
-                        status,
-                        charge.served_status(),
+                        status, SERVED_STATUS,
                         "case {case:?}: a call the store can retain must be served, got {status}: \
                          {payload}"
                     );

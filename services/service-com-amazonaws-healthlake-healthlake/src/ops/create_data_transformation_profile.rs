@@ -24,6 +24,9 @@
 //! profile that token minted, and answers what the create that minted it
 //! answered — whatever the rest of the request says.
 //!
+//! The reply carries the new profile's status beside the modelled members — see
+//! [`CreatedProfile`] — so a caller learns it without a second call.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -186,13 +189,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for CreateDataTransformationProfile<Eng>
 {
     type Input = CreateDataTransformationProfileInput;
-    type Output = CreateDataTransformationProfileOutput;
+    type Output = CreatedProfile;
     type Error = CreateDataTransformationProfileError;
 
     const NAME: &'static str = "CreateDataTransformationProfile";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_DATA_TRANSFORMATION_PROFILE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_DATA_TRANSFORMATION_PROFILE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 201u16;
+    // HealthLake speaks awsJson1_0 (`smithy_query(query="service_info")` ->
+    // `protocols: ["awsJson1_0"]`), and the awsJson family binds nothing to the
+    // transport: this operation's `@http(code: 201)` is reported
+    // `httpBindingsInert` for exactly that reason, so the success status is the
+    // protocol's 200 — the status every other operation of this service answers
+    // with — and not the inert modelled code.
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,
@@ -209,11 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused anything else; this re-states the rule rather than trusting it,
         // because a format this service cannot convert from must never be recorded
         // on a profile. It answers in the SAME words as the validator — member and
-        // permitted set, no echo of the rejected value.
+        // the value set the service reports, no echo of the rejected value.
         if !SOURCE_FORMAT_VALUES.contains(&input.source_format.as_str()) {
             return Err(validation(crate::service::enum_violation_message(
                 SOURCE_FORMAT_PATH,
-                SOURCE_FORMAT_VALUES,
+                crate::state::REPORTED_SOURCE_FORMATS,
             )));
         }
         // The modelled `TargetFormat` enum declares exactly one value, which this
@@ -242,13 +251,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cloned()
         {
             if let Some(existing) = store.profiles.get(&recorded.profile_id) {
-                return Ok(CreateDataTransformationProfileOutput {
-                    profile_id: existing.id.clone(),
-                    version: crate::state::DRAFT_PROFILE_VERSION,
-                    source_format: existing.source_format.clone(),
-                    target_format: existing.target_format.clone(),
-                    profile_name: existing.name.clone(),
-                    last_updated_at: existing.created_at,
+                return Ok(CreatedProfile {
+                    modelled: CreateDataTransformationProfileOutput {
+                        profile_id: existing.id.clone(),
+                        version: crate::state::DRAFT_PROFILE_VERSION,
+                        source_format: existing.source_format.clone(),
+                        target_format: existing.target_format.clone(),
+                        profile_name: existing.name.clone(),
+                        last_updated_at: existing.created_at,
+                    },
+                    profile_status: existing.status().to_string(),
                 });
             }
         }
@@ -311,13 +323,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
         };
 
-        let output = CreateDataTransformationProfileOutput {
-            profile_id: profile.id.clone(),
-            version: profile.draft.version,
-            source_format: profile.source_format.clone(),
-            target_format: profile.target_format.clone(),
-            profile_name: profile.name.clone(),
-            last_updated_at: profile.created_at,
+        let output = CreatedProfile {
+            modelled: CreateDataTransformationProfileOutput {
+                profile_id: profile.id.clone(),
+                version: profile.draft.version,
+                source_format: profile.source_format.clone(),
+                target_format: profile.target_format.clone(),
+                profile_name: profile.name.clone(),
+                last_updated_at: profile.created_at,
+            },
+            // The status of the record this call is about to store, read off that
+            // record rather than written out here.
+            profile_status: profile.status().to_string(),
         };
         store.profiles.insert(id.clone(), profile);
         if let Some(token) = input.client_token {
@@ -365,10 +382,15 @@ fn initial_mapping(
             // id no profile holds is not told its VERSION is missing — the same
             // distinction `GetDataTransformationProfile` makes.
             let Some(profile) = store.profiles.get(&source.profile_id) else {
-                return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+                return Err(not_found(crate::state::profile_not_found_message(
+                    &source.profile_id,
+                )));
             };
             let Some(version) = profile.version(source.version) else {
-                return Err(not_found(crate::state::PROFILE_VERSION_NOT_FOUND_MESSAGE));
+                return Err(not_found(crate::state::profile_version_not_found_message(
+                    &source.profile_id,
+                    source.version,
+                )));
             };
             Ok(version.mapping.clone())
         }
@@ -429,12 +451,12 @@ fn quota_exceeded(message: impl Into<String>) -> CreateDataTransformationProfile
     .into()
 }
 
-/// This operation's 404, worded without quoting the requested identifier — the
-/// wording this service's not-found text uses.
-fn not_found(message: &str) -> CreateDataTransformationProfileError {
+/// This operation's 404, stating which profile — and, where a version was named,
+/// which version of it — the service does not hold.
+fn not_found(message: String) -> CreateDataTransformationProfileError {
     CreateDataTransformationProfileErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: Some(message.to_string()),
+            message: Some(message),
         },
     )
     .into()

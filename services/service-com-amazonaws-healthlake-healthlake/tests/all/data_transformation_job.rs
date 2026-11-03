@@ -38,7 +38,7 @@ use service_com_amazonaws_healthlake_healthlake::ops::types::{
 };
 use service_com_amazonaws_healthlake_healthlake::state::{
     ComAmazonawsHealthlakeHealthlakeState, ExportJob, JobStatus, TransformationJob,
-    TransformationJobStatus, TRANSFORMATION_JOB_NOT_FOUND_MESSAGE,
+    TransformationJobStatus,
 };
 
 use crate::fhir_datastore_lifecycle::{error_code, error_message, HealthLake, PAST_TRANSITION};
@@ -560,12 +560,14 @@ async fn a_job_id_no_record_holds_is_refused_with_the_fixed_not_found_sentence()
         );
         assert_eq!(
             error_message(&payload),
-            TRANSFORMATION_JOB_NOT_FOUND_MESSAGE,
-            "case {case:?}: must state this service's fixed not-found sentence, got {payload}"
+            service_com_amazonaws_healthlake_healthlake::state::transformation_job_not_found_message(
+                job_id
+            ),
+            "case {case:?}: must state the not-found sentence naming the job, got {payload}"
         );
         assert!(
-            !payload.to_string().contains(job_id),
-            "case {case:?}: a refusal must quote nothing from the request, got {payload}"
+            payload.to_string().contains(job_id),
+            "case {case:?}: the refusal must name the job that was not found, got {payload}"
         );
     }
 

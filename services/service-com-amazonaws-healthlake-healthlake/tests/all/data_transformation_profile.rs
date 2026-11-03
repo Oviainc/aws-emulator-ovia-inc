@@ -20,18 +20,21 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_healthlake_healthlake::scaffolded::wire_http_status;
 use service_com_amazonaws_healthlake_healthlake::state::{
-    PROFILE_NOT_FOUND_MESSAGE, PROFILE_VERSION_NOT_FOUND_MESSAGE,
+    profile_not_found_message, profile_version_not_found_message, ACTIVE_PROFILE_STATUS,
 };
 
 use crate::fhir_datastore_lifecycle::{error_code, string_at, HealthLake};
 
-/// The success status the model gives `CreateDataTransformationProfile`
-/// (`@http(code: 201)`), which this service answers on the wire.
-const CREATE_SUCCESS_STATUS: u16 = 201;
+/// The success status this service answers `CreateDataTransformationProfile` with.
+///
+/// HealthLake speaks awsJson1_0, which binds nothing to the transport, so the
+/// operation's `@http(code: 201)` is inert on the wire
+/// (`smithy_query(query="operation",operation="CreateDataTransformationProfile")` ->
+/// `httpBindingsInert`) and a success is the protocol's 200.
+const CREATE_SUCCESS_STATUS: u16 = 200;
 
 /// The shared router harness plus the case-labelled assertions this suite's tables
-/// need: every row names itself in the failure message, and this slice's create
-/// answers the modelled 201 rather than the 200 the shared `ok` requires.
+/// need: every row names itself in the failure message.
 ///
 /// `pub(crate)` so the sibling profile suites in `tests/all/` drive the slice
 /// through this one harness rather than each writing its own.
@@ -88,6 +91,56 @@ impl Profiles {
 /// this service's own error shapes declare, not the framework's lowercase one.
 pub(crate) fn modelled_message(payload: &Value) -> Option<&str> {
     payload.get("Message").and_then(Value::as_str)
+}
+
+/// The sentence this service refuses `operation` with when the profile `request`
+/// addresses is one no record holds.
+///
+/// The rule the profile surface's not-found texts follow: a call that resolves a
+/// particular VERSION of the profile is refused for that version — a read that NAMED
+/// one, an update (which edits the DRAFT, version 0) and a publish (which copies the
+/// version it is told to, the DRAFT by default) — while a call that resolves the
+/// PROFILE itself is refused for the profile. Either way the sentence names what the
+/// call could not find, taken from the request.
+///
+/// `pub(crate)` so every profile suite asserts the one rule rather than restating it.
+pub(crate) fn expected_profile_not_found(operation: &str, request: &Value) -> String {
+    let profile_id = addressed_profile(request);
+    match operation {
+        "GetDataTransformationProfile" => {
+            match request.get("ProfileVersion").and_then(Value::as_i64) {
+                Some(version) => profile_version_not_found_message(&profile_id, version as i32),
+                None => profile_not_found_message(&profile_id),
+            }
+        }
+        "UpdateDataTransformationProfile" => profile_version_not_found_message(
+            &profile_id,
+            service_com_amazonaws_healthlake_healthlake::state::DRAFT_PROFILE_VERSION,
+        ),
+        "PublishDataTransformationProfile" => profile_version_not_found_message(
+            &profile_id,
+            request
+                .get("FromExistingVersion")
+                .and_then(Value::as_i64)
+                .unwrap_or(i64::from(
+                    service_com_amazonaws_healthlake_healthlake::state::DRAFT_PROFILE_VERSION,
+                )) as i32,
+        ),
+        _ => profile_not_found_message(&profile_id),
+    }
+}
+
+/// The profile a request addresses: its `ProfileId`, or the id segment of the
+/// `ResourceARN` a tagging call names it by.
+fn addressed_profile(request: &Value) -> String {
+    if let Some(profile_id) = request.get("ProfileId").and_then(Value::as_str) {
+        return profile_id.to_string();
+    }
+    let arn = request
+        .get("ResourceARN")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    arn.rsplit('/').next().unwrap_or_default().to_string()
 }
 
 /// A `Source` union naming raw profile content.
@@ -315,6 +368,11 @@ async fn create_persists_a_draft_every_get_reads_back() {
             created["LastUpdatedAt"].as_f64().is_some_and(|at| at > 0.0),
             "case {case:?}: LastUpdatedAt is the creation instant, got {created}"
         );
+        assert_eq!(
+            created["ProfileStatus"].as_str(),
+            Some(ACTIVE_PROFILE_STATUS),
+            "case {case:?}: the create reports the new profile's status, got {created}"
+        );
         assert!(
             !minted.contains(&profile_id),
             "case {case:?}: every create mints a distinct ProfileId, got {profile_id:?} twice"
@@ -370,26 +428,42 @@ async fn create_persists_a_draft_every_get_reads_back() {
             "case {case:?}: a created DRAFT has no change to describe, got {draft}"
         );
 
-        // A profile that has never been published has no latest published version,
-        // which is what an omitted `ProfileVersion` resolves to. The status is the
-        // one this service puts a CLIENT fault on the awsJson wire with, derived
-        // from the shape's modelled `@httpError(404)` rather than hand-copied.
-        let (status, code, payload) = healthlake
-            .refused_body(
+        // A profile that has never been published is READ BACK at its DRAFT when the
+        // request names no version: the DRAFT is what the create wrote, so the
+        // authoring loop create -> get serves the content the caller just stored.
+        let omitted = healthlake
+            .ok(
                 case,
                 "GetDataTransformationProfile",
                 &json!({ "ProfileId": profile_id }),
             )
             .await;
         assert_eq!(
+            omitted, draft,
+            "case {case:?}: a read naming no version serves the DRAFT of an unpublished \
+             profile, got {omitted}"
+        );
+
+        // A version the profile does not hold is refused by number, naming the
+        // profile and that version. The status is the one this service puts a CLIENT
+        // fault on the awsJson wire with, derived from the shape's modelled
+        // `@httpError(404)` rather than hand-copied.
+        let (status, code, payload) = healthlake
+            .refused_body(
+                case,
+                "GetDataTransformationProfile",
+                &json!({ "ProfileId": profile_id, "ProfileVersion": 1 }),
+            )
+            .await;
+        assert_eq!(
             modelled_message(&payload),
-            Some(PROFILE_VERSION_NOT_FOUND_MESSAGE),
-            "case {case:?}: the refusal states this service's fixed version not-found sentence"
+            Some(profile_version_not_found_message(&profile_id, 1).as_str()),
+            "case {case:?}: the refusal names the profile and the version, got {payload}"
         );
         assert_eq!(
             (status, code.as_str()),
             (wire_http_status(404), "ResourceNotFoundException"),
-            "case {case:?}: an unpublished profile has no latest published version"
+            "case {case:?}: an unpublished profile holds no version 1"
         );
     }
 }
@@ -615,12 +689,15 @@ async fn refused_creates_persist_nothing() {
             "case {case:?}: expected {expected_status} {expected_code}, got {payload}"
         );
         // A clone that names no stored profile is told the PROFILE is missing, not
-        // its version: the two lookups answer with their own fixed sentence.
+        // its version: the two lookups answer with their own sentence, each naming
+        // what it could not find.
         if expected_code == "ResourceNotFoundException" {
+            let named = string_at(&request["Source"]["ExistingVersionedProfileId"], "ProfileId");
             assert_eq!(
                 modelled_message(&payload),
-                Some(PROFILE_NOT_FOUND_MESSAGE),
-                "case {case:?}: a clone of no stored profile states the profile not-found sentence"
+                Some(profile_not_found_message(&named).as_str()),
+                "case {case:?}: a clone of no stored profile names the profile it could not \
+                 find, got {payload}"
             );
         }
     }
@@ -659,7 +736,7 @@ async fn refused_creates_persist_nothing() {
         (
             wire_http_status(404),
             "ResourceNotFoundException",
-            Some(PROFILE_VERSION_NOT_FOUND_MESSAGE)
+            Some(profile_version_not_found_message(&origin_id, 7).as_str())
         ),
         "case {case:?}: the version, not the profile, is what is missing"
     );
@@ -725,8 +802,8 @@ async fn reading_a_version_a_profile_does_not_have_is_not_found() {
             .await;
         assert_eq!(
             modelled_message(&payload),
-            Some(PROFILE_VERSION_NOT_FOUND_MESSAGE),
-            "case {case:?}: version {version} is refused with the fixed version not-found sentence"
+            Some(profile_version_not_found_message(&profile_id, version).as_str()),
+            "case {case:?}: version {version} is refused naming the profile and that version"
         );
         assert_eq!(
             (status, code.as_str()),
@@ -748,27 +825,31 @@ async fn reading_a_version_a_profile_does_not_have_is_not_found() {
         "case {case:?}: ProfileVersion 100 is outside the modelled 0..99 range"
     );
 
-    // A well-formed id no profile has, at the DRAFT version every profile has.
-    let (status, code, payload) = healthlake
-        .refused_body(
-            "a well-formed ProfileId no profile has",
-            "GetDataTransformationProfile",
-            &json!({
-                "ProfileId": "ffffffffffffffffffffffffffffffff",
-                "ProfileVersion": 0,
-            }),
-        )
-        .await;
-    assert_eq!(
-        modelled_message(&payload),
-        Some(PROFILE_NOT_FOUND_MESSAGE),
-        "an unknown ProfileId is refused with this service's fixed not-found sentence"
-    );
-    assert_eq!(
-        (status, code.as_str()),
-        (wire_http_status(404), "ResourceNotFoundException"),
-        "an unknown ProfileId is not found"
-    );
+    // A well-formed id no profile has: a read that NAMED a version is refused for
+    // that version of it, and one that named none for the profile itself.
+    for request in [
+        json!({ "ProfileId": "ffffffffffffffffffffffffffffffff", "ProfileVersion": 0 }),
+        json!({ "ProfileId": "ffffffffffffffffffffffffffffffff" }),
+    ] {
+        let (status, code, payload) = healthlake
+            .refused_body(
+                "a well-formed ProfileId no profile has",
+                "GetDataTransformationProfile",
+                &request,
+            )
+            .await;
+        let expected = expected_profile_not_found("GetDataTransformationProfile", &request);
+        assert_eq!(
+            modelled_message(&payload),
+            Some(expected.as_str()),
+            "an unknown ProfileId is refused with a sentence naming it, got {payload}"
+        );
+        assert_eq!(
+            (status, code.as_str()),
+            (wire_http_status(404), "ResourceNotFoundException"),
+            "an unknown ProfileId is not found"
+        );
+    }
 }
 
 /// The idempotency table: the rule must hold whatever the request carries, so the

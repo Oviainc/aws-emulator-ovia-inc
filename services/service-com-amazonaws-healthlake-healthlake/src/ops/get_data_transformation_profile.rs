@@ -4,7 +4,8 @@
 //!
 //! Reports one version of a stored data transformation profile: the version the
 //! caller named, the DRAFT at version 0, or — when the caller names none — the
-//! latest version published from that DRAFT. A reporting operation: it reads
+//! latest version published from that DRAFT, falling back to the DRAFT itself
+//! while the profile holds no published version. A reporting operation: it reads
 //! [`crate::state`] and writes nothing.
 //!
 //! ## Shape of an operation
@@ -182,18 +183,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what a later caller sees is exactly what this one saw.
         let store = state.lock();
         let Some(profile) = store.profiles.get(&input.profile_id) else {
-            return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+            // A read that NAMED a version is refused for that version of the
+            // profile; a read that named none is refused for the profile itself —
+            // which is the resource it was asking for.
+            return Err(not_found(match input.profile_version {
+                Some(version) => {
+                    crate::state::profile_version_not_found_message(&input.profile_id, version)
+                }
+                None => crate::state::profile_not_found_message(&input.profile_id),
+            }));
         };
 
         // "Specify 0 to retrieve the DRAFT version. If you omit this parameter, the
         // service returns the latest published version" — and a profile that has
-        // never been published has no latest published version to return.
+        // never been published is read back at its DRAFT, which is the version the
+        // create and every update wrote.
         let version = match input.profile_version {
-            Some(version) => profile.version(version),
-            None => profile.latest_published(),
-        };
-        let Some(version) = version else {
-            return Err(not_found(crate::state::PROFILE_VERSION_NOT_FOUND_MESSAGE));
+            Some(version) => match profile.version(version) {
+                Some(version) => version,
+                None => {
+                    return Err(not_found(crate::state::profile_version_not_found_message(
+                        &input.profile_id,
+                        version,
+                    )))
+                }
+            },
+            None => profile.latest_readable(),
         };
 
         Ok(GetDataTransformationProfileOutput {
@@ -210,12 +225,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// This operation's 404, worded without quoting the requested identifier — the
-/// wording this service's not-found text uses.
-fn not_found(message: &str) -> GetDataTransformationProfileError {
+/// This operation's 404, stating which profile — and, where the request named one,
+/// which version of it — the service does not hold.
+fn not_found(message: String) -> GetDataTransformationProfileError {
     GetDataTransformationProfileErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: Some(message.to_string()),
+            message: Some(message),
         },
     )
     .into()

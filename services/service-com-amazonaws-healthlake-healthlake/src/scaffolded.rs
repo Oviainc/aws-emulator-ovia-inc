@@ -115,7 +115,11 @@ impl SerializableStruct for NotImplemented {
 }
 
 /// The `message` member of the synthetic `ValidationException` error shape.
-static VALIDATION_EXCEPTION_MESSAGE: Schema = Schema::new_member(
+///
+/// `pub(crate)` because it is the ONE declaration of that wire member in this crate:
+/// [`crate::service`] writes the same member beside the modelled `Message` on a
+/// constraint refusal, and two schemas for one member could drift.
+pub(crate) static VALIDATION_EXCEPTION_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
         "smithy.framework#ValidationException$message",
         "smithy.framework",

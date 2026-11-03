@@ -787,8 +787,8 @@ async fn a_started_job_is_listed_exactly_as_describe_reports_it() {
         )
         .await;
     assert_eq!(
-        status, 201,
-        "creating the profile must answer its modelled 201, got {status}: {created}"
+        status, 200,
+        "creating the profile must answer the protocol's 200, got {status}: {created}"
     );
     let profile_id = string_at(&created, "ProfileId");
 

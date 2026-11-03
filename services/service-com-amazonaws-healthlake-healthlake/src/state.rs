@@ -288,28 +288,67 @@ const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 /// The sentence this service's `ResourceNotFoundException` carries when the
 /// request names a data transformation profile no record holds.
 ///
-/// Fixed, for the reason [`DATASTORE_NOT_FOUND_MESSAGE`] is: the same sentence
-/// whatever `ProfileId` was asked about, so a not-found answer never quotes the
-/// request back at the caller. Every profile not-found path in this crate states
-/// it through this one constant.
-pub const PROFILE_NOT_FOUND_MESSAGE: &str = "Could not find specified profile.";
+/// Unlike the data-store texts above, the data transformation surface IDENTIFIES
+/// the resource it could not find: the sentence is a template whose one variable
+/// part is the `ProfileId` the request asked about, so a caller fanning out over
+/// several profiles can tell which one was missing. The identifier is taken from
+/// the request and is bounded by the modelled `ProfileIdString` (32 characters,
+/// `^[a-f0-9]{32}$`), which the boundary validator has already enforced. Every
+/// profile not-found path in this crate states it through this one function.
+pub fn profile_not_found_message(profile_id: &str) -> String {
+    format!("Profile '{profile_id}' not found")
+}
 
 /// The sentence this service's `ResourceNotFoundException` carries when the
-/// profile exists but not at the version the request asked for — a version that
-/// was never published, or a latest published version on a profile that has only
-/// its DRAFT. Fixed for the same reason as [`PROFILE_NOT_FOUND_MESSAGE`].
-pub const PROFILE_VERSION_NOT_FOUND_MESSAGE: &str =
-    "Could not find specified profile version.";
+/// profile exists but not at the version the call resolved — a version that was
+/// never published, or the DRAFT of a profile no record holds.
+///
+/// The template of [`profile_not_found_message`] with a second variable part: the
+/// version the call resolved, so a caller can tell a missing profile from a
+/// missing version of one. Every profile-version not-found path in this crate
+/// states it through this one function.
+pub fn profile_version_not_found_message(profile_id: &str, version: i32) -> String {
+    format!("Profile '{profile_id}' version {version} not found")
+}
 
 /// The sentence this service's `ResourceNotFoundException` carries when the
 /// request names a data transformation job no record holds.
 ///
-/// Fixed, for the reason [`DATASTORE_NOT_FOUND_MESSAGE`] is: the same sentence
-/// whatever `JobId` was asked about, so a not-found answer never quotes the
-/// request back at the caller. Every transformation-job not-found path in this
-/// crate states it through this one constant.
-pub const TRANSFORMATION_JOB_NOT_FOUND_MESSAGE: &str =
-    "Could not find specified data transformation job.";
+/// A template, for the reason [`profile_not_found_message`] is: its one variable
+/// part is the `JobId` the request asked about, bounded by the modelled
+/// `DataTransformationJobId` (1..32, `^[a-zA-Z0-9-]+$`) the boundary validator has
+/// already enforced. Every transformation-job not-found path in this crate states
+/// it through this one function.
+pub fn transformation_job_not_found_message(job_id: &str) -> String {
+    format!("Transformation job not found: {job_id}")
+}
+
+/// The `SourceFormat` value set this service's refusal of a value outside the enum
+/// REPORTS, in the order it lists them.
+///
+/// Wider than the on-disk model snapshot's `SourceFormat` enum
+/// (`smithy_query(query="shape",shape="SourceFormat")` -> `values: [CCDA, CSV]`),
+/// which lags the service: the wire refusal the service answers an unsupported
+/// format with names all three, so this is what a caller correcting its request
+/// reads. The CONSTRAINT itself is still the model's — the boundary walk enforces the
+/// snapshot's enum — so this set is used for the SENTENCE only, in the one place each
+/// refusal is worded.
+///
+/// One consequence, stated plainly rather than left for a reader to find: a value
+/// this set names but the snapshot's enum does not (`HL7V2`) is still REFUSED, since
+/// what admits a value is the model the framework walks. Growing the snapshot is what
+/// would accept it; `tests/all/source_format_enum_refusal.rs` keeps that value among
+/// its refused rows so the emulator's answer for it is pinned, not quietly assumed.
+pub const REPORTED_SOURCE_FORMATS: &[&str] = &["CSV", "HL7V2", "CCDA"];
+
+/// The status a stored data transformation profile reports.
+///
+/// The service reports a profile's status in its create reply, and a profile is
+/// usable from the instant that reply is written — its DRAFT exists then, so no
+/// transition is owed and no other status is reachable. It is not a member of the
+/// model snapshot's profile shapes, so the spelling is the one the wire carries.
+/// Read through [`DataTransformationProfile::status`], never written out beside it.
+pub const ACTIVE_PROFILE_STATUS: &str = "ACTIVE";
 
 /// Why a started data transformation job ends in the modelled `FAILED` status:
 /// the run has to READ the source files from the input Amazon S3 location and
@@ -1609,6 +1648,18 @@ pub struct DataTransformationProfile {
 }
 
 impl DataTransformationProfile {
+    /// The status this service reports this profile in.
+    ///
+    /// Read off the record: the DRAFT exists from the instant the create that
+    /// minted it returned, so a profile this service holds owes the clock no
+    /// transition and nothing about it is pending — it is reported
+    /// [`ACTIVE_PROFILE_STATUS`]. `ProfileStatus` is not a member of the model
+    /// snapshot's profile shapes; the service reports it in the create reply, and
+    /// this is the one place that answer is decided.
+    pub fn status(&self) -> &'static str {
+        ACTIVE_PROFILE_STATUS
+    }
+
     /// The version `version` names: the DRAFT at [`DRAFT_PROFILE_VERSION`], a
     /// published snapshot above it, or `None` when this profile has no such
     /// version.
@@ -1618,6 +1669,19 @@ impl DataTransformationProfile {
         } else {
             self.published.get(&version)
         }
+    }
+
+    /// The version a read that names NO version resolves to: the latest published
+    /// version, and the DRAFT while the profile has none.
+    ///
+    /// `GetDataTransformationProfile` documents the first half ("If you omit this
+    /// parameter, the service returns the latest published version") and the
+    /// recorded wire shows the second: a profile that has been created, and
+    /// perhaps updated, but never published is READ BACK at its DRAFT rather than
+    /// refused, so the authoring loop create -> get and create -> update -> get
+    /// serves the content the caller just wrote.
+    pub fn latest_readable(&self) -> &ProfileVersionRecord {
+        self.latest_published().unwrap_or(&self.draft)
     }
 
     /// The stored tags as the modelled `TagList`, ordered by key — the same
@@ -2027,7 +2091,7 @@ impl ComAmazonawsHealthlakeHealthlakeState {
     ///
     /// Call [`Self::settle_lifecycle`] first, so the status this reads is the one
     /// the clock already owes.
-    pub fn tags_for_mutation(&mut self, arn: &str) -> Result<MutableTags<'_>, &'static str> {
+    pub fn tags_for_mutation(&mut self, arn: &str) -> Result<MutableTags<'_>, String> {
         match tagged_resource_from_arn(arn) {
             Some(TaggedResource::Datastore(id)) => self
                 .datastores
@@ -2039,22 +2103,27 @@ impl ComAmazonawsHealthlakeHealthlakeState {
                     max_tags: MAX_TAGS_PER_DATASTORE,
                     noun: DATASTORE_NOUN,
                 })
-                .ok_or(DATASTORE_NOT_FOUND_MESSAGE),
-            Some(TaggedResource::Profile(id)) => self
-                .profiles
-                .get_mut(id)
-                .filter(|profile| profile.arn == arn)
-                .map(|profile| MutableTags {
-                    tags: &mut profile.tags,
-                    max_tags: MAX_TAGS_PER_PROFILE,
-                    noun: PROFILE_NOUN,
-                })
-                .ok_or(PROFILE_NOT_FOUND_MESSAGE),
+                .ok_or_else(|| DATASTORE_NOT_FOUND_MESSAGE.to_string()),
+            // The profile texts name the profile, so the id the ARN carries is
+            // what the refusal states — the same template every other profile
+            // not-found path in this crate states.
+            Some(TaggedResource::Profile(id)) => {
+                let message = profile_not_found_message(id);
+                self.profiles
+                    .get_mut(id)
+                    .filter(|profile| profile.arn == arn)
+                    .map(|profile| MutableTags {
+                        tags: &mut profile.tags,
+                        max_tags: MAX_TAGS_PER_PROFILE,
+                        noun: PROFILE_NOUN,
+                    })
+                    .ok_or(message)
+            }
             // Unreachable through the wire — the modelled `AmazonResourceName`
             // pattern is enforced before a handler runs — but an ARN of neither
             // resource form names no resource, so it is answered the same way a
             // missing one is.
-            None => Err(DATASTORE_NOT_FOUND_MESSAGE),
+            None => Err(DATASTORE_NOT_FOUND_MESSAGE.to_string()),
         }
     }
 
@@ -2075,25 +2144,25 @@ impl ComAmazonawsHealthlakeHealthlakeState {
     /// [`DELETED_RETENTION`] precisely so a reader can still observe it. Call
     /// [`Self::settle_lifecycle`] first, so this reader agrees with
     /// Describe/List/Delete about which records still exist.
-    pub fn tags_for_report(&self, arn: &str) -> Result<Vec<Tag>, &'static str> {
+    pub fn tags_for_report(&self, arn: &str) -> Result<Vec<Tag>, String> {
         match tagged_resource_from_arn(arn) {
             Some(TaggedResource::Datastore(id)) => self
                 .datastores
                 .get(id)
                 .filter(|datastore| datastore.arn == arn)
                 .map(Datastore::tag_list)
-                .ok_or(DATASTORE_NOT_FOUND_MESSAGE),
+                .ok_or_else(|| DATASTORE_NOT_FOUND_MESSAGE.to_string()),
             Some(TaggedResource::Profile(id)) => self
                 .profiles
                 .get(id)
                 .filter(|profile| profile.arn == arn)
                 .map(DataTransformationProfile::tag_list)
-                .ok_or(PROFILE_NOT_FOUND_MESSAGE),
+                .ok_or_else(|| profile_not_found_message(id)),
             // Unreachable through the awsJson wire — the modelled
             // `AmazonResourceName` pattern is enforced before a handler runs —
             // but an ARN of neither resource form names no resource, so it is
             // answered the same way a missing one is.
-            None => Err(DATASTORE_NOT_FOUND_MESSAGE),
+            None => Err(DATASTORE_NOT_FOUND_MESSAGE.to_string()),
         }
     }
 

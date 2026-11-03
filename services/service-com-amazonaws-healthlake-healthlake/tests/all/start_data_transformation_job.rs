@@ -36,7 +36,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_healthlake_healthlake::state::{
-    ComAmazonawsHealthlakeHealthlakeState, ProfileVersionRecord, PROFILE_NOT_FOUND_MESSAGE,
+    ComAmazonawsHealthlakeHealthlakeState, ProfileVersionRecord, profile_not_found_message,
     TRANSFORMATION_NOT_PERFORMED_MESSAGE,
 };
 
@@ -64,7 +64,8 @@ const DRAFT_VERSION: i64 = 0;
 
 /// Create one data transformation profile and return `(ProfileId, ProfileName)`.
 ///
-/// `CreateDataTransformationProfile` answers the 201 its model gives it, so the
+/// `CreateDataTransformationProfile` answers 200 — awsJson1_0 binds nothing to the
+/// transport, so the operation's `@http(code: 201)` is inert — so the
 /// call is dispatched rather than taken through the harness's 200-only helper.
 ///
 /// `pub(crate)` so the sibling suites of this test target get a profile the same
@@ -85,8 +86,8 @@ pub(crate) async fn profile(service: &HealthLake, name: &str) -> (String, String
         )
         .await;
     assert_eq!(
-        status, 201,
-        "creating the profile {name:?} must answer its modelled 201, got {status}: {created}"
+        status, 200,
+        "creating the profile {name:?} must answer the protocol's 200, got {status}: {created}"
     );
     (string_at(&created, "ProfileId"), name.to_string())
 }
@@ -485,14 +486,16 @@ async fn a_profile_id_no_record_holds_is_refused_and_mints_nothing() {
             "ResourceNotFoundException",
             "case {case:?}: the refusal must be ResourceNotFoundException, got {payload}"
         );
+        let expected = profile_not_found_message(profile_id);
         assert_eq!(
             error_message(&payload),
-            PROFILE_NOT_FOUND_MESSAGE,
-            "case {case:?}: the refusal must state this service's fixed sentence, got {payload}"
+            expected,
+            "case {case:?}: the refusal must name the profile it could not find, got {payload}"
         );
         assert!(
-            !payload.to_string().contains(profile_id),
-            "case {case:?}: a refusal must quote nothing from the request, got {payload}"
+            payload.to_string().contains(profile_id),
+            "case {case:?}: the refusal must name the profile the request asked for, \
+             got {payload}"
         );
         assert_eq!(
             held_jobs(&service),

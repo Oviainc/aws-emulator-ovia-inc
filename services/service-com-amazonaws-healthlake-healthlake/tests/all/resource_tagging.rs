@@ -22,8 +22,8 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_healthlake_healthlake::state::{
-    DATASTORE_NOT_FOUND_MESSAGE, MAX_TAGS_PER_DATASTORE, MAX_TAGS_PER_PROFILE,
-    PROFILE_NOT_FOUND_MESSAGE,
+    profile_not_found_message, DATASTORE_NOT_FOUND_MESSAGE, MAX_TAGS_PER_DATASTORE,
+    MAX_TAGS_PER_PROFILE,
 };
 
 use crate::fhir_datastore_lifecycle::{error_code, string_at, HealthLake};
@@ -148,9 +148,8 @@ pub(crate) async fn create_datastore(
 /// Create a data transformation profile named `name`, carrying `tags` (the
 /// member omitted when `None`), and return its `ProfileId`.
 ///
-/// `CreateDataTransformationProfile` answers the modelled `@http(code: 201)`,
-/// so this does not go through the harness's 200-only `ok`. Its `Tags` is the
-/// modelled `TagMap` — a map, not the `TagList` the tagging operations take.
+/// Its `Tags` is the modelled `TagMap` — a map, not the `TagList` the tagging
+/// operations take.
 ///
 /// `pub(crate)`: the one create the tagging suites write a profile through.
 pub(crate) async fn create_profile(
@@ -386,36 +385,36 @@ async fn an_arn_whose_resource_is_not_held_is_refused_and_stores_nothing() {
     // Every row satisfies the modelled `AmazonResourceName` pattern, so the
     // boundary validator passes it and the handler decides. Rows span the ways an
     // ARN can name a resource this service does not hold, in EITHER resource form,
-    // each paired with the fixed sentence of the resource it names.
+    // each paired with the sentence of the resource it names.
     let unknown_profile = "0123456789abcdef0123456789abcdef";
     let fields: Vec<&str> = datastore_arn.split(':').collect();
     let (region, account, datastore_resource) = (fields[3], fields[4], fields[5]);
-    let rows: Vec<(&str, String, &str)> = vec![
+    let rows: Vec<(&str, String, String)> = vec![
         (
             "a profile id nothing was minted under",
             profile_arn(&datastore_arn, unknown_profile),
-            PROFILE_NOT_FOUND_MESSAGE,
+            profile_not_found_message(unknown_profile),
         ),
         (
             "the live profile id in another region",
             format!(
                 "arn:aws:healthlake:eu-west-1:{account}:dataTransformationProfile/{profile_id}"
             ),
-            PROFILE_NOT_FOUND_MESSAGE,
+            profile_not_found_message(&profile_id),
         ),
         (
             "the live profile id in another account",
             format!(
                 "arn:aws:healthlake:{region}:210987654321:dataTransformationProfile/{profile_id}"
             ),
-            PROFILE_NOT_FOUND_MESSAGE,
+            profile_not_found_message(&profile_id),
         ),
         (
             "the live profile id in another partition",
             format!(
                 "arn:aws-cn:healthlake:{region}:{account}:dataTransformationProfile/{profile_id}"
             ),
-            PROFILE_NOT_FOUND_MESSAGE,
+            profile_not_found_message(&profile_id),
         ),
         (
             "a data store id nothing was minted under",
@@ -423,12 +422,12 @@ async fn an_arn_whose_resource_is_not_held_is_refused_and_stores_nothing() {
                 "arn:aws:healthlake:{region}:{account}:datastore/fhir/\
                  00000000000000000000000000000000"
             ),
-            DATASTORE_NOT_FOUND_MESSAGE,
+            DATASTORE_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "the live data store in another partition",
             format!("arn:aws-us-gov:healthlake:{region}:{account}:{datastore_resource}"),
-            DATASTORE_NOT_FOUND_MESSAGE,
+            DATASTORE_NOT_FOUND_MESSAGE.to_string(),
         ),
     ];
 
@@ -453,12 +452,12 @@ async fn an_arn_whose_resource_is_not_held_is_refused_and_stores_nothing() {
             let message = payload.get("Message").and_then(Value::as_str);
             assert_eq!(
                 message,
-                Some(*expected_message),
+                Some(expected_message.as_str()),
                 "case {case:?}: {operation} must state {expected_message:?}, got {message:?}"
             );
             assert!(
                 !payload.to_string().contains(arn.as_str()),
-                "case {case:?}: {operation} must quote nothing from the request, got {payload}"
+                "case {case:?}: {operation} must quote no ARN from the request, got {payload}"
             );
         }
     }

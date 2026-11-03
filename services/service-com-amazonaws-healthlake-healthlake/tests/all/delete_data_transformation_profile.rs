@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_healthlake_healthlake::scaffolded::wire_http_status;
-use service_com_amazonaws_healthlake_healthlake::state::{MAX_PROFILES, PROFILE_NOT_FOUND_MESSAGE};
+use service_com_amazonaws_healthlake_healthlake::state::MAX_PROFILES;
 
 use crate::data_transformation_profile::{
     assert_well_formed_profile_id, mapping, mapping_of, modelled_message, profile_mapping_source,
@@ -182,8 +182,8 @@ async fn profile_arn(healthlake: &Profiles, profile_id: &str) -> String {
     crate::resource_tagging::profile_arn(&string_at(&created, "DatastoreArn"), profile_id)
 }
 
-/// Assert `request` on `operation` is refused with this service's fixed profile
-/// not-found answer.
+/// Assert `request` on `operation` is refused with this service's profile
+/// not-found answer, naming what the call could not find.
 async fn assert_profile_not_found(
     healthlake: &Profiles,
     case: &str,
@@ -191,15 +191,18 @@ async fn assert_profile_not_found(
     request: &Value,
 ) {
     let (status, code, payload) = healthlake.refused_body(case, operation, request).await;
+    let expected = crate::data_transformation_profile::expected_profile_not_found(
+        operation, request,
+    );
     assert_eq!(
         (status, code.as_str(), modelled_message(&payload)),
         (
             wire_http_status(404),
             "ResourceNotFoundException",
-            Some(PROFILE_NOT_FOUND_MESSAGE)
+            Some(expected.as_str())
         ),
-        "case {case:?}: {operation} on a profile no record holds is refused with this \
-         service's not-found sentence, got {payload}"
+        "case {case:?}: {operation} on a profile no record holds is refused with the \
+         sentence naming it, got {payload}"
     );
 }
 
@@ -490,9 +493,15 @@ async fn refused_deletes_remove_nothing() {
             );
             assert_eq!(
                 modelled_message(&payload),
-                Some(PROFILE_NOT_FOUND_MESSAGE),
-                "case {case:?}: an unknown profile states this service's fixed not-found \
-                 sentence, got {payload}"
+                Some(
+                    crate::data_transformation_profile::expected_profile_not_found(
+                        "DeleteDataTransformationProfile",
+                        &request
+                    )
+                    .as_str()
+                ),
+                "case {case:?}: an unknown profile is named in the not-found sentence, \
+                 got {payload}"
             );
         }
 

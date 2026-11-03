@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_healthlake_healthlake::state::{
-    DATASTORE_NOT_FOUND_MESSAGE, PROFILE_NOT_FOUND_MESSAGE,
+    DATASTORE_NOT_FOUND_MESSAGE, profile_not_found_message,
 };
 
 use crate::fhir_datastore_lifecycle::{error_code, HealthLake};
@@ -323,28 +323,28 @@ async fn untagging_an_arn_whose_resource_is_not_held_is_refused_and_removes_noth
     // Every row satisfies the modelled `AmazonResourceName` pattern, so the
     // boundary validator passes it and the handler decides. Rows span the ways
     // an ARN can name a resource this service does not hold, in EITHER resource
-    // form, each paired with the fixed sentence of the resource it names.
+    // form, each paired with the sentence of the resource it names.
     let fields: Vec<&str> = datastore_arn.split(':').collect();
     let (region, account, datastore_resource) = (fields[3], fields[4], fields[5]);
-    let rows: Vec<(&str, String, &str)> = vec![
+    let rows: Vec<(&str, String, String)> = vec![
         (
             "a profile id nothing was minted under",
             profile_arn(&datastore_arn, "0123456789abcdef0123456789abcdef"),
-            PROFILE_NOT_FOUND_MESSAGE,
+            profile_not_found_message("0123456789abcdef0123456789abcdef"),
         ),
         (
             "the live profile id in another region",
             format!(
                 "arn:aws:healthlake:eu-west-1:{account}:dataTransformationProfile/{profile_id}"
             ),
-            PROFILE_NOT_FOUND_MESSAGE,
+            profile_not_found_message(&profile_id),
         ),
         (
             "the live profile id in another account",
             format!(
                 "arn:aws:healthlake:{region}:210987654321:dataTransformationProfile/{profile_id}"
             ),
-            PROFILE_NOT_FOUND_MESSAGE,
+            profile_not_found_message(&profile_id),
         ),
         (
             "a data store id nothing was minted under",
@@ -352,12 +352,12 @@ async fn untagging_an_arn_whose_resource_is_not_held_is_refused_and_removes_noth
                 "arn:aws:healthlake:{region}:{account}:datastore/fhir/\
                  00000000000000000000000000000000"
             ),
-            DATASTORE_NOT_FOUND_MESSAGE,
+            DATASTORE_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "the live data store in another partition",
             format!("arn:aws-us-gov:healthlake:{region}:{account}:{datastore_resource}"),
-            DATASTORE_NOT_FOUND_MESSAGE,
+            DATASTORE_NOT_FOUND_MESSAGE.to_string(),
         ),
     ];
 
@@ -377,12 +377,12 @@ async fn untagging_an_arn_whose_resource_is_not_held_is_refused_and_removes_noth
         let message = payload.get("Message").and_then(Value::as_str);
         assert_eq!(
             message,
-            Some(*expected_message),
+            Some(expected_message.as_str()),
             "case {case:?}: UntagResource must state {expected_message:?}, got {message:?}"
         );
         assert!(
             !payload.to_string().contains(arn.as_str()),
-            "case {case:?}: UntagResource must quote nothing from the request, got {payload}"
+            "case {case:?}: UntagResource must quote no ARN from the request, got {payload}"
         );
     }
 
