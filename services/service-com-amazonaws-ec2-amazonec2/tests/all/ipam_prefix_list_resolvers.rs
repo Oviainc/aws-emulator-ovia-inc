@@ -21,7 +21,9 @@
 //! * one `ClientToken` names the one resolver it minted: a replay answers that resolver, and a
 //!   replay asking for anything else is refused;
 //! * every member of the created resolver reads back through `DescribeIpamPrefixListResolvers`,
-//!   which also narrows by id, by the documented filters and by the page size.
+//!   which also narrows by id, by the documented filters and by the page size;
+//! * the IPAM facts the resolver reports are the STORED IPAM's own — its ARN and the Region it
+//!   is located in — whichever Region the create itself was signed for.
 //!
 //! Each table row is a distinct input along what those generalise over: which address family,
 //! which optional member the request carries, how many rules and of which type, how many tags,
@@ -1184,4 +1186,151 @@ async fn the_describe_pages_in_a_stable_order() {
         all,
         "the refused reads changed nothing"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Whose Region a resolver reports
+// ---------------------------------------------------------------------------
+
+/// The resolver ids a describe signed for `region` and carrying `params` reports.
+async fn described_ids_in(
+    case: &str,
+    router: &MultiServiceRouter,
+    region: &str,
+    params: &[Param],
+) -> Vec<String> {
+    let (status, body) = call(router, region, DESCRIBE, params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from {DESCRIBE}, got {status} with body {body}"
+    );
+    described_resolvers(case, &body)
+        .into_iter()
+        .filter_map(|resolver| resolver.resolver_id)
+        .collect()
+}
+
+/// One row of the cross-Region table: the Region the IPAM was created in, the Region the
+/// resolver's create was signed for, and the Region its read was signed for.
+struct RegionCase {
+    case: &'static str,
+    ipam_region: &'static str,
+    create_region: &'static str,
+    describe_region: &'static str,
+}
+
+/// The rule: a resolver's IPAM facts are the STORED IPAM's own — "the Amazon Resource Name (ARN)
+/// of the IPAM associated with this resolver" (`IpamPrefixListResolver$IpamArn`) and "the Amazon
+/// Web Services Region where the associated IPAM is located"
+/// (`IpamPrefixListResolver$IpamRegion`) — whichever Region the create itself was signed for; and
+/// the describe's `ipam-region` filter matches that stored Region rather than the caller's.
+///
+/// Each row differs along which Region holds the IPAM and which Regions the two calls are signed
+/// for, so a create taking either fact from the Region of the request in front of it, rather than
+/// from the IPAM it resolved, fails every row but the first.
+#[tokio::test]
+async fn the_resolver_reports_the_region_of_the_ipam_it_selects_from() {
+    // Region codes of the commercial partition (`ec2::state::commercial_regions`).
+    let rows = vec![
+        RegionCase {
+            case: "every call signed for the IPAM's own Region",
+            ipam_region: "us-east-1",
+            create_region: "us-east-1",
+            describe_region: "us-east-1",
+        },
+        RegionCase {
+            case: "a create signed for another Region than its IPAM's",
+            ipam_region: "eu-west-1",
+            create_region: "us-east-1",
+            describe_region: "eu-west-1",
+        },
+        RegionCase {
+            case: "a create and a read each signed for a third Region",
+            ipam_region: "ap-southeast-2",
+            create_region: "us-west-2",
+            describe_region: "eu-central-1",
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let (router, _engine) = emulator();
+
+        // The IPAM, created in the Region that is therefore its home Region.
+        let (status, body) = call(&router, row.ipam_region, "CreateIpam", &[]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from CreateIpam, got {status} with body {body}"
+        );
+        let read = |name: &str| -> String {
+            element(&body, name)
+                .unwrap_or_else(|| panic!("case {case:?}: no <{name}> on the IPAM in {body}"))
+        };
+        let ipam_id = read("ipamId");
+        let ipam_arn = read("ipamArn");
+        assert_eq!(
+            read("ipamRegion"),
+            row.ipam_region,
+            "case {case:?}: the IPAM's home Region is the one its own create was signed for"
+        );
+
+        // The resolver, created from a Region that need not be that one.
+        let (status, body) = call(
+            &router,
+            row.create_region,
+            CREATE,
+            &[
+                param("IpamId", &ipam_id),
+                param("AddressFamily", ADDRESS_FAMILY_IPV6),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from {CREATE}, got {status} with body {body}"
+        );
+        let resolver = created_resolver(case, &body);
+        let resolver_id = resolver
+            .resolver_id
+            .clone()
+            .unwrap_or_else(|| panic!("case {case:?}: the created resolver has no id: {body}"));
+        assert_eq!(
+            resolver.ipam_region.as_deref(),
+            Some(row.ipam_region),
+            "case {case:?}: the resolver reports the Region of the IPAM it selects CIDRs from, \
+             got {resolver:?}"
+        );
+        assert_eq!(
+            resolver.ipam_arn.as_deref(),
+            Some(ipam_arn.as_str()),
+            "case {case:?}: the resolver reports that IPAM's own ARN, got {resolver:?}"
+        );
+
+        // The read, signed for a Region that may be neither of those: the stored resolver is the
+        // one the `ipam-region` filter selects by its IPAM's Region.
+        assert_eq!(
+            described_ids_in(
+                case,
+                &router,
+                row.describe_region,
+                &filters(&[("ipam-region", &[row.ipam_region])]),
+            )
+            .await,
+            vec![resolver_id.clone()],
+            "case {case:?}: the IPAM's own Region selects the resolver it holds"
+        );
+        if row.create_region != row.ipam_region {
+            assert_eq!(
+                described_ids_in(
+                    case,
+                    &router,
+                    row.describe_region,
+                    &filters(&[("ipam-region", &[row.create_region])]),
+                )
+                .await,
+                Vec::<String>::new(),
+                "case {case:?}: the Region the create was signed for selects no resolver"
+            );
+        }
+    }
 }
