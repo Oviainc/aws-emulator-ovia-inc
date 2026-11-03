@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCisScanConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCisScanConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCisScanConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored CIS scan configuration and returns its ARN; an ARN
+//! that names no stored configuration is a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +145,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCisScanConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCisScanConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCisScanConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteCisScanConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "Amazon Inspector CIS scan configuration state is unavailable"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+
+        let mut guard = state.lock();
+        // `remove` is what makes a second delete of the same ARN a 404: the record is
+        // gone, so the lookup that reports it cannot find it either.
+        let removed = guard
+            .cis_scan_configurations
+            .remove(&input.scan_configuration_arn)
+            .ok_or_else(|| {
+                DeleteCisScanConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        // The service's own wording for an ARN that names nothing: the
+                        // sentence states the class of failure and nothing about the
+                        // request, so it is the same for every ARN that is not stored.
+                        message: "Resource not found.".to_string(),
+                    },
+                )
+            })?;
+
+        Ok(DeleteCisScanConfigurationOutput {
+            scan_configuration_arn: removed.arn,
+        })
     }
 }

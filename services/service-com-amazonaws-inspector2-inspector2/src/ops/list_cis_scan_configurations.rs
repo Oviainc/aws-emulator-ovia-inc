@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCisScanConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCisScanConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCisScanConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages through the CIS scan configurations stored in this service's
+//! shared state, keeping those the request's filter criteria select and ordering them as
+//! the request asks.
 //!
 //! ## Shape of an operation
 //!
@@ -141,6 +135,137 @@ impl<Eng> ListCisScanConfigurations<Eng> {
     }
 }
 
+/// `ListCisScanConfigurations`'s page size when the request names no `maxResults`: the
+/// largest page the model allows (`ListCisScanConfigurationsMaxResults` range 1..100,
+/// `maxResults` default 100), so an unpaginated caller sees everything it can in one
+/// answer.
+const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// The largest page the model admits (`ListCisScanConfigurationsMaxResults` range 1..100,
+/// `CisScanConfigurationList` len ..100), which also bounds how large an answer one small
+/// request can produce.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// The `CisScanConfigurationsSortBy` token a request that names none is read as.
+/// Source: `smithy_query(query="operation", operation="ListCisScanConfigurations")` —
+/// `sortBy` carries `default: "SCAN_NAME"`.
+const DEFAULT_SORT_BY: &str = "SCAN_NAME";
+
+/// The `CisScanConfigurationsSortBy` token ordering by scan configuration ARN.
+/// Source: `smithy_query(query="shape", shape="CisScanConfigurationsSortBy")` —
+/// `SCAN_NAME | SCAN_CONFIGURATION_ARN`.
+const SORT_BY_ARN: &str = "SCAN_CONFIGURATION_ARN";
+
+/// The `CisSortOrder` token for a descending answer; the other token, `ASC`, is the order
+/// a request that names none gets.
+/// Source: `smithy_query(query="shape", shape="CisSortOrder")` — `ASC | DESC`.
+const SORT_ORDER_DESC: &str = "DESC";
+
+/// The `CisStringComparison` token matching a value that STARTS WITH the filter's value.
+/// Source: `smithy_query(query="shape", shape="CisStringComparison")` —
+/// `EQUALS | PREFIX | NOT_EQUALS`.
+const COMPARISON_PREFIX: &str = "PREFIX";
+
+/// The `CisStringComparison` token matching a value DIFFERENT from the filter's value.
+/// Source: `smithy_query(query="shape", shape="CisStringComparison")`.
+const COMPARISON_NOT_EQUALS: &str = "NOT_EQUALS";
+
+/// The value one configuration is ordered by under `sort_by`.
+fn sort_key(stored: &crate::state::StoredCisScanConfiguration, sort_by: &str) -> String {
+    if sort_by == SORT_BY_ARN {
+        stored.arn.clone()
+    } else {
+        // `SCAN_NAME`, the model's default and the only other token the enum admits.
+        stored.scan_name.clone()
+    }
+}
+
+/// Whether `value` satisfies one `CisStringFilter`.
+fn matches_string_filter(value: &str, filter: &CisStringFilter) -> bool {
+    match filter.comparison.as_str() {
+        COMPARISON_PREFIX => value.starts_with(&filter.value),
+        COMPARISON_NOT_EQUALS => value != filter.value,
+        // `EQUALS` is the only other token `CisStringComparison` admits, and the boundary
+        // validator refuses a value outside the enum before this handler runs.
+        _ => value == filter.value,
+    }
+}
+
+/// Whether a configuration's target resource tags satisfy one `TagFilter`: the key is
+/// among them and carries the filter's value. `TagComparison` admits only `EQUALS`.
+/// Source: `smithy_query(query="shape", shape="TagFilter,TagComparison")`.
+fn matches_tag_filter(
+    target_resource_tags: &::std::collections::BTreeMap<String, Vec<String>>,
+    filter: &TagFilter,
+) -> bool {
+    target_resource_tags
+        .get(&filter.key)
+        .is_some_and(|values| values.contains(&filter.value))
+}
+
+/// Whether `stored` is selected by the request's filter criteria.
+///
+/// Each criterion the request carries is a LIST of filters, and a configuration is kept
+/// when it satisfies at least one filter in every list the request named: the lists are
+/// ANDed, and the filters inside one list ORed. A criterion the request left out — and an
+/// EMPTY list, which names no filter — selects nothing away.
+fn selected(
+    stored: &crate::state::StoredCisScanConfiguration,
+    criteria: Option<&ListCisScanConfigurationsFilterCriteria>,
+) -> bool {
+    let Some(criteria) = criteria else {
+        return true;
+    };
+    let satisfies = |filters: Option<&Vec<CisStringFilter>>, value: &str| {
+        filters.is_none_or(|filters| {
+            filters.is_empty()
+                || filters
+                    .iter()
+                    .any(|filter| matches_string_filter(value, filter))
+        })
+    };
+    satisfies(criteria.scan_name_filters.as_ref(), &stored.scan_name)
+        && satisfies(
+            criteria.scan_configuration_arn_filters.as_ref(),
+            &stored.arn,
+        )
+        && criteria
+            .target_resource_tag_filters
+            .as_ref()
+            .is_none_or(|filters| {
+                filters.is_empty()
+                    || filters
+                        .iter()
+                        .any(|filter| matches_tag_filter(&stored.target_resource_tags, filter))
+            })
+}
+
+/// The opaque `nextToken` naming the position a page ended at: the `(sort key, ARN)` pair
+/// of its last record. That pair is a TOTAL order over the records — a scan name is not
+/// unique, an ARN is — so the next page resumes at the first record ordered after it and
+/// cannot skip or repeat a configuration when records are added or removed between pages.
+/// The hex coding itself is [`crate::state::encode_cursor`], shared with this service's
+/// other paginated operations.
+fn encode_token(key: &str, arn: &str) -> String {
+    crate::state::encode_cursor(&format!("{key}\n{arn}"))
+}
+
+/// The position a cursor names, or `None` when the value is not a cursor this service
+/// minted. A token only decodes when it is hex AND the bytes are a sort key followed by an
+/// ARN of this service, so an arbitrary even-length hex string is refused rather than read
+/// as a position. A sort key cannot hold the separator or the ARN's own characters, since a
+/// `CisScanConfigurationArn` matches no newline.
+fn decode_token(token: &str) -> Option<(String, String)> {
+    let minted_prefix = format!("arn:aws:{}:", crate::state::SERVICE_NAMESPACE);
+    let decoded = crate::state::decode_cursor(token, |value| {
+        value
+            .rsplit_once('\n')
+            .is_some_and(|(_, arn)| arn.starts_with(&minted_prefix))
+    })?;
+    let (key, arn) = decoded.rsplit_once('\n')?;
+    Some((key.to_string(), arn.to_string()))
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListCisScanConfigurations<Eng>
 {
@@ -158,18 +283,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCisScanConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCisScanConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCisScanConfigurations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListCisScanConfigurationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "Amazon Inspector CIS scan configuration state is unavailable"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+
+        // A token this service did not mint cannot name a position, so the request is
+        // refused rather than silently answered from the start of the list.
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_token(token).ok_or_else(|| {
+                ListCisScanConfigurationsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token returned by a previous \
+                              ListCisScanConfigurations call"
+                        .to_string(),
+                    reason: "CANNOT_PARSE".to_string(),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message: "must be a nextToken returned by ListCisScanConfigurations"
+                            .to_string(),
+                    }]),
+                })
+            })?),
+            None => None,
+        };
+        let after = after
+            .as_ref()
+            .map(|(key, arn)| (key.as_str(), arn.as_str()));
+
+        // `maxResults` is modelled `range 1..100` with a default of 100, so the boundary
+        // validator has already refused anything outside that band; a request that named
+        // none at all is the default page.
+        let page_size = match input.max_results {
+            requested if requested < 1 => DEFAULT_PAGE_SIZE,
+            requested => (requested as usize).min(MAX_PAGE_SIZE),
+        };
+        let sort_by = if input.sort_by.is_empty() {
+            DEFAULT_SORT_BY
+        } else {
+            input.sort_by.as_str()
+        };
+        let descending = input.sort_order.as_deref() == Some(SORT_ORDER_DESC);
+
+        let guard = state.lock();
+        // Ordered by the requested key, then by ARN so the order is total and a page
+        // boundary falls between two records rather than inside a run of equal keys. The
+        // collection is bounded by the store's own cap
+        // ([`crate::state::MAX_STORED_CIS_SCAN_CONFIGURATIONS`]), not by anything the
+        // request carries, and the answer built from it by `page_size` above.
+        let mut ordered: Vec<(String, &crate::state::StoredCisScanConfiguration)> = guard
+            .cis_scan_configurations
+            .values()
+            .filter(|stored| selected(stored, input.filter_criteria.as_ref()))
+            .map(|stored| (sort_key(stored, sort_by), stored))
+            .collect();
+        ordered.sort_by(|(left_key, left), (right_key, right)| {
+            (left_key.as_str(), left.arn.as_str()).cmp(&(right_key.as_str(), right.arn.as_str()))
+        });
+        if descending {
+            ordered.reverse();
+        }
+
+        // One more than the page is read so the cursor is only emitted when a further
+        // configuration really exists.
+        let page: Vec<&(String, &crate::state::StoredCisScanConfiguration)> = ordered
+            .iter()
+            .filter(|(key, stored)| {
+                after.is_none_or(|position| {
+                    let here = (key.as_str(), stored.arn.as_str());
+                    if descending {
+                        here < position
+                    } else {
+                        here > position
+                    }
+                })
+            })
+            .take(page_size + 1)
+            .collect();
+
+        let truncated = page.len() > page_size;
+        let page = &page[..page.len().min(page_size)];
+        let next_token = truncated
+            .then(|| {
+                page.last()
+                    .map(|(key, stored)| encode_token(key, &stored.arn))
+            })
+            .flatten();
+
+        let scan_configurations = page
+            .iter()
+            .map(|(_, stored)| guard.cis_scan_configuration_view(stored))
+            .collect();
+
+        Ok(ListCisScanConfigurationsOutput {
+            scan_configurations: Some(scan_configurations),
+            next_token,
+        })
     }
 }

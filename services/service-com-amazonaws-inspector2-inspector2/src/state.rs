@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-inspector2-inspector2 service.
 //!
-//! Four resources live here, and every implemented operation computes its answer from
+//! Five resources live here, and every implemented operation computes its answer from
 //! them:
 //!
 //! * `accounts` — per-account Amazon Inspector enablement, written by `Enable` and read
@@ -12,15 +12,18 @@
 //! * `filters` — the suppression/other findings filters, keyed by their own ARN so a
 //!   record and its ARN can never diverge. `BTreeMap` iteration is stable, which is what
 //!   makes a `ListFilters` page token meaningful across calls.
+//! * `cis_scan_configurations` — the CIS scan configurations, keyed by their own ARN for
+//!   the same reason, written by `CreateCisScanConfiguration`, listed by
+//!   `ListCisScanConfigurations` and removed by `DeleteCisScanConfiguration`.
 //! * `encryption_keys` — the customer managed KMS key in force per resource type and scan
 //!   type, written by `UpdateEncryptionKey` and read back by `GetEncryptionKey`.
 //! * `org_package_paths` — the organization-wide deep inspection custom paths both deep
 //!   inspection reads report alongside an account's own.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::FilterCriteria;
+use crate::ops::types::{FilterCriteria, Schedule};
 
 /// The region a request is scoped to when it carries no SigV4 credential scope to read
 /// one from: the region every generated emulator defaults to (see `emulator_arn` in
@@ -78,6 +81,33 @@ pub const DEEP_INSPECTION_TRANSITION: Duration = Duration::from_secs(3);
 /// per account too; this is the emulator's own bound, of the same order.
 pub const MAX_STORED_FILTERS: usize = 1_000;
 
+/// The most CIS scan configurations this emulator stores before refusing to mint another,
+/// so a caller looping `CreateCisScanConfiguration` cannot grow the process heap without
+/// bound. The real service caps CIS scan configurations per account too; this is the
+/// emulator's own bound, of the same order as the filter bound above. The operation models
+/// no quota error, so the refusal is its `ValidationException`
+/// ([`too_many_cis_scan_configurations_message`]).
+pub const MAX_STORED_CIS_SCAN_CONFIGURATIONS: usize = 1_000;
+
+/// The refusal text for a `CreateCisScanConfiguration` that would take the number of
+/// stored CIS scan configurations past [`MAX_STORED_CIS_SCAN_CONFIGURATIONS`].
+pub fn too_many_cis_scan_configurations_message() -> String {
+    format!(
+        "You have reached the limit of {MAX_STORED_CIS_SCAN_CONFIGURATIONS} CIS scan \
+         configurations. Delete a CIS scan configuration and try again."
+    )
+}
+
+/// The `TargetAccount` token standing for the account that owns the CIS scan
+/// configuration, rather than for an account id of its own.
+/// Source: `smithy_query(query="shape", shape="TargetAccount")` — a 12-digit account id,
+/// `ALL_ACCOUNTS` or `SELF`.
+pub const TARGET_ACCOUNT_SELF: &str = "SELF";
+
+/// The `TargetAccount` token standing for every account of the owner's organization.
+/// Source: `smithy_query(query="shape", shape="TargetAccount")`.
+pub const TARGET_ACCOUNT_ALL: &str = "ALL_ACCOUNTS";
+
 /// The most accounts this emulator tracks enablement for. Every operation that records
 /// something for an account goes through
 /// [`ComAmazonawsInspector2Inspector2State::account_mut`], which refuses to add one past
@@ -118,6 +148,35 @@ pub struct StoredFilter {
     pub tags: Option<BTreeMap<String, String>>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
+}
+
+/// One stored CIS scan configuration: exactly what `CreateCisScanConfiguration` was
+/// given, plus the ARN the service minted and the account that owns it.
+#[derive(Debug, Clone)]
+pub struct StoredCisScanConfiguration {
+    /// The minted ARN; also this record's key in
+    /// [`ComAmazonawsInspector2Inspector2State::cis_scan_configurations`].
+    pub arn: String,
+    /// The account that created the configuration (`CisScanConfiguration$ownerId`).
+    pub owner_id: String,
+    pub scan_name: String,
+    /// A `CisSecurityLevel` token: `LEVEL_1` or `LEVEL_2`.
+    pub security_level: String,
+    pub schedule: Schedule,
+    /// The `TargetAccount` values as SENT — an account id, `SELF` or `ALL_ACCOUNTS`.
+    /// `ALL_ACCOUNTS` names a set that changes as accounts join, so the tokens are kept
+    /// here and resolved on every read ([`ComAmazonawsInspector2Inspector2State::target_account_ids`])
+    /// rather than frozen at create time.
+    pub target_accounts: Vec<String>,
+    /// The resource tags a scan selects its targets by, as sent. Sorted so the rendering
+    /// order is stable; bounded by the modelled `TargetResourceTags` length (at most 5
+    /// keys, each with at most 5 values), which the boundary validator enforces before any
+    /// handler runs.
+    pub target_resource_tags: BTreeMap<String, Vec<String>>,
+    /// The tags as sent: `None` when the request carried no `tags` member, and an empty
+    /// map when it carried an empty one, so a read renders back exactly what was stored.
+    /// Sorted so the rendering order is stable.
+    pub tags: Option<BTreeMap<String, String>>,
 }
 
 /// One account's Amazon Inspector deep inspection configuration for Amazon EC2.
@@ -267,6 +326,12 @@ pub struct ComAmazonawsInspector2Inspector2State {
     pub accounts: BTreeMap<String, AccountEnablement>,
     /// Monotonic source for the id segment of a minted filter ARN.
     pub next_filter_id: u64,
+    /// Stored CIS scan configurations, keyed by ARN. Bounded by
+    /// [`MAX_STORED_CIS_SCAN_CONFIGURATIONS`]: `CreateCisScanConfiguration` refuses once
+    /// the map holds that many, and only `DeleteCisScanConfiguration` removes one.
+    pub cis_scan_configurations: BTreeMap<String, StoredCisScanConfiguration>,
+    /// Monotonic source for the id segment of a minted CIS scan configuration ARN.
+    pub next_cis_scan_configuration_id: u64,
     /// The customer managed KMS key in force for one `ResourceType` / `ScanType` pair —
     /// the scope Amazon Inspector configures an encryption key at, for the single account
     /// this emulator presents (neither encryption-key operation carries an account
@@ -376,6 +441,104 @@ impl ComAmazonawsInspector2Inspector2State {
             region,
             &format!("owner/{owner_id}/filter/{id}"),
         )
+    }
+
+    /// Mint the ARN for a new CIS scan configuration:
+    /// `arn:aws:inspector2:<region>:<account>:owner/<owner>/cis-configuration/<id>`.
+    ///
+    /// `CisScanConfigurationArn` ends `/cis-configuration/[0-9a-fA-F-]+`, which is the
+    /// hyphenated UUID form the real service mints that segment in. The 16 bytes behind it
+    /// are this emulator's monotonic counter, so no two configurations of one run collide;
+    /// the UUID LAYOUT — the group boundaries and the version and variant bits — is
+    /// `service_common`'s one rendering of 16 opaque bytes, so it is not restated here.
+    pub fn mint_cis_scan_configuration_arn(&mut self, region: &str, owner_id: &str) -> String {
+        self.next_cis_scan_configuration_id += 1;
+        let counter = self.next_cis_scan_configuration_id.to_be_bytes();
+        let mut bytes = [0u8; 16];
+        // The counter's low 56 bits, placed BELOW the byte the variant bits land in, so
+        // the layout never overwrites a digit of the counter.
+        bytes[9..].copy_from_slice(&counter[1..]);
+        let id = ::service_common::uuid_from_random_bytes(bytes);
+        ::engine::emulator_arn(
+            SERVICE_NAMESPACE,
+            region,
+            &format!("owner/{owner_id}/cis-configuration/{id}"),
+        )
+    }
+
+    /// The accounts the organization `owner_id` administers holds, as this store knows
+    /// them: the owner itself, plus every account Amazon Inspector has been enabled for
+    /// through it. That set is what a `TARGET_ACCOUNT_ALL` target names, and it is read on
+    /// every call rather than recorded, because an account that joins later is inside a
+    /// configuration that already targets every account.
+    fn organization_account_ids(&self, owner_id: &str) -> BTreeSet<String> {
+        let mut accounts: BTreeSet<String> = self.accounts.keys().cloned().collect();
+        accounts.insert(owner_id.to_string());
+        accounts
+    }
+
+    /// The account ids `stored` targets, as the wire `CisTargets$accountIds` reports them.
+    ///
+    /// A create names its targets as `TargetAccount` values, which admit two tokens
+    /// besides an account id, while a read reports `AccountId` values (12 digits) — so the
+    /// tokens are RESOLVED here: `SELF` is the account that owns the configuration, and
+    /// `ALL_ACCOUNTS` is every account of its organization
+    /// ([`Self::organization_account_ids`]). The ids are de-duplicated and ordered, which
+    /// is what the modelled `uniqueItems` asks for and makes two reads of one
+    /// configuration agree.
+    ///
+    /// Source: `smithy_query(query="shape", shape="TargetAccount,CisAccountIdList")`.
+    pub fn target_account_ids(&self, stored: &StoredCisScanConfiguration) -> Vec<String> {
+        let mut resolved: BTreeSet<String> = BTreeSet::new();
+        for target in &stored.target_accounts {
+            match target.as_str() {
+                TARGET_ACCOUNT_SELF => {
+                    resolved.insert(stored.owner_id.clone());
+                }
+                TARGET_ACCOUNT_ALL => {
+                    resolved.extend(self.organization_account_ids(&stored.owner_id));
+                }
+                account_id => {
+                    resolved.insert(account_id.to_string());
+                }
+            }
+        }
+        resolved.into_iter().collect()
+    }
+
+    /// One stored CIS scan configuration as the wire `CisScanConfiguration`: everything
+    /// the create stored, with its targets resolved ([`Self::target_account_ids`]).
+    ///
+    /// Source: `smithy_query(query="shape", shape="CisScanConfiguration")` —
+    /// `scanConfigurationArn` is required and every other member optional.
+    pub fn cis_scan_configuration_view(
+        &self,
+        stored: &StoredCisScanConfiguration,
+    ) -> crate::ops::types::CisScanConfiguration {
+        crate::ops::types::CisScanConfiguration {
+            scan_configuration_arn: stored.arn.clone(),
+            owner_id: Some(stored.owner_id.clone()),
+            scan_name: Some(stored.scan_name.clone()),
+            security_level: Some(stored.security_level.clone()),
+            schedule: Some(stored.schedule.clone()),
+            targets: Some(crate::ops::types::CisTargets {
+                account_ids: Some(self.target_account_ids(stored)),
+                target_resource_tags: Some(
+                    stored
+                        .target_resource_tags
+                        .iter()
+                        .map(|(key, values)| (key.clone(), values.clone()))
+                        .collect(),
+                ),
+            }),
+            // Rendered exactly as stored: absent when the create carried no `tags`, and an
+            // empty map when it carried an empty one.
+            tags: stored.tags.as_ref().map(|tags| {
+                tags.iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+        }
     }
 
     /// The Amazon Inspector deep inspection configuration `account_id` reports at `now`.
