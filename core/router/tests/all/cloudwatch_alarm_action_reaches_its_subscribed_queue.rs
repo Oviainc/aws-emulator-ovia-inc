@@ -45,7 +45,7 @@ const POLLS: usize = 10;
 const WAIT_TIME_SECONDS: u32 = 1;
 
 /// The whole emulator over one engine, exactly as the binary assembles it.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine = aws_emulator_router::new_engine();
     let mut router = aws_emulator_router::build_router(engine);
     // Signature verification is the front door's concern, not this suite's.
@@ -99,7 +99,13 @@ async fn rpc(
 }
 
 /// One CloudWatch call (`awsJson1_0`).
-async fn cw(router: &MultiServiceRouter, case: &str, region: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn cw(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     rpc(
         router,
         case,
@@ -154,7 +160,7 @@ async fn sns(
 /// ensure that the Amazon SQS queue policy allows the Amazon SNS topic to send messages to
 /// the queue"), and whether it is scoped by condition to the publishing topic.
 #[derive(Debug, Clone, Copy)]
-enum Grant {
+pub(crate) enum Grant {
     Unscoped,
     ScopedToTopic,
 }
@@ -177,7 +183,7 @@ impl Grant {
 
 /// A topic in `region` with a queue of this emulator subscribed to it, the queue granting SNS
 /// the send the way `grant` writes it. Answers the topic's ARN and the queue's url.
-async fn given_topic_with_subscriber(
+pub(crate) async fn given_topic_with_subscriber(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -233,7 +239,12 @@ async fn given_topic_with_subscriber(
 
 /// Take every notification waiting on the queue at `url`, as the alarm documents SNS
 /// enveloped, deleting what it hands over so a later leg reads only what arrived since.
-async fn drain(router: &MultiServiceRouter, case: &str, region: &str, url: &str) -> Vec<Value> {
+pub(crate) async fn drain(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    url: &str,
+) -> Vec<Value> {
     let received = sqs(
         router,
         case,
@@ -272,7 +283,7 @@ async fn drain(router: &MultiServiceRouter, case: &str, region: &str, url: &str)
 }
 
 /// Drain until `wanted` notifications have arrived or the polls run out.
-async fn drain_until(
+pub(crate) async fn drain_until(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,

@@ -236,6 +236,9 @@ mod cloudwatch_alarm_action_reaches_its_subscribed_queue;
 // regions concurrently landing suites add their line to.
 #[path = "all/cloudwatch_breaching_alarm_fires_through_the_whole_router.rs"]
 mod cloudwatch_breaching_alarm_fires_through_the_whole_router;
+// Declared beside the entry above, at the head, for the same reason.
+#[path = "all/cloudwatch_composite_alarm_rule_decides_its_sns_action.rs"]
+mod cloudwatch_composite_alarm_rule_decides_its_sns_action;
 // Declared beside the entry above, at the head, for the same reason: the appended tail and
 // the sorted `c…` span (where the other cloudwatch suites land) are both regions concurrently
 // landing suites add their line to.
