@@ -146,9 +146,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata is not needed: a configuration set and the destinations
-        // under it are keyed by name within the one emulated account.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The engine is not the shared in-memory engine, so this service has no
             // store to write to. That is not a modelled SES state: answer the
@@ -172,44 +169,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(bad_request)?;
         let destination_name = input.event_destination_name;
 
+        // Resolve the set and the name under the lock, then RELEASE it: the
+        // authorization decision below is an in-process call into the service that owns
+        // the destination, and no store lock is held across one.
+        let refused = store_refusal(&state.lock(), &set_name, &destination_name);
+        if let Some(refusal) = refused {
+            return Err(refusal);
+        }
+
+        // A destination this service may not publish to is one the request cannot
+        // establish: the refusal is the authorization failure the destination's own
+        // resource policy answered, lifted into this operation's input error.
+        if let Some(refusal) =
+            crate::state::event_publication::destination_refusal(ctx, &definition, &set_name).await
+        {
+            return Err(bad_request(refusal));
+        }
+
         let mut store = state.lock();
+        // Read again under the lock the write is made under: the decision above released
+        // it, so what the store says about this attach is resolved rather than assumed.
+        if let Some(refusal) = store_refusal(&store, &set_name, &destination_name) {
+            return Err(refusal);
+        }
         let Some(set) = store.configuration_sets.get_mut(&set_name) else {
-            return Err(
-                CreateConfigurationSetEventDestinationErrorModeled::NotFoundException(
-                    NotFoundException {
-                        message: Some(crate::state::configuration_set_not_found(&set_name)),
-                    },
-                )
-                .into(),
-            );
+            return Err(set_not_found(&set_name));
         };
-        if set.event_destinations.contains_key(&destination_name) {
-            return Err(
-                CreateConfigurationSetEventDestinationErrorModeled::AlreadyExistsException(
-                    AlreadyExistsException {
-                        message: Some(crate::state::event_destination_already_exists(
-                            &set_name,
-                            &destination_name,
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-        if set.event_destinations.len() >= crate::state::MAX_EVENT_DESTINATIONS_PER_SET {
-            return Err(
-                CreateConfigurationSetEventDestinationErrorModeled::LimitExceededException(
-                    LimitExceededException {
-                        message: Some(format!(
-                            "Configuration set {set_name} already holds the maximum of {} event \
-                             destinations.",
-                            crate::state::MAX_EVENT_DESTINATIONS_PER_SET
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
         set.event_destinations.insert(
             destination_name.clone(),
             EventDestinationRecord::new(&destination_name, definition),
@@ -221,11 +206,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// What the STORE refuses this attach for — a configuration set the account does not
+/// hold, a destination name the set already holds, or a set already holding as many
+/// destinations as it may — or `None` when the store refuses nothing.
+///
+/// One reading for both passes over the store, so the refusal a caller is given cannot
+/// depend on which of them reached it.
+fn store_refusal(
+    store: &crate::state::ComAmazonawsSesv2SimpleemailserviceV2State,
+    set_name: &str,
+    destination_name: &str,
+) -> Option<CreateConfigurationSetEventDestinationError> {
+    let Some(set) = store.configuration_sets.get(set_name) else {
+        return Some(set_not_found(set_name));
+    };
+    if set.event_destinations.contains_key(destination_name) {
+        return Some(already_exists(set_name, destination_name));
+    }
+    if set.event_destinations.len() >= crate::state::MAX_EVENT_DESTINATIONS_PER_SET {
+        return Some(limit_exceeded(set_name));
+    }
+    None
+}
+
 /// Refuse the request with this service's input error.
 fn bad_request(message: impl Into<String>) -> CreateConfigurationSetEventDestinationError {
     CreateConfigurationSetEventDestinationErrorModeled::BadRequestException(BadRequestException {
         message: Some(message.into()),
     })
+    .into()
+}
+
+/// Refuse the request with the modelled error for a configuration set this account does
+/// not hold.
+fn set_not_found(set_name: &str) -> CreateConfigurationSetEventDestinationError {
+    CreateConfigurationSetEventDestinationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::configuration_set_not_found(set_name)),
+    })
+    .into()
+}
+
+/// Refuse the request with the modelled error for a destination name the set already
+/// holds.
+fn already_exists(
+    set_name: &str,
+    destination_name: &str,
+) -> CreateConfigurationSetEventDestinationError {
+    CreateConfigurationSetEventDestinationErrorModeled::AlreadyExistsException(
+        AlreadyExistsException {
+            message: Some(crate::state::event_destination_already_exists(
+                set_name,
+                destination_name,
+            )),
+        },
+    )
+    .into()
+}
+
+/// Refuse the request with the modelled error for a set already holding as many
+/// destinations as it may.
+fn limit_exceeded(set_name: &str) -> CreateConfigurationSetEventDestinationError {
+    CreateConfigurationSetEventDestinationErrorModeled::LimitExceededException(
+        LimitExceededException {
+            message: Some(format!(
+                "Configuration set {set_name} already holds the maximum of {} event \
+                 destinations.",
+                crate::state::MAX_EVENT_DESTINATIONS_PER_SET
+            )),
+        },
+    )
     .into()
 }
 

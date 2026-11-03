@@ -120,6 +120,30 @@ impl Ses {
         Self { router, engine }
     }
 
+    /// The same emulator with Amazon SNS mounted beside this service on the ONE engine —
+    /// the shape `core/router/src/lib.rs` mounts every service in — for a suite whose
+    /// subject is a resource of that service, which this one reaches through the
+    /// in-process callback.
+    pub(crate) fn with_sns() -> Self {
+        let engine = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(
+            service_com_amazonaws_sns_amazonsimplenotificationservice::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+        Self { router, engine }
+    }
+
+    /// The in-process callback into this same emulator: the seam a handler reaches
+    /// another mounted service through, so a suite's setup reaches that service exactly
+    /// the way the handler does.
+    pub(crate) fn callback(&self) -> smithy_server_runtime::EmbeddedEmulator {
+        smithy_server_runtime::EmbeddedEmulator::from_router(self.router.clone())
+    }
+
     /// Grant this account production access, which is what takes it out of the sandbox.
     ///
     /// It is set on the one account record every account operation reads and writes (the

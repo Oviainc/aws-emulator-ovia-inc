@@ -31,6 +31,8 @@ use std::time::{Duration, SystemTime};
 
 use smithy_server_runtime::{Violation, ViolationKind};
 
+pub mod event_publication;
+
 /// How long after `CreateEmailIdentity` an identity's `PENDING` -> `SUCCESS`
 /// verification transition becomes due.
 ///
@@ -984,6 +986,21 @@ pub fn tenant_arn(region: &str, tenant_name: &str, tenant_id: &str) -> String {
 /// request's spelling of it names one.
 pub fn identity_arn(region: &str, identity: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("identity/{identity}"))
+}
+
+/// `arn:aws:ses:<region>:<account>:configuration-set/<name>` — the ARN of a
+/// configuration set, which is how this service names the set a cross-service request
+/// of its own came FROM ([`event_publication`]).
+///
+/// `configuration-set/<name>` is the resource form SES addresses a configuration set
+/// by ([`TENANT_RESOURCE_TYPES`]), so the ARN minted here and the one the tagging and
+/// tenant surfaces read are the same value.
+pub fn configuration_set_arn(region: &str, configuration_set_name: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("configuration-set/{configuration_set_name}"),
+    )
 }
 
 /// Whether `tenant_name` satisfies the documented `TenantName` form: at most

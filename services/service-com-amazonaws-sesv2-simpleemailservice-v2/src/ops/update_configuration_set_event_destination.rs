@@ -138,9 +138,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata is not needed: a configuration set and the destinations
-        // under it are keyed by name within the one emulated account.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The engine is not the shared in-memory engine, so this service has no
             // store to write to. That is not a modelled SES state: answer the
@@ -164,15 +161,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(bad_request)?;
         let destination_name = input.event_destination_name;
 
+        // Resolve the set and the destination under the lock, then RELEASE it: the
+        // authorization decision below is an in-process call into the service that owns
+        // the destination, and no store lock is held across one.
+        let refused = missing_resource(&state.lock(), &set_name, &destination_name);
+        if let Some(refusal) = refused {
+            return Err(refusal);
+        }
+
+        // A destination this service may not publish to is one the request cannot
+        // establish, whether it establishes it by creating the destination or by making
+        // it what an existing destination publishes to: the refusal is the authorization
+        // failure the destination's own resource policy answered, and the stored
+        // definition is left as it was.
+        if let Some(refusal) =
+            crate::state::event_publication::destination_refusal(ctx, &definition, &set_name).await
+        {
+            return Err(bad_request(refusal));
+        }
+
         let mut store = state.lock();
-        let Some(set) = store.configuration_sets.get_mut(&set_name) else {
-            return Err(not_found(crate::state::configuration_set_not_found(
-                &set_name,
-            )));
-        };
-        // This operation modifies the destination the URI names and creates none, so
-        // a name the set does not hold is a resource that does not exist.
-        let Some(destination) = set.event_destinations.get_mut(&destination_name) else {
+        // Read again under the lock the write is made under: the decision above released
+        // it, so the resources the request addresses are resolved rather than assumed.
+        if let Some(refusal) = missing_resource(&store, &set_name, &destination_name) {
+            return Err(refusal);
+        }
+        let Some(destination) = store
+            .configuration_sets
+            .get_mut(&set_name)
+            .and_then(|set| set.event_destinations.get_mut(&destination_name))
+        else {
             return Err(not_found(crate::state::event_destination_not_found(
                 &set_name,
                 &destination_name,
@@ -184,6 +202,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored destination is read back with `GetConfigurationSetEventDestinations`.
         Ok(UpdateConfigurationSetEventDestinationOutput {})
     }
+}
+
+/// The refusal for a resource this request addresses that the account does not hold — the
+/// configuration set, or the destination within it, which this operation modifies and
+/// creates none of — or `None` when both are there.
+///
+/// One reading for both passes over the store, so the refusal a caller is given cannot
+/// depend on which of them reached it.
+fn missing_resource(
+    store: &crate::state::ComAmazonawsSesv2SimpleemailserviceV2State,
+    set_name: &str,
+    destination_name: &str,
+) -> Option<UpdateConfigurationSetEventDestinationError> {
+    let Some(set) = store.configuration_sets.get(set_name) else {
+        return Some(not_found(crate::state::configuration_set_not_found(
+            set_name,
+        )));
+    };
+    (!set.event_destinations.contains_key(destination_name)).then(|| {
+        not_found(crate::state::event_destination_not_found(
+            set_name,
+            destination_name,
+        ))
+    })
 }
 
 /// Refuse the request with this service's input error.

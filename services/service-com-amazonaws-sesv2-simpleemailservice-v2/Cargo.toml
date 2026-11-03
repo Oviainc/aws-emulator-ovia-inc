@@ -22,6 +22,13 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The AWS SDK for Amazon SNS, driven over the in-process callback
+# (`OperationContext::callback`): an event destination that publishes to an SNS topic is
+# established only where that topic's own access policy does not refuse this service's
+# publish, which is read from the topic itself (`state::event_publication`). Only the
+# generated client is needed — the emulator supplies the transport, so the SDK's own HTTPS
+# stack and runtime are left out.
+aws-sdk-sns = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -30,6 +37,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# SNS is mounted beside this service on one engine in the event-destination
+# authorization suite, because the topic an event destination names is created and given
+# its access policy through the SNS API the handler reads it through.
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 
 [lints]
 workspace = true
