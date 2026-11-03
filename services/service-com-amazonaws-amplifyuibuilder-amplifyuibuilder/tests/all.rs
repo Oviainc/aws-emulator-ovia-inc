@@ -74,6 +74,9 @@ mod resource_tagging;
 #[path = "all/response_front_door.rs"]
 mod response_front_door;
 
+#[path = "all/shared_page_walk.rs"]
+mod shared_page_walk;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

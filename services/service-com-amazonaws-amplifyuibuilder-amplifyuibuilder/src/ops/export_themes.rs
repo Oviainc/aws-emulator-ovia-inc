@@ -156,50 +156,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = (input.app_id.clone(), input.environment_name.clone());
         let store = state.lock();
 
-        // The token carries the app environment it was issued for and the cursor
-        // the next page starts at. A malformed token, one issued for another app
-        // environment, or one whose cursor is not among those handed out names no
-        // page of this export, so it is refused rather than served as a page.
-        // With no token at all the export starts at the first cursor the service
-        // ever hands out, i.e. at the head of the list.
-        let cursor = match input.next_token.as_deref() {
-            None => crate::state::FIRST_CURSOR,
-            Some(token) => {
-                match crate::state::parse_page_token(token, &key, store.cursor_seq) {
-                    Some(cursor) => cursor,
-                    None => {
-                        return Err(ExportThemesErrorModeled::InvalidParameterException(
-                            InvalidParameterException {
-                                message: Some(format!(
-                                    "nextToken {token:?} is not a token returned by \
-                                     ExportThemes for this app environment"
-                                )),
-                            },
-                        )
-                        .into())
-                    }
-                }
-            }
-        };
-
-        let mut entities = Vec::new();
-        let mut next_token = None;
-        for theme in store.themes_in(&input.app_id, &input.environment_name) {
-            // Resume at the first theme at or after the cursor, so a page is
-            // still served when the theme the token named was deleted meanwhile.
-            if theme.cursor < cursor {
-                continue;
-            }
-            if entities.len() == crate::state::EXPORT_PAGE_LIMIT {
-                next_token = Some(crate::state::page_token(&key, theme.cursor));
-                break;
-            }
-            entities.push(theme.to_theme());
-        }
+        // One page of this app environment's themes, through the service's one
+        // page walk (`crate::state::page_of`), projected to the FULL `Theme`
+        // record rather than to a summary and bounded by this export's own page
+        // limit. A malformed token, one issued for another app environment, or
+        // one whose cursor is not among those handed out names no page of this
+        // export, so it is refused rather than served as a page. With no token at
+        // all the export starts at the first cursor the service ever hands out,
+        // i.e. at the head of the list.
+        let page = crate::state::page_of(
+            store.themes_in(&input.app_id, &input.environment_name),
+            &key,
+            store.cursor_seq,
+            input.next_token.as_deref(),
+            crate::state::EXPORT_PAGE_LIMIT,
+            crate::state::StoredTheme::to_theme,
+        )
+        .map_err(|unknown| {
+            ExportThemesErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(unknown.message(Self::NAME)),
+            })
+        })?;
 
         Ok(ExportThemesOutput {
-            entities,
-            next_token,
+            entities: page.entities,
+            next_token: page.next_token,
         })
     }
 }

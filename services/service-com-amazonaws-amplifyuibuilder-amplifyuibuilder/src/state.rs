@@ -44,6 +44,17 @@
 //! resolves a `resourceArn` to that record, and [`resource_tags`] /
 //! [`with_resource_tags_mut`] are the one read and the one write over it.
 //!
+//! ## The page walk
+//!
+//! Every paginated operation of this service — the component, theme and
+//! codegen-job lists and the three exports — serves its page from [`page_of`],
+//! the one walk over an app environment's records: it honours only a token
+//! [`page_token`] issued for that app environment, resumes at the cursor the
+//! token carries and issues the token of the next page. An operation supplies
+//! only what is its own — the records, the page bound and the projection it
+//! reports — so the resume semantics and the refusal of an unknown token cannot
+//! drift between two of them.
+//!
 //! ## The third-party token surface
 //!
 //! `RefreshToken` answers with an ACCESS TOKEN for a third-party provider, so the
@@ -1335,6 +1346,115 @@ pub fn parse_page_token(token: &str, key: &EnvironmentKey, issued: u64) -> Optio
     }
     let cursor = u64::from_str_radix(cursor, 16).ok()?;
     (FIRST_CURSOR..=issued).contains(&cursor).then_some(cursor)
+}
+
+/// A record one of this service's paginated operations pages over: one held in
+/// its app environment's creation (or start) order and carrying the cursor that
+/// order assigned it.
+///
+/// It is the one thing [`page_of`] needs of a record, so every stored kind whose
+/// list is paginated implements it and none of them needs its own page walk.
+pub trait PagedRecord {
+    /// The position this record holds in its app environment's order — what a
+    /// page token indexes into.
+    fn cursor(&self) -> u64;
+}
+
+impl PagedRecord for StoredComponent {
+    fn cursor(&self) -> u64 {
+        self.cursor
+    }
+}
+
+impl PagedRecord for StoredCodegenJob {
+    fn cursor(&self) -> u64 {
+        self.cursor
+    }
+}
+
+impl PagedRecord for StoredForm {
+    fn cursor(&self) -> u64 {
+        self.cursor
+    }
+}
+
+impl PagedRecord for StoredTheme {
+    fn cursor(&self) -> u64 {
+        self.cursor
+    }
+}
+
+/// One page of an app environment's records: the projections it serves, and the
+/// token that resumes after them — absent when the page ends the list.
+#[derive(Debug)]
+pub struct Page<T> {
+    pub entities: Vec<T>,
+    pub next_token: Option<String>,
+}
+
+/// A `nextToken` this service never issued for the app environment it was
+/// presented against, and so names no page.
+#[derive(Debug)]
+pub struct UnknownPageToken(String);
+
+impl UnknownPageToken {
+    /// The `message` the refusal carries, naming the operation the token was
+    /// presented to and the token it refuses.
+    pub fn message(&self, operation: &str) -> String {
+        format!(
+            "nextToken {:?} is not a token returned by {operation} for this app environment",
+            self.0
+        )
+    }
+}
+
+/// One page of `records`, resumed at `next_token` and at most `page_size` long,
+/// with each served record put through `project`.
+///
+/// The one page walk of this service, shared by every paginated operation:
+///
+/// * a request carrying no token starts at [`FIRST_CURSOR`], the head of the
+///   list;
+/// * a token is honoured only when [`parse_page_token`] recognises it as one this
+///   service issued for `key` out of the `issued` cursors it has handed out —
+///   anything else yields [`UnknownPageToken`], which the caller turns into its
+///   own modelled refusal rather than serving a page;
+/// * the page resumes at the first record AT OR AFTER the cursor, so a page is
+///   still served when the record the token named was deleted meanwhile;
+/// * once `page_size` records are served, the next token is issued from the
+///   cursor of the first record left unserved, so the next page resumes exactly
+///   there.
+pub fn page_of<R: PagedRecord, T>(
+    records: &[R],
+    key: &EnvironmentKey,
+    issued: u64,
+    next_token: Option<&str>,
+    page_size: usize,
+    project: impl Fn(&R) -> T,
+) -> Result<Page<T>, UnknownPageToken> {
+    let cursor = match next_token {
+        None => FIRST_CURSOR,
+        Some(token) => parse_page_token(token, key, issued)
+            .ok_or_else(|| UnknownPageToken(token.to_string()))?,
+    };
+
+    let mut entities = Vec::with_capacity(page_size.min(records.len()));
+    let mut resume_at = None;
+    for record in records {
+        if record.cursor() < cursor {
+            continue;
+        }
+        if entities.len() == page_size {
+            resume_at = Some(page_token(key, record.cursor()));
+            break;
+        }
+        entities.push(project(record));
+    }
+
+    Ok(Page {
+        entities,
+        next_token: resume_at,
+    })
 }
 
 /// The app environment half of a page token: a digest of the (appId,
