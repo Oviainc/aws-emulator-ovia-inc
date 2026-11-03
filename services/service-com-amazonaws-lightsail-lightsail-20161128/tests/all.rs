@@ -359,6 +359,8 @@ mod snapshot_copy;
 mod snapshot_name_namespace;
 #[path = "all/snapshot_source_members.rs"]
 mod snapshot_source_members;
+#[path = "all/state_guard_refusal_messages.rs"]
+mod state_guard_refusal_messages;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/static_ip_allocation.rs"]

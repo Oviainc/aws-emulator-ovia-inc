@@ -101,8 +101,10 @@ struct Row {
     status: u16,
     /// The error code it must carry, or `None` for a delete that goes through.
     error_code: Option<&'static str>,
-    /// Fragments the refusal's message must carry: the bucket and every
-    /// condition that blocks this delete.
+    /// Fragments the refusal's message must carry: the service's own sentence
+    /// for a bucket a force delete is required for, which names the bucket and
+    /// the condition class and nothing else — WHICH conditions block this
+    /// delete is a diagnostic of the emulator, logged rather than returned.
     message_fragments: &'static [&'static str],
 }
 
@@ -137,7 +139,7 @@ const DELETE_ROWS: &[Row] = &[
         force_delete: None,
         status: 400,
         error_code: Some(INVALID_INPUT),
-        message_fragments: &[ORIGIN_BUCKET, "in use", "origin of 1 distribution"],
+        message_fragments: &[ORIGIN_BUCKET, "in use"],
     },
     Row {
         case: "the origin of one distribution, forceDelete false",
@@ -150,7 +152,7 @@ const DELETE_ROWS: &[Row] = &[
         force_delete: Some(false),
         status: 400,
         error_code: Some(INVALID_INPUT),
-        message_fragments: &[ORIGIN_BUCKET, "in use", "origin of 1 distribution"],
+        message_fragments: &[ORIGIN_BUCKET, "in use"],
     },
     Row {
         case: "the origin of two distributions, flag absent",
@@ -166,7 +168,7 @@ const DELETE_ROWS: &[Row] = &[
         force_delete: None,
         status: 400,
         error_code: Some(INVALID_INPUT),
-        message_fragments: &[ORIGIN_BUCKET, "in use", "origin of 2 distributions"],
+        message_fragments: &[ORIGIN_BUCKET, "in use"],
     },
     Row {
         case: "the origin of one distribution, forceDelete true",
@@ -208,12 +210,7 @@ const DELETE_ROWS: &[Row] = &[
         force_delete: None,
         status: 400,
         error_code: Some(INVALID_INPUT),
-        message_fragments: &[
-            ORIGIN_BUCKET,
-            "in use",
-            "access key",
-            "origin of 1 distribution",
-        ],
+        message_fragments: &[ORIGIN_BUCKET, "in use"],
     },
     Row {
         case: "a bucket beside a distribution that pulls from another bucket",
@@ -261,7 +258,7 @@ const DELETE_ROWS: &[Row] = &[
         force_delete: None,
         status: 400,
         error_code: Some(INVALID_INPUT),
-        message_fragments: &[ORIGIN_BUCKET, "in use", "origin of 1 distribution"],
+        message_fragments: &[ORIGIN_BUCKET, "in use"],
     },
     Row {
         case: "the origin of a distribution that has since been deleted, flag absent",
@@ -287,7 +284,7 @@ const DELETE_ROWS: &[Row] = &[
         force_delete: None,
         status: 400,
         error_code: Some(INVALID_INPUT),
-        message_fragments: &[WEST_BUCKET, "in use", "origin of 1 distribution"],
+        message_fragments: &[WEST_BUCKET, "in use"],
     },
     Row {
         case: "a bucket in another Region no distribution pulls from, flag absent",
@@ -441,8 +438,9 @@ async fn delete_bucket_gates_on_the_distributions_that_pull_from_it() {
                     code, expected,
                     "case {case:?}: expected {expected}, got {code} with {body:?}"
                 );
-                // The refusal names the bucket and every condition that blocks the
-                // delete, which is what a caller needs to know what to clear.
+                // The refusal names the bucket and the condition class, and
+                // carries nothing else: the per-condition detail is logged, not
+                // put in the modelled message.
                 let message = body["message"].as_str().unwrap_or_default();
                 for fragment in row.message_fragments {
                     assert!(

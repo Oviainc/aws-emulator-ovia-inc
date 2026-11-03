@@ -448,18 +448,22 @@ async fn a_bucket_whose_only_grantee_was_deleted_deletes_without_force() {
             }
             // The other grantee still has access, so the condition still holds —
             // the release took back exactly the one grant the removal freed.
-            Some(_) => {
+            Some(survivor) => {
                 assert_eq!(
                     (status, error_code(&body).as_str()),
                     (400, "InvalidInputException"),
                     "case {case}: expected the surviving grant to still block an unforced \
                      delete, got {status} {body:?}"
                 );
-                let message = body["message"].as_str().unwrap_or_default();
-                assert!(
-                    message.contains("1 resource were granted access to it"),
-                    "case {case}: expected the refusal to count the one surviving grant, got \
-                     {message:?}"
+                // The release took back exactly the one grant the removal freed,
+                // which is read from the bucket's own set rather than out of the
+                // refusal's message: the message carries the service's own
+                // sentence, not an inventory of what blocked this delete.
+                assert_eq!(
+                    granted(case, &emulator, *region, bucket).await,
+                    vec![survivor.to_string()],
+                    "case {case}: expected only the surviving grant to be left in the \
+                     bucket's set, got {body:?}"
                 );
             }
         }

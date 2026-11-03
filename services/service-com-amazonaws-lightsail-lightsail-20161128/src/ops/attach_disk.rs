@@ -228,27 +228,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .collect();
 
-            // A disk is attached to at most one instance: the modelled
-            // `Disk$attachedTo` names the one resource it is attached to, so an
-            // attachment can only be made from a disk that has none. The refusal
-            // is keyed on the ATTACHMENT rather than on the disk's state, so it
-            // holds however the state is reported.
-            if let Some(holder) = attached_to {
-                return Err(operation_failure(format!(
-                    "The disk {disk_name} is already attached to the instance {holder}. \
-                     Detach the disk before attaching it to another instance."
-                )));
-            }
             // Only a disk that exists and is doing nothing can be attached: a
             // disk Lightsail is still provisioning (`pending`) has nothing to
-            // expose yet, and the modelled `DiskState`'s other values describe a
-            // disk that is in use or whose state is not reportable.
-            if disk_state != crate::state::DISK_STATE_AVAILABLE {
-                return Err(operation_failure(format!(
-                    "The disk {disk_name} is {disk_state}: a disk can be attached only \
-                     while it is {}.",
-                    crate::state::DISK_STATE_AVAILABLE
-                )));
+            // expose yet, and a disk an instance already holds is `in-use` —
+            // the modelled `Disk$attachedTo` names the ONE resource a disk is
+            // attached to, so an attachment can only be made from a disk that
+            // has none. Both are the same condition, the disk's own state
+            // standing in the way, and both are refused with the sentence the
+            // crate's one owner of that wording builds from the state alone:
+            // the attachment is reported BY the state (`in-use`), never by a
+            // sentence of its own naming the holder. The attachment is still
+            // checked beside the state, so an attach can only ever be made from
+            // a disk that is both free and `available`.
+            if attached_to.is_some() || disk_state != crate::state::DISK_STATE_AVAILABLE {
+                return Err(operation_failure(
+                    crate::state::disk_blocked_by_state_message(
+                        crate::state::DISK_VERB_ATTACH,
+                        disk_state,
+                    ),
+                ));
             }
             // From this operation's own documentation: it "attaches a block
             // storage disk to a running or stopped Lightsail instance". An

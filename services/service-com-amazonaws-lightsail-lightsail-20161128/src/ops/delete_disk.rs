@@ -184,11 +184,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::with_state(&*self.engine, |store| {
             // READ what the request addresses first, so a refused delete removes
             // nothing: the disk must exist, and nothing may be holding it.
-            let (location, state) = {
+            let (location, state, attached_to) = {
                 let Some(disk) = store.disk(&name) else {
                     return Err(not_found(&name));
                 };
-                (disk.location.clone(), disk.state)
+                (
+                    disk.location.clone(),
+                    disk.state,
+                    disk.attached_to.clone(),
+                )
             };
 
             // "The disk must be in the available state (not attached to a
@@ -198,6 +202,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // provisioned, or one an instance has in use — is the service's
             // operation-failure rejection, and the record is left exactly as it
             // was.
+            //
+            // WHICH of the two the refusal reports is what the caller needs: a
+            // disk an instance holds is blocked by the ATTACHMENT, and the one
+            // thing the caller has to know is the instance to detach it from, so
+            // that refusal names the holder the disk's own record carries. Only
+            // a disk nothing holds, and that is still not `available`, is
+            // blocked by its state alone, and that one reports the state.
+            if let Some(instance_name) = attached_to {
+                return Err(still_attached(&instance_name));
+            }
             if state != crate::state::DISK_STATE_AVAILABLE {
                 return Err(not_deletable(state));
             }
@@ -229,19 +243,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The disk the request names is not `available`, so it is not deletable yet:
-/// the modelled `OperationFailureException` — HTTP 400, "Lightsail throws this
-/// exception when an operation fails to execute" — whose message is built from
-/// the disk's own current `DiskState` value, the state that makes it
-/// undeletable.
+/// The disk the request names is not `available` and nothing holds it, so it is
+/// not deletable yet: the modelled `OperationFailureException` — HTTP 400,
+/// "Lightsail throws this exception when an operation fails to execute" — whose
+/// message is built by the crate's one owner of that wording from the disk's own
+/// current `DiskState` value, the state that makes it undeletable.
 fn not_deletable(state: &str) -> DeleteDiskError {
     DeleteDiskErrorModeled::OperationFailureException(OperationFailureException {
-        message: Some(format!(
-            "You can't delete this disk right now. The state of this disk is: {state}."
+        message: Some(crate::state::disk_blocked_by_state_message(
+            crate::state::DISK_VERB_DELETE,
+            state,
         )),
         // `code`, `docs` and `tip` are members this service fills from its own
         // catalogue of failures, and no recorded response shows what it puts
         // there for this one — so they are left absent rather than invented.
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The disk the request names is still attached to an instance, so the delete
+/// cannot be performed: the same modelled `OperationFailureException`, whose
+/// message names the instance holding the disk — the one resource the caller has
+/// to detach it from — read from the disk's own record.
+fn still_attached(instance_name: &str) -> DeleteDiskError {
+    DeleteDiskErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(crate::state::disk_still_attached_message(instance_name)),
         ..Default::default()
     })
     .into()

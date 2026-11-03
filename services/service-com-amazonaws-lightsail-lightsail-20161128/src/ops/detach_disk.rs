@@ -268,12 +268,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The disk the request names is attached to nothing, so this detach has no
 /// attachment to release: the modelled `OperationFailureException` — HTTP 400,
 /// "Lightsail throws this exception when an operation fails to execute" — whose
-/// message is built from the disk's own current `DiskState` value, the state
-/// that makes it undetachable.
+/// message is built by the crate's one owner of that wording from the disk's own
+/// current `DiskState` value, the state that makes it undetachable.
 fn not_detachable(state: &str) -> DetachDiskError {
     DetachDiskErrorModeled::OperationFailureException(OperationFailureException {
-        message: Some(format!(
-            "You can't detach this disk right now. The state of this disk is: {state}."
+        message: Some(crate::state::disk_blocked_by_state_message(
+            crate::state::DISK_VERB_DETACH,
+            state,
         )),
         // `code`, `docs` and `tip` are members this service fills from its own
         // catalogue of failures, and no recorded response shows what it puts

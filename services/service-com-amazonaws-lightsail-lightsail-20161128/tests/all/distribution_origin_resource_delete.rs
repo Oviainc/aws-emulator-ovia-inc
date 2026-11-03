@@ -530,16 +530,18 @@ async fn deleting_a_distributions_origin_resource_is_refused_while_it_is_pulled_
                 code, INVALID_INPUT,
                 "case {case:?}: expected {INVALID_INPUT}, got {code} with {body:?}"
             );
-            // The refusal names the resource and how many distributions pull
-            // from it, which is what a caller needs to know what to clear.
+            // The refusal names the resource and, for the deletes that word the
+            // condition themselves, how many distributions pull from it.
+            // `DeleteBucket` answers the service's own sentence alone — the
+            // per-condition detail is logged, not returned — so its rows assert
+            // the headline only.
             let message = body["message"].as_str().unwrap_or_default();
             let condition = origin_condition(row.blocking_distributions);
-            for fragment in [
-                row.target.0.resource_type(),
-                target_name,
-                "is in use",
-                condition.as_str(),
-            ] {
+            let mut fragments = vec![row.target.0.resource_type(), target_name, "is in use"];
+            if row.target.0 != Kind::Bucket {
+                fragments.push(condition.as_str());
+            }
+            for fragment in fragments {
                 assert!(
                     message.contains(fragment),
                     "case {case:?}: expected the refusal to carry {fragment:?}, got {message:?}"

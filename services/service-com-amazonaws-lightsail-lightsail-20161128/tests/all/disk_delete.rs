@@ -438,9 +438,9 @@ const NOT_AVAILABLE: &[NotAvailable] = &[
 
 /// RULE: a disk is deletable only while it is attached to nothing, so a delete of
 /// a disk in any other state fails as an operation — HTTP 400
-/// `OperationFailureException`, whose message names the disk's own state — and
-/// the disk is left exactly as it was. Once that disk IS `available`, the same
-/// call is accepted.
+/// `OperationFailureException`, whose message names the instance still holding
+/// the disk, or the disk's own state when nothing holds it — and the disk is left
+/// exactly as it was. Once that disk IS `available`, the same call is accepted.
 #[tokio::test]
 async fn deleting_a_disk_that_is_not_available_is_refused_as_an_operation_failure() {
     let emulator = Emulator::new();
@@ -498,10 +498,23 @@ async fn deleting_a_disk_that_is_not_available_is_refused_as_an_operation_failur
             "case {case}: expected the operation-failure rejection, got {body:?}"
         );
         let answered = message(&body);
-        assert!(
-            answered.contains(&format!("The state of this disk is: {}.", row.state)),
-            "case {case}: expected a message naming the disk's state '{}', got {answered:?}",
-            row.state
+        let expected = match row.attach_to {
+            // A disk an instance holds is blocked by the ATTACHMENT, and the
+            // refusal names the instance to detach it from.
+            Some(instance_name) => format!(
+                "You can't perform this operation because the disk is still attached to a \
+                 Lightsail instance: {instance_name}."
+            ),
+            // A disk nothing holds is blocked by its state, and the refusal
+            // reports that state.
+            None => format!(
+                "You can't delete this disk right now. The state of this disk is: {}.",
+                row.state
+            ),
+        };
+        assert_eq!(
+            answered, expected,
+            "case {case}: expected the refusal {expected:?}, got {answered:?}"
         );
 
         // The refusal removed nothing and changed nothing.

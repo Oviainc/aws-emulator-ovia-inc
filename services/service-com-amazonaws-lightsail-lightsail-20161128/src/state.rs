@@ -421,6 +421,16 @@ pub const DISK_STATE_AVAILABLE: &str = "available";
 /// See [`DISK_STATE_PENDING`].
 pub const DISK_STATE_IN_USE: &str = "in-use";
 
+/// The verbs the disk calls name themselves by in a refusal their disk's state
+/// blocks, one per operation that has such a guard, so the sentence
+/// [`disk_blocked_by_state_message`] builds carries the verb of the call that
+/// was refused.
+pub const DISK_VERB_ATTACH: &str = "attach";
+/// See [`DISK_VERB_ATTACH`].
+pub const DISK_VERB_DETACH: &str = "detach";
+/// See [`DISK_VERB_ATTACH`].
+pub const DISK_VERB_DELETE: &str = "delete";
+
 /// `DiskSnapshotState` values this slice uses, from the modelled
 /// `DiskSnapshotState` enum and the `DiskSnapshot$state` documentation ("The
 /// status of the disk snapshot operation"): a snapshot Lightsail is still taking
@@ -17937,6 +17947,32 @@ pub fn origin_of_distributions_condition(count: usize) -> Option<String> {
             if count == 1 { "" } else { "s" }
         )
     })
+}
+
+/// How a refusal words the condition "the disk's own state does not allow this
+/// call", given the operation's verb (`attach`, `detach`, `delete`) and the
+/// disk's current `DiskState` value.
+///
+/// The ONE owner of that wording: every disk call a disk's state blocks reports
+/// the condition the same way, keyed on the STATE alone — the only variable part
+/// besides the verb — so attach, detach and delete cannot word one condition
+/// three different ways.
+pub fn disk_blocked_by_state_message(verb: &str, state: &str) -> String {
+    format!("You can't {verb} this disk right now. The state of this disk is: {state}.")
+}
+
+/// How a refusal words the condition "the disk is still attached to an
+/// instance", naming the instance that holds it — the only variable part, read
+/// from the disk's own [`StoredDisk::attached_to`].
+///
+/// The ONE owner of that wording, beside [`disk_blocked_by_state_message`]: this
+/// sentence is what names the instance a caller has to detach from, so a call
+/// blocked by the ATTACHMENT reports the holder rather than a state word.
+pub fn disk_still_attached_message(instance_name: &str) -> String {
+    format!(
+        "You can't perform this operation because the disk is still attached to a Lightsail \
+         instance: {instance_name}."
+    )
 }
 
 /// The region a request is scoped to: the one its SigV4 credential scope names,

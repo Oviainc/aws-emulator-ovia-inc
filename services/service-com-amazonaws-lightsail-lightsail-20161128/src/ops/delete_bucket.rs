@@ -243,20 +243,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 blocked_by.push(condition);
             }
             if !blocked_by.is_empty() {
-                // The headline names the bucket and the condition, the way AWS words
-                // the objects case ("Bucket is not empty: <bucketName>"); the detail
-                // names every condition that blocks THIS delete, so the caller learns
-                // what to clear.
+                // The modelled message carries the template alone — the headline
+                // naming the condition and the bucket, the way AWS words the
+                // objects case ("Bucket is not empty: <bucketName>"), with the
+                // bucket name from the request as its only variable part. Which
+                // conditions block THIS delete is a diagnostic of this emulator,
+                // not part of the service's message, so it is LOGGED rather than
+                // returned: a client comparing the message to AWS's sees AWS's.
                 let headline = if objects > 0 {
                     format!("Bucket is not empty: {}", input.bucket_name)
                 } else {
                     format!("Bucket is in use: {}", input.bucket_name)
                 };
-                return Err(invalid(format!(
-                    "{headline} ({}); delete what the bucket holds, or set forceDelete to \
-                     delete it anyway",
-                    blocked_by.join(", and ")
-                )));
+                ::tracing::info!(
+                    operation = "DeleteBucket",
+                    outcome = "refused",
+                    bucket_name = %input.bucket_name,
+                    blocked_by = %blocked_by.join(", and "),
+                    "a delete without forceDelete was refused by what the bucket holds"
+                );
+                return Err(invalid(headline));
             }
         }
 
