@@ -51,6 +51,14 @@ sqlparser = "0.59"
 # engine, read through its own accessors rather than through a second copy of them.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
+# The Amazon S3 client a bulk thing provisioning task reads its input file object through
+# (`state::thing_registration`), over the in-process callback into this same emulator (no
+# network client feature: the transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "behavior-version-latest",
+] }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
@@ -63,6 +71,9 @@ tokio = { workspace = true, features = ["time"] }
 # the action's role lives in.
 service-com-amazonaws-iotdataplane-iotmoonrakerservice = { workspace = true }
 service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
+# The Amazon S3 service, mounted beside IoT on one engine so the input file a bulk thing
+# provisioning task names is an object staged with `PutObject`.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

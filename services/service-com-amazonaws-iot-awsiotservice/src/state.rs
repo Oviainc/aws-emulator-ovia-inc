@@ -77,6 +77,14 @@
 //! whose EXISTENCE the IoT Jobs data plane also needs — `StartCommandExecution`
 //! refuses an execution of a command nobody created — so every recorded command's
 //! ARN is registered in the shared index as well (see [`command_registry`]).
+//!
+//! Finally it holds the account's BULK THING PROVISIONING TASKS, keyed by `taskId` (the
+//! `@httpLabel` of `/thing-registration-tasks/{taskId}`): one record per
+//! `StartThingRegistrationTask`, holding what the start supplied and what the run of its
+//! input file amounted to, which is what `DescribeThingRegistrationTask` reports (see
+//! [`thing_registration`]). The THINGS such a task provisions are not a store of their own:
+//! they go into the thing registry above, so a reader of a thing cannot tell whether
+//! `CreateThing` or a bulk task put it there.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
@@ -186,6 +194,63 @@ impl RegisteredThing {
     /// also used as the default MQTT client ID."
     pub fn default_client_id(&self) -> String {
         self.thing_name.clone()
+    }
+}
+
+/// Most things the account's registry holds.
+///
+/// A caller grows the registry, and now in BULK — one `StartThingRegistrationTask` provisions
+/// up to [`thing_registration::MAX_INPUT_FILE_LINES`] things in one request — so it is bounded
+/// like every other store a caller grows ([`MAX_THING_TYPES`], [`MAX_JOBS`],
+/// [`MAX_TOPIC_RULES`]): this is the ceiling every writer of a thing refuses past.
+pub const MAX_THINGS: usize = 10_000;
+
+/// Why a name cannot carry a thing configuration — what
+/// [`ComAmazonawsIotAwsiotserviceState::register_thing`] answers instead of a record.
+///
+/// It is the registry's reason, not a wire error: each writer of a thing maps it onto the
+/// error ITS model declares, and they share the wording here.
+#[derive(Debug, Clone)]
+pub enum ThingRegistrationRefusal {
+    /// The registry already holds [`MAX_THINGS`], so this write would grow it past the
+    /// ceiling.
+    RegistryFull,
+    /// `thingTypeName` names no thing type this account holds.
+    MissingThingType(String),
+    /// It names a thing type the account has DEPRECATED, which nothing new may use.
+    DeprecatedThingType(String),
+    /// `billingGroupName` names no billing group this account holds.
+    MissingBillingGroup(String),
+    /// The name is registered already, with a DIFFERENT configuration — carrying the
+    /// identity of the record it holds, which a conflict reports.
+    AlreadyRegistered {
+        /// The registered thing's name, as `ResourceAlreadyExistsException$resourceId`.
+        thing_name: String,
+        /// Its ARN, as `ResourceAlreadyExistsException$resourceArn`.
+        thing_arn: String,
+    },
+}
+
+impl ThingRegistrationRefusal {
+    /// What the refusal reports, in the wording AWS IoT states each of these in.
+    pub fn message(&self) -> String {
+        match self {
+            Self::RegistryFull => {
+                format!("the maximum of {MAX_THINGS} things is already reached")
+            }
+            Self::MissingThingType(thing_type_name) => {
+                format!("Thing type {thing_type_name} does not exist")
+            }
+            Self::DeprecatedThingType(thing_type_name) => format!(
+                "Can not create new thing with deprecated thing type:{thing_type_name}"
+            ),
+            Self::MissingBillingGroup(billing_group_name) => {
+                format!("Billing group {billing_group_name} does not exist")
+            }
+            Self::AlreadyRegistered { thing_name, .. } => {
+                format!("Thing {thing_name} already exists with a different configuration")
+            }
+        }
     }
 }
 
@@ -705,9 +770,86 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// index a caller has just enabled or changed. An index with no record here is
     /// one no change is outstanding for, so it reports [`INDEX_STATUS_ACTIVE`].
     pub index_builds: BTreeMap<String, FleetIndexBuild>,
+    /// Every bulk thing provisioning task that exists, keyed by `taskId`.
+    ///
+    /// The id is the task's identity — `StartThingRegistrationTask` answers it as "The bulk
+    /// thing provisioning task ID" and the model binds it as the `@httpLabel` of
+    /// `/thing-registration-tasks/{taskId}` on every single-task operation — so a
+    /// `BTreeMap` keyed by id is the task store itself. `BTreeMap` (not `HashMap`) because
+    /// `ListThingRegistrationTasks` is `@paginated` and a page boundary is only meaningful
+    /// over a stable order.
+    ///
+    /// A caller grows this store, so it is bounded:
+    /// [`thing_registration::MAX_THING_REGISTRATION_TASKS`] is the ceiling
+    /// `StartThingRegistrationTask` refuses past.
+    pub thing_registration_tasks: BTreeMap<String, ThingRegistrationTask>,
 }
 
 impl ComAmazonawsIotAwsiotserviceState {
+    /// Register `thing_name` with `configuration`: the ONE registry write every writer of a
+    /// thing makes — `CreateThing`, and one line of a bulk thing provisioning task
+    /// ([`thing_registration`]) — so the two cannot drift about which things the registry
+    /// takes or about what refuses one.
+    ///
+    /// The resolutions are the account's own records: a `thingTypeName` naming a type it
+    /// holds and has not DEPRECATED ("If true, no new things could be associated with this
+    /// type"), and a `billingGroupName` naming a group it holds. A name already registered
+    /// with the SAME configuration writes nothing and answers the record the first write
+    /// left, which is the idempotence `CreateThing` documents ("If this call is made
+    /// multiple times using the same thing name and configuration, the call will succeed");
+    /// the same name with a different configuration is a conflict.
+    pub fn register_thing(
+        &mut self,
+        region: &str,
+        thing_name: String,
+        configuration: ThingConfiguration,
+    ) -> Result<RegisteredThing, ThingRegistrationRefusal> {
+        if let Some(thing_type_name) = &configuration.thing_type_name {
+            match self.thing_types.get(thing_type_name) {
+                None => {
+                    return Err(ThingRegistrationRefusal::MissingThingType(
+                        thing_type_name.clone(),
+                    ))
+                }
+                Some(thing_type) if thing_type.is_deprecated() => {
+                    return Err(ThingRegistrationRefusal::DeprecatedThingType(
+                        thing_type_name.clone(),
+                    ))
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(billing_group_name) = &configuration.billing_group_name {
+            if !self.billing_groups.contains(billing_group_name) {
+                return Err(ThingRegistrationRefusal::MissingBillingGroup(
+                    billing_group_name.clone(),
+                ));
+            }
+        }
+        if let Some(existing) = self.things.get(&thing_name) {
+            if existing.configuration != configuration {
+                return Err(ThingRegistrationRefusal::AlreadyRegistered {
+                    thing_name: existing.thing_name.clone(),
+                    thing_arn: existing.thing_arn.clone(),
+                });
+            }
+            // The repeat register names the SAME thing: it mints no new identity and writes
+            // nothing, so a client that retried keeps the id and ARN of the first write.
+            return Ok(existing.clone());
+        }
+        // The ceiling is read AFTER the conflict check, because a name already registered adds
+        // no record. Past it nothing is written: a writer refuses rather than answering
+        // success for a thing the registry does not hold.
+        if self.things.len() >= MAX_THINGS {
+            return Err(ThingRegistrationRefusal::RegistryFull);
+        }
+        let thing_arn = thing_arn(region, &thing_name);
+        let thing_id = self.mint_thing_id();
+        let thing = RegisteredThing::new(thing_name, thing_id, thing_arn, configuration);
+        self.things.insert(thing.thing_name.clone(), thing.clone());
+        Ok(thing)
+    }
+
     /// Mint a `thingId` no thing in the registry is using.
     ///
     /// AWS IoT's `thingId` is a version-4 UUID — the id in every `thing/<name>`
@@ -2475,6 +2617,13 @@ pub mod rule_expression;
 pub mod rule_sql;
 pub mod rules_engine;
 pub use rules_engine::{dispatch_published_message, SERVICE_PRINCIPAL};
+
+// What a BULK THING PROVISIONING task does — the thing each line of its input file
+// provisions under its provisioning template, and what a reader of the task reports about
+// the run — lives in `state/thing_registration.rs`, beside the store accessor for the same
+// reason the rules engine does.
+pub mod thing_registration;
+pub use thing_registration::ThingRegistrationTask;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

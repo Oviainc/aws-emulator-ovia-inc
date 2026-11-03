@@ -258,7 +258,7 @@ fn encode_component(value: &str) -> String {
 }
 
 /// Percent-encode one `awsQuery` form value.
-fn form_encode(value: &str) -> String {
+pub(crate) fn form_encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         match byte {
@@ -272,7 +272,7 @@ fn form_encode(value: &str) -> String {
 }
 
 /// The text of the first `<tag>` of an XML body.
-fn xml_text(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn xml_text(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();

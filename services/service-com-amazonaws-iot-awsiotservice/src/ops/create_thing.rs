@@ -176,95 +176,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // A thing may only reference a thing type or a billing group that EXISTS,
-        // and the registry is the only record of which do, so both are resolved
-        // against it. `ResourceNotFoundException` ("The specified resource does not
-        // exist", HTTP 404) is the modelled error for exactly this.
-        if let Some(thing_type_name) = &requested.thing_type_name {
-            let Some(thing_type) = store.thing_types.get(thing_type_name) else {
-                return Err(CreateThingErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!("Thing type {thing_type_name} does not exist")),
-                    },
-                )
-                .into());
-            };
-            // A DEPRECATED thing type still exists, so it is not a 404: it is a type
-            // nothing new may use. `ThingTypeMetadata$deprecated` is "Whether the
-            // thing type is deprecated. If true, no new things could be associated
-            // with this type", and `DeprecateThingType` states the same rule, so a
-            // create naming one is refused with the modelled
-            // `InvalidRequestException` ("The request is not valid", HTTP 400).
-            if thing_type.is_deprecated() {
-                return Err(CreateThingErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(format!(
-                            "Can not create new thing with deprecated thing type:{thing_type_name}"
-                        )),
-                    },
-                )
-                .into());
-            }
-        }
-        if let Some(billing_group_name) = &requested.billing_group_name {
-            if !store.billing_groups.contains(billing_group_name) {
-                return Err(CreateThingErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Billing group {billing_group_name} does not exist"
-                        )),
-                    },
-                )
-                .into());
-            }
-        }
+        // The ONE registry write every writer of a thing makes
+        // (`crate::state::ComAmazonawsIotAwsiotserviceState::register_thing`): it resolves
+        // the thing type and the billing group against the records the account holds, and
+        // decides a repeat create by this operation's own documentation — "If this call is
+        // made multiple times using the same thing name and configuration, the call will
+        // succeed. If this call is made with the same thing name but different configuration
+        // a ResourceAlreadyExistsException is thrown." A repeat create of the same thing
+        // mints no new identity and writes nothing, so a client that retried keeps the id and
+        // ARN it was handed the first time.
+        //
+        // The response is built from the record that was persisted, so what this call reports
+        // and what the next `DescribeThing` reads are one value, not two that could drift.
+        let thing = store
+            .register_thing(&region, input.thing_name, requested)
+            .map_err(|refusal| {
+                let message = Some(refusal.message());
+                match refusal {
+                    // "The specified resource does not exist" (HTTP 404) is the modelled
+                    // error for a thing type or billing group the registry does not hold.
+                    crate::state::ThingRegistrationRefusal::MissingThingType(_)
+                    | crate::state::ThingRegistrationRefusal::MissingBillingGroup(_) => {
+                        CreateThingErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException { message },
+                        )
+                    }
+                    // A DEPRECATED thing type still exists, so it is not a 404: it is a type
+                    // nothing new may use, which `InvalidRequestException` ("The request is
+                    // not valid", HTTP 400) is the modelled error for. The registry's own
+                    // ceiling is refused the same way, because `CreateThing` models no
+                    // `LimitExceededException` — never a 200 that records nothing.
+                    crate::state::ThingRegistrationRefusal::DeprecatedThingType(_)
+                    | crate::state::ThingRegistrationRefusal::RegistryFull => {
+                        CreateThingErrorModeled::InvalidRequestException(InvalidRequestException {
+                            message,
+                        })
+                    }
+                    crate::state::ThingRegistrationRefusal::AlreadyRegistered {
+                        thing_name,
+                        thing_arn,
+                    } => CreateThingErrorModeled::ResourceAlreadyExistsException(
+                        ResourceAlreadyExistsException {
+                            message,
+                            resource_id: Some(thing_name),
+                            resource_arn: Some(thing_arn),
+                        },
+                    ),
+                }
+            })?;
 
-        // What is already registered under this name decides the call, per the
-        // operation's own documentation: "If this call is made multiple times using
-        // the same thing name and configuration, the call will succeed. If this call
-        // is made with the same thing name but different configuration a
-        // ResourceAlreadyExistsException is thrown."
-        if let Some(existing) = store.things.get(&input.thing_name) {
-            if existing.configuration != requested {
-                return Err(CreateThingErrorModeled::ResourceAlreadyExistsException(
-                    ResourceAlreadyExistsException {
-                        message: Some(format!(
-                            "Thing {} already exists with a different configuration",
-                            existing.thing_name
-                        )),
-                        resource_id: Some(existing.thing_name.clone()),
-                        resource_arn: Some(existing.thing_arn.clone()),
-                    },
-                )
-                .into());
-            }
-            // The repeat create names the SAME thing: it mints no new identity and
-            // writes nothing, and answers from the stored record — so a client that
-            // retried a create keeps the id and ARN it was handed the first time.
-            return Ok(CreateThingOutput {
-                thing_name: Some(existing.thing_name.clone()),
-                thing_arn: Some(existing.thing_arn.clone()),
-                thing_id: Some(existing.thing_id.clone()),
-            });
-        }
-
-        let thing_arn = crate::state::thing_arn(&region, &input.thing_name);
-        let thing = crate::state::RegisteredThing::new(
-            input.thing_name,
-            store.mint_thing_id(),
-            thing_arn,
-            requested,
-        );
-
-        // The response is built from the record that is about to be persisted, so
-        // what this call reports and what the next `DescribeThing` reads are one
-        // value, not two that could drift.
-        let output = CreateThingOutput {
+        Ok(CreateThingOutput {
             thing_name: Some(thing.thing_name.clone()),
             thing_arn: Some(thing.thing_arn.clone()),
-            thing_id: Some(thing.thing_id.clone()),
-        };
-        store.things.insert(thing.thing_name.clone(), thing);
-        Ok(output)
+            thing_id: Some(thing.thing_id),
+        })
     }
 }
