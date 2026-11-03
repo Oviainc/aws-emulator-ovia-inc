@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRecommendation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRecommendation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRecommendation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +142,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRecommendation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRecommendationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRecommendation"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetRecommendationErrorModeled::InternalServerException(InternalServerException {
+                message: "the DevOps Agent state store is unavailable".to_string(),
+            })
+        })?;
+
+        // The identifier that names a recommendation takes a narrower form than
+        // `ResourceId` expresses, so a value without that form is refused as invalid
+        // BEFORE anything is looked up, rather than reported as an absent resource:
+        // it names no recommendation in any agent space.
+        if !crate::state::is_recommendation_id(&input.recommendation_id) {
+            return Err(GetRecommendationErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::pattern_validation_message(
+                        crate::state::RECOMMENDATION_ID_PATH,
+                        crate::state::RECOMMENDATION_ID_PATTERN,
+                    ),
+                    field_list: Some(vec![ValidationExceptionField {
+                        path: crate::state::RECOMMENDATION_ID_PATH.to_string(),
+                        message: crate::state::pattern_constraint_message(
+                            crate::state::RECOMMENDATION_ID_PATTERN,
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // The ARN a recommendation reports its AgentSpace by is in the partition,
+        // region and account the request itself is served in.
+        let region = crate::state::region_of(ctx);
+
+        // `@readonly`: this reports the stored recommendation and writes nothing. A
+        // recommendation is reachable only through the agent space that holds it, and
+        // the caller is authorised against that space before anything inside it can be
+        // known, so an `agentSpaceId` that resolves to no space fails CLOSED instead of
+        // disclosing which spaces exist; only inside a space the caller reached is a
+        // missing resource reported as one.
+        let store = state.lock();
+        let space = store
+            .agent_spaces
+            .get(&input.agent_space_id)
+            .ok_or_else(|| {
+                GetRecommendationErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+                })
+            })?;
+        let recommendation = space
+            .recommendations
+            .get(&input.recommendation_id)
+            .ok_or_else(|| {
+                GetRecommendationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::recommendation_not_found_message(
+                            &input.recommendation_id,
+                        ),
+                    },
+                )
+            })?;
+
+        // A read that names a version is served that version of the recommendation;
+        // one that names none is served the latest. A version the recommendation does
+        // not have names nothing to report, so it is as absent as an unknown
+        // identifier — and the refusal names the version that was asked for.
+        let agent_space_arn = crate::state::agent_space_arn(&region, &space.agent_space_id);
+        let rendered = recommendation
+            .to_api(&agent_space_arn, input.recommendation_version)
+            .ok_or_else(|| {
+                GetRecommendationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: match input.recommendation_version {
+                            Some(version) => crate::state::recommendation_version_not_found_message(
+                                &input.recommendation_id,
+                                version,
+                            ),
+                            None => crate::state::recommendation_not_found_message(
+                                &input.recommendation_id,
+                            ),
+                        },
+                    },
+                )
+            })?;
+
+        Ok(GetRecommendationOutput {
+            recommendation: rendered,
+        })
     }
 }

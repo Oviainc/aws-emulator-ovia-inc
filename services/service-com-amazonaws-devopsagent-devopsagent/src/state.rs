@@ -14,8 +14,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AgentSpace, Asset, AssetFile, AssetFileBody, IamAuthConfiguration, IdcAuthConfiguration,
-    IdpAuthConfiguration, Recurrence, ReferenceOutput, ScheduleCondition, ScheduleSpec, Task,
-    Trigger, TriggerCondition,
+    IdpAuthConfiguration, Recommendation, RecommendationContent, Recurrence, ReferenceOutput,
+    ScheduleCondition, ScheduleSpec, Task, Trigger, TriggerCondition,
 };
 
 /// The most AgentSpaces this emulator stores for the account before
@@ -288,6 +288,71 @@ fn goal_uuid(sequence: u64) -> String {
     ::service_common::uuid_from_random_bytes(bytes)
 }
 
+/// The prefix every recommendation identifier carries.
+///
+/// A recommendation is named by its own identifier, which the model constrains no
+/// further than `ResourceId` (`^[a-zA-Z0-9_.-]+$`, 1..128), so the narrower form
+/// the identifier takes is enforced here — the same way a goal identifier's is
+/// ([`GOAL_ID_PREFIX`]).
+pub const RECOMMENDATION_ID_PREFIX: &str = "rec-";
+
+/// The form a recommendation identifier takes: [`RECOMMENDATION_ID_PREFIX`]
+/// followed by a UUID. Rendered into the refusal a malformed identifier gets, so
+/// the caller reads the requirement it missed.
+pub const RECOMMENDATION_ID_PATTERN: &str =
+    "^rec-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
+
+/// The member a request naming a recommendation is validated as, as a JSON
+/// pointer. Rendered into the refusal's message and into its
+/// `ValidationExceptionField` path.
+pub const RECOMMENDATION_ID_PATH: &str = "/recommendationId";
+
+/// Whether `value` has the form of a recommendation identifier, i.e. satisfies
+/// [`RECOMMENDATION_ID_PATTERN`].
+///
+/// An identifier that does not is refused as invalid rather than looked up: it
+/// names no recommendation in any agent space.
+pub fn is_recommendation_id(value: &str) -> bool {
+    value
+        .strip_prefix(RECOMMENDATION_ID_PREFIX)
+        .is_some_and(is_uuid)
+}
+
+/// The refusal message a recommendation operation answers with when the identifier
+/// it was given is well formed but names no recommendation in the agent space the
+/// caller reached.
+///
+/// The same form as every other missing-resource refusal of this service
+/// ([`asset_not_found_message`], [`goal_not_found_message`]): the kind of resource
+/// and the identifier the request carried, taken verbatim from the request. The
+/// parent space is already known to the caller, so it is not repeated.
+pub fn recommendation_not_found_message(recommendation_id: &str) -> String {
+    format!("Recommendation not found: {recommendation_id}")
+}
+
+/// The refusal message a recommendation read answers with when the version it names
+/// is not one the recommendation has: the same form as
+/// [`recommendation_not_found_message`], naming the version that was asked for — as
+/// [`asset_version_not_found_message`] does for an asset revision.
+pub fn recommendation_version_not_found_message(recommendation_id: &str, version: i64) -> String {
+    format!("Recommendation not found: {recommendation_id} version {version}")
+}
+
+/// The ARN of one AgentSpace, in the partition and region the request was signed
+/// for and the account the request is served in.
+///
+/// This service's ARN namespace is [`ARN_NAMESPACE`] and an AgentSpace is reached
+/// under `agent-space/<agentSpaceId>`, which is the resource path its own
+/// operations address it by.
+pub fn agent_space_arn(region: &str, agent_space_id: &str) -> String {
+    let account_id = caller_account_id();
+    format!("arn:{ARN_PARTITION}:{ARN_NAMESPACE}:{region}:{account_id}:agent-space/{agent_space_id}")
+}
+
+/// The partition every ARN this emulator mints names: this emulator presents one
+/// commercial-partition account, so every resource it reports lives in `aws`.
+const ARN_PARTITION: &str = "aws";
+
 /// The region a request whose SigV4 credential scope names none is served in.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
@@ -555,6 +620,11 @@ pub struct AgentSpaceRecord {
     /// Bounded by [`MAX_ASSETS_PER_AGENT_SPACE`]. An asset is reachable only
     /// through its space, so deleting the space takes its assets with it.
     pub assets: HashMap<String, AssetRecord>,
+    /// The recommendations this AgentSpace holds, keyed by `recommendationId`. A
+    /// recommendation is reachable only through the space it belongs to, so an
+    /// identifier belonging to another space is as absent as one that never
+    /// existed.
+    pub recommendations: HashMap<String, RecommendationRecord>,
     /// The Operator App configured for this AgentSpace, absent until an
     /// authentication flow is enabled for it.
     pub operator_app: Option<OperatorAppRecord>,
@@ -968,6 +1038,101 @@ impl TriggerRecord {
             created_at: to_date_time(self.created_at),
             updated_at: to_date_time(self.updated_at),
         }
+    }
+}
+
+/// A persisted recommendation and every revision of it this service still serves.
+///
+/// What a recommendation IS stays fixed once it exists — the task that generated
+/// it, the goal it was generated against and when it was created — while its
+/// content, status, priority and ranking are what a revision carries, because
+/// `Recommendation$version` is the resource's "version number for optimistic
+/// locking" and a read may name one (`GetRecommendationRequest$recommendationVersion`
+/// — "Specific version of the recommendation to retrieve. If not specified,
+/// returns the latest version"). So a version stays readable once a later one
+/// supersedes it, and the revisions are the one home of everything that changes.
+#[derive(Debug, Clone)]
+pub struct RecommendationRecord {
+    pub recommendation_id: String,
+    pub agent_space_id: String,
+    /// The task that generated this recommendation.
+    pub task_id: String,
+    /// The goal it was generated against, when it was generated against one.
+    pub goal_id: Option<String>,
+    /// The version that goal was at when this recommendation was generated.
+    pub goal_version: Option<i64>,
+    pub created_at: SystemTime,
+    /// Every revision of this recommendation, by the `version` that names it. The
+    /// highest is the one it is at; the earlier ones are what a read naming a
+    /// version still resolves.
+    pub revisions: BTreeMap<i64, RecommendationRevision>,
+}
+
+/// What one revision of a recommendation holds: everything about it that a later
+/// revision can change.
+#[derive(Debug, Clone)]
+pub struct RecommendationRevision {
+    pub title: String,
+    /// `RecommendationContent$summary`: the brief summary, required on the wire.
+    pub summary: String,
+    /// `RecommendationContent$spec`: the agent-ready specification, when the
+    /// revision carries one.
+    pub spec: Option<String>,
+    pub status: String,
+    pub priority: String,
+    pub additional_context: Option<String>,
+    /// Position in the ranked list, when this revision has been ranked.
+    pub rank_position: Option<i32>,
+    /// When this revision was last ranked, which only a ranked revision has.
+    pub ranked_at: Option<SystemTime>,
+    pub updated_at: SystemTime,
+}
+
+impl RecommendationRecord {
+    /// The version of the latest revision this recommendation has, or `None` for a
+    /// record holding no revision at all.
+    pub fn latest_version(&self) -> Option<i64> {
+        self.revisions.keys().next_back().copied()
+    }
+
+    /// The revision `version` names, or the latest one when `version` is `None`;
+    /// `None` when that is no revision this recommendation has.
+    pub fn revision(&self, version: Option<i64>) -> Option<(i64, &RecommendationRevision)> {
+        let version = match version {
+            Some(version) => version,
+            None => self.latest_version()?,
+        };
+        self.revisions
+            .get(&version)
+            .map(|revision| (version, revision))
+    }
+
+    /// The modelled `Recommendation` for one revision of this record: the revision
+    /// `version` names, or the latest when it names none. `None` when the record
+    /// has no such revision, which is what makes a read of an absent version a
+    /// not-found rather than a different recommendation.
+    pub fn to_api(&self, agent_space_arn: &str, version: Option<i64>) -> Option<Recommendation> {
+        let (version, revision) = self.revision(version)?;
+        Some(Recommendation {
+            agent_space_arn: agent_space_arn.to_string(),
+            recommendation_id: self.recommendation_id.clone(),
+            task_id: self.task_id.clone(),
+            goal_id: self.goal_id.clone(),
+            title: revision.title.clone(),
+            content: RecommendationContent {
+                summary: revision.summary.clone(),
+                spec: revision.spec.clone(),
+            },
+            status: revision.status.clone(),
+            priority: revision.priority.clone(),
+            goal_version: self.goal_version,
+            additional_context: revision.additional_context.clone(),
+            rank_position: revision.rank_position,
+            ranked_at: revision.ranked_at.map(to_date_time),
+            created_at: to_date_time(self.created_at),
+            updated_at: to_date_time(revision.updated_at),
+            version,
+        })
     }
 }
 

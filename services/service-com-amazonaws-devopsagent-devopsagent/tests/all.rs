@@ -25,6 +25,8 @@ mod assets;
 mod backlog_task_refusal_arms;
 #[path = "all/operator_app.rs"]
 mod operator_app;
+#[path = "all/recommendation_reads.rs"]
+mod recommendation_reads;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/trigger_refusal_arms.rs"]
