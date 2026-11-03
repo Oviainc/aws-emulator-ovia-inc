@@ -33,6 +33,8 @@ mod domain_name_conflict_and_not_found;
 mod domain_project_lifecycle;
 #[path = "all/domain_scoped_read_authorization.rs"]
 mod domain_scoped_read_authorization;
+#[path = "all/domain_unit_deletion.rs"]
+mod domain_unit_deletion;
 #[path = "all/domain_unit_hierarchy.rs"]
 mod domain_unit_hierarchy;
 #[path = "all/domain_unit_name_uniqueness.rs"]

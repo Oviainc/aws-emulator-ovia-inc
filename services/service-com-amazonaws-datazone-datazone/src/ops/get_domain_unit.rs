@@ -3,7 +3,9 @@
 //! @op GetDomainUnit
 //!
 //! Reports one stored domain unit: the record `CreateDomainUnit` persisted — or, for a
-//! domain's root unit, the one created with the domain — read back from state.
+//! domain's root unit, the one created with the domain — read back from state. A unit
+//! `DeleteDomainUnit` has removed is answered as a denial instead: nothing is held on
+//! that id any more.
 //!
 //! ## Shape of an operation
 //!
@@ -183,6 +185,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let unit = store
             .domain_unit(&input.domain_identifier, &input.identifier)
             .ok_or_else(|| {
+                // A unit this domain has DELETED: the owners that were the grants held
+                // on it went with it, so nothing is held on the id any more and the
+                // read is denied — the one answer that covers both halves of the
+                // question without disclosing which applies, and the same on every
+                // repeated read. An id the domain never held is still existence.
+                if store
+                    .domains
+                    .get(&input.domain_identifier)
+                    .is_some_and(|domain| domain.has_deleted_domain_unit(&input.identifier))
+                {
+                    return GetDomainUnitErrorModeled::AccessDeniedException(
+                        AccessDeniedException {
+                            message: crate::state::not_permitted_or_absent_message(Self::NAME),
+                        },
+                    );
+                }
                 GetDomainUnitErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: crate::state::ResourceKind::DomainUnit.not_found_message(),
                 })

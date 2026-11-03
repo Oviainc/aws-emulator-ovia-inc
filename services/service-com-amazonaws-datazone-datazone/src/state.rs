@@ -14,7 +14,7 @@
 //! `status_due_ms` — materialised by [`ComAmazonawsDatazoneDatazoneState::settle_clock`],
 //! which every handler calls first. No handler ever sleeps for it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 /// The span the emulator takes to finish a domain lifecycle step AWS reports as
 /// in-progress (`CREATING` -> `AVAILABLE`, `DELETING` -> gone).
@@ -267,6 +267,16 @@ pub struct Domain {
     /// which is created with the domain itself. Bounded by
     /// [`MAX_DOMAIN_UNITS_PER_DOMAIN`].
     pub domain_units: BTreeMap<String, DomainUnit>,
+    /// The ids of the domain units this domain has DELETED, oldest first.
+    ///
+    /// A domain unit's owners are the grants held on it, and they go with the unit, so
+    /// once `DeleteDomainUnit` has removed one, nothing is held on that id any more and
+    /// a call addressing it is denied rather than answered with an existence report —
+    /// see [`not_permitted_or_absent_message`]. Bounded by
+    /// [`MAX_DELETED_DOMAIN_UNITS_PER_DOMAIN`] through
+    /// [`Domain::record_deleted_domain_unit`], so a create/delete loop cannot grow the
+    /// emulator's heap without limit.
+    pub deleted_domain_unit_ids: VecDeque<String>,
     /// The catalog listings stored in this domain, keyed by their `ListingId` — the
     /// identifier `GetListing`/`DeleteListing` address one by — so they go with the
     /// domain when it is deleted. Bounded by [`MAX_LISTINGS_PER_DOMAIN`].
@@ -372,6 +382,78 @@ impl Domain {
                 })
         })
     }
+
+    /// The object stored in this domain that still hangs UNDER the domain unit
+    /// `unit_id` and so prevents its deletion, named the way a deletion refusal names
+    /// it ([`hierarchy_object`]), or `None` when nothing does.
+    ///
+    /// A domain unit is a node of the domain's ownership hierarchy, so what depends on
+    /// it is what hangs under it: the child domain units whose parent it is, the
+    /// projects assigned to it, and — for the domain's ROOT unit — the domain itself,
+    /// which names that unit in `rootDomainUnitId` and so is never left without it.
+    /// Child units are looked at first, then projects, each walk over a `BTreeMap`, so
+    /// the dependency reported for a unit several objects hang under is the same one on
+    /// every call. `None` exactly when nothing in this domain hangs under the unit,
+    /// which is what lets `DeleteDomainUnit` remove it. Linear scans over maps bounded
+    /// by [`MAX_DOMAIN_UNITS_PER_DOMAIN`] and [`MAX_PROJECTS_PER_DOMAIN`], the same
+    /// trade [`Self::listing_for_entity`] makes.
+    pub fn domain_unit_blocker(&self, unit_id: &str) -> Option<String> {
+        if self.root_domain_unit_id == unit_id {
+            return Some(hierarchy_object(HIERARCHY_KIND_DOMAIN, &self.id));
+        }
+        self.domain_units
+            .values()
+            .find(|unit| unit.parent_domain_unit_id.as_deref() == Some(unit_id))
+            .map(|unit| hierarchy_object(HIERARCHY_KIND_DOMAIN_UNIT, &unit.id))
+            .or_else(|| {
+                self.projects
+                    .values()
+                    .find(|project| project.domain_unit_id.as_deref() == Some(unit_id))
+                    .map(|project| hierarchy_object(HIERARCHY_KIND_PROJECT, &project.id))
+            })
+    }
+
+    /// Remember that the domain unit `unit_id` was deleted from this domain.
+    ///
+    /// The ids are kept oldest first and bounded by
+    /// [`MAX_DELETED_DOMAIN_UNITS_PER_DOMAIN`]: past the bound the oldest id is
+    /// forgotten, so a create/delete loop cannot grow the store without limit.
+    pub fn record_deleted_domain_unit(&mut self, unit_id: String) {
+        if self.has_deleted_domain_unit(&unit_id) {
+            return;
+        }
+        while self.deleted_domain_unit_ids.len() >= MAX_DELETED_DOMAIN_UNITS_PER_DOMAIN {
+            self.deleted_domain_unit_ids.pop_front();
+        }
+        self.deleted_domain_unit_ids.push_back(unit_id);
+    }
+
+    /// Whether the domain unit `unit_id` was deleted from this domain.
+    pub fn has_deleted_domain_unit(&self, unit_id: &str) -> bool {
+        self.deleted_domain_unit_ids.iter().any(|id| id == unit_id)
+    }
+}
+
+/// The kind name a DOMAIN UNIT carries where a deletion refusal names it.
+///
+/// SOURCE: the recorded `ConflictException` for `DeleteDomainUnit`, which names both the
+/// unit being deleted and the child unit that prevented it `domainUnit <domainUnitId>`.
+pub const HIERARCHY_KIND_DOMAIN_UNIT: &str = "domainUnit";
+
+/// The kind name a PROJECT carries there: the same form, with the API's own type name
+/// for the kind.
+pub const HIERARCHY_KIND_PROJECT: &str = "project";
+
+/// The kind name a DOMAIN carries there — what a domain's root unit is held by.
+pub const HIERARCHY_KIND_DOMAIN: &str = "domain";
+
+/// One object of a domain's ownership hierarchy as a deletion refusal names it:
+/// `<kind> <identifier>`, the kind followed by the object's own identifier within the
+/// domain (see [`HIERARCHY_KIND_DOMAIN_UNIT`] for where the form comes from). Distinct
+/// from [`graph_object`], the form the asset/form-type dependency graph names its
+/// objects by.
+pub fn hierarchy_object(kind: &str, identifier: &str) -> String {
+    format!("{kind} {identifier}")
 }
 
 /// One stored object whose dependency on another object prevents that object's deletion
@@ -1832,6 +1914,13 @@ pub const MAX_FORM_TYPE_REVISIONS: usize = 100;
 /// under a parent that is itself stored.
 pub const MAX_DOMAIN_UNITS_PER_DOMAIN: usize = 100;
 
+/// The most deleted-domain-unit ids this emulator remembers per domain
+/// ([`Domain::deleted_domain_unit_ids`]). Every id it holds is one a unit the store no
+/// longer has once carried, so the whole hierarchy a domain can hold at once fits —
+/// past that the oldest is forgotten and a call addressing it falls back to the
+/// existence answer.
+pub const MAX_DELETED_DOMAIN_UNITS_PER_DOMAIN: usize = MAX_DOMAIN_UNITS_PER_DOMAIN;
+
 /// The most owners this emulator keeps on one entity, for the same reason and with the
 /// same refusal (`AddEntityOwner` models `ServiceQuotaExceededException` too): adding
 /// owners is caller-driven growth of a stored entity.
@@ -2842,6 +2931,20 @@ pub fn not_permitted_message(operation: &str) -> String {
 /// from [`not_permitted_message`], which is the recorded wording for a denial inside a
 /// domain, and shared so the domain-level operations cannot drift from one another.
 pub const DOMAIN_SCOPE_DENIED_MESSAGE: &str = "";
+
+/// The `AccessDeniedException` message DataZone answers a call addressing a domain unit
+/// it has DELETED: [`not_permitted_message`] plus the clause that makes the one answer
+/// cover both halves of a question the service will not separate.
+///
+/// Recorded behaviour, and fixed text apart from the OPERATION NAME — the same single
+/// substitution [`not_permitted_message`] takes, so nothing the caller sent appears in
+/// it and the answer is the same on every repeated call.
+pub fn not_permitted_or_absent_message(operation: &str) -> String {
+    format!(
+        "{}, or the requested resource does not exist",
+        not_permitted_message(operation)
+    )
+}
 
 /// The `ConflictException` message `CreateDomain` answers when the account already has
 /// a domain with the requested name. The requirement is the 409 refusal and the code;

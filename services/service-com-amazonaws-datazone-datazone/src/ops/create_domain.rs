@@ -320,6 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             glossary_terms: std::collections::BTreeMap::new(),
             asset_types: std::collections::BTreeMap::new(),
             domain_units: std::collections::BTreeMap::new(),
+            deleted_domain_unit_ids: std::collections::VecDeque::new(),
             listings: std::collections::BTreeMap::new(),
             account_pools: std::collections::BTreeMap::new(),
             id: id.clone(),

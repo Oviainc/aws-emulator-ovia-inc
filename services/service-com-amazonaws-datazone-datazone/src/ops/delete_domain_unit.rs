@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDomainUnit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDomainUnit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDomainUnit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one node of a domain's domain-unit hierarchy — but only when nothing in the
+//! domain still hangs under it: a unit another object depends on is refused with
+//! `ConflictException` naming both objects, and the store is left exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +141,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDomainUnit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDomainUnitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDomainUnit"))
+        let _ = ctx;
+        use crate::state::{
+            deletion_prevented_message, hierarchy_object, not_permitted_message,
+            not_permitted_or_absent_message, now_ms, ResourceKind, DOMAIN_STATUS_DELETING,
+            HIERARCHY_KIND_DOMAIN_UNIT,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDomainUnitErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        // Authorization comes FIRST, as it does for every domain-scoped call: a
+        // permission is held ON a domain, so a caller holds none on an identifier this
+        // store serves no domain for, and the request is denied before any resource is
+        // resolved rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(DeleteDomainUnitErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
+        // A domain already being deleted is gone as far as its contents go — the same
+        // liveness rule the other deletes inside a domain use.
+        let domain = store
+            .domains
+            .get_mut(&input.domain_identifier)
+            .filter(|domain| domain.status != DOMAIN_STATUS_DELETING)
+            .ok_or_else(|| {
+                DeleteDomainUnitErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: ResourceKind::Domain.not_found_message(),
+                    },
+                )
+            })?;
+
+        if !domain.domain_units.contains_key(&input.identifier) {
+            // A unit this domain has already DELETED: its owners were the grants held
+            // on it and they went with it, so nothing is held on the id any more and
+            // the call is denied — the one answer that covers both halves of the
+            // question without disclosing which applies. Every repeat gets it.
+            if domain.has_deleted_domain_unit(&input.identifier) {
+                return Err(DeleteDomainUnitErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: not_permitted_or_absent_message(Self::NAME),
+                    },
+                )
+                .into());
+            }
+            return Err(DeleteDomainUnitErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: ResourceKind::DomainUnit.not_found_message(),
+                },
+            )
+            .into());
+        }
+
+        // Referential integrity: a domain unit goes only once nothing in the domain
+        // hangs under it. Checked BEFORE the removal, so a refused delete leaves the
+        // store exactly as it was — the unit stays readable — and the refusal names the
+        // unit the request addressed together with the stored object that prevented it.
+        if let Some(blocker) = domain.domain_unit_blocker(&input.identifier) {
+            let object = hierarchy_object(HIERARCHY_KIND_DOMAIN_UNIT, &input.identifier);
+            return Err(DeleteDomainUnitErrorModeled::ConflictException(ConflictException {
+                message: deletion_prevented_message(&object, &blocker),
+            })
+            .into());
+        }
+
+        domain.domain_units.remove(&input.identifier);
+        // Recorded AFTER the removal, so the id is remembered exactly when it stopped
+        // naming a stored unit.
+        domain.record_deleted_domain_unit(input.identifier);
+        Ok(DeleteDomainUnitOutput {})
     }
 }
