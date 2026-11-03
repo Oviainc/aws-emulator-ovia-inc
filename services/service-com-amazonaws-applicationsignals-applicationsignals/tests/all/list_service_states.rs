@@ -469,26 +469,94 @@ async fn the_reported_instant_round_trips_through_get_service_level_objective() 
 
 /// The window selects the changes reported: a service the store records no change for inside
 /// it has no state at all, since a state carries exactly one change event.
+///
+/// Every bound of a window stated relative to the stored history is measured from an instant
+/// the STORE recorded — the latest `LastUpdatedTime` the writes themselves answered with,
+/// which [`seed`] reads back — rather than from a clock sample read before those writes: a
+/// record's instant is the clock's at the moment of the write, so a sample taken earlier can
+/// precede it, and a bound a second past such a sample can then still sit INSIDE the history
+/// it was meant to be after. Only the empty-store row, which has no record to measure from,
+/// names the clock.
+///
+/// The rows differ along where the window sits relative to the history (before it, after it,
+/// over it, beginning just past its end), how wide it is (an hour, two, a day, a single
+/// second) and whether the store holds anything at all.
 #[tokio::test]
 async fn the_window_selects_the_changes_reported() {
     let router = router();
-    let now = now_seconds();
     let discovered = discovered_services().len();
 
+    // Nothing is stored yet, so there is no recorded instant to measure from and no change
+    // for any window to report.
+    let empty_at = now_seconds() as f64;
+    let (status, answer) = list_states(
+        &router,
+        json!({ "StartTime": empty_at - 3_600.0, "EndTime": empty_at + 3_600.0 }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"an empty store over a covering window\": expected HTTP 200, got {status} with {answer:?}"
+    );
+    assert_eq!(
+        answer["ServiceStates"].as_array().map(Vec::len),
+        Some(0),
+        "case \"an empty store over a covering window\": expected 0 states, got {:?}",
+        answer["ServiceStates"]
+    );
+
+    // The last instant the store recorded for any service: every bound below is an offset
+    // from it, so no row depends on how long the writes took.
+    let last_write = seed(&router)
+        .await
+        .values()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        last_write.is_finite(),
+        "case \"the seeded history\": expected the writes to report their instants, got {last_write}"
+    );
+
     let cases = [
-        ("an empty store over a covering window", now - 3_600, now + 3_600, 0),
-        ("a window that ends before anything was written", now - 7_200, now - 3_600, 0),
-        ("a window entirely in the future", now + 3_600, now + 7_200, 0),
-        ("a window that contains the writes", now - 3_600, now + 3_600, discovered),
-        ("a window that begins long ago", now - 86_400, now + 86_400, discovered),
-        ("a window that begins after the writes", now + 1, now + 7_200, 0),
+        (
+            "a window that ends before anything was written",
+            last_write - 7_200.0,
+            last_write - 3_600.0,
+            0,
+        ),
+        (
+            "a window entirely after the writes",
+            last_write + 3_600.0,
+            last_write + 7_200.0,
+            0,
+        ),
+        (
+            "a window that contains the writes",
+            last_write - 3_600.0,
+            last_write + 3_600.0,
+            discovered,
+        ),
+        (
+            "a window that begins long ago",
+            last_write - 86_400.0,
+            last_write + 86_400.0,
+            discovered,
+        ),
+        (
+            "a window that begins a second after the last write",
+            last_write + 1.0,
+            last_write + 7_200.0,
+            0,
+        ),
+        (
+            "a one-second window just past the last write",
+            last_write + 1.0,
+            last_write + 2.0,
+            0,
+        ),
     ];
 
     for (case, start, end, expected) in cases {
-        // The first row runs before anything is stored; the rest after.
-        if case == "a window that ends before anything was written" {
-            seed(&router).await;
-        }
         let (status, answer) =
             list_states(&router, json!({ "StartTime": start, "EndTime": end })).await;
         assert_eq!(
