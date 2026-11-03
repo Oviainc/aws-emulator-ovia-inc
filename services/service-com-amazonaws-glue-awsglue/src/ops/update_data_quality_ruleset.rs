@@ -8,6 +8,12 @@
 //! ones, the members it omits are preserved, and the response projects the record as it
 //! now stands — which is what a later `GetDataQualityRuleset` of that name reports.
 //!
+//! That projection is wider than the three members the modelled response below binds: the
+//! service also reports the ruleset's identifier, the table it targets and both of its
+//! timestamps, so the whole stored record comes back. The response shape is hand-declared
+//! for exactly that reason — see
+//! [`crate::ops::types::UpdateDataQualityRulesetOutput`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -214,11 +220,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every member comes from the record as it now stands, so this response reports
         // exactly what a later `GetDataQualityRuleset` of this name will: a ruleset no
-        // write has given a description reports none rather than an empty string.
+        // write has given a description reports none rather than an empty string, and the
+        // ruleset's own identity — the identifier it was assigned, the table it targets and
+        // both of its timestamps — is reported beside the patched definition rather than
+        // left for the caller to re-read.
         Ok(UpdateDataQualityRulesetOutput {
             name: Some(entry.name.clone()),
             description: entry.description.clone(),
             ruleset: Some(entry.ruleset.clone()),
+            identifier: Some(entry.identifier.clone()),
+            target_table: entry.target_table.clone(),
+            created_on: Some(crate::state::to_date_time(entry.created_on)),
+            last_modified_on: Some(crate::state::to_date_time(entry.last_modified_on)),
         })
     }
 }

@@ -219,6 +219,8 @@ mod resource_policies;
 mod resource_tagging;
 #[path = "all/resource_untagging.rs"]
 mod resource_untagging;
+#[path = "all/response_members.rs"]
+mod response_members;
 #[path = "all/schema_registry.rs"]
 mod schema_registry;
 #[path = "all/schema_version_deletion.rs"]

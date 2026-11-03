@@ -209,10 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(ListWorkflowsOutput {
-            // `Workflows` is `WorkflowNames`, "len 1..25", so the model admits no empty
-            // list: an account holding no workflow, and a page past the end of the
-            // listing, report no `Workflows` member at all rather than an empty one.
-            workflows: (!page.is_empty()).then_some(page),
+            // Present even when empty: an account holding no workflow, and a page past the
+            // end of the listing, have an EMPTY listing rather than an absent one — exactly
+            // as the sibling name listings of this crate report theirs. `WorkflowNames`'
+            // "len 1..25" bounds what a REQUEST may carry in a list of workflow names; it
+            // is not a licence to drop the member from an answer, which is what an SDK's
+            // paginator iterates.
+            workflows: Some(page),
             next_token,
         })
     }

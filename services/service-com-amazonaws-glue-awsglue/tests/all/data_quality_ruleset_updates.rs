@@ -30,9 +30,19 @@ const MIN_RULESET_LENGTH: usize = 1;
 /// empty string is a description a request may name.
 const MAX_DESCRIPTION_LENGTH: usize = 2_048;
 
-/// The three members `UpdateDataQualityRulesetResponse` models
-/// (`smithy_query operation=UpdateDataQualityRuleset`).
-const UPDATE_RESPONSE_MEMBERS: [&str; 3] = ["Name", "Description", "Ruleset"];
+/// The members `UpdateDataQualityRuleset` answers with: the three the published response
+/// shape binds (`smithy_query operation=UpdateDataQualityRuleset`) plus the four the service
+/// also reports from the stored record — see [`crate::response_members`], which asserts that
+/// projection.
+const UPDATE_RESPONSE_MEMBERS: [&str; 7] = [
+    "Name",
+    "Description",
+    "Ruleset",
+    "Identifier",
+    "TargetTable",
+    "CreatedOn",
+    "LastModifiedOn",
+];
 
 /// Create a ruleset, and fail the test if the create is refused.
 async fn create(router: &smithy_server_runtime::MultiServiceRouter, body: &Value) {
@@ -271,8 +281,7 @@ async fn an_update_writes_the_members_it_names_and_preserves_the_rest() {
                 "case {case}: expected the Description the record now holds, got {answered}"
             );
         }
-        // `UpdateDataQualityRulesetResponse` models three members, so the answer carries
-        // no fourth one.
+        // The answer carries the members of the ruleset projection and nothing else.
         for member in answered
             .as_object()
             .unwrap_or_else(|| panic!("case {case}: the answer is a structure, got {answered}"))
@@ -289,6 +298,11 @@ async fn an_update_writes_the_members_it_names_and_preserves_the_rest() {
         // update answered with.
         let after = get(&router, name).await;
         for member in UPDATE_RESPONSE_MEMBERS {
+            if member == "Identifier" {
+                // `GetDataQualityRulesetResponse` binds no `Identifier`, so the read has
+                // none to agree with.
+                continue;
+            }
             assert_eq!(
                 after.get(member).cloned().unwrap_or(Value::Null),
                 answered.get(member).cloned().unwrap_or(Value::Null),

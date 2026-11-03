@@ -8757,15 +8757,21 @@ impl AssetEntry {
     /// association added survive a later one and an association sent twice is the same
     /// state as sending it once. The bound is checked against the UNION, so re-associating
     /// terms an asset already holds is served however full it is.
+    ///
+    /// The ceiling is also what bounds the WORK: a request can only carry as many new ids
+    /// as the union admits, so the walk stops at the first one past it rather than merging
+    /// the whole request first — one call cannot spend more comparisons or more memory than
+    /// [`MAX_ASSET_GLOSSARY_TERMS`] allows, whatever it sends.
     pub fn associate_glossary_terms(&mut self, identifiers: &[String]) -> Option<Vec<String>> {
         let mut merged = self.glossary_terms.clone();
         for identifier in identifiers {
-            if !merged.iter().any(|held| held == identifier) {
-                merged.push(identifier.clone());
+            if merged.iter().any(|held| held == identifier) {
+                continue;
             }
-        }
-        if merged.len() > MAX_ASSET_GLOSSARY_TERMS {
-            return None;
+            if merged.len() == MAX_ASSET_GLOSSARY_TERMS {
+                return None;
+            }
+            merged.push(identifier.clone());
         }
         self.glossary_terms = merged;
         Some(self.glossary_terms.clone())
@@ -15054,17 +15060,50 @@ fn is_dqdl_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
 
+/// How many 64-bit words a data quality ruleset's identifier carries: two, i.e. 128 bits
+/// rendered as 32 lowercase hexadecimal characters, the width every opaque id this crate
+/// mints has ([`mint_hex_id`]).
+const DATA_QUALITY_RULESET_IDENTIFIER_WORDS: usize = 2;
+
+/// How many data quality ruleset identifiers this process has minted. A nonce source for
+/// [`new_data_quality_ruleset_identifier`], one counter of its own so another kind of id
+/// running ahead cannot skew it.
+static MINTED_DATA_QUALITY_RULESET_IDENTIFIERS: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh ruleset identifier: the id the service assigns a data quality ruleset when it is
+/// created, and reports beside the ruleset afterwards.
+///
+/// 32 lowercase hexadecimal characters, i.e. 128 bits, which is inside `HashString`'s
+/// `length 1..255` — the string every id this service hands a data quality resource is
+/// spelled as. It is minted once, at create, and stored on the [`DataQualityRulesetEntry`],
+/// so every later answer about that ruleset reports the same identifier and two rulesets
+/// never share one.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_data_quality_ruleset_identifier() -> String {
+    mint_hex_id(
+        &MINTED_DATA_QUALITY_RULESET_IDENTIFIERS,
+        DATA_QUALITY_RULESET_IDENTIFIER_WORDS,
+    )
+}
+
 /// One stored data quality ruleset: the DQDL rules `CreateDataQualityRuleset` registers
 /// under a name, plus the members only the server sets.
 ///
 /// Every member of the modelled `GetDataQualityRulesetResponse` is held here, so a read
-/// serves what the write stored and invents nothing, plus the create's `Tags` and
-/// `ClientToken`, which that response does not carry.
+/// serves what the write stored and invents nothing, plus the identifier the create assigned
+/// the ruleset and the create's `Tags` and `ClientToken`, which that response does not carry.
 #[derive(Debug, Clone)]
 pub struct DataQualityRulesetEntry {
     /// "A unique name for the data quality ruleset", which is also its key in
     /// [`ComAmazonawsGlueAwsglueState::data_quality_rulesets`].
     pub name: String,
+    /// The identifier the create assigned this ruleset
+    /// ([`new_data_quality_ruleset_identifier`]), which is what an answer reporting the
+    /// ruleset's own identity carries. Set once and never moved, so it addresses this record
+    /// for as long as the record exists.
+    pub identifier: String,
     /// "A description of the data quality ruleset", absent when the write named none.
     pub description: Option<String>,
     /// "A Data Quality Definition Language (DQDL) ruleset", stored exactly as sent: this
@@ -15103,11 +15142,13 @@ pub struct DataQualityRulesetEntry {
 impl DataQualityRulesetEntry {
     /// Build a stored ruleset from a `CreateDataQualityRuleset` request served at `now`.
     ///
-    /// Every member but the two timestamps comes from the request: the client authors the
-    /// whole ruleset, and the model gives a created ruleset no id or status of its own.
+    /// Every member but the identifier and the two timestamps comes from the request: the
+    /// client authors the whole ruleset, and the model gives a created ruleset no status of
+    /// its own.
     pub fn from_create_input(input: &CreateDataQualityRulesetInput, now: SystemTime) -> Self {
         Self {
             name: input.name.clone(),
+            identifier: new_data_quality_ruleset_identifier(),
             description: input.description.clone(),
             ruleset: input.ruleset.clone(),
             target_table: input.target_table.clone(),

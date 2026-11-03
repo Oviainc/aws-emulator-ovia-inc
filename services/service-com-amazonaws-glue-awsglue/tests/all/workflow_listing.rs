@@ -51,8 +51,9 @@ fn given_workflow(engine: &Arc<engine::InMemoryEngine>, name: &str) {
 
 /// The names one answer reports, in the order the service returned them.
 ///
-/// `Workflows` is `WorkflowNames`, "len 1..25", so the model admits no empty list: an
-/// answer reporting nothing carries no member at all, which reads here as no names.
+/// `Workflows` is present in every answer, as an empty list when the listing has nothing to
+/// report, so an absent member would itself be a defect — [`crate::response_members`] is
+/// where that is asserted; this reads the list.
 fn listed_names(page: &Value) -> Vec<String> {
     match page.get("Workflows") {
         None | Some(Value::Null) => Vec::new(),
@@ -213,16 +214,17 @@ async fn a_page_reports_at_most_max_results_names_and_a_token_only_when_more_rem
 }
 
 /// A listing of an account holding no workflow, and a page past the end of the listing,
-/// report no `Workflows` member: `WorkflowNames` is "len 1..25", so the model admits no
-/// empty list.
+/// report an EMPTY `Workflows` list and no token: an empty listing is an empty collection,
+/// not an omitted member.
 #[tokio::test]
-async fn an_exhausted_listing_reports_no_workflows_member() {
+async fn an_exhausted_listing_reports_an_empty_workflows_member() {
     let (router, engine) = emulator_with_store();
 
     let empty = ok(&router, "ListWorkflows", &json!({})).await;
-    assert!(
-        empty.get("Workflows").is_none_or(Value::is_null),
-        "case no workflows at all: expected no Workflows member, got {empty}"
+    assert_eq!(
+        empty.get("Workflows"),
+        Some(&json!([])),
+        "case no workflows at all: expected an empty Workflows list, got {empty}"
     );
     assert!(
         empty.get("NextToken").is_none_or(Value::is_null),
@@ -236,9 +238,10 @@ async fn an_exhausted_listing_reports_no_workflows_member() {
         ("a cursor past every stored name", "zzz-beyond"),
     ] {
         let page = ok(&router, "ListWorkflows", &json!({ "NextToken": cursor })).await;
-        assert!(
-            page.get("Workflows").is_none_or(Value::is_null),
-            "case {case:?}: expected no Workflows member, got {page}"
+        assert_eq!(
+            page.get("Workflows"),
+            Some(&json!([])),
+            "case {case:?}: expected an empty Workflows list, got {page}"
         );
         assert!(
             page.get("NextToken").is_none_or(Value::is_null),
