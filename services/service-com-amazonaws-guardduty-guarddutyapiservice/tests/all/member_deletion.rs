@@ -559,7 +559,7 @@ async fn re_recording_a_deleted_account_yields_a_fresh_record() {
     // A second email per account, differing from the recorded one, so a stale record
     // would be observable: the rows span the same email shapes [`MEMBERS`] does.
     const REPLACEMENT_EMAILS: [&str; 3] = [
-        "member-one-again@example.net",
+        "member-one-again@example-corp.net",
         "second.address@example-corp.org",
         "m2+tag@example.io",
     ];

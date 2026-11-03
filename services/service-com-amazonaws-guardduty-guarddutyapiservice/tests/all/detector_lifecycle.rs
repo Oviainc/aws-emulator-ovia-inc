@@ -80,9 +80,39 @@ pub(crate) async fn call_in(
     call_signed(router, &auth_for(region), method, path, body).await
 }
 
+/// [`call`], sent to the endpoint authority `host` rather than to this harness's
+/// default one.
+///
+/// The authority a request arrives at is what an uploaded list's `Location` is read
+/// against (`state::request_host`), so a suite about that rule has to choose it.
+pub(crate) async fn call_at(
+    router: &Router,
+    host: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    call_signed_at(router, AUTH, host, method, path, body).await
+}
+
 async fn call_signed(
     router: &Router,
     authorization: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    call_signed_at(router, authorization, DEFAULT_HOST, method, path, body).await
+}
+
+/// The endpoint authority every request of this harness addresses unless a suite
+/// names another ([`call_at`]).
+const DEFAULT_HOST: &str = "guardduty.us-east-1.amazonaws.com";
+
+async fn call_signed_at(
+    router: &Router,
+    authorization: &str,
+    host: &str,
     method: &str,
     path: &str,
     body: Option<Value>,
@@ -93,7 +123,7 @@ async fn call_signed(
     };
     let request = http::Request::builder()
         .method(method)
-        .uri(format!("https://guardduty.us-east-1.amazonaws.com{path}"))
+        .uri(format!("https://{host}{path}"))
         .header("authorization", authorization)
         .header("content-type", "application/json")
         .body(payload)

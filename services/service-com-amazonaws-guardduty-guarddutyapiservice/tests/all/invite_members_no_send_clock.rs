@@ -54,8 +54,9 @@ const INVITED: &str = "Invited";
 
 /// The recorded account every row keeps un-invited, so the call AFTER the burst has a
 /// member to move: `(accountId, email)`, 12 decimal digits and the email
-/// `CreateMembers` records (`smithy_query(shape="AccountId")`).
-const MOVER: (&str, &str) = ("555566667777", "mover@example.com");
+/// `CreateMembers` records (`smithy_query(shape="AccountId")`). Its domain can
+/// receive mail, so the send that moves it leaves it [`INVITED`].
+const MOVER: (&str, &str) = ("555566667777", "mover@example-corp.com");
 
 /// How many copies of the call one burst sends. A call that sends no invitation
 /// consumes no instant, so the burst may be any size; it is this large because a

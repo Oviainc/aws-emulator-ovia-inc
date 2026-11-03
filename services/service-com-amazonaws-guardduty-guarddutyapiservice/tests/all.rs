@@ -171,6 +171,8 @@ mod member_detector_organization_managed_switches;
 mod member_detector_timestamp;
 #[path = "all/member_invitation.rs"]
 mod member_invitation;
+#[path = "all/member_invitation_email_verification.rs"]
+mod member_invitation_email_verification;
 #[path = "all/member_monitoring.rs"]
 mod member_monitoring;
 #[path = "all/member_monitoring_outstanding_invitation.rs"]
@@ -275,5 +277,7 @@ mod trusted_entity_set_lifecycle;
 mod trusted_entity_set_listing;
 #[path = "all/trusted_entity_set_update.rs"]
 mod trusted_entity_set_update;
+#[path = "all/uploaded_list_location_endpoint.rs"]
+mod uploaded_list_location_endpoint;
 #[path = "all/usage_statistics.rs"]
 mod usage_statistics;

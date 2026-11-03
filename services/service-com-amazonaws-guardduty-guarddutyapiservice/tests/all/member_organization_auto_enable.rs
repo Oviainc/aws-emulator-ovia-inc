@@ -93,9 +93,10 @@ const INVITED: &str =
     service_com_amazonaws_guardduty_guarddutyapiservice::state::RELATIONSHIP_INVITED;
 
 /// Email forms the rows cycle, so a case varies along the account details as well as
-/// along the configuration.
+/// along the configuration. Each is in a domain that can receive mail, so a member of
+/// this suite is left [`INVITED`] by the send that invites it.
 pub(crate) const EMAIL_FORMS: [&str; 3] = [
-    "member@example.com",
+    "member@example-corp.com",
     "first.last@sub.example-corp.com",
     "m+tag@example.io",
 ];

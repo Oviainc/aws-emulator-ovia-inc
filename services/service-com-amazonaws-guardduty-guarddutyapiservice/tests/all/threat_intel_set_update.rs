@@ -29,9 +29,13 @@
 //!    only the list its id names.
 //! 4. An id the store does not resolve is refused with HTTP 400 under the
 //!    `InvalidInputException` class, naming the MEMBER and never echoing the
-//!    caller's value, and it updates nothing — including the id of a list whose
-//!    delete has been accepted, and a threat list being a sub-resource of a REGIONAL
-//!    detector, an id only the Region that created it may update.
+//!    caller's value, and it updates nothing — a threat list being a sub-resource of
+//!    a REGIONAL detector, an id only the Region that created it may update.
+//! 5. An id whose own delete is already running is a DIFFERENT refusal: the change
+//!    collides with work in flight rather than naming a list that is not there, so it
+//!    is refused under the `InternalServerErrorException` class with the 400 of a
+//!    request the service will not perform, carrying
+//!    `state::OPERATION_IN_PROGRESS_MESSAGE`, and it updates nothing.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_guardduty_guarddutyapiservice::state;
@@ -45,6 +49,11 @@ use crate::threat_intel_set_delete::{past_activation, past_deletion};
 /// The error class every GuardDuty client rejection carries in the body's `__type`
 /// discriminator.
 const CLASS: &str = "InvalidInputException";
+
+/// The error class GuardDuty names a change that collides with work already running
+/// on the list by — the class this service's own `in_progress` refusal carries in the
+/// body's `__type` and in `x-amzn-errortype`.
+const IN_PROGRESS_CLASS: &str = "InternalServerErrorException";
 
 /// A well-formed `ThreatIntelSetId` (32 lowercase hex characters, the form this
 /// service mints) that no create ever minted.
@@ -717,9 +726,13 @@ async fn an_unresolvable_id_is_refused_and_updates_nothing() {
     );
 }
 
-/// A list whose delete has been accepted is no longer one the account can act on, so
-/// an update of it is refused exactly like an id the detector never held — and the
-/// record stays on its way out rather than being walked back into use.
+/// A list whose delete has been accepted is one the account's own delete is still
+/// running on, so an update of it collides with that work: HTTP 400 under the
+/// `InternalServerErrorException` class with the fixed in-progress sentence — and
+/// the record stays on its way out rather than being walked back into use.
+///
+/// The rows are both ends of the deletion's own transition, and both values of
+/// `Activate`, so the refusal is not a function of what the update asks for.
 #[tokio::test]
 async fn an_update_of_a_deleted_list_is_refused() {
     let router = new_router();
@@ -731,27 +744,43 @@ async fn an_update_of_a_deleted_list_is_refused() {
         ("while the deletion is still pending", false),
         ("once the deletion has settled", true),
     ] {
-        let id = created(&router, &detector, case, base_create("deleted", false)).await;
-        retire(&router, &detector, &id, case).await;
-        if wait {
-            tokio::time::sleep(past_deletion()).await;
+        for activate in [true, false] {
+            let case = &format!("{case}, activate={activate}");
+            let id = created(&router, &detector, case, base_create("deleted", false)).await;
+            retire(&router, &detector, &id, case).await;
+            if wait {
+                tokio::time::sleep(past_deletion()).await;
+            }
+            let expected = status_of(&router, &detector, &id, case).await;
+
+            let (status, body) =
+                update_set(&router, &detector, &id, json!({"activate": activate})).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400, got {status} {body:?}"
+            );
+            let class = error_code(&body);
+            assert_eq!(
+                class, IN_PROGRESS_CLASS,
+                "case {case:?}: expected the {IN_PROGRESS_CLASS} class, got {class:?} {body:?}"
+            );
+            let message = body["message"].as_str().unwrap_or_default();
+            assert_eq!(
+                message,
+                state::OPERATION_IN_PROGRESS_MESSAGE,
+                "case {case:?}: expected the in-progress sentence, got {message:?}"
+            );
+            assert!(
+                !message.contains(id.as_str()),
+                "case {case:?}: the refusal must not echo {id:?}, got {message:?}"
+            );
+
+            let after = status_of(&router, &detector, &id, case).await;
+            assert_eq!(
+                after, expected,
+                "case {case:?}: a refused update must not move a deleted list's status, got \
+                 {after:?}"
+            );
         }
-        let expected = status_of(&router, &detector, &id, case).await;
-
-        let (status, body) = update_set(&router, &detector, &id, json!({"activate": true})).await;
-        assert_classified_refusal(
-            case,
-            status,
-            &body,
-            state::SET_ID_NOT_FOUND_MESSAGE,
-            &[id.as_str()],
-        );
-
-        let after = status_of(&router, &detector, &id, case).await;
-        assert_eq!(
-            after, expected,
-            "case {case:?}: a refused update must not move a deleted list's status, got \
-             {after:?}"
-        );
     }
 }

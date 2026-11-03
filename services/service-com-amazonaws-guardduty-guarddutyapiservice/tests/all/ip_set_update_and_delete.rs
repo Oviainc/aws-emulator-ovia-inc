@@ -27,7 +27,10 @@
 //!    `DELETED` — `GetIPSet`'s `Status` is `@required` and its enum carries both
 //!    (`smithy_query(operation="GetIPSet")`) — whatever status the list was in when
 //!    the delete arrived. A repeated delete is accepted and moves nothing, and an
-//!    update of a deleted list is refused.
+//!    update of a deleted list collides with the delete already running on it, so it
+//!    is refused under the `InternalServerErrorException` class with the 400 of a
+//!    request the service will not perform, carrying
+//!    `state::OPERATION_IN_PROGRESS_MESSAGE`.
 //! 4. A deleted list occupies none of the detector's `state::IP_SETS_PER_DETECTOR`
 //!    slots, so a delete frees room for a create, and nothing a delete did touches
 //!    the detector's other IPSets.
@@ -46,12 +49,16 @@ use crate::ip_set_lifecycle::past_the_transition;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     DETECTOR_ID_MEMBER, IP_SETS_PER_DETECTOR, IP_SET_ACTIVATING, IP_SET_ACTIVE,
     IP_SET_DEACTIVATING, IP_SET_DELETED, IP_SET_DELETE_PENDING, IP_SET_INACTIVE,
-    SET_ID_NOT_FOUND_MESSAGE,
+    OPERATION_IN_PROGRESS_MESSAGE, SET_ID_NOT_FOUND_MESSAGE,
 };
 
 /// The error class every client rejection on this service carries in the body's
 /// `__type` discriminator.
 const INVALID_INPUT: &str = "InvalidInputException";
+
+/// The error class GuardDuty names a change that collides with work already running
+/// on the list by.
+const IN_PROGRESS_CLASS: &str = "InternalServerErrorException";
 
 /// A well-formed `IpSetId` (32 lowercase hex characters, the form this service
 /// mints) that no create ever minted.
@@ -630,8 +637,9 @@ async fn a_delete_reports_delete_pending_and_then_deleted() {
     }
 }
 
-/// An update of a list whose delete has been accepted is refused — in both the
-/// transitional and the terminal status — and the refusal changes nothing.
+/// An update of a list whose delete has been accepted collides with the delete
+/// already running on it — in both the transitional and the terminal status — and the
+/// refusal changes nothing.
 #[tokio::test]
 async fn an_update_of_a_deleted_ip_set_is_refused() {
     let router = new_router();
@@ -670,7 +678,24 @@ async fn an_update_of_a_deleted_ip_set_is_refused() {
             json!({"name": "resurrected", "activate": true}),
         )
         .await;
-        assert_classified_refusal(case, status, &body, SET_ID_NOT_FOUND_MESSAGE, &[id.as_str()]);
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} {body:?}"
+        );
+        let class = error_code(&body);
+        assert_eq!(
+            class, IN_PROGRESS_CLASS,
+            "case {case:?}: expected the {IN_PROGRESS_CLASS} class, got {class:?} {body:?}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        assert_eq!(
+            message, OPERATION_IN_PROGRESS_MESSAGE,
+            "case {case:?}: expected the in-progress sentence, got {message:?}"
+        );
+        assert!(
+            !message.contains(id.as_str()),
+            "case {case:?}: the refusal must not echo {id:?}, got {message:?}"
+        );
 
         // The refusal wrote nothing: neither the name nor the status moved.
         let body = read(&router, &detector, &id, case).await;

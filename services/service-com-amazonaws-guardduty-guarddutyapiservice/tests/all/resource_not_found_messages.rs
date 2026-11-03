@@ -427,16 +427,11 @@ async fn each_family_words_its_own_absent_resource_refusal() {
     )
     .await;
     // A deleted IPSet and threat list are RETAINED so a read can still report their
-    // `DELETED` status, so their rows below use an id no create minted and the update
-    // path, which is what refuses a record a delete has already claimed.
-    ok(
-        &router,
-        "delete the stored IPSet",
-        "DELETE",
-        &format!("/detector/{detector}/ipset/{}", stored.ip_set),
-        None,
-    )
-    .await;
+    // `DELETED` status, and a change to one collides with the delete already running
+    // on it rather than naming an absent resource (the `ip_set_update_and_delete`
+    // suite's rule), so the uploaded-list rows below are about identifiers that
+    // resolve to NOTHING: ids no create minted, and a stored id in a spelling the
+    // store does not hold.
 
     let mut rows: Vec<Row> = Vec::new();
 
@@ -450,12 +445,6 @@ async fn each_family_words_its_own_absent_resource_refusal() {
             "ipset",
             stored.ip_set.to_uppercase(),
             "the stored id upper-cased",
-        ),
-        (
-            "ipset",
-            "ipset",
-            stored.ip_set.clone(),
-            "an id whose delete was accepted",
         ),
         (
             "threatintelset",
@@ -476,31 +465,26 @@ async fn each_family_words_its_own_absent_resource_refusal() {
             "the stored id upper-cased",
         ),
     ] {
-        // The read of a RETAINED deleted record is a success, not a refusal, so the
-        // delete-shaped row probes the update only.
-        let deleted_record = why == "an id whose delete was accepted";
-        if !deleted_record {
-            rows.push(Row {
-                case: format!("{family} read: {why}"),
-                method: "GET",
-                path: format!("/detector/{detector}/{segment}/{id}"),
-                body: None,
-                status: 400,
-                class: INVALID_INPUT,
-                expected: NO_SUCH_RESOURCE,
-                sent: id.clone(),
-            });
-            rows.push(Row {
-                case: format!("{family} delete: {why}"),
-                method: "DELETE",
-                path: format!("/detector/{detector}/{segment}/{id}"),
-                body: None,
-                status: 400,
-                class: INVALID_INPUT,
-                expected: NO_SUCH_RESOURCE,
-                sent: id.clone(),
-            });
-        }
+        rows.push(Row {
+            case: format!("{family} read: {why}"),
+            method: "GET",
+            path: format!("/detector/{detector}/{segment}/{id}"),
+            body: None,
+            status: 400,
+            class: INVALID_INPUT,
+            expected: NO_SUCH_RESOURCE,
+            sent: id.clone(),
+        });
+        rows.push(Row {
+            case: format!("{family} delete: {why}"),
+            method: "DELETE",
+            path: format!("/detector/{detector}/{segment}/{id}"),
+            body: None,
+            status: 400,
+            class: INVALID_INPUT,
+            expected: NO_SUCH_RESOURCE,
+            sent: id.clone(),
+        });
         rows.push(Row {
             case: format!("{family} update: {why}"),
             method: "POST",

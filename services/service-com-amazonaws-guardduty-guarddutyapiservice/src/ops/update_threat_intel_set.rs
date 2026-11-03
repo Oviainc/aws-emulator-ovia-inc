@@ -156,13 +156,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "the updated URI of the file that contains the ThreatIntelSet"
         // (`smithy_query(operation="UpdateThreatIntelSet")`) — so it is held to the
         // same S3 URL syntax the create holds it to
-        // ([`crate::state::is_s3_location`]), and a value the service could never
-        // fetch is refused before the stored location is overwritten with it.
-        if input
-            .location
-            .as_deref()
-            .is_some_and(|location| !crate::state::is_s3_location(location))
-        {
+        // ([`crate::state::is_s3_location`]), against the Amazon S3 endpoint this
+        // caller reaches ([`crate::state::request_host`]), and a value the service
+        // could never fetch is refused before the stored location is overwritten
+        // with it.
+        if input.location.as_deref().is_some_and(|location| {
+            !crate::state::is_s3_location(location, crate::state::request_host(ctx).as_deref())
+        }) {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::invalid_parameter_message(
                     crate::state::THREAT_INTEL_SET_LOCATION_MEMBER,
@@ -196,20 +196,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::detector_id_rejection(&input.detector_id),
             ));
         };
-        // A list whose delete has already been accepted is no longer one the account
-        // can act on, so it is refused exactly like an id the detector never held:
-        // both are the absence every uploaded-list operation reports with one fixed
-        // sentence ([`crate::state::SET_ID_NOT_FOUND_MESSAGE`]). The delete itself
-        // stays idempotent — it asks for the state the record is already in — while
-        // an update would otherwise walk a `DELETED` record back into use.
-        let Some(set) = detector
-            .threat_intel_set(&input.threat_intel_set_id)
-            .filter(|set| !set.is_deleting())
-        else {
+        // An id the detector does not hold at all is the absence every uploaded-list
+        // operation reports with one fixed sentence
+        // ([`crate::state::SET_ID_NOT_FOUND_MESSAGE`]).
+        let Some(set) = detector.threat_intel_set(&input.threat_intel_set_id) else {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::SET_ID_NOT_FOUND_MESSAGE,
             ));
         };
+        // A list whose delete has already been accepted is a DIFFERENT refusal: the
+        // record is there and the account's own delete is still running on it, so the
+        // change collides with work already in flight rather than naming a list that
+        // is not there — the same collision `UpdateIPSet` answers, under the service's
+        // server error class with the status of a request it will not perform
+        // ([`crate::scaffolded::Scaffolded::in_progress`]). The delete itself stays
+        // idempotent — it asks for the state the record is already in — while an
+        // update would otherwise walk a `DELETED` record back into use.
+        if set.is_deleting() {
+            return Err(crate::scaffolded::Scaffolded::in_progress(
+                crate::state::OPERATION_IN_PROGRESS_MESSAGE,
+            ));
+        }
 
         // Whether this request changes the list at all is decided HERE, over the
         // stored record and still before the clock moves: an update that writes back

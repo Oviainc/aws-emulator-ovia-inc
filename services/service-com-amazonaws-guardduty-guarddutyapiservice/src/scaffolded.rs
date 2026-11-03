@@ -197,6 +197,16 @@ pub const INVALID_INPUT_EXCEPTION: &str = "InvalidInputException";
 /// unmarshal the response into, and the client needs the class to switch on.
 pub const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
 
+/// The error CLASS GuardDuty names a request it refuses because work it collides
+/// with is already running.
+///
+/// The service's own server error shape (`httpError` 500,
+/// `smithy_query(shape="InternalServerErrorException")`), and a modelled error of
+/// the operations that answer it — but the refusal carries the status of a request
+/// the service will not perform rather than the shape's own, because nothing
+/// failed on the server: see [`Scaffolded::in_progress`].
+pub const INTERNAL_SERVER_ERROR_EXCEPTION: &str = "InternalServerErrorException";
+
 /// `message` of a classified rejection, rendered with the `jsonName` the modeled
 /// envelope gives it (`smithy_query(shape="BadRequestException")`).
 ///
@@ -386,6 +396,25 @@ impl<E> Scaffolded<E> {
         Self::Classified(ClassifiedError::new(
             INVALID_INPUT_EXCEPTION,
             BAD_REQUEST_EXCEPTION,
+            message,
+        ))
+    }
+
+    /// Refuse the request as GuardDuty refuses a change to a resource whose own
+    /// delete is already running: the status of a request the service will not
+    /// perform (400), under the [`INTERNAL_SERVER_ERROR_EXCEPTION`] class.
+    ///
+    /// The class is the SERVER one on purpose — it is the error code GuardDuty
+    /// names this collision by — so it is carried in the body's `__type` and
+    /// `type` AND in the `x-amzn-errortype` header that resolves the error shape:
+    /// the class is itself a modelled error of the operations that answer it, so
+    /// an SDK still unmarshals the response, and a client reading the code alone
+    /// tells a collision with work already in flight (retry later) from an
+    /// unacceptable parameter (do not retry).
+    pub fn in_progress(message: impl Into<String>) -> Self {
+        Self::Classified(ClassifiedError::new(
+            INTERNAL_SERVER_ERROR_EXCEPTION,
+            INTERNAL_SERVER_ERROR_EXCEPTION,
             message,
         ))
     }

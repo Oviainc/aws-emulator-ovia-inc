@@ -71,7 +71,7 @@ const REGION: &str = crate::member_association::DEFAULT_REGION;
 /// An account recorded while the organization already auto-enables `ALL`, with its
 /// email. Outside [`MEMBERS`] and outside [`NON_MEMBER_ACCOUNT_IDS`], so recording it
 /// leaves every table the other member suites share intact.
-const LATE_MEMBER: (&str, &str) = ("555566667777", "late-member@example.com");
+const LATE_MEMBER: (&str, &str) = ("555566667777", "late-member@example-corp.com");
 
 /// A second Region, which is how a second administrator's detector is reached:
 /// GuardDuty holds one detector per account per Region.

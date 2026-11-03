@@ -46,8 +46,13 @@ const ENVELOPE: &str = "BadRequestException";
 /// Member accounts to record: 12 decimal digits each, which is the form `AccountId`
 /// takes (`len 12..12` — `smithy_query(shape="AccountId")`). The rows differ along
 /// the account id and along the email's shape, which is all `CreateMembers` stores.
+///
+/// Every address is in a domain that can RECEIVE mail
+/// (`state::email_domain_receives_mail`), so a member of this fixture is one whose
+/// invitation is announced and awaits an answer; the addresses whose domain can
+/// never receive it are the `member_invitation` suite's own rows.
 pub(crate) const MEMBERS: [(&str, &str); 3] = [
-    ("111122223333", "member-one@example.com"),
+    ("111122223333", "member-one@example-corp.com"),
     ("222233334444", "first.last@sub.example-corp.com"),
     ("333344445555", "m+tag@example.io"),
 ];

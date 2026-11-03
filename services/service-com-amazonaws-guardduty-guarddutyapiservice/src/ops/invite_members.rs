@@ -267,22 +267,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // needing a second `CreateMembers`.
                 Some(member) => {
                     sent = true;
+                    // What this send leaves the member in: an invitation is
+                    // announced to the address `CreateMembers` recorded, and
+                    // GuardDuty resolves that address's domain as it sends, so an
+                    // address no mail can reach fails verification there and then
+                    // rather than waiting for an answer that can never arrive
+                    // ([`crate::state::invitation_outcome`]).
+                    let outcome = crate::state::invitation_outcome(&member.email);
                     // One invitation is pending per administrator/member pair, so
                     // inviting an account whose invitation is still pending re-sends
                     // that same invitation rather than issuing a second one: nothing
                     // about the member moves, `InvitedAt` and `UpdatedAt` included.
                     // "Still pending" is the inbox's answer, not the stored status's:
-                    // a member left `Invited` by a send whose invitation has since
-                    // been accepted, declined or deleted has none pending, so the
-                    // instant this send is made at is what its record carries — a
-                    // member's `InvitedAt` names the instant an invitation this store
-                    // holds was sent at, never one that was answered.
-                    if invitation_pending
-                        && member.relationship_status == crate::state::RELATIONSHIP_INVITED
-                    {
+                    // a member left by a send whose invitation has since been
+                    // accepted, declined or deleted has none pending, so the instant
+                    // this send is made at is what its record carries — a member's
+                    // `InvitedAt` names the instant an invitation this store holds
+                    // was sent at, never one that was answered. The stored status is
+                    // compared against the OUTCOME of a send to this member, so a
+                    // re-send changes nothing whichever outcome the first one had.
+                    if invitation_pending && member.relationship_status == outcome {
                         continue;
                     }
-                    member.relationship_status = crate::state::RELATIONSHIP_INVITED.to_string();
+                    member.relationship_status = outcome.to_string();
                     member.invited_at_millis = Some(now);
                     member.updated_at_millis = now;
                     wrote = true;

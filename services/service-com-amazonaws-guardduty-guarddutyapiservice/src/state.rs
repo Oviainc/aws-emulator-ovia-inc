@@ -2141,6 +2141,77 @@ pub const RELATIONSHIP_ENABLED: &str = "Enabled";
 /// [`RELATIONSHIP_CREATED`] for where the values come from.
 pub const RELATIONSHIP_DISABLED: &str = "Disabled";
 
+/// `Member.RelationshipStatus` for a member whose invitation could not be
+/// announced because the address `CreateMembers` recorded for it cannot be
+/// verified ([`email_domain_receives_mail`]). See [`RELATIONSHIP_CREATED`] for
+/// where the values come from.
+///
+/// It is the outcome of the SEND, not a status the clock later owes: GuardDuty
+/// resolves the address's domain as it sends, so an address no mail can reach
+/// fails verification there and then rather than staying pending for an answer
+/// that can never arrive. The invitation itself is still delivered, so the
+/// relationship is as associated as an answered-for one
+/// ([`MemberRecord::is_associated`]) and the member account can still accept it
+/// through the API — what failed is the EMAIL the invitation is announced by.
+pub const RELATIONSHIP_EMAIL_VERIFICATION_FAILED: &str = "EmailVerificationFailed";
+
+/// The DNS names no mail can be delivered to, as the names that are RESERVED
+/// never to be assigned: the four special-use top-level domains `.invalid`,
+/// `.test`, `.example` and `.localhost`, and the three second-level names
+/// `example.com`, `example.net` and `example.org`, all of which are set aside for
+/// documentation, examples and testing (RFC 2606 §2–3, RFC 6761 §6) and so have no
+/// mail exchanger to hand a message to.
+///
+/// A domain IN one of these namespaces — the name itself or anything under it — is
+/// the one class of address whose undeliverability is knowable without resolving
+/// anything, which is why it is the whole catalogue: every other domain may have a
+/// mail exchanger, so an invitation to it is announced and awaits an answer.
+const UNDELIVERABLE_EMAIL_DOMAINS: [&str; 7] = [
+    "invalid",
+    "test",
+    "example",
+    "localhost",
+    "example.com",
+    "example.net",
+    "example.org",
+];
+
+/// Can the domain of `email` receive the message an invitation is announced by?
+///
+/// Answers `false` only for an address in one of the reserved, never-assigned
+/// namespaces ([`UNDELIVERABLE_EMAIL_DOMAINS`]), and for an address carrying no
+/// domain at all; the comparison is case-insensitive and ignores a trailing root
+/// dot, because neither distinguishes two DNS names.
+pub fn email_domain_receives_mail(email: &str) -> bool {
+    let Some((_, domain)) = email.rsplit_once('@') else {
+        return false;
+    };
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() {
+        return false;
+    }
+    !UNDELIVERABLE_EMAIL_DOMAINS.iter().any(|reserved| {
+        domain
+            .strip_suffix(reserved)
+            .is_some_and(|rest| rest.is_empty() || rest.ends_with('.'))
+    })
+}
+
+/// The relationship status an invitation sent to `email` leaves the member in:
+/// [`RELATIONSHIP_INVITED`] once it has been announced and is awaiting the
+/// account's answer, and [`RELATIONSHIP_EMAIL_VERIFICATION_FAILED`] when the
+/// address cannot be verified at all.
+///
+/// One function for the send and for the re-send that must change nothing, so the
+/// two cannot disagree on what the outcome of inviting one member is.
+pub fn invitation_outcome(email: &str) -> &'static str {
+    if email_domain_receives_mail(email) {
+        RELATIONSHIP_INVITED
+    } else {
+        RELATIONSHIP_EMAIL_VERIFICATION_FAILED
+    }
+}
+
 /// How many received invitations one detector's inbox retains.
 ///
 /// A bound on [`Detector::received_invitations`], whose key is an ACCOUNT ID and
@@ -2931,11 +3002,12 @@ pub struct MemberRecord {
     pub email: String,
     /// `Member.RelationshipStatus`: [`RELATIONSHIP_CREATED`],
     /// [`RELATIONSHIP_INVITED`] once `InviteMembers` has sent the account an
-    /// invitation, [`RELATIONSHIP_DISABLED`] once `StopMonitoringMembers` has
-    /// stopped monitoring the account, [`RELATIONSHIP_ENABLED`] once
-    /// `StartMonitoringMembers` has turned monitoring back on for it, or
-    /// [`RELATIONSHIP_REMOVED`] once `DisassociateMembers` has ended the
-    /// association.
+    /// invitation — or [`RELATIONSHIP_EMAIL_VERIFICATION_FAILED`] when that send
+    /// could not verify the account's address — [`RELATIONSHIP_DISABLED`] once
+    /// `StopMonitoringMembers` has stopped monitoring the account,
+    /// [`RELATIONSHIP_ENABLED`] once `StartMonitoringMembers` has turned monitoring
+    /// back on for it, or [`RELATIONSHIP_REMOVED`] once `DisassociateMembers` has
+    /// ended the association.
     pub relationship_status: String,
     /// When the invitation `InviteMembers` sent this account was sent, in epoch
     /// milliseconds — the member's `InvitedAt`, "the timestamp when the invitation
@@ -2985,9 +3057,13 @@ impl MemberRecord {
     /// ([`RELATIONSHIP_CREATED`]), and one a disassociation moved
     /// ([`RELATIONSHIP_REMOVED`]). The invitation is what associates the account, so
     /// the relationship is an association from there on — whether or not the account
-    /// has answered it, which is the narrower [`Self::is_monitored`].
+    /// has answered it, which is the narrower [`Self::is_monitored`], and whether or
+    /// not its address could be verified
+    /// ([`RELATIONSHIP_EMAIL_VERIFICATION_FAILED`]), since that send delivered the
+    /// invitation too.
     pub fn is_associated(&self) -> bool {
         self.relationship_status == RELATIONSHIP_INVITED
+            || self.relationship_status == RELATIONSHIP_EMAIL_VERIFICATION_FAILED
             || self.relationship_status == RELATIONSHIP_ENABLED
             || self.relationship_status == RELATIONSHIP_DISABLED
     }
@@ -3990,6 +4066,17 @@ pub const IP_SET_ID_MEMBER: &str = "ipSetId";
 /// have been minted at all are the same absence.
 pub const SET_ID_NOT_FOUND_MESSAGE: &str = NO_SUCH_RESOURCE_MESSAGE;
 
+/// The message GuardDuty refuses a change to an uploaded list whose own delete is
+/// already running with.
+///
+/// One fixed sentence that names neither the operation, the member nor the
+/// caller's value: what it reports is that the request collides with work already
+/// in flight on that list, which is why it is answered under the service's server
+/// error class ([`crate::scaffolded::Scaffolded::in_progress`]) rather than as the
+/// absence an id the detector never held gets ([`SET_ID_NOT_FOUND_MESSAGE`]).
+pub const OPERATION_IN_PROGRESS_MESSAGE: &str =
+    "The request is rejected. This operation is already in progress.";
+
 /// The wire name of the `Name` member an IPSet create or update carries: both
 /// bind it in the JSON body under `jsonName` `name`
 /// (`smithy_query(operation="CreateIPSet")`). It is what a rejection names,
@@ -4612,7 +4699,15 @@ pub fn is_entity_set_name(name: &str) -> bool {
 /// and the virtual-hosted-style one
 /// (`https://bucket.s3[.-]<region>.amazonaws.com/key`). Each needs BOTH a bucket
 /// and a non-empty object key: a URL naming only a bucket does not name a list.
-pub fn is_s3_location(location: &str) -> bool {
+///
+/// `endpoint_host` is the endpoint the REQUEST addressed ([`request_host`]), and a
+/// path-style object URL on that endpoint is an S3 object URL too: the Amazon S3
+/// endpoint a caller of this emulator reaches is the emulator's own endpoint, not
+/// a public `amazonaws.com` host, so a list uploaded through it is addressed
+/// `<this endpoint>/<bucket>/<key>`. Nothing else widens: a URL naming any OTHER
+/// authority addresses a host neither Amazon S3 nor this emulator serves, so it is
+/// still refused.
+pub fn is_s3_location(location: &str, endpoint_host: Option<&str>) -> bool {
     let Ok(url) = ::url::Url::parse(location) else {
         return false;
     };
@@ -4620,19 +4715,50 @@ pub fn is_s3_location(location: &str) -> bool {
         return false;
     };
     let key = url.path().trim_start_matches('/');
+    let path_style = || {
+        key.split_once('/')
+            .is_some_and(|(bucket, object_key)| !bucket.is_empty() && !object_key.is_empty())
+    };
     match url.scheme() {
         // `s3://bucket/key`: the authority IS the bucket and the path the key.
         "s3" => !host.is_empty() && !key.is_empty(),
         "https" => match s3_endpoint_prefix(host) {
             // Path-style: the first path segment is the bucket, the rest the key.
-            Some("") => key.split_once('/').is_some_and(|(bucket, object_key)| {
-                !bucket.is_empty() && !object_key.is_empty()
-            }),
+            Some("") => path_style(),
             // Virtual-hosted style: the host carries the bucket, the path the key.
             Some(bucket) => !bucket.is_empty() && !key.is_empty(),
-            None => false,
+            // The endpoint serving this request, addressed path-style. Compared as
+            // the ENDPOINT and not as its spelling: the port the scheme implies is
+            // filled in on both sides, and a DNS name does not distinguish case, so
+            // one endpoint written two legal ways is one endpoint.
+            None => {
+                endpoint_host.is_some_and(|endpoint| {
+                    let (name, port) = endpoint_authority(endpoint);
+                    name.eq_ignore_ascii_case(host) && url.port_or_known_default() == Some(port)
+                }) && path_style()
+            }
         },
         _ => false,
+    }
+}
+
+/// The port a caller reaches an `https` endpoint on when its authority names none —
+/// the port the scheme implies, which [`::url::Url::port_or_known_default`] fills in
+/// on the other side of the comparison in [`is_s3_location`].
+const HTTPS_PORT: u16 = 443;
+
+/// The endpoint a `host[:port]` authority names: its host, and the port it is
+/// reached on with [`HTTPS_PORT`] filled in where the authority leaves it out.
+///
+/// A trailing group that is not a port is part of the host — an IPv6 literal carries
+/// colons of its own — so it is kept rather than stripped.
+fn endpoint_authority(authority: &str) -> (&str, u16) {
+    match authority.rsplit_once(':') {
+        Some((host, port)) => match port.parse::<u16>() {
+            Ok(port) => (host, port),
+            Err(_) => (authority, HTTPS_PORT),
+        },
+        None => (authority, HTTPS_PORT),
     }
 }
 
@@ -9851,6 +9977,28 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 
 /// The Region an unsigned request is attributed to.
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The endpoint host this request addressed — its `Host` header, or the authority
+/// of the request URI when it carries one. `None` when the request names no
+/// endpoint of its own.
+///
+/// It is what tells an uploaded list's `Location` whether it addresses the Amazon
+/// S3 endpoint the CALLER reaches ([`is_s3_location`]): every service this
+/// emulator presents is served at one endpoint, so the endpoint a request arrives
+/// at is also the one its S3 objects are addressed at.
+pub fn request_host(ctx: &smithy_server_runtime::OperationContext<'_>) -> Option<String> {
+    ctx.parts()
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            ctx.parts()
+                .uri
+                .authority()
+                .map(::http::uri::Authority::as_str)
+        })
+        .map(ToString::to_string)
+}
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
