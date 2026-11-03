@@ -19,15 +19,15 @@
 //! * a deleted node is gone from every reader, and the instance group it belonged to asks
 //!   for one instance fewer, so the group's count and its nodes cannot disagree;
 //! * an identifier the cluster holds no node for, and one whose node is mid-change, is
-//!   reported in the matching failure list with the modelled per-node error code, leaving
-//!   the identifiers beside it in the same batch deleted;
+//!   reported in the matching failure list with the per-node error code of the identifier
+//!   kind that named it, leaving the identifiers beside it in the same batch deleted;
 //! * a request naming no node at all, or more identifiers than one call may carry, is
 //!   refused, and so is one naming a cluster this account does not hold.
 
 use serde_json::{json, Value};
 
 use crate::hyperpod_cluster_node_replacement::{
-    in_service_cluster, nodes_of, string_list, Node, IN_USE, NODE_NOT_FOUND, PAST_SETTLE_DUE,
+    in_service_cluster, nodes_of, string_list, Node, IN_USE, PAST_SETTLE_DUE,
 };
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
 
@@ -39,10 +39,14 @@ use service_com_amazonaws_sagemaker_sagemaker::state::cluster_not_found;
 /// The per-node failure message for a node that cannot be deleted right now, in the terms
 /// both of this operation's failure shapes document their subject in (smithy_query
 /// shape=BatchDeleteClusterNodesError, shape=BatchDeleteClusterNodeLogicalIdsError). The
-/// not-found and in-use wordings are the ones the sibling replacement suite already names
-/// ([`NODE_NOT_FOUND`], [`IN_USE`]).
+/// in-use wording is the one the sibling replacement suite already names ([`IN_USE`]).
 const INVALID_STATUS: &str = "The node is in a state that does not allow deletion. Wait for \
      the node to finish any ongoing changes before retrying.";
+
+/// How SageMaker words the per-node failure of an identifier this cluster holds no node
+/// for, whichever identifier kind named it: fixed text with no variable part, since the
+/// failure entry it sits in already carries the identifier it is about.
+const NOT_FOUND: &str = "Node does not exist in the given cluster.";
 
 /// How many instances each instance group of `cluster` currently holds, as
 /// `DescribeCluster` reports it in that group's `CurrentCount`.
@@ -224,10 +228,11 @@ async fn a_call_drops_exactly_the_nodes_its_identifiers_name() {
     }
 }
 
-/// RULE: a per-node failure is reported for the identifier it belongs to, with the
-/// modelled error code for the condition — `NodeIdNotFound` for an identifier the cluster
-/// holds no node for, `InvalidNodeStatus` for a node that is mid-change — and leaves every
-/// other identifier of the same batch deleted: a batch operation reports per-entry
+/// RULE: a per-node failure is reported for the identifier it belongs to, carrying the
+/// error code of the IDENTIFIER KIND that named the node — an instance id's failures are
+/// coded for the instance (`InstanceIdNotFound`, `InstanceIdInUse`) and a logical id's for
+/// the node (`NodeLogicalIdNotFound`, `NodeIdInUse`, `InvalidNodeStatus`) — and leaves
+/// every other identifier of the same batch deleted: a batch operation reports per-entry
 /// outcomes instead of failing whole.
 #[tokio::test]
 async fn an_identifier_that_names_no_deletable_node_is_reported_in_the_failure_list() {
@@ -263,8 +268,8 @@ async fn an_identifier_that_names_no_deletable_node_is_reported_in_the_failure_l
             vec![],
             json!([{
                 "NodeId": "i-0123456789abcdef0",
-                "Code": "NodeIdNotFound",
-                "Message": NODE_NOT_FOUND,
+                "Code": "InstanceIdNotFound",
+                "Message": NOT_FOUND,
             }]),
             Value::Null,
         ),
@@ -279,8 +284,8 @@ async fn an_identifier_that_names_no_deletable_node_is_reported_in_the_failure_l
             Value::Null,
             json!([{
                 "NodeLogicalId": "no-such-node",
-                "Code": "NodeIdNotFound",
-                "Message": NODE_NOT_FOUND,
+                "Code": "NodeLogicalIdNotFound",
+                "Message": NOT_FOUND,
             }]),
         ),
         (
@@ -299,14 +304,33 @@ async fn an_identifier_that_names_no_deletable_node_is_reported_in_the_failure_l
             }]),
         ),
         (
+            // The SAME node as the row above, named by the other identifier kind: the
+            // condition is one node's, so only the code's vocabulary changes with it.
+            "mid-change-node-named-by-its-instance-id",
+            json!({
+                "ClusterName": cluster,
+                "NodeIds": [nodes[3].instance_id.clone()],
+            }),
+            vec![],
+            vec![],
+            json!([{
+                "NodeId": nodes[3].instance_id.clone(),
+                "Code": "InstanceIdInUse",
+                "Message": IN_USE,
+            }]),
+            Value::Null,
+        ),
+        (
+            // A shorter instance id (`^i-[a-f0-9]{8}(?:[a-f0-9]{9})?$` admits 8 or 17 hex
+            // characters), so the code does not follow the identifier's length.
             "every-identifier-unknown",
             json!({ "ClusterName": cluster, "NodeIds": ["i-abcdef01"] }),
             vec![],
             vec![],
             json!([{
                 "NodeId": "i-abcdef01",
-                "Code": "NodeIdNotFound",
-                "Message": NODE_NOT_FOUND,
+                "Code": "InstanceIdNotFound",
+                "Message": NOT_FOUND,
             }]),
             Value::Null,
         ),
@@ -328,13 +352,13 @@ async fn an_identifier_that_names_no_deletable_node_is_reported_in_the_failure_l
             answered.get("Failed").unwrap_or(&Value::Null),
             &failed,
             "case {case:?}: an instance id that names no deletable node is reported with \
-             its modelled code, got {answered}"
+             the instance code for its condition, got {answered}"
         );
         assert_eq!(
             answered.get("FailedNodeLogicalIds").unwrap_or(&Value::Null),
             &failed_logical,
-            "case {case:?}: a logical id that names no deletable node is reported with its \
-             modelled code, got {answered}"
+            "case {case:?}: a logical id that names no deletable node is reported with the \
+             node code for its condition, got {answered}"
         );
     }
 

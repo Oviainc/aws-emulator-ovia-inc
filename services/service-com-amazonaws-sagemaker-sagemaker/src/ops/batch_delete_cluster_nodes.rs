@@ -6,9 +6,9 @@
 //! each node the request names from the cluster — lowering the target count of the
 //! instance group it belonged to, reporting the identifiers it deleted in
 //! `Successful`/`SuccessfulNodeLogicalIds` IN THE ORDER THE REQUEST LISTED THEM, and a
-//! node it cannot delete in `Failed`/`FailedNodeLogicalIds` with the modelled per-node
-//! error code rather than failing the whole batch. This is the ONLY file to touch for this
-//! operation.
+//! node it cannot delete in `Failed`/`FailedNodeLogicalIds` with the per-node error code
+//! of the IDENTIFIER THAT NAMED IT rather than failing the whole batch. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -123,19 +123,36 @@ impl From<BatchDeleteClusterNodesErrorModeled> for BatchDeleteClusterNodesError 
     }
 }
 
-/// `BatchDeleteClusterNodesErrorCode`'s members this operation can report, from the
-/// model's enum of the same name
-/// (smithy_query query="shape" shape="BatchDeleteClusterNodesErrorCode").
+/// The per-node error codes the `NodeIds` failure list reports: each names its condition
+/// in the terms of the EC2 INSTANCE the identifier named, which is the vocabulary the
+/// batch node operations share for an instance identifier (smithy_query query="shape"
+/// shape="BatchReplaceClusterNodesErrorCode" / "BatchRebootClusterNodesErrorCode", and
+/// what SageMaker answers for an instance id this cluster holds no node for).
 ///
-/// The logical-id failure shape documents its own codes in prose
-/// (`NodeLogicalIdNotFound`, `InternalError`), but both failure lists target THIS enum, so
-/// a value outside it would be off the wire contract: a missing node is `NodeIdNotFound`
-/// whichever identifier named it. Nothing here faults, so no internal-error code is
-/// reported.
-const ERROR_NODE_ID_NOT_FOUND: &str = "NodeIdNotFound";
-/// See [`ERROR_NODE_ID_NOT_FOUND`].
+/// `BatchDeleteClusterNodesErrorCode`, which both failure lists target (its members are
+/// generated as `super::types::BATCH_DELETE_CLUSTER_NODES_ERROR_CODE_VALUES`), still
+/// carries the node-identifier spellings of the same three conditions from before
+/// `InstanceIds` was renamed `NodeIds`; the service answers the instance spellings for
+/// this list, so that enum is the stale account and these are the wire codes — do not
+/// "correct" them back to it.
+const ERROR_INSTANCE_ID_NOT_FOUND: &str = "InstanceIdNotFound";
+/// See [`ERROR_INSTANCE_ID_NOT_FOUND`].
+const ERROR_INVALID_INSTANCE_STATUS: &str = "InvalidInstanceStatus";
+/// See [`ERROR_INSTANCE_ID_NOT_FOUND`].
+const ERROR_INSTANCE_ID_IN_USE: &str = "InstanceIdInUse";
+
+/// The per-node error codes the `NodeLogicalIds` failure list reports: each names its
+/// condition in the terms of the NODE the logical id named, as that list's own error shape
+/// documents them ("Possible values include `NodeLogicalIdNotFound`, `InvalidNodeStatus`",
+/// smithy_query query="doc" shape="BatchDeleteClusterNodeLogicalIdsError" member="Code").
+/// Its remaining documented code reports a fault inside the service while it processed one
+/// node; nothing here faults, so nothing reports it.
+const ERROR_NODE_LOGICAL_ID_NOT_FOUND: &str = "NodeLogicalIdNotFound";
+/// See [`ERROR_NODE_LOGICAL_ID_NOT_FOUND`].
 const ERROR_INVALID_NODE_STATUS: &str = "InvalidNodeStatus";
-/// See [`ERROR_NODE_ID_NOT_FOUND`].
+/// See [`ERROR_NODE_LOGICAL_ID_NOT_FOUND`]: the in-use condition is not among the codes
+/// that list documents, so it keeps the node-identifier spelling the operation's own enum
+/// gives it.
 const ERROR_NODE_ID_IN_USE: &str = "NodeIdInUse";
 
 /// The most nodes one call may delete: "You must specify either NodeLogicalIds,
@@ -148,8 +165,14 @@ const ERROR_NODE_ID_IN_USE: &str = "NodeIdInUse";
 const DELETE_BATCH_MAX: usize = 50;
 
 /// How a per-node failure is worded, in the terms each failure shape documents its subject
-/// in — a "node" for both lists, which is what `BatchDeleteClusterNodes` deletes.
-const MESSAGE_NOT_FOUND: &str = "The node does not exist in the specified cluster.";
+/// in — a "node" for both lists, which is what `BatchDeleteClusterNodes` deletes
+/// (smithy_query query="shape" shape="BatchDeleteClusterNodesError" /
+/// "BatchDeleteClusterNodeLogicalIdsError"), so only the CODE follows the identifier that
+/// named the node.
+///
+/// Fixed text with no variable part: the sentence names no identifier, since the entry it
+/// sits in already carries the one it is about.
+const MESSAGE_NOT_FOUND: &str = "Node does not exist in the given cluster.";
 /// See [`MESSAGE_NOT_FOUND`].
 const MESSAGE_INVALID_STATUS: &str = "The node is in a state that does not allow deletion. \
      Wait for the node to finish any ongoing changes before retrying.";
@@ -282,9 +305,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     successful.push(node_id.clone());
                     continue;
                 }
-                Outcome::NotFound => (ERROR_NODE_ID_NOT_FOUND, MESSAGE_NOT_FOUND),
-                Outcome::InUse => (ERROR_NODE_ID_IN_USE, MESSAGE_IN_USE),
-                Outcome::InvalidStatus => (ERROR_INVALID_NODE_STATUS, MESSAGE_INVALID_STATUS),
+                Outcome::NotFound => (ERROR_INSTANCE_ID_NOT_FOUND, MESSAGE_NOT_FOUND),
+                Outcome::InUse => (ERROR_INSTANCE_ID_IN_USE, MESSAGE_IN_USE),
+                Outcome::InvalidStatus => (ERROR_INVALID_INSTANCE_STATUS, MESSAGE_INVALID_STATUS),
             };
             failed.push(BatchDeleteClusterNodesError2 {
                 node_id: node_id.clone(),
@@ -303,7 +326,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     successful_logical.push(logical_id.clone());
                     continue;
                 }
-                Outcome::NotFound => (ERROR_NODE_ID_NOT_FOUND, MESSAGE_NOT_FOUND),
+                Outcome::NotFound => (ERROR_NODE_LOGICAL_ID_NOT_FOUND, MESSAGE_NOT_FOUND),
                 Outcome::InUse => (ERROR_NODE_ID_IN_USE, MESSAGE_IN_USE),
                 Outcome::InvalidStatus => (ERROR_INVALID_NODE_STATUS, MESSAGE_INVALID_STATUS),
             };
