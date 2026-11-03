@@ -510,6 +510,19 @@ async fn digest_mismatch_is_refused_and_stores_nothing() {
             (400, "ValidationException".to_string()),
             "case {label:?}: expected a 400 ValidationException, got {refused:?}"
         );
+        // The refusal names BOTH digests — the one the request declared and the one the
+        // service computed over the bytes it received — which is what tells a client its
+        // upload was corrupted rather than its credentials rejected, and the only evidence
+        // that the service hashed the payload instead of trusting the header.
+        assert_eq!(
+            refused.message(),
+            format!(
+                "The provided content hashes do not match the calculated content hashes. \
+                 Hash algorithm 'SHA-256', Expected hash '{declared}', Actual hash '{truth}'"
+            ),
+            "case {label:?}: expected the content-hash-mismatch sentence, got {:?}",
+            refused.message()
+        );
 
         // Nothing was stored: the version does not exist.
         let absent = describe(&router, &case).await;

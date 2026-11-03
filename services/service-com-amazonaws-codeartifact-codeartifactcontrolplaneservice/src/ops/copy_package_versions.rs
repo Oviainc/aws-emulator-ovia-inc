@@ -379,6 +379,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyPackageVersio
             } else {
                 Vec::new()
             };
+            // The SOURCE repository's own internal id, read off its record: the repository a
+            // per-version `NOT_FOUND` names is the one the versions were looked for in,
+            // which for a copy is the source.
+            let source_repository_id = domain
+                .repositories
+                .get(&input.source_repository)
+                .map(crate::state::Repository::id)
+                .unwrap_or_default();
             // Where this copy may find the package, NEAREST FIRST: the source repository's
             // own records, then each reachable upstream's. A repository that does not hold
             // the package contributes nothing to the search rather than ending it.
@@ -430,9 +438,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyPackageVersio
                         version_error(
                             PACKAGE_VERSION_ERROR_NOT_FOUND,
                             crate::state::package_version_not_found_message(
+                                &source_repository_id,
+                                &input.format,
+                                input.namespace.as_deref(),
                                 &input.package,
                                 version,
-                                &input.source_repository,
                             ),
                         ),
                     );

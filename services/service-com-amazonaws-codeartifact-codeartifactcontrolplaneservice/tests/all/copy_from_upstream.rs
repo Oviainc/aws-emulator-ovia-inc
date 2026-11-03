@@ -37,7 +37,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::domain_repository_lifecycle::create_repository;
 use crate::harness::{auth_for, call, create_domain, emulator, Answer, REGION};
-use crate::package_version_publish::{binary_content, describe, publish, Publish, DOMAIN};
+use crate::package_version_publish::{
+    binary_content, describe, publish, Publish, DOMAIN, NAMESPACE,
+};
 
 /// The repository every version below is PUBLISHED into: the back of every chain.
 const BACK: &str = "upstream-back";
@@ -644,8 +646,10 @@ async fn an_upstream_copy_reports_each_named_version_in_one_of_the_two_maps() {
         );
     }
 
-    // The `NOT_FOUND` entry states the version and the repository the copy was addressed
-    // on, which is the one a client re-reads.
+    // The `NOT_FOUND` entry states the coordinate the copy looked for and the repository
+    // it looked in — the SOURCE — by that repository's own internal id, which is the
+    // sentence every version-absent refusal of this service states
+    // (`tests/all/package_version_not_found_coordinate.rs` pins it over the whole class).
     let answer = copy(
         &router,
         FRONT,
@@ -654,9 +658,15 @@ async fn an_upstream_copy_reports_each_named_version_in_one_of_the_two_maps() {
         json!({ "versions": ["9.9.9"], "includeFromUpstream": true }),
     )
     .await;
-    assert_eq!(
-        failure_message(&answer, "9.9.9"),
-        format!("Package version {package} 9.9.9 not found in repository {FRONT}."),
-        "expected the version-not-found sentence naming the source repository, got {answer:?}"
+    let message = failure_message(&answer, "9.9.9");
+    let expected_coordinate = format!(
+        "packageCoordinate = 'PackageVersionCoordinateEntity{{name={package}, type=GENERIC, \
+         namespace={NAMESPACE}, version=9.9.9, displayName={NAMESPACE}/{package}/9.9.9}}'."
+    );
+    assert!(
+        message.starts_with("Package version not found in repo. repoId = '")
+            && message.ends_with(&expected_coordinate),
+        "expected the version-not-found sentence carrying {expected_coordinate:?}, got \
+         {message:?}"
     );
 }

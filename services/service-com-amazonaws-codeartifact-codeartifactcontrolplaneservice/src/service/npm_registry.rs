@@ -1055,9 +1055,15 @@ fn set_dist_tag(
         .is_some_and(|version| downloadable(&version.status));
     if !resolvable {
         return not_found(crate::state::package_version_not_found_message(
-            &package.display_name(),
+            &crate::state::repository_id(
+                &resolved.domain_owner,
+                &resolved.domain,
+                &resolved.repository,
+            ),
+            PACKAGE_FORMAT_NPM,
+            package.namespace.as_deref(),
+            &package.name,
             &version,
-            &resolved.repository,
         ));
     }
     // A tag the package does not already carry is a new entry in its tag map, which is

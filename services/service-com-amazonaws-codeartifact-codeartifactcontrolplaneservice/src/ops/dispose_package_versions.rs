@@ -287,6 +287,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DisposePackageVer
         // A package is addressed by its whole (format, namespace, name) triple, the same
         // key `DescribePackage` resolves — refused in the sentence the VERSION-addressing
         // operations state for a package absent from the addressed repository.
+        //
+        // The repository's own id is read out before the package is taken mutably out of
+        // the same record: it is what a per-version `NOT_FOUND` names the repository the
+        // version was looked for in.
+        let repository_id = repository.id();
         let key =
             crate::state::package_key(&input.format, input.namespace.as_deref(), &input.package);
         let Some(package) = repository.packages.get_mut(&key) else {
@@ -325,9 +330,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DisposePackageVer
                     version_error(
                         PACKAGE_VERSION_ERROR_NOT_FOUND,
                         crate::state::package_version_not_found_message(
+                            &repository_id,
+                            &input.format,
+                            input.namespace.as_deref(),
                             &input.package,
                             version,
-                            &input.repository,
                         ),
                     ),
                 );

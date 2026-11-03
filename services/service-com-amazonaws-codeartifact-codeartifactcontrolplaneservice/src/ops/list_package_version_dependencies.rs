@@ -278,9 +278,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(version) = package.versions.get(&input.package_version) else {
             return Err(not_found(
                 crate::state::package_version_not_found_message(
+                    &repository.id(),
+                    &input.format,
+                    input.namespace.as_deref(),
                     &input.package,
                     &input.package_version,
-                    &input.repository,
                 ),
                 &crate::state::package_version_resource_id(
                     input.namespace.as_deref(),

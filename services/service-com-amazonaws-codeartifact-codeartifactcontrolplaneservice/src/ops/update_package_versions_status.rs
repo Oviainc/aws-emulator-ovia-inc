@@ -322,6 +322,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
         // different format or namespace addresses a DIFFERENT package, and that one is not
         // found — in the sentence the VERSION-addressing operations state for a package
         // absent from the addressed repository.
+        //
+        // The repository's own id is read out before the package is taken mutably out of
+        // the same record: it is what a per-version `NOT_FOUND` names the repository the
+        // version was looked for in.
+        let repository_id = repository.id();
         let key =
             crate::state::package_key(&input.format, input.namespace.as_deref(), &input.package);
         let Some(package) = repository.packages.get_mut(&key) else {
@@ -361,7 +366,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
             }
             decided.push((
                 version.clone(),
-                decide(&input, &revisions, package.versions.get(version), version),
+                decide(
+                    &input,
+                    &repository_id,
+                    &revisions,
+                    package.versions.get(version),
+                    version,
+                ),
             ));
         }
 
@@ -475,9 +486,11 @@ fn skipped_message(package: &str, version: &str) -> String {
 /// per-version failure it owes instead.
 ///
 /// `stored` is the record the addressed package holds for that version, `None` when it
-/// holds none.
+/// holds none; `repository_id` is the id of the repository it was looked for in, which the
+/// `NOT_FOUND` outcome names.
 fn decide(
     input: &UpdatePackageVersionsStatusInput,
+    repository_id: &str,
     revisions: &::std::collections::HashMap<String, String>,
     stored: Option<&crate::state::PackageVersion>,
     version: &str,
@@ -486,9 +499,11 @@ fn decide(
         return Err(version_error(
             PACKAGE_VERSION_ERROR_NOT_FOUND,
             crate::state::package_version_not_found_message(
+                repository_id,
+                &input.format,
+                input.namespace.as_deref(),
                 &input.package,
                 version,
-                &input.repository,
             ),
         ));
     };

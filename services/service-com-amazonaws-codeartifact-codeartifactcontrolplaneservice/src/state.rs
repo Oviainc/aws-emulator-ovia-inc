@@ -1468,6 +1468,12 @@ impl Repository {
         }
     }
 
+    /// The internal id this service knows this repository by, which its own refusals name
+    /// it by ([`repository_id`]).
+    pub fn id(&self) -> String {
+        repository_id(&self.domain_owner, &self.domain_name, &self.name)
+    }
+
     /// Resolve a package the way every package-scoped operation addresses it: by the
     /// `(format, namespace, package)` triple, never by name alone.
     pub fn package(&self, format: &str, namespace: Option<&str>, package: &str) -> Option<&Package> {
@@ -2708,8 +2714,72 @@ pub fn package_not_found_message(format: &str, namespace: Option<&str>, package:
 
 /// The `ResourceNotFoundException` message for a version the addressed package does not
 /// hold, and the `errorMessage` of a `NOT_FOUND` entry in a per-version answer map.
-pub fn package_version_not_found_message(package: &str, version: &str, repository: &str) -> String {
-    format!("Package version {package} {version} not found in repository {repository}.")
+///
+/// A version-absent refusal reports TWO things: the repository it looked in, by the
+/// internal id this service knows that repository by ([`repository_id`]) rather than by the
+/// name the request used, and the whole coordinate it resolved, rendered as the
+/// `PackageVersionCoordinateEntity` of [`package_version_coordinate`]. The coordinate is
+/// the part that tells a caller WHICH version was looked for — format and namespace
+/// included — so a wrong-namespace or wrong-format lookup is distinguishable from a
+/// genuinely absent version.
+pub fn package_version_not_found_message(
+    repository_id: &str,
+    format: &str,
+    namespace: Option<&str>,
+    package: &str,
+    version: &str,
+) -> String {
+    format!(
+        "Package version not found in repo. repoId = '{repository_id}', packageCoordinate = \
+         '{}'.",
+        package_version_coordinate(format, namespace, package, version)
+    )
+}
+
+/// The whole coordinate a package VERSION was addressed by, as this service renders one
+/// inside a refusal: `PackageVersionCoordinateEntity{name=…, type=…, namespace=…,
+/// version=…, displayName=…}`.
+///
+/// The `type` is the `PackageFormat` upper-cased, and the `namespace` component is present
+/// exactly where the coordinate carries one — a format whose versions have no namespace
+/// component (the model's `PackageSummary$namespace` doc lists Python, NuGet, Ruby and
+/// Cargo) has none to render, so the entity leaves it out rather than rendering an empty
+/// one.
+fn package_version_coordinate(
+    format: &str,
+    namespace: Option<&str>,
+    package: &str,
+    version: &str,
+) -> String {
+    let display_name = coordinate_display_name(namespace, package, version);
+    let format = format.to_uppercase();
+    match namespace {
+        Some(namespace) => format!(
+            "PackageVersionCoordinateEntity{{name={package}, type={format}, \
+             namespace={namespace}, version={version}, displayName={display_name}}}"
+        ),
+        None => format!(
+            "PackageVersionCoordinateEntity{{name={package}, type={format}, version={version}, \
+             displayName={display_name}}}"
+        ),
+    }
+}
+
+/// The `displayName` of one package-version coordinate: the version written the way a
+/// coordinate of its shape is written.
+///
+/// A coordinate that carries a namespace is written as the path
+/// `<namespace>/<package>/<version>` — the same `/`-joined identity a refusal reports as
+/// its `resourceId` ([`package_version_resource_id`]), which no component can contain a
+/// separator of (`PackageNamespace`, `PackageName` and `PackageVersion` are all modelled
+/// `^[^#/\s]+$`). A coordinate that carries none is written as the version-pinned form
+/// `<package>==<version>`, which is how a package manager whose versions have no namespace
+/// component writes one pinned version.
+fn coordinate_display_name(namespace: Option<&str>, package: &str, version: &str) -> String {
+    match namespace {
+        Some(namespace) => format!("{namespace}/{package}/{version}"),
+        None => format!("{package}=={version}"),
+    }
 }
 
 /// The `ConflictException` message for a create whose package-group pattern is already
@@ -2954,17 +3024,40 @@ pub fn asset_bucket_arn(region: &str, domain: &str) -> String {
 /// the same reason as [`asset_bucket_arn`]'s suffix: the same domain must report the
 /// same key on every read.
 pub fn default_encryption_key_arn(region: &str, domain: &str) -> String {
-    let digest = identity_digest(&["kms-key", region, domain]);
+    let key_id = opaque_id(&identity_digest(&["kms-key", region, domain]));
+    ::engine::emulator_arn("kms", region, &format!("key/{key_id}"))
+}
+
+/// The internal id this service knows one repository by — the `repoId` a refusal that
+/// could not resolve a package version reports.
+///
+/// Not a modelled member: no operation returns it, and nothing addresses a repository by
+/// it; it is the id the service's own refusals name a repository by, beside the name the
+/// request used. Derived from the repository's identity — the account owning its domain,
+/// the domain, and the repository name — for the same reason [`asset_bucket_arn`]'s suffix
+/// is: the same repository reports the same id on every read, two repositories never
+/// report one id, and no refusal carries a per-call random value.
+pub fn repository_id(domain_owner: &str, domain: &str, repository: &str) -> String {
+    opaque_id(&identity_digest(&[
+        "repository-id",
+        domain_owner,
+        domain,
+        repository,
+    ]))
+}
+
+/// An opaque resource id derived from `digest`: its first 16 bytes written in the
+/// 8-4-4-4-12 hex grouping AWS writes an internal resource id in.
+fn opaque_id(digest: &[u8; 32]) -> String {
     let hex = hex::encode(&digest[..16]);
-    let key_id = format!(
+    format!(
         "{}-{}-{}-{}-{}",
         &hex[0..8],
         &hex[8..12],
         &hex[12..16],
         &hex[16..20],
         &hex[20..32]
-    );
-    ::engine::emulator_arn("kms", region, &format!("key/{key_id}"))
+    )
 }
 
 /// A stable 32-byte digest over a resource's identifying fields.
