@@ -237,12 +237,17 @@ fn invalid_grant(description: &'static str) -> CreateTokenWithIAMError {
     .into()
 }
 
-/// `UnsupportedGrantTypeException` (400): the grant type is not one this
-/// operation serves. The ones it does serve are [`st::IAM_SUPPORTED_GRANT_TYPES`].
-fn unsupported_grant_type() -> CreateTokenWithIAMError {
-    CreateTokenWithIAMErrorModeled::UnsupportedGrantTypeException(UnsupportedGrantTypeException {
-        error: Some("unsupported_grant_type".to_string()),
-        error_description: Some(st::DESCRIPTION_INVALID_GRANT_TYPE.to_string()),
+/// `InvalidClientException` (401): the request names no client this operation can
+/// issue a token to. `clientId` "is an application ARN that has OAuth grants
+/// configured", so the grants an application is configured for are part of what
+/// identifies it as a client of this endpoint: a `grantType` outside the ones this
+/// operation serves ([`st::IAM_SUPPORTED_GRANT_TYPES`]) can be configured on no
+/// application at all, so such a request authenticates no client and never reaches
+/// a grant flow. The text is the FIXED one of the class.
+fn invalid_client() -> CreateTokenWithIAMError {
+    CreateTokenWithIAMErrorModeled::InvalidClientException(InvalidClientException {
+        error: Some("invalid_client".to_string()),
+        error_description: Some(st::DESCRIPTION_INVALID_CLIENT.to_string()),
     })
     .into()
 }
@@ -307,9 +312,9 @@ enum PresentedGrant {
 /// and whether that record exists is not a fact about the application the
 /// request names — so a grant this service never issued is refused as the
 /// invalid grant it is, naming the member that carried it, whatever client
-/// presented it. A grant type this operation does not serve is settled here too,
-/// so nothing further is read for a request no grant of this service could
-/// satisfy.
+/// presented it. A `grantType` outside the ones this operation serves is settled
+/// here too, as the client failure it is: nothing further is read for a request
+/// naming a grant flow this endpoint does not have at all.
 fn presented_grant(
     store: &crate::state::ComAmazonawsSsooidcAwsssooidcserviceState,
     input: &CreateTokenWithIAMInput,
@@ -365,9 +370,13 @@ fn presented_grant(
             // assertion presented here resolves to a grant.
             Err(invalid_grant(st::DESCRIPTION_INVALID_ASSERTION))
         }
-        // The device-code grant is `CreateToken`'s and is deliberately not among
-        // the grants resolved above.
-        _ => Err(unsupported_grant_type()),
+        // Any other value names a grant flow this operation does not serve: the
+        // device-code grant, which is `CreateToken`'s and whose `deviceCode` this
+        // request shape does not even model, as much as a grant name no OAuth
+        // profile of this service defines. No application ARN can have such a
+        // grant configured, so the request authenticates no client of this
+        // endpoint and is refused as that, before any record is read.
+        _ => Err(invalid_client()),
     }
 }
 

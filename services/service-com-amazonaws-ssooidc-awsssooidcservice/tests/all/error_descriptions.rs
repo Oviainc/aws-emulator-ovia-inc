@@ -471,6 +471,18 @@ async fn every_refusal_answers_the_fixed_description_of_its_class() {
             "invalid_grant",
             DESCRIPTION_INVALID_AUTHORIZATION_CODE,
         ),
+        row(
+            "a grantType the IAM operation does not serve",
+            IAM_TOKEN_PATH,
+            json!({
+                "clientId": UNKNOWN_APPLICATION_ARN,
+                "grantType": GRANT_TYPE_DEVICE_CODE,
+            }),
+            401,
+            "InvalidClientException",
+            "invalid_client",
+            DESCRIPTION_INVALID_CLIENT,
+        ),
         // StartDeviceAuthorization: the request itself, then the pair it presents.
         row(
             "a startUrl that is no URI at all",

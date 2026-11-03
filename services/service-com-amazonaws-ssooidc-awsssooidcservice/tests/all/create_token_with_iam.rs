@@ -362,7 +362,8 @@ async fn the_refresh_grant_rotates_a_persisted_refresh_token() {
 
 /// RULE: a grant request this operation cannot resolve to something the service issued or
 /// configured is refused with the modeled error for WHY it cannot: a grant type outside
-/// the four this API serves is `UnsupportedGrantTypeException`, a member the
+/// the four this API serves authenticates no client of this endpoint and is
+/// `InvalidClientException` (HTTP 401), a member the
 /// grant needs that is missing or carries an unsupported value is
 /// `InvalidRequestException`, and a grant that resolves to nothing — an unknown client, an
 /// unknown token, a code or assertion this service never issued, or a token issued to
@@ -382,28 +383,29 @@ async fn an_unresolvable_grant_is_refused_with_the_error_for_why() {
         .await;
 
     let rows: Vec<(&str, Value, u16, &str, &str)> = vec![
-        // The grant type is settled before anything else, so even an unknown client
-        // naming a grant this API does not serve learns that first.
+        // The grant type is settled before anything else, so a request naming a
+        // grant this API does not serve is refused as an unauthenticated client
+        // whether or not the client it names is known.
         (
             "the device-code grant, which this API does not serve",
             json!({"clientId": "unknown", "grantType": GRANT_TYPE_DEVICE_CODE, "deviceCode": "x"}),
-            400,
-            "UnsupportedGrantTypeException",
-            "unsupported_grant_type",
+            401,
+            "InvalidClientException",
+            "invalid_client",
         ),
         (
             "a grant type no OAuth profile of this service defines",
             json!({"clientId": holder.client_id, "grantType": "client_credentials"}),
-            400,
-            "UnsupportedGrantTypeException",
-            "unsupported_grant_type",
+            401,
+            "InvalidClientException",
+            "invalid_client",
         ),
         (
             "an empty grant type",
             json!({"clientId": holder.client_id, "grantType": ""}),
-            400,
-            "UnsupportedGrantTypeException",
-            "unsupported_grant_type",
+            401,
+            "InvalidClientException",
+            "invalid_client",
         ),
         (
             "a client this service has no OAuth grant configured for",
