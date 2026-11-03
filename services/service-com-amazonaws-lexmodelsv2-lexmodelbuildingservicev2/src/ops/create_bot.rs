@@ -259,6 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_updated_date_time: now,
             bot_tags: input.bot_tags.unwrap_or_default(),
             test_bot_alias_tags: input.test_bot_alias_tags.unwrap_or_default(),
+            // A bot is created with its `DRAFT` version only: no numbered version has
+            // been created of it yet.
+            versions_created: 0,
             pending_status: None,
         };
         bot.schedule_status(

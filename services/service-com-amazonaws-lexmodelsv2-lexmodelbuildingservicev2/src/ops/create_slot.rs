@@ -343,7 +343,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The response is read back off the record that was just stored, so a `slotId`
         // this operation hands out always has a backing slot.
-        let stored = store.slots.entry(slot_id).or_insert(slot);
+        let key = crate::state::versioned_key(&slot.bot_version, &slot.slot_id);
+        let stored = store.slots.entry(key).or_insert(slot);
         Ok(CreateSlotOutput {
             slot_id: Some(stored.slot_id.clone()),
             slot_name: Some(stored.slot_name.clone()),

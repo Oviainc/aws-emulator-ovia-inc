@@ -364,7 +364,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The response is read back off the record that was just stored, so an `intentId`
         // this operation hands out always has a backing intent.
-        let stored = store.intents.entry(intent_id).or_insert(intent);
+        let key = crate::state::versioned_key(&intent.bot_version, &intent.intent_id);
+        let stored = store.intents.entry(key).or_insert(intent);
         Ok(CreateIntentOutput {
             intent_id: Some(stored.intent_id.clone()),
             intent_name: Some(stored.intent_name.clone()),

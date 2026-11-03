@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBotVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBotVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBotVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a version of a bot in [`crate::state`] and answers from the stored record, so
+//! `DescribeBotVersion` reports back what was stored. The version is an immutable
+//! SNAPSHOT: each locale the request names is copied out of the version named as that
+//! locale's source, together with the intents, slot types and slots defined in it, which
+//! keep the ids they already have. The version starts in `Versioning`; the `Available`
+//! transition the clock owes is due [`crate::state::CREATION_SETTLES_AFTER`] later and is
+//! materialised by the next read, so a caller reading straight back still observes
+//! `Versioning`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +175,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBotVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBotVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBotVersion"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBotVersionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // A version is a version OF a bot, so the bot has to be there to version.
+        let Some(bot) = store.settled_bot(&input.bot_id).cloned() else {
+            return Err(CreateBotVersionErrorModeled::PreconditionFailedException(
+                PreconditionFailedException {
+                    // The sentence this service states when a parent the request names
+                    // does not resolve, whatever the parent and whatever identified it.
+                    message: Some(crate::state::PARENT_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Every locale the request asks for has to exist in the version it names as that
+        // locale's source: there is nothing else to copy into the new version. All of
+        // them are checked BEFORE anything is stored, so a request naming one that does
+        // not resolve leaves no half-built version behind. The pairs are ordered so the
+        // copying runs in one order whatever order the request's map iterated in.
+        let mut sources: Vec<(String, String)> = input
+            .bot_version_locale_specification
+            .iter()
+            .map(|(locale_id, details)| (locale_id.clone(), details.source_bot_version.clone()))
+            .collect();
+        sources.sort();
+        if sources.iter().any(|(locale_id, source_version)| {
+            !store.bot_locale_exists(&input.bot_id, source_version, locale_id)
+        }) {
+            return Err(CreateBotVersionErrorModeled::PreconditionFailedException(
+                PreconditionFailedException {
+                    message: Some(crate::state::PARENT_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The published "Versions per bot" quota bounds the store: past it the service
+        // answers its modelled quota error rather than growing forever.
+        if store.bot_version_count(&input.bot_id) >= crate::state::VERSIONS_PER_BOT_QUOTA {
+            return Err(CreateBotVersionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "You have reached the quota of {} versions for bot {}; delete a version or request a quota increase",
+                        crate::state::VERSIONS_PER_BOT_QUOTA,
+                        input.bot_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "When you create the first version of a bot, Amazon Lex sets the version
+        // number to 1. Subsequent bot versions increase in an increment of 1."
+        let Some(bot_version) = store.mint_bot_version(&input.bot_id) else {
+            return Err(CreateBotVersionErrorModeled::PreconditionFailedException(
+                PreconditionFailedException {
+                    message: Some(crate::state::PARENT_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "When you specify a source version, the locale data is copied from the source
+        // version to the new version": the locale, and everything defined inside it.
+        for (locale_id, source_version) in &sources {
+            store.snapshot_locale(&input.bot_id, source_version, &bot_version, locale_id);
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut version = crate::state::BotVersion {
+            bot_id: bot.bot_id.clone(),
+            bot_version: bot_version.clone(),
+            // A version holds the bot settings as they were when it was created: it is
+            // immutable, so a later update of the bot does not reach it.
+            bot_name: bot.bot_name.clone(),
+            description: input.description,
+            role_arn: bot.role_arn.clone(),
+            data_privacy: bot.data_privacy.clone(),
+            idle_session_ttl_in_seconds: bot.idle_session_ttl_in_seconds,
+            bot_type: bot.bot_type.clone(),
+            bot_members: bot.bot_members.clone(),
+            bot_status: crate::state::BOT_STATUS_VERSIONING.to_string(),
+            creation_date_time: now,
+            locale_specification: input.bot_version_locale_specification,
+            pending_status: None,
+        };
+        // "When the status is Available, the bot version is ready for use", which is
+        // where a version Amazon Lex has finished creating settles.
+        version.schedule_status(
+            crate::state::BOT_STATUS_AVAILABLE,
+            crate::state::CREATION_SETTLES_AFTER,
+        );
+
+        // The response is read back off the record that was just stored, so a
+        // `botVersion` this operation hands out always has a backing version.
+        let key = crate::state::bot_version_key(&input.bot_id, &bot_version);
+        let stored = store.bot_versions.entry(key).or_insert(version);
+        Ok(CreateBotVersionOutput {
+            bot_id: Some(stored.bot_id.clone()),
+            description: stored.description.clone(),
+            bot_version: Some(stored.bot_version.clone()),
+            bot_version_locale_specification: Some(stored.locale_specification.clone()),
+            bot_status: Some(stored.bot_status.clone()),
+            creation_date_time: Some(crate::state::to_date_time(stored.creation_date_time)),
+        })
     }
 }

@@ -23,12 +23,21 @@
 //! The slot slice (`CreateSlot`, `DescribeSlot`, `ListSlots`) is served out of `slots`:
 //! a slot is defined inside one intent of one locale of one bot version, so every record
 //! carries those four identifiers and every read is scoped by them.
+//!
+//! The version slice (`CreateBotVersion`, `DescribeBotVersion`) is served out of
+//! `bot_versions`, keyed by the bot and the number the version was created under. A
+//! version is an immutable SNAPSHOT of the version each of its locales was taken from,
+//! so creating one copies those locales and everything defined in them — intents, slot
+//! types and slots — into the new version under the ids they already have. That is why a
+//! resource of a bot version is keyed by its bot version as well as by its own id: one id
+//! names the same resource in every version that snapshotted it.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    AudioFillerSettings, BotMember, BotSummary, CompositeSlotTypeSetting, DataPrivacy,
+    AudioFillerSettings, BotMember, BotSummary, BotVersionLocaleDetails,
+    CompositeSlotTypeSetting, DataPrivacy,
     DialogCodeHookSettings, ErrorLogSettings, ExternalSourceSetting, FulfillmentCodeHookSettings,
     GenerativeAISettings, InitialResponseSetting, InputContext, IntentClosingSetting,
     IntentConfirmationSetting, KendraConfiguration, MultipleValuesSetting, ObfuscationSetting,
@@ -46,6 +55,10 @@ pub const BOT_STATUS_CREATING: &str = "Creating";
 pub const BOT_STATUS_AVAILABLE: &str = "Available";
 /// See [`BOT_STATUS_CREATING`].
 pub const BOT_STATUS_DELETING: &str = "Deleting";
+/// See [`BOT_STATUS_CREATING`]. The status a bot version carries while Amazon Lex is
+/// creating it: `CreateBotVersion` reports it, and the version is `Available` once it is
+/// "ready for use".
+pub const BOT_STATUS_VERSIONING: &str = "Versioning";
 
 /// `BotLocaleStatus` members this crate names. The full modelled set is
 /// `smithy_query(query="shape",shape="BotLocaleStatus")`:
@@ -324,6 +337,12 @@ pub struct Bot {
     pub last_updated_date_time: SystemTime,
     pub bot_tags: HashMap<String, String>,
     pub test_bot_alias_tags: HashMap<String, String>,
+    /// How many versions of this bot have been created. AWS documents what the count
+    /// means for the number a version is created under: "The version number will always
+    /// represent the total number of versions created of the bot, not the current number
+    /// of versions. If a bot version is deleted, that bot version number will not be
+    /// reused." Moved on through [`ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State::mint_bot_version`].
+    pub versions_created: u32,
     /// The status the clock owes this bot, and the instant it falls due. `None` once
     /// the bot has reached a status nothing further is owed from. Set it through
     /// [`Bot::schedule_status`] rather than by hand.
@@ -346,15 +365,17 @@ impl Bot {
 
     /// This bot as a `ListBots` summary entry.
     ///
-    /// `latestBotVersion` stays absent until a numbered version exists: a freshly
-    /// created bot has only the `DRAFT` version, which is not a numerical version.
-    pub fn summary(&self) -> BotSummary {
+    /// `latestBotVersion` is "the latest numerical version in use for the bot": the
+    /// highest number a version the store still holds was created under, which the caller
+    /// resolves and passes in. It stays absent until a numbered version exists, since a
+    /// bot that has only its `DRAFT` version has no numerical version.
+    pub fn summary(&self, latest_bot_version: Option<String>) -> BotSummary {
         BotSummary {
             bot_id: Some(self.bot_id.clone()),
             bot_name: Some(self.bot_name.clone()),
             description: self.description.clone(),
             bot_status: Some(self.bot_status.clone()),
-            latest_bot_version: None,
+            latest_bot_version,
             last_updated_date_time: Some(to_date_time(self.last_updated_date_time)),
             bot_type: self.bot_type.clone(),
         }
@@ -374,6 +395,85 @@ impl Bot {
     /// The stored `testBotAliasTags`, absent rather than empty when there are none.
     pub fn wire_test_bot_alias_tags(&self) -> Option<HashMap<String, String>> {
         (!self.test_bot_alias_tags.is_empty()).then(|| self.test_bot_alias_tags.clone())
+    }
+}
+
+/// How many versions one bot may hold: the published AWS Lex V2 service quota "Versions
+/// per bot" (default 100, adjustable on request).
+///
+/// `CreateBotVersion` answers the modelled `ServiceQuotaExceededException` ("You have
+/// reached a quota for your bot", HTTP 402) once the bot holds this many, which is what
+/// bounds the stored versions: at most [`BOTS_PER_ACCOUNT_QUOTA`] bots times this many
+/// records, so a caller cannot grow that map past it.
+pub const VERSIONS_PER_BOT_QUOTA: usize = 100;
+
+/// How a bot version is keyed: the bot and the number the version was created under,
+/// which is the pair every version operation's URI carries.
+pub type BotVersionKey = (String, String);
+
+/// The [`BotVersionKey`] for one version of one bot.
+pub fn bot_version_key(bot_id: &str, bot_version: &str) -> BotVersionKey {
+    (bot_id.to_string(), bot_version.to_string())
+}
+
+/// How a resource defined INSIDE a bot version — an intent, a slot type, a slot — is
+/// keyed: the bot version holding it and its own id.
+///
+/// The id alone does not identify the record, because creating a version snapshots the
+/// locales it is taken from and everything in them keeps the id it already has: the same
+/// intent id names the draft intent and the copy of it each version holds.
+pub type VersionedResourceKey = (String, String);
+
+/// The [`VersionedResourceKey`] for one resource of one bot version.
+pub fn versioned_key(bot_version: &str, resource_id: &str) -> VersionedResourceKey {
+    (bot_version.to_string(), resource_id.to_string())
+}
+
+/// A version of a bot, as `CreateBotVersion` stored it and `DescribeBotVersion` reads it
+/// back.
+///
+/// A version is IMMUTABLE, so it holds the bot settings as they were when it was created
+/// rather than reading them back off the bot, which goes on changing: a later `UpdateBot`
+/// changes the draft, never a published version.
+#[derive(Debug, Clone)]
+pub struct BotVersion {
+    pub bot_id: String,
+    pub bot_version: String,
+    pub bot_name: String,
+    /// The description of the VERSION, as the create named it — the bot's own description
+    /// is its own.
+    pub description: Option<String>,
+    pub role_arn: String,
+    pub data_privacy: DataPrivacy,
+    pub idle_session_ttl_in_seconds: i32,
+    pub bot_type: Option<String>,
+    pub bot_members: Vec<BotMember>,
+    pub bot_status: String,
+    pub creation_date_time: SystemTime,
+    /// The version each locale of this version was copied from, keyed by locale id —
+    /// what the create named, and what it reports back.
+    pub locale_specification: HashMap<String, BotVersionLocaleDetails>,
+    /// The status the clock owes this version, and the instant it falls due. Set it
+    /// through [`BotVersion::schedule_status`] rather than by hand.
+    pub pending_status: Option<(String, Instant)>,
+}
+
+impl BotVersion {
+    /// Apply the status transition the clock has already made due, if any — the same
+    /// contract as [`Bot::settle`].
+    pub fn settle(&mut self) {
+        settle_status(&mut self.bot_status, &mut self.pending_status);
+    }
+
+    /// Schedule `status` to become this version's status once `after` has elapsed.
+    pub fn schedule_status(&mut self, status: &str, after: Duration) {
+        self.pending_status = Some((status.to_string(), Instant::now() + after));
+    }
+
+    /// The members of the bot network this version holds, as the wire shape renders
+    /// them: absent rather than an empty list when the version is of a plain bot.
+    pub fn wire_bot_members(&self) -> Option<Vec<BotMember>> {
+        (!self.bot_members.is_empty()).then(|| self.bot_members.clone())
     }
 }
 
@@ -757,30 +857,32 @@ pub struct ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
     pub bots: HashMap<String, Bot>,
     /// Every bot locale this emulator holds, keyed by [`bot_locale_key`]. A locale
     /// belongs to one version of one bot, so this map is bounded by the bots the store
-    /// may hold ([`BOTS_PER_ACCOUNT_QUOTA`]) times the locale ids a bot version can
-    /// carry ([`SUPPORTED_LOCALES`]): a caller cannot grow it past that.
+    /// may hold ([`BOTS_PER_ACCOUNT_QUOTA`]) times the versions a bot may have
+    /// ([`VERSIONS_PER_BOT_QUOTA`], plus its `DRAFT`) times the locale ids a bot version
+    /// can carry ([`SUPPORTED_LOCALES`]): a caller cannot grow it past that.
     pub bot_locales: HashMap<BotLocaleKey, BotLocale>,
-    /// Every custom slot type this emulator holds, keyed by the `slotTypeId` it minted.
-    /// The record carries the bot, bot version and locale it was created in, which is
-    /// what scopes every read of it. A slot type belongs to one locale of one bot
-    /// version, so this map is bounded by the bots the store may hold
-    /// ([`BOTS_PER_ACCOUNT_QUOTA`]) times the locale ids a bot version can carry
-    /// ([`SUPPORTED_LOCALES`]) times [`SLOT_TYPES_PER_LOCALE_QUOTA`]: a caller cannot
-    /// grow it past that.
-    pub slot_types: HashMap<String, SlotType>,
-    /// Every intent this emulator holds, keyed by the `intentId` it minted. The record
+    /// Every custom slot type this emulator holds, keyed by [`versioned_key`]. The record
     /// carries the bot, bot version and locale it was created in, which is what scopes
-    /// every read of it. An intent belongs to one locale of one bot version, so this map
-    /// is bounded by the bots the store may hold ([`BOTS_PER_ACCOUNT_QUOTA`]) times the
-    /// locale ids a bot version can carry ([`SUPPORTED_LOCALES`]) times
-    /// [`INTENTS_PER_LOCALE_QUOTA`]: a caller cannot grow it past that.
-    pub intents: HashMap<String, Intent>,
-    /// Every slot this emulator holds, keyed by the `slotId` it minted. The record
-    /// carries the bot, bot version, locale and intent it was created in, which is what
-    /// scopes every read of it. A slot belongs to one intent, so this map is bounded by
-    /// the intents the store may hold times [`SLOTS_PER_INTENT_QUOTA`]: a caller cannot
+    /// every read of it. A slot type belongs to one locale of one bot version, so this
+    /// map is bounded the way [`Self::bot_locales`] is, times
+    /// [`SLOT_TYPES_PER_LOCALE_QUOTA`]: a caller cannot grow it past that.
+    pub slot_types: HashMap<VersionedResourceKey, SlotType>,
+    /// Every intent this emulator holds, keyed by [`versioned_key`]. The record carries
+    /// the bot, bot version and locale it was created in, which is what scopes every read
+    /// of it. An intent belongs to one locale of one bot version, so this map is bounded
+    /// the way [`Self::bot_locales`] is, times [`INTENTS_PER_LOCALE_QUOTA`]: a caller
+    /// cannot grow it past that.
+    pub intents: HashMap<VersionedResourceKey, Intent>,
+    /// Every slot this emulator holds, keyed by [`versioned_key`]. The record carries the
+    /// bot, bot version, locale and intent it was created in, which is what scopes every
+    /// read of it. A slot belongs to one intent, so this map is bounded by the intents the
+    /// store may hold times [`SLOTS_PER_INTENT_QUOTA`]: a caller cannot grow it past that.
+    pub slots: HashMap<VersionedResourceKey, Slot>,
+    /// Every bot version this emulator holds, keyed by [`bot_version_key`]. A version
+    /// belongs to one bot, so this map is bounded by the bots the store may hold
+    /// ([`BOTS_PER_ACCOUNT_QUOTA`]) times [`VERSIONS_PER_BOT_QUOTA`]: a caller cannot
     /// grow it past that.
-    pub slots: HashMap<String, Slot>,
+    pub bot_versions: HashMap<BotVersionKey, BotVersion>,
     /// The monotonic source the minted ids are derived from.
     id_seq: u64,
 }
@@ -808,10 +910,17 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
         loop {
             self.id_seq += 1;
             let candidate = render_id(self.id_seq);
-            if !self.slot_types.contains_key(&candidate) {
+            if !self.holds_slot_type_id(&candidate) {
                 return candidate;
             }
         }
+    }
+
+    /// Does any bot version hold a slot type under this id? An id is checked across
+    /// every version, so one handed out never collides with a snapshot copy of another
+    /// slot type.
+    fn holds_slot_type_id(&self, slot_type_id: &str) -> bool {
+        self.slot_types.keys().any(|(_, id)| id == slot_type_id)
     }
 
     /// Mint an unused `intentId`, from the same counter and in the same
@@ -821,10 +930,15 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
         loop {
             self.id_seq += 1;
             let candidate = render_id(self.id_seq);
-            if !self.intents.contains_key(&candidate) {
+            if !self.holds_intent_id(&candidate) {
                 return candidate;
             }
         }
+    }
+
+    /// Does any bot version hold an intent under this id? See [`Self::holds_slot_type_id`].
+    fn holds_intent_id(&self, intent_id: &str) -> bool {
+        self.intents.keys().any(|(_, id)| id == intent_id)
     }
 
     /// Mint an unused `slotId`, from the same counter and in the same `[0-9a-zA-Z]{10}`
@@ -834,10 +948,138 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
         loop {
             self.id_seq += 1;
             let candidate = render_id(self.id_seq);
-            if !self.slots.contains_key(&candidate) {
+            if !self.holds_slot_id(&candidate) {
                 return candidate;
             }
         }
+    }
+
+    /// Does any bot version hold a slot under this id? See [`Self::holds_slot_type_id`].
+    fn holds_slot_id(&self, slot_id: &str) -> bool {
+        self.slots.keys().any(|(_, id)| id == slot_id)
+    }
+
+    /// The number the next version of `bot_id` is created under, counting the versions
+    /// the bot has had rather than the ones it still holds: a number a deleted version
+    /// was created under is never handed out again. `None` when the store holds no such
+    /// bot.
+    pub fn mint_bot_version(&mut self, bot_id: &str) -> Option<String> {
+        let bot = self.bots.get_mut(bot_id)?;
+        bot.versions_created += 1;
+        Some(bot.versions_created.to_string())
+    }
+
+    /// How many versions of `bot_id` the store holds — what
+    /// [`VERSIONS_PER_BOT_QUOTA`] bounds.
+    pub fn bot_version_count(&self, bot_id: &str) -> usize {
+        self.bot_versions
+            .keys()
+            .filter(|(bot, _)| bot == bot_id)
+            .count()
+    }
+
+    /// "The latest numerical version in use for the bot", as a `ListBots` summary reports
+    /// it: the highest number a version of `bot_id` the store STILL HOLDS was created
+    /// under, which is not [`Bot::versions_created`] once a version has been deleted.
+    /// `None` for a bot that has only its `DRAFT` version.
+    pub fn latest_bot_version(&self, bot_id: &str) -> Option<String> {
+        self.bot_versions
+            .keys()
+            .filter(|(bot, _)| bot == bot_id)
+            .filter_map(|(_, version)| version.parse::<u32>().ok())
+            .max()
+            .map(|latest| latest.to_string())
+    }
+
+    /// The stored version the pair names, with any due status transition applied first —
+    /// the same contract as [`Self::settled_bot`].
+    pub fn settled_bot_version(
+        &mut self,
+        bot_id: &str,
+        bot_version: &str,
+    ) -> Option<&BotVersion> {
+        let version = self
+            .bot_versions
+            .get_mut(&bot_version_key(bot_id, bot_version))?;
+        version.settle();
+        Some(version)
+    }
+
+    /// Drop every version of `bot_id` and answer how many went: a version cannot outlive
+    /// the bot it is a version of.
+    pub fn remove_bot_versions_of_bot(&mut self, bot_id: &str) -> usize {
+        let before = self.bot_versions.len();
+        self.bot_versions.retain(|(bot, _), _| bot != bot_id);
+        before - self.bot_versions.len()
+    }
+
+    /// Copy one locale of one version of a bot into another version of the same bot, the
+    /// way creating a version snapshots the version it is taken from: the locale record
+    /// itself and every intent, slot type and slot defined in it, each keeping the id it
+    /// already has, so one id names the same resource in the source version and in the
+    /// snapshot.
+    ///
+    /// Answers whether there was a source locale to copy.
+    pub fn snapshot_locale(
+        &mut self,
+        bot_id: &str,
+        source_version: &str,
+        target_version: &str,
+        locale_id: &str,
+    ) -> bool {
+        let Some(mut locale) = self
+            .settled_bot_locale(bot_id, source_version, locale_id)
+            .cloned()
+        else {
+            return false;
+        };
+        locale.bot_version = target_version.to_string();
+        // The copy carries the status the source locale had settled on, and nothing is
+        // owed on it: the build the source was in the middle of is the source's.
+        locale.pending_status = None;
+        locale.pending_failure_reasons = Vec::new();
+        self.bot_locales
+            .insert(bot_locale_key(bot_id, target_version, locale_id), locale);
+
+        let intents: Vec<Intent> = self
+            .intents_in_locale(bot_id, source_version, locale_id)
+            .cloned()
+            .collect();
+        for mut intent in intents {
+            intent.bot_version = target_version.to_string();
+            self.intents
+                .insert(versioned_key(target_version, &intent.intent_id), intent);
+        }
+
+        let slot_types: Vec<SlotType> = self
+            .slot_types_in_locale(bot_id, source_version, locale_id)
+            .cloned()
+            .collect();
+        for mut slot_type in slot_types {
+            slot_type.bot_version = target_version.to_string();
+            self.slot_types.insert(
+                versioned_key(target_version, &slot_type.slot_type_id),
+                slot_type,
+            );
+        }
+
+        let slots: Vec<Slot> = self
+            .slots
+            .values()
+            .filter(|slot| {
+                slot.bot_id == bot_id
+                    && slot.bot_version == source_version
+                    && slot.locale_id == locale_id
+            })
+            .cloned()
+            .collect();
+        for mut slot in slots {
+            slot.bot_version = target_version.to_string();
+            self.slots
+                .insert(versioned_key(target_version, &slot.slot_id), slot);
+        }
+
+        true
     }
 
     /// Is `name` already the name of a stored bot? `CreateBot` refuses a duplicate:
@@ -940,7 +1182,7 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
         intent_id: &str,
     ) -> Option<&Intent> {
         self.intents
-            .get(intent_id)
+            .get(&versioned_key(bot_version, intent_id))
             .filter(|intent| intent.is_in_locale(bot_id, bot_version, locale_id))
     }
 
@@ -954,7 +1196,7 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
         intent_id: &str,
     ) -> Option<&mut Intent> {
         self.intents
-            .get_mut(intent_id)
+            .get_mut(&versioned_key(bot_version, intent_id))
             .filter(|intent| intent.is_in_locale(bot_id, bot_version, locale_id))
     }
 
@@ -992,7 +1234,7 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
             creation_date_time: now,
             last_updated_date_time: now,
         };
-        self.intents.insert(intent_id.clone(), intent);
+        self.intents.insert(versioned_key(bot_version, &intent_id), intent);
         intent_id
     }
 
@@ -1047,7 +1289,7 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
         slot_type_id: &str,
     ) -> Option<&SlotType> {
         self.slot_types
-            .get(slot_type_id)
+            .get(&versioned_key(bot_version, slot_type_id))
             .filter(|slot_type| slot_type.is_in_locale(bot_id, bot_version, locale_id))
     }
 
@@ -1100,7 +1342,7 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
         slot_id: &str,
     ) -> Option<&Slot> {
         self.slots
-            .get(slot_id)
+            .get(&versioned_key(bot_version, slot_id))
             .filter(|slot| slot.is_in_intent(bot_id, bot_version, locale_id, intent_id))
     }
 

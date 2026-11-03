@@ -242,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     matches_filter(field, filter)
                 })
             })
-            .map(crate::state::Bot::summary)
+            .map(|bot| bot.summary(store.latest_bot_version(&bot.bot_id)))
             .collect();
 
         // `BotName` is the only modelled sort attribute; the `botId` tiebreak keeps the

@@ -34,14 +34,19 @@ use crate::slot_type::{create_slot_type, host_locale, slot_type_body};
 /// `CreateSlot`'s URI:
 /// `PUT /bots/{botId}/botversions/{botVersion}/botlocales/{localeId}/intents/{intentId}/slots`.
 /// `ListSlots` is the same URI under `POST`.
-fn slots_uri(bot_id: &str, bot_version: &str, locale_id: &str, intent_id: &str) -> String {
+pub(crate) fn slots_uri(
+    bot_id: &str,
+    bot_version: &str,
+    locale_id: &str,
+    intent_id: &str,
+) -> String {
     format!(
         "/bots/{bot_id}/botversions/{bot_version}/botlocales/{locale_id}/intents/{intent_id}/slots"
     )
 }
 
 /// `DescribeSlot`'s URI, which adds the `slotId` to [`slots_uri`].
-fn slot_uri(
+pub(crate) fn slot_uri(
     bot_id: &str,
     bot_version: &str,
     locale_id: &str,
@@ -56,7 +61,7 @@ fn slot_uri(
 
 /// A `CreateSlot` request body carrying the two required members — the name and the
 /// elicitation setting — plus `extra`.
-fn slot_body(name: &str, extra: Value) -> Value {
+pub(crate) fn slot_body(name: &str, extra: Value) -> Value {
     let mut body = json!({
         "slotName": name,
         "valueElicitationSetting": {

@@ -318,7 +318,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The response is read back off the record that was just stored, so a
         // `slotTypeId` this operation hands out always has a backing slot type.
-        let stored = store.slot_types.entry(slot_type_id).or_insert(slot_type);
+        let key = crate::state::versioned_key(&slot_type.bot_version, &slot_type.slot_type_id);
+        let stored = store.slot_types.entry(key).or_insert(slot_type);
         Ok(CreateSlotTypeOutput {
             slot_type_id: Some(stored.slot_type_id.clone()),
             slot_type_name: Some(stored.slot_type_name.clone()),
