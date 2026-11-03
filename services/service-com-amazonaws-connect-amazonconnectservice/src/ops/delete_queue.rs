@@ -175,12 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        let removed = store
-            .instances
-            .get_mut(&input.instance_id)
-            .and_then(|instance| instance.queues.remove(&input.queue_id));
+        // The instance is resolved on its own first: an `InstanceId` that names no
+        // instance is refused as the instance not being found, whichever resource inside
+        // it the request asks for.
+        let instance = store.instances.get_mut(&input.instance_id).ok_or_else(|| {
+            DeleteQueueErrorModeled::ResourceNotFoundException(crate::state::instance_not_found(
+                &input.instance_id,
+            ))
+        })?;
 
-        if removed.is_none() {
+        if instance.queues.remove(&input.queue_id).is_none() {
             return Err(DeleteQueueErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(

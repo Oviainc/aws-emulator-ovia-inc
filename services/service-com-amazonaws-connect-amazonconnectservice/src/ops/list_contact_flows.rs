@@ -170,9 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
-            ListContactFlowsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("Instance not found: {}", input.instance_id)),
-            })
+            ListContactFlowsErrorModeled::ResourceNotFoundException(
+                crate::state::instance_not_found(&input.instance_id),
+            )
         })?;
 
         // An absent or empty `ContactFlowTypes` keeps every type; otherwise only the

@@ -28,7 +28,7 @@ use crate::ops::types::{
     HoursOfOperation, HoursOfOperationConfig, HoursOfOperationSummary, HoursOfOperationTimeSlice,
     HoursOfOperationsIdentifier, Instance, InstanceStorageConfig, InstanceSummary,
     OutboundCallerConfig, OutboundEmailConfig, PhoneNumberStatus, Queue, QueueSummary,
-    PHONE_NUMBER_TYPE_VALUES,
+    ResourceNotFoundException, PHONE_NUMBER_TYPE_VALUES,
 };
 
 /// The region an unsigned request is served in. The emulator's own shared AWS config
@@ -1513,6 +1513,19 @@ pub fn instance_service_role(instance_id: &str) -> String {
 pub fn instance_access_url(alias: Option<&str>, instance_id: &str) -> String {
     let label = alias.unwrap_or(instance_id);
     format!("https://{label}.my.connect.aws")
+}
+
+/// Connect's refusal for an `InstanceId` that names no instance — including an
+/// identifier that named one until `DeleteInstance` retired it.
+///
+/// The message is the identifier embedded in the service's sentence, `Instance <id>
+/// not found`, with the identifier taken verbatim from the request and no other member
+/// of the error populated. Every handler that resolves an `InstanceId` builds the
+/// refusal here, so the service has exactly one spelling of it.
+pub fn instance_not_found(instance_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Instance {instance_id} not found")),
+    }
 }
 
 /// Convert a stored instant into the modelled timestamp type.

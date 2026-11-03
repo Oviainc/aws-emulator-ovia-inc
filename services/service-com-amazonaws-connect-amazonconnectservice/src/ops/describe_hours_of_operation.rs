@@ -154,10 +154,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        let hours = store
-            .instances
-            .get(&input.instance_id)
-            .and_then(|instance| instance.hours_of_operation_detail(&input.hours_of_operation_id))
+        // The instance is resolved on its own first: an `InstanceId` that names no
+        // instance is refused as the instance not being found, whichever resource inside
+        // it the request asks for.
+        let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
+            DescribeHoursOfOperationErrorModeled::ResourceNotFoundException(
+                crate::state::instance_not_found(&input.instance_id),
+            )
+        })?;
+        let hours = instance
+            .hours_of_operation_detail(&input.hours_of_operation_id)
             .ok_or_else(|| {
                 DescribeHoursOfOperationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

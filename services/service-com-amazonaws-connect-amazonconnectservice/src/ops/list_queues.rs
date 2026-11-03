@@ -171,9 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
-            ListQueuesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("Instance not found: {}", input.instance_id)),
-            })
+            ListQueuesErrorModeled::ResourceNotFoundException(crate::state::instance_not_found(
+                &input.instance_id,
+            ))
         })?;
 
         let wanted = input.queue_types.unwrap_or_default();

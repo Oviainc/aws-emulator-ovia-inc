@@ -176,9 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if store.instances.remove(&input.instance_id).is_none() {
             return Err(DeleteInstanceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Instance not found: {}", input.instance_id)),
-                },
+                crate::state::instance_not_found(&input.instance_id),
             )
             .into());
         }

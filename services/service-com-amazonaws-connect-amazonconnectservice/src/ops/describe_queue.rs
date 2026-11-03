@@ -149,18 +149,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        let queue = store
-            .instances
-            .get(&input.instance_id)
-            .and_then(|instance| instance.queues.get(&input.queue_id))
-            .ok_or_else(|| {
-                DescribeQueueErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "Queue not found: {} in instance {}",
-                        input.queue_id, input.instance_id
-                    )),
-                })
-            })?;
+        // The instance is resolved on its own first: an `InstanceId` that names no
+        // instance is refused as the instance not being found, whichever resource inside
+        // it the request asks for.
+        let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
+            DescribeQueueErrorModeled::ResourceNotFoundException(crate::state::instance_not_found(
+                &input.instance_id,
+            ))
+        })?;
+        let queue = instance.queues.get(&input.queue_id).ok_or_else(|| {
+            DescribeQueueErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "Queue not found: {} in instance {}",
+                    input.queue_id, input.instance_id
+                )),
+            })
+        })?;
 
         Ok(DescribeQueueOutput {
             queue: Some(queue.to_queue()),
