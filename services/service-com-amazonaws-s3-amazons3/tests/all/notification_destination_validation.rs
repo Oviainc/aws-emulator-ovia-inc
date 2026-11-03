@@ -16,16 +16,20 @@
 //!   each queue destination it named has the `s3:TestEvent` waiting on it, naming the
 //!   bucket and the request that configured it;
 //! * a container naming ONE destination the service that owns it REFUSES — a queue or a
-//!   function that does not exist, a queue S3 cannot publish to at all — is refused WHOLE,
-//!   HTTP 400 `InvalidArgument`, and the bucket keeps the configuration it already carried;
+//!   function that does not exist, a queue S3 cannot publish to at all, a function whose
+//!   resource-based policy does not let Amazon S3 invoke it for this bucket — is refused
+//!   WHOLE, HTTP 400 `InvalidArgument`, and the bucket keeps the configuration it already
+//!   carried;
 //! * `SkipDestinationValidation` "skips validation of Amazon SQS, Amazon SNS, and Lambda
 //!   destinations", so such a request is recorded as given and publishes no test
 //!   notification at all.
 //!
 //! The rows span what the rule generalises over: the destination KIND (an SQS queue, a
 //! Lambda function), WHY the destination's service refuses it (it does not hold it, it
-//! cannot take the publication), HOW MANY destinations one container names (one, two of one
-//! kind, two kinds) and which of them is refused, and whether validation is skipped.
+//! cannot take the publication, it grants Amazon S3 no invoke), WHICH grant a function
+//! carries (none, one for this bucket, one for every source, one for another bucket,
+//! another principal, another action), HOW MANY destinations one container names (one, two
+//! of one kind, two kinds) and which of them is refused, and whether validation is skipped.
 //!
 //! Every assertion drives real HTTP requests through a router carrying S3 beside the
 //! services that own the destinations, so what is pinned is the wire behaviour a client
@@ -98,13 +102,38 @@ impl Existing {
     }
 }
 
-/// One destination a row's container names: its kind, the resource's name and how that
-/// resource exists in the owning service before the put is made.
+/// Which grant the function destination of a row carries when the put is made — the
+/// resource-based policy statement `AddPermission` adds to it, which is what S3 reads to
+/// decide whether it may invoke the function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grant {
+    /// No `AddPermission` call at all: the function carries no resource-based policy.
+    None,
+    /// `lambda:InvokeFunction` to `s3.amazonaws.com`, narrowed to THIS bucket's ARN.
+    ThisBucket,
+    /// The same action and principal with no `SourceArn`, so every source is granted.
+    AnySource,
+    /// The same action and principal, narrowed to ANOTHER bucket's ARN.
+    OtherBucket,
+    /// `lambda:InvokeFunction` to another service principal.
+    OtherPrincipal,
+    /// Another action to `s3.amazonaws.com`.
+    OtherAction,
+}
+
+/// The bucket a [`Grant::OtherBucket`] statement names, which is never the bucket the row
+/// configures.
+const ANOTHER_BUCKET: &str = "some-other-bucket";
+
+/// One destination a row's container names: its kind, the resource's name, how that
+/// resource exists in the owning service before the put is made, and — for a function —
+/// the grant its resource-based policy carries.
 #[derive(Debug, Clone, Copy)]
 struct Named {
     kind: Kind,
     name: &'static str,
     existing: Existing,
+    grant: Grant,
 }
 
 /// One row of the table.
@@ -126,6 +155,7 @@ fn rows() -> Vec<Row> {
                 kind: Kind::Queue,
                 name: "validated-queue",
                 existing: Existing::Yes,
+                grant: Grant::None,
             }],
             skip_validation: false,
             expected_status: 200,
@@ -136,6 +166,7 @@ fn rows() -> Vec<Row> {
                 kind: Kind::Queue,
                 name: "absent-queue",
                 existing: Existing::No,
+                grant: Grant::None,
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
@@ -146,19 +177,76 @@ fn rows() -> Vec<Row> {
                 kind: Kind::Queue,
                 name: "ordered-queue.fifo",
                 existing: Existing::AsFifoQueue,
+                grant: Grant::None,
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
         },
         Row {
-            case: "one function that exists",
+            case: "one function that exists, granting this bucket the invoke",
             destinations: &[Named {
                 kind: Kind::Function,
                 name: "validated-function",
                 existing: Existing::Yes,
+                grant: Grant::ThisBucket,
             }],
             skip_validation: false,
             expected_status: 200,
+        },
+        Row {
+            case: "one function that exists, granting every source the invoke",
+            destinations: &[Named {
+                kind: Kind::Function,
+                name: "any-source-function",
+                existing: Existing::Yes,
+                grant: Grant::AnySource,
+            }],
+            skip_validation: false,
+            expected_status: 200,
+        },
+        Row {
+            case: "one function that exists with no invoke permission at all",
+            destinations: &[Named {
+                kind: Kind::Function,
+                name: "ungranted-function",
+                existing: Existing::Yes,
+                grant: Grant::None,
+            }],
+            skip_validation: false,
+            expected_status: INVALID_ARGUMENT_STATUS,
+        },
+        Row {
+            case: "one function whose invoke grant names another bucket",
+            destinations: &[Named {
+                kind: Kind::Function,
+                name: "other-bucket-function",
+                existing: Existing::Yes,
+                grant: Grant::OtherBucket,
+            }],
+            skip_validation: false,
+            expected_status: INVALID_ARGUMENT_STATUS,
+        },
+        Row {
+            case: "one function whose invoke grant names another principal",
+            destinations: &[Named {
+                kind: Kind::Function,
+                name: "other-principal-function",
+                existing: Existing::Yes,
+                grant: Grant::OtherPrincipal,
+            }],
+            skip_validation: false,
+            expected_status: INVALID_ARGUMENT_STATUS,
+        },
+        Row {
+            case: "one function whose grant is of another action",
+            destinations: &[Named {
+                kind: Kind::Function,
+                name: "other-action-function",
+                existing: Existing::Yes,
+                grant: Grant::OtherAction,
+            }],
+            skip_validation: false,
+            expected_status: INVALID_ARGUMENT_STATUS,
         },
         Row {
             case: "one function that does not exist",
@@ -166,6 +254,7 @@ fn rows() -> Vec<Row> {
                 kind: Kind::Function,
                 name: "absent-function",
                 existing: Existing::No,
+                grant: Grant::None,
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
@@ -177,15 +266,36 @@ fn rows() -> Vec<Row> {
                     kind: Kind::Queue,
                     name: "both-kinds-queue",
                     existing: Existing::Yes,
+                    grant: Grant::None,
                 },
                 Named {
                     kind: Kind::Function,
                     name: "both-kinds-function",
                     existing: Existing::Yes,
+                    grant: Grant::ThisBucket,
                 },
             ],
             skip_validation: false,
             expected_status: 200,
+        },
+        Row {
+            case: "a queue that exists and a function that grants no invoke",
+            destinations: &[
+                Named {
+                    kind: Kind::Queue,
+                    name: "mixed-kinds-queue",
+                    existing: Existing::Yes,
+                    grant: Grant::None,
+                },
+                Named {
+                    kind: Kind::Function,
+                    name: "mixed-kinds-ungranted-function",
+                    existing: Existing::Yes,
+                    grant: Grant::None,
+                },
+            ],
+            skip_validation: false,
+            expected_status: INVALID_ARGUMENT_STATUS,
         },
         Row {
             case: "two queues, the second of which does not exist",
@@ -194,11 +304,13 @@ fn rows() -> Vec<Row> {
                     kind: Kind::Queue,
                     name: "partly-valid-queue",
                     existing: Existing::Yes,
+                    grant: Grant::None,
                 },
                 Named {
                     kind: Kind::Queue,
                     name: "partly-valid-absent-queue",
                     existing: Existing::No,
+                    grant: Grant::None,
                 },
             ],
             skip_validation: false,
@@ -210,6 +322,7 @@ fn rows() -> Vec<Row> {
                 kind: Kind::Queue,
                 name: "skipped-queue",
                 existing: Existing::Yes,
+                grant: Grant::None,
             }],
             skip_validation: true,
             expected_status: 200,
@@ -220,6 +333,18 @@ fn rows() -> Vec<Row> {
                 kind: Kind::Queue,
                 name: "skipped-absent-queue",
                 existing: Existing::No,
+                grant: Grant::None,
+            }],
+            skip_validation: true,
+            expected_status: 200,
+        },
+        Row {
+            case: "a function granting no invoke, with validation skipped",
+            destinations: &[Named {
+                kind: Kind::Function,
+                name: "skipped-ungranted-function",
+                existing: Existing::Yes,
+                grant: Grant::None,
             }],
             skip_validation: true,
             expected_status: 200,
@@ -306,8 +431,9 @@ async fn create_fifo_queue(emulator: &Emulator, name: &str) {
     );
 }
 
-/// Create the Lambda function named `name`, so a configuration naming it resolves.
-async fn create_function(emulator: &Emulator, name: &str) {
+/// Create the Lambda function named `name`, so a configuration naming it resolves, and add
+/// the resource-based policy statement `grant` describes.
+async fn create_function(emulator: &Emulator, name: &str, bucket: &str, grant: Grant) {
     let created = emulator
         .send(
             "lambda",
@@ -331,6 +457,67 @@ async fn create_function(emulator: &Emulator, name: &str) {
         "creating the function {name:?} must succeed, got {} with {}",
         created.status,
         created.text()
+    );
+    add_permission(emulator, name, bucket, grant).await;
+}
+
+/// `AddPermission` on the function named `name` for the statement `grant` describes, or
+/// nothing at all for [`Grant::None`].
+///
+/// The members are the ones `AddPermission` takes — the `Principal` that invokes the
+/// function, the `Action` it may use and the `SourceArn` the grant is narrowed to — and an
+/// S3 bucket's ARN is `arn:aws:s3:::<bucket>`, which carries no Region or account "because
+/// a bucket name is globally unique".
+async fn add_permission(emulator: &Emulator, name: &str, bucket: &str, grant: Grant) {
+    let bucket_arn = |bucket: &str| format!("arn:aws:s3:::{bucket}");
+    let mut statement = match grant {
+        Grant::None => return,
+        Grant::ThisBucket => json!({
+            "StatementId": "s3-invoke",
+            "Action": "lambda:InvokeFunction",
+            "Principal": "s3.amazonaws.com",
+            "SourceArn": bucket_arn(bucket),
+        }),
+        Grant::AnySource => json!({
+            "StatementId": "s3-invoke-any",
+            "Action": "lambda:InvokeFunction",
+            "Principal": "s3.amazonaws.com",
+        }),
+        Grant::OtherBucket => json!({
+            "StatementId": "s3-invoke-other-bucket",
+            "Action": "lambda:InvokeFunction",
+            "Principal": "s3.amazonaws.com",
+            "SourceArn": bucket_arn(ANOTHER_BUCKET),
+        }),
+        Grant::OtherPrincipal => json!({
+            "StatementId": "events-invoke",
+            "Action": "lambda:InvokeFunction",
+            "Principal": "events.amazonaws.com",
+            "SourceArn": bucket_arn(bucket),
+        }),
+        Grant::OtherAction => json!({
+            "StatementId": "s3-get-function",
+            "Action": "lambda:GetFunction",
+            "Principal": "s3.amazonaws.com",
+            "SourceArn": bucket_arn(bucket),
+        }),
+    };
+    statement["FunctionName"] = json!(name);
+    let granted = emulator
+        .send(
+            "lambda",
+            "POST",
+            &format!("/2015-03-31/functions/{name}/policy"),
+            &[("content-type", "application/json")],
+            statement.to_string().into_bytes(),
+        )
+        .await;
+    assert_eq!(
+        granted.status,
+        201,
+        "granting {grant:?} on the function {name:?} must succeed, got {} with {}",
+        granted.status,
+        granted.text()
     );
 }
 
@@ -379,7 +566,9 @@ async fn a_configuration_is_recorded_only_once_every_destination_it_names_resolv
                     let url = emulator.create_queue(named.name).await;
                     queue_urls.push((named.name, url));
                 }
-                (Kind::Function, _) => create_function(&emulator, named.name).await,
+                (Kind::Function, _) => {
+                    create_function(&emulator, named.name, &bucket, named.grant).await;
+                }
             }
         }
 

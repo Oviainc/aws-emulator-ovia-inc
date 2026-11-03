@@ -955,7 +955,7 @@ pub async fn unvalidated_destinations(
                 topic_validated(&mut clients, callback, &region, &target.arn, &notification).await
             }
             super::NotificationDestination::LambdaFunction => {
-                function_validated(&mut clients, callback, &region, &target.arn).await
+                function_validated(&mut clients, callback, &region, &target.arn, bucket).await
             }
         };
         if !validated {
@@ -1025,12 +1025,27 @@ async fn topic_validated(
     }
 }
 
-/// Whether the function `arn` names resolves in Lambda.
+/// Whether the function `arn` names resolves in Lambda AND its resource-based policy lets
+/// Amazon S3 invoke it for `bucket`.
+///
+/// Both halves are what the real service checks: "in the case of Lambda destinations,
+/// Amazon S3 verifies that the Lambda function permissions grant Amazon S3 permission to
+/// invoke the function from the Amazon S3 bucket"
+/// (`PutBucketNotificationConfiguration`'s own documentation). The permission is a grant on
+/// the FUNCTION, so it is read where it lives — the function's own resource-based policy,
+/// which Lambda reports through `GetPolicy` — and evaluated by the one IAM evaluator every
+/// service of this emulator decides an access request with: the S3 service principal
+/// invoking the resolved function, with the request's source bucket and account as the
+/// condition context a grant may be narrowed by. A function carrying no policy at all
+/// answers `GetPolicy` with its own refusal, which grants nothing.
+///
+/// Nothing is written by either call.
 async fn function_validated(
     clients: &mut Clients,
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     arn: &str,
+    bucket: &str,
 ) -> bool {
     let answer = clients
         .lambda(callback, region)
@@ -1038,16 +1053,87 @@ async fn function_validated(
         .function_name(arn)
         .send()
         .await;
-    match answer {
-        Ok(_) => true,
+    // The ARN the grant is evaluated on is the one LAMBDA resolved the destination to, so a
+    // destination written in any of the forms `FunctionName` admits is judged against the
+    // ARN its statements name.
+    let resolved = match answer {
+        Ok(configuration) => configuration
+            .function_arn
+            .unwrap_or_else(|| arn.to_string()),
         Err(error) => {
             if refused_by_its_service(&error) {
                 return false;
             }
             unverifiable("a Lambda function", arn, &error);
-            true
+            return true;
         }
-    }
+    };
+    let answer = clients
+        .lambda(callback, region)
+        .get_policy()
+        .function_name(&resolved)
+        .send()
+        .await;
+    let document = match answer {
+        Ok(policy) => policy.policy.unwrap_or_default(),
+        Err(error) => {
+            if refused_by_its_service(&error) {
+                // A function with no resource-based policy is reported as having none, and
+                // a function whose policy cannot be read grants nothing either way.
+                return false;
+            }
+            unverifiable("a Lambda function", arn, &error);
+            return true;
+        }
+    };
+    invoke_granted(&document, &resolved, bucket)
+}
+
+/// The IAM action S3 needs on a function destination to deliver an event to it.
+const INVOKE_FUNCTION_ACTION: &str = "lambda:InvokeFunction";
+
+/// The service principal Amazon S3 publishes notifications under — "for Amazon Web Services
+/// services, the principal is a domain-style identifier that the service defines, such as
+/// s3.amazonaws.com" (`AddPermission$Principal`).
+const S3_SERVICE_PRINCIPAL: &str = "s3.amazonaws.com";
+
+/// The condition key a grant narrowed to ONE invoking resource names the source by.
+const SOURCE_ARN_KEY: &str = "aws:SourceArn";
+
+/// The condition key a grant narrowed to the account that OWNS the invoking resource names
+/// it by.
+const SOURCE_ACCOUNT_KEY: &str = "aws:SourceAccount";
+
+/// Whether `document`, a function's resource-based policy, allows the S3 service principal
+/// to invoke `function_arn` for an event published by `bucket`.
+///
+/// The decision is [`::service_common::iam_authorization`]'s, so a document this reads and
+/// the same document read by the service that owns it cannot disagree; the two condition
+/// keys an invoke grant is narrowed by travel as the request's context, and are declared as
+/// keys this request MODELS because it carries a value for each.
+///
+/// `aws:SourceAccount` is the account that OWNS the invoking bucket, which here is the one
+/// account this emulator serves ([`::engine::emulator_account_id`]) — the same account
+/// every bucket's owner is reported as. A deployment where bucket ownership varies reads
+/// the owner off the bucket's own record instead, and this is the seam that changes.
+fn invoke_granted(document: &str, function_arn: &str, bucket: &str) -> bool {
+    let principals = [S3_SERVICE_PRINCIPAL.to_string()];
+    let context = [
+        (SOURCE_ARN_KEY.to_string(), bucket_arn(bucket)),
+        (
+            SOURCE_ACCOUNT_KEY.to_string(),
+            ::engine::emulator_account_id().to_string(),
+        ),
+    ];
+    let request = ::service_common::iam_authorization::Request::new(
+        INVOKE_FUNCTION_ACTION,
+        function_arn,
+        &principals,
+    )
+    .with_context(&context)
+    .with_published_keys(&[SOURCE_ARN_KEY, SOURCE_ACCOUNT_KEY]);
+    ::service_common::iam_authorization::resource_decision(document, &request)
+        == ::service_common::iam_authorization::Decision::Allowed
 }
 
 /// The error codes that are the EMULATOR's own refusal of the call rather than an answer

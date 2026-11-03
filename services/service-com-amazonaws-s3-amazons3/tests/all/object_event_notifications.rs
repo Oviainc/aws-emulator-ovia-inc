@@ -1079,6 +1079,34 @@ async fn a_write_invokes_the_function_a_lambda_configuration_names() {
         }
     }
 
+    // The grant S3 reads before it records the configuration: "in the case of Lambda
+    // destinations, Amazon S3 verifies that the Lambda function permissions grant Amazon S3
+    // permission to invoke the function from the Amazon S3 bucket"
+    // (`PutBucketNotificationConfiguration`'s own documentation).
+    let granted = emulator
+        .send(
+            "lambda",
+            "POST",
+            &format!("/2015-03-31/functions/{function}/policy"),
+            &[("content-type", "application/json")],
+            json!({
+                "StatementId": "s3-invoke",
+                "Action": "lambda:InvokeFunction",
+                "Principal": "s3.amazonaws.com",
+                "SourceArn": format!("arn:aws:s3:::{bucket}"),
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .await;
+    assert_eq!(
+        granted.status,
+        201,
+        "granting S3 the invoke on the function must succeed, got {} with {}",
+        granted.status,
+        granted.text()
+    );
+
     emulator
         .put_notification(
             bucket,
