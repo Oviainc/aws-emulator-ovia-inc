@@ -281,9 +281,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // This operation's `NotFoundException` message is BUILT FROM THE REQUEST: the
         // fleet identifier the caller supplied, verbatim, in the template AWS answers a
         // CreateGameSession on an absent fleet with — `Cannot find fleet with ID
-        // <FleetId>`.
+        // <FleetId>`, which `crate::state::fleet_not_found_message` is the one place that
+        // sentence is written.
         let fleet_not_found = |fleet_reference: &str| -> Self::Error {
-            not_found(format!("Cannot find fleet with ID {fleet_reference}"))
+            not_found(crate::state::fleet_not_found_message(fleet_reference))
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

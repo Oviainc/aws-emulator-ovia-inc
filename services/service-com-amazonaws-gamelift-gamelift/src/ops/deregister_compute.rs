@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterCompute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterCompute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterCompute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -154,20 +145,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterCompute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterComputeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterCompute"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeregisterComputeErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.tick(::std::time::SystemTime::now());
+
+        // "To deregister a compute, ... specify the compute name and the fleet ID." This
+        // operation acts on ONE named resource, so an identifier that names no stored
+        // resource is the modelled `NotFoundException` ("The requested resource was not
+        // found. The resource was either not created yet or deleted") — for the fleet the
+        // request names as much as for the compute registered with it.
+        let Some(fleet_id) = state.resolve_fleet_id(&input.fleet_id) else {
+            return Err(DeregisterComputeErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::fleet_not_found_message(&input.fleet_id)),
+                },
+            )
+            .into());
+        };
+        let Some(name) = state
+            .resolve_compute(&fleet_id, &input.compute_name)
+            .map(|compute| compute.compute_name.clone())
+        else {
+            return Err(DeregisterComputeErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::compute_not_found_message(
+                        &input.compute_name,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Removes a compute resource from an Anywhere fleet. Deregistered computes can no
+        // longer host game sessions": the compute leaves state, so the name it held is free
+        // again and a read of it no longer finds it.
+        state.computes.remove(&(fleet_id, name));
+
+        Ok(DeregisterComputeOutput {})
     }
 }

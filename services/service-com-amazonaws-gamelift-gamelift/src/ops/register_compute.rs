@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterCompute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterCompute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterCompute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +176,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterCompute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterComputeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterCompute"))
+        use crate::state::{COMPUTE_STATUS_ACTIVE, COMPUTE_TYPE_ANYWHERE};
+
+        let invalid = |message: String| -> Self::Error {
+            RegisterComputeErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RegisterComputeErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // "Provide a fleet ID and a fleet location to associate with the compute being
+        // registered." The model declares no `NotFoundException` for this operation, so a
+        // fleet identifier that names no stored fleet is reported as what it is: a
+        // parameter value in the request that is invalid.
+        let Some(fleet_id) = state.resolve_fleet_id(&input.fleet_id) else {
+            return Err(invalid(crate::state::fleet_not_found_message(
+                &input.fleet_id,
+            )));
+        };
+        let Some(fleet) = state.fleets.get(&fleet_id) else {
+            return Err(invalid(crate::state::fleet_not_found_message(
+                &input.fleet_id,
+            )));
+        };
+        let fleet_arn = fleet.fleet_arn.clone();
+
+        // "This API works with the following fleet types: Anywhere ... For an Anywhere
+        // fleet that doesn't use the Agent, call this operation to register fleet
+        // computes." A managed fleet's computes are the instances Amazon GameLift Servers
+        // provisions itself, so there is nothing for a caller to register on one.
+        if fleet.compute_type != COMPUTE_TYPE_ANYWHERE {
+            return Err(invalid(format!(
+                "Fleet {fleet_id} has compute type {}; a compute can only be registered to a \
+                 fleet with compute type {COMPUTE_TYPE_ANYWHERE}.",
+                fleet.compute_type
+            )));
+        }
+
+        // `Location`'s own doc: "This parameter is required when registering a compute for
+        // an Anywhere fleet", and `Compute$Location` is "the name of the custom location
+        // you added to the fleet that this compute resource resides in" — so the location
+        // must be one this fleet deploys to, or the compute would reside nowhere the fleet
+        // reaches.
+        let Some(location) = input.location.clone() else {
+            return Err(invalid(format!(
+                "Location is required to register a compute to a fleet with compute type \
+                 {COMPUTE_TYPE_ANYWHERE}."
+            )));
+        };
+        if !fleet.has_location(&location) {
+            return Err(invalid(format!(
+                "Location {location} is not a location of fleet {fleet_id}."
+            )));
+        }
+
+        // "To register a compute, give the compute a name ... and specify the compute
+        // resource's DNS name or IP address", which `Compute$IpAddress` states as the
+        // requirement on the stored record: "Amazon GameLift Servers requires a DNS name or
+        // IP address for a compute." Either one satisfies it — `IpAddress`'s "when
+        // registering an Anywhere fleet, an IP address is required" is the same requirement
+        // for a compute that has no DNS name, and a compute reached by DNS name is what
+        // `DnsName` is for.
+        if input.ip_address.is_none() && input.dns_name.is_none() {
+            return Err(invalid(
+                "Either DnsName or IpAddress is required to register a compute.".to_string(),
+            ));
+        }
+
+        // "give the compute a name (must be unique within the fleet)": a name that is taken
+        // in this fleet is the conflict `ConflictException` describes ("the requested
+        // operation would cause a conflict with the current state of a service resource
+        // associated with the request"), and the compute already registered under it is
+        // left exactly as it is. This check and the insert below both run under the state
+        // lock this handler holds, so concurrent registrations of one name produce exactly
+        // ONE winner. The refusal is the service's own text for that conflict: the name
+        // the REQUEST asked for, and the location the compute that holds it is REGISTERED
+        // IN, which is where the caller has to look for it.
+        let key = (fleet_id.clone(), input.compute_name.clone());
+        if let Some(registered) = state.computes.get(&key) {
+            return Err(RegisterComputeErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Compute name {} is already registered in location {}.",
+                        registered.compute_name, registered.location
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `RegisterCompute` adds a compute that stays registered until it is deregistered
+        // or its fleet is deleted, so the quota is what keeps the store bounded as well as
+        // what makes the modelled error reachable. A compute belongs to one fleet, so the
+        // count is the fleet's own (see `MAX_COMPUTES_PER_FLEET`).
+        if state
+            .computes
+            .keys()
+            .filter(|(fleet, _)| fleet == &fleet_id)
+            .count()
+            >= crate::state::MAX_COMPUTES_PER_FLEET
+        {
+            return Err(RegisterComputeErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Fleet {fleet_id} already has the maximum of {} computes.",
+                        crate::state::MAX_COMPUTES_PER_FLEET
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        // `Compute$ComputeArn`'s modelled pattern is
+        // `^arn:.*:compute\/[a-zA-Z0-9\-]+(\/[a-zA-Z0-9\-]+)?$`, so the ARN's resource is
+        // the compute's own name — which `ComputeName` has already constrained to that
+        // form.
+        let compute_arn =
+            crate::state::gamelift_arn(&region, &format!("compute/{}", input.compute_name));
+        let record = crate::state::ComputeRecord {
+            fleet_id: fleet_id.clone(),
+            fleet_arn,
+            compute_name: input.compute_name.clone(),
+            compute_arn,
+            ip_address: input.ip_address.clone(),
+            dns_name: input.dns_name.clone(),
+            // A registered compute is the caller's own hardware, already running and
+            // reachable at the address the request gave: there is no provisioning workflow
+            // for the service to carry out, so it is registered in the status that lets it
+            // host game servers. `Compute$ComputeStatus`: "A compute must have an ACTIVE
+            // status to host game sessions."
+            status: COMPUTE_STATUS_ACTIVE.to_string(),
+            location,
+            creation_time: now,
+            service_sdk_endpoint: crate::state::service_sdk_endpoint(&region),
+        };
+        state.computes.insert(key.clone(), record);
+
+        // Report the STORED record, so this response and every later read of the same
+        // compute can only agree.
+        let Some(stored) = state.computes.get(&key) else {
+            return Err(RegisterComputeErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the new compute could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(RegisterComputeOutput {
+            compute: Some(stored.to_modelled()),
+        })
     }
 }

@@ -17,6 +17,8 @@ mod alias_deletion;
 mod alias_update_isolation;
 #[path = "all/aliases.rs"]
 mod aliases;
+#[path = "all/anywhere_computes.rs"]
+mod anywhere_computes;
 #[path = "all/builds.rs"]
 mod builds;
 #[path = "all/error_message_templates.rs"]

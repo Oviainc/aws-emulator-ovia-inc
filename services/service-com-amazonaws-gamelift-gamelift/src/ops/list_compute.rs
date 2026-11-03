@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCompute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCompute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCompute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -177,20 +168,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCompute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComputeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCompute"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListComputeErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.tick(::std::time::SystemTime::now());
+
+        // "Retrieve a list of all computes in a fleet. Specify a fleet ID." This operation
+        // reports a COLLECTION, and the model declares no `NotFoundException` for it: a
+        // fleet identifier that names no stored fleet selects nothing, so the request
+        // succeeds with an empty list — the same way the other collection reads of this
+        // service answer a selector that matches nothing.
+        let computes = match state.resolve_fleet_id(&input.fleet_id) {
+            Some(fleet_id) => state
+                .computes_in_order(&fleet_id)
+                .into_iter()
+                // "Retrieve a list of all computes in a specific fleet location. Specify a
+                // fleet ID and location."
+                .filter(|compute| {
+                    input
+                        .location
+                        .as_ref()
+                        .is_none_or(|location| &compute.location == location)
+                })
+                // `ComputeStatus` selects the computes that are in the status the request
+                // names, and `ContainerGroupDefinitionName` the ones running "the deployed
+                // container group definition" it names — which only a compute in a
+                // container fleet carries, so on any other fleet that selector matches
+                // nothing rather than everything.
+                .filter(|compute| {
+                    input
+                        .compute_status
+                        .as_ref()
+                        .is_none_or(|status| &compute.status == status)
+                })
+                .filter(|_| input.container_group_definition_name.is_none())
+                .map(crate::state::ComputeRecord::to_modelled)
+                .collect(),
+            None => Vec::new(),
+        };
+
+        // "Use the pagination parameters to retrieve results in a set of sequential
+        // pages": a `NextToken` this service did not mint for this collection is a
+        // parameter value in the request that is invalid.
+        let Some((page, next_token)) = crate::state::paginate(
+            crate::state::PageKind::Computes,
+            &computes,
+            input.limit,
+            input.next_token.as_deref(),
+        ) else {
+            return Err(ListComputeErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "NextToken is not a pagination token this service issued.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        Ok(ListComputeOutput {
+            compute_list: Some(page),
+            next_token,
+        })
     }
 }

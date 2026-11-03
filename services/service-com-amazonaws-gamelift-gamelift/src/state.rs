@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Alias, AnywhereConfiguration, Build, CertificateConfiguration, DesiredPlayerSession,
+    Alias, AnywhereConfiguration, Build, CertificateConfiguration, Compute, DesiredPlayerSession,
     FilterConfiguration, FleetAttributes, GameProperty, GameSession, GameSessionPlacement,
     GameSessionQueue, GameSessionQueueDestination, IpPermission, LocationModel, LocationState,
     MatchmakingConfiguration, MatchmakingRuleSet, MatchmakingTicket, PlacedPlayerSession, Player,
@@ -51,6 +51,11 @@ pub const BUILD_STATUS_INITIALIZED: &str = "INITIALIZED";
 /// "`READY` -- The game build has been successfully uploaded. You can now create new
 /// fleets for this build."
 pub const BUILD_STATUS_READY: &str = "READY";
+
+/// `ComputeStatus` value a compute that can host game servers carries
+/// (`smithy_query shape=ComputeStatus`), as `Compute$ComputeStatus` documents it: "A
+/// compute must have an `ACTIVE` status to host game sessions."
+pub const COMPUTE_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// `GameSessionStatus` values this slice uses (`smithy_query shape=GameSessionStatus`).
 pub const GAME_SESSION_STATUS_ACTIVATING: &str = "ACTIVATING";
@@ -187,6 +192,16 @@ pub const MAX_SERVER_PROCESSES_PER_INSTANCE: i32 = 50;
 /// fleet's capacity, the game-session and player-session stores) from growing without
 /// limit.
 pub const MAX_FLEETS_PER_ACCOUNT: usize = 100;
+
+/// How many computes one fleet holds before `RegisterCompute` answers the modelled
+/// `LimitExceededException` ("The requested operation would cause the resource to exceed
+/// the allowed service limit").
+///
+/// Like [`MAX_FLEETS_PER_ACCOUNT`], the model carries no quota, so the count is CHOSEN:
+/// far above any realistic script — a compute is one hosting resource of a fleet — and the
+/// bound that keeps the compute store from growing without limit as computes are
+/// registered.
+pub const MAX_COMPUTES_PER_FLEET: usize = 100;
 
 /// How many fleet identifiers one `DescribeFleetAttributes` request may name.
 ///
@@ -483,6 +498,8 @@ pub enum PageKind {
     GameSessionQueues,
     /// `ListLocations`.
     Locations,
+    /// `ListCompute`.
+    Computes,
     /// `DescribeMatchmakingRuleSets`.
     MatchmakingRuleSets,
     /// `DescribeMatchmakingConfigurations`.
@@ -497,6 +514,7 @@ impl PageKind {
             Self::GameSessions => 'g',
             Self::GameSessionQueues => 'q',
             Self::Locations => 'l',
+            Self::Computes => 'm',
             Self::MatchmakingRuleSets => 'r',
             Self::MatchmakingConfigurations => 'c',
         }
@@ -894,6 +912,105 @@ fn port_span(range: &(i32, i32)) -> usize {
         .and_then(|width| width.checked_add(1))
         .and_then(|width| usize::try_from(width).ok())
         .unwrap_or(1)
+}
+
+/// What the service answers when no fleet is stored under the `FleetIdOrArn` an operation
+/// was asked to act on, in the template `CreateGameSession` answers an absent fleet with:
+/// the identifier the CALLER supplied, verbatim, since either of the two forms the member
+/// accepts selects the same fleet.
+///
+/// Each operation has its own template for this (`DeleteFleet` answers `Unable to find
+/// fleet '<id>'.`), so this one is shared only by the operations that answer THIS
+/// sentence, and is the one place that sentence is written.
+pub fn fleet_not_found_message(id_or_arn: &str) -> String {
+    format!("Cannot find fleet with ID {id_or_arn}")
+}
+
+/// What the service answers when the fleet holds no compute under the `ComputeNameOrArn`
+/// an operation was asked to act on — the message of the modelled `NotFoundException`,
+/// shared by every operation that names ONE compute, so the same missing compute reads the
+/// same way whichever of them was called.
+///
+/// The same template every other GameLift resource this store holds is reported missing
+/// with ([`alias_not_found_message`], [`build_not_found_message`]): the resource kind leads
+/// the sentence and the identifier the CALLER supplied is its one variable part, carried
+/// verbatim in parentheses, since either of the two forms the member accepts
+/// (`^([a-zA-Z0-9\-]+(\/[a-zA-Z0-9\-]+)?|arn:.*:compute\/...)$`) selects the same compute.
+pub fn compute_not_found_message(name_or_arn: &str) -> String {
+    format!("Compute ({name_or_arn}) not found")
+}
+
+/// The Amazon GameLift Servers SDK endpoint a game server process on a registered compute
+/// connects to.
+///
+/// `Compute$GameLiftServiceSdkEndpoint` is "the Amazon GameLift Servers SDK endpoint
+/// connection for a registered compute resource in an Anywhere fleet. The game servers on
+/// the compute use this endpoint to connect to the Amazon GameLift Servers service", and
+/// `RegisterCompute`'s own doc has each server process pass it to "the Amazon GameLift
+/// Servers server SDK action `InitSDK()`" — a WebSocket connection to the service in the
+/// Region the compute is registered in, which is the one variable part of the endpoint.
+pub fn service_sdk_endpoint(region: &str) -> String {
+    format!("wss://{region}.api.amazongamelift.com")
+}
+
+/// A compute resource registered with an Anywhere fleet, as `RegisterCompute` persisted
+/// it.
+///
+/// Every member of the modelled `Compute` is either a setting the request supplied or one
+/// the service decided, so the record holds them all and [`ComputeRecord::to_modelled`] is
+/// the one projection every read of the compute is served from.
+#[derive(Debug, Clone)]
+pub struct ComputeRecord {
+    /// The fleet the compute belongs to, and the ARN of that fleet.
+    pub fleet_id: String,
+    pub fleet_arn: String,
+    pub compute_name: String,
+    pub compute_arn: String,
+    /// The address the request gave the compute. "Amazon GameLift Servers requires a DNS
+    /// name or IP address for a compute", so at least one of the two is always held.
+    pub ip_address: Option<String>,
+    pub dns_name: Option<String>,
+    pub status: String,
+    /// The fleet location the compute resides in.
+    pub location: String,
+    pub creation_time: SystemTime,
+    /// The endpoint this compute's game server processes connect to the service through
+    /// (see [`service_sdk_endpoint`]).
+    pub service_sdk_endpoint: String,
+}
+
+impl ComputeRecord {
+    /// This compute as the modelled `Compute`.
+    ///
+    /// The members a registered Anywhere compute does not have are absent rather than
+    /// invented: `Type` is the fleet's EC2 instance type and "for registered computes in an
+    /// Amazon GameLift Servers Anywhere fleet, this property is empty"; `InstanceId` names
+    /// "the EC2 instance that is hosting the compute" and an Anywhere compute is hardware
+    /// the service does not own; `OperatingSystem` is read off a managed instance's build;
+    /// `GameLiftAgentEndpoint` belongs to a fleet running the Amazon GameLift Servers
+    /// Agent, which "handles all compute registry tasks for you" instead of this
+    /// operation; and `ContainerAttributes` and `GameServerContainerGroupDefinitionArn`
+    /// belong to a compute in a container fleet.
+    pub fn to_modelled(&self) -> Compute {
+        Compute {
+            fleet_id: Some(self.fleet_id.clone()),
+            fleet_arn: Some(self.fleet_arn.clone()),
+            compute_name: Some(self.compute_name.clone()),
+            compute_arn: Some(self.compute_arn.clone()),
+            ip_address: self.ip_address.clone(),
+            dns_name: self.dns_name.clone(),
+            compute_status: Some(self.status.clone()),
+            location: Some(self.location.clone()),
+            creation_time: Some(to_date_time(self.creation_time)),
+            operating_system: None,
+            r#type: None,
+            game_lift_service_sdk_endpoint: Some(self.service_sdk_endpoint.clone()),
+            game_lift_agent_endpoint: None,
+            instance_id: None,
+            container_attributes: None,
+            game_server_container_group_definition_arn: None,
+        }
+    }
 }
 
 /// A game session placed on a fleet, as `CreateGameSession` persisted it.
@@ -2145,6 +2262,11 @@ pub struct ComAmazonawsGameliftGameliftState {
     /// Game session placements by `PlacementId`, "a unique identifier for a game session
     /// placement".
     pub game_session_placements: HashMap<String, GameSessionPlacementRecord>,
+    /// Compute resources registered with a fleet, keyed by that fleet's `FleetId` and the
+    /// compute's own name: `RegisterCompute`'s doc — "give the compute a name (must be
+    /// unique within the fleet)" — makes the pair the record's key, so the same name on
+    /// another fleet is another compute.
+    pub computes: HashMap<(String, String), ComputeRecord>,
     /// Game sessions by their full-ARN `GameSessionId`.
     pub game_sessions: HashMap<String, GameSessionRecord>,
     /// Player sessions by `PlayerSessionId`.
@@ -2512,10 +2634,13 @@ impl ComAmazonawsGameliftGameliftState {
         }
     }
 
-    /// Drop a fleet, the game sessions placed on it, the player slots reserved in those
-    /// sessions, and the idempotency tokens that named them.
+    /// Drop a fleet, the computes registered with it, the game sessions placed on it, the
+    /// player slots reserved in those sessions, and the idempotency tokens that named them.
     pub fn remove_fleet(&mut self, fleet_id: &str) {
         self.fleets.remove(fleet_id);
+        // A compute belongs to one fleet (`Compute$FleetId`), so the fleet going away takes
+        // its registered computes with it rather than leaving them readable.
+        self.computes.retain(|(fleet, _), _| fleet != fleet_id);
         let sessions: HashSet<String> = self
             .game_sessions
             .iter()
@@ -2569,6 +2694,39 @@ impl ComAmazonawsGameliftGameliftState {
                 .get(id_or_arn)
                 .map(|fleet| fleet.fleet_id.clone())
         }
+    }
+
+    /// The compute `name_or_arn` names in the fleet `fleet_id`, or `None` when that fleet
+    /// holds none under it.
+    ///
+    /// `Compute$ComputeArn` is "the ARN that is assigned to a compute resource and uniquely
+    /// identifies it", so either of the forms `ComputeNameOrArn` accepts selects the same
+    /// compute.
+    pub fn resolve_compute(&self, fleet_id: &str, name_or_arn: &str) -> Option<&ComputeRecord> {
+        if name_or_arn.starts_with("arn:") {
+            self.computes
+                .values()
+                .find(|compute| compute.fleet_id == fleet_id && compute.compute_arn == name_or_arn)
+        } else {
+            self.computes
+                .get(&(fleet_id.to_string(), name_or_arn.to_string()))
+        }
+    }
+
+    /// The computes registered with `fleet_id`, oldest first, so a paginated walk is
+    /// stable across calls.
+    pub fn computes_in_order(&self, fleet_id: &str) -> Vec<&ComputeRecord> {
+        let mut computes: Vec<&ComputeRecord> = self
+            .computes
+            .values()
+            .filter(|compute| compute.fleet_id == fleet_id)
+            .collect();
+        computes.sort_by(|left, right| {
+            left.creation_time
+                .cmp(&right.creation_time)
+                .then_with(|| left.compute_name.cmp(&right.compute_name))
+        });
+        computes
     }
 
     /// Every stored fleet, oldest first, so a paginated walk is stable across calls.
