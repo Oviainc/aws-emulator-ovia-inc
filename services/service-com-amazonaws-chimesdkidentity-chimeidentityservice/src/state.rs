@@ -347,6 +347,20 @@ impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
         self.app_instances.get(instance_arn)?.bots.get(bot_arn)
     }
 
+    /// The name the identity `identity_arn` names carries, for an operation that reports
+    /// an `Identity` (an ARN and the name of whatever it names).
+    ///
+    /// An app instance's identity is either an [`AppInstanceUser`](AppInstanceUserRecord),
+    /// which always carries a name, or an [`AppInstanceBot`](AppInstanceBotRecord), whose
+    /// name is optional — so BOTH are resolved here and an identity this service does not
+    /// hold (or a bot created without one) simply has no name to report.
+    pub fn identity_name(&self, identity_arn: &str) -> Option<String> {
+        if let Some(user) = self.user(identity_arn) {
+            return Some(user.name.clone());
+        }
+        self.bot(identity_arn)?.name.clone()
+    }
+
     /// Store a bot under its parent instance and index it.
     ///
     /// As with [`insert_user`](Self::insert_user) the parent lookup here is the ONLY one

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/app_instance_admin.rs"]
 mod app_instance_admin;
+#[path = "all/app_instance_admin_listing.rs"]
+mod app_instance_admin_listing;
 #[path = "all/app_instance_bot_description.rs"]
 mod app_instance_bot_description;
 #[path = "all/app_instance_bots.rs"]

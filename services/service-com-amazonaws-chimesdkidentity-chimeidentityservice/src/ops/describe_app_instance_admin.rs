@@ -183,13 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )),
                 })
             })?;
-        // The administering identity's NAME is held by the user record, not by the
-        // directory, so it is read from the store here and left absent for an identity
+        // The administering identity's NAME is held by the identity's own record, not by
+        // the directory, so it is read from the store here and left absent for an identity
         // this service does not hold.
-        let name = state
-            .lock()
-            .user(&record.admin_arn)
-            .map(|user| user.name.clone());
+        let name = state.lock().identity_name(&record.admin_arn);
 
         Ok(DescribeAppInstanceAdminOutput {
             app_instance_admin: Some(AppInstanceAdmin {

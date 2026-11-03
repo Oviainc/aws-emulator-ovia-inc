@@ -93,7 +93,14 @@ async fn create_bot(
 }
 
 /// Create a bot and return its ARN, failing the test if it was refused.
-async fn bot(emulator: &Emulator, app_instance_arn: &str, token: &str, name: &str) -> String {
+/// `pub(crate)` so the suites beside this one in the same test binary mint a stored
+/// `AppInstanceBot` through this one helper rather than each carrying a copy.
+pub(crate) async fn bot(
+    emulator: &Emulator,
+    app_instance_arn: &str,
+    token: &str,
+    name: &str,
+) -> String {
     let (status, body) = create_bot(
         emulator,
         app_instance_arn,

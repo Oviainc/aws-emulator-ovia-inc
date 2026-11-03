@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAppInstanceAdmins
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAppInstanceAdmins`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAppInstanceAdmins::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,20 +149,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAppInstanceAdmins` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAppInstanceAdminsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAppInstanceAdmins"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAppInstanceAdminsErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the AppInstance store is unavailable".to_string()),
+            })
+        })?;
+        let directory = crate::state::app_instance_admins(&*self.engine).ok_or_else(|| {
+            ListAppInstanceAdminsErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the AppInstanceAdmin directory is unavailable".to_string()),
+            })
+        })?;
+
+        // LOCK ORDER: the store first, the shared admin directory second — the order every
+        // writer in this crate takes them in.
+        let store = state.lock();
+        if !store.app_instances.contains_key(&input.app_instance_arn) {
+            // This operation models no 404 shape, so an unknown ARN is refused with the
+            // modelled `BadRequestException` carrying the `NotFound` error code, as the
+            // rest of this service does.
+            return Err(ListAppInstanceAdminsErrorModeled::BadRequestException(
+                BadRequestException {
+                    code: Some("NotFound".to_string()),
+                    message: Some(format!(
+                        "AppInstance {} does not exist",
+                        input.app_instance_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A reporting operation: it reads the recorded promotions of THIS app instance and
+        // writes nothing. The records are copied out of the shared directory keyed by the
+        // administering identity's ARN — the directory holds at most
+        // `MAX_REGISTERED_ADMINS` of them in all — so the page walks them in a stable
+        // order and the directory lock is released before the page is projected.
+        let administrators: ::std::collections::BTreeMap<
+            String,
+            ::service_common::chime_app_instance_admins::AppInstanceAdminRecord,
+        > = directory
+            .lock()
+            .admins_of(&input.app_instance_arn)
+            .into_iter()
+            .map(|record| (record.admin_arn.clone(), record.clone()))
+            .collect();
+
+        // `NextToken` is opaque and scoped to the listing that issued it, so one this
+        // listing never issued is a bad request rather than an empty page.
+        let scope = format!("{}:{}", Self::NAME, input.app_instance_arn);
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_page_token(&scope, token).ok_or_else(|| {
+                    ListAppInstanceAdminsErrorModeled::BadRequestException(BadRequestException {
+                        code: Some("BadRequest".to_string()),
+                        message: Some(
+                            "NextToken is not a token this listing issued".to_string(),
+                        ),
+                    })
+                })?,
+            ),
+            None => None,
+        };
+
+        let page = crate::state::paginate(
+            &administrators,
+            input.max_results,
+            after.as_deref(),
+            &scope,
+            |record| AppInstanceAdminSummary {
+                // The administering identity's NAME is held by the identity's own record,
+                // not by the promotion, so it is read from the store here and left absent
+                // for an identity this service does not hold.
+                admin: Some(Identity {
+                    arn: Some(record.admin_arn.clone()),
+                    name: store.identity_name(&record.admin_arn),
+                }),
+            },
+        );
+
+        Ok(ListAppInstanceAdminsOutput {
+            app_instance_arn: Some(input.app_instance_arn),
+            app_instance_admins: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

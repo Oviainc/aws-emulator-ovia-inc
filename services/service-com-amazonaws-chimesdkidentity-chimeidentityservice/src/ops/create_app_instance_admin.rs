@@ -204,9 +204,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             match store.user(&input.app_instance_admin_arn) {
                 Some(user) => Some(user.name.clone()),
-                // An `AppInstanceUser` has to exist to be promoted; an
-                // `AppInstanceBot` is not a resource this emulator stores yet, so its
-                // promotion is recorded without a name rather than refused.
+                // An `AppInstanceUser` has to exist to be promoted; an `AppInstanceBot`
+                // this service holds reports the name on its own record, and one it does
+                // not hold is recorded without a name rather than refused.
                 None if input.app_instance_admin_arn.starts_with(&format!(
                     "{}/user/",
                     input.app_instance_arn
@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         input.app_instance_admin_arn
                     )));
                 }
-                None => None,
+                None => store.identity_name(&input.app_instance_admin_arn),
             }
         };
 
