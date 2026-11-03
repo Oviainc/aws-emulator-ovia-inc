@@ -546,6 +546,28 @@ async fn an_eventbridge_rule_that_does_not_match_receives_no_compliance_change()
             .unwrap_or_else(|| panic!("case {case:?}: expected a QueueUrl, got {created}"))
             .to_string();
         let queue_arn = format!("arn:aws:sqs:{REGION}:{ACCOUNT_ID}:other-events");
+        // The queue admits EventBridge, so what this row shows is the PATTERN
+        // deciding the delivery and nothing else.
+        sqs(
+            &router,
+            "SetQueueAttributes",
+            &json!({
+                "QueueUrl": &queue_url,
+                "Attributes": {
+                    "Policy": json!({
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Effect": "Allow",
+                            "Principal": {"Service": "events.amazonaws.com"},
+                            "Action": "sqs:SendMessage",
+                            "Resource": &queue_arn,
+                        }],
+                    })
+                    .to_string(),
+                },
+            }),
+        )
+        .await;
         events(
             &router,
             "PutRule",
