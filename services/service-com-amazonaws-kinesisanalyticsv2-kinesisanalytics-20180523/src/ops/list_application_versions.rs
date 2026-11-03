@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplicationVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplicationVersions`'s real behaviour. Implement it here — this is
+//! Implemented: reports one summary per version an application has, oldest first. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplicationVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +152,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplicationVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplicationVersions"))
+        // `ApplicationName`'s length and pattern, `Limit`'s 1..50 range and `NextToken`'s
+        // 1..512 length are refused at the boundary with HTTP 400 before this handler runs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListApplicationVersionsErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(
+                        "this service is not mounted on a stateful engine, so no \
+                         application version can be listed"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The version the next page starts at, as the token this operation issues names
+        // it: a version id. A token this operation never issued names no page to resume
+        // from, so it is refused rather than silently answering the first page.
+        let start = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match token.parse::<i64>() {
+                Ok(version_id) => Some(version_id),
+                Err(_) => {
+                    return Err(
+                        ListApplicationVersionsErrorModeled::InvalidArgumentException(
+                            InvalidArgumentException {
+                                message: Some(crate::state::invalid_next_token_message(token)),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+        };
+
+        // `Limit` is modelled `range 1..50`, so a supplied value is already in range and
+        // an absent one pages at the modelled maximum. Clamped anyway, so no value can
+        // make this page size zero and hand back an empty page with a next token.
+        let limit = input.limit.unwrap_or(MAX_LIMIT).clamp(1, MAX_LIMIT) as usize;
+
+        let mut store = state.lock();
+        // Reporting, not mutating: `settle_named` only materialises the status change the
+        // clock already owed, so the version in force is summarised with the status in
+        // force now.
+        store.settle_named(&input.application_name);
+
+        let Some(application) = store.applications.get(&input.application_name) else {
+            return Err(
+                ListApplicationVersionsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_application_message(
+                            &input.application_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "This operation is supported only for Managed Service for Apache Flink" (this
+        // operation's doc), the same rule `DescribeApplicationVersion` states: an
+        // application of another runtime family keeps no version history to list, so it is
+        // refused with the modelled `UnsupportedOperationException` (HTTP 400).
+        if !crate::state::is_flink_runtime(&application.runtime_environment) {
+            return Err(
+                ListApplicationVersionsErrorModeled::UnsupportedOperationException(
+                    UnsupportedOperationException {
+                        message: Some(crate::state::unsupported_for_runtime_message(
+                            Self::NAME,
+                            &application.runtime_environment,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The summaries are ascending by version id on every call, so a token can resume
+        // the walk by naming the version the next page starts at.
+        let mut page: Vec<ApplicationVersionSummary> = Vec::new();
+        let mut next_token = None;
+        for summary in application
+            .version_summaries()
+            .into_iter()
+            .filter(|summary| start.is_none_or(|from| summary.application_version_id >= from))
+        {
+            if page.len() == limit {
+                next_token = Some(summary.application_version_id.to_string());
+                break;
+            }
+            page.push(summary);
+        }
+
+        Ok(ListApplicationVersionsOutput {
+            application_version_summaries: Some(page),
+            next_token,
+        })
     }
 }
+
+/// The largest page `ListApplicationVersions` serves, and the size it pages at when the
+/// caller names none: `ListApplicationVersionsInputLimit` is modelled `range 1..50`
+/// (`smithy_query(query="shape",shape="ListApplicationVersionsInputLimit")`).
+const MAX_LIMIT: i32 = 50;

@@ -434,6 +434,25 @@ fn is_modeled_token(token: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '/' | '='))
 }
 
+/// Whether `token` is written in the 8-4-4-4-12 layout of a UUID — the structure a token
+/// must NOT wear.
+///
+/// A `ConditionalToken` is opaque: "a value you use to implement strong concurrency for
+/// application updates", handed back as received. A value punctuated as a UUID invites a
+/// client to parse it as one, which it is not; this service's server-assigned IDS are
+/// written that way, and a token is not an id.
+fn is_uuid_layout(token: &str) -> bool {
+    let groups: Vec<&str> = token.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .map(|group| group.len())
+            .eq([8, 4, 4, 4, 12])
+        && groups
+            .iter()
+            .all(|group| group.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 /// A `ConditionalToken` names the version in force: it satisfies the modelled form, is
 /// distinct per application, is stable across reads, and a fresh one is minted whenever
 /// the version it names moves.
@@ -452,6 +471,10 @@ async fn a_conditional_token_is_stable_per_version_and_rotates_with_it() {
         assert!(
             is_modeled_token(&token),
             "case {name:?}: expected a token of the modelled form, got {token:?}"
+        );
+        assert!(
+            !is_uuid_layout(&token),
+            "case {name:?}: expected an opaque token rather than UUID text, got {token:?}"
         );
         assert!(
             !seen.contains(&token),
@@ -484,6 +507,11 @@ async fn a_conditional_token_is_stable_per_version_and_rotates_with_it() {
         assert!(
             is_modeled_token(&rotated),
             "case {name:?}: expected another token of the modelled form, got {rotated:?}"
+        );
+        assert!(
+            !is_uuid_layout(&rotated),
+            "case {name:?}: expected another opaque token rather than UUID text, got \
+             {rotated:?}"
         );
         assert!(
             !seen.contains(&rotated),

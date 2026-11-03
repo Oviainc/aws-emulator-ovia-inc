@@ -216,15 +216,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags = input.tags.clone().unwrap_or_default();
         // "the maximum number of user-defined application tags is 50" — the
         // `CreateApplication$Tags` doc; the modelled `Tags` bound (1..200) counts system
-        // tags too, so the user-tag ceiling is the service's own rule to enforce here.
-        if tags.len() > MAX_USER_TAGS {
+        // tags too, so the user-tag ceiling is the service's own rule, stated once in
+        // `crate::state` because `TagResource` holds every application to the same one.
+        if tags.len() > crate::state::MAX_USER_TAGS {
             return Err(CreateApplicationErrorModeled::TooManyTagsException(
                 TooManyTagsException {
-                    message: Some(format!(
-                        "{} tags were supplied; at most {MAX_USER_TAGS} user-defined \
-                         application tags are allowed",
-                        tags.len()
-                    )),
+                    message: Some(crate::state::too_many_tags_message(tags.len())),
                 },
             )
             .into());
@@ -298,7 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .map(|options| store.describe_logging_options(options))
             .unwrap_or_default();
-        let conditional_token = store.mint_id("ConditionalToken");
+        let conditional_token = store.mint_conditional_token();
 
         let application = crate::state::Application {
             arn: crate::state::application_arn(&region, &name),
@@ -334,6 +331,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
             operations: Vec::new(),
             snapshots: Default::default(),
+            // An application this call just created has left no version behind.
+            versions: Default::default(),
         };
 
         store.applications.insert(name.clone(), application);
@@ -348,7 +347,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(CreateApplicationOutput { application_detail })
     }
 }
-
-/// The ceiling on user-defined application tags, from the `CreateApplication$Tags` and
-/// `TooManyTagsException` docs: "the maximum number of user-defined application tags is 50".
-const MAX_USER_TAGS: usize = 50;

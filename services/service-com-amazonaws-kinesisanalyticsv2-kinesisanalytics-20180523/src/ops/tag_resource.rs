@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
+//! Implemented: assigns key-value tags to the application a `ResourceARN` names. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +142,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Every modelled constraint on the input — `ResourceARN`'s length and `^arn:`
+        // pattern, `Tags`'s 1..200 length, each `Tag`'s key and value lengths — is refused
+        // at the boundary with HTTP 400 before this handler runs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(
+                        "this service is not mounted on a stateful engine, so no tag can \
+                         be assigned"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A `ResourceARN` that is not the ARN of one of this service's applications names
+        // nothing to tag, which is a parameter violation rather than a resource that
+        // happens to be absent — the same split this crate already makes for a Studio
+        // notebook's `DatabaseARN`.
+        let Some(name) = crate::state::application_name_from_arn(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(crate::state::invalid_resource_arn_message(
+                        &input.resource_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+        let name = name.to_string();
+
+        let mut store = state.lock();
+        // Reporting the status the clock already owed costs this write nothing and keeps
+        // the stored record the one every other reader sees.
+        store.settle_named(&name);
+
+        let Some(application) = store.application_by_arn_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::missing_application_message(&name)),
+                },
+            )
+            .into());
+        };
+
+        // "If you specify a tag that already exists, the tag value is replaced with the
+        // value that you specify in the request" (the `Tag` doc), so the tags this call
+        // carries are MERGED into the ones the application holds and only the keys it
+        // names change. What the ceiling counts is therefore the set the application would
+        // then carry, not the number of tags this one request supplies.
+        let resulting: ::std::collections::BTreeSet<&str> = application
+            .tags
+            .keys()
+            .map(String::as_str)
+            .chain(input.tags.iter().map(|tag| tag.key.as_str()))
+            .collect();
+        if resulting.len() > crate::state::MAX_USER_TAGS {
+            let count = resulting.len();
+            return Err(TagResourceErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(crate::state::too_many_tags_message(count)),
+                },
+            )
+            .into());
+        }
+
+        for tag in input.tags {
+            // "The value is optional" (`Tag$Value`): a key assigned without one carries
+            // the empty value the model admits, which is what a reader reports back.
+            application
+                .tags
+                .insert(tag.key, tag.value.unwrap_or_default());
+        }
+
+        // `TagResourceResponse` is an EMPTY structure: the assignment itself is the whole
+        // answer, and `ListTagsForResource` reads it back out of the store.
+        Ok(TagResourceOutput {})
     }
 }

@@ -45,6 +45,8 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+pub mod request_layer;
+
 /// `refusal` with every enumerated value set stated in LEXICOGRAPHIC order, and everything
 /// else — the member paths, the values echoed, every other requirement — untouched.
 ///
@@ -75,6 +77,10 @@ fn in_stated_value_order(refusal: &Refusal) -> Refusal {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// What a request whose body carries a value no modelled timestamp member can be read
+    /// from is served by, instead of the operation it named: see
+    /// [`request_layer`]. Holds no state, so one value serves every such request.
+    unreadable_body: request_layer::UnreadableBody,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -84,6 +90,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            unreadable_body: request_layer::UnreadableBody,
         }
     }
 }
@@ -139,6 +146,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // and is left to the generated routing table and its protocol-correct refusal.
         let operation =
             service_common::rpc_target::requested_operation(req, self.entry.identity().shape_id())?;
+
+        // Deserialization precedes every later layer, so a value the protocol cannot read
+        // into the modelled member it is bound to is refused BEFORE the operation runs and
+        // before anything is mutated: an `epoch-seconds` timestamp carrying a quoted number
+        // is such a value, and `crate::service::request_layer` states that rule for every
+        // timestamp member of this model.
+        if request_layer::unreadable_timestamp(operation, request_layer::request_body(req))
+            .is_some()
+        {
+            return Some(&self.unreadable_body);
+        }
+
         self.entry.routing_table().get(operation)
     }
 

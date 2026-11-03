@@ -10,7 +10,12 @@
 //! names and `DescribeApplicationSnapshot` reads it back from there.
 //!
 //! Beside the records themselves this module owns the two projections every reader
-//! needs ([`Application::detail`], [`Application::summary`]), the merge an update applies
+//! needs ([`Application::detail`], [`Application::summary`]), the per-version records a
+//! version reader reports ([`Application::version_detail`],
+//! [`Application::version_summaries`]), the tag list the tagging operations read and write
+//! ([`Application::tag_list`]), the resolution of a `ResourceARN` to the application it
+//! names ([`ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State::application_by_arn`]),
+//! the merge an update applies
 //! to a stored configuration ([`Application::apply_configuration_update`]), the mode an
 //! application runs in when its create named none ([`default_application_mode`]), the
 //! maintenance window every application carries
@@ -31,6 +36,7 @@ use crate::ops::types::{
     ApplicationEncryptionConfigurationDescription,
     ApplicationMaintenanceConfigurationDescription, ApplicationSnapshotConfigurationDescription,
     ApplicationSummary, ApplicationSystemRollbackConfigurationDescription,
+    ApplicationVersionSummary,
     CatalogConfigurationDescription, CheckpointConfigurationDescription, CodeContentDescription,
     CustomArtifactConfigurationDescription, DeployAsApplicationConfigurationDescription,
     EnvironmentPropertyDescriptions, FlinkApplicationConfigurationDescription,
@@ -41,7 +47,7 @@ use crate::ops::types::{
     MonitoringConfigurationDescription, OutputDescription, ParallelismConfigurationDescription,
     ReferenceDataSourceDescription, RunConfigurationDescription, RunConfigurationUpdate,
     S3ApplicationCodeLocationDescription, S3ContentBaseLocationDescription,
-    S3ReferenceDataSourceDescription, SnapshotDetails, SqlApplicationConfigurationDescription,
+    S3ReferenceDataSourceDescription, SnapshotDetails, SqlApplicationConfigurationDescription, Tag,
     VpcConfigurationDescription, ZeppelinApplicationConfigurationDescription,
     ZeppelinMonitoringConfigurationDescription,
 };
@@ -198,6 +204,15 @@ pub struct Application {
     /// The snapshots taken of this application, by `SnapshotName`, so a reader walks a
     /// stable name-ordered sequence. Bounded by [`MAX_SNAPSHOTS_PER_APPLICATION`].
     pub snapshots: BTreeMap<String, Snapshot>,
+    /// The record of every version this application has LEFT, by `ApplicationVersionId`,
+    /// frozen as the detail that version ran under at the instant it was superseded. The
+    /// version in force is NOT held here — it is the live record above, so a reader of it
+    /// sees the status and the configuration in force now — which is why
+    /// [`Application::version_detail`] and [`Application::version_summaries`] are the one
+    /// way a reader reaches a version at all. Ordered by id, so a version walk is
+    /// ascending on every call and a pagination token can resume it by naming an id.
+    /// Bounded by [`MAX_RETAINED_VERSIONS`].
+    pub versions: BTreeMap<i64, ApplicationDetail>,
 }
 
 impl Application {
@@ -298,6 +313,54 @@ impl Application {
                 &self.maintenance_window_start,
             ),
         }
+    }
+
+    /// The `ApplicationDetail` of ONE version of this application: the live detail for the
+    /// version in force, and the frozen record for a version this application has left.
+    ///
+    /// `None` when this application was never on that version, which is what every reader
+    /// of a version by id reports as a miss.
+    pub fn version_detail(&self, version_id: i64) -> Option<ApplicationDetail> {
+        if version_id == self.version_id {
+            return Some(self.detail());
+        }
+        self.versions.get(&version_id).cloned()
+    }
+
+    /// One `ApplicationVersionSummary` per version this application has, oldest first:
+    /// every retained record and then the version in force.
+    ///
+    /// Each summary is projected from that version's own detail, so the status a summary
+    /// carries is the status of the version it summarises — the live one for the version in
+    /// force and the frozen one for a version already left. The retained details are read by
+    /// REFERENCE: a summary is two scalars, so listing the history copies two scalars per
+    /// version rather than a configuration record per version.
+    pub fn version_summaries(&self) -> Vec<ApplicationVersionSummary> {
+        let summarise = |version_id: i64, status: &str| ApplicationVersionSummary {
+            application_version_id: version_id,
+            application_status: status.to_string(),
+        };
+        self.versions
+            .values()
+            .map(|detail| summarise(detail.application_version_id, &detail.application_status))
+            .chain(::std::iter::once(summarise(self.version_id, &self.status)))
+            .collect()
+    }
+
+    /// This application's tags as the API reports them, in key order so two reads of one
+    /// application report them in the same order.
+    ///
+    /// A tag assigned without a value carries the empty value the model admits
+    /// (`Tag$Value` is `@length 0..256`), rather than being reported as a tag with no
+    /// value member at all: the key IS assigned.
+    pub fn tag_list(&self) -> Vec<Tag> {
+        self.tags
+            .iter()
+            .map(|(key, value)| Tag {
+                key: key.clone(),
+                value: Some(value.clone()),
+            })
+            .collect()
     }
 
     /// The `ApplicationSummary` `ListApplications` returns.
@@ -784,6 +847,21 @@ pub const MAX_OPERATIONS_PER_APPLICATION: usize = 200;
 /// refusal is the service's own rather than a trim a reader could not explain.
 pub const MAX_SNAPSHOTS_PER_APPLICATION: usize = 1_000;
 
+/// The ceiling on how many SUPERSEDED versions one application retains, beside the version
+/// in force. Same reasoning as [`MAX_OPERATIONS_PER_APPLICATION`]: every accepted update
+/// adds a record no caller can drain, so the history is trimmed oldest-first rather than
+/// growing for the life of the process — and no operation that mints a version declares a
+/// quota error, so a refusal would be one no real client sees. The number is the
+/// emulator's own.
+pub const MAX_RETAINED_VERSIONS: usize = 1_000;
+
+/// The ceiling on user-defined application tags, from the `CreateApplication$Tags`,
+/// `TagResource` and `TooManyTagsException` docs: "the maximum number of application tags
+/// includes system tags. The maximum number of user-defined application tags is 50". The
+/// modelled `Tags` bound (`@length 1..200`) counts the system tags too, so this ceiling is
+/// the service's own rule and every operation that assigns a tag holds to it.
+pub const MAX_USER_TAGS: usize = 50;
+
 /// Per-service state for com-amazonaws-kinesisanalyticsv2-kinesisanalytics-20180523. A handler reaches it through [`service_state`].
 ///
 /// `applications` is a `BTreeMap`, so `ListApplications` walks a stable, name-ordered
@@ -819,17 +897,36 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
     }
 
     /// A fresh server-assigned id in the 8-4-4-4-12 hex form AWS uses for the ids this
-    /// API hands out (`OperationId`, `InputId`, `ConditionalToken`, …).
+    /// API hands out (`OperationId`, `InputId`, …).
     ///
     /// Unique by construction: the digest covers a monotonically increasing sequence
-    /// number, so no two ids from one store collide, and the form satisfies both `Id`
-    /// (`^[a-zA-Z0-9_.-]+$`, 1..50) and `ConditionalToken` (`^[a-zA-Z0-9-_+/=]+$`, 1..512).
+    /// number, so no two ids from one store collide, and the form satisfies `Id`
+    /// (`^[a-zA-Z0-9_.-]+$`, 1..50).
     pub fn mint_id(&mut self, kind: &str) -> String {
         self.id_sequence += 1;
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         hex_id(&format!("{kind}:{}:{nanos}", self.id_sequence))
+    }
+
+    /// A fresh `ConditionalToken`: "a value you use to implement strong concurrency for
+    /// application updates" (the member's doc), minted for the version in force.
+    ///
+    /// A token is OPAQUE — a caller only ever hands the value it was given back — so it
+    /// carries none of the structure an id does and is NOT written in the 8-4-4-4-12 form
+    /// [`Self::mint_id`] gives a server-assigned id: a value wearing that punctuation
+    /// invites a client to read it as a UUID, which is not what this value is. It is
+    /// unique by the same construction (the digest covers a monotonically increasing
+    /// sequence number, so no two tokens from one store collide, and no two applications
+    /// share one), and satisfies `ConditionalToken`'s `^[a-zA-Z0-9-_+/=]+$` pattern and
+    /// 1..512 length (`smithy_query(query="shape",shape="ConditionalToken")`).
+    pub fn mint_conditional_token(&mut self) -> String {
+        self.id_sequence += 1;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        opaque_token(&format!("ConditionalToken:{}:{nanos}", self.id_sequence))
     }
 
     /// Replace `name`'s maintenance window start time and answer the window as it now
@@ -951,7 +1048,8 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
         }
     }
 
-    /// Record a new version of `application` and return it.
+    /// Record a new version of `application` and return it, retaining `superseded` as the
+    /// record of the version it leaves.
     ///
     /// Every accepted configuration update results in a new version of the application
     /// (the `AddApplicationInput` doc says so for adding a streaming source, and
@@ -960,17 +1058,57 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
     /// the version it moved on from is remembered as `ApplicationVersionUpdatedFrom`, and
     /// the `ConditionalToken` — which names the CURRENT version — is minted afresh.
     ///
+    /// A version the application has left stays READABLE — `ListApplicationVersions`
+    /// "lists all the versions for the specified application" and
+    /// `DescribeApplicationVersion` describes one of them — so `superseded` is the detail
+    /// the outgoing version ran under, taken BEFORE the caller's changes were merged, and
+    /// is kept under the id it carries. The retained history is bounded by
+    /// [`MAX_RETAINED_VERSIONS`] and trimmed oldest-first.
+    ///
     /// Answers `None` when no application is stored under `application`, so a caller
     /// cannot read a version that was never recorded.
-    pub fn advance_version(&mut self, application: &str, now: DateTime) -> Option<i64> {
-        let conditional_token = self.mint_id("ConditionalToken");
+    pub fn advance_version(
+        &mut self,
+        application: &str,
+        now: DateTime,
+        superseded: ApplicationDetail,
+    ) -> Option<i64> {
+        let conditional_token = self.mint_conditional_token();
         let app = self.applications.get_mut(application)?;
+        app.versions.insert(superseded.application_version_id, superseded);
+        while app.versions.len() > MAX_RETAINED_VERSIONS {
+            let Some(oldest) = app.versions.keys().next().copied() else {
+                break;
+            };
+            app.versions.remove(&oldest);
+        }
         app.version_updated_from = Some(app.version_id);
         app.version_id += 1;
         app.version_create_timestamp = now;
         app.last_update_timestamp = now;
         app.conditional_token = Some(conditional_token);
         Some(app.version_id)
+    }
+
+    /// The application the `ResourceARN` of a tagging call names, for a caller that reads
+    /// its tags.
+    ///
+    /// The ARN is resolved through [`application_name_from_arn`] and the stored ARN then
+    /// has to EQUAL the one supplied, so an ARN naming this account's application in
+    /// another Region resolves to nothing rather than to the like-named application of the
+    /// Region the caller happens to be signing for.
+    pub fn application_by_arn(&self, arn: &str) -> Option<&Application> {
+        self.applications
+            .get(application_name_from_arn(arn)?)
+            .filter(|application| application.arn == arn)
+    }
+
+    /// The same lookup as [`Self::application_by_arn`], for a caller that WRITES the tags
+    /// of the application the ARN names.
+    pub fn application_by_arn_mut(&mut self, arn: &str) -> Option<&mut Application> {
+        self.applications
+            .get_mut(application_name_from_arn(arn)?)
+            .filter(|application| application.arn == arn)
     }
 
     /// Store `input` as `application`'s streaming source and move the application on to a
@@ -987,7 +1125,10 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
         now: DateTime,
     ) -> Option<(i64, Vec<InputDescription>)> {
         let description = self.describe_input(input);
-        let version_id = self.advance_version(application, now)?;
+        // The detail of the version this add LEAVES: read before the input is stored, so
+        // the record kept for it describes the application as that version ran.
+        let superseded = self.applications.get(application)?.detail();
+        let version_id = self.advance_version(application, now, superseded)?;
         let app = self.applications.get_mut(application)?;
         let descriptions = app
             .configuration
@@ -1650,6 +1791,91 @@ pub fn existing_application_message(name: &str) -> String {
     format!("Application '{name}' already exists.")
 }
 
+/// How this service words a lookup miss on one VERSION of an application: the id the
+/// caller asked for and the application it was looked for in, in the sentence shape
+/// [`missing_application_message`] uses for the application itself.
+pub fn missing_application_version_message(version_id: i64, application: &str) -> String {
+    format!("Application version '{version_id}' does not exist for application {application}.")
+}
+
+/// How this service words a call refused because the operation it names is supported only
+/// for Managed Service for Apache Flink applications — which `DescribeApplicationVersion`
+/// and `ListApplicationVersions` both document ("This operation is supported only for
+/// Managed Service for Apache Flink") — and the application it was called on runs on
+/// another runtime family.
+///
+/// The sentence is the RECORDED one: the behavioural unit
+/// `kinesisanalyticsv2.studio-notebook-version-history-reads-rejected-as-unsupported`
+/// expects `UnsupportedOperationException` carrying
+/// "DescribeApplicationVersion is not supported for applications with runtime environment
+/// ZEPPELIN-FLINK-3_0." The operation and the application's `RuntimeEnvironment` are its
+/// variable parts, taken from the request and from the stored application, so one wording
+/// answers every such call whatever runtime the application runs on.
+pub fn unsupported_for_runtime_message(operation: &str, runtime: &str) -> String {
+    format!("{operation} is not supported for applications with runtime environment {runtime}.")
+}
+
+/// Whether `runtime` names the runtime family of a Managed Service for Apache Flink
+/// application: the plain `FLINK-` family, as opposed to a SQL application
+/// ([`is_sql_runtime`]) or a Studio notebook ([`is_notebook_runtime`]), which run the same
+/// service's other two kinds of application.
+///
+/// Read off a STORED application, so what decides is the runtime the application runs on
+/// rather than a value a request carried.
+pub fn is_flink_runtime(runtime: &str) -> bool {
+    !is_sql_runtime(runtime) && !is_notebook_runtime(runtime)
+}
+
+/// How this service words a call that would leave an application carrying more
+/// user-defined tags than [`MAX_USER_TAGS`] admits: how many tags it asked the application
+/// to carry, and the ceiling.
+///
+/// One sentence for the create that supplies tags and for `TagResource`, so the two cannot
+/// report the same ceiling differently.
+pub fn too_many_tags_message(count: usize) -> String {
+    format!(
+        "{count} tags were supplied; at most {MAX_USER_TAGS} user-defined application tags \
+         are allowed"
+    )
+}
+
+/// How this service words a `ResourceARN` that is not the ARN of one of its applications at
+/// all — a value that names no application to tag or read tags from, as opposed to one
+/// naming an application this store does not hold ([`missing_application_message`]). The
+/// same split, and the same sentence shape, as [`invalid_catalog_database_arn_message`].
+pub fn invalid_resource_arn_message(resource_arn: &str) -> String {
+    format!(
+        "The ResourceARN '{resource_arn}' is not the ARN of a Managed Service for Apache Flink \
+         application"
+    )
+}
+
+/// The name of the application a `KinesisAnalyticsARN` names, or `None` when the value is
+/// not the ARN of an application of this service.
+///
+/// Read through the shared ARN parse, so a caller-supplied ARN is read exactly as every
+/// other service reads one rather than by splitting the value again. The vendor field has
+/// to be this service's `arnNamespace` and the resource an `application` with a non-empty
+/// id, which is the form [`application_arn`] mints.
+pub fn application_name_from_arn(resource_arn: &str) -> Option<&str> {
+    if !::service_common::arn::is_resource_arn_of(resource_arn, ARN_NAMESPACE) {
+        return None;
+    }
+    let name =
+        ::service_common::arn::resource_id_of_type(resource_arn, APPLICATION_RESOURCE_TYPE)?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// How this service words a `NextToken` that is not a pagination token it issued: the
+/// value the caller sent, quoted, and the fact that it names no page to resume from.
+pub fn invalid_next_token_message(next_token: &str) -> String {
+    format!("The NextToken '{next_token}' is not valid.")
+}
+
+/// The type of resource an application's ARN names, the `application` of
+/// `application/<name>`.
+const APPLICATION_RESOURCE_TYPE: &str = "application";
+
 /// How this service words a sentence about one application's SNAPSHOT: the snapshot the
 /// request named is quoted, because it is what the sentence is about, and the application
 /// it belongs to is named plainly as the scope it was looked up in.
@@ -1785,14 +2011,20 @@ const DEFAULT_REGION: &str = "us-east-1";
 /// (`smithy_query(query="service_info")`), and the account segment is the emulator's
 /// canonical one, which [`::engine::emulator_arn`] owns.
 pub fn application_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn("kinesisanalytics", region, &format!("application/{name}"))
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{APPLICATION_RESOURCE_TYPE}/{name}"),
+    )
 }
+
+/// This service's `arnNamespace` (`smithy_query(query="service_info")`): the vendor field
+/// of every ARN it mints, and the one a `ResourceARN` it is handed has to carry.
+const ARN_NAMESPACE: &str = "kinesisanalytics";
 
 /// A digest-derived id in the 8-4-4-4-12 hex form.
 fn hex_id(seed: &str) -> String {
-    use sha2::Digest;
-    let digest = sha2::Sha256::digest(seed.as_bytes());
-    let hex = hex::encode(&digest[..16]);
+    let hex = digest_hex(seed);
     format!(
         "{}-{}-{}-{}-{}",
         &hex[0..8],
@@ -1801,6 +2033,19 @@ fn hex_id(seed: &str) -> String {
         &hex[16..20],
         &hex[20..32]
     )
+}
+
+/// A digest-derived OPAQUE token: the same digest as [`hex_id`], with no punctuation at
+/// all, so the value carries no structure a client could read a meaning out of.
+fn opaque_token(seed: &str) -> String {
+    digest_hex(seed)
+}
+
+/// The first 16 bytes of `seed`'s SHA-256, hex encoded: 32 characters, which both the id
+/// form and the token form above are written from.
+fn digest_hex(seed: &str) -> String {
+    use sha2::Digest;
+    hex::encode(&sha2::Sha256::digest(seed.as_bytes())[..16])
 }
 
 /// The VPC id reported for a subnet set, derived from the subnets themselves so the

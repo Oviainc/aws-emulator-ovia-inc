@@ -15,6 +15,8 @@
 mod application_lifecycle;
 #[path = "all/application_mode_and_maintenance_window.rs"]
 mod application_mode_and_maintenance_window;
+#[path = "all/body_timestamp_class.rs"]
+mod body_timestamp_class;
 #[path = "all/error_envelope_wording.rs"]
 mod error_envelope_wording;
 #[path = "all/harness.rs"]
@@ -23,9 +25,13 @@ mod harness;
 mod modeled_client_errors;
 #[path = "all/ops_name_bindings.rs"]
 mod ops_name_bindings;
+#[path = "all/scratch.rs"]
+mod scratch;
 #[path = "all/sql_input_and_configuration_defaults.rs"]
 mod sql_input_and_configuration_defaults;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/studio_notebook_catalog.rs"]
 mod studio_notebook_catalog;
+#[path = "all/tags_versions_and_snapshots.rs"]
+mod tags_versions_and_snapshots;

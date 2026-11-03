@@ -669,17 +669,11 @@ fn uncoercible_value(schema: &Schema, value: &Value) -> Option<String> {
         })
 }
 
-/// The member of `schema` a JSON key names: its `@jsonName` when the model gives
-/// one, else its Smithy member name — the same lookup the JSON codec performs.
+/// The member of `schema` a JSON key names, through the tree's one statement of that
+/// lookup (`service_common::json_wire_values`), which is the same lookup the JSON codec
+/// performs.
 fn member_by_wire_name<'a>(schema: &'a Schema, key: &str) -> Option<&'a Schema> {
-    schema.members().iter().copied().find(|member| {
-        let wire = member
-            .json_name()
-            .map(|name| name.value())
-            .or_else(|| member.member_name())
-            .unwrap_or_default();
-        wire == key
-    })
+    service_common::json_wire_values::member_by_wire_name(schema, key)
 }
 
 /// Whether a member is read from the request rather than from the body, so the
@@ -747,45 +741,20 @@ fn fits_integral(number: &serde_json::Number, min: i64, max: i64) -> bool {
 
 /// The message a failed coercion states: the CLASS of value the request sent
 /// and the modelled type it could not be read as, which are the two facts a caller
-/// has to reconcile. The type is named by its Smithy shape type (`Integer`,
-/// `Long`, `Boolean`, …); the article is grammatical.
+/// has to reconcile.
 ///
-/// CROSS-REFERENCE:
-/// `services/service-com-amazonaws-xray-awsxray/src/service/request_layer.rs`
-/// states the same sentence for its own request layer, reached a different way
-/// (it runs the framework's deserializer rather than walking the body). If a
-/// third service needs it, hoist this function and [`json_value_class`] into
-/// `services/common` and have all three read it instead of copying it again.
+/// Both halves — naming the class and wording the sentence — are
+/// `service_common::json_wire_values`, the tree's one statement of them, shared with the
+/// request layers of `services/service-com-amazonaws-xray-awsxray` and
+/// `services/service-com-amazonaws-kinesisanalyticsv2-kinesisanalytics-20180523`.
 fn coercion_message(value: &Value, target: ShapeType) -> String {
-    let named = format!("{target:?}");
-    let article = if named.starts_with(['A', 'E', 'I', 'O', 'U']) {
-        "an"
-    } else {
-        "a"
-    };
-    format!(
-        "{} can not be converted to {article} {named}",
-        json_value_class(value)
-    )
+    service_common::json_wire_values::coercion_message(json_value_class(value), target)
 }
 
 /// The class of JSON value this is, as a coercion failure names it:
-/// `<JSON type>_VALUE`.
-///
-/// The refusal names the CLASS, never the value: the recorded refusal of a
-/// string bound to an integer member is "STRING_VALUE can not be converted to an
-/// Integer" whatever string was sent, which is both what the service says and
-/// what keeps a caller from amplifying a long value into a long response. That
-/// one recorded name fixes the form; the rest follow it.
+/// `<JSON type>_VALUE`, through that same shared statement.
 fn json_value_class(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "NULL_VALUE",
-        Value::Bool(_) => "BOOLEAN_VALUE",
-        Value::Number(_) => "NUMBER_VALUE",
-        Value::String(_) => "STRING_VALUE",
-        Value::Array(_) => "ARRAY_VALUE",
-        Value::Object(_) => "OBJECT_VALUE",
-    }
+    service_common::json_wire_values::json_value_class(value)
 }
 
 /// The path component of a request URI: no scheme, no authority, no query.

@@ -339,6 +339,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The detail of the version this update supersedes, read BEFORE anything is
+        // merged, so the record kept for that version describes the application as that
+        // version ran rather than as this update leaves it.
+        let superseded = application.detail();
+
         // Every update is applied to a COPY of the stored application and the copy stored
         // only once all of them have landed, so an update that names an element the
         // application does not hold leaves the stored record exactly as it was rather
@@ -367,9 +372,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         store.applications.insert(name.clone(), updated);
         // "Managed Service for Apache Flink updates the ApplicationVersionId each time you
-        // update your application": the version advance, the version's create timestamp
-        // and the fresh `ConditionalToken` are the one the whole crate shares.
-        store.advance_version(&name, now);
+        // update your application": the version advance, the version's create timestamp,
+        // the fresh `ConditionalToken` and the retention of the version just superseded
+        // are the one the whole crate shares.
+        store.advance_version(&name, now, superseded);
 
         // A RUNNING application has to restart its job under the new configuration before
         // the update is in force, so it reports `UPDATING` until the clock makes that due

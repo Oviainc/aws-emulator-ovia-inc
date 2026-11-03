@@ -424,17 +424,18 @@ fn note_in(found: &RefCell<Option<String>>, schema: &Schema, error: SerdeError) 
 /// `vendor/smithy-schema-server/src/json.rs`): this layer should read that kind
 /// instead of the prose.
 fn value_class(error: &SerdeError) -> Option<&'static str> {
+    use service_common::json_wire_values as classes;
     let stated = error.to_string();
     if stated.contains("does not fit in") {
-        return Some("NUMBER_VALUE");
+        return Some(classes::NUMBER_VALUE);
     }
     let found = stated.strip_prefix("expected ")?.split(", got ").nth(1)?;
     match found {
-        "string" => Some("STRING_VALUE"),
-        "number" => Some("NUMBER_VALUE"),
-        "boolean" => Some("BOOLEAN_VALUE"),
-        "array start" => Some("ARRAY_VALUE"),
-        "object start" => Some("OBJECT_VALUE"),
+        "string" => Some(classes::STRING_VALUE),
+        "number" => Some(classes::NUMBER_VALUE),
+        "boolean" => Some(classes::BOOLEAN_VALUE),
+        "array start" => Some(classes::ARRAY_VALUE),
+        "object start" => Some(classes::OBJECT_VALUE),
         // "null", and the framing tokens ("object key", "array end", …), which
         // describe where the parser is rather than a value a caller sent.
         _ => None,
@@ -443,27 +444,19 @@ fn value_class(error: &SerdeError) -> Option<&'static str> {
 
 /// The sentence a failed coercion states: the class of value the request sent
 /// and the modelled type it could not be read as — the two facts a caller has to
-/// reconcile, and the two the refusal is built from. The type is named by its
-/// Smithy shape type (`Integer`, `Long`, `Boolean`, …); the article is
-/// grammatical.
+/// reconcile, and the two the refusal is built from.
 ///
-/// CROSS-REFERENCE:
-/// `services/service-com-amazonaws-directoryservicedata-directoryservicedata/src/service.rs`
-/// states the same sentence (its `coercion_message` / `json_value_class`) for
-/// its own request layer. The two layers DETECT an unreadable body differently —
-/// that service walks the body against its input schemas, this one runs the
-/// framework's deserializer — and answer in different envelopes, so only this
-/// sentence is shared ground. When a third service needs it, hoist this function
-/// and the class vocabulary above into `services/common` and have all three read
-/// it, rather than adding a third copy.
+/// Both the class vocabulary above and this sentence are
+/// `service_common::json_wire_values`, the tree's one statement of them, shared
+/// with the request layers of
+/// `services/service-com-amazonaws-directoryservicedata-directoryservicedata`
+/// (which walks the body against its input schemas rather than running the
+/// framework's deserializer) and of
+/// `services/service-com-amazonaws-kinesisanalyticsv2-kinesisanalytics-20180523`.
+/// Only the sentence is shared ground: each layer detects an unreadable body its
+/// own way and answers in its own envelope.
 fn coercion_message(class: &str, target: ShapeType) -> String {
-    let named = format!("{target:?}");
-    let article = if named.starts_with(['A', 'E', 'I', 'O', 'U']) {
-        "an"
-    } else {
-        "a"
-    };
-    format!("{class} can not be converted to {article} {named}")
+    service_common::json_wire_values::coercion_message(class, target)
 }
 
 /// Forward one scalar read to the real deserializer, recording a JSON type
