@@ -335,7 +335,8 @@ pub fn rejection(svc: &dyn Service, req: &RtRequest, refused: Vec<Violation>) ->
 /// As [`rejection`], with the code and message a service's own [`BodyWording`] chose.
 ///
 /// The envelope and the status stay the framework's — a constraint failure is a 400 in
-/// every protocol — so a service's wording decides the words and nothing else.
+/// every protocol, rendered in the envelope of the protocol `req` is served in — so a
+/// service's wording decides the words and nothing else.
 pub fn worded_rejection(
     svc: &dyn Service,
     req: &RtRequest,

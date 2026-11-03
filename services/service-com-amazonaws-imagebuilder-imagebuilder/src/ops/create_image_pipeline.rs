@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateImagePipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateImagePipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateImagePipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one image pipeline and stores it under its own ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -173,7 +165,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // here — hence the `CreateImagePipelineError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#CreateImagePipeline")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`: every resource this
+// create references — the infrastructure configuration, the recipe, a distribution
+// configuration, a workflow — may name nothing stored, this SERVICE models that shape for
+// exactly that case (`com.amazonaws.imagebuilder#ResourceNotFoundException`, HTTP 404, "At
+// least one of the resources referenced by your request does not exist", declared in
+// `types/shared_types.rs`), and this operation's own `errors` list omits it. So a
+// reference that resolves to nothing is reported MISSING rather than dressed up as an
+// invalid request, which is a different claim a client branches on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#CreateImagePipeline",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum CreateImagePipelineErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
@@ -184,6 +188,7 @@ pub enum CreateImagePipelineErrorModeled {
     InvalidRequestException(InvalidRequestException),
     ResourceAlreadyExistsException(ResourceAlreadyExistsException),
     ResourceInUseException(ResourceInUseException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceException(ServiceException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -240,18 +245,217 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateImagePipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateImagePipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateImagePipeline"))
+        // Every modelled constraint on this input — `name`'s pattern, the ARN patterns,
+        // the string lengths, the map bounds — has been refused by the centralized walk
+        // before this body runs, so what is checked here is only what the model cannot
+        // say.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateImagePipelineErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // "You must specify exactly one recipe for the pipeline, using either a
+        // containerRecipeArn or an imageRecipeArn" — the model can say neither that one of
+        // the two is required nor that they exclude each other, so the rule is read here.
+        if input.image_recipe_arn.is_some() == input.container_recipe_arn.is_some() {
+            return Err(CreateImagePipelineErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::pipeline_recipe_message()),
+                },
+            )
+            .into());
+        }
+
+        // "You must also specify executionRole when you provide workflows."
+        if input.workflows.is_some() && input.execution_role.is_none() {
+            return Err(CreateImagePipelineErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::workflows_without_execution_role_message()),
+                },
+            )
+            .into());
+        }
+
+        let fingerprint = crate::state::image_pipeline_request_fingerprint(&input);
+        let arn = crate::state::image_pipeline_arn(&region, &input.name);
+
+        // The idempotency check, the uniqueness check, the reference resolution and the
+        // insert happen under ONE lock, so concurrent creates are serialized: the first
+        // to take the lock stores the pipeline and every other one sees it.
+        let mut store = state.lock();
+
+        // "If you retry a request with the same client token, Image Builder returns the
+        // original response without running the operation again" — down to its
+        // `requestId`.
+        if let Some(receipt) = store.create_receipt(
+            crate::state::CREATE_IMAGE_PIPELINE_OPERATION,
+            &region,
+            &input.client_token,
+        ) {
+            if receipt.fingerprint != fingerprint {
+                return Err(
+                    CreateImagePipelineErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(crate::state::idempotent_parameter_mismatch_message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Ok(CreateImagePipelineOutput {
+                request_id: Some(receipt.request_id.clone()),
+                client_token: Some(receipt.client_token.clone()),
+                image_pipeline_arn: Some(receipt.arn.clone()),
+            });
+        }
+
+        // "Pipeline names must be unique to your account in each Amazon Web Services
+        // Region", and the ARN carries the normalized name, so one key answers that.
+        if store.image_pipelines.contains_key(&arn) {
+            return Err(
+                CreateImagePipelineErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(crate::state::image_pipeline_exists_message(&input.name)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every resource the pipeline references has to BE a stored resource of this
+        // Region, so a reference naming nothing is reported MISSING rather than stored.
+        if store
+            .infrastructure_configuration(&input.infrastructure_configuration_arn, &region)
+            .is_none()
+        {
+            return Err(missing(&input.infrastructure_configuration_arn));
+        }
+
+        // The recipe reference is resolved the way every versioned reference of this
+        // service is, so a pipeline may hold a wildcard version and each of its runs
+        // builds the newest recipe that reference reaches. The platform the pipeline
+        // reports is "inherited from the recipe that the pipeline uses". A CONTAINER
+        // recipe is a resource this store does not hold at all, so such a reference names
+        // nothing — the answer any reference to a resource that was never created gets.
+        let platform = match (&input.image_recipe_arn, &input.container_recipe_arn) {
+            (Some(reference), _) => match store.resolve_image_recipe(reference, &region) {
+                Some(recipe) => recipe.platform.clone(),
+                None => return Err(missing(reference)),
+            },
+            (None, Some(reference)) => return Err(missing(reference)),
+            // Refused above: exactly one of the two is named.
+            (None, None) => None,
+        };
+
+        // A distribution configuration and a workflow are resources of this service too,
+        // and this store holds neither yet, so a reference to one names nothing.
+        if let Some(reference) = &input.distribution_configuration_arn {
+            return Err(missing(reference));
+        }
+        if let Some(configuration) = input.workflows.iter().flatten().next() {
+            return Err(missing(&configuration.workflow_arn));
+        }
+
+        // The store is finite: a create that would take it past this emulator's own cap
+        // is refused rather than growing it. Checked BEFORE the dry-run branch, so a dry
+        // run reports the same outcome the real create would have.
+        if store.image_pipeline_store_is_full() {
+            return Err(
+                CreateImagePipelineErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::image_pipeline_store_full_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `dryRun`: "Validates the required permissions and request parameters without
+        // performing the operation. If validation succeeds, the operation returns a
+        // DryRunOperationException error response." Nothing has been written by here —
+        // including the request's receipt, so a dry run leaves the token free for the
+        // real request.
+        if input.dry_run {
+            return Err(CreateImagePipelineErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(crate::state::dry_run_message()),
+                },
+            )
+            .into());
+        }
+
+        let request_id = crate::state::new_request_id();
+        let client_token = input.client_token.clone();
+        let stored_at = crate::state::iso8601(::std::time::SystemTime::now());
+
+        store.insert_image_pipeline(
+            crate::state::ImagePipelineRecord {
+                arn: arn.clone(),
+                region,
+                name: input.name,
+                description: input.description,
+                platform,
+                enhanced_image_metadata_enabled: input
+                    .enhanced_image_metadata_enabled
+                    .unwrap_or(crate::state::DEFAULT_ENHANCED_IMAGE_METADATA_ENABLED),
+                image_recipe_arn: input.image_recipe_arn,
+                container_recipe_arn: input.container_recipe_arn,
+                infrastructure_configuration_arn: input.infrastructure_configuration_arn,
+                distribution_configuration_arn: input.distribution_configuration_arn,
+                // "If you don't provide test settings, Image Builder stores a default
+                // configuration with image tests enabled", and of the timeout: "If you
+                // don't specify a value, Image Builder stores and returns 720" — so what
+                // is stored is that configuration with both defaults filled in, which is
+                // what a read then reports.
+                image_tests_configuration: ImageTestsConfiguration {
+                    image_tests_enabled: Some(
+                        input
+                            .image_tests_configuration
+                            .as_ref()
+                            .and_then(|configuration| configuration.image_tests_enabled)
+                            .unwrap_or(crate::state::DEFAULT_IMAGE_TESTS_ENABLED),
+                    ),
+                    timeout_minutes: Some(
+                        input
+                            .image_tests_configuration
+                            .as_ref()
+                            .and_then(|configuration| configuration.timeout_minutes)
+                            .unwrap_or(crate::state::DEFAULT_IMAGE_TESTS_TIMEOUT_MINUTES),
+                    ),
+                },
+                schedule: input.schedule,
+                status: input
+                    .status
+                    .unwrap_or_else(|| crate::state::PIPELINE_STATUS_ENABLED.to_string()),
+                tags: input.tags.map(crate::state::into_ordered_tags),
+                image_tags: input.image_tags.map(crate::state::into_ordered_tags),
+                image_scanning_configuration: input.image_scanning_configuration,
+                execution_role: input.execution_role,
+                workflows: input.workflows,
+                logging_configuration: input.logging_configuration,
+                date_created: stored_at.clone(),
+                date_updated: stored_at,
+            },
+            &client_token,
+            fingerprint,
+            request_id.clone(),
+        );
+
+        Ok(CreateImagePipelineOutput {
+            request_id: Some(request_id),
+            client_token: Some(client_token),
+            image_pipeline_arn: Some(arn),
+        })
     }
+}
+
+/// The refusal a reference naming no resource of the calling Region is answered with.
+fn missing(reference: &str) -> CreateImagePipelineError {
+    CreateImagePipelineErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::required_resource_not_found_message(reference)),
+    })
+    .into()
 }

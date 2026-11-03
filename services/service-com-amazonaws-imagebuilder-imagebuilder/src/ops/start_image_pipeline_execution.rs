@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartImagePipelineExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartImagePipelineExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartImagePipelineExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Queues one build of a stored image pipeline and files the image build version it
+//! creates.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +174,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartImagePipelineExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartImagePipelineExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartImagePipelineExecution"))
+        // Every modelled constraint on this input — the pipeline ARN's pattern, the token
+        // length, the tag-map bounds — has been refused by the centralized walk before
+        // this body runs, so what is read here is only what the store can answer.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartImagePipelineExecutionErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let fingerprint = crate::state::pipeline_execution_request_fingerprint(&input);
+
+        // The idempotency check, the pipeline read, the build-number assignment and the
+        // filing of the new build version happen under ONE lock, so two starts of one
+        // pipeline are serialized and each gets a build number of its own.
+        let mut store = state.lock();
+
+        // "If you retry a request with the same client token, Image Builder returns the
+        // original response without running the operation again" — so a retry names the
+        // build version the first call created, and no second build is queued.
+        if let Some(receipt) = store.create_receipt(
+            crate::state::START_IMAGE_PIPELINE_EXECUTION_OPERATION,
+            &region,
+            &input.client_token,
+        ) {
+            if receipt.fingerprint != fingerprint {
+                return Err(
+                    StartImagePipelineExecutionErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(crate::state::idempotent_parameter_mismatch_message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Ok(StartImagePipelineExecutionOutput {
+                request_id: Some(receipt.request_id.clone()),
+                client_token: Some(receipt.client_token.clone()),
+                image_build_version_arn: Some(receipt.arn.clone()),
+            });
+        }
+
+        // The pipeline has to BE a stored pipeline of this Region: a start that names
+        // nothing stored is reported MISSING. A DISABLED pipeline is still started —
+        // "You can start a build this way whether the pipeline is enabled or disabled".
+        let Some(pipeline) = store.image_pipeline(&input.image_pipeline_arn, &region) else {
+            return Err(missing(&input.image_pipeline_arn));
+        };
+
+        // The image a build produces takes its name and its three assigned version nodes
+        // from the recipe the pipeline builds, and the reference is resolved AT THE START,
+        // so a pipeline holding a wildcard version builds the newest recipe that
+        // reference reaches now. A recipe the reference no longer reaches — deleted, or a
+        // container recipe, which this store does not hold — leaves the run nothing to
+        // build, which is the missing resource it names.
+        let reference = pipeline
+            .image_recipe_arn
+            .clone()
+            .or_else(|| pipeline.container_recipe_arn.clone());
+        let pipeline_builds_a_container = pipeline.image_recipe_arn.is_none();
+        // A stored pipeline always names exactly one recipe, which is what its create
+        // enforced; a record naming neither has nothing for a run to build, so the
+        // pipeline the request named is what it has no buildable resource under.
+        let reference = reference.unwrap_or_else(|| input.image_pipeline_arn.clone());
+        let Some(recipe) = store.resolve_image_recipe(&reference, &region) else {
+            return Err(missing(&reference));
+        };
+        let (name, version) = (recipe.name.clone(), recipe.version.clone());
+        let platform = recipe.platform.clone();
+        // "For an image recipe, this is always AMI": which kind of recipe the pipeline
+        // builds decides what its images are.
+        let image_type = if pipeline_builds_a_container {
+            crate::state::IMAGE_TYPE_DOCKER
+        } else {
+            crate::state::IMAGE_TYPE_AMI
+        };
+
+        // The store is finite: a run that would take it past this emulator's own cap is
+        // refused rather than growing it, and nothing is queued.
+        if store.image_store_is_full() {
+            return Err(
+                StartImagePipelineExecutionErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some(crate::state::image_store_full_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Image Builder automatically assigns the build number to the fourth node", so
+        // each run of one name+version pair counts up from the greatest build stored.
+        let build_version = store.next_image_build_version(
+            &region,
+            &crate::state::normalized_name(&name),
+            &version,
+        );
+        let arn = crate::state::image_build_version_arn(&region, &name, &version, build_version);
+
+        let request_id = crate::state::new_request_id();
+        let client_token = input.client_token.clone();
+        let queued_at = ::std::time::SystemTime::now();
+
+        // "The response returns as soon as Image Builder creates the new image resource
+        // and queues the build", so the record is filed now, carrying the instant its
+        // build is due to finish — which is what a later read of its status is answered
+        // from, with nothing to poll.
+        let filed = store.start_pipeline_run(
+            crate::state::ImageBuildVersionRecord {
+                arn: arn.clone(),
+                region,
+                name,
+                version,
+                build_version,
+                source_pipeline_arn: Some(input.image_pipeline_arn),
+                platform,
+                image_type: Some(image_type.to_string()),
+                // "USER_INITIATED" is the build type of a manual pipeline build request,
+                // which is exactly what this operation serves.
+                build_type: Some(crate::state::BUILD_TYPE_USER_INITIATED.to_string()),
+                date_created: crate::state::iso8601(queued_at),
+                available_at: queued_at.checked_add(crate::state::IMAGE_BUILD_SPAN),
+                // "Builds that you start manually use the tags from the
+                // StartImagePipelineExecution request instead" of the pipeline's
+                // `imageTags`, so the image carries exactly what this request named.
+                tags: input.tags.map(crate::state::into_ordered_tags),
+                // "The packages that are associated with an image build version, as
+                // determined by Amazon Web Services Systems Manager Inventory at build
+                // time": the build was only just queued, so nothing has been inventoried
+                // on a build instance yet.
+                packages: ::std::collections::BTreeMap::new(),
+            },
+            &client_token,
+            fingerprint,
+            request_id.clone(),
+        );
+        if !filed {
+            return Err(
+                StartImagePipelineExecutionErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some(crate::state::image_store_full_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(StartImagePipelineExecutionOutput {
+            request_id: Some(request_id),
+            client_token: Some(client_token),
+            image_build_version_arn: Some(arn),
+        })
     }
+}
+
+/// The refusal a request naming no resource of the calling Region is answered with.
+fn missing(reference: &str) -> StartImagePipelineExecutionError {
+    StartImagePipelineExecutionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::required_resource_not_found_message(reference)),
+    })
+    .into()
 }

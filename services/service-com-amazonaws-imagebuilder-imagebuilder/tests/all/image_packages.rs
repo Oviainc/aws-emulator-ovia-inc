@@ -173,6 +173,7 @@ fn recorded_image(
                 ((*package).to_string(), (*package_version).to_string())
             })
             .collect::<BTreeMap<String, String>>(),
+        ..ImageBuildVersionRecord::default()
     };
     let filed = engine
         .state::<ComAmazonawsImagebuilderImagebuilderState>()
@@ -665,6 +666,7 @@ async fn the_store_holds_at_most_one_record_per_build_version_up_to_its_bound() 
                 packages: [("bash".to_string(), "4.2.46-35.amzn2".to_string())]
                     .into_iter()
                     .collect(),
+                ..ImageBuildVersionRecord::default()
             });
         assert!(
             filed,
@@ -682,6 +684,7 @@ async fn the_store_holds_at_most_one_record_per_build_version_up_to_its_bound() 
             packages: [("curl".to_string(), "7.88.1-1.amzn2.0.1".to_string())]
                 .into_iter()
                 .collect(),
+            ..ImageBuildVersionRecord::default()
         });
     assert!(
         !filed,
@@ -710,6 +713,7 @@ async fn the_store_holds_at_most_one_record_per_build_version_up_to_its_bound() 
             packages: [("zlib".to_string(), "1.2.11-29.amzn2.0.1".to_string())]
                 .into_iter()
                 .collect(),
+            ..ImageBuildVersionRecord::default()
         });
     assert!(
         filed,
@@ -747,6 +751,7 @@ async fn one_build_version_keeps_at_most_the_bounded_inventory() {
             arn: arn.clone(),
             region: REGION.to_string(),
             packages: submitted.iter().cloned().collect(),
+            ..ImageBuildVersionRecord::default()
         });
     assert!(filed, "case an over-stuffed inventory: expected it filed");
 

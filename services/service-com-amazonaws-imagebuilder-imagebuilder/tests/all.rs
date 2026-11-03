@@ -19,6 +19,8 @@ mod component_image_recipe;
 mod component_policy;
 #[path = "all/image_packages.rs"]
 mod image_packages;
+#[path = "all/image_pipeline_execution.rs"]
+mod image_pipeline_execution;
 #[path = "all/infrastructure_configuration.rs"]
 mod infrastructure_configuration;
 #[path = "all/resource_not_found.rs"]

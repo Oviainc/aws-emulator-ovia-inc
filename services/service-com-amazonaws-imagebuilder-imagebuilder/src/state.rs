@@ -46,6 +46,23 @@
 //! of an absent one reports no packages rather than refusing: the inventory of a build
 //! that never ran is empty, not missing.
 //!
+//! An **image pipeline** is what starts those builds. It references the recipe and the
+//! infrastructure configuration a build uses and holds the settings that control the
+//! build, and it is stored keyed by its own ARN, which carries the [`normalized_name`]:
+//! "Pipeline names must be unique to your account in each Amazon Web Services Region.
+//! Image Builder generates the pipeline ARN from a normalized form of the name"
+//! (`CreateImagePipeline`'s `name`). Two of the members a pipeline read reports are NOT
+//! held on the record: the date of its last run and the status of that run are read from
+//! the newest image build version that names the pipeline as its source
+//! ([`ComAmazonawsImagebuilderImagebuilderState::image_pipeline_view`]), so what a read
+//! reports about a pipeline's runs cannot drift from the runs the store actually holds.
+//!
+//! A build is not instant: `StartImagePipelineExecution` "returns as soon as Image
+//! Builder creates the new image resource and queues the build", so a build version is
+//! filed carrying the instant its build is due to finish, and the status it reports is
+//! read from the CLOCK against that instant ([`ImageBuildVersionRecord::status_at`]) —
+//! nothing has to be polled for a queued build to become available.
+//!
 //! A **resource policy** is held beside the resource it is applied to, keyed by that
 //! resource's own ARN
 //! ([`ComAmazonawsImagebuilderImagebuilderState::resource_policies`]): every policy pair
@@ -62,14 +79,16 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AdditionalInstanceConfiguration, Component, ComponentConfiguration, ComponentParameterDetail,
-    ComponentState, CreateComponentInput, CreateImageRecipeInput,
-    CreateInfrastructureConfigurationInput, Filter, ImageRecipe, ImageRecipeSummary,
+    ComponentState, CreateComponentInput, CreateImagePipelineInput, CreateImageRecipeInput,
+    CreateInfrastructureConfigurationInput, Filter, ImagePipeline, ImageRecipe, ImageRecipeSummary,
+    ImageScanningConfiguration, ImageState, ImageSummary, ImageTestsConfiguration,
     InfrastructureConfiguration, InstanceBlockDeviceMapping, InstanceMetadataOptions, Logging,
-    ParentInstanceConfiguration, Placement,
+    ParentInstanceConfiguration, PipelineLoggingConfiguration, Placement, Schedule,
+    StartImagePipelineExecutionInput, WorkflowConfiguration,
 };
 
 /// This service's ARN namespace and SigV4 signing name (`arnNamespace` / `sigv4Name`
@@ -100,6 +119,11 @@ pub const IMAGE_RECIPE_ARN_PREFIX: &str = "image-recipe/";
 /// `^arn:aws[^:]*:imagebuilder:[^:]+:(?:[0-9]{12}|aws(?:-[a-z-]+)?):image/[a-z0-9-_]+/[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$`.
 pub const IMAGE_ARN_PREFIX: &str = "image/";
 
+/// The resource portion an image-pipeline ARN carries before its name, from the modelled
+/// `ImagePipelineArn` pattern
+/// `^arn:aws[^:]*:imagebuilder:[^:]+:(?:[0-9]{12}|aws):image-pipeline/[a-z0-9-_]+$`.
+pub const IMAGE_PIPELINE_ARN_PREFIX: &str = "image-pipeline/";
+
 /// The operations whose `clientToken` receipts share one index, each named as the key
 /// that index files its receipts under — the operation's own name, so two operations
 /// never read each other's.
@@ -112,12 +136,23 @@ pub const CREATE_COMPONENT_OPERATION: &str = "CreateComponent";
 /// See [`CREATE_INFRASTRUCTURE_CONFIGURATION_OPERATION`].
 pub const CREATE_IMAGE_RECIPE_OPERATION: &str = "CreateImageRecipe";
 
+/// See [`CREATE_INFRASTRUCTURE_CONFIGURATION_OPERATION`].
+pub const CREATE_IMAGE_PIPELINE_OPERATION: &str = "CreateImagePipeline";
+
+/// See [`CREATE_INFRASTRUCTURE_CONFIGURATION_OPERATION`]. A pipeline execution carries a
+/// `clientToken` of its own and mints an image build version, so its receipts are filed
+/// under its own name like any other create's.
+pub const START_IMAGE_PIPELINE_EXECUTION_OPERATION: &str = "StartImagePipelineExecution";
+
 /// The listing a page token belongs to, so a token issued by one list operation cannot
 /// be spent on another ([`encode_page_token`]).
 pub const LIST_IMAGE_RECIPES_OPERATION: &str = "ListImageRecipes";
 
 /// See [`LIST_IMAGE_RECIPES_OPERATION`].
 pub const LIST_IMAGE_PACKAGES_OPERATION: &str = "ListImagePackages";
+
+/// See [`LIST_IMAGE_RECIPES_OPERATION`].
+pub const LIST_IMAGE_BUILD_VERSIONS_OPERATION: &str = "ListImageBuildVersions";
 
 /// How many nodes of a semantic version a caller assigns.
 ///
@@ -176,6 +211,16 @@ pub const MAX_IMAGE_RECIPES_PER_PAGE: usize = 25;
 /// The most items one `ListImagePackages` page carries when the request names no
 /// `maxResults`: the modelled `maxResults` range's own maximum (1..25).
 pub const MAX_IMAGE_PACKAGES_PER_PAGE: usize = 25;
+
+/// The most items one `ListImageBuildVersions` page carries when the request names no
+/// `maxResults`: the modelled `maxResults` range's own maximum (1..25).
+pub const MAX_IMAGE_BUILD_VERSIONS_PER_PAGE: usize = 25;
+
+/// The filter names `ListImageBuildVersions` accepts, from the `filters` member's own
+/// list: "Use the following filters to streamline results: name, osVersion, platform,
+/// type, version."
+pub const IMAGE_BUILD_VERSION_FILTER_NAMES: &[&str] =
+    &["name", "osVersion", "platform", "type", "version"];
 
 /// The most tags one resource carries.
 ///
@@ -238,6 +283,63 @@ pub const DEFAULT_TERMINATE_INSTANCE_ON_FAILURE: bool = true;
 /// `terminateInstanceOnCompletion`, whose own documentation says "Defaults to true".
 pub const DEFAULT_TERMINATE_INSTANCE_ON_COMPLETION: bool = true;
 
+/// The status a stored pipeline reports when the create named none, from the modelled
+/// `status` member: "The status of the image pipeline. If you don't specify a status, it
+/// defaults to ENABLED" — one of the two values of the modelled `PipelineStatus` enum.
+pub const PIPELINE_STATUS_ENABLED: &str = "ENABLED";
+
+/// Applied when `CreateImagePipeline` omits `enhancedImageMetadataEnabled`, whose own
+/// documentation says "Defaults to true".
+pub const DEFAULT_ENHANCED_IMAGE_METADATA_ENABLED: bool = true;
+
+/// Applied when a create omits `imageTestsConfiguration` altogether, or omits its
+/// `imageTestsEnabled`: "If you don't provide test settings, Image Builder stores a
+/// default configuration with image tests enabled" (`CreateImagePipeline`'s
+/// `imageTestsConfiguration`), and `imageTestsEnabled` itself "Defaults to true".
+pub const DEFAULT_IMAGE_TESTS_ENABLED: bool = true;
+
+/// Applied when a stored test configuration carries no `timeoutMinutes`, whose own
+/// documentation says "If you don't specify a value, Image Builder stores and returns
+/// 720".
+pub const DEFAULT_IMAGE_TESTS_TIMEOUT_MINUTES: i32 = 720;
+
+/// The status an image build version reports while the build it was filed for is still
+/// outstanding, from the modelled `ImageStatus` enum.
+///
+/// `StartImagePipelineExecution` "returns as soon as Image Builder creates the new image
+/// resource and queues the build", so the image a start answers with exists and its build
+/// is QUEUED — which is what `PENDING` says.
+pub const IMAGE_STATUS_PENDING: &str = "PENDING";
+
+/// The status an image build version reports once its build is no longer outstanding: the
+/// end state the modelled `ImageState`'s own documentation names for a build that ran
+/// ("A new image moves through build, test, and distribution statuses during creation,
+/// and ends in the AVAILABLE, FAILED, or CANCELLED state").
+pub const IMAGE_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// How a build a caller asked for by hand was initiated, from the modelled `BuildType`
+/// enum, whose own documentation names `USER_INITIATED` for a manual build request, as
+/// against the `SCHEDULED` build that only a pipeline's own schedule starts.
+pub const BUILD_TYPE_USER_INITIATED: &str = "USER_INITIATED";
+
+/// The image type a build from an IMAGE recipe produces, from the modelled `type` member
+/// of `ImageRecipe`: "For an image recipe, this is always AMI."
+pub const IMAGE_TYPE_AMI: &str = "AMI";
+
+/// The image type a build from a CONTAINER recipe produces, the other value of the
+/// modelled `ImageType` enum. See [`IMAGE_TYPE_AMI`].
+pub const IMAGE_TYPE_DOCKER: &str = "DOCKER";
+
+/// How long after the call that queued it a build is due to finish, and so how long the
+/// image it creates reports [`IMAGE_STATUS_PENDING`] before it reports
+/// [`IMAGE_STATUS_AVAILABLE`].
+///
+/// CHOSEN, not documented: the model says a new image is queued and reaches its end state
+/// later, but names no duration — a real build takes many minutes. It is deliberately not
+/// zero, so a caller that reads straight after the call still observes the queued state,
+/// and short enough that a caller waiting for the image does not wait long.
+pub const IMAGE_BUILD_SPAN: Duration = Duration::from_secs(3);
+
 /// The metadata-tag keys a caller may not assign to the build and test instances.
 ///
 /// From the `resourceTags` member's own documentation: "Tag keys can't begin with
@@ -265,6 +367,10 @@ pub const MAX_COMPONENTS: usize = 1_000;
 /// The most image recipes this emulator will hold. An emulator resource guard, for the
 /// same reason as [`MAX_COMPONENTS`].
 pub const MAX_IMAGE_RECIPES: usize = 1_000;
+
+/// The most image pipelines this emulator will hold. An emulator resource guard, for the
+/// same reason as [`MAX_COMPONENTS`].
+pub const MAX_IMAGE_PIPELINES: usize = 1_000;
 
 /// The most image build versions this emulator will hold. An emulator resource guard, for
 /// the same reason as [`MAX_COMPONENTS`]:
@@ -553,12 +659,161 @@ pub struct ImageBuildVersionRecord {
     pub arn: String,
     /// The Region whose endpoint built it, and the only one that can reach it.
     pub region: String,
+    /// The image name this build version belongs to, as the recipe it was built from
+    /// carries it; the ARN carries its [`normalized_name`].
+    pub name: String,
+    /// The three assigned version nodes this build version belongs to, taken from the
+    /// recipe it was built from.
+    pub version: String,
+    /// The fourth version node: "Image Builder automatically assigns the build number to
+    /// the fourth node", counted up per name+version pair from [`FIRST_BUILD_VERSION`].
+    pub build_version: u64,
+    /// The pipeline whose execution created this build version, when a pipeline did \u2014 the
+    /// modelled `sourcePipelineArn` is "only present for images that a pipeline execution
+    /// created".
+    pub source_pipeline_arn: Option<String>,
+    /// The platform the image was built for, taken from the recipe it was built from.
+    pub platform: Option<String>,
+    /// Whether the build produced an AMI or a container image, from the kind of recipe it
+    /// was built from: the modelled `type` member of `ImageRecipe` documents "For an image
+    /// recipe, this is always AMI", and a container recipe's images are `DOCKER`.
+    pub image_type: Option<String>,
+    /// How the build was initiated, from the modelled `BuildType` enum: a build a caller
+    /// asked for by hand is [`BUILD_TYPE_USER_INITIATED`].
+    pub build_type: Option<String>,
+    /// The instant the build that produced it was queued, as a read reports it.
+    pub date_created: String,
+    /// The instant the build that produced it is due to finish, when one is outstanding:
+    /// the status the record reports is read from the clock against it
+    /// ([`Self::status_at`]). A record filed for a build that is not outstanding carries
+    /// none and is already available.
+    pub available_at: Option<SystemTime>,
+    /// The tags applied to the image resource, which for a manually started build are the
+    /// ones that request carried: "Builds that you start manually use the tags from the
+    /// StartImagePipelineExecution request" (the modelled `imageTags` member).
+    pub tags: Option<BTreeMap<String, String>>,
     /// The package inventory recorded for this build version, keyed by package name: one
     /// version per name, held in name order, so two reads of one page report the same
     /// entries and a token's position in the listing is stable. Bounded at
     /// [`MAX_IMAGE_PACKAGES`] where it is filed
     /// ([`ComAmazonawsImagebuilderImagebuilderState::insert_image`]).
     pub packages: BTreeMap<String, String>,
+}
+
+impl ImageBuildVersionRecord {
+    /// The status this build version reports at the instant `at`.
+    ///
+    /// A build that was queued is outstanding until the instant it is due to finish
+    /// ([`IMAGE_BUILD_SPAN`]), which the clock decides and no call has to materialise: the
+    /// same read answers [`IMAGE_STATUS_PENDING`] before that instant and
+    /// [`IMAGE_STATUS_AVAILABLE`] from it on.
+    #[must_use]
+    pub fn status_at(&self, at: SystemTime) -> &'static str {
+        match self.available_at {
+            Some(due) if at < due => IMAGE_STATUS_PENDING,
+            _ => IMAGE_STATUS_AVAILABLE,
+        }
+    }
+
+    /// This record as the modelled `ImageSummary` one listed page entry carries, read at
+    /// the instant `at`, which only its status depends on ([`Self::status_at`]).
+    #[must_use]
+    pub fn summary(&self, at: SystemTime) -> ImageSummary {
+        ImageSummary {
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            r#type: self.image_type.clone(),
+            version: Some(self.version.clone()),
+            platform: self.platform.clone(),
+            // "The operating system version for instances that launch from this image":
+            // nothing this store holds says which OS version a parent image carries (a
+            // recipe's `parentImage` is an AMI id, an ARN or a parameter name), so a build
+            // version reports none rather than naming one nothing observed.
+            os_version: None,
+            state: Some(ImageState {
+                status: Some(self.status_at(at).to_string()),
+                reason: None,
+                failure_context: None,
+            }),
+            owner: Some(::engine::EMULATOR_ACCOUNT_ID.to_string()),
+            date_created: Some(self.date_created.clone()),
+            // "The output resources that Image Builder produces for this image": this
+            // emulator runs no build instance and distributes nothing, so a build version
+            // reports no output AMI or container image rather than naming one that exists
+            // nowhere.
+            output_resources: None,
+            tags: self.tags.clone().map(into_tag_map),
+            build_type: self.build_type.clone(),
+            // "The origin of the base image that Image Builder used to build this image":
+            // a recipe's `parentImage` is caller-supplied text that nothing here can place
+            // in that enum, so none is reported.
+            image_source: None,
+            deprecation_time: None,
+            lifecycle_execution_id: None,
+            logging_configuration: None,
+        }
+    }
+
+    /// The value of the member `filter_name` filters on, or `None` when this record
+    /// reports none. See [`IMAGE_BUILD_VERSION_FILTER_NAMES`].
+    #[must_use]
+    pub fn filterable(&self, filter_name: &str) -> Option<&str> {
+        match filter_name {
+            "name" => Some(self.name.as_str()),
+            "version" => Some(self.version.as_str()),
+            "platform" => self.platform.as_deref(),
+            "type" => self.image_type.as_deref(),
+            // A build version reports no `osVersion` (see [`Self::summary`]), so a filter
+            // on it matches none.
+            _ => None,
+        }
+    }
+}
+
+/// One stored image pipeline: what a create wrote, which is what every later read reports
+/// \u2014 beside the two members a read derives from the runs the pipeline has started
+/// ([`ComAmazonawsImagebuilderImagebuilderState::image_pipeline_view`]).
+#[derive(Debug, Clone)]
+pub struct ImagePipelineRecord {
+    /// This pipeline's own ARN, which is also its key in the store.
+    pub arn: String,
+    /// The Region whose endpoint created it, and the only one that can reach it.
+    pub region: String,
+    /// The name as the caller submitted it; the ARN carries its [`normalized_name`].
+    pub name: String,
+    pub description: Option<String>,
+    /// The platform the pipeline builds for: "the platform of the image pipeline,
+    /// inherited from the recipe that the pipeline uses" (the modelled `platform`
+    /// member), read from that recipe when the pipeline was created.
+    pub platform: Option<String>,
+    pub enhanced_image_metadata_enabled: bool,
+    /// Exactly one of this and `container_recipe_arn` is held: "You must specify exactly
+    /// one recipe for the pipeline, using either a containerRecipeArn or an
+    /// imageRecipeArn" (`CreateImagePipeline`). The reference is stored as the create
+    /// submitted it, wildcard version nodes included, so each run resolves it afresh.
+    pub image_recipe_arn: Option<String>,
+    /// See [`Self::image_recipe_arn`].
+    pub container_recipe_arn: Option<String>,
+    pub infrastructure_configuration_arn: String,
+    pub distribution_configuration_arn: Option<String>,
+    /// The test settings the pipeline's builds apply, with the documented defaults
+    /// already filled in ([`DEFAULT_IMAGE_TESTS_ENABLED`],
+    /// [`DEFAULT_IMAGE_TESTS_TIMEOUT_MINUTES`]), since Image Builder "stores a default
+    /// configuration" rather than storing nothing.
+    pub image_tests_configuration: ImageTestsConfiguration,
+    pub schedule: Option<Schedule>,
+    pub status: String,
+    pub tags: Option<BTreeMap<String, String>>,
+    pub image_tags: Option<BTreeMap<String, String>>,
+    pub image_scanning_configuration: Option<ImageScanningConfiguration>,
+    pub execution_role: Option<String>,
+    pub workflows: Option<Vec<WorkflowConfiguration>>,
+    pub logging_configuration: Option<PipelineLoggingConfiguration>,
+    /// When the create stored it.
+    pub date_created: String,
+    /// When it was last written. A pipeline nothing has updated carries the instant it
+    /// was created.
+    pub date_updated: String,
 }
 
 /// What a successful create filed about the request it served, so a retry of that
@@ -593,6 +848,10 @@ pub enum TaggedResource {
     Component,
     /// An image recipe ([`IMAGE_RECIPE_ARN_PREFIX`]).
     ImageRecipe,
+    /// An image pipeline ([`IMAGE_PIPELINE_ARN_PREFIX`]).
+    ImagePipeline,
+    /// One image build version ([`IMAGE_ARN_PREFIX`]).
+    Image,
 }
 
 /// Per-service state for com-amazonaws-imagebuilder-imagebuilder. A handler reaches it through [`service_state`].
@@ -609,6 +868,9 @@ pub struct ComAmazonawsImagebuilderImagebuilderState {
     /// normalized name and its version, so one key says which name+version pair is
     /// taken where.
     pub image_recipes: BTreeMap<String, ImageRecipeRecord>,
+    /// Every stored image pipeline, keyed by its own ARN — which carries its Region and
+    /// its normalized name, so one key says which pipeline name is taken where.
+    pub image_pipelines: BTreeMap<String, ImagePipelineRecord>,
     /// Every stored image build version, keyed by its own build version ARN — which
     /// carries its Region, its normalized name, its version and its build number. The
     /// image-build path is what files one ([`Self::insert_image`]), together with the
@@ -969,6 +1231,178 @@ impl ComAmazonawsImagebuilderImagebuilderState {
         self.images.len() >= MAX_IMAGES
     }
 
+    /// The build number the NEXT build version of this image name+version pair carries.
+    ///
+    /// "Image Builder automatically assigns the build number to the fourth node"
+    /// (`semanticVersion`), so each new build of one name+version pair counts up from the
+    /// greatest build already stored, and the first starts at [`FIRST_BUILD_VERSION`].
+    #[must_use]
+    pub fn next_image_build_version(&self, region: &str, normalized: &str, version: &str) -> u64 {
+        self.images
+            .values()
+            .filter(|record| {
+                record.region == region
+                    && normalized_name(&record.name) == normalized
+                    && record.version == version
+            })
+            .map(|record| record.build_version)
+            .max()
+            .map_or(FIRST_BUILD_VERSION, |latest| latest.saturating_add(1))
+    }
+
+    /// The image pipeline `arn` names, but only when it belongs to `request_region`.
+    ///
+    /// A regional endpoint serves only its own Region's resources, so a pipeline of
+    /// another Region answers as if it did not exist.
+    #[must_use]
+    pub fn image_pipeline(&self, arn: &str, request_region: &str) -> Option<&ImagePipelineRecord> {
+        self.image_pipelines
+            .get(arn)
+            .filter(|record| record.region == request_region)
+    }
+
+    /// Store a newly created image pipeline together with the receipt for the request that
+    /// created it.
+    pub fn insert_image_pipeline(
+        &mut self,
+        record: ImagePipelineRecord,
+        client_token: &str,
+        fingerprint: String,
+        request_id: String,
+    ) {
+        self.file_create_receipt(
+            CREATE_IMAGE_PIPELINE_OPERATION,
+            &record.region,
+            client_token,
+            fingerprint,
+            request_id,
+            record.arn.clone(),
+        );
+        self.image_pipelines.insert(record.arn.clone(), record);
+    }
+
+    /// Whether the store is already holding as many image pipelines as this emulator will
+    /// keep ([`MAX_IMAGE_PIPELINES`]).
+    #[must_use]
+    pub fn image_pipeline_store_is_full(&self) -> bool {
+        self.image_pipelines.len() >= MAX_IMAGE_PIPELINES
+    }
+
+    /// The newest build version a run of the pipeline `arn` names created, if it has run.
+    ///
+    /// The newest is the one whose build was queued last, and the greatest build number
+    /// settles two runs queued in the same instant.
+    #[must_use]
+    pub fn latest_pipeline_run(&self, arn: &str) -> Option<&ImageBuildVersionRecord> {
+        self.images
+            .values()
+            .filter(|record| record.source_pipeline_arn.as_deref() == Some(arn))
+            .max_by_key(|record| (record.available_at, record.build_version))
+    }
+
+    /// The pipeline `arn` names as the modelled `ImagePipeline` a read reports at the
+    /// instant `at`, or `None` when `request_region` holds no pipeline under that ARN.
+    ///
+    /// Every member but two is what the create stored. The last run's date and status are
+    /// read from the runs the store holds ([`Self::latest_pipeline_run`]), so a pipeline
+    /// nothing has started reports neither, and the status it reports for the one it did
+    /// start moves with the clock rather than with what anything wrote.
+    #[must_use]
+    pub fn image_pipeline_view(
+        &self,
+        arn: &str,
+        request_region: &str,
+        at: SystemTime,
+    ) -> Option<ImagePipeline> {
+        let record = self.image_pipeline(arn, request_region)?;
+        let last_run = self.latest_pipeline_run(&record.arn);
+        Some(ImagePipeline {
+            arn: Some(record.arn.clone()),
+            name: Some(record.name.clone()),
+            description: record.description.clone(),
+            platform: record.platform.clone(),
+            enhanced_image_metadata_enabled: Some(record.enhanced_image_metadata_enabled),
+            image_recipe_arn: record.image_recipe_arn.clone(),
+            container_recipe_arn: record.container_recipe_arn.clone(),
+            infrastructure_configuration_arn: Some(record.infrastructure_configuration_arn.clone()),
+            distribution_configuration_arn: record.distribution_configuration_arn.clone(),
+            image_tests_configuration: Some(record.image_tests_configuration.clone()),
+            schedule: record.schedule.clone(),
+            status: Some(record.status.clone()),
+            date_created: Some(record.date_created.clone()),
+            date_updated: Some(record.date_updated.clone()),
+            date_last_run: last_run.map(|run| run.date_created.clone()),
+            last_run_status: last_run.map(|run| run.status_at(at).to_string()),
+            // "The next date when the pipeline is scheduled to run": nothing in this
+            // emulator runs a pipeline on its schedule, so no run is due at any date and
+            // a read reports none rather than naming a date nothing will act on.
+            date_next_run: None,
+            tags: record.tags.clone().map(into_tag_map),
+            image_scanning_configuration: record.image_scanning_configuration.clone(),
+            image_tags: record.image_tags.clone().map(into_tag_map),
+            execution_role: record.execution_role.clone(),
+            workflows: record.workflows.clone(),
+            logging_configuration: record.logging_configuration.clone(),
+            // "Image Builder tracks the number of consecutive failures for scheduled
+            // pipeline executions": no scheduled execution has run, so none has failed.
+            consecutive_failures: Some(0),
+        })
+    }
+
+    /// The image recipe the ARN `reference` names, when one is stored in `request_region`.
+    ///
+    /// `reference` may be a recipe ARN naming an exact version, or one whose trailing
+    /// version nodes are `x` wildcards \u2014 "Version ARNs resolve to the latest available
+    /// matching" record \u2014 so the greatest matching version is the one answered. That is
+    /// what lets a pipeline hold one reference and have each of its runs build the newest
+    /// recipe the reference reaches.
+    #[must_use]
+    pub fn resolve_image_recipe(
+        &self,
+        reference: &str,
+        request_region: &str,
+    ) -> Option<&ImageRecipeRecord> {
+        let reference = VersionedReference::parse(reference, IMAGE_RECIPE_ARN_PREFIX)?;
+        if reference.region != request_region || reference.build_version.is_some() {
+            return None;
+        }
+        self.image_recipes
+            .values()
+            .filter(|record| {
+                reference.name == normalized_name(&record.name)
+                    && version_admits(&reference.version, &record.version)
+            })
+            .max_by_key(|record| parse_semantic_version(&record.version).unwrap_or_default())
+    }
+
+    /// File the image build version one pipeline execution queued, together with the
+    /// receipt for the request that queued it.
+    ///
+    /// Answers `false` and files NOTHING when the build-version store is full, for the
+    /// reason [`Self::insert_image`] states \u2014 so the receipt is filed only for a run that
+    /// really was queued.
+    pub fn start_pipeline_run(
+        &mut self,
+        record: ImageBuildVersionRecord,
+        client_token: &str,
+        fingerprint: String,
+        request_id: String,
+    ) -> bool {
+        let (region, arn) = (record.region.clone(), record.arn.clone());
+        if !self.insert_image(record) {
+            return false;
+        }
+        self.file_create_receipt(
+            START_IMAGE_PIPELINE_EXECUTION_OPERATION,
+            &region,
+            client_token,
+            fingerprint,
+            request_id,
+            arn,
+        );
+        true
+    }
+
     /// Forget the image recipe `arn` names, when it belongs to `request_region`.
     pub fn remove_image_recipe(
         &mut self,
@@ -1024,6 +1458,12 @@ impl ComAmazonawsImagebuilderImagebuilderState {
         if self.image_recipe(arn, request_region).is_some() {
             return Some(TaggedResource::ImageRecipe);
         }
+        if self.image_pipeline(arn, request_region).is_some() {
+            return Some(TaggedResource::ImagePipeline);
+        }
+        if self.image(arn, request_region).is_some() {
+            return Some(TaggedResource::Image);
+        }
         None
     }
 
@@ -1054,6 +1494,13 @@ impl ComAmazonawsImagebuilderImagebuilderState {
                 .image_recipes
                 .get(arn)
                 .and_then(|record| record.tags.clone()),
+            TaggedResource::ImagePipeline => self
+                .image_pipelines
+                .get(arn)
+                .and_then(|record| record.tags.clone()),
+            TaggedResource::Image => {
+                self.images.get(arn).and_then(|record| record.tags.clone())
+            }
         };
         Some(stored.unwrap_or_default())
     }
@@ -1080,6 +1527,11 @@ impl ComAmazonawsImagebuilderImagebuilderState {
             TaggedResource::ImageRecipe => {
                 self.image_recipes.get_mut(arn).map(|record| &mut record.tags)
             }
+            TaggedResource::ImagePipeline => self
+                .image_pipelines
+                .get_mut(arn)
+                .map(|record| &mut record.tags),
+            TaggedResource::Image => self.images.get_mut(arn).map(|record| &mut record.tags),
         }
     }
 }
@@ -1178,6 +1630,16 @@ pub fn image_build_version_arn(
     )
 }
 
+/// The ARN of the image pipeline `name` names in `region`.
+#[must_use]
+pub fn image_pipeline_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{IMAGE_PIPELINE_ARN_PREFIX}{}", normalized_name(name)),
+    )
+}
+
 /// The three assigned nodes `version` carries, or `None` when it is not three integers
 /// within the documented upper limit.
 ///
@@ -1222,13 +1684,16 @@ impl VersionNode {
     }
 }
 
-/// What a component ARN names: everything the resolution rule compares a stored build
-/// version against.
+/// What a VERSIONED resource ARN names: everything a resolution rule compares a stored
+/// record against.
 ///
-/// The ONE reading of a component reference, so the read, a recipe's component list and
-/// the delete's dependency check agree on which build versions one ARN reaches.
+/// One reading for every versioned resource kind of this model, since each of their ARNs
+/// carries the same resource portion — `<kind>/<name>/<version>[/<build>]` — and the same
+/// wildcard rule: "Version ARNs resolve to the latest available matching component build
+/// version" (`GetComponent`'s `componentBuildVersionArn`), with a wildcard admitted only
+/// in a trailing position.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ComponentReference {
+pub struct VersionedReference {
     /// The Region field of the ARN.
     pub region: String,
     /// The normalized name the ARN carries.
@@ -1236,22 +1701,23 @@ pub struct ComponentReference {
     /// The three version nodes, each assigned or wildcard.
     pub version: [VersionNode; ASSIGNED_VERSION_NODES],
     /// The build number, when the ARN names one — a build version ARN does, a version
-    /// ARN does not.
+    /// ARN does not, and a resource kind that is not built at all never does.
     pub build_version: Option<u64>,
 }
 
-impl ComponentReference {
-    /// What `value` names, or `None` when it is not a component ARN of this service.
+impl VersionedReference {
+    /// What `value` names as a reference to a resource stored under `resource_prefix`, or
+    /// `None` when it is not an ARN of that kind of resource of this service.
     ///
     /// The ARN's six fields come from this tree's one ARN parse
     /// (`service_common::arn`); what is read here is only the resource portion
-    /// `component/<name>/<version>[/<build>]`. A wildcard is admitted only in a TRAILING
+    /// `<kind>/<name>/<version>[/<build>]`. A wildcard is admitted only in a TRAILING
     /// position, as `GetComponent`'s `componentBuildVersionArn` documents (`1.0.x`,
     /// `1.x.x`), so `x.0.0` names nothing.
     #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str, resource_prefix: &str) -> Option<Self> {
         let arn = ::service_common::arn::parse_of(value, ARN_SERVICE)?;
-        let resource = arn.resource.strip_prefix(COMPONENT_ARN_PREFIX)?;
+        let resource = arn.resource.strip_prefix(resource_prefix)?;
         let mut fields = resource.split('/');
         let name = fields.next()?;
         let version = fields.next()?;
@@ -1303,6 +1769,56 @@ impl ComponentReference {
             build_version,
         })
     }
+}
+
+/// Whether the three nodes a reference carries admit the `assigned` version of a stored
+/// record. A record whose stored version is not three assigned nodes is reached by no
+/// reference at all.
+#[must_use]
+fn version_admits(nodes: &[VersionNode; ASSIGNED_VERSION_NODES], assigned: &str) -> bool {
+    parse_semantic_version(assigned).is_some_and(|values| {
+        nodes
+            .iter()
+            .zip(values)
+            .all(|(node, value)| node.admits(value))
+    })
+}
+
+/// What a component ARN names: the [`VersionedReference`] reading of it, under the
+/// component resource prefix.
+///
+/// The ONE reading of a component reference, so the read, a recipe's component list and
+/// the delete's dependency check agree on which build versions one ARN reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentReference {
+    /// The Region field of the ARN.
+    pub region: String,
+    /// The normalized name the ARN carries.
+    pub name: String,
+    /// The three version nodes, each assigned or wildcard.
+    pub version: [VersionNode; ASSIGNED_VERSION_NODES],
+    /// The build number, when the ARN names one — a build version ARN does, a version
+    /// ARN does not.
+    pub build_version: Option<u64>,
+}
+
+impl From<VersionedReference> for ComponentReference {
+    fn from(named: VersionedReference) -> Self {
+        Self {
+            region: named.region,
+            name: named.name,
+            version: named.version,
+            build_version: named.build_version,
+        }
+    }
+}
+
+impl ComponentReference {
+    /// What `value` names, or `None` when it is not a component ARN of this service.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        VersionedReference::parse(value, COMPONENT_ARN_PREFIX).map(Self::from)
+    }
 
     /// Whether this reference reaches the stored build version `record`.
     #[must_use]
@@ -1316,13 +1832,7 @@ impl ComponentReference {
         {
             return false;
         }
-        let Some(assigned) = parse_semantic_version(&record.version) else {
-            return false;
-        };
-        self.version
-            .iter()
-            .zip(assigned)
-            .all(|(node, value)| node.admits(value))
+        version_admits(&self.version, &record.version)
     }
 }
 
@@ -1695,6 +2205,38 @@ pub fn image_recipe_query_fingerprint(owner: Option<&str>, filters: Option<&[Fil
     )
 }
 
+/// A deterministic rendering of which build versions one `ListImageBuildVersions`
+/// request asked for, so a token issued for one query is refused for another.
+///
+/// `maxResults` is deliberately NOT part of it, for the reason
+/// [`image_recipe_query_fingerprint`] states.
+#[must_use]
+pub fn image_build_version_query_fingerprint(
+    image_version_arn: Option<&str>,
+    filters: Option<&[Filter]>,
+) -> String {
+    let rendered_filters = filters.map_or_else(
+        || ABSENT.to_string(),
+        |filters| {
+            group(
+                &filters
+                    .iter()
+                    .map(|filter| {
+                        group(&[
+                            text(filter.name.as_deref()),
+                            list(filter.values.as_deref()),
+                        ])
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        },
+    );
+    format!(
+        "imageVersionArn={};filters={rendered_filters};",
+        text(image_version_arn)
+    )
+}
+
 /// A deterministic rendering of which packages one `ListImagePackages` request asked for,
 /// so a token issued for one image build version is refused for another.
 ///
@@ -2041,6 +2583,155 @@ pub fn image_recipe_request_fingerprint(input: &CreateImageRecipeInput) -> Strin
         .collect()
 }
 
+/// A deterministic rendering of the creation parameters one `CreateImagePipeline`
+/// request carries. See [`infrastructure_configuration_request_fingerprint`] for what it
+/// leaves out and why.
+#[must_use]
+pub fn image_pipeline_request_fingerprint(input: &CreateImagePipelineInput) -> String {
+    let mut fields: BTreeMap<&'static str, String> = BTreeMap::new();
+    fields.insert("name", text(Some(input.name.as_str())));
+    fields.insert("description", text(input.description.as_deref()));
+    fields.insert("imageRecipeArn", text(input.image_recipe_arn.as_deref()));
+    fields.insert(
+        "containerRecipeArn",
+        text(input.container_recipe_arn.as_deref()),
+    );
+    fields.insert(
+        "infrastructureConfigurationArn",
+        text(Some(input.infrastructure_configuration_arn.as_str())),
+    );
+    fields.insert(
+        "distributionConfigurationArn",
+        text(input.distribution_configuration_arn.as_deref()),
+    );
+    fields.insert("status", text(input.status.as_deref()));
+    fields.insert("executionRole", text(input.execution_role.as_deref()));
+    fields.insert(
+        "enhancedImageMetadataEnabled",
+        flag(input.enhanced_image_metadata_enabled),
+    );
+    fields.insert("tags", tag_map(input.tags.as_ref()));
+    fields.insert("imageTags", tag_map(input.image_tags.as_ref()));
+    fields.insert(
+        "imageTestsConfiguration",
+        input.image_tests_configuration.as_ref().map_or_else(
+            || ABSENT.to_string(),
+            |configuration| {
+                group(&[
+                    flag(configuration.image_tests_enabled),
+                    number(configuration.timeout_minutes),
+                ])
+            },
+        ),
+    );
+    fields.insert(
+        "imageScanningConfiguration",
+        input.image_scanning_configuration.as_ref().map_or_else(
+            || ABSENT.to_string(),
+            |configuration| {
+                group(&[
+                    flag(configuration.image_scanning_enabled),
+                    configuration.ecr_configuration.as_ref().map_or_else(
+                        || ABSENT.to_string(),
+                        |ecr| {
+                            group(&[
+                                text(ecr.repository_name.as_deref()),
+                                list(ecr.container_tags.as_deref()),
+                            ])
+                        },
+                    ),
+                ])
+            },
+        ),
+    );
+    fields.insert(
+        "schedule",
+        input.schedule.as_ref().map_or_else(
+            || ABSENT.to_string(),
+            |schedule| {
+                group(&[
+                    text(schedule.schedule_expression.as_deref()),
+                    text(schedule.timezone.as_deref()),
+                    text(schedule.pipeline_execution_start_condition.as_deref()),
+                    schedule.auto_disable_policy.as_ref().map_or_else(
+                        || ABSENT.to_string(),
+                        |policy| number(Some(policy.failure_count)),
+                    ),
+                ])
+            },
+        ),
+    );
+    fields.insert(
+        "loggingConfiguration",
+        input.logging_configuration.as_ref().map_or_else(
+            || ABSENT.to_string(),
+            |logging| {
+                group(&[
+                    text(logging.image_log_group_name.as_deref()),
+                    text(logging.pipeline_log_group_name.as_deref()),
+                ])
+            },
+        ),
+    );
+    fields.insert(
+        "workflows",
+        input.workflows.as_ref().map_or_else(
+            || ABSENT.to_string(),
+            |workflows| {
+                group(
+                    &workflows
+                        .iter()
+                        .map(|configuration| {
+                            group(&[
+                                text(Some(configuration.workflow_arn.as_str())),
+                                text(configuration.parallel_group.as_deref()),
+                                text(configuration.on_failure.as_deref()),
+                                configuration.parameters.as_ref().map_or_else(
+                                    || ABSENT.to_string(),
+                                    |parameters| {
+                                        group(
+                                            &parameters
+                                                .iter()
+                                                .map(|parameter| {
+                                                    group(&[
+                                                        text(Some(parameter.name.as_str())),
+                                                        list(Some(parameter.value.as_slice())),
+                                                    ])
+                                                })
+                                                .collect::<Vec<_>>(),
+                                        )
+                                    },
+                                ),
+                            ])
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            },
+        ),
+    );
+    fields
+        .iter()
+        .map(|(member, rendered)| format!("{member}={rendered};"))
+        .collect()
+}
+
+/// A deterministic rendering of the parameters one `StartImagePipelineExecution` request
+/// carries beside its `clientToken`: the pipeline it starts and the tags the image it
+/// creates is to carry. See [`infrastructure_configuration_request_fingerprint`].
+#[must_use]
+pub fn pipeline_execution_request_fingerprint(input: &StartImagePipelineExecutionInput) -> String {
+    let mut fields: BTreeMap<&'static str, String> = BTreeMap::new();
+    fields.insert(
+        "imagePipelineArn",
+        text(Some(input.image_pipeline_arn.as_str())),
+    );
+    fields.insert("tags", tag_map(input.tags.as_ref()));
+    fields
+        .iter()
+        .map(|(member, rendered)| format!("{member}={rendered};"))
+        .collect()
+}
+
 /// One string member, length-prefixed so no two different values render alike.
 fn text(value: Option<&str>) -> String {
     value.map_or_else(
@@ -2206,6 +2897,18 @@ pub fn image_recipe_store_full_message() -> String {
     format!("This account already holds the maximum of {MAX_IMAGE_RECIPES} image recipes.")
 }
 
+/// Why a create is refused once the image-pipeline store is full.
+#[must_use]
+pub fn image_pipeline_store_full_message() -> String {
+    format!("This account already holds the maximum of {MAX_IMAGE_PIPELINES} image pipelines.")
+}
+
+/// Why a build is refused once the image store is full.
+#[must_use]
+pub fn image_store_full_message() -> String {
+    format!("This account already holds the maximum of {MAX_IMAGES} image build versions.")
+}
+
 /// Why an operation could not reach this service's store at all.
 #[must_use]
 pub fn store_unavailable_message() -> String {
@@ -2311,6 +3014,34 @@ pub fn image_recipe_exists_message(name: &str, semantic_version: &str) -> String
         "An image recipe named {name} at version {semantic_version} already exists in this Amazon \
          Web Services Region."
     )
+}
+
+/// Why a create whose pipeline name is already taken in this Region is refused.
+///
+/// The rule is `CreateImagePipeline`'s `name` member: "Pipeline names must be unique to
+/// your account in each Amazon Web Services Region."
+#[must_use]
+pub fn image_pipeline_exists_message(name: &str) -> String {
+    format!("An image pipeline named {name} already exists in this Amazon Web Services Region.")
+}
+
+/// Why a `CreateImagePipeline` naming neither recipe, or both, is refused.
+///
+/// The rule is the operation's own: "You must specify exactly one recipe for the pipeline,
+/// using either a containerRecipeArn or an imageRecipeArn", which each of the two members
+/// repeats as "You must specify either this property or … but not both".
+#[must_use]
+pub fn pipeline_recipe_message() -> String {
+    "The request must specify exactly one of imageRecipeArn and containerRecipeArn.".to_string()
+}
+
+/// Why a create naming workflows but no execution role is refused.
+///
+/// The rule is the `workflows` member's own: "You must also specify executionRole when you
+/// provide workflows."
+#[must_use]
+pub fn workflows_without_execution_role_message() -> String {
+    "The request must specify an executionRole when it specifies workflows.".to_string()
 }
 
 /// Why a tagging call that would leave a resource holding more tags than one resource may
