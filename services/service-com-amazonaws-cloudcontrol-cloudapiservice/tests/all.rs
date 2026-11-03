@@ -17,6 +17,8 @@ mod audit_records;
 mod emulator;
 #[path = "all/primary_identifier.rs"]
 mod primary_identifier;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/resource_lifecycle.rs"]
 mod resource_lifecycle;
 #[path = "all/resource_listing.rs"]

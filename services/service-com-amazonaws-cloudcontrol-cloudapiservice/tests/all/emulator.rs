@@ -42,6 +42,10 @@ pub(crate) const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// "`SUCCESS`: The resource operation has successfully completed."
 pub(crate) const STATUS_SUCCESS: &str = "SUCCESS";
 
+/// "`FAILED`: The resource operation has failed. Refer to the error code and status
+/// message for more information."
+pub(crate) const STATUS_FAILED: &str = "FAILED";
+
 /// One emulator: a router with this service mounted over one shared engine.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
@@ -158,6 +162,19 @@ impl Emulator {
     /// Wait until the request `request_token` names has completed, answering the
     /// `ProgressEvent` it reports then.
     pub(crate) async fn settled(&self, request_token: &str) -> Value {
+        let event = self.terminal(request_token).await;
+        assert_eq!(
+            text(&event, "OperationStatus"),
+            STATUS_SUCCESS,
+            "request {request_token:?}: expected the operation to succeed, got {event:?}"
+        );
+        event
+    }
+
+    /// Wait until the request `request_token` names has reached a TERMINAL status,
+    /// answering the `ProgressEvent` it reports then — whichever status that is, so a
+    /// case can assert on a request the owning handler failed.
+    pub(crate) async fn terminal(&self, request_token: &str) -> Value {
         let started = Instant::now();
         loop {
             let (status, body) = self.status(request_token).await;
@@ -167,14 +184,14 @@ impl Emulator {
                  GetResourceRequestStatus, got {status} with body {body:?}"
             );
             let event = progress(&body);
-            if text(&event, "OperationStatus") == STATUS_SUCCESS {
+            let reached = text(&event, "OperationStatus");
+            if reached == STATUS_SUCCESS || reached == STATUS_FAILED {
                 return event;
             }
             assert!(
                 started.elapsed() < SETTLED_BUDGET,
-                "request {request_token:?}: expected the operation to complete within \
-                 {SETTLED_BUDGET:?}, it is still {:?}",
-                text(&event, "OperationStatus")
+                "request {request_token:?}: expected the operation to reach a terminal \
+                 status within {SETTLED_BUDGET:?}, it is still {reached:?}"
             );
             tokio::time::sleep(SETTLED_INTERVAL).await;
         }

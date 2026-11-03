@@ -250,10 +250,13 @@ fn judge_against_store(
                 ));
             }
         }
-        crate::state::ClientTokenVerdict::Conflict => {
+        crate::state::ClientTokenVerdict::Conflict(first_use) => {
             return Err(UpdateResourceErrorModeled::ClientTokenConflictException(
                 ClientTokenConflictException {
-                    message: Some(crate::state::CLIENT_TOKEN_CONFLICT_MESSAGE.to_string()),
+                    message: Some(crate::state::client_token_conflict_message(
+                        input.client_token.as_deref().unwrap_or_default(),
+                        &first_use,
+                    )),
                 },
             )
             .into());
@@ -264,18 +267,16 @@ fn judge_against_store(
     // A resource is acted on by one operation at a time: a patch applied to a model
     // another running operation is about to replace would be lost, so the second
     // operation is refused rather than racing it.
-    if store.operation_in_flight(&input.type_name, &input.identifier) {
-        return Err(UpdateResourceErrorModeled::ConcurrentOperationException(
-            ConcurrentOperationException {
-                message: Some(crate::state::CONCURRENT_OPERATION_MESSAGE.to_string()),
-            },
-        )
-        .into());
+    if let Some(holding) = store.in_flight_request(&input.type_name, &input.identifier) {
+        return Err(concurrent_operation(&input.identifier, Some(holding)));
     }
     let Some(stored) = store.resource(&input.type_name, &input.identifier) else {
+        // A not-found is the OWNING handler's verdict, so the refusal carries that
+        // handler's whole answer: its diagnostic, the handler error code it failed with
+        // and the token of the invocation that failed.
         return Err(UpdateResourceErrorModeled::ResourceNotFoundException(
             ResourceNotFoundException {
-                message: Some(crate::state::resource_not_found_message(
+                message: Some(crate::state::resource_not_found_refusal(
                     &input.type_name,
                     &input.identifier,
                 )),
@@ -287,6 +288,42 @@ fn judge_against_store(
         stored.properties.clone(),
         stored.identifier_property.clone(),
     ))
+}
+
+/// The refusal for an update that OVERLAPPED another operation on the same resource:
+/// either one is still running, or one has already moved the resource out from under the
+/// model this request was computed against.
+///
+/// Answers `None` when the store still holds exactly the model this request read, so
+/// nothing overlapped it and whatever else went wrong is the request's own fault. This
+/// is the one place that decides it, so a patch that could not be applied is never
+/// blamed on the document when the document was applied to a model another operation has
+/// since replaced or removed.
+fn overlapping_operation(
+    store: &crate::state::ComAmazonawsCloudcontrolCloudapiserviceState,
+    input: &UpdateResourceInput,
+    base: &::serde_json::Value,
+) -> Option<UpdateResourceError> {
+    let holding = store
+        .in_flight_request(&input.type_name, &input.identifier)
+        .map(str::to_string);
+    let moved = store
+        .resource(&input.type_name, &input.identifier)
+        .is_none_or(|stored| &stored.properties != base);
+    (holding.is_some() || moved)
+        .then(|| concurrent_operation(&input.identifier, holding.as_deref()))
+}
+
+/// The modelled refusal for a resource another operation is already acting on, naming
+/// the resource under contention and the request that holds it.
+fn concurrent_operation(identifier: &str, holding_request: Option<&str>) -> UpdateResourceError {
+    UpdateResourceErrorModeled::ConcurrentOperationException(ConcurrentOperationException {
+        message: Some(crate::state::concurrent_operation_message(
+            identifier,
+            holding_request,
+        )),
+    })
+    .into()
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
@@ -315,13 +352,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The registry is consulted at the front door: a `TypeName` it does not hold
+        // names no resource provider to run, so nothing about the request is resolved
+        // and no resource operation request is minted for it.
+        if !crate::state::type_is_registered(&input.type_name) {
+            return Err(crate::scaffolded::Scaffolded::type_not_found(
+                crate::state::type_not_found_message(&input.type_name),
+            ));
+        }
+
         // What the REQUEST ITSELF carries is judged before anything it names is
         // resolved: `PatchDocument` is "a JavaScript Object Notation (JSON) document
         // that describes a list of patch operations", so it is read by the RFC 6902
         // implementation and a document that is not one is a fault in the input
-        // whatever the identifier names.
+        // whatever the identifier names — refused by the front door, which is what
+        // judges the request itself, rather than reported as a handler verdict.
         let patch: ::json_patch::Patch = ::serde_json::from_str(&input.patch_document)
-            .map_err(|_| invalid_request("PatchDocument is not a valid JSON Patch document"))?;
+            .map_err(|_| {
+                validation(crate::state::invalid_patch_document_message(
+                    &crate::state::patch_document_read_failure(&input.patch_document),
+                ))
+            })?;
         let fingerprint = crate::state::request_fingerprint(&[
             Some(Self::NAME),
             Some(&input.type_name),
@@ -358,30 +409,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // The properties a patch may not change are the type's own: its registry
+        // schema's `createOnlyProperties`, and the primary identifier every operation
+        // addresses the resource by. A create-only property is refused because the
+        // DOCUMENT names it — that is a verdict on the patch against the type's schema,
+        // reached before the document is applied, so a document that names one is
+        // refused the same way whether or not its operation could have been applied to
+        // the current model.
+        let create_only =
+            crate::state::create_only_properties(&input.type_name, &identifier_property);
+        let touched = crate::state::patched_properties(&patch);
+        let offending: Vec<&str> = create_only
+            .iter()
+            .filter(|property| touched.contains(*property))
+            .map(String::as_str)
+            .collect();
+        if !offending.is_empty() {
+            return Err(not_updatable(&offending));
+        }
+
         // "You specify your resource property updates as a list of patch operations
         // contained in a JSON patch document": the patch is applied to a COPY of the
         // model the store holds, with the one rule that bounds the work it can drive
         // (`crate::state::apply_patch`), and what it produces is what the store holds
         // next. Nothing is stored unless the whole patch succeeded.
         let mut patched = base.clone();
-        crate::state::apply_patch(&mut patched, &patch)
-            .map_err(|refusal| invalid_request(refusal.detail()))?;
-        // A resource's primary identifier is what every operation addresses it by, so it
-        // is create-only for every resource type: a patch that would change or drop it
-        // is the modelled create-only refusal rather than a resource that answers to a
-        // different identifier than the one it is stored under.
+        if let Err(refusal) = crate::state::apply_patch(&mut patched, &patch) {
+            // A patch that could not be applied is only the DOCUMENT's fault while the
+            // model it was computed against is still the one the store holds: an
+            // operation that overlapped this one may have replaced or removed that
+            // model, which is contention rather than a bad request.
+            let mut store = state.lock();
+            store.materialise_due(::std::time::SystemTime::now());
+            if let Some(overlap) = overlapping_operation(&store, &input, &base) {
+                return Err(overlap);
+            }
+            drop(store);
+            return Err(if refusal.is_document_fault() {
+                validation(crate::state::invalid_patch_document_message(
+                    &refusal.detail(),
+                ))
+            } else {
+                invalid_request(refusal.detail())
+            });
+        }
+        // A patch that does not NAME the primary identifier can still change it — the
+        // whole model can be replaced at the empty pointer — so the invariant is checked
+        // on the model the patch left behind too: a resource never answers to an
+        // identifier other than the one it is stored under.
         if patched
             .get(&identifier_property)
             .and_then(crate::state::identifier_text)
             .as_deref()
             != Some(input.identifier.as_str())
         {
-            return Err(UpdateResourceErrorModeled::NotUpdatableException(
-                NotUpdatableException {
-                    message: Some(crate::state::not_updatable_message(&identifier_property)),
-                },
-            )
-            .into());
+            return Err(not_updatable(&[identifier_property.as_str()]));
         }
 
         // The request is recorded under a fresh lock and judged against the store once
@@ -405,14 +487,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             StoreVerdict::Update(properties, _) if properties != base => {
                 // The model the patch was computed against is no longer the model the
-                // store holds, so applying it would discard whatever changed it: the
-                // resource is not in a state this request can be acted on from.
-                return Err(UpdateResourceErrorModeled::ResourceConflictException(
-                    ResourceConflictException {
-                        message: Some(crate::state::RESOURCE_CONFLICT_MESSAGE.to_string()),
-                    },
-                )
-                .into());
+                // store holds, so applying it would discard whatever changed it: an
+                // operation overlapped this one, which is the contention refusal — the
+                // holding request has already terminated, so there is none to name.
+                return Err(concurrent_operation(&input.identifier, None));
             }
             StoreVerdict::Update(..) => {}
         }
@@ -465,6 +543,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The modelled refusal for a patch that would change a property the resource type's
+/// schema declares create-only, naming them as the schema's own pointers.
+fn not_updatable(properties: &[&str]) -> UpdateResourceError {
+    UpdateResourceErrorModeled::NotUpdatableException(NotUpdatableException {
+        message: Some(crate::state::not_updatable_message(properties)),
+    })
+    .into()
+}
+
 /// The modelled refusal this operation states a fault in the REQUEST with: "the resource
 /// handler has returned that invalid input from the user has generated a generic
 /// exception".
@@ -473,4 +560,17 @@ fn invalid_request(detail: impl AsRef<str>) -> UpdateResourceError {
         message: Some(crate::state::invalid_request_message(detail.as_ref())),
     })
     .into()
+}
+
+/// The refusal the FRONT DOOR states a fault in the request itself with, before any
+/// handler is asked: the input-validation failure Cloud Control API answers a request it
+/// will not pass on at all.
+///
+/// Distinct from [`invalid_request`] on purpose: `InvalidRequestException` is modelled as
+/// "the resource handler has returned that invalid input from the user has generated a
+/// generic exception", so it reports a HANDLER's verdict on the input, while this reports
+/// that the request never reached one. The service's model declares no shape for it, so
+/// it travels through the operation's error channel ([`crate::scaffolded`]).
+fn validation(detail: impl AsRef<str>) -> UpdateResourceError {
+    crate::scaffolded::Scaffolded::validation(detail.as_ref())
 }

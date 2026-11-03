@@ -217,6 +217,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A listing is a listing OF A TYPE, so the type is resolved first: a type the
+        // CloudFormation registry does not hold has no inventory to report, and
+        // answering it with an empty page would make a type name nothing publishes
+        // indistinguishable from an account that owns none of that type.
+        if !crate::state::type_is_registered(&input.type_name) {
+            return Err(crate::scaffolded::Scaffolded::type_not_found(
+                crate::state::type_not_found_message(&input.type_name),
+            ));
+        }
+
         // "The resource model to use to select the resources to return": a partial
         // model, so the listing reports the resources whose own model carries every
         // property it names with the same value. Judged on the REQUEST alone, before

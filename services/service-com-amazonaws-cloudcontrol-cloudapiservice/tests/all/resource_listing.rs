@@ -8,10 +8,10 @@ use serde_json::{json, Value};
 use super::emulator::{code, descriptions, message, text, Emulator};
 
 /// The type whose listing the suite pages over.
-const WIDGET: &str = "AWS::Custom::Widget";
+const STREAM: &str = "AWS::Kinesis::Stream";
 
 /// A second type, whose resources must never appear in the first type's listing.
-const GADGET: &str = "AWS::Custom::Gadget";
+const RULE: &str = "AWS::Events::Rule";
 
 /// Create every named resource of `type_name` and wait until all of them are
 /// provisioned. The creates are independent, so one span covers them all.
@@ -34,8 +34,8 @@ async fn a_listing_pages_in_identifier_order_and_resumes_where_it_stopped() {
     // Created in an order that is not identifier order, so an ordered listing cannot be
     // insertion order by accident.
     let names = ["echo", "alpha", "delta", "bravo", "charlie"];
-    provision_all(&emulator, WIDGET, "WidgetName", &names).await;
-    provision_all(&emulator, GADGET, "GadgetName", &["alpha", "zulu"]).await;
+    provision_all(&emulator, STREAM, "StreamName", &names).await;
+    provision_all(&emulator, RULE, "RuleName", &["alpha", "zulu"]).await;
 
     let mut expected: Vec<String> = names.iter().map(|name| name.to_string()).collect();
     expected.sort();
@@ -44,7 +44,7 @@ async fn a_listing_pages_in_identifier_order_and_resumes_where_it_stopped() {
     // one that does not, exactly the set, the modelled maximum, and no `MaxResults` at
     // all.
     for page_size in [Some(1), Some(2), Some(3), Some(5), Some(100), None] {
-        let walked = emulator.walk(WIDGET, page_size).await;
+        let walked = emulator.walk(STREAM, page_size).await;
         assert_eq!(
             walked, expected,
             "page size {page_size:?}: expected {expected:?}, got {walked:?}"
@@ -52,7 +52,7 @@ async fn a_listing_pages_in_identifier_order_and_resumes_where_it_stopped() {
     }
 
     // A page that is not the last one carries a token; the last one does not.
-    let first = emulator.list(WIDGET, Some(2), None).await;
+    let first = emulator.list(STREAM, Some(2), None).await;
     assert_eq!(
         descriptions(&first).len(),
         2,
@@ -64,17 +64,17 @@ async fn a_listing_pages_in_identifier_order_and_resumes_where_it_stopped() {
     );
     assert_eq!(
         text(&first, "TypeName"),
-        WIDGET,
+        STREAM,
         "the listing must report the type it is of, got {first:?}"
     );
-    let whole = emulator.list(WIDGET, Some(100), None).await;
+    let whole = emulator.list(STREAM, Some(100), None).await;
     assert!(
         whole["NextToken"].is_null(),
         "the last page must carry no NextToken, got {whole:?}"
     );
 
     // And the other type's listing is its own.
-    let other = emulator.walk(GADGET, Some(1)).await;
+    let other = emulator.walk(RULE, Some(1)).await;
     assert_eq!(
         other,
         vec!["alpha".to_string(), "zulu".to_string()],
@@ -87,20 +87,14 @@ async fn a_continuation_token_resumes_only_the_listing_that_minted_it() {
     let emulator = Emulator::new();
     provision_all(
         &emulator,
-        WIDGET,
-        "WidgetName",
+        STREAM,
+        "StreamName",
         &["alpha", "bravo", "charlie"],
     )
     .await;
-    provision_all(
-        &emulator,
-        GADGET,
-        "GadgetName",
-        &["alpha", "bravo", "charlie"],
-    )
-    .await;
+    provision_all(&emulator, RULE, "RuleName", &["alpha", "bravo", "charlie"]).await;
 
-    let first = emulator.list(WIDGET, Some(1), None).await;
+    let first = emulator.list(STREAM, Some(1), None).await;
     let token = first["NextToken"].as_str().unwrap_or_default().to_string();
     assert!(
         !token.is_empty(),
@@ -108,7 +102,7 @@ async fn a_continuation_token_resumes_only_the_listing_that_minted_it() {
     );
 
     // It resumes THIS listing, after the resource the page stopped at.
-    let resumed = emulator.list(WIDGET, Some(1), Some(&token)).await;
+    let resumed = emulator.list(STREAM, Some(1), Some(&token)).await;
     let identifiers: Vec<String> = descriptions(&resumed)
         .iter()
         .map(|description| text(description, "Identifier"))
@@ -124,7 +118,7 @@ async fn a_continuation_token_resumes_only_the_listing_that_minted_it() {
     let (status, body) = emulator
         .cc(
             "ListResources",
-            Emulator::list_request(GADGET, Some(1), Some(&token), None),
+            Emulator::list_request(RULE, Some(1), Some(&token), None),
         )
         .await;
     assert_eq!(
@@ -157,7 +151,7 @@ async fn a_continuation_token_resumes_only_the_listing_that_minted_it() {
         let (status, body) = emulator
             .cc(
                 "ListResources",
-                Emulator::list_request(WIDGET, Some(1), Some(&candidate), None),
+                Emulator::list_request(STREAM, Some(1), Some(&candidate), None),
             )
             .await;
         assert_eq!(
@@ -176,13 +170,13 @@ async fn a_continuation_token_resumes_only_the_listing_that_minted_it() {
 async fn a_listing_narrowed_by_a_resource_model_reports_the_resources_that_match_it() {
     let emulator = Emulator::new();
     let models = [
-        json!({ "WidgetName": "alpha", "Stage": "prod", "Size": 1 }),
-        json!({ "WidgetName": "bravo", "Stage": "prod", "Size": 2 }),
-        json!({ "WidgetName": "charlie", "Stage": "test", "Size": 1 }),
+        json!({ "StreamName": "alpha", "Stage": "prod", "Size": 1 }),
+        json!({ "StreamName": "bravo", "Stage": "prod", "Size": 2 }),
+        json!({ "StreamName": "charlie", "Stage": "test", "Size": 1 }),
     ];
     let mut accepted = Vec::new();
     for model in &models {
-        let event = emulator.create_ok(WIDGET, model, None).await;
+        let event = emulator.create_ok(STREAM, model, None).await;
         accepted.push(text(&event, "RequestToken"));
     }
     for request_token in &accepted {
@@ -222,7 +216,7 @@ async fn a_listing_narrowed_by_a_resource_model_reports_the_resources_that_match
         let listed = emulator
             .cc_ok(
                 "ListResources",
-                Emulator::list_request(WIDGET, Some(100), None, Some(&selector)),
+                Emulator::list_request(STREAM, Some(100), None, Some(&selector)),
             )
             .await;
         let identifiers: Vec<String> = descriptions(&listed)
@@ -245,7 +239,7 @@ async fn a_listing_narrowed_by_a_resource_model_reports_the_resources_that_match
         let (status, body) = emulator
             .cc(
                 "ListResources",
-                json!({ "TypeName": WIDGET, "ResourceModel": selector }),
+                json!({ "TypeName": STREAM, "ResourceModel": selector }),
             )
             .await;
         assert_eq!(

@@ -53,7 +53,7 @@ async fn the_primary_identifier_is_the_value_of_the_types_own_identifier_propert
         },
         Case {
             name: "the type's own name property, spelled in lower case",
-            type_name: "AWS::Custom::Thing",
+            type_name: "AWS::IoT::Thing",
             desired: json!({ "thingname": "thing-1" }),
             expected: Some("thing-1"),
         },
@@ -74,15 +74,15 @@ async fn the_primary_identifier_is_the_value_of_the_types_own_identifier_propert
         },
         Case {
             name: "the bare Id fallback",
-            type_name: "AWS::Custom::Widget",
-            desired: json!({ "Id": "widget-7", "Colour": "blue" }),
-            expected: Some("widget-7"),
+            type_name: "AWS::EC2::Instance",
+            desired: json!({ "Id": "i-0a1b2c3d", "InstanceType": "t3.micro" }),
+            expected: Some("i-0a1b2c3d"),
         },
         Case {
             name: "the bare Arn fallback",
-            type_name: "AWS::Custom::Gadget",
-            desired: json!({ "Arn": "arn:aws:custom:us-east-1:123456789012:gadget/g1" }),
-            expected: Some("arn:aws:custom:us-east-1:123456789012:gadget/g1"),
+            type_name: "AWS::Events::Rule",
+            desired: json!({ "Arn": "arn:aws:events:us-east-1:123456789012:rule/g1" }),
+            expected: Some("arn:aws:events:us-east-1:123456789012:rule/g1"),
         },
         Case {
             name: "the most specific property wins over the fallbacks",
@@ -92,8 +92,8 @@ async fn the_primary_identifier_is_the_value_of_the_types_own_identifier_propert
         },
         Case {
             name: "a numeric identifier",
-            type_name: "AWS::Custom::Shard",
-            desired: json!({ "ShardId": 42, "Partition": "a" }),
+            type_name: "AWS::DynamoDB::Table",
+            desired: json!({ "TableId": 42, "Partition": "a" }),
             expected: Some("42"),
         },
         Case {
@@ -224,7 +224,7 @@ async fn the_same_identifier_under_two_types_is_two_resources() {
 #[tokio::test]
 async fn an_identifier_is_accepted_at_the_modelled_bound_and_refused_past_it() {
     let emulator = Emulator::new();
-    const WIDGET: &str = "AWS::Custom::Widget";
+    const STREAM: &str = "AWS::Kinesis::Stream";
 
     // The model gives `Identifier` a length of 1..1024, so both published bounds are
     // exercised, and then one character past the maximum. The creates are independent,
@@ -233,7 +233,7 @@ async fn an_identifier_is_accepted_at_the_modelled_bound_and_refused_past_it() {
     let mut accepted = Vec::new();
     for length in lengths {
         let event = emulator
-            .create_ok(WIDGET, &json!({ "WidgetName": "b".repeat(length) }), None)
+            .create_ok(STREAM, &json!({ "StreamName": "b".repeat(length) }), None)
             .await;
         accepted.push(text(&event, "RequestToken"));
     }
@@ -246,9 +246,9 @@ async fn an_identifier_is_accepted_at_the_modelled_bound_and_refused_past_it() {
             "length {length}: expected the identifier the desired state names, got \
              {identifier:?}"
         );
-        let stored = emulator.properties(WIDGET, &identifier).await;
+        let stored = emulator.properties(STREAM, &identifier).await;
         assert_eq!(
-            stored.get("WidgetName"),
+            stored.get("StreamName"),
             Some(&json!(name)),
             "length {length}: the resource must read back under that identifier, got {stored:?}"
         );
@@ -256,7 +256,7 @@ async fn an_identifier_is_accepted_at_the_modelled_bound_and_refused_past_it() {
 
     let too_long = "b".repeat(1025);
     let (status, body) = emulator
-        .create(WIDGET, &json!({ "WidgetName": too_long }), None)
+        .create(STREAM, &json!({ "StreamName": too_long }), None)
         .await;
     assert_eq!(
         status, 400,
@@ -269,7 +269,7 @@ async fn an_identifier_is_accepted_at_the_modelled_bound_and_refused_past_it() {
     );
     assert_eq!(
         message(&body),
-        "Invalid request provided: WidgetName must be a non-empty scalar of at most 1024 \
+        "Invalid request provided: StreamName must be a non-empty scalar of at most 1024 \
          characters to identify the resource",
         "one character past the maximum: unexpected wording"
     );

@@ -41,9 +41,63 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code Cloud Control API answers an input-constraint violation with, which is
+/// also the code the framework's own refusal carries — restated here because
+/// `override_refusal` replaces the code and the message together.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// Render one constraint violation the way this service's front door states it.
+///
+/// Everything but the `@pattern` clause is the framework's own wording, which is why
+/// this reads it from the violation rather than restating it: only the expression a
+/// pattern-constrained member has to satisfy differs, and it is stated WITHOUT the
+/// anchors a model writes around it to demand a whole-string match.
+///
+/// Answers `None` for a violation this service has no wording of its own for, which lets
+/// [`constraint_envelope`] decline the whole refusal and keep the framework's wording
+/// rather than invent one ([`ViolationKind`] is `#[non_exhaustive]`, so a class can be
+/// added upstream).
+fn constraint_clause(violation: &Violation) -> Option<String> {
+    let clause = violation.message();
+    let ViolationKind::Pattern(pattern) = &violation.kind else {
+        return Some(clause);
+    };
+    let stated = ::service_common::validation::unanchored(pattern);
+    // The clause the framework built for this violation, with the expression it quoted
+    // replaced by the one this service states: the subject half (which value is echoed,
+    // and whether it was absent) stays exactly as the walk reported it. The requirement
+    // is the clause's last part, so the LAST occurrence is the one to replace — a caller
+    // who submits the expression itself as a value keeps that echo intact.
+    match clause.rfind(pattern.as_str()) {
+        Some(at) => Some(format!(
+            "{}{stated}{}",
+            &clause[..at],
+            &clause[at + pattern.len()..]
+        )),
+        None => Some(clause),
+    }
+}
+
+/// The `ValidationException` message for a refusal: the AWS envelope over one clause per
+/// violation.
+fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(constraint_clause)
+        .collect::<Option<Vec<_>>>()?;
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        count => Some(format!(
+            "{count} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
 
 /// The `com-amazonaws-cloudcontrol-cloudapiservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -97,16 +151,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // One part of the wording is this service's rather than the framework's: a
+        // `@pattern` is stated as the expression the value has to satisfy, without the
+        // `^` / `$` the model writes around it to make the match total — a client lifts
+        // that expression out of the message to re-validate locally, so it has to be the
+        // one the service advertises. The code stays the `ValidationException` the
+        // framework itself would have answered, because `override_refusal` replaces both.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: constraint_envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

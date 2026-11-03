@@ -10,8 +10,10 @@
 use serde_json::{json, Value};
 
 use super::emulator::{
-    code, descriptions, message, progress, text, Emulator, STATUS_IN_PROGRESS, STATUS_SUCCESS,
+    code, descriptions, message, progress, text, Emulator, STATUS_FAILED, STATUS_IN_PROGRESS,
+    STATUS_SUCCESS,
 };
+use super::refusal_wording::assert_handler_not_found;
 
 /// A resource type whose primary identifier the caller supplies.
 const BUCKET: &str = "AWS::S3::Bucket";
@@ -20,7 +22,7 @@ const BUCKET: &str = "AWS::S3::Bucket";
 const LOG_GROUP: &str = "AWS::Logs::LogGroup";
 
 /// A type whose model a case grows with a patch, kept apart from the lifecycle rows.
-const WIDGET: &str = "AWS::Custom::Widget";
+const STREAM: &str = "AWS::Kinesis::Stream";
 
 /// A patch that changes nothing a case cares about, for the rows that are about
 /// something other than the patch.
@@ -103,23 +105,37 @@ async fn the_six_operations_run_end_to_end() {
         "GetResource must report the stored resource model, expected {desired:?}, got {stored:?}"
     );
 
-    // A second create of the same resource under a NEW client token is the conflict.
+    // A second create of the same resource is the OWNING handler's verdict: the request
+    // is accepted and then fails with that handler's error code and its own wording.
     let (status, body) = emulator
         .create(BUCKET, &desired, Some("tok-create-again"))
         .await;
     assert_eq!(
-        status, 400,
-        "a second create of the same resource: expected HTTP 400, got {status} with body {body:?}"
+        status, 200,
+        "a second create of the same resource: expected HTTP 200, got {status} with body {body:?}"
     );
-    assert!(
-        code(&body).contains("AlreadyExistsException"),
-        "a second create of the same resource: expected AlreadyExistsException, got {:?}",
-        code(&body)
+    let duplicate = emulator
+        .terminal(&text(&progress(&body), "RequestToken"))
+        .await;
+    assert_eq!(
+        text(&duplicate, "OperationStatus"),
+        STATUS_FAILED,
+        "a second create of the same resource must fail, got {duplicate:?}"
     );
     assert_eq!(
-        message(&body),
+        text(&duplicate, "ErrorCode"),
+        "AlreadyExists",
+        "a second create of the same resource: unexpected handler error code"
+    );
+    assert_eq!(
+        text(&duplicate, "StatusMessage"),
         "Resource of type 'AWS::S3::Bucket' with identifier 'demo-bucket' already exists.",
         "a second create of the same resource: unexpected wording"
+    );
+    let stored = emulator.properties(BUCKET, "demo-bucket").await;
+    assert_eq!(
+        stored, desired,
+        "the failed create must leave the resource as it was, got {stored:?}"
     );
 
     // UpdateResource applies the patch to the stored model, and a later read shows it.
@@ -186,10 +202,11 @@ async fn the_six_operations_run_end_to_end() {
         "GetResource after the delete: expected ResourceNotFoundException, got {:?}",
         code(&body)
     );
-    assert_eq!(
-        message(&body),
-        "Resource of type 'AWS::S3::Bucket' with identifier 'demo-bucket' was not found.",
-        "GetResource after the delete: unexpected wording"
+    assert_handler_not_found(
+        &message(&body),
+        BUCKET,
+        &format!("Resource of type '{BUCKET}' with identifier 'demo-bucket' was not found."),
+        "GetResource after the delete",
     );
     let walked = emulator.walk(BUCKET, None).await;
     assert!(
@@ -266,7 +283,10 @@ async fn a_resource_operation_is_in_progress_before_it_completes() {
         );
         assert_eq!(
             message(&body),
-            "Another resource operation is currently being performed on this resource.",
+            format!(
+                "Concurrent operation found for resource app-logs with RequestToken \
+                 {request_token}"
+            ),
             "case {case:?}: unexpected wording"
         );
     }
@@ -347,7 +367,10 @@ async fn a_client_token_replays_its_request_and_refuses_a_different_one() {
         );
         assert_eq!(
             message(&body),
-            "The specified client token has already been used in another resource request.",
+            format!(
+                "ClientToken tok-1 is already associated with an existing operation with \
+                 RequestToken {request_token}"
+            ),
             "case {case:?}: unexpected wording"
         );
     }
@@ -445,14 +468,18 @@ async fn unknown_identifiers_and_tokens_are_the_modelled_refusals() {
             "case {case:?}: expected ResourceNotFoundException, got {:?}",
             code(&body)
         );
-        assert_eq!(
-            message(&body),
-            "Resource of type 'AWS::S3::Bucket' with identifier 'absent-bucket' was not found.",
-            "case {case:?}: unexpected wording"
+        assert_handler_not_found(
+            &message(&body),
+            BUCKET,
+            &format!(
+                "Resource of type '{BUCKET}' with identifier 'absent-bucket' was not found."
+            ),
+            case,
         );
     }
 
-    // A request token this service never minted names no request at all.
+    // A request token this service never minted names no request at all, and the refusal
+    // names the token it was handed.
     for token in ["bogus", "00000000-0000-0000-0000-000000000000", "AAAA="] {
         let (status, body) = emulator.status(token).await;
         assert_eq!(
@@ -466,7 +493,7 @@ async fn unknown_identifiers_and_tokens_are_the_modelled_refusals() {
         );
         assert_eq!(
             message(&body),
-            "A resource operation with the specified request token can't be found.",
+            format!("Request with token {token} was not found"),
             "token {token:?}: unexpected wording"
         );
     }
@@ -652,46 +679,70 @@ async fn an_update_applies_the_patch_and_refuses_one_that_cannot_be() {
         );
     }
 
-    // The rows a patch is refused on, each leaving the stored model untouched.
+    // The rows a patch is refused on, each leaving the stored model untouched. The code
+    // is part of the row: a document the FRONT DOOR will not read, or one naming a path
+    // the resource model does not have, never reaches a handler, while a verdict on the
+    // model the handler would have been asked to store is the handler's own.
     let before = emulator.properties(BUCKET, &identifier).await;
-    let refusals: [(&str, &str, &str); 7] = [
+    let refusals: [(&str, &str, &str, String); 7] = [
         (
             "a patch document that is not JSON",
             "not json",
-            "PatchDocument is not a valid JSON Patch document",
+            "ValidationException",
+            "Invalid PatchDocument: A JSONArray text must start with '[' at 1 \
+             [character 2 line 1]"
+                .to_string(),
         ),
         (
             "a patch document that is not a list of operations",
             "{\"op\":\"add\",\"path\":\"/A\",\"value\":1}",
-            "PatchDocument is not a valid JSON Patch document",
+            "ValidationException",
+            "Invalid PatchDocument: A JSONArray text must start with '[' at 1 \
+             [character 2 line 1]"
+                .to_string(),
         ),
         (
             "a patch operation RFC 6902 does not define",
             "[{\"op\":\"frobnicate\",\"path\":\"/A\"}]",
-            "PatchDocument is not a valid JSON Patch document",
+            "ValidationException",
+            "Invalid PatchDocument: the document carries an operation that is not a JSON \
+             Patch operation"
+                .to_string(),
         ),
         (
             "a replace of a path the model does not carry",
             "[{\"op\":\"replace\",\"path\":\"/Missing/Deeper\",\"value\":1}]",
-            "the patch document could not be applied to the resource model",
+            "ValidationException",
+            "Invalid PatchDocument: the replace operation at path '/Missing/Deeper' could \
+             not be applied to the resource model"
+                .to_string(),
         ),
         (
             "a remove of a path the model does not carry",
             "[{\"op\":\"remove\",\"path\":\"/Missing\"}]",
-            "the patch document could not be applied to the resource model",
+            "ValidationException",
+            "Invalid PatchDocument: the remove operation at path '/Missing' could not be \
+             applied to the resource model"
+                .to_string(),
         ),
         (
             "a test operation that does not hold",
             "[{\"op\":\"test\",\"path\":\"/BucketName\",\"value\":\"other\"}]",
-            "the patch document could not be applied to the resource model",
+            "ValidationException",
+            "Invalid PatchDocument: the test operation at path '/BucketName' could not be \
+             applied to the resource model"
+                .to_string(),
         ),
         (
             "a patch that would leave something other than a resource model",
             "[{\"op\":\"replace\",\"path\":\"\",\"value\":[]}]",
-            "the patch document would leave a resource model that is not a JSON object",
+            "InvalidRequestException",
+            "Invalid request provided: the patch document would leave a resource model that \
+             is not a JSON object"
+                .to_string(),
         ),
     ];
-    for (case, patch_document, detail) in refusals {
+    for (case, patch_document, expected_code, expected_message) in refusals {
         let (status, body) = emulator
             .cc(
                 "UpdateResource",
@@ -707,13 +758,13 @@ async fn an_update_applies_the_patch_and_refuses_one_that_cannot_be() {
             "case {case:?}: expected HTTP 400, got {status} with body {body:?}"
         );
         assert!(
-            code(&body).contains("InvalidRequestException"),
-            "case {case:?}: expected InvalidRequestException, got {:?}",
+            code(&body).contains(expected_code),
+            "case {case:?}: expected {expected_code}, got {:?}",
             code(&body)
         );
         assert_eq!(
             message(&body),
-            format!("Invalid request provided: {detail}"),
+            expected_message,
             "case {case:?}: unexpected wording"
         );
         let after = emulator.properties(BUCKET, &identifier).await;
@@ -731,8 +782,8 @@ async fn a_patch_cannot_grow_the_resource_model_without_bound() {
     // A model with a few kilobytes in it, so a patch that duplicates it crosses the
     // modelled `Properties` maximum in a handful of operations.
     let blob = "x".repeat(4096);
-    let desired = json!({ "WidgetName": "amplified", "Blob": blob });
-    let identifier = emulator.provision(WIDGET, &desired).await;
+    let desired = json!({ "StreamName": "amplified", "Blob": blob });
+    let identifier = emulator.provision(STREAM, &desired).await;
 
     // The rows differ along how the patch tries to drive work out of proportion to its
     // own size: duplicating the whole model repeatedly (each `copy` of the root roughly
@@ -776,7 +827,7 @@ async fn a_patch_cannot_grow_the_resource_model_without_bound() {
         ),
     ];
     for (case, patch, detail) in rows {
-        let (status, body) = emulator.update(WIDGET, &identifier, &patch, None).await;
+        let (status, body) = emulator.update(STREAM, &identifier, &patch, None).await;
         assert_eq!(
             status, 400,
             "case {case:?}: expected HTTP 400, got {status} with body {body:?}"
@@ -791,7 +842,7 @@ async fn a_patch_cannot_grow_the_resource_model_without_bound() {
             format!("Invalid request provided: {detail}"),
             "case {case:?}: unexpected wording"
         );
-        let stored = emulator.properties(WIDGET, &identifier).await;
+        let stored = emulator.properties(STREAM, &identifier).await;
         assert_eq!(
             stored, desired,
             "case {case:?}: a refused update must change nothing"
@@ -803,9 +854,9 @@ async fn a_patch_cannot_grow_the_resource_model_without_bound() {
         .map(|step| json!({ "op": "add", "path": format!("/At{step}"), "value": step }))
         .collect();
     emulator
-        .update_and_settle(WIDGET, &identifier, &Value::Array(at_the_bound))
+        .update_and_settle(STREAM, &identifier, &Value::Array(at_the_bound))
         .await;
-    let stored = emulator.properties(WIDGET, &identifier).await;
+    let stored = emulator.properties(STREAM, &identifier).await;
     assert_eq!(
         stored.get("At99"),
         Some(&json!(99)),
@@ -849,7 +900,8 @@ async fn a_patch_cannot_change_the_primary_identifier() {
         );
         assert_eq!(
             message(&body),
-            "Cannot update create-only property 'BucketName'.",
+            "Invalid patch update: createOnlyProperties [/properties/BucketName] cannot be \
+             updated",
             "case {case:?}: unexpected wording"
         );
         let stored = emulator.properties(BUCKET, &identifier).await;

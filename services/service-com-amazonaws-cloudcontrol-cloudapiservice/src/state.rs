@@ -21,7 +21,7 @@
 //! first, so no two operations can disagree about which requests have completed or which
 //! resources exist.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
@@ -272,8 +272,9 @@ pub enum ClientTokenVerdict {
     /// This token already carried THIS request: the named request is replayed rather
     /// than a second one started.
     Replay(String),
-    /// This token already carried a DIFFERENT request.
-    Conflict,
+    /// This token already carried a DIFFERENT request: the named request is the one it
+    /// was first used for, which is what the conflict reports back.
+    Conflict(String),
 }
 
 /// Why a request could not be recorded.
@@ -289,25 +290,29 @@ pub struct RequestStoreFull;
 enum EffectFailure {
     /// The resource the request was accepted against is no longer in the store.
     ResourceGone,
+    /// The resource a create was to provision is already in the store.
+    ResourceExists,
 }
 
 impl EffectFailure {
-    /// The `HandlerErrorCode` the record reports (`ProgressEvent$ErrorCode`): `NotFound`
-    /// is the handler error code for a resource that could not be found, which is what a
-    /// request accepted against a resource since removed finds.
+    /// The `HandlerErrorCode` the record reports (`ProgressEvent$ErrorCode`), which is
+    /// the owning resource type's handler verdict: a resource the handler could not find
+    /// is `NotFound`, and one that is already there is `AlreadyExists`.
     fn error_code(&self) -> &'static str {
         match self {
-            Self::ResourceGone => "NotFound",
+            Self::ResourceGone => HANDLER_ERROR_NOT_FOUND,
+            Self::ResourceExists => HANDLER_ERROR_ALREADY_EXISTS,
         }
     }
 
-    /// The `StatusMessage` the record reports, naming the resource the work was owed on.
+    /// The `StatusMessage` the record reports: the owning handler's own diagnostic for
+    /// the resource the work was owed on. The handler error code is reported beside it in
+    /// `ProgressEvent$ErrorCode`, so the message carries the detail alone.
     fn status_message(&self, record: &RequestRecord) -> String {
+        let identifier = record.identifier.as_deref().unwrap_or_default();
         match self {
-            Self::ResourceGone => resource_not_found_message(
-                &record.type_name,
-                record.identifier.as_deref().unwrap_or_default(),
-            ),
+            Self::ResourceGone => handler_not_found_detail(&record.type_name, identifier),
+            Self::ResourceExists => handler_already_exists_detail(&record.type_name, identifier),
         }
     }
 }
@@ -422,6 +427,13 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
                 identifier_property,
                 type_version_id,
             } => {
+                // The create was accepted against a store that held no such resource;
+                // if one is there now, the owning handler is the one that finds it, so
+                // the request FAILS with that handler's verdict rather than overwriting
+                // a resource this request never named.
+                if self.resources.contains_key(&key) {
+                    return Err(EffectFailure::ResourceExists);
+                }
                 let model = rendered_properties(&properties);
                 self.resources.insert(
                     key,
@@ -494,15 +506,19 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
         self.resources.len()
     }
 
-    /// Whether a resource operation is still running against `identifier` of
-    /// `type_name`, which is what makes a second operation on the same resource the
-    /// modelled concurrent-operation refusal.
-    pub fn operation_in_flight(&self, type_name: &str, identifier: &str) -> bool {
-        self.requests.values().any(|record| {
-            record.is_pending()
-                && record.type_name == type_name
-                && record.identifier.as_deref() == Some(identifier)
-        })
+    /// The request still running against `identifier` of `type_name`, which is what
+    /// makes a second operation on the same resource the modelled concurrent-operation
+    /// refusal — and whose `RequestToken` is what that refusal names, so the caller can
+    /// poll the operation that holds the resource.
+    pub fn in_flight_request(&self, type_name: &str, identifier: &str) -> Option<&str> {
+        self.requests
+            .values()
+            .find(|record| {
+                record.is_pending()
+                    && record.type_name == type_name
+                    && record.identifier.as_deref() == Some(identifier)
+            })
+            .map(|record| record.request_token.as_str())
     }
 
     /// The request `request_token` names, or `None` when this store holds none.
@@ -565,7 +581,7 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
             return ClientTokenVerdict::Fresh;
         };
         if entry.request_fingerprint != fingerprint {
-            return ClientTokenVerdict::Conflict;
+            return ClientTokenVerdict::Conflict(entry.request_token.clone());
         }
         if self.requests.contains_key(&entry.request_token) {
             return ClientTokenVerdict::Replay(entry.request_token.clone());
@@ -892,8 +908,14 @@ pub const MAX_PATCH_OPERATIONS: usize = 100;
 pub enum PatchRefusal {
     /// The document carries more operations than a patch may.
     TooManyOperations,
-    /// One of its operations could not be applied to the model.
-    NotApplicable,
+    /// One of its operations could not be applied to the model: the operation, as the
+    /// document spells it, and the path it names.
+    NotApplicable {
+        /// The operation RFC 6902 name of the step that failed.
+        operation: &'static str,
+        /// The pointer that step named.
+        path: String,
+    },
     /// The model it produced is not an object of properties.
     NotAnObject,
     /// The model it produced is longer than one this service can report.
@@ -901,16 +923,19 @@ pub enum PatchRefusal {
 }
 
 impl PatchRefusal {
-    /// What the refusal states, behind the invalid-request prefix
-    /// ([`invalid_request_message`]).
+    /// What the refusal states, behind the prefix the refusal is carried under.
     pub fn detail(&self) -> String {
         match self {
             Self::TooManyOperations => format!(
                 "PatchDocument must carry at most {MAX_PATCH_OPERATIONS} patch operations"
             ),
-            Self::NotApplicable => {
-                "the patch document could not be applied to the resource model".to_string()
-            }
+            // Naming the operation and the path it failed on is what tells this refusal
+            // from every other reason a document may be rejected: the caller has to know
+            // WHICH step of its document the resource model would not take.
+            Self::NotApplicable { operation, path } => format!(
+                "the {operation} operation at path '{path}' could not be applied to the \
+                 resource model"
+            ),
             Self::NotAnObject => {
                 "the patch document would leave a resource model that is not a JSON object"
                     .to_string()
@@ -921,6 +946,70 @@ impl PatchRefusal {
             ),
         }
     }
+
+    /// Whether this refusal is a fault in the DOCUMENT, which the front door judges from
+    /// the request and the resource model alone, rather than a verdict on the model the
+    /// handler would have been asked to store.
+    ///
+    /// A patch operation that names a path the model does not carry cannot be applied to
+    /// any model, so it is the front door's refusal. The remaining refusals are about
+    /// what applying the document WOULD leave behind — a value that is not a resource
+    /// model, one past the length the model can report — or about this emulator's own
+    /// cap on the work one document may drive ([`MAX_PATCH_OPERATIONS`]), none of which
+    /// the front door decides.
+    pub fn is_document_fault(&self) -> bool {
+        matches!(self, Self::NotApplicable { .. })
+    }
+}
+
+/// The RFC 6902 name of one patch operation, as a patch document spells it, and the
+/// pointer it names.
+fn operation_description(operation: &::json_patch::PatchOperation) -> (&'static str, String) {
+    use ::json_patch::PatchOperation;
+
+    match operation {
+        PatchOperation::Add(operation) => ("add", operation.path.to_string()),
+        PatchOperation::Remove(operation) => ("remove", operation.path.to_string()),
+        PatchOperation::Replace(operation) => ("replace", operation.path.to_string()),
+        PatchOperation::Move(operation) => ("move", operation.path.to_string()),
+        PatchOperation::Copy(operation) => ("copy", operation.path.to_string()),
+        PatchOperation::Test(operation) => ("test", operation.path.to_string()),
+    }
+}
+
+/// The top-level properties of the resource model a patch document would CHANGE.
+///
+/// A patch operation names its target as a JSON pointer into the model, so the property
+/// it changes is that pointer's first token: `/Tags/0/Key` changes `Tags`. An operation
+/// that MOVES a value changes the property it writes to and the one it takes the value
+/// from, since a move removes the source; a `copy` only reads its source, and a `test`
+/// changes nothing at all. The empty pointer names the whole model rather than any one
+/// property, so it names none here and the invariants on the model the patch leaves
+/// behind are what judge it.
+///
+/// This is what lets a refusal be decided from the DOCUMENT: a property a patch may not
+/// change is refused because the document names it, whether or not the operation could
+/// have been applied.
+pub fn patched_properties(patch: &::json_patch::Patch) -> BTreeSet<String> {
+    use ::json_patch::PatchOperation;
+
+    let mut properties = BTreeSet::new();
+    for operation in &patch.0 {
+        let targets: Vec<&::json_patch::jsonptr::Pointer> = match operation {
+            PatchOperation::Add(operation) => vec![&operation.path],
+            PatchOperation::Remove(operation) => vec![&operation.path],
+            PatchOperation::Replace(operation) => vec![&operation.path],
+            PatchOperation::Move(operation) => vec![&operation.path, &operation.from],
+            PatchOperation::Copy(operation) => vec![&operation.path],
+            PatchOperation::Test(_) => Vec::new(),
+        };
+        for target in targets {
+            if let Some(token) = target.first() {
+                properties.insert(token.decoded().into_owned());
+            }
+        }
+    }
+    properties
 }
 
 /// Apply `patch` to `properties`, ONE operation at a time, holding the document to the
@@ -942,7 +1031,13 @@ pub fn apply_patch(properties: &mut Value, patch: &::json_patch::Patch) -> Resul
     }
     for operation in &patch.0 {
         let step = ::json_patch::Patch(vec![operation.clone()]);
-        ::json_patch::patch(properties, &step).map_err(|_| PatchRefusal::NotApplicable)?;
+        ::json_patch::patch(properties, &step).map_err(|_| {
+            let (named, path) = operation_description(operation);
+            PatchRefusal::NotApplicable {
+                operation: named,
+                path,
+            }
+        })?;
         if !properties_within_bound(properties) {
             return Err(PatchRefusal::TooLarge);
         }
@@ -1004,8 +1099,300 @@ pub fn properties_match_selector(properties: &Value, selector: &Value) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// The registry of resource types
+// ---------------------------------------------------------------------------
+
+/// The namespaces this emulator's CloudFormation registry holds resource types under —
+/// the `<Organization>::<Service>` half of a `TypeName`.
+///
+/// Catalog source: the namespaces CloudFormation publishes resource types under, as the
+/// AWS CloudFormation resource and property type reference lists them (one
+/// `AWS::<Service>::…` section per service, plus Alexa's own `Alexa::ASK`).
+///
+/// A `TypeName` is `<Organization>::<Service>::<Resource>` and the registry is keyed by
+/// the whole triple, but WHICH resources one service publishes is that service's own
+/// business and changes with every release, while the namespace a type has to live in
+/// does not: a namespace the registry holds nothing under can hold no type at all, which
+/// is what [`type_is_registered`] decides. A private type a particular account
+/// registered is not here either, because this emulator's registry holds none.
+const REGISTERED_NAMESPACES: &[&str] = &[
+    "Alexa::ASK",
+    "AWS::ACMPCA",
+    "AWS::AccessAnalyzer",
+    "AWS::AmazonMQ",
+    "AWS::Amplify",
+    "AWS::AmplifyUIBuilder",
+    "AWS::ApiGateway",
+    "AWS::ApiGatewayV2",
+    "AWS::AppConfig",
+    "AWS::AppFlow",
+    "AWS::AppIntegrations",
+    "AWS::AppMesh",
+    "AWS::AppRunner",
+    "AWS::AppStream",
+    "AWS::AppSync",
+    "AWS::ApplicationAutoScaling",
+    "AWS::ApplicationInsights",
+    "AWS::Athena",
+    "AWS::AuditManager",
+    "AWS::AutoScaling",
+    "AWS::AutoScalingPlans",
+    "AWS::Backup",
+    "AWS::Batch",
+    "AWS::Budgets",
+    "AWS::CE",
+    "AWS::Cassandra",
+    "AWS::CertificateManager",
+    "AWS::Chatbot",
+    "AWS::Cloud9",
+    "AWS::CloudFormation",
+    "AWS::CloudFront",
+    "AWS::CloudTrail",
+    "AWS::CloudWatch",
+    "AWS::CodeArtifact",
+    "AWS::CodeBuild",
+    "AWS::CodeCommit",
+    "AWS::CodeDeploy",
+    "AWS::CodeGuruProfiler",
+    "AWS::CodeGuruReviewer",
+    "AWS::CodePipeline",
+    "AWS::CodeStar",
+    "AWS::CodeStarConnections",
+    "AWS::Cognito",
+    "AWS::Comprehend",
+    "AWS::Config",
+    "AWS::Connect",
+    "AWS::ControlTower",
+    "AWS::CustomerProfiles",
+    "AWS::DAX",
+    "AWS::DLM",
+    "AWS::DMS",
+    "AWS::DataBrew",
+    "AWS::DataPipeline",
+    "AWS::DataSync",
+    "AWS::Detective",
+    "AWS::DevOpsGuru",
+    "AWS::DirectoryService",
+    "AWS::DocDB",
+    "AWS::DynamoDB",
+    "AWS::EC2",
+    "AWS::ECR",
+    "AWS::ECS",
+    "AWS::EFS",
+    "AWS::EKS",
+    "AWS::EMR",
+    "AWS::EMRContainers",
+    "AWS::EMRServerless",
+    "AWS::ElastiCache",
+    "AWS::ElasticBeanstalk",
+    "AWS::ElasticLoadBalancing",
+    "AWS::ElasticLoadBalancingV2",
+    "AWS::Elasticsearch",
+    "AWS::EventSchemas",
+    "AWS::Events",
+    "AWS::Evidently",
+    "AWS::FIS",
+    "AWS::FMS",
+    "AWS::FSx",
+    "AWS::FinSpace",
+    "AWS::Forecast",
+    "AWS::FraudDetector",
+    "AWS::GameLift",
+    "AWS::GlobalAccelerator",
+    "AWS::Glue",
+    "AWS::Grafana",
+    "AWS::Greengrass",
+    "AWS::GreengrassV2",
+    "AWS::GroundStation",
+    "AWS::GuardDuty",
+    "AWS::HealthLake",
+    "AWS::IAM",
+    "AWS::IVS",
+    "AWS::ImageBuilder",
+    "AWS::Inspector",
+    "AWS::InspectorV2",
+    "AWS::InternetMonitor",
+    "AWS::IoT",
+    "AWS::IoTAnalytics",
+    "AWS::IoTEvents",
+    "AWS::IoTFleetHub",
+    "AWS::IoTSiteWise",
+    "AWS::IoTTwinMaker",
+    "AWS::IoTWireless",
+    "AWS::KMS",
+    "AWS::KafkaConnect",
+    "AWS::Kendra",
+    "AWS::Kinesis",
+    "AWS::KinesisAnalytics",
+    "AWS::KinesisAnalyticsV2",
+    "AWS::KinesisFirehose",
+    "AWS::KinesisVideo",
+    "AWS::LakeFormation",
+    "AWS::Lambda",
+    "AWS::Lex",
+    "AWS::LicenseManager",
+    "AWS::Lightsail",
+    "AWS::Location",
+    "AWS::Logs",
+    "AWS::LookoutEquipment",
+    "AWS::LookoutMetrics",
+    "AWS::LookoutVision",
+    "AWS::M2",
+    "AWS::MSK",
+    "AWS::Macie",
+    "AWS::ManagedBlockchain",
+    "AWS::MediaConnect",
+    "AWS::MediaConvert",
+    "AWS::MediaLive",
+    "AWS::MediaPackage",
+    "AWS::MediaStore",
+    "AWS::MediaTailor",
+    "AWS::MemoryDB",
+    "AWS::Neptune",
+    "AWS::NetworkFirewall",
+    "AWS::NetworkManager",
+    "AWS::NimbleStudio",
+    "AWS::OpenSearchServerless",
+    "AWS::OpenSearchService",
+    "AWS::OpsWorks",
+    "AWS::Organizations",
+    "AWS::Panorama",
+    "AWS::Personalize",
+    "AWS::Pinpoint",
+    "AWS::Pipes",
+    "AWS::QLDB",
+    "AWS::QuickSight",
+    "AWS::RAM",
+    "AWS::RDS",
+    "AWS::RUM",
+    "AWS::Redshift",
+    "AWS::RedshiftServerless",
+    "AWS::RefactorSpaces",
+    "AWS::Rekognition",
+    "AWS::ResilienceHub",
+    "AWS::ResourceExplorer2",
+    "AWS::ResourceGroups",
+    "AWS::RoboMaker",
+    "AWS::Route53",
+    "AWS::Route53RecoveryControl",
+    "AWS::Route53RecoveryReadiness",
+    "AWS::Route53Resolver",
+    "AWS::S3",
+    "AWS::S3ObjectLambda",
+    "AWS::S3Outposts",
+    "AWS::SDB",
+    "AWS::SES",
+    "AWS::SNS",
+    "AWS::SQS",
+    "AWS::SSM",
+    "AWS::SSMContacts",
+    "AWS::SSMIncidents",
+    "AWS::SSO",
+    "AWS::SageMaker",
+    "AWS::SecretsManager",
+    "AWS::SecurityHub",
+    "AWS::ServiceCatalog",
+    "AWS::ServiceCatalogAppRegistry",
+    "AWS::ServiceDiscovery",
+    "AWS::Shield",
+    "AWS::Signer",
+    "AWS::SimSpaceWeaver",
+    "AWS::StepFunctions",
+    "AWS::SupportApp",
+    "AWS::Synthetics",
+    "AWS::Timestream",
+    "AWS::Transfer",
+    "AWS::VoiceID",
+    "AWS::VpcLattice",
+    "AWS::WAF",
+    "AWS::WAFRegional",
+    "AWS::WAFv2",
+    "AWS::Wisdom",
+    "AWS::WorkSpaces",
+    "AWS::XRay",
+];
+
+/// The `<Organization>::<Service>` namespace of `type_name`, or `None` for a value that
+/// is not a three-segment type name at all.
+///
+/// The `TypeName` pattern already holds a request to three non-empty alphanumeric
+/// segments, so this reads the segments rather than re-checking them.
+fn type_namespace(type_name: &str) -> Option<String> {
+    let mut segments = type_name.split("::");
+    let organization = segments.next()?;
+    let service = segments.next()?;
+    let resource = segments.next()?;
+    (!resource.is_empty() && segments.next().is_none())
+        .then(|| format!("{organization}::{service}"))
+}
+
+/// Whether this emulator's CloudFormation registry holds `type_name` —
+/// what every operation that names a `TypeName` asks before it resolves anything that
+/// type name names ([`REGISTERED_NAMESPACES`] states what the registry holds).
+pub fn type_is_registered(type_name: &str) -> bool {
+    type_namespace(type_name)
+        .is_some_and(|namespace| REGISTERED_NAMESPACES.contains(&namespace.as_str()))
+}
+
+// ---------------------------------------------------------------------------
 // Refusal wording
 // ---------------------------------------------------------------------------
+
+/// The `HandlerErrorCode` for a resource the owning handler could not find.
+pub const HANDLER_ERROR_NOT_FOUND: &str = "NotFound";
+
+/// The `HandlerErrorCode` for a resource the owning handler found already there.
+pub const HANDLER_ERROR_ALREADY_EXISTS: &str = "AlreadyExists";
+
+/// One resource type's own not-found diagnostic, for the types whose owning service
+/// states it in its own terms rather than in Cloud Control API's generic sentence.
+struct HandlerDiagnostic {
+    /// The sentence the owning service's own API states.
+    sentence: &'static str,
+    /// The `Service` the owning handler's client is for, where that handler carries its
+    /// client's rendering of the service's exception rather than the bare sentence.
+    sdk_service: Option<&'static str>,
+}
+
+/// What the owning resource type's handler states for a resource it cannot find, keyed
+/// by `TypeName` — the registry's own key.
+///
+/// Cloud Control API is a facade over the type's handler, so the diagnostic inside a
+/// not-found refusal is the OWNING service's, not Cloud Control's: CloudWatch says an
+/// alarm does not exist, SNS says a topic does not exist. A type absent from here is
+/// reported in Cloud Control's own generic sentence
+/// ([`resource_not_found_message`]), which is what a handler built on the generic
+/// resource-provider base class states.
+const HANDLER_NOT_FOUND_DIAGNOSTICS: &[(&str, HandlerDiagnostic)] = &[
+    (
+        "AWS::CloudWatch::Alarm",
+        HandlerDiagnostic {
+            sentence: "Alarm does not exist",
+            sdk_service: None,
+        },
+    ),
+    (
+        "AWS::SNS::Topic",
+        HandlerDiagnostic {
+            sentence: "Topic does not exist",
+            sdk_service: Some("Sns"),
+        },
+    ),
+];
+
+/// What the owning resource type's handler states for a create whose resource is already
+/// there, keyed by `TypeName`.
+///
+/// Same rule as [`HANDLER_NOT_FOUND_DIAGNOSTICS`]: the sentence belongs to the service
+/// that owns the type. A type absent from here is reported in Cloud Control's own
+/// generic sentence ([`already_exists_message`]).
+const HANDLER_ALREADY_EXISTS_DIAGNOSTICS: &[(&str, &str)] = &[(
+    "AWS::SQS::Queue",
+    "Queue creation failed because the queue already exists",
+)];
+
+/// The status code an owning service reports for a resource that is not there.
+const HANDLER_NOT_FOUND_STATUS: u16 = 404;
 
 /// How every operation of this service words "a resource with the specified identifier
 /// can't be found", with the type and identifier the request named.
@@ -1013,9 +1400,76 @@ pub fn resource_not_found_message(type_name: &str, identifier: &str) -> String {
     format!("Resource of type '{type_name}' with identifier '{identifier}' was not found.")
 }
 
+/// The diagnostic the handler that owns `type_name` states for a resource it cannot
+/// find.
+pub fn handler_not_found_detail(type_name: &str, identifier: &str) -> String {
+    let Some((_, diagnostic)) = HANDLER_NOT_FOUND_DIAGNOSTICS
+        .iter()
+        .find(|(name, _)| *name == type_name)
+    else {
+        return resource_not_found_message(type_name, identifier);
+    };
+    match diagnostic.sdk_service {
+        // The handler carries its client's rendering of the owning service's own
+        // exception, which names the service, the status it answered and the request the
+        // handler made of it.
+        Some(service) => format!(
+            "{} (Service: {service}, Status Code: {HANDLER_NOT_FOUND_STATUS}, Request ID: {})",
+            diagnostic.sentence,
+            mint_token()
+        ),
+        None => diagnostic.sentence.to_string(),
+    }
+}
+
 /// How a create words "the resource with the name requested already exists".
 pub fn already_exists_message(type_name: &str, identifier: &str) -> String {
     format!("Resource of type '{type_name}' with identifier '{identifier}' already exists.")
+}
+
+/// The diagnostic the handler that owns `type_name` states for a create whose resource is
+/// already there.
+pub fn handler_already_exists_detail(type_name: &str, identifier: &str) -> String {
+    HANDLER_ALREADY_EXISTS_DIAGNOSTICS
+        .iter()
+        .find(|(name, _)| *name == type_name)
+        .map(|(_, sentence)| (*sentence).to_string())
+        .unwrap_or_else(|| already_exists_message(type_name, identifier))
+}
+
+/// How a SYNCHRONOUS refusal carries a handler verdict: the owning handler's status, its
+/// own diagnostic, the `HandlerErrorCode` it failed with and the `RequestToken` of the
+/// handler invocation that failed.
+///
+/// A `ProgressEvent` reports the handler error code in `ErrorCode` and the diagnostic in
+/// `StatusMessage`, each in its own member. An exception has only its `Message`, so a
+/// refusal a resource-level operation answers inline is where the whole verdict has to
+/// go — which is why clients recover the handler error code from this text.
+pub fn handler_failure_message(
+    type_name: &str,
+    detail: &str,
+    handler_error_code: &str,
+    request_token: &str,
+) -> String {
+    format!(
+        "{type_name} Handler returned status {STATUS_FAILED}: {detail} \
+         (HandlerErrorCode: {handler_error_code}, RequestToken: {request_token})"
+    )
+}
+
+/// The `Message` a resource-level operation refuses an absent resource with: the
+/// handler-wrapped not-found verdict ([`handler_failure_message`]).
+///
+/// The token is minted here because the handler invocation this refusal reports IS this
+/// call: nothing was accepted, so there is no resource operation request to poll and no
+/// record for the token to name.
+pub fn resource_not_found_refusal(type_name: &str, identifier: &str) -> String {
+    handler_failure_message(
+        type_name,
+        &handler_not_found_detail(type_name, identifier),
+        HANDLER_ERROR_NOT_FOUND,
+        &mint_token(),
+    )
 }
 
 /// How a mutating operation words a refusal caused by the request itself, with the
@@ -1024,30 +1478,146 @@ pub fn invalid_request_message(detail: &str) -> String {
     format!("Invalid request provided: {detail}")
 }
 
-/// How a mutating operation words an attempt to change a create-only property, naming
-/// the property the request would have changed.
-pub fn not_updatable_message(property: &str) -> String {
-    format!("Cannot update create-only property '{property}'.")
+/// The prefix a resource type's registry schema names one of its properties with: every
+/// pointer in its `createOnlyProperties`, `readOnlyProperties` and `primaryIdentifier`
+/// lists points into the schema's `properties` object.
+const PROPERTY_POINTER_PREFIX: &str = "/properties/";
+
+/// The properties a resource type's registry schema declares `createOnlyProperties`,
+/// keyed by `TypeName`.
+///
+/// Catalog source: the `createOnlyProperties` list of each type's resource provider
+/// schema, as CloudFormation publishes it (`DescribeType`), with the
+/// `/properties/` prefix of each pointer dropped — it is put back wherever a pointer is
+/// rendered ([`not_updatable_message`]).
+///
+/// A type absent from here still has ONE create-only property: its own primary
+/// identifier, which is what every operation addresses the resource by and therefore
+/// cannot change while the resource stays the same resource. That is what
+/// [`create_only_properties`] adds for every type, catalogued or not.
+const CREATE_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
+    ("AWS::CloudWatch::Alarm", &["AlarmName"]),
+    ("AWS::DynamoDB::Table", &["TableName", "KeySchema"]),
+    ("AWS::EC2::VPC", &["CidrBlock", "Ipv4IpamPoolId"]),
+    ("AWS::Kinesis::Stream", &["Name"]),
+    ("AWS::Logs::LogGroup", &["LogGroupName"]),
+    ("AWS::S3::Bucket", &["BucketName", "ObjectLockEnabled"]),
+    ("AWS::SNS::Topic", &["TopicName", "FifoTopic"]),
+    ("AWS::SQS::Queue", &["QueueName", "FifoQueue"]),
+    ("AWS::SSM::Parameter", &["Name"]),
+];
+
+/// The properties a patch may not change for `type_name`, whose primary identifier the
+/// resource carries under `identifier_property`: the type's declared
+/// `createOnlyProperties`, and that identifier property wherever the schema's list does
+/// not already name it.
+///
+/// Kept in the schema's own order, with the identifier first where it is added, so a
+/// refusal lists the offending properties the way the schema declares them.
+pub fn create_only_properties(type_name: &str, identifier_property: &str) -> Vec<String> {
+    let declared = CREATE_ONLY_PROPERTIES
+        .iter()
+        .find(|(name, _)| *name == type_name)
+        .map(|(_, properties)| *properties)
+        .unwrap_or(&[]);
+    let mut properties: Vec<String> = declared.iter().map(|name| (*name).to_string()).collect();
+    if !properties.iter().any(|name| name == identifier_property) {
+        properties.insert(0, identifier_property.to_string());
+    }
+    properties
 }
 
-/// How a mutating operation words "another resource operation is currently being
-/// performed on this resource".
-pub const CONCURRENT_OPERATION_MESSAGE: &str =
-    "Another resource operation is currently being performed on this resource.";
+/// How a mutating operation words a patch that would change a create-only property: the
+/// patch diagnostic, naming the offending properties as the pointers into the type's
+/// registry schema that its `createOnlyProperties` list spells them with.
+///
+/// Takes the whole set, because one patch document can touch several create-only
+/// properties and the diagnostic lists them together.
+pub fn not_updatable_message(properties: &[&str]) -> String {
+    let pointers: Vec<String> = properties
+        .iter()
+        .map(|property| format!("{PROPERTY_POINTER_PREFIX}{property}"))
+        .collect();
+    format!(
+        "Invalid patch update: createOnlyProperties [{}] cannot be updated",
+        pointers.join(", ")
+    )
+}
 
-/// How a mutating operation words "the resource is temporarily unavailable to be acted
-/// upon".
-pub const RESOURCE_CONFLICT_MESSAGE: &str =
-    "The resource is temporarily unavailable to be acted upon.";
+/// How a mutating operation words a `PatchDocument` its reader would not take, with the
+/// prefix Cloud Control API states such a refusal behind.
+pub fn invalid_patch_document_message(detail: &str) -> String {
+    format!("Invalid PatchDocument: {detail}")
+}
 
-/// How a mutating operation words "the specified client token has already been used in
-/// another resource request".
-pub const CLIENT_TOKEN_CONFLICT_MESSAGE: &str =
-    "The specified client token has already been used in another resource request.";
+/// What the document reader states about a `PatchDocument` it could not read as a list
+/// of patch operations.
+///
+/// A patch document is read as a JSON ARRAY first, so a document whose first value
+/// character is not `[` is refused by the reader before any operation is looked at, and
+/// the complaint names where in the document that character is: the index of the
+/// character read, its position on its line and the line it is on, all counted from the
+/// document itself. A document that IS an array but carries something that is not a
+/// patch operation fails later, on the operation rather than on the text.
+pub fn patch_document_read_failure(document: &str) -> String {
+    // Where the reader stopped: whitespace before the value is skipped, and the first
+    // character of the value is the one it reports.
+    let trimmed = document.trim_start();
+    let skipped = &document[..document.len() - trimmed.len()];
+    let value = trimmed.chars().next();
+    if value == Some('[') {
+        return "the document carries an operation that is not a JSON Patch operation".to_string();
+    }
+    // The character of the value itself is read before the reader gives up, so it counts
+    // towards the index; a document that holds no value character at all leaves the
+    // index at the whitespace it skipped.
+    let read = usize::from(value.is_some());
+    let index = skipped.chars().count() + read;
+    let line = 1 + skipped.matches('\n').count();
+    let on_line = match skipped.rfind('\n') {
+        Some(newline) => skipped[newline + 1..].chars().count() + read,
+        None => index,
+    };
+    format!(
+        "A JSONArray text must start with '[' at {index} [character {} line {line}]",
+        on_line + 1
+    )
+}
 
-/// How `GetResourceRequestStatus` words a token no request of this store answers to.
-pub const REQUEST_TOKEN_NOT_FOUND_MESSAGE: &str =
-    "A resource operation with the specified request token can't be found.";
+/// How a mutating operation words a resource another operation is already acting on: the
+/// resource under contention and, when one is still running, the request that holds it.
+///
+/// The holding request is what lets a caller poll the operation that blocked it to
+/// completion; a request that has since terminated leaves the resource named alone.
+pub fn concurrent_operation_message(identifier: &str, holding_request: Option<&str>) -> String {
+    match holding_request {
+        Some(request_token) => format!(
+            "Concurrent operation found for resource {identifier} with RequestToken \
+             {request_token}"
+        ),
+        None => format!("Concurrent operation found for resource {identifier}"),
+    }
+}
+
+/// How a mutating operation words a `ClientToken` that already named another request:
+/// the token the caller submitted and the request it was first used for.
+pub fn client_token_conflict_message(client_token: &str, request_token: &str) -> String {
+    format!(
+        "ClientToken {client_token} is already associated with an existing operation with \
+         RequestToken {request_token}"
+    )
+}
+
+/// How `GetResourceRequestStatus` words a token no request of this store answers to,
+/// naming the token that was not found.
+pub fn request_token_not_found_message(request_token: &str) -> String {
+    format!("Request with token {request_token} was not found")
+}
+
+/// How an operation that names a `TypeName` words one the registry does not hold.
+pub fn type_not_found_message(type_name: &str) -> String {
+    format!("The type '{type_name}' cannot be found.")
+}
 
 /// How a mutating operation words a request it has no room to accept.
 pub const THROTTLING_MESSAGE: &str = "Rate exceeded";
@@ -1159,11 +1729,46 @@ mod tests {
                 "status {status:?}: not a value the model's OperationStatus enum declares"
             );
         }
-        let code = EffectFailure::ResourceGone.error_code();
-        assert!(
-            crate::ops::types::HANDLER_ERROR_CODE_VALUES.contains(&code),
-            "error code {code:?}: not a value the model's HandlerErrorCode enum declares"
-        );
+        for code in [
+            EffectFailure::ResourceGone.error_code(),
+            EffectFailure::ResourceExists.error_code(),
+        ] {
+            assert!(
+                crate::ops::types::HANDLER_ERROR_CODE_VALUES.contains(&code),
+                "error code {code:?}: not a value the model's HandlerErrorCode enum declares"
+            );
+        }
+    }
+
+    /// The registry holds the namespaces CloudFormation publishes types under, and
+    /// nothing else — so a type name of the right SHAPE is still not a type the registry
+    /// can find.
+    #[test]
+    fn only_a_namespace_the_registry_holds_names_a_registered_type() {
+        for registered in [
+            // Not a type any check of this service names: the rule is about the
+            // namespace, not about the types one suite happens to use.
+            "AWS::Kinesis::Stream",
+            "AWS::S3::Bucket",
+            "Alexa::ASK::Skill",
+        ] {
+            assert!(
+                type_is_registered(registered),
+                "type {registered:?}: expected the registry to hold it"
+            );
+        }
+        for unregistered in [
+            "AWS::NoSuchService::FakeResource",
+            "AWS::SimParityProbe::NoSuchType",
+            "AWS::Custom::Widget",
+            "Sqs::Queue",
+            "AWS::SQS::Queue::Extra",
+        ] {
+            assert!(
+                !type_is_registered(unregistered),
+                "type {unregistered:?}: expected the registry to hold no such type"
+            );
+        }
     }
 
     /// A page token round-trips under the key and the type that minted it, and under

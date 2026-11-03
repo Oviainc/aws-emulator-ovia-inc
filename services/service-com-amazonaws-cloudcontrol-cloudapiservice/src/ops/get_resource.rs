@@ -214,15 +214,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A resource is a resource OF A TYPE, so the type is resolved first: a type the
+        // CloudFormation registry does not hold has no resources to look for, and
+        // reporting it as a resource that cannot be found would conflate a type name
+        // nothing publishes with a resource nothing created.
+        if !crate::state::type_is_registered(&input.type_name) {
+            return Err(crate::scaffolded::Scaffolded::type_not_found(
+                crate::state::type_not_found_message(&input.type_name),
+            ));
+        }
+
         let mut store = state.lock();
         // What the clock already owes the store: a create whose work has fallen due has
         // provisioned its resource and a delete whose work has fallen due has removed
         // one, whether or not anybody called in between.
         store.materialise_due(::std::time::SystemTime::now());
         let Some(stored) = store.resource(&input.type_name, &input.identifier) else {
+            // A not-found is the OWNING handler's verdict, so the refusal carries that
+            // handler's whole answer: its diagnostic, the handler error code it failed
+            // with and the token of the invocation that failed.
             return Err(GetResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message(
+                    message: Some(crate::state::resource_not_found_refusal(
                         &input.type_name,
                         &input.identifier,
                     )),

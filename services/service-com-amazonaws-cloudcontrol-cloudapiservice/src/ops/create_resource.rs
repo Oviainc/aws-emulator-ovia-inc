@@ -230,6 +230,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The registry is consulted at the front door: a `TypeName` it does not hold
+        // names no resource provider to run, so nothing about the request is resolved
+        // and no resource operation request is minted for it.
+        if !crate::state::type_is_registered(&input.type_name) {
+            return Err(crate::scaffolded::Scaffolded::type_not_found(
+                crate::state::type_not_found_message(&input.type_name),
+            ));
+        }
+
         // What the REQUEST ITSELF carries is judged before anything it names is
         // resolved, so no verdict about a resource can mask a fault in the input: the
         // desired state has to be a JSON object of properties, and the property that
@@ -303,10 +312,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     });
                 }
             }
-            crate::state::ClientTokenVerdict::Conflict => {
+            crate::state::ClientTokenVerdict::Conflict(first_use) => {
                 return Err(CreateResourceErrorModeled::ClientTokenConflictException(
                     ClientTokenConflictException {
-                        message: Some(crate::state::CLIENT_TOKEN_CONFLICT_MESSAGE.to_string()),
+                        message: Some(crate::state::client_token_conflict_message(
+                            input.client_token.as_deref().unwrap_or_default(),
+                            &first_use,
+                        )),
                     },
                 )
                 .into());
@@ -316,26 +328,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A resource is acted on by one operation at a time: while a request against
         // this identifier is still running there is nothing to say whether the resource
-        // will exist, so a second one is refused rather than racing it.
-        if store.operation_in_flight(&input.type_name, &identifier) {
+        // will exist, so a second one is refused rather than racing it — naming the
+        // resource under contention and the request that holds it.
+        if let Some(holding) = store.in_flight_request(&input.type_name, &identifier) {
+            let message = crate::state::concurrent_operation_message(&identifier, Some(holding));
             return Err(CreateResourceErrorModeled::ConcurrentOperationException(
                 ConcurrentOperationException {
-                    message: Some(crate::state::CONCURRENT_OPERATION_MESSAGE.to_string()),
+                    message: Some(message),
                 },
             )
             .into());
         }
-        if store.resource(&input.type_name, &identifier).is_some() {
-            return Err(CreateResourceErrorModeled::AlreadyExistsException(
-                AlreadyExistsException {
-                    message: Some(crate::state::already_exists_message(
-                        &input.type_name,
-                        &identifier,
-                    )),
-                },
-            )
-            .into());
-        }
+        // A resource that is already there is the OWNING handler's verdict, not Cloud
+        // Control's: the request is accepted like any other create and the handler finds
+        // the resource when the work falls due, so the caller polls it to a terminal
+        // FAILED carrying that handler's error code and its own wording.
+        //
         // Checked BEFORE anything is stored, so an accepted call is the only thing that
         // can grow the store.
         if store.resource_count() >= crate::state::MAX_RESOURCES {

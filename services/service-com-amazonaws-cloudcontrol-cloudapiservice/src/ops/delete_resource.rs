@@ -230,6 +230,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The registry is consulted at the front door: a `TypeName` it does not hold
+        // names no resource provider to run, so nothing about the request is resolved
+        // and no resource operation request is minted for it.
+        if !crate::state::type_is_registered(&input.type_name) {
+            return Err(crate::scaffolded::Scaffolded::type_not_found(
+                crate::state::type_not_found_message(&input.type_name),
+            ));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.materialise_due(now);
@@ -260,10 +269,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     });
                 }
             }
-            crate::state::ClientTokenVerdict::Conflict => {
+            crate::state::ClientTokenVerdict::Conflict(first_use) => {
                 return Err(DeleteResourceErrorModeled::ClientTokenConflictException(
                     ClientTokenConflictException {
-                        message: Some(crate::state::CLIENT_TOKEN_CONFLICT_MESSAGE.to_string()),
+                        message: Some(crate::state::client_token_conflict_message(
+                            input.client_token.as_deref().unwrap_or_default(),
+                            &first_use,
+                        )),
                     },
                 )
                 .into());
@@ -273,19 +285,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A resource is acted on by one operation at a time, so a delete that arrives
         // while another operation is still running against this identifier is refused
-        // rather than racing it.
-        if store.operation_in_flight(&input.type_name, &input.identifier) {
+        // rather than racing it — naming the resource under contention and the request
+        // that holds it.
+        if let Some(holding) = store.in_flight_request(&input.type_name, &input.identifier) {
+            let message =
+                crate::state::concurrent_operation_message(&input.identifier, Some(holding));
             return Err(DeleteResourceErrorModeled::ConcurrentOperationException(
                 ConcurrentOperationException {
-                    message: Some(crate::state::CONCURRENT_OPERATION_MESSAGE.to_string()),
+                    message: Some(message),
                 },
             )
             .into());
         }
         if store.resource(&input.type_name, &input.identifier).is_none() {
+            // A not-found is the OWNING handler's verdict, so the refusal carries that
+            // handler's whole answer: its diagnostic, the handler error code it failed
+            // with and the token of the invocation that failed.
             return Err(DeleteResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message(
+                    message: Some(crate::state::resource_not_found_refusal(
                         &input.type_name,
                         &input.identifier,
                     )),

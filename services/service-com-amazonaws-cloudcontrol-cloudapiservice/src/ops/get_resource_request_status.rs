@@ -135,11 +135,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         // This operation reports a request this service holds, and the only failure it
         // models is a token naming none. A store that is not mounted holds no request at
-        // all, so that is the same answer rather than a different one.
+        // all, so that is the same answer rather than a different one. The refusal names
+        // the token that was not found: the message is all a caller polling several
+        // tokens gets back, so it has to say which one.
         let not_found = || {
             GetResourceRequestStatusErrorModeled::RequestTokenNotFoundException(
                 RequestTokenNotFoundException {
-                    message: Some(crate::state::REQUEST_TOKEN_NOT_FOUND_MESSAGE.to_string()),
+                    message: Some(crate::state::request_token_not_found_message(
+                        &input.request_token,
+                    )),
                 },
             )
             .into()
