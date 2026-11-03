@@ -107,6 +107,8 @@ mod email_templates;
 mod export_job_creation;
 #[path = "all/export_jobs.rs"]
 mod export_jobs;
+#[path = "all/import_jobs.rs"]
+mod import_jobs;
 #[path = "all/list_tenants.rs"]
 mod list_tenants;
 #[path = "all/message_insights.rs"]

@@ -6,7 +6,8 @@
 //! below: the email-identity table, the contact-list table, the email-template
 //! table, the configuration-set
 //! table, the suppression-list table, the multi-region-endpoint table, the
-//! dedicated-IP table, the export-job table, the outbound-message log, the
+//! dedicated-IP table, the export-job table, the import-job table, the
+//! outbound-message log, the
 //! per-account send counters and
 //! the account-level attributes. Nothing here is per-request scratch — the whole
 //! struct lives in the one shared engine (see [`service_state`]).
@@ -166,6 +167,54 @@ pub const EXPORT_JOB_COMPLETION_SETTLE: Duration = Duration::from_secs(3);
 /// above what a client exercising the export API needs, and `CreateExportJob` refuses
 /// past it with the `LimitExceededException` its model binds.
 pub const MAX_EXPORT_JOBS: usize = 1_000;
+
+/// The `JobStatus` an import job's run reports before it has started: "CREATED – Job
+/// has just been created."
+///
+/// Source: `smithy_query(query="doc",shape="JobStatus")`; the values the member
+/// accepts are also in `crate::ops::types::JOB_STATUS_VALUES`.
+pub const IMPORT_JOB_CREATED: &str = "CREATED";
+
+/// The `JobStatus` an import job's run reports while it is under way: "PROCESSING –
+/// Job is processing."
+pub const IMPORT_JOB_PROCESSING: &str = "PROCESSING";
+
+/// The terminal `JobStatus` an import job's run reaches: "COMPLETED – Job has
+/// completed processing successfully."
+///
+/// WHY the terminal record is this value rather than one of the failure ones: the
+/// model's `FAILED` reports an error something would have had to DIAGNOSE and
+/// `CANCELLED` needs a call that cancels a job, which this service models none of for
+/// an import job. Nothing about an accepted create is wrong, so the lifecycle the
+/// create owed settles into its success state — the same reading this service's
+/// export jobs take of the same modelled enum.
+pub const IMPORT_JOB_COMPLETED: &str = "COMPLETED";
+
+/// How long after an import job is created its `CREATED` -> `PROCESSING` transition
+/// becomes due.
+///
+/// Real SES picks the run up on a schedule nothing here can observe, so the span is
+/// CHOSEN, not documented: it is this emulator's convention for a transition the clock
+/// owes, and deliberately not zero, so a caller that reads the job straight back still
+/// sees it in the status it was created in. The due instant is stored on the record;
+/// nothing ever sleeps for it.
+pub const IMPORT_JOB_PROCESSING_SETTLE: Duration = Duration::from_secs(3);
+
+/// How long after an import job starts processing its `PROCESSING` -> `COMPLETED`
+/// transition becomes due, counted from the instant processing fell due — so a run is
+/// complete [`IMPORT_JOB_PROCESSING_SETTLE`] plus this after the job was created.
+///
+/// CHOSEN for the same reason as [`IMPORT_JOB_PROCESSING_SETTLE`], and likewise not
+/// zero: a caller that reads straight after the run started still sees it processing.
+pub const IMPORT_JOB_COMPLETION_SETTLE: Duration = Duration::from_secs(3);
+
+/// Import jobs the account may hold.
+///
+/// A CHOSEN bound, not an AWS one: an import job is created by a request, so a
+/// long-lived emulator must not grow without limit while serving them. It is far above
+/// what a client exercising the import API needs, and `CreateImportJob` refuses past it
+/// with the `LimitExceededException` its model binds.
+pub const MAX_IMPORT_JOBS: usize = 1_000;
 
 /// The window the account's sending quota is measured over: SES states the quota
 /// as `Max24HourSend`, "the maximum number of emails you can send in a 24-hour
@@ -1183,6 +1232,11 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// in; the order a listing reports them in is
     /// [`ExportJobRecord::listing_key`]'s.
     pub export_jobs: BTreeMap<String, ExportJobRecord>,
+    /// Import jobs, keyed by the `JobId` minted for them — the only name an import job
+    /// has, and the one every import-job operation addresses it by. Ordered, so the
+    /// table enumerates deterministically whatever order the jobs were created in.
+    /// Bounded by [`MAX_IMPORT_JOBS`], which `CreateImportJob` enforces.
+    pub import_jobs: BTreeMap<String, ImportJobRecord>,
     /// The outbound-message log, oldest first: one entry per accepted `SendEmail`.
     pub sent_messages: Vec<SentMessage>,
     /// Per-account send counters, bumped by `SendEmail`.
@@ -1201,6 +1255,9 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// Monotonic counter feeding [`Self::next_export_job_id`], so two export jobs
     /// created in the same microsecond still get different ids.
     pub export_job_sequence: u64,
+    /// Monotonic counter feeding [`Self::next_import_job_id`], so two import jobs
+    /// created in the same microsecond still get different ids.
+    pub import_job_sequence: u64,
 }
 
 impl ComAmazonawsSesv2SimpleemailserviceV2State {
@@ -1697,6 +1754,40 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
             salt.hash(&mut hasher);
             nanos.hash(&mut hasher);
             self.export_job_sequence.hash(&mut hasher);
+            write!(hex, "{:016x}", hasher.finish()).expect("writing to a String cannot fail");
+        }
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        )
+    }
+
+    /// Mint the `JobId` of a new import job.
+    ///
+    /// `JobId` is documented only as "a string that represents the import job ID" and
+    /// the model bounds it at one character or more, so — exactly as
+    /// [`Self::next_export_job_id`] does for the other job kind — the shape mirrors the
+    /// dashed 8-4-4-4-12 hex id SES hands back while the only guarantees this makes are
+    /// the ones a client depends on: the id is unique across import jobs and stable for
+    /// as long as the job holds it (it is minted once, at create, and read back from the
+    /// record afterwards). Uniqueness is structural, because the monotonic sequence
+    /// number is hashed in, so two jobs created in the same instant still differ.
+    pub fn next_import_job_id(&mut self, now: SystemTime) -> String {
+        self.import_job_sequence += 1;
+        let nanos = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut hex = String::with_capacity(32);
+        for salt in [0_u64, u64::from_be_bytes(*b"ImportJb")] {
+            let mut hasher = DefaultHasher::new();
+            salt.hash(&mut hasher);
+            nanos.hash(&mut hasher);
+            self.import_job_sequence.hash(&mut hasher);
             write!(hex, "{:016x}", hasher.finish()).expect("writing to a String cannot fail");
         }
         format!(
@@ -4382,6 +4473,152 @@ impl ExportJobRecord {
             // does.
             completed_timestamp: self.completed_at.map(::aws_smithy_types::DateTime::from),
         }
+    }
+}
+
+/// The `ImportDestinationType` the destination `destination` selects, or `None` when it
+/// selects neither or both.
+///
+/// `ImportDestination` is "an object that contains details about the resource
+/// destination the import job is going to target", and the two members it declares are
+/// the two kinds of resource an import can target — a contact list or the account's
+/// suppression list — so which one it carries is what the job's destination type is: a
+/// request that names neither, or both, names no one destination to import into. The
+/// values are the modelled ones (see `crate::ops::types::IMPORT_DESTINATION_TYPE_VALUES`).
+pub fn import_destination_type(
+    destination: &crate::ops::types::ImportDestination,
+) -> Option<&'static str> {
+    match (
+        destination.contact_list_destination.as_ref(),
+        destination.suppression_list_destination.as_ref(),
+    ) {
+        (Some(_), None) => Some("CONTACT_LIST"),
+        (None, Some(_)) => Some("SUPPRESSION_LIST"),
+        _ => None,
+    }
+}
+
+/// How this service words `BadRequestException` for an `ImportDestination` that selects
+/// no one destination.
+///
+/// The counterpart of [`invalid_export_data_source`], and worded the same way: the
+/// sentence states the modelled rule — the structure carries exactly one of the two
+/// destinations — and carries no part of the request, because what is wrong is which
+/// members are present, which the sentence already names.
+pub fn invalid_import_destination() -> String {
+    "ImportDestination must contain exactly one of SuppressionListDestination or \
+     ContactListDestination."
+        .to_string()
+}
+
+/// How this service words `NotFoundException` for a `JobId` the account holds no import
+/// job for, stated once for every operation that reads an import job by its id.
+///
+/// `NotFoundException` is documented only as "the resource you attempted to access
+/// doesn't exist", which names no resource, so the sentence names the resource kind and
+/// the requested id, which is its only variable part, taken from the request — the same
+/// wording this service gives every other resource it is asked for by id.
+pub fn import_job_not_found(job_id: &str) -> String {
+    format!("Import job {job_id} does not exist.")
+}
+
+/// One import job: what it imports, where it imports it to, and when it was created.
+///
+/// Its STATUS is not stored: it is DERIVED from the instant the job was created
+/// ([`Self::status`]), because the whole lifecycle of an import run is owed by the clock
+/// rather than by any call — this service models no operation that cancels or restarts
+/// an import job. So a reader reports the status the clock has made due without writing
+/// to the store, and two readers of one job can never disagree about where it has got
+/// to.
+///
+/// That status is a RECORD of the lifecycle the create owed, not a report on records
+/// something imported: the records an import job reads live in the Amazon S3 object the
+/// job's data source names, which this emulator does not read, so
+/// [`Self::processed_records_count`] and [`Self::failed_records_count`] count what this
+/// emulator really imported — none — and nothing synthesises a number to match the
+/// status the lifecycle reached. An operation that comes to ingest an import job's
+/// records must take them from somewhere this emulator really holds and bump those
+/// counts as it does.
+#[derive(Debug, Clone)]
+pub struct ImportJobRecord {
+    /// The `JobId` this record is keyed by, minted when the job was created and stable
+    /// for the life of the job.
+    pub job_id: String,
+    /// `ImportDestination`: the resource the job imports into, exactly as the create
+    /// supplied it, which every read of the job reports back.
+    pub destination: crate::ops::types::ImportDestination,
+    /// `ImportDataSource`: the S3 location the job reads and the format of what is
+    /// there, exactly as the create supplied it.
+    pub data_source: crate::ops::types::ImportDataSource,
+    /// When the job was created, which is the `CreatedTimestamp` a read reports and the
+    /// instant its whole lifecycle is owed from.
+    pub created_at: SystemTime,
+    /// When the `CREATED` -> `PROCESSING` transition falls due.
+    pub processing_due_at: SystemTime,
+    /// When the `PROCESSING` -> `COMPLETED` transition falls due.
+    pub completion_due_at: SystemTime,
+    /// `ProcessedRecordsCount`: "the current number of records processed" — the records
+    /// this emulator has really imported for the job.
+    pub processed_records_count: i32,
+    /// `FailedRecordsCount`: "the number of records that failed processing because of
+    /// invalid input or other reasons" — the ones this emulator really rejected.
+    pub failed_records_count: i32,
+}
+
+impl ImportJobRecord {
+    /// A job as a create stores it: just created, with both transitions of its run
+    /// already due at known instants and nothing imported yet.
+    pub fn new(
+        job_id: String,
+        destination: crate::ops::types::ImportDestination,
+        data_source: crate::ops::types::ImportDataSource,
+        now: SystemTime,
+    ) -> Self {
+        let processing_due_at = now.checked_add(IMPORT_JOB_PROCESSING_SETTLE).unwrap_or(now);
+        Self {
+            job_id,
+            destination,
+            data_source,
+            created_at: now,
+            processing_due_at,
+            completion_due_at: processing_due_at
+                .checked_add(IMPORT_JOB_COMPLETION_SETTLE)
+                .unwrap_or(processing_due_at),
+            processed_records_count: 0,
+            failed_records_count: 0,
+        }
+    }
+
+    /// The status of the job's run at `now`.
+    ///
+    /// Derived, so nothing is written because a job was read, and a run whose whole span
+    /// has already elapsed reports [`IMPORT_JOB_COMPLETED`] rather than one status per
+    /// call.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now >= self.completion_due_at {
+            IMPORT_JOB_COMPLETED
+        } else if now >= self.processing_due_at {
+            IMPORT_JOB_PROCESSING
+        } else {
+            IMPORT_JOB_CREATED
+        }
+    }
+
+    /// When the run completed, once the clock has made its completion due.
+    ///
+    /// "The time stamp of when the import job was completed": a run that has not
+    /// completed has no such instant, and one that has completed finished when it fell
+    /// due, not when somebody first looked.
+    pub fn completed_at(&self, now: SystemTime) -> Option<SystemTime> {
+        (now >= self.completion_due_at).then_some(self.completion_due_at)
+    }
+
+    /// The `ImportDestinationType` this job's destination selects.
+    ///
+    /// A stored job always carries exactly one destination, because that is what
+    /// `CreateImportJob` accepts ([`import_destination_type`]).
+    pub fn destination_type(&self) -> Option<&'static str> {
+        import_destination_type(&self.destination)
     }
 }
 

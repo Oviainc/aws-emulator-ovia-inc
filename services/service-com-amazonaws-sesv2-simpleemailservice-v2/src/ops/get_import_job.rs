@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetImportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetImportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetImportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Provides information about one import job the account holds
+//! ([`crate::state::ImportJobRecord`]): the destination it imports into, the data source
+//! it reads, how far its run has got and how many records it has imported. A `JobId` the
+//! account holds no import job for is refused as the resource it is. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +146,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetImportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetImportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetImportJob"))
+        // An import job belongs to the account rather than to a Region-scoped resource,
+        // so no request metadata is needed — the same reading this service's other job
+        // operations take.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetImportJob without the shared emulator state",
+            ));
+        };
+
+        let job_id = input.job_id;
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        let Some(record) = store.import_jobs.get(&job_id) else {
+            // "The resource you attempted to access doesn't exist": the account holds no
+            // import job under this id, so there is nothing to report on.
+            return Err(GetImportJobErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::import_job_not_found(&job_id)),
+            })
+            .into());
+        };
+
+        Ok(GetImportJobOutput {
+            // The id the job was minted with, which is the only name it has.
+            job_id: Some(record.job_id.clone()),
+            // Both halves of what the job was created for, reported as the create
+            // supplied them.
+            import_destination: Some(record.destination.clone()),
+            import_data_source: Some(record.data_source.clone()),
+            // "The failure details about an import job": nothing has diagnosed a failure
+            // of this run, so the job carries no failure details to report.
+            failure_info: None,
+            // The status the clock has made due, derived from the record rather than
+            // moved by this read.
+            job_status: Some(record.status(now).to_string()),
+            created_timestamp: Some(::aws_smithy_types::DateTime::from(record.created_at)),
+            completed_timestamp: record
+                .completed_at(now)
+                .map(::aws_smithy_types::DateTime::from),
+            // What the job has really imported, counted on the record.
+            processed_records_count: Some(record.processed_records_count),
+            failed_records_count: Some(record.failed_records_count),
+        })
     }
 }

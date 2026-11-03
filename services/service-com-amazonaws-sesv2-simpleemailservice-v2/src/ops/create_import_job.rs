@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateImportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateImportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateImportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an import job for a data destination, and stores it: the job this mints is
+//! what every read of the account's import jobs reports
+//! ([`crate::state::ImportJobRecord`]), and the `JobId` it answers with is the only name
+//! the job has. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +137,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateImportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateImportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateImportJob"))
+        // An import job belongs to the account rather than to a Region-scoped resource,
+        // so no request metadata is needed — the same reading this service's other job
+        // operations take.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateImportJob without the shared emulator state",
+            ));
+        };
+
+        // `ImportDestination` names the one resource the import targets, and which of
+        // its two members it carries is which kind of resource that is. Both members are
+        // optional in the model, so a request naming neither — or both — reaches here and
+        // is refused: there is no one destination to import into.
+        if crate::state::import_destination_type(&input.import_destination).is_none() {
+            return Err(bad_request(crate::state::invalid_import_destination()));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Whatever the clock had already made due at `now` was due whether or not
+        // anybody called, so materialising it changes nothing a later caller would
+        // otherwise have seen.
+        store.settle(now);
+
+        // A contact-list import targets a list of the account's by name
+        // (`ContactListDestination$ContactListName`), so a job cannot be created for a
+        // list the account does not hold. `CreateImportJob` models no not-found error, so
+        // the request is refused as the invalid input it is.
+        if let Some(contact_list) = input.import_destination.contact_list_destination.as_ref() {
+            if !store
+                .contact_lists
+                .contains_key(&contact_list.contact_list_name)
+            {
+                return Err(bad_request(crate::state::contact_list_not_found(
+                    &contact_list.contact_list_name,
+                )));
+            }
+        }
+
+        // "There are too many instances of the specified resource type"
+        // (`LimitExceededException`): the store holds all the import jobs it may, so
+        // another create is refused rather than growing it without end.
+        if store.import_jobs.len() >= crate::state::MAX_IMPORT_JOBS {
+            return Err(CreateImportJobErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} import jobs.",
+                        crate::state::MAX_IMPORT_JOBS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let job_id = store.next_import_job_id(now);
+        // The destination and the data source are what the run imports and where it
+        // imports it to, so they are stored with the job and read back from it rather
+        // than recomputed — the destination type among them
+        // ([`crate::state::ImportJobRecord::destination_type`]).
+        store.import_jobs.insert(
+            job_id.clone(),
+            crate::state::ImportJobRecord::new(
+                job_id.clone(),
+                input.import_destination,
+                input.import_data_source,
+                now,
+            ),
+        );
+
+        Ok(CreateImportJobOutput {
+            // "A string that represents the import job ID": the id minted for the stored
+            // job, and the only name it has.
+            job_id: Some(job_id),
+        })
     }
+}
+
+/// Refuse the request with this operation's input error — "the input you provided is
+/// invalid".
+fn bad_request(message: impl Into<String>) -> CreateImportJobError {
+    CreateImportJobErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }
