@@ -63,6 +63,8 @@ mod resource_tags;
 mod rollback_stage;
 #[path = "all/rule_executions.rs"]
 mod rule_executions;
+#[path = "all/run_order_concurrency.rs"]
+mod run_order_concurrency;
 #[path = "all/s3_deploy_object_key.rs"]
 mod s3_deploy_object_key;
 #[path = "all/source_revision_overrides.rs"]

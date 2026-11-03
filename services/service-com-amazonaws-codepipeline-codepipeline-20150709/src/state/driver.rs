@@ -601,42 +601,56 @@ fn step_stage(
             continue;
         }
 
+        // Every action of ONE run order runs CONCURRENTLY, so they all become due at the
+        // same instant: a span after the run order before them finished (or after the
+        // execution started, for the first one). The instant is derived from the newest
+        // completed action of this execution rather than from the call that happens to
+        // observe it, and it is assigned to the whole run order in one pass — so a
+        // sibling finishing its work never pushes the rest of its run order back, and
+        // only the NEXT run order waits for them all.
+        if positions
+            .iter()
+            .any(|index| record.stages[stage].actions[*index].due.is_none())
+        {
+            let anchor = record
+                .stages
+                .iter()
+                .flat_map(|stage| &stage.actions)
+                .filter(|action| action.is_terminal())
+                .map(|action| action.last_status_change)
+                .max()
+                .unwrap_or(record.start_time);
+            let due = anchor + ACTION_STEP;
+            for index in &positions {
+                let action = &mut record.stages[stage].actions[*index];
+                if action.due.is_none() {
+                    action.due = Some(due);
+                }
+            }
+            record.last_update_time = now;
+        }
+
         for index in positions {
             let action = &record.stages[stage].actions[index];
             if action.is_terminal() {
                 continue;
             }
             if action.is_in_progress() {
-                // Either a human has not answered the approval yet, or another call is
-                // performing this action's work (and may still be within its claim).
-                let claimed = action.claimed?;
-                if now.duration_since(claimed).unwrap_or_default() < CLAIM_TIMEOUT {
-                    return None;
+                // Either a human has not answered this action's approval yet, or another
+                // call is performing its work (and may still be within its claim).
+                // Either way it is THIS action that waits and not the rest of its run
+                // order, so the walk moves on to its siblings; a claim nobody completed
+                // is reclaimed below.
+                match action.claimed {
+                    Some(claimed)
+                        if now.duration_since(claimed).unwrap_or_default() >= CLAIM_TIMEOUT => {}
+                    _ => continue,
                 }
             }
-            match action.due {
-                // The step is due a span after the step BEFORE it finished, so the
-                // passage of time alone makes it due: the instant is derived from the
-                // newest completed action of this execution — or from its start, for the
-                // first step — never from the call that happens to observe it.
-                None => {
-                    let anchor = record
-                        .stages
-                        .iter()
-                        .flat_map(|stage| &stage.actions)
-                        .filter(|action| action.is_terminal())
-                        .map(|action| action.last_status_change)
-                        .max()
-                        .unwrap_or(record.start_time);
-                    let due = anchor + ACTION_STEP;
-                    record.stages[stage].actions[index].due = Some(due);
-                    record.last_update_time = now;
-                    if due > now {
-                        return None;
-                    }
-                }
-                Some(due) if due > now => return None,
-                Some(_) => {}
+            // The whole run order shares one due instant, so an action whose instant has
+            // not arrived means none of its siblings' has either.
+            if action.due.is_some_and(|due| due > now) {
+                continue;
             }
             return start_action(record, context, stage, index, now);
         }
@@ -708,11 +722,19 @@ fn start_action(
         .and_then(|run| super::execution::declared_action(declaration, run, index))
         .cloned();
     let action = &mut record.stages[stage].actions[index];
-    action.status = Some(ACTION_IN_PROGRESS.to_string());
-    action.last_status_change = now;
     // The instant the execution REACHED this action, which is what the action
-    // execution's `startTime` reports however long its work then takes.
-    action.start_time = Some(now);
+    // execution's `startTime` reports however long its work then takes: the instant the
+    // clock made this step DUE, not the instant a call happened to materialise it. So
+    // every action of one run order reports the same start — they run concurrently — and
+    // a caller that polls late does not move the start it then reads. It is never before
+    // the action's own last recorded change either, so a re-run action (which a retry
+    // resets at the instant it asks for it) does not report a start from before the
+    // request that re-ran it.
+    let floor = action.last_status_change.min(now);
+    let began = action.due.map_or(now, |due| due.clamp(floor, now));
+    action.status = Some(ACTION_IN_PROGRESS.to_string());
+    action.last_status_change = began;
+    action.start_time = Some(began);
     let Some(declared) = declared else {
         fail_action(
             action,

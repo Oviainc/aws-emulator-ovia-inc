@@ -8,10 +8,10 @@
 //!
 //! `StartPipelineExecution` does not just mint an id: the service then DRIVES the
 //! execution. Each stage's actions run in `runOrder` order (an action never starts
-//! before every action of a lower run order has finished; the actions of ONE run order
-//! are started one step apart rather than at the same instant, which changes when each
-//! begins but not what the stage waits for), an action's artifacts are produced into
-//! the pipeline's `artifactStore`, and the execution reaches a terminal
+//! before every action of a lower run order has finished, and the actions of ONE run
+//! order run concurrently: they all start at the same instant and none of them waits for
+//! a sibling), an action's artifacts are produced into the
+//! pipeline's `artifactStore`, and the execution reaches a terminal
 //! `PipelineExecutionStatus` (`Succeeded`, `Failed`, `Stopped`, `Superseded`) that the
 //! reporting operations report. So the execution's progress is a function of the stored
 //! declaration and the CLOCK, not of what anybody asked for.
