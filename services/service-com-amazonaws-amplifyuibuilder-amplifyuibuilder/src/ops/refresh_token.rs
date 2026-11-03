@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RefreshToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RefreshToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RefreshToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Refreshing a third-party access token: the caller presents the refresh token it holds
+//! for a provider, and the service answers with a NEW access token for that session plus
+//! the whole seconds it stays usable.
+//!
+//! The refresh token is the PROVIDER's, not this service's — nothing here issues one — so
+//! the session a refresh addresses is named by the request itself (provider, `clientId`,
+//! refresh token) and the access token it hands back is minted by the emulator's
+//! credential store and stored as that session's live token
+//! (`crate::state::ProviderTokenSession`). Every value in the response is read off that
+//! stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -84,10 +86,29 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-amplifyuibuilder-amplif
 // here — hence the `RefreshTokenError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.amplifyuibuilder#RefreshToken")]
+// `InternalServerException` and `ServiceQuotaExceededException` are widened in through
+// `extra_errors`, both shapes this SERVICE models and both declared in
+// `types/shared_types.rs`:
+//
+// * `InternalServerException` (HTTP 500) — an unreachable shared store, or a credential
+//   store that minted no secret to build an access token from, is a server-side
+//   condition rather than a malformed request, and it is the server failure every
+//   sibling handler in this crate reports (`CreateComponent`, `GetComponent`,
+//   `PutMetadataFlag` all list or widen it).
+// * `ServiceQuotaExceededException` (HTTP 402) — the session a refresh stores is keyed by
+//   request-supplied values, so the store is bounded like the component and metadata
+//   stores (`crate::state::PROVIDER_TOKEN_SESSION_QUOTA`), and past that bound a refresh
+//   that would start ANOTHER session is refused rather than growing the state without
+//   end.
+#[smithy_macros::operation_error(
+    "com.amazonaws.amplifyuibuilder#RefreshToken",
+    extra_errors = ["InternalServerException", "ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum RefreshTokenErrorModeled {
+    InternalServerException(InternalServerException),
     InvalidParameterException(InvalidParameterException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -141,18 +162,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RefreshToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RefreshTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RefreshToken"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // An unreachable shared store is a server-side condition, not a refusal
+            // of a request that satisfied every constraint the model declares.
+            return Err(RefreshTokenErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the amplifyuibuilder token store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `token` is `@required` but carries no `@length`, so the model admits a blank
+        // one: a refresh token of no characters names no session to refresh, which is
+        // the invalid input parameter this operation models. The refusal quotes nothing
+        // — the member is `@sensitive`.
+        if input.refresh_token_body.token.trim().is_empty() {
+            return Err(RefreshTokenErrorModeled::InvalidParameterException(
+                crate::state::blank_refresh_token(),
+            )
+            .into());
+        }
+
+        // Minted by the emulator's credential store, outside the store lock: a service
+        // never constructs secret material itself.
+        let Some(access_token) = crate::state::mint_provider_access_token(ctx.credential_store())
+        else {
+            return Err(RefreshTokenErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("no access token could be minted for this request".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // The session this refresh addresses. `provider` is an `@httpLabel` targeting
+        // the `TokenProviders` enum, so the only values that reach here are the ones the
+        // model declares.
+        let key = (
+            input.provider,
+            input.refresh_token_body.client_id,
+            input.refresh_token_body.token,
+        );
+        let mut store = state.lock();
+        // The expiry the clock already owes, materialised before the bound below is
+        // read, so a caller is never refused over access tokens that have run out.
+        store.expire_provider_token_sessions(now);
+
+        if !store.has_room_for_provider_token_session(&key) {
+            return Err(RefreshTokenErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this emulator already holds the maximum of {} live token sessions",
+                        crate::state::PROVIDER_TOKEN_SESSION_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The response is read off the STORED session, so what the caller is handed and
+        // what the store holds for that session cannot differ.
+        let session = store.refresh_provider_token_session(key, access_token, now);
+        Ok(RefreshTokenOutput {
+            access_token: session.access_token.clone(),
+            expires_in: session.expires_in(now),
+        })
     }
 }

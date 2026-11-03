@@ -43,6 +43,17 @@
 //! record the resource's own reader answers from. [`parse_resource_arn`] is what
 //! resolves a `resourceArn` to that record, and [`resource_tags`] /
 //! [`with_resource_tags_mut`] are the one read and the one write over it.
+//!
+//! ## The third-party token surface
+//!
+//! `RefreshToken` answers with an ACCESS TOKEN for a third-party provider, so the
+//! store also holds one [`ProviderTokenSession`] per refresh token it has been
+//! called with: the access token that is currently live for that session, and the
+//! instant it stops being live. The access token is secret material, so it is
+//! minted by the emulator's credential store ([`mint_provider_access_token`]) and
+//! never constructed here, and the record is released by
+//! [`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::expire_provider_token_sessions`]
+//! once the clock has made that expiry due.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -581,6 +592,15 @@ pub struct ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
     /// for a component, the key carries the (appId, environmentName) the create
     /// addressed: a token is scoped to the environment it was used in.
     pub theme_tokens: HashMap<(EnvironmentKey, String), String>,
+    /// The LIVE third-party access token of each token session `RefreshToken`
+    /// has answered, keyed by the [`ProviderTokenKey`] the request named.
+    ///
+    /// One entry per session, REPLACED rather than added to when the same
+    /// session is refreshed again, and dropped once its access token has run out
+    /// ([`Self::expire_provider_token_sessions`]), so the map holds only tokens
+    /// that are still live and never more than
+    /// [`PROVIDER_TOKEN_SESSION_QUOTA`] of them.
+    pub provider_token_sessions: HashMap<ProviderTokenKey, ProviderTokenSession>,
     /// The seed this store's resource ids are minted from, drawn from the
     /// operating system the first time one is minted.
     id_seed: Option<u64>,
@@ -1078,6 +1098,56 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
         }
     }
 
+    /// Materialise the expiry the clock has ALREADY made due: forget every token
+    /// session whose access token has run out.
+    ///
+    /// Owed at each session's `expires_at` whether or not anybody called, so a
+    /// token handler runs this first and then reads only live sessions.
+    /// Idempotent.
+    pub fn expire_provider_token_sessions(&mut self, now: SystemTime) {
+        self.provider_token_sessions
+            .retain(|_, session| session.is_live(now));
+    }
+
+    /// The live token session `key` addresses, or `None` when this store holds
+    /// none for it.
+    pub fn provider_token_session(&self, key: &ProviderTokenKey) -> Option<&ProviderTokenSession> {
+        self.provider_token_sessions.get(key)
+    }
+
+    /// Whether the store may hold the session `key` names: one it already holds
+    /// always may (nothing grows), a new one only while the store is under
+    /// [`PROVIDER_TOKEN_SESSION_QUOTA`]. Call this BEFORE
+    /// [`Self::refresh_provider_token_session`].
+    pub fn has_room_for_provider_token_session(&self, key: &ProviderTokenKey) -> bool {
+        self.provider_token_sessions.contains_key(key)
+            || self.provider_token_sessions.len() < PROVIDER_TOKEN_SESSION_QUOTA
+    }
+
+    /// Make `access_token` the live access token of the session `key` names,
+    /// from `now`, and report the STORED record — which is what the response is
+    /// read off, so a caller is never told a token the store does not hold.
+    ///
+    /// A session the store already holds is REPLACED: refreshing hands out a new
+    /// access token, and the one it supersedes stops being the session's.
+    pub fn refresh_provider_token_session(
+        &mut self,
+        key: ProviderTokenKey,
+        access_token: String,
+        now: SystemTime,
+    ) -> &ProviderTokenSession {
+        use std::collections::hash_map::Entry;
+
+        let session = ProviderTokenSession::new(&key, access_token, now);
+        match self.provider_token_sessions.entry(key) {
+            Entry::Occupied(mut held) => {
+                held.insert(session);
+                held.into_mut()
+            }
+            Entry::Vacant(empty) => empty.insert(session),
+        }
+    }
+
     /// One candidate id: a version 4 UUID whose 122 free bits are the leading
     /// bits of a SHA-256 digest over this store's seed, a counter and the clock.
     ///
@@ -1284,6 +1354,168 @@ fn token_scope(key: &EnvironmentKey) -> u32 {
 /// True when `name` is a feature this service's metadata holds.
 pub fn is_known_metadata_feature(name: &str) -> bool {
     METADATA_FEATURES.contains(&name)
+}
+
+// ---------------------------------------------------------------------------
+// The third-party token surface: the access token `RefreshToken` hands back.
+// ---------------------------------------------------------------------------
+
+/// How long an access token this service hands back stays live, and so the
+/// `expiresIn` a freshly minted one reports.
+///
+/// CHOSEN, not documented: AWS publishes no lifetime for the access token the
+/// AmplifyUIBuilder token operations answer with. An hour is long enough for a
+/// caller to use the token it was just handed, and short enough that a session
+/// nobody refreshes is released from the store again soon.
+pub const PROVIDER_ACCESS_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
+
+/// How many characters of credential-store secret an access token carries.
+///
+/// CHOSEN: AWS publishes no length for it, and the token is opaque to a caller.
+/// 32 characters of the store's 64-symbol alphabet is ~192 bits, so a token
+/// cannot be guessed inside [`PROVIDER_ACCESS_TOKEN_LIFETIME`].
+pub const PROVIDER_ACCESS_TOKEN_CHARS: usize = 32;
+
+/// How many live token sessions the store holds before a refresh that would
+/// start another one is refused.
+///
+/// A session is keyed by request-supplied values, so without a bound every
+/// request naming a fresh refresh token would add an entry. Amplify UI Builder
+/// publishes no quota this emulator can quote, so — exactly like
+/// [`COMPONENT_QUOTA`] — this is the emulator's OWN bound on the store, set far
+/// above any workflow an emulator serves. Each entry is released by
+/// [`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::expire_provider_token_sessions`]
+/// as soon as its access token has run out, so the bound holds a count of LIVE
+/// tokens rather than of calls.
+pub const PROVIDER_TOKEN_SESSION_QUOTA: usize = 1_000;
+
+/// Which token session a request addresses: the `provider` it names, the
+/// `clientId` it carries (absent when it names none) and the refresh token
+/// itself.
+///
+/// All three, because a refresh token is issued to ONE client of ONE provider:
+/// two clients presenting the same token hold two sessions, each with its own
+/// access token, rather than taking each other's.
+pub type ProviderTokenKey = (String, Option<String>, String);
+
+/// One live third-party token session: the access token this service last handed
+/// back for a refresh token, and when that access token stops being live.
+///
+/// The refresh token itself is NOT this service's to mint — a caller holds one
+/// the provider issued — so it is held only as the key's third element, and this
+/// record states nothing further about it.
+#[derive(Clone)]
+pub struct ProviderTokenSession {
+    /// The provider the session's tokens belong to (`TokenProviders`).
+    pub provider: String,
+    /// The `clientId` the refreshing request named, if it named one.
+    pub client_id: Option<String>,
+    /// The access token currently live for the session. Minted by the emulator's
+    /// credential store (see [`mint_provider_access_token`]), never constructed
+    /// here.
+    pub access_token: String,
+    /// When this access token was handed back.
+    pub issued_at: SystemTime,
+    /// When it stops being live: [`PROVIDER_ACCESS_TOKEN_LIFETIME`] after
+    /// [`Self::issued_at`].
+    pub expires_at: SystemTime,
+}
+
+/// Prints the session's provider and client but NEITHER token, so a formatted or
+/// logged value leaks no secret material — the shape the credential store's own
+/// minted-credential type takes for the same reason.
+impl std::fmt::Debug for ProviderTokenSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderTokenSession")
+            .field("provider", &self.provider)
+            .field("client_id", &self.client_id)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProviderTokenSession {
+    /// The session `key` names, carrying `access_token` from `now` until
+    /// [`PROVIDER_ACCESS_TOKEN_LIFETIME`] later.
+    pub fn new(key: &ProviderTokenKey, access_token: String, now: SystemTime) -> Self {
+        Self {
+            provider: key.0.clone(),
+            client_id: key.1.clone(),
+            access_token,
+            issued_at: now,
+            expires_at: now + PROVIDER_ACCESS_TOKEN_LIFETIME,
+        }
+    }
+
+    /// Whether this access token is still live at `now`.
+    pub fn is_live(&self, now: SystemTime) -> bool {
+        now < self.expires_at
+    }
+
+    /// The `expiresIn` a response reports for this access token: the whole
+    /// seconds it has left at `now`, read off the stored expiry instant.
+    ///
+    /// A SPAN, not an instant. The model's prose for the member reads "The date
+    /// and time when the new access token expires", but it targets `Integer`
+    /// with no timestamp format and no units
+    /// (`smithy_query(query="operation", operation="RefreshToken")`), and the
+    /// name both token operations report it under — `expiresIn`, a time to live
+    /// — is what a caller reads: how long the token it was just handed remains
+    /// usable, the quantity a provider's OAuth token endpoint reports in
+    /// seconds. What the service ENFORCES is the expiry INSTANT
+    /// ([`Self::expires_at`], applied by
+    /// [`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::expire_provider_token_sessions`]),
+    /// and this span is read from it rather than from the request.
+    pub fn expires_in(&self, now: SystemTime) -> i32 {
+        let left = self
+            .expires_at
+            .duration_since(now)
+            .unwrap_or_default()
+            .as_secs();
+        i32::try_from(left).unwrap_or(i32::MAX)
+    }
+}
+
+/// A fresh third-party access token, or `None` when the credential store minted
+/// no secret to build one from.
+///
+/// An access token is a secret handed to a caller, and nothing in a service may
+/// construct secret material itself, so it is drawn from the one component that
+/// generates secrets. It authenticates to the THIRD-PARTY provider and not to
+/// this emulator, so the credential is removed from the store again straight
+/// away: the caller gets the token, the emulator keeps no credential it would
+/// accept as SigV4, and nothing accumulates per call.
+pub fn mint_provider_access_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let access_token: Option<String> = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .map(|secret| secret.chars().take(PROVIDER_ACCESS_TOKEN_CHARS).collect());
+    // Reclaimed on EVERY path: the token is not a credential of this emulator
+    // (see above), so a mint that yielded no secret must not leave one behind
+    // either.
+    let _ = store.delete(&minted.id);
+    access_token
+}
+
+/// The message of the refusal of a token request whose refresh token carries no
+/// characters at all.
+///
+/// `RefreshTokenRequestBody$token` is a `@required` `SensitiveString` with no
+/// `@length` (`smithy_query(query="shape", shape="RefreshTokenRequestBody")`),
+/// so the model admits a blank one and the service is what refuses it. The
+/// sentence interpolates NOTHING: the member is `@sensitive`, so a refusal must
+/// not quote the value it rejected, and — like every message of this service
+/// ([`ITEM_NOT_FOUND_MESSAGE`] and the literals beside it) — it is the only
+/// machine-readable name this failure class has on an untyped error.
+pub const BLANK_REFRESH_TOKEN_MESSAGE: &str = "The refresh token provided is not valid";
+
+/// The `InvalidParameterException` payload for a refresh token that carries no
+/// characters.
+pub fn blank_refresh_token() -> InvalidParameterException {
+    InvalidParameterException {
+        message: Some(BLANK_REFRESH_TOKEN_MESSAGE.to_string()),
+    }
 }
 
 // The messages of this service's resource refusals.
