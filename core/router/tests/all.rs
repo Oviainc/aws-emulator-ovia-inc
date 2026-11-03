@@ -19,6 +19,11 @@
 // else appends to.
 #[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
 mod cloudformation_refuses_s3vectors_vector_buckets;
+// Declared here, in this same head region, for the reason the entry above records: the
+// appended tail and the sorted `s…` span (where every sqs suite lands) are both regions
+// concurrently landing suites add their line to.
+#[path = "all/sqs_queue_policy_governs_cross_service_delivery.rs"]
+mod sqs_queue_policy_governs_cross_service_delivery;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `a…` span (beside the other application* suites) are both regions concurrently
 // landing suites add their line to.
