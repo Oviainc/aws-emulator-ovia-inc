@@ -25,6 +25,8 @@ mod firewall_protection_settings;
 mod flow_operations;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/reference_validation.rs"]
+mod reference_validation;
 #[path = "all/refusal_message_shapes.rs"]
 mod refusal_message_shapes;
 #[path = "all/resource_policies.rs"]

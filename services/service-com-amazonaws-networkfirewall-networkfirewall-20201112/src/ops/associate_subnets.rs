@@ -262,7 +262,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 crate::state::impl_resolve_error!(
     associate_lookup_error -> AssociateSubnetsError, AssociateSubnetsErrorModeled,
-    plural = "firewalls",
     name_member = "FirewallName", arn_member = "FirewallArn"
 );
 

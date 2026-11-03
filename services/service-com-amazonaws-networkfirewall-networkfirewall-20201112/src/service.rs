@@ -40,9 +40,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
 /// How this service words a boundary refusal. Private: it is reached through
@@ -104,13 +102,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this
         // service reword it.
         //
-        // This endpoint states such a refusal without the VALUE the caller sent, reports a
-        // constraint declared on the ELEMENTS of a collection member at that member with
-        // the element shape's whole constraint set, and enumerates an enumerated type's
-        // value set as the service accepts it. See `validation`, which owns those three
-        // rules; the envelope, the member paths and every requirement sentence stay the
-        // framework's, as does the error code, restated there because this seam replaces
-        // the code and the message together.
+        // This endpoint refuses a value that cannot be one of its resource ARNs as the
+        // malformed REFERENCE it is, with the modelled error its handlers answer the same
+        // defect with. Otherwise it states the refusal without the VALUE the caller sent,
+        // reports a constraint declared on the ELEMENTS of a collection member at that member
+        // with the element shape's whole constraint set, and enumerates an enumerated type's
+        // value set as the service accepts it. See `validation`, which owns those rules; the
+        // envelope, the member paths and every requirement sentence stay the framework's, as
+        // does the error code, restated there because this seam replaces the code and the
+        // message together.
         validation::refused(refusal)
     }
 
@@ -142,3 +142,5 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         None
     }
 }
+
+

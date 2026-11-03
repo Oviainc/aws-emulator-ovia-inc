@@ -227,7 +227,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 crate::state::impl_resolve_error!(
     describe_lookup_error -> DescribeRuleGroupError, DescribeRuleGroupErrorModeled,
-    plural = "rule groups",
     name_member = "RuleGroupName", arn_member = "RuleGroupArn"
 );
 

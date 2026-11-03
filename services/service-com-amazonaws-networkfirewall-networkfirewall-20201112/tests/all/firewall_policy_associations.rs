@@ -396,7 +396,7 @@ async fn refused_policy_associations_change_nothing() {
             label: "no firewall identified at all",
             request: json!({ "FirewallPolicyArn": policy_arn("refuse-b") }),
             code: "InvalidRequestException",
-            message: Some("You must specify either FirewallName or FirewallArn."),
+            message: Some("At least one of FirewallName or FirewallArn must be set"),
         },
         RefusalCase {
             label: "name and ARN identify different firewalls",
@@ -406,7 +406,7 @@ async fn refused_policy_associations_change_nothing() {
                 "FirewallPolicyArn": policy_arn("refuse-b"),
             }),
             code: "InvalidRequestException",
-            message: Some("FirewallName and FirewallArn identify different firewalls."),
+            message: Some("Name and Arn(Name in Arn) do not match"),
         },
         RefusalCase {
             label: "the policy ARN names no stored policy",

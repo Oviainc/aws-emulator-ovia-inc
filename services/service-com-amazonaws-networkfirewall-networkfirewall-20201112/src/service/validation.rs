@@ -9,10 +9,19 @@
 //! reached from [`crate::service`]'s `override_refusal`, the one seam that sees a refusal
 //! taken before dispatch.
 //!
-//! Three rules distinguish this service's wording from the framework's default. None is keyed
-//! to an operation, a member name or a value, so each holds for every constrained member of
+//! Four rules distinguish this service's wording from the framework's default. The first is
+//! the one keyed to MEMBERS — the references this service resolves itself — and the other
+//! three are keyed to nothing at all, so each of those holds for every constrained member of
 //! every operation of this service:
 //!
+//! 0. a value in a member that carries a RESOURCE REFERENCE this service resolves itself
+//!    ([`REFERENCE_ARN_MEMBERS`]), refused because it is outside the form or the length a
+//!    `ResourceArn` declares, is not a validation clause at all: it cannot be one of this
+//!    service's ARNs, which is the same defect the resolution path refuses once a value
+//!    reaches a handler ([`crate::state::ARN_INVALID_FORMAT_MESSAGE`]), so it leaves as THAT
+//!    modelled client error with that constant — never as an error shape this service's
+//!    model does not declare. This one is keyed to member names because a reference is a
+//!    member-level fact: the model says which members name a resource;
 //! 1. a clause names the offending MEMBER PATH and the CONSTRAINT it broke, and NOTHING of
 //!    the value the caller sent — not the submitted bytes, and not the `null` the framework
 //!    writes where a member was absent. The requirement states what the request must
@@ -34,8 +43,8 @@
 //! rather than rewording: [`service_common::validation_message::aws_validation_refusal_over_elements_withholding`]
 //! is the entry point that takes both halves (withhold every value, group over a collection's
 //! elements), and the envelope, the member paths, the element sets and every requirement
-//! sentence stay the framework's and that module's. Rule 3 is the only wording this service
-//! owns, because the value set it states is a fact about THIS service.
+//! sentence stay the framework's and that module's. Rules 0 and 3 are the only wording this
+//! service owns, because what each states is a fact about THIS service.
 //!
 //! One limit of that shared rendering, which it states too: an element set is read off the
 //! operation input schemas codegen derives from the model, and a member schema carries its own
@@ -46,6 +55,21 @@
 use ::aws_smithy_schema::Schema;
 use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use ::smithy_server_runtime::{Refusal, Refused};
+
+/// The members that carry a RESOURCE REFERENCE this service resolves itself, as a violation
+/// path spells a top-level member (lowerCamel).
+///
+/// Rule 0 is keyed to these by member NAME, because that is all this seam sees: a refusal
+/// carries the member path and not the operation. So the set holds only the ARN members whose
+/// every binding IS such a reference — `FirewallArn` and `RuleGroupArn`. `FirewallPolicyArn`
+/// is deliberately absent: it is half of `DescribeFirewallPolicy`'s pair, but on
+/// `CreateFirewall` the same member name is a required reference to another resource whose
+/// refusal for a malformed value is recorded as a validation clause
+/// (`tests/all/validation_refusal_wording.rs`), and a member-name rule cannot tell the two
+/// bindings apart. Every other ARN-valued member — a `ResourceArn` naming a resource to tag
+/// or share, a reference inside a submitted document — keeps the refusal its own operation
+/// already answers.
+const REFERENCE_ARN_MEMBERS: [&str; 2] = ["firewallArn", "ruleGroupArn"];
 
 /// Enumerated value sets this service's validator enumerates in FULL, each keyed by the set
 /// the public model declares for the same type.
@@ -182,12 +206,17 @@ const INPUT_SCHEMAS: &[&Schema] = {
 /// Only an input-constraint refusal is reworded. An authentication refusal is a different
 /// failure with its own code and status, and nothing about it is this service's to word.
 ///
-/// The error code travels with the message from the shared rendering, which names the one
-/// every operation of this service declares for a refused input.
+/// Rule 0 is answered first and on its own: a refused resource REFERENCE is not a validation
+/// clause this service states, it is the modelled refusal its handlers answer the same defect
+/// with. Everything else takes the shared rendering, whose error code travels with the
+/// message and names the one every operation of this service declares for a refused input.
 pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
     };
+    if let Some(refused) = malformed_reference(violations) {
+        return Some(refused);
+    }
     // Rule 3 is applied to the violations BEFORE the clauses are rendered, so the clause
     // itself, its member path and the words around the value set stay the framework's.
     let stated: Vec<Violation> = violations.iter().map(in_service_value_set).collect();
@@ -201,6 +230,33 @@ pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
         // is about, so the decision is the same for every member path.
         |_| true,
     )
+}
+
+/// The error shape rule 0 answers with: the client error every operation of this service
+/// declares for a request whose reference is bad, which is the shape its handlers return for
+/// the same defect (`smithy_query(query="shape",shape="InvalidRequestException")`).
+const REFERENCE_REFUSAL_CODE: &str = "InvalidRequestException";
+
+/// Rule 0: the malformed-reference refusal when EVERY violation is a reference member whose
+/// value cannot be a resource ARN, and `None` otherwise.
+///
+/// A value outside the member's declared form and one outside its declared length are the
+/// same answer: both are bounds a `ResourceArn` has to satisfy to be an ARN at all. Nothing
+/// of the value reaches the message, which is one constant.
+fn malformed_reference(violations: &[Violation]) -> Option<Refused> {
+    let malformed = !violations.is_empty()
+        && violations.iter().all(|violation| {
+            matches!(
+                violation.kind,
+                ViolationKind::Pattern(_)
+                    | ViolationKind::MinLength(_)
+                    | ViolationKind::MaxLength(_)
+            ) && REFERENCE_ARN_MEMBERS.contains(&violation.path.as_str())
+        });
+    malformed.then(|| Refused {
+        code: REFERENCE_REFUSAL_CODE.to_owned(),
+        message: crate::state::ARN_INVALID_FORMAT_MESSAGE.to_owned(),
+    })
 }
 
 /// `violation` with an enumerated type's value set stated as the SERVICE enumerates it, and

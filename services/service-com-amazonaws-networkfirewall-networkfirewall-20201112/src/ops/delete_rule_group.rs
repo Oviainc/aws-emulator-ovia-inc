@@ -232,7 +232,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 crate::state::impl_resolve_error!(
     delete_lookup_error -> DeleteRuleGroupError, DeleteRuleGroupErrorModeled,
-    plural = "rule groups",
     name_member = "RuleGroupName", arn_member = "RuleGroupArn"
 );
 

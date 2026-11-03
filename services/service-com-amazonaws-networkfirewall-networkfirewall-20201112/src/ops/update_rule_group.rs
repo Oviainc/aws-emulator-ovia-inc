@@ -367,7 +367,6 @@ fn invalid_request(message: &str) -> UpdateRuleGroupError {
 
 crate::state::impl_resolve_error!(
     update_lookup_error -> UpdateRuleGroupError, UpdateRuleGroupErrorModeled,
-    plural = "rule groups",
     name_member = "RuleGroupName", arn_member = "RuleGroupArn"
 );
 

@@ -235,9 +235,10 @@ struct BadIdentifierCase {
 }
 
 /// RULE: a request whose name/ARN pair does not identify exactly one stored
-/// firewall is refused before anything is written — naming neither member, or
-/// two members that identify different firewalls, is `InvalidRequestException`
-/// (HTTP 400) naming the two members; naming one that is not stored is
+/// firewall is refused before anything is written — naming neither member is
+/// `InvalidRequestException` (HTTP 400) naming the two members, a pair whose two
+/// members identify different firewalls is `InvalidRequestException` reporting
+/// that disagreement; naming one that is not stored is
 /// `ResourceNotFoundException` (HTTP 400) with this service's one fixed
 /// not-found text.
 ///
@@ -255,7 +256,7 @@ async fn a_delete_protection_update_that_identifies_no_one_firewall_is_refused()
             label: "neither name nor ARN",
             request: json!({ "DeleteProtection": true }),
             expected_code: "InvalidRequestException",
-            expected_message: "You must specify either FirewallName or FirewallArn.".to_string(),
+            expected_message: "At least one of FirewallName or FirewallArn must be set".to_string(),
         },
         BadIdentifierCase {
             label: "name and ARN identify different firewalls",
@@ -265,8 +266,7 @@ async fn a_delete_protection_update_that_identifies_no_one_firewall_is_refused()
                 "DeleteProtection": true,
             }),
             expected_code: "InvalidRequestException",
-            expected_message: "FirewallName and FirewallArn identify different firewalls."
-                .to_string(),
+            expected_message: "Name and Arn(Name in Arn) do not match".to_string(),
         },
         BadIdentifierCase {
             label: "an ARN no stored firewall carries",

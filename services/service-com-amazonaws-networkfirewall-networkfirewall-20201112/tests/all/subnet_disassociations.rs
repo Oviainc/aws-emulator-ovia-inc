@@ -381,7 +381,7 @@ async fn refused_disassociations_change_nothing() {
             label: "no firewall identified at all",
             request: json!({ "SubnetIds": ["subnet-d00"] }),
             code: "InvalidRequestException",
-            message: Some("You must specify either FirewallName or FirewallArn."),
+            message: Some("At least one of FirewallName or FirewallArn must be set"),
         },
         RefusalCase {
             label: "name and ARN identify different firewalls",
@@ -391,7 +391,7 @@ async fn refused_disassociations_change_nothing() {
                 "SubnetIds": ["subnet-d00"],
             }),
             code: "InvalidRequestException",
-            message: Some("FirewallName and FirewallArn identify different firewalls."),
+            message: Some("Name and Arn(Name in Arn) do not match"),
         },
         RefusalCase {
             label: "no subnet named",

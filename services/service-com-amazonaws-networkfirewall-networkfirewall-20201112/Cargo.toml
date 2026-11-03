@@ -8,6 +8,12 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# `service-common` carries the workspace's ONE caller-supplied-ARN parse, which this service
+# reads every name/ARN reference through, and `validation_message`: the fleet's one rendering
+# of a boundary refusal — the AWS envelope, the clause with its value half dropped, and a
+# collection's element constraint set stated at the collection member — which
+# `service::validation` delegates to rather than wording.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -21,10 +27,6 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# `validation_message`: the fleet's one rendering of a boundary refusal — the AWS envelope,
-# the clause with its value half dropped, and a collection's element constraint set stated
-# at the collection member — which `service::validation` delegates to rather than wording.
-service-common = { path = "../common" }
 # SHA-256, used to mint the server-generated `ResourceId` / `UpdateToken` and
 # firewall-endpoint ids this service hands out (see `state::fresh_bytes`).
 sha2 = { workspace = true }

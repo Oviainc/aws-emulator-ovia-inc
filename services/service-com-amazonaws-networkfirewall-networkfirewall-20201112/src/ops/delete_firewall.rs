@@ -251,6 +251,5 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 crate::state::impl_resolve_error!(
     delete_lookup_error -> DeleteFirewallError, DeleteFirewallErrorModeled,
-    plural = "firewalls",
     name_member = "FirewallName", arn_member = "FirewallArn"
 );

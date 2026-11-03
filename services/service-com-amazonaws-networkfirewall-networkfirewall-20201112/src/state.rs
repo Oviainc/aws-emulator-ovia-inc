@@ -383,16 +383,56 @@ impl SharedResource {
 /// What `arn` names, or `None` when it names a resource kind that cannot carry a
 /// resource policy (a firewall, say).
 pub fn shared_resource_kind(arn: &str) -> Option<SharedResource> {
-    let resource = arn.split(':').next_back()?;
-    let (resource_type, _) = resource.split_once('/')?;
+    let (resource_type, _) = own_resource(arn)?;
     match resource_type {
-        "firewall-policy" => Some(SharedResource::FirewallPolicy),
-        "stateless-rulegroup" | "stateful-rulegroup" | "stateful-domain-rulegroup" => {
-            Some(SharedResource::RuleGroup)
-        }
+        ARN_TYPE_FIREWALL_POLICY => Some(SharedResource::FirewallPolicy),
+        group_type if ARN_TYPES_RULE_GROUP.contains(&group_type) => Some(SharedResource::RuleGroup),
         _ => None,
     }
 }
+
+/// The `(resource type, resource name)` the ARN `arn` names, or `None` when it
+/// names no resource of THIS service.
+///
+/// The ARN grammar is the workspace's one caller-supplied-ARN parse
+/// ([`::service_common::arn`]), so this service splits no ARN itself. What it
+/// adds is what a Network Firewall ARN is: its own vendor namespace — another
+/// vendor's resource is addressable by no operation here, whatever its resource
+/// field spells — and a resource field naming both a TYPE and a resource
+/// (`<type>/<name>`, or the `<type>:<name>` form AWS also writes), which every
+/// one of this service's resources takes.
+pub fn own_resource(arn: &str) -> Option<(&str, &str)> {
+    let parsed = ::service_common::arn::parse_of(arn, ARN_NAMESPACE)?;
+    let resource_type = parsed.resource_type();
+    let resource_name = ::service_common::arn::resource_id_of_type(arn, resource_type)?;
+    (!resource_type.is_empty() && !resource_name.is_empty())
+        .then_some((resource_type, resource_name))
+}
+
+/// The ARN resource type a firewall carries (`firewall/<name>`).
+pub const ARN_TYPE_FIREWALL: &str = "firewall";
+
+/// The ARN resource type a firewall policy carries (`firewall-policy/<name>`).
+pub const ARN_TYPE_FIREWALL_POLICY: &str = "firewall-policy";
+
+/// The ARN resource type a stateless rule group carries.
+pub const ARN_TYPE_STATELESS_RULE_GROUP: &str = "stateless-rulegroup";
+
+/// The ARN resource type a stateful rule group carries.
+pub const ARN_TYPE_STATEFUL_RULE_GROUP: &str = "stateful-rulegroup";
+
+/// The ARN resource type a stateful DOMAIN rule group carries.
+pub const ARN_TYPE_STATEFUL_DOMAIN_RULE_GROUP: &str = "stateful-domain-rulegroup";
+
+/// The ARN resource types a rule group carries, one per half of the rule-group
+/// name space plus the stateful-domain form of it — the types
+/// [`rule_group_resource_path`] builds and the ones a rule-group reference may
+/// name.
+pub const ARN_TYPES_RULE_GROUP: [&str; 3] = [
+    ARN_TYPE_STATELESS_RULE_GROUP,
+    ARN_TYPE_STATEFUL_RULE_GROUP,
+    ARN_TYPE_STATEFUL_DOMAIN_RULE_GROUP,
+];
 
 /// The resource kinds Network Firewall tags: "You can tag the Amazon Web Services
 /// resources that you manage through Network Firewall: firewalls, firewall
@@ -414,12 +454,11 @@ pub enum TaggableResource {
 /// isn't valid in the context of the request", which is what
 /// `InvalidRequestException` documents.
 pub fn taggable_resource_kind(arn: &str) -> Option<TaggableResource> {
-    let resource = arn.split(':').next_back()?;
-    let (resource_type, _) = resource.split_once('/')?;
+    let (resource_type, _) = own_resource(arn)?;
     match resource_type {
-        "firewall" => Some(TaggableResource::Firewall),
-        "firewall-policy" => Some(TaggableResource::FirewallPolicy),
-        "stateless-rulegroup" | "stateful-rulegroup" | "stateful-domain-rulegroup" => {
+        ARN_TYPE_FIREWALL => Some(TaggableResource::Firewall),
+        ARN_TYPE_FIREWALL_POLICY => Some(TaggableResource::FirewallPolicy),
+        group_type if ARN_TYPES_RULE_GROUP.contains(&group_type) => {
             Some(TaggableResource::RuleGroup)
         }
         _ => None,
@@ -626,12 +665,17 @@ pub fn firewall_policy_arn(region: &str, name: &str) -> String {
 /// what makes a name reusable across the stateless and stateful halves of the
 /// service.
 pub fn rule_group_resource_path(group_type: &str, name: &str) -> String {
-    let kind = if group_type == RULE_GROUP_STATELESS {
-        "stateless-rulegroup"
+    format!("{}/{name}", rule_group_arn_type(group_type))
+}
+
+/// The ARN resource type a rule group of `group_type` carries: the stateless
+/// half of the name space has its own, and every stateful type shares the other.
+pub fn rule_group_arn_type(group_type: &str) -> &'static str {
+    if group_type == RULE_GROUP_STATELESS {
+        ARN_TYPE_STATELESS_RULE_GROUP
     } else {
-        "stateful-rulegroup"
-    };
-    format!("{kind}/{name}")
+        ARN_TYPE_STATEFUL_RULE_GROUP
+    }
 }
 
 /// `arn:aws:network-firewall:<region>:<account>:<stateful|stateless>-rulegroup/<name>`.
@@ -1033,6 +1077,12 @@ pub enum ResolveError {
     NoIdentifier,
     /// Both were supplied and they name different resources.
     Mismatch,
+    /// The ARN does not have the form of a resource ARN that names one of this
+    /// service's resources.
+    MalformedArn,
+    /// The ARN is well formed but names another service's resource, or a
+    /// resource type the operation does not address.
+    WrongResourceType,
     /// No stored resource carries that name or ARN.
     NotFound,
 }
@@ -1051,9 +1101,35 @@ pub enum RuleGroupLookupError {
 /// What a request that gives a rule group's name but neither its `Type` nor its
 /// ARN is refused with: `DescribeRuleGroup$Type` (and the same member on every
 /// other rule-group operation) is "required for requests that do not include the
-/// RuleGroupARN".
-pub const TYPE_REQUIRED_MESSAGE: &str =
-    "Type is required for requests that do not include the RuleGroupArn.";
+/// RuleGroupARN", so a name alone names at most half of a rule group's identity.
+/// The text names the member and the resource kind only, and carries nothing
+/// from the request.
+pub const TYPE_REQUIRED_MESSAGE: &str = "Type must be set when referring to RuleGroup by name";
+
+/// What a request supplying an ARN that is not a well-formed resource ARN is
+/// refused with, whichever member the reference arrived in.
+///
+/// The defect is a property of the reference, not of the request: the text names
+/// neither the member, nor the resource kind, nor the offending value. The model
+/// fixes the classification and the status only
+/// (`smithy_query(query="shape",shape="InvalidRequestException")`: client error,
+/// HTTP 400, member `Message`, "Your request references an ARN that is
+/// malformed, or corresponds to a resource that isn't valid in the context of
+/// the request").
+pub const ARN_INVALID_FORMAT_MESSAGE: &str = "Resource ARN has an invalid format.";
+
+/// What a request supplying a well-formed ARN whose resource-type segment is not
+/// the type the operation addresses is refused with — the second half of
+/// [`ARN_INVALID_FORMAT_MESSAGE`]'s documented pair, "a resource that isn't
+/// valid in the context of the request". It names the mismatch itself and
+/// carries neither the type asked for nor the one the ARN holds.
+pub const ARN_TYPE_MISMATCH_MESSAGE: &str = "Resource Type and Arn(Type in Arn) do not match";
+
+/// What a request supplying BOTH a name and an ARN that identify different
+/// resources is refused with — the same family as [`ARN_TYPE_MISMATCH_MESSAGE`],
+/// one segment of the ARN disagreeing with what the request said it should be. It
+/// names the mismatch itself and carries neither member's value.
+pub const ARN_NAME_MISMATCH_MESSAGE: &str = "Name and Arn(Name in Arn) do not match";
 
 /// What EVERY `ResourceNotFoundException` this service answers carries.
 ///
@@ -1978,9 +2054,14 @@ impl ComAmazonawsNetworkfirewallNetworkfirewall20201112State {
         name: Option<&str>,
         arn: Option<&str>,
     ) -> Result<String, ResolveError> {
-        resolve(&self.firewall_arn_index, name, arn, |key| {
-            self.firewalls.contains_key(key)
-        })
+        resolve(
+            &self.firewall_arn_index,
+            name,
+            name,
+            arn,
+            &[ARN_TYPE_FIREWALL],
+            |key| self.firewalls.contains_key(key),
+        )
     }
 
     /// Accept a flow operation of `operation_type` on the firewall `request`
@@ -2094,9 +2175,14 @@ impl ComAmazonawsNetworkfirewallNetworkfirewall20201112State {
         name: Option<&str>,
         arn: Option<&str>,
     ) -> Result<String, ResolveError> {
-        resolve(&self.firewall_policy_arn_index, name, arn, |key| {
-            self.firewall_policies.contains_key(key)
-        })
+        resolve(
+            &self.firewall_policy_arn_index,
+            name,
+            name,
+            arn,
+            &[ARN_TYPE_FIREWALL_POLICY],
+            |key| self.firewall_policies.contains_key(key),
+        )
     }
 
     /// The [`rule_groups`](Self::rule_groups) key a request's `RuleGroupName`,
@@ -2107,7 +2193,12 @@ impl ComAmazonawsNetworkfirewallNetworkfirewall20201112State {
     /// `Type` "is required for requests that do not include the RuleGroupARN"
     /// (`DescribeRuleGroup$Type`). With an ARN in hand the name adds nothing the
     /// ARN does not already carry, so a typeless name is resolved through the ARN
-    /// and then checked against the record rather than ignored.
+    /// — and still checked against it, like every other name beside an ARN.
+    ///
+    /// `Type` narrows which ARN resource type the reference may carry, because
+    /// the type is part of a rule group's ARN: a request that asks for one half
+    /// of the name space with the other half's ARN names the wrong kind of
+    /// resource.
     ///
     /// Every rule-group operation that takes this triple resolves it here, so one
     /// identification rule serves the read, the update and the delete alike.
@@ -2124,23 +2215,20 @@ impl ComAmazonawsNetworkfirewallNetworkfirewall20201112State {
             }
             (_, _) => None,
         };
-        let key = resolve(
+        let requested_type = group_type.map(rule_group_arn_type);
+        let resource_types: &[&str] = match &requested_type {
+            Some(resource_type) => ::std::slice::from_ref(resource_type),
+            None => &ARN_TYPES_RULE_GROUP,
+        };
+        resolve(
             &self.rule_group_arn_index,
+            name,
             resource_path.as_deref(),
             arn,
+            resource_types,
             |key| self.rule_groups.contains_key(key),
         )
-        .map_err(RuleGroupLookupError::Resolve)?;
-        if resource_path.is_none()
-            && name.is_some_and(|name| {
-                self.rule_groups
-                    .get(&key)
-                    .is_some_and(|record| record.rule_group_name != name)
-            })
-        {
-            return Err(RuleGroupLookupError::Resolve(ResolveError::Mismatch));
-        }
-        Ok(key)
+        .map_err(RuleGroupLookupError::Resolve)
     }
 
     /// Why a `FirewallPolicy` document's rule-group references cannot be served,
@@ -2384,22 +2472,65 @@ fn policy_rule_group_references(policy: &FirewallPolicy) -> impl Iterator<Item =
         )
 }
 
-/// The shared name-or-ARN resolution rule: an ARN resolves through the index, a
-/// name is used directly, both must agree, and the result must still exist.
+/// The resource type and the resource name a reference ARN names, or why it names
+/// no resource of this service.
+///
+/// [`own_resource`] is the one grammar; this reads its two refusals apart,
+/// because they are different to a caller: a value that is not an ARN of this
+/// service's form is MALFORMED, while one that is an ARN of another vendor names
+/// a resource that is simply not addressable here.
+fn reference_resource(arn: &str) -> Result<(&str, &str), ResolveError> {
+    let vendor = ::service_common::arn::vendor(arn).ok_or(ResolveError::MalformedArn)?;
+    if vendor != ARN_NAMESPACE {
+        return Err(ResolveError::WrongResourceType);
+    }
+    own_resource(arn).ok_or(ResolveError::MalformedArn)
+}
+
+/// The shared name-or-ARN resolution rule, in the order a caller observes it: a
+/// reference must be supplied; a supplied ARN must be a resource ARN of this
+/// service ([`reference_resource`]); a name supplied beside it must be the name
+/// that ARN carries; the ARN's resource type must be one of `resource_types`; and
+/// only then must the resource the reference identifies — `name_key`, or the ARN
+/// through the index — still exist.
+///
+/// `name` is the resource name the request gave and `name_key` the store key that
+/// name identifies (the two differ where a resource's key is not its bare name).
+/// The reference is CHECKED before the store is consulted, so a request that
+/// names no resource — no identifier at all, an ARN that is not one, an ARN
+/// carrying another name or another kind of resource — is a bad request rather
+/// than a lookup miss.
 fn resolve(
     arn_index: &HashMap<String, String>,
     name: Option<&str>,
+    name_key: Option<&str>,
     arn: Option<&str>,
+    resource_types: &[&str],
     exists: impl Fn(&str) -> bool,
 ) -> Result<String, ResolveError> {
-    let from_arn = match arn {
-        Some(arn) => Some(arn_index.get(arn).cloned().ok_or(ResolveError::NotFound)?),
-        None => None,
-    };
-    let key = match (name, from_arn) {
-        (Some(name), Some(from_arn)) if name != from_arn => return Err(ResolveError::Mismatch),
-        (Some(name), _) => name.to_string(),
-        (None, Some(from_arn)) => from_arn,
+    if let Some(arn) = arn {
+        let (resource_type, resource_name) = reference_resource(arn)?;
+        if name.is_some_and(|name| name != resource_name) {
+            return Err(ResolveError::Mismatch);
+        }
+        if !resource_types.contains(&resource_type) {
+            return Err(ResolveError::WrongResourceType);
+        }
+    }
+    let key = match (name_key, arn) {
+        (Some(name_key), None) => name_key.to_string(),
+        // With both in hand the ARN must still be one this service minted: it
+        // names a region and an account beyond the name the check above
+        // compared, so an ARN nothing is stored under locates no resource even
+        // when its name segment reads right.
+        (Some(name_key), Some(arn)) => {
+            let from_arn = arn_index.get(arn).cloned().ok_or(ResolveError::NotFound)?;
+            if from_arn != name_key {
+                return Err(ResolveError::Mismatch);
+            }
+            from_arn
+        }
+        (None, Some(arn)) => arn_index.get(arn).cloned().ok_or(ResolveError::NotFound)?,
         (None, None) => return Err(ResolveError::NoIdentifier),
     };
     if exists(&key) {
@@ -2414,17 +2545,19 @@ fn resolve(
 /// The handlers that resolve a resource by name or ARN each own a DIFFERENT error
 /// enum (`#[operation_error]` admits only the variants that operation's model
 /// declares), so the mapping cannot be a single function. This macro keeps it a
-/// single piece of wording: a request naming no resource at all, or naming two
-/// different ones, is a bad request; one naming a resource that is not stored is
-/// a miss answered with the service's one constant
-/// [`RESOURCE_NOT_FOUND_MESSAGE`], which carries nothing from the request.
+/// single piece of wording: a request whose REFERENCE is bad — no identifier at
+/// all, an ARN that is not a well-formed one, an ARN of another kind of resource,
+/// or a name and an ARN naming two different ones — is a bad request, each with
+/// the one constant its check owns; only a well-formed reference that resolves to
+/// nothing stored is a miss, answered with the service's one constant
+/// [`RESOURCE_NOT_FOUND_MESSAGE`]. None of them carries anything from the
+/// request.
 ///
 /// Internal to this crate: `pub(crate) use` below keeps it off the crate's
 /// public surface while still letting `src/ops/*` reach it by path.
 macro_rules! impl_resolve_error {
     (
         $mapper:ident -> $error:ty, $modeled:ident,
-        plural = $plural:literal,
         name_member = $name_member:literal, arn_member = $arn_member:literal
     ) => {
         /// Map a name/ARN resolution failure onto this operation's modelled errors.
@@ -2441,31 +2574,37 @@ macro_rules! impl_resolve_error {
                     $crate::ops::types::InvalidRequestException {
                         message: ::std::option::Option::Some(
                             concat!(
-                                "You must specify either ",
+                                "At least one of ",
                                 $name_member,
                                 " or ",
                                 $arn_member,
-                                "."
+                                " must be set"
                             )
                             .to_string(),
                         ),
                     },
                 ),
-                $crate::state::ResolveError::Mismatch => $modeled::InvalidRequestException(
+                $crate::state::ResolveError::MalformedArn => $modeled::InvalidRequestException(
                     $crate::ops::types::InvalidRequestException {
                         message: ::std::option::Option::Some(
-                            concat!(
-                                $name_member,
-                                " and ",
-                                $arn_member,
-                                " identify different ",
-                                $plural,
-                                "."
-                            )
-                            .to_string(),
+                            $crate::state::ARN_INVALID_FORMAT_MESSAGE.to_string(),
                         ),
                     },
                 ),
+                $crate::state::ResolveError::WrongResourceType => {
+                    $modeled::InvalidRequestException($crate::ops::types::InvalidRequestException {
+                        message: ::std::option::Option::Some(
+                            $crate::state::ARN_TYPE_MISMATCH_MESSAGE.to_string(),
+                        ),
+                    })
+                }
+                $crate::state::ResolveError::Mismatch => {
+                    $modeled::InvalidRequestException($crate::ops::types::InvalidRequestException {
+                        message: ::std::option::Option::Some(
+                            $crate::state::ARN_NAME_MISMATCH_MESSAGE.to_string(),
+                        ),
+                    })
+                }
             }
             .into()
         }
