@@ -31,6 +31,13 @@ use service_com_amazonaws_freetier_awsfreetierservice::ops::types::{
     MATCH_OPTION_VALUES,
 };
 
+/// The largest page `ListAccountActivities` serves, read off the service's own
+/// constant (`crate::state::ACTIVITIES_MAX_RESULTS_CEILING`) so a suite asking
+/// for the whole catalog in one call cannot drift from the bound the listing
+/// enforces. Both paginated operations accept it.
+pub(crate) const ACTIVITIES_PAGE_SIZE_CEILING: i32 =
+    service_com_amazonaws_freetier_awsfreetierservice::state::ACTIVITIES_MAX_RESULTS_CEILING;
+
 /// A router with only this service mounted, over one shared engine — the same
 /// assembly `core/router` performs, minus the other services. The engine comes
 /// back too, so a test can age the stored plan the way the clock would.
@@ -426,7 +433,7 @@ async fn a_free_plan_past_its_expiration_instant_reports_expired() {
 
 /// Every activity the catalog holds, in catalog order, as (id, status) pairs.
 async fn catalog(router: &MultiServiceRouter) -> Vec<(String, String)> {
-    let payload = ok(router, "ListAccountActivities", &json!({"maxResults": 1000})).await;
+    let payload = ok(router, "ListAccountActivities", &json!({"maxResults": ACTIVITIES_PAGE_SIZE_CEILING})).await;
     payload["activities"]
         .as_array()
         .expect("activities is a list")
@@ -441,7 +448,12 @@ async fn catalog(router: &MultiServiceRouter) -> Vec<(String, String)> {
 #[tokio::test]
 async fn listed_activities_satisfy_the_modelled_summary_shape() {
     let router = router();
-    let payload = ok(&router, "ListAccountActivities", &json!({"maxResults": 1000})).await;
+    let payload = ok(
+        &router,
+        "ListAccountActivities",
+        &json!({"maxResults": ACTIVITIES_PAGE_SIZE_CEILING}),
+    )
+    .await;
     let activities = payload["activities"]
         .as_array()
         .expect("activities is a list");
@@ -499,7 +511,7 @@ async fn activity_status_filter_selects_exactly_the_listed_statuses() {
         let payload = ok(
             &router,
             "ListAccountActivities",
-            &json!({"maxResults": 1000, "filterActivityStatuses": wanted}),
+            &json!({"maxResults": ACTIVITIES_PAGE_SIZE_CEILING, "filterActivityStatuses": wanted}),
         )
         .await;
         let got: Vec<String> = payload["activities"]
@@ -628,7 +640,7 @@ async fn an_unissued_activity_token_is_refused() {
 #[tokio::test]
 async fn activity_detail_agrees_with_its_summary() {
     let router = router();
-    let listed = ok(&router, "ListAccountActivities", &json!({"maxResults": 1000})).await;
+    let listed = ok(&router, "ListAccountActivities", &json!({"maxResults": ACTIVITIES_PAGE_SIZE_CEILING})).await;
 
     for summary in listed["activities"].as_array().expect("activities is a list") {
         let id = text(summary, "activityId");
@@ -773,7 +785,7 @@ async fn listed_titles(
     router: &MultiServiceRouter,
     language_code: Option<&str>,
 ) -> BTreeMap<String, String> {
-    let mut body = json!({"maxResults": 1000});
+    let mut body = json!({"maxResults": ACTIVITIES_PAGE_SIZE_CEILING});
     if let Some(code) = language_code {
         body["languageCode"] = json!(code);
     }

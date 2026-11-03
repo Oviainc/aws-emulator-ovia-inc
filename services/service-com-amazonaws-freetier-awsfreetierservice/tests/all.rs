@@ -15,6 +15,8 @@
 mod account_plan_window;
 #[path = "all/activity_language_code.rs"]
 mod activity_language_code;
+#[path = "all/activity_plane_refusals.rs"]
+mod activity_plane_refusals;
 #[path = "all/date_time_wire_form.rs"]
 mod date_time_wire_form;
 #[path = "all/dimension_decode.rs"]

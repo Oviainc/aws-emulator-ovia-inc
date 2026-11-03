@@ -43,7 +43,7 @@ use service_com_amazonaws_freetier_awsfreetierservice::state::{
     ACTIVITY_STATUS_IN_PROGRESS, PLAN_STATUS_ACTIVE, PLAN_TYPE_FREE,
 };
 
-use crate::free_tier::{harness, ok, text};
+use crate::free_tier::{harness, ok, text, ACTIVITIES_PAGE_SIZE_CEILING};
 
 /// Assert `member` of `payload` is the RFC 3339 date-time string the rule requires, and
 /// answer the instant it names in epoch milliseconds.
@@ -151,7 +151,12 @@ async fn every_activity_date_time_member_is_an_rfc_3339_string_naming_the_stored
             }
         }
 
-        let listed = ok(&router, "ListAccountActivities", &json!({"maxResults": 1000})).await;
+        let listed = ok(
+            &router,
+            "ListAccountActivities",
+            &json!({"maxResults": ACTIVITIES_PAGE_SIZE_CEILING}),
+        )
+        .await;
         let ids: Vec<String> = listed["activities"]
             .as_array()
             .expect("activities is a list")

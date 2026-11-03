@@ -9,9 +9,11 @@
 //!
 //! 1. a condition a HANDLER checks (the root-operator arity of a `filter`, the number of
 //!    match options, a `nextToken` the service did not issue) is stated as ONE fixed
-//!    sentence for the whole condition, in the envelope this service's validation layer
-//!    states every one of them in (`crate::state::stated_validation`): nothing of the
-//!    request appears in it, so every input that breaks the rule reads the same;
+//!    sentence for the whole condition: nothing of the request appears in it, so every
+//!    input that breaks the rule reads the same. WHICH sentence, and whether it is wrapped
+//!    in the envelope this service's filter-shape layer states a condition in
+//!    (`crate::state::stated_validation`), is a property of the operation that states it;
+//!    an unissued `nextToken` is the condition two operations reach and state differently;
 //! 2. a constraint the MODEL declares is refused in front of the handler and stated in the
 //!    AWS validation envelope — one clause per failing member, with the value as
 //!    submitted, the member's dotted path and the requirement — and a constraint broken by
@@ -29,6 +31,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_freetier_awsfreetierservice::ops::types::{
     ACTIVITY_STATUS_VALUES, MATCH_OPTION_VALUES,
+};
+use service_com_amazonaws_freetier_awsfreetierservice::state::{
+    stated_validation, ACTIVITIES_INVALID_NEXT_TOKEN, INVALID_NEXT_TOKEN,
 };
 
 use crate::free_tier::{call, error_code, harness, ok};
@@ -250,13 +255,13 @@ async fn a_match_options_count_other_than_one_states_one_sentence() {
     }
 }
 
-/// RULE 1, an unissued `nextToken`: a token this service did not issue is refused with ONE
-/// sentence, which names neither the operation asked nor the token sent — so BOTH
-/// paginated operations state it, and a token of one is refused by the other.
+/// RULE 1, an unissued `nextToken`: each paginated operation refuses a token it did not
+/// issue with ONE sentence of its own, which names neither the operation asked nor the
+/// token sent — so every way of failing to be a token of that listing reads the same,
+/// including a token the OTHER listing issued.
 #[tokio::test]
 async fn a_next_token_the_service_did_not_issue_states_one_sentence() {
     let router = harness().0;
-    let expected = "[Message = The next token is invalid.]";
 
     // A token each paginated operation really issued, so a row can send one operation's
     // token to the other.
@@ -293,18 +298,27 @@ async fn a_next_token_the_service_did_not_issue_states_one_sentence() {
         ),
     ];
 
-    // Both paginated operations, with the token each one did NOT issue among the rows.
+    // Both paginated operations, each with the sentence IT states and with the token it
+    // did NOT issue among the rows.
     let operations = [
-        ("GetFreeTierUsage", activities_token.clone()),
-        ("ListAccountActivities", usage_token.clone()),
+        (
+            "GetFreeTierUsage",
+            activities_token.clone(),
+            stated_validation(INVALID_NEXT_TOKEN),
+        ),
+        (
+            "ListAccountActivities",
+            usage_token.clone(),
+            ACTIVITIES_INVALID_NEXT_TOKEN.to_string(),
+        ),
     ];
-    for (operation, foreign) in &operations {
+    for (operation, foreign, expected) in &operations {
         for (case, token) in &rows {
             let case = format!("{operation} refusing {case}");
             let actual =
                 refusal_message(&router, &case, operation, &json!({"nextToken": token})).await;
             assert_eq!(
-                actual, expected,
+                &actual, expected,
                 "case {case} ({token:?}): expected {expected:?}, got {actual:?}"
             );
         }
@@ -313,7 +327,7 @@ async fn a_next_token_the_service_did_not_issue_states_one_sentence() {
         let actual =
             refusal_message(&router, &case, operation, &json!({"nextToken": foreign})).await;
         assert_eq!(
-            actual, expected,
+            &actual, expected,
             "case {case}: expected {expected:?}, got {actual:?}"
         );
     }

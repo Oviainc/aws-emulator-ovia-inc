@@ -182,6 +182,16 @@ async fn every_refused_request_is_answered_in_the_services_media_type() {
             expected_status: 400,
             expected_code: "ValidationException",
         },
+        // One past the ceiling the ACTIVITY listing itself serves, which is below
+        // the modelled maximum: the same status, code and media type as a bound
+        // the model declares.
+        Case {
+            name: "one past the ceiling the activity listing serves",
+            target: Some("AWSFreeTierService.ListAccountActivities"),
+            body: r#"{"maxResults":101}"#,
+            expected_status: 400,
+            expected_code: "ValidationException",
+        },
         // `ActivityId` is `@length(min: 32, max: 32)` with
         // `@pattern("^[a-zA-Z0-9]+$")`.
         Case {
@@ -300,9 +310,9 @@ async fn the_published_bounds_themselves_are_served() {
             expected_code: "",
         },
         Case {
-            name: "maxResults at the published maximum, on another operation",
+            name: "maxResults at the ceiling the activity listing serves",
             target: Some("AWSFreeTierService.ListAccountActivities"),
-            body: r#"{"maxResults":1000}"#,
+            body: r#"{"maxResults":100}"#,
             expected_status: 200,
             expected_code: "",
         },

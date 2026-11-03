@@ -20,11 +20,12 @@ use serde_json::{json, Value};
 use service_com_amazonaws_freetier_awsfreetierservice::ops::types::ACTIVITY_STATUS_VALUES;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::free_tier::{call, error_code, harness, ok, refused, text};
+use crate::free_tier::{call, error_code, harness, ok, refused, text, ACTIVITIES_PAGE_SIZE_CEILING};
 
-/// The largest page the model allows (`MaxResults` is `@range(1..1000)` on both
-/// paginated operations), so one call reports the whole collection.
-const MAX_RESULTS_CEILING: usize = 1000;
+/// The largest page `ListAccountActivities` serves
+/// ([`ACTIVITIES_PAGE_SIZE_CEILING`]), which both paginated operations accept,
+/// so one call reports the whole collection.
+const MAX_RESULTS_CEILING: usize = ACTIVITIES_PAGE_SIZE_CEILING as usize;
 
 /// This service's paginated operations: the operation, the output member
 /// carrying its page, and the listing kind its tokens name.

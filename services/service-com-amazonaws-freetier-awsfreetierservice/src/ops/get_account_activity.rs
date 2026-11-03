@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .find(|activity| activity.activity_id == activity_id)
         else {
-            return Err(unknown_activity(activity_id));
+            return Err(unknown_activity());
         };
 
         // `startedAt` appears only for an activity in the IN_PROGRESS or
@@ -239,6 +239,15 @@ fn validation(message: impl AsRef<str>) -> GetAccountActivityError {
     .into()
 }
 
+/// What this service states for a well-formed `ActivityId` that names no
+/// activity of the caller's account: a FIXED sentence with no variable parts.
+///
+/// The message echoes nothing of the request — not the id that was asked for,
+/// not the account it was asked of — because the condition it reports is the
+/// same for every id the catalog does not hold: a client reading the text reads
+/// the condition, and one request's identifier is not part of it.
+const ACTIVITY_NOT_FOUND: &str = "Activity not found";
+
 /// The modelled `ResourceNotFoundException` for a well-formed id that names no
 /// activity of the caller's account.
 ///
@@ -247,10 +256,10 @@ fn validation(message: impl AsRef<str>) -> GetAccountActivityError {
 /// model annotates on it, exactly as the service's other not-found path is: the
 /// shape, the body and the wire error code stay the modelled ones, so the status
 /// a client reads does not depend on which operation it asked.
-fn unknown_activity(activity_id: &str) -> GetAccountActivityError {
+fn unknown_activity() -> GetAccountActivityError {
     crate::scaffolded::resource_not_found(
         GetAccountActivityErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-            message: format!("no activity with id {activity_id} exists for this account"),
+            message: ACTIVITY_NOT_FOUND.to_string(),
         }),
     )
 }

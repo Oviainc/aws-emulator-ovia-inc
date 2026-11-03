@@ -27,7 +27,9 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_freetier_awsfreetierservice::ops::types::LANGUAGE_CODE_VALUES;
-use service_com_amazonaws_freetier_awsfreetierservice::state::primary_subtag;
+use service_com_amazonaws_freetier_awsfreetierservice::state::{
+    primary_subtag, ACTIVITIES_MAX_RESULTS_CEILING,
+};
 use service_com_amazonaws_freetier_awsfreetierservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -35,6 +37,11 @@ use smithy_server_runtime::MultiServiceRouter;
 /// modelled code this service holds its catalog's base text in
 /// (`crate::state::DEFAULT_LANGUAGE_CODE`).
 const BASE_LANGUAGE_CODE: &str = "en-US";
+
+/// The largest page `ListAccountActivities` serves
+/// (`crate::state::ACTIVITIES_MAX_RESULTS_CEILING`), so one call reports the
+/// whole catalog.
+const PAGE_SIZE_CEILING: i32 = ACTIVITIES_MAX_RESULTS_CEILING;
 
 /// The members of the detail view that `languageCode` is documented to select,
 /// and so the only ones allowed to differ between two codes. Everything else
@@ -116,7 +123,7 @@ async fn detail(
 
 /// Every activity id the catalog holds.
 async fn activity_ids(router: &MultiServiceRouter) -> Vec<String> {
-    ok(router, "ListAccountActivities", &json!({"maxResults": 1000}))
+    ok(router, "ListAccountActivities", &json!({"maxResults": PAGE_SIZE_CEILING}))
         .await["activities"]
         .as_array()
         .expect("activities is a list")
@@ -131,7 +138,7 @@ async fn listed_titles(
     router: &MultiServiceRouter,
     language_code: Option<&str>,
 ) -> BTreeMap<String, String> {
-    let mut body = json!({"maxResults": 1000});
+    let mut body = json!({"maxResults": PAGE_SIZE_CEILING});
     if let Some(code) = language_code {
         body["languageCode"] = json!(code);
     }

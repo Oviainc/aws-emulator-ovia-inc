@@ -27,7 +27,15 @@
 //!    model-derived schemas the walk checks against ([`element_constraints`]);
 //! 5. a clause about a COLLECTION's own `@length` states no value, because a list and a
 //!    map have no scalar rendering to quote (`service_common::validation_message`'s
-//!    readers of the framework's count rendering).
+//!    readers of the framework's count rendering);
+//! 6. an enumerated type's value SET is listed in the order the SERVICE states that enum
+//!    in, which is not the order the model declares its members in
+//!    ([`crate::state::stated_enum_value_set`]); applied inside
+//!    [`framework_requirement`], so one enum reads alike whether its clause is stated at
+//!    the member itself or nested inside one about the list that holds it;
+//! 7. a bound the SERVICE enforces for itself — one the model does not declare, so the
+//!    constraint walk never sees it — is stated in the same envelope and the same
+//!    requirement sentence, and quotes NO value ([`above_ceiling`]).
 //!
 //! Rules 1-3 and 5 are `services/common`'s already
 //! (`service_common::validation_message::aws_validation_refusal`), which cannot be
@@ -200,6 +208,12 @@ fn states_a_count(violation: &Violation) -> bool {
 fn framework_requirement(kind: &ViolationKind) -> Option<String> {
     let reported = match kind {
         ViolationKind::Pattern(pattern) => ViolationKind::Pattern(unanchored(pattern)),
+        // Rule 6. Applied here, where every requirement sentence is built, so a value set
+        // reads the same way whether the clause is stated at the enumerated member itself
+        // or nested inside one about the list whose elements target that enum.
+        ViolationKind::EnumValue(values) => {
+            ViolationKind::EnumValue(crate::state::stated_enum_value_set(values))
+        }
         other => other.clone(),
     };
     let stated = Violation {
@@ -212,6 +226,36 @@ fn framework_requirement(kind: &ViolationKind) -> Option<String> {
     stated
         .rsplit_once(CLAUSE_MARKER)
         .map(|(_, requirement)| requirement.to_string())
+}
+
+/// This service's refusal of a value above a ceiling the SERVICE enforces on the member
+/// at `path`, as rule 7 states it: the envelope of rule 1 over one clause naming the
+/// member and the requirement, and NO value.
+///
+/// A bound the model declares is found by the constraint walk, which carries the bytes
+/// the caller submitted, so its clause quotes them (rule 2). A bound the service enforces
+/// on top of the model's is checked after that walk has already accepted the value, and
+/// the clause the live service answers it with quotes nothing — which is also the one
+/// thing that tells the two bounds apart in the response. The requirement itself is the
+/// framework's own sentence for the class, read off [`ViolationKind`] exactly as every
+/// other requirement here is, so a service-enforced bound cannot be worded differently
+/// from a modelled one.
+pub(crate) fn above_ceiling(path: &str, ceiling: i32) -> String {
+    let kind = ViolationKind::MaxValue(ceiling.to_string());
+    // A class the framework words without the clause marker keeps its whole message,
+    // which still states the bound — the same fallback [`framework_requirement`]'s callers
+    // make, written out because there is no framework wording to fall back TO here.
+    let requirement = framework_requirement(&kind).unwrap_or_else(|| {
+        Violation {
+            path: String::new(),
+            kind,
+            value: None,
+            sensitive: false,
+        }
+        .message()
+    });
+    let clause = format!("Value at '{path}' {CLAUSE_MARKER}{requirement}");
+    envelope(std::slice::from_ref(&clause)).unwrap_or(clause)
 }
 
 /// Every constraint the ELEMENT shape of the list member at `list_path` declares, as the

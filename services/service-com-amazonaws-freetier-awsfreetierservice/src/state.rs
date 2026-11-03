@@ -521,6 +521,40 @@ pub fn page_size(max_results: i32) -> usize {
     usize::try_from(requested).unwrap_or(DEFAULT_MAX_RESULTS as usize)
 }
 
+/// The member a page-size refusal names, as both listings' inputs spell it.
+const MAX_RESULTS_MEMBER: &str = "maxResults";
+
+/// The largest page `ListAccountActivities` SERVES, which is smaller than the
+/// maximum the model declares for the member it is asked through (`MaxResults`
+/// is `@range(1..1000)` —
+/// `smithy_query(query="shape",shape="MaxResults")`).
+///
+/// The live listing serves a page size of 100 and refuses 101, so the ceiling a
+/// caller of this listing has to respect is this one and not the modelled 1000.
+/// It is a property of the LISTING rather than of the member's shape — the usage
+/// listing serves the modelled maximum — so each listing passes its own ceiling
+/// to [`max_results_refusal`] instead of this being read off the member.
+pub const ACTIVITIES_MAX_RESULTS_CEILING: i32 = 100;
+
+/// Whether a request's `maxResults` is above `ceiling`, the largest page the
+/// listing it was asked of serves, and the message refusing it when it is.
+///
+/// A listing that serves a smaller page than its member's `@range` declares
+/// enforces the difference itself: the model's bound is checked by the
+/// framework's constraint walk in FRONT of the handler, so a value that reaches
+/// here is one the model admits and only the listing's own ceiling is left to
+/// apply. It is applied before anything is paged, so the refusal cannot depend
+/// on how many rows the account holds or on what else the request asked for.
+///
+/// `None` means the page size is one the listing serves — the ceiling itself
+/// included, because a ceiling is a value that is still served. `Some(message)`
+/// is the refusal's message, worded by [`crate::service::validation`], the one
+/// place this service states a broken input bound.
+pub fn max_results_refusal(ceiling: i32, max_results: i32) -> Option<String> {
+    (max_results > ceiling)
+        .then(|| crate::service::validation::above_ceiling(MAX_RESULTS_MEMBER, ceiling))
+}
+
 /// The rows one request selects out of a stored collection, each paired with
 /// its position in the STORED order: starting at the offset the request's token
 /// resumed at, every row `selects` keeps.
@@ -580,17 +614,29 @@ pub fn cut_page<'rows, T>(
     (page, next_token)
 }
 
-/// What the service states for a `nextToken` it did not issue — a token of the
-/// other listing, of an older encoding, one carrying an offset no page could
-/// have stopped at, or one that was never a token at all.
+/// What `GetFreeTierUsage` states for a `nextToken` it did not issue — a token
+/// of the other listing, of an older encoding, one carrying an offset no page
+/// could have stopped at, or one that was never a token at all.
 ///
-/// The last part of the pagination rule, beside
+/// Stated through [`stated_validation`], the envelope that operation's own
+/// refusals carry.
+///
+/// The CONDITION is one rule, the last part of the pagination rule beside
 /// [`encode_page_token`]/[`page_offset`], [`page_size`], [`select_rows`] and
-/// [`cut_page`], so both paginated operations refuse a token they did not issue
-/// in ONE wording: the condition is "this is not a token of mine", which is the
-/// same condition whichever listing was asked and whatever the token held, so
-/// the sentence names neither the operation nor the token.
+/// [`cut_page`]: "this is not a token of mine", the same whichever listing was
+/// asked and whatever the token held, which is why neither sentence names the
+/// token. The SENTENCE is not: see [`ACTIVITIES_INVALID_NEXT_TOKEN`].
 pub const INVALID_NEXT_TOKEN: &str = "The next token is invalid.";
+
+/// What `ListAccountActivities` states for that same condition, and it states it
+/// VERBATIM — no envelope.
+///
+/// The two listings do not share one sentence: each states the one the live
+/// service answers it with, so the wording is a property of the operation that
+/// states it and not of the condition alone, and a client must not assume a
+/// shared string in either direction. The sentences sit together here, beside
+/// the one condition both reach, so that stays visible.
+pub const ACTIVITIES_INVALID_NEXT_TOKEN: &str = "Invalid nextToken";
 
 /// The `message` a `ValidationException` this service's OWN validation layer
 /// raises carries: the sentence stating the condition, in the envelope that
@@ -611,6 +657,74 @@ pub const INVALID_NEXT_TOKEN: &str = "The next token is invalid.";
 /// something the rule does not distinguish.
 pub fn stated_validation(sentence: &str) -> String {
     format!("[Message = {sentence}]")
+}
+
+/// The order this service STATES the `LanguageCode` value set in when it refuses
+/// a value outside it.
+///
+/// A refusal of a value outside an enumerated type names the values that type
+/// admits, and the order it names them in is the SERVICE's: the order a value
+/// set reaches the refusal in is the order the MODEL declares that enum's
+/// members in (`en-US, en-GB, id-ID, de-DE, es-ES, fr-FR, ja-JP, it-IT, pt-PT,
+/// ko-KR, zh-CN, zh-TW, tr-TR` \u2014
+/// `smithy_query(query="shape",shape="LanguageCode")`), while the service lists
+/// the same set in this one. It is FIXED text: no member of the request and
+/// nothing in the store varies it, and both activity readers state it alike.
+///
+/// It holds exactly the values the model declares for that enum, reordered and
+/// nothing else, which the `activity_plane_refusals` suite pins against
+/// `crate::ops::types::LANGUAGE_CODE_VALUES`.
+pub const LANGUAGE_CODE_VALUE_SET: [&str; 13] = [
+    "zh-TW", "en-US", "zh-CN", "tr-TR", "pt-PT", "it-IT", "fr-FR", "es-ES", "de-DE", "id-ID",
+    "ko-KR", "ja-JP", "en-GB",
+];
+
+/// The order this service STATES the `ActivityStatus` value set in, which the
+/// model declares `NOT_STARTED, IN_PROGRESS, COMPLETED, EXPIRING`
+/// (`smithy_query(query="shape",shape="ActivityStatus")`).
+///
+/// The sibling of [`LANGUAGE_CODE_VALUE_SET`]; see it for why a published order
+/// exists at all. This one is stated nested inside a clause about the LIST that
+/// carries the enum (`filterActivityStatuses`), which is a property of where the
+/// violation was found and not of the set, so the order is the same either way.
+pub const ACTIVITY_STATUS_VALUE_SET: [&str; 4] =
+    ["IN_PROGRESS", "COMPLETED", "NOT_STARTED", "EXPIRING"];
+
+/// Every enum value set this service publishes an order for.
+///
+/// One row per enum whose stated order differs from its declaration order; a
+/// value set absent from this table is stated as it was presented, because this
+/// service has shown no other order for it.
+const PUBLISHED_ENUM_VALUE_SETS: &[&[&str]] =
+    &[&LANGUAGE_CODE_VALUE_SET, &ACTIVITY_STATUS_VALUE_SET];
+
+/// `values` in the order this service states that enum's value set in: the
+/// published order when `values` is a set it publishes one for
+/// ([`PUBLISHED_ENUM_VALUE_SETS`]), and `values` unchanged for any other set.
+///
+/// An enum is recognised by its value SET rather than by the member that carried
+/// the rejected value, so every member targeting one enum \u2014 of any operation, at
+/// any depth, whether the clause is stated at the member itself or nested inside
+/// one about the list that holds it \u2014 states that enum's set in the one order.
+/// The match is on membership and size, never on position, so a model revision
+/// that reordered its own declaration of the same enum would still be stated in
+/// the published order.
+pub fn stated_enum_value_set(values: &[String]) -> Vec<String> {
+    match published_enum_value_set(values) {
+        Some(published) => published.iter().map(|value| (*value).to_string()).collect(),
+        None => values.to_vec(),
+    }
+}
+
+/// The published order for `values`, or `None` when this service publishes none
+/// for that set. The lookup half of [`stated_enum_value_set`].
+fn published_enum_value_set(values: &[String]) -> Option<&'static [&'static str]> {
+    PUBLISHED_ENUM_VALUE_SETS.iter().copied().find(|published| {
+        published.len() == values.len()
+            && published
+                .iter()
+                .all(|value| values.iter().any(|presented| presented == value))
+    })
 }
 
 /// Whether a request's `languageCode` names a language an activity reader can

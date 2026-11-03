@@ -21,12 +21,12 @@ use service_com_amazonaws_freetier_awsfreetierservice::ops::types::LANGUAGE_CODE
 use service_com_amazonaws_freetier_awsfreetierservice::state::primary_subtag;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::free_tier::{harness, ok, text};
+use crate::free_tier::{harness, ok, text, ACTIVITIES_PAGE_SIZE_CEILING};
 
-/// The largest page the model allows one request to ask for: `MaxResults` is
-/// `@range(1..1000)` on `ListAccountActivities`, so this asks for the whole
-/// catalog in one call.
-const MAX_RESULTS_CEILING: i32 = 1000;
+/// The largest page `ListAccountActivities` serves
+/// ([`ACTIVITIES_PAGE_SIZE_CEILING`]), so this asks for the whole catalog in one
+/// call.
+const MAX_RESULTS_CEILING: i32 = ACTIVITIES_PAGE_SIZE_CEILING;
 
 /// One of this service's activity readers — the two call sites of the shared
 /// rule.

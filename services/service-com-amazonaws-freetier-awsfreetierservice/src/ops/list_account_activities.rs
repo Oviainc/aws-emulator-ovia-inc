@@ -163,6 +163,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The page size this LISTING serves is its own bound, smaller than the
+        // maximum the model declares for the member, and it is applied before
+        // anything is paged.
+        if let Some(message) = crate::state::max_results_refusal(
+            crate::state::ACTIVITIES_MAX_RESULTS_CEILING,
+            input.max_results,
+        ) {
+            return Err(refusal(message));
+        }
+
         // Every status named in the filter must be one the model declares; a
         // value outside the enum selects nothing, so it is refused rather than
         // served as an empty page.
@@ -204,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             catalog.len(),
         ) {
             Some(offset) => offset,
-            None => return Err(validation(crate::state::INVALID_NEXT_TOKEN)),
+            None => return Err(refusal(crate::state::ACTIVITIES_INVALID_NEXT_TOKEN)),
         };
 
         // The rows the request selects, each with its catalog position, through
@@ -250,6 +260,21 @@ const PAGE_KIND: &str = "activities";
 fn validation(message: impl AsRef<str>) -> ListAccountActivitiesError {
     ListAccountActivitiesErrorModeled::ValidationException(ValidationException {
         message: crate::state::stated_validation(message.as_ref()),
+    })
+    .into()
+}
+
+/// Refuse the request with this operation's own modelled `ValidationException`
+/// (HTTP 400), stating `message` VERBATIM.
+///
+/// This operation's refusals of an input BOUND — a page size above the ceiling
+/// it serves, a `nextToken` it never issued — carry their sentence alone, not
+/// wrapped in the envelope [`validation`] states a condition in: the envelope is
+/// a property of the layer that words the refusal, and these two are worded
+/// where the bound lives (`crate::state`) rather than by the filter-shape layer.
+fn refusal(message: impl Into<String>) -> ListAccountActivitiesError {
+    ListAccountActivitiesErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
     })
     .into()
 }

@@ -110,7 +110,9 @@
 //! words every one of them the same way.
 
 pub mod announced_media_type;
-mod validation;
+/// Reached by [`crate::state`] as well: a bound a HANDLER enforces on top of the model's
+/// is stated in the same words as one the walk found (see that module's rule 7).
+pub(crate) mod validation;
 
 use announced_media_type::RESPONSE_MEDIA_TYPE;
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};

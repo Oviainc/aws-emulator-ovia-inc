@@ -20,7 +20,9 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_freetier_awsfreetierservice::state::PLAN_TYPE_FREE;
 
-use crate::free_tier::{call, error_code, harness, ok, refused, text};
+use crate::free_tier::{
+    call, error_code, harness, ok, refused, text, ACTIVITIES_PAGE_SIZE_CEILING,
+};
 
 /// The modelled error shape this suite is about, as it appears on the wire.
 const NOT_FOUND_CODE: &str = "ResourceNotFoundException";
@@ -54,7 +56,12 @@ const UNKNOWN_ACTIVITY_IDS: [&str; 4] = [
 
 /// The activity ids the seeded catalog actually holds.
 async fn catalog_ids(router: &smithy_server_runtime::MultiServiceRouter) -> Vec<String> {
-    let listed = ok(router, "ListAccountActivities", &json!({"maxResults": 1000})).await;
+    let listed = ok(
+        router,
+        "ListAccountActivities",
+        &json!({"maxResults": ACTIVITIES_PAGE_SIZE_CEILING}),
+    )
+    .await;
     listed["activities"]
         .as_array()
         .expect("activities is a list")

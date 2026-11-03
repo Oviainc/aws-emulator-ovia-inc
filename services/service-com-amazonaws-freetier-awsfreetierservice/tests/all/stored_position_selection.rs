@@ -16,11 +16,12 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::free_tier::{harness, ok, text};
+use crate::free_tier::{harness, ok, text, ACTIVITIES_PAGE_SIZE_CEILING};
 
-/// The largest page one request may ask for: `MaxResults` is `@range(1..1000)`
-/// on both paginated operations, so this asks for every remaining row at once.
-const MAX_RESULTS_CEILING: usize = 1000;
+/// The largest page `ListAccountActivities` serves
+/// ([`ACTIVITIES_PAGE_SIZE_CEILING`]), which both paginated operations accept,
+/// so this asks for every remaining row at once.
+const MAX_RESULTS_CEILING: usize = ACTIVITIES_PAGE_SIZE_CEILING as usize;
 
 /// This service's paginated operations, each with the output member carrying its
 /// page — the two call sites of the selection step.

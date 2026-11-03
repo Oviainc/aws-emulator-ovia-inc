@@ -25,12 +25,12 @@ use serde_json::{json, Value};
 use service_com_amazonaws_freetier_awsfreetierservice::ops::types::LANGUAGE_CODE_VALUES;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::free_tier::{call, error_code, harness, ok, text};
+use crate::free_tier::{call, error_code, harness, ok, text, ACTIVITIES_PAGE_SIZE_CEILING};
 
-/// The largest page the model allows one request to ask for: `MaxResults` is
-/// `@range(1..1000)` on both paginated operations, so this asks for the whole
-/// collection in one call.
-const MAX_RESULTS_CEILING: usize = 1000;
+/// The largest page `ListAccountActivities` serves
+/// ([`ACTIVITIES_PAGE_SIZE_CEILING`]), which both paginated operations accept,
+/// so this asks for the whole collection in one call.
+const MAX_RESULTS_CEILING: usize = ACTIVITIES_PAGE_SIZE_CEILING as usize;
 
 /// This service's paginated operations, each with the output member carrying
 /// its page. Both cut their page and issue their token through the one shared
