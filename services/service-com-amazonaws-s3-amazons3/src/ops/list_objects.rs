@@ -460,17 +460,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // part of every answer, each carrying the empty value — the prefix every key
             // begins with, and the start of the listing — for a request that named none.
             prefix: Some(encode(input.prefix.clone().unwrap_or_default())),
-            delimiter: input.delimiter.clone().map(&encode),
+            delimiter: input.delimiter.clone().map(encode),
             max_keys: Some(max_keys),
             marker: Some(encode(input.marker.clone().unwrap_or_default())),
             // Truncated exactly when an entry was left for the next page.
             is_truncated: Some(truncated),
-            next_marker: next_marker.map(&encode),
+            next_marker: next_marker.map(encode),
             contents: (!contents.is_empty()).then(|| {
                 contents
                     .into_iter()
                     .map(|mut entry| {
-                        entry.key = entry.key.map(&encode);
+                        entry.key = entry.key.map(encode);
                         entry
                     })
                     .collect()

@@ -832,12 +832,15 @@ impl EnvironmentSpec {
         // environment it cannot provision. Judged on the RESOLVED version, so a request
         // that moves the version is judged by the version it moves to, and AFTER the
         // catalog check above, so only a version the service runs reaches the comparison.
-        for (member, value, floored_value, floor) in [(
+        // One row per member whose doc names such a release floor; the table holds the one
+        // member whose doc names one today.
+        let version_floors = [(
             "WebserverAccessMode",
             self.webserver_access_mode.as_str(),
             WEBSERVER_ACCESS_MODE_PUBLIC_AND_PRIVATE,
             PUBLIC_AND_PRIVATE_MIN_AIRFLOW_VERSION,
-        )] {
+        )];
+        for (member, value, floored_value, floor) in version_floors {
             if value == floored_value && !airflow_version_at_least(&self.airflow_version, floor) {
                 return Err(format!(
                     "{floored_value} is not a valid {member} for an environment running \

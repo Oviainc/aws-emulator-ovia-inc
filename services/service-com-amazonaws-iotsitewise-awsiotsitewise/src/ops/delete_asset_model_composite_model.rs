@@ -515,7 +515,7 @@ fn depends_on(
             .value
             .property_id
             .as_deref()
-            .is_some_and(&dangling)
+            .is_some_and(dangling)
             || variable
                 .value
                 .property_path

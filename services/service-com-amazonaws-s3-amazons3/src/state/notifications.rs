@@ -690,7 +690,7 @@ impl DeliveryPermit {
     /// flight.
     fn claim() -> Option<Self> {
         IN_FLIGHT_DELIVERY_TASKS
-            .fetch_update(
+            .try_update(
                 ::std::sync::atomic::Ordering::SeqCst,
                 ::std::sync::atomic::Ordering::SeqCst,
                 |in_flight| (in_flight < MAX_IN_FLIGHT_DELIVERY_TASKS).then_some(in_flight + 1),

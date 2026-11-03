@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/agent_space_batch_read.rs"]
 mod agent_space_batch_read;
+#[path = "all/agent_space_deletion.rs"]
+mod agent_space_deletion;
 #[path = "all/agent_space_lifecycle.rs"]
 mod agent_space_lifecycle;
 #[path = "all/agent_space_update.rs"]

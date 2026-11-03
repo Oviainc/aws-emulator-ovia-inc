@@ -916,7 +916,7 @@ impl ExecutionGuard {
         // caught rather than missed.
         let previous = self
             .steps_left
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 Some(left.saturating_sub(spent))
             })
             .unwrap_or(0);

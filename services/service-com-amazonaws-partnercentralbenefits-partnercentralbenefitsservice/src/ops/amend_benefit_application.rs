@@ -496,7 +496,7 @@ fn apply_amendment(
     if let Some(clause) = field_path_length_clause(&amendment.field_path) {
         return Err(refused_path(clause));
     }
-    let segments = path_segments(&amendment.field_path).ok_or_else(&unamendable)?;
+    let segments = path_segments(&amendment.field_path).ok_or_else(unamendable)?;
     let (head, rest) = segments
         .split_first()
         .expect("`split('.')` yields at least one segment");

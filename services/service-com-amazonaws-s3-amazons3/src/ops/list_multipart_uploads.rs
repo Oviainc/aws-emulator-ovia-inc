@@ -532,26 +532,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The address the uploads were recorded under (no access point is held here, so
             // there is no ARN or alias to report instead).
             bucket: Some(input.bucket.clone()),
-            prefix: input.prefix.clone().map(&encode),
-            delimiter: input.delimiter.clone().map(&encode),
+            prefix: input.prefix.clone().map(encode),
+            delimiter: input.delimiter.clone().map(encode),
             // "Maximum number of multipart uploads that could have been included in the
             // response" — the effective bound this page was computed under, not the raw
             // request value.
             max_uploads: Some(max_uploads),
             // "The key at or after which the listing began" and its upload-id companion:
             // the markers the request carried are echoed back.
-            key_marker: input.key_marker.clone().map(&encode),
+            key_marker: input.key_marker.clone().map(encode),
             upload_id_marker: input.upload_id_marker.clone(),
             // Truncated exactly when an entry was left for the next page; the markers name
             // the last entry reported here, which the next request resumes after.
             is_truncated: Some(truncated),
-            next_key_marker: next_key_marker.map(&encode),
+            next_key_marker: next_key_marker.map(encode),
             next_upload_id_marker,
             uploads: (!uploads.is_empty()).then(|| {
                 uploads
                     .into_iter()
                     .map(|mut upload| {
-                        upload.key = upload.key.map(&encode);
+                        upload.key = upload.key.map(encode);
                         upload
                     })
                     .collect()

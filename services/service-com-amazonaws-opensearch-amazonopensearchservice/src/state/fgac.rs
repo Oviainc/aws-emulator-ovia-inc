@@ -185,8 +185,8 @@ pub fn is_master(domain: &Domain, principal_arn: &str) -> bool {
             .iter()
             .any(|identity| identity.eq_ignore_ascii_case(configured))
     };
-    domain.master_user_arn.as_ref().is_some_and(&named)
-        || domain.master_user_name.as_ref().is_some_and(&named)
+    domain.master_user_arn.as_ref().is_some_and(named)
+        || domain.master_user_name.as_ref().is_some_and(named)
 }
 
 /// The roles this domain's role mappings bind `principal_arn` to, in configuration order.

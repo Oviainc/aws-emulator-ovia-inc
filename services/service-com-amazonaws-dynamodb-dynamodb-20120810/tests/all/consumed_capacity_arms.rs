@@ -68,7 +68,10 @@ fn assert_arms(case: &str, kind: Kind, consumed: &Value) {
         "case {case:?}: an operation consumes capacity of one kind, so {absent} is absent, \
          got {consumed}"
     );
-    for line in ["Table"] {
+    // The per-line members a `ConsumedCapacity` can carry beside the aggregate; `Table`
+    // is the one this check covers.
+    let lines = ["Table"];
+    for line in lines {
         if let Some(capacity) = consumed.get(line) {
             assert_eq!(
                 capacity[reported].as_f64(),

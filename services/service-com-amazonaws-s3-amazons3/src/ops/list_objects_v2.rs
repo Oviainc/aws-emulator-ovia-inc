@@ -486,7 +486,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the element is part of every answer and carries the empty prefix, which every
             // key begins with, for a request that named none.
             prefix: Some(encode(input.prefix.clone().unwrap_or_default())),
-            delimiter: input.delimiter.clone().map(&encode),
+            delimiter: input.delimiter.clone().map(encode),
             max_keys: Some(max_keys),
             // "KeyCount is the number of keys returned with this request" — the
             // entries on this page, each rolled-up prefix counting as one.
@@ -499,12 +499,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "If ContinuationToken was sent with the request, it is included in the
             // response" — same for StartAfter, which IS a key name.
             continuation_token: input.continuation_token.clone(),
-            start_after: input.start_after.clone().map(&encode),
+            start_after: input.start_after.clone().map(encode),
             contents: (!contents.is_empty()).then(|| {
                 contents
                     .into_iter()
                     .map(|mut entry| {
-                        entry.key = entry.key.map(&encode);
+                        entry.key = entry.key.map(encode);
                         entry
                     })
                     .collect()

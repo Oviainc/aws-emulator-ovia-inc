@@ -502,24 +502,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListObjectVersionsOutput {
             name: Some(input.bucket.clone()),
-            prefix: input.prefix.clone().map(&encode),
-            delimiter: input.delimiter.clone().map(&encode),
+            prefix: input.prefix.clone().map(encode),
+            delimiter: input.delimiter.clone().map(encode),
             max_keys: Some(max_keys),
             // "Marks the last key returned in a truncated response" / "Marks the last
             // version of the key returned in a truncated response": the markers the
             // request carried are echoed back.
-            key_marker: input.key_marker.clone().map(&encode),
+            key_marker: input.key_marker.clone().map(encode),
             version_id_marker: input.version_id_marker.clone(),
             // Truncated exactly when an entry was left for the next page; the markers
             // name the last entry reported here, which the next request resumes after.
             is_truncated: Some(truncated),
-            next_key_marker: next_key_marker.map(&encode),
+            next_key_marker: next_key_marker.map(encode),
             next_version_id_marker,
             versions: (!versions.is_empty()).then(|| {
                 versions
                     .into_iter()
                     .map(|mut version| {
-                        version.key = version.key.map(&encode);
+                        version.key = version.key.map(encode);
                         version
                     })
                     .collect()
@@ -540,7 +540,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 delete_markers
                     .into_iter()
                     .map(|mut marker| {
-                        marker.key = marker.key.map(&encode);
+                        marker.key = marker.key.map(encode);
                         marker
                     })
                     .collect()

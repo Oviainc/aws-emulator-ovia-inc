@@ -5255,7 +5255,7 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .values()
             .filter(|record| record.global_network_id == global_network_id)
         {
-            if let Some(site) = record.site_id.as_deref().and_then(&site_arn) {
+            if let Some(site) = record.site_id.as_deref().and_then(site_arn) {
                 tie(&mut pairs, &record.arn, &site);
             }
         }
@@ -5369,7 +5369,7 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             if let Some(from) = device_arn(device_id) {
                 tie(&mut pairs, &from, &to);
             }
-            if let Some(from) = link_id.and_then(&link_arn) {
+            if let Some(from) = link_id.and_then(link_arn) {
                 tie(&mut pairs, &from, &to);
             }
         }
