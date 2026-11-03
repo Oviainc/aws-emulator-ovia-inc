@@ -46,12 +46,23 @@ fn names(states: &Value) -> Vec<String> {
 
 /// The capacity members `LocationConfiguration` carries and `LocationState`
 /// echoes back (`smithy_query(query="shape", shape="LocationConfiguration")`).
+///
+/// A setting the configuration left out is echoed at its default of 0 ("Default is 0
+/// when creating a stream group or adding a location" —
+/// `LocationConfiguration::OnDemandCapacity`), so these members are always numbers on
+/// a reported location state.
 const CAPACITY_MEMBERS: [&str; 4] = [
     "AlwaysOnCapacity",
     "OnDemandCapacity",
     "TargetIdleCapacity",
     "MaximumCapacity",
 ];
+
+/// What `member` of a `LocationConfiguration` asks for: the value it carries, or the
+/// default of 0 when it carries none.
+fn configured(configuration: &Value, member: &str) -> Value {
+    json!(configuration[member].as_i64().unwrap_or(0))
+}
 
 /// The location set of a group is the union of what its requests configured, and
 /// a location this call adds is `ACTIVATING` until the clock provisions it.
@@ -139,9 +150,10 @@ async fn adding_locations_persists_exactly_the_locations_the_call_configures() {
             );
             for member in CAPACITY_MEMBERS {
                 assert_eq!(
-                    state[member], configuration[member],
+                    state[member],
+                    configured(configuration, member),
                     "case {case:?}: expected {member} {}, got {state}",
-                    configuration[member]
+                    configured(configuration, member)
                 );
             }
             let requested = configuration["AlwaysOnCapacity"].as_i64().unwrap_or(0);
@@ -365,7 +377,7 @@ async fn re_adding_a_location_the_group_holds_is_an_idempotent_no_op() {
                 );
                 assert_eq!(
                     state["MaximumCapacity"],
-                    Value::Null,
+                    json!(0),
                     "case {case:?}: location {name} keeps the capacity it holds, got {state}"
                 );
                 assert_eq!(
@@ -377,9 +389,10 @@ async fn re_adding_a_location_the_group_holds_is_an_idempotent_no_op() {
             } else {
                 for member in CAPACITY_MEMBERS {
                     assert_eq!(
-                        state[member], configuration[member],
+                        state[member],
+                        configured(configuration, member),
                         "case {case:?}: expected {member} {}, got {state}",
-                        configuration[member]
+                        configured(configuration, member)
                     );
                 }
             }

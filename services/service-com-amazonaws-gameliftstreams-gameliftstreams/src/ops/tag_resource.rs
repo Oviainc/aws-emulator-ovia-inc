@@ -11,6 +11,10 @@
 //! tagging does not move the resource's `LastUpdatedAt`: a `Get*` of a resource whose
 //! only change was a tagging still reports the instant its state last moved.
 //!
+//! A successful tag write has nothing to report back, and this API says so with the
+//! status that means it: HTTP 204, with an empty body (see
+//! `TAG_RESOURCE_NO_CONTENT` below).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -84,6 +88,32 @@ use super::types::*;
 // `TagResourceError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-gameliftstreams-gameliftstreams.json");
 
+/// The wire framing of a successful `TagResource`: NO CONTENT.
+///
+/// `TagResourceResponse` declares no members at all, and this API answers a
+/// successful tag write the way it answers its other bodiless writes — HTTP 204
+/// with an empty body — so the response is framed as an empty body, exactly as the
+/// `Delete*` / `Revoke*` operations of this service frame theirs, rather than as an
+/// empty JSON object under the protocol's default success status. The model carries
+/// no response code of its own for this operation to say otherwise
+/// (`smithy_query(query="operation", operation="TagResource")` reports its `@http`
+/// code as defaulted), so the status this service answers with is the one carried
+/// here and on `SUCCESS_STATUS` below.
+const TAG_RESOURCE_NO_CONTENT: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[],
+    )
+    .with_http(::aws_smithy_schema::traits::HttpTrait::new(
+        "POST",
+        "/tags/{ResourceArn}",
+        Some(204u16),
+    ));
+
+/// [`TAG_RESOURCE_NO_CONTENT`] as the operation's output schema.
+static TAG_RESOURCE_NO_CONTENT_SCHEMA: &::aws_smithy_schema::Schema = &TAG_RESOURCE_NO_CONTENT;
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `TagResourceError` alias below. An operation that models no errors
@@ -141,8 +171,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
-    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = TAG_RESOURCE_NO_CONTENT_SCHEMA;
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

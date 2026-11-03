@@ -28,6 +28,10 @@ use super::stream_workflow::{
 /// Amazon GameLift Streams resource types: Application StreamGroup".
 const TAGGABLE: [&str; 2] = ["application", "streamgroup"];
 
+/// The status a successful `TagResource` answers with: the write has nothing to
+/// report, and this API answers its bodiless writes with 204 No Content.
+const TAG_RESOURCE_SUCCESS: u16 = 204;
+
 /// `[(key, value)]` as the `Tags` map the wire carries.
 fn tag_map(pairs: &[(String, String)]) -> Value {
     let map: Map<String, Value> = pairs
@@ -189,8 +193,8 @@ async fn tagging_merges_its_pairs_into_the_tags_a_resource_already_carries() {
 
             let (status, body) = tag(&router, &arn, &case.assign).await;
             assert_eq!(
-                status, 200,
-                "case {label:?}: expected TagResource 200, got {status} {body}"
+                status, TAG_RESOURCE_SUCCESS,
+                "case {label:?}: expected TagResource {TAG_RESOURCE_SUCCESS}, got {status} {body}"
             );
 
             let (status, got) = list_tags(&router, &arn).await;
@@ -228,8 +232,9 @@ async fn concurrent_taggings_of_one_resource_lose_no_update() {
     );
     for (index, (status, body)) in [a, b, c, d, e, f].into_iter().enumerate() {
         assert_eq!(
-            status, 200,
-            "case {index}: expected a concurrent TagResource 200, got {status} {body}"
+            status, TAG_RESOURCE_SUCCESS,
+            "case {index}: expected a concurrent TagResource {TAG_RESOURCE_SUCCESS}, \
+             got {status} {body}"
         );
     }
 
@@ -255,12 +260,12 @@ async fn tags_belong_to_one_resource_each() {
 
     assert_eq!(
         tag(&router, &application, &pairs(&[("owner", "app")])).await.0,
-        200,
+        TAG_RESOURCE_SUCCESS,
         "tagging the application must succeed"
     );
     assert_eq!(
         tag(&router, &group, &pairs(&[("owner", "group")])).await.0,
-        200,
+        TAG_RESOURCE_SUCCESS,
         "tagging the stream group must succeed"
     );
 
@@ -293,9 +298,9 @@ async fn a_resource_holds_no_more_than_the_published_number_of_tags() {
         .collect();
     let (status, body) = tag(&router, &arn, &full).await;
     assert_eq!(
-        status, 200,
-        "case \"at the bound\": expected TagResource 200 for {TAGS_PER_RESOURCE} tags, \
-         got {status} {body}"
+        status, TAG_RESOURCE_SUCCESS,
+        "case \"at the bound\": expected TagResource {TAG_RESOURCE_SUCCESS} for \
+         {TAGS_PER_RESOURCE} tags, got {status} {body}"
     );
 
     // One key past the bound is refused, and nothing it carried is stored.
@@ -309,8 +314,9 @@ async fn a_resource_holds_no_more_than_the_published_number_of_tags() {
     // at the bound.
     let (status, body) = tag(&router, &arn, &pairs(&[("key-0", "replaced")])).await;
     assert_eq!(
-        status, 200,
-        "case \"replacing a held key at the bound\": expected 200, got {status} {body}"
+        status, TAG_RESOURCE_SUCCESS,
+        "case \"replacing a held key at the bound\": expected {TAG_RESOURCE_SUCCESS}, \
+         got {status} {body}"
     );
 
     let (status, got) = list_tags(&router, &arn).await;

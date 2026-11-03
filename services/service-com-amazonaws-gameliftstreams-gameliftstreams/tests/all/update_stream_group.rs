@@ -57,13 +57,18 @@ fn location_state(value: &Value, location: &str, case: &str) -> Value {
 /// capacities that follow from its always-on capacity in an `ACTIVE` group: allocated
 /// always-on capacity "is allocated to you and is never released back to the service",
 /// and nothing is streaming, so all of it is idle.
+///
+/// A capacity setting no configuration ever named is reported at its default of 0
+/// ("Default is 0 when creating a stream group or adding a location" —
+/// `LocationConfiguration::OnDemandCapacity`), so every capacity member of a reported
+/// location state is a number and `expected` holding no entry means zero.
 fn assert_capacities(state: &Value, expected: &BTreeMap<&str, i64>, location: &str, case: &str) {
     for member in CAPACITY_MEMBERS {
+        let wanted = expected.get(member).copied().unwrap_or(0);
         assert_eq!(
             state[member].as_i64(),
-            expected.get(member).copied(),
-            "case {case:?}: location {location} {member}: expected {:?}, got {state}",
-            expected.get(member)
+            Some(wanted),
+            "case {case:?}: location {location} {member}: expected {wanted}, got {state}"
         );
     }
     let always_on = expected.get("AlwaysOnCapacity").copied().unwrap_or(0);

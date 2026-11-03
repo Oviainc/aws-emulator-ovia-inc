@@ -84,6 +84,21 @@ pub const STREAM_GROUP_QUOTA: usize = 1_000;
 /// the stored tag map cannot grow without end.
 pub const TAGS_PER_RESOURCE: usize = 50;
 
+/// The IPv4 CIDR block of the service VPC a stream group's capacity runs in,
+/// reported on every location of a stream group.
+///
+/// `LocationState::InternalVpcIpv4CidrBlock` is "the CIDR block of the service VPC
+/// for this location. Add this CIDR block to your VPC route table to enable traffic
+/// routing through the Transit Gateway", so the block belongs to the SERVICE's own
+/// network in that location rather than to anything the caller sent: every location
+/// runs its own service VPC, and separate VPCs may carry the same private block, so
+/// one value describes them all.
+///
+/// This emulator provisions no network, so the block is its own choice — a private
+/// RFC 1918 range, in the `/16` form the member's modelled `Ipv4CidrBlock` pattern
+/// accepts.
+pub const SERVICE_VPC_IPV4_CIDR_BLOCK: &str = "10.0.0.0/16";
+
 /// How many stream sessions ONE stream group holds at a time.
 ///
 /// A stream session occupies a compute resource the stream group allocated, so the
@@ -903,10 +918,20 @@ impl StreamGroup {
     /// One location's `LocationState`: the capacity the request configured, the
     /// location's own status, and what is allocated to it and idle in it right now.
     ///
+    /// Every capacity SETTING is reported as a number, including the ones the
+    /// configuration left out: an unconfigured setting holds the service's default
+    /// of zero ("Default is 0 when creating a stream group or adding a location" —
+    /// `LocationConfiguration::OnDemandCapacity`), and a zero is what says the
+    /// setting is off ("This setting, if non-zero, indicates minimum streaming
+    /// capacity ..." — `AlwaysOnCapacity`). An absent member would instead say the
+    /// service has nothing to report for it.
+    ///
     /// `AllocatedCapacity` is the always-on capacity the location holds once it is
     /// `ACTIVE` (always-on capacity "is allocated to you and is never released back
     /// to the service" — `CreateStreamGroup` documentation), and `IdleCapacity` is
     /// that allocation less the stream sessions the location is currently running.
+    /// `InternalVpcIpv4CidrBlock` is the block of the service VPC this location's
+    /// capacity runs in ([`SERVICE_VPC_IPV4_CIDR_BLOCK`]).
     ///
     /// The group's own status wins where it says what every location is doing: a
     /// `DELETING` group is releasing all of them, and an `EXPIRED` group's capacity
@@ -934,17 +959,17 @@ impl StreamGroup {
         LocationState {
             location_name: Some(slot.name.clone()),
             status: Some(location_status.to_string()),
-            always_on_capacity: slot.always_on_capacity,
-            on_demand_capacity: slot.on_demand_capacity,
-            target_idle_capacity: slot.target_idle_capacity,
-            maximum_capacity: slot.maximum_capacity,
+            always_on_capacity: Some(slot.always_on_capacity.unwrap_or(0).max(0)),
+            on_demand_capacity: Some(slot.on_demand_capacity.unwrap_or(0).max(0)),
+            target_idle_capacity: Some(slot.target_idle_capacity.unwrap_or(0).max(0)),
+            maximum_capacity: Some(slot.maximum_capacity.unwrap_or(0).max(0)),
             requested_capacity: Some(requested),
             allocated_capacity: Some(allocated),
             // Saturating, not checked: the capacities come from the request,
             // so the arithmetic must not be able to overflow whatever a
             // caller sent.
             idle_capacity: Some(allocated.saturating_sub(running).max(0)),
-            internal_vpc_ipv4_cidr_block: None,
+            internal_vpc_ipv4_cidr_block: Some(SERVICE_VPC_IPV4_CIDR_BLOCK.to_string()),
             vpc_transit_configuration: None,
         }
     }

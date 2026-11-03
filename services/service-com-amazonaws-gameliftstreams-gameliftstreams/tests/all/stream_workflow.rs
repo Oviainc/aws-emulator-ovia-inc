@@ -371,9 +371,15 @@ async fn the_core_streaming_workflow_round_trips_through_state() {
             "LocationName": "us-west-2",
             "Status": "ACTIVATING",
             "AlwaysOnCapacity": 1,
+            // The settings this configuration left out hold their default of 0.
+            "OnDemandCapacity": 0,
+            "TargetIdleCapacity": 0,
+            "MaximumCapacity": 0,
             "RequestedCapacity": 1,
             "AllocatedCapacity": 0,
             "IdleCapacity": 0,
+            // The service VPC this location's capacity runs in.
+            "InternalVpcIpv4CidrBlock": "10.0.0.0/16",
         }]),
         "CreateStreamGroup: location states must derive from the request and the \
          group's status, got {group}"

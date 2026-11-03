@@ -980,7 +980,7 @@ async fn a_malformed_resource_arn_is_a_bad_request() {
     )
     .await;
     assert_eq!(
-        status, 200,
+        status, 204,
         "case \"a well-formed ResourceArn\": expected the call to be served, got {status} {got}"
     );
     let (status, listed) = call(&router, "GET", &format!("/tags/{arn}"), None).await;
