@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTelemetryPipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTelemetryPipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the ONE stored pipeline record the identifier names in the
+//! region the request was signed for, then answers the modelled empty 200.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTelemetryPipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules this handler enforces:
+//!
+//! * `PipelineIdentifier` is "the identifier (name or ARN)" of a pipeline and it
+//!   resolves only within the region the caller signed for (`resolve_pipeline_key`,
+//!   the one lookup every pipeline-scoped operation goes through), so a name of
+//!   another region, or an ARN of another partition, region, account or resource
+//!   type, names nothing here;
+//! * an identifier that names no stored pipeline is the modelled
+//!   `ResourceNotFoundException` (HTTP 404) carrying the same sentence a pipeline read
+//!   reports for it, so a repeated delete of the same pipeline is a 404 once the first
+//!   one has removed the record;
+//! * the delete removes the record and its ARN index entry together, so both handles
+//!   stop resolving at the instant the record stops existing, and the freed name is
+//!   available to a later create.
+//!
+//! The status the pipeline stands at when the call arrives does not change the answer:
+//! this service documents no pipeline status a delete is refused in, so the modelled
+//! `ConflictException` is deliberately unreachable here rather than raised on a guess
+//! about which states conflict. The emulator verifies every request's signature
+//! centrally and models no IAM policy evaluation, so the modelled
+//! `AccessDeniedException` is unreachable too: a 200 from this operation is not
+//! evidence that a principal is authorized.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +166,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTelemetryPipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTelemetryPipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTelemetryPipeline"))
+        // `PipelineIdentifier`'s presence and its 1..512 length are modelled, so the
+        // centralized request walk has already refused anything outside them with a
+        // 400 `ValidationException` before this body runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteTelemetryPipelineErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the telemetry pipeline store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // The presented access-key id is an identifier, never a secret: it is what the
+        // audit record below attributes this state-changing call to.
+        let principal = ::emulator_server::extract_akid(&ctx.parts().headers);
+
+        let mut store = state.lock();
+        let removed = store.remove_pipeline(&region, &input.pipeline_identifier);
+        drop(store);
+
+        let Some(record) = removed else {
+            ::tracing::info!(
+                target: "audit",
+                operation = Self::NAME,
+                outcome = "rejected-unknown-resource",
+                principal = %principal,
+                region = %region,
+                "refused a telemetry pipeline delete"
+            );
+            // The refusal is the service's own fixed sentence for a pipeline nothing
+            // answers; the identifier the request carried is reported as `ResourceId`,
+            // the member modelled for it, and `ResourceType` names the resource in the
+            // API's own words.
+            return Err(DeleteTelemetryPipelineErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::PIPELINE_NOT_FOUND_MESSAGE.to_string()),
+                    resource_id: Some(input.pipeline_identifier),
+                    resource_type: Some(crate::state::PIPELINE_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Audit record for a state-changing call: who asked, what changed, and how it
+        // ended. The retired pipeline's configuration body is deliberately not in it.
+        ::tracing::info!(
+            target: "audit",
+            operation = Self::NAME,
+            outcome = "deleted",
+            principal = %principal,
+            region = %region,
+            resource = %record.name,
+            resource_arn = %record.arn,
+            "deleted a telemetry pipeline"
+        );
+
+        Ok(DeleteTelemetryPipelineOutput {})
     }
 }

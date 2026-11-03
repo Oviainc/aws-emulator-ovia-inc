@@ -1453,6 +1453,27 @@ impl ComAmazonawsObservabilityadminObservabilityadminState {
         self.telemetry_pipelines.insert(record.key(), record);
     }
 
+    /// Remove the pipeline `identifier` names in `region`, answering the record that
+    /// was removed, or `None` when the identifier names none.
+    ///
+    /// Both the record and its ARN index entry go, so every handle a caller holds on
+    /// the pipeline — its name and its ARN alike — stops resolving at the same instant
+    /// the record stops existing, the way a retired telemetry rule
+    /// ([`Self::remove_rule_tree`]) and a retired S3 Table integration
+    /// ([`Self::remove_s3_table_integration`]) leave no index entry behind either.
+    /// The freed name is then available to a later create, which is what makes a
+    /// delete the way a caller reuses a name.
+    pub fn remove_pipeline(
+        &mut self,
+        region: &str,
+        identifier: &str,
+    ) -> Option<StoredTelemetryPipeline> {
+        let key = self.resolve_pipeline_key(region, identifier)?;
+        let record = self.telemetry_pipelines.remove(&key)?;
+        self.pipeline_arn_index.remove(&record.arn);
+        Some(record)
+    }
+
     /// The key of the S3 Table integration `arn` names for a caller signed for
     /// `region`.
     ///

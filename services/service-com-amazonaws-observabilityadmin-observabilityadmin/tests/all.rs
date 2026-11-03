@@ -14,6 +14,9 @@
 #[path = "all/centralization_rules.rs"]
 mod centralization_rules;
 
+#[path = "all/delete_telemetry_pipeline.rs"]
+mod delete_telemetry_pipeline;
+
 #[path = "all/pipeline_configuration_summary.rs"]
 mod pipeline_configuration_summary;
 
