@@ -1461,29 +1461,67 @@ pub struct ExportDocumentTarget {
     pub object: String,
 }
 
+/// The segments a request path carries under `prefix`, each percent-DECODED, or `None`
+/// when the path is not one under that prefix.
+///
+/// The ONE reader both of this service's document planes resolve a request path through
+/// ([`parse_export_document_path`] below and `crate::service`'s report/term parser), so
+/// the two cannot publish their documents under two spelling conventions.
+///
+/// A segment is DECODED before anything is matched against it, because an escaped octet
+/// and the character it escapes are the same character: a URL whose segments carry a
+/// percent-encoded spelling names the same document as the URL this service announced, so
+/// a client, SDK or proxy that re-spells a segment on the way is served the document the
+/// path named. The path is split into segments FIRST, so a `%2F` inside one segment stays
+/// a character of that segment rather than becoming a separator — an escaped delimiter
+/// does not delimit. A decoded segment is only ever compared against a stored record and
+/// never joined into a path this emulator opens, so a decoded `..` names no document
+/// rather than naming a parent.
+///
+/// At most one segment MORE than a published path carries is read
+/// ([`DOCUMENT_PATH_SEGMENTS`]), which is what tells a caller's path with extra segments
+/// from a published one: the extra segment is enough for either parser to refuse the path,
+/// and a longer path is refused on its length rather than decoded segment by segment.
+pub fn decoded_path_segments(path: &str, prefix: &str) -> Option<Vec<String>> {
+    let mut segments = path.split('/').map(smithy_server_runtime::percent_decode);
+    for expected in prefix.split('/') {
+        if segments.next()? != expected {
+            return None;
+        }
+    }
+    let rest: Vec<String> = segments.take(DOCUMENT_PATH_SEGMENTS + 1).collect();
+    (!rest.is_empty()).then_some(rest)
+}
+
+/// How many segments a document path of this service carries under its prefix: both planes
+/// publish four — the two the document's owner is named by, the one that qualifies it (the
+/// version, or the fixed [`EXPORT_PATH_SEGMENT`]) and the object.
+const DOCUMENT_PATH_SEGMENTS: usize = 4;
+
+/// The fixed segment [`export_document_path`] writes between the inquiry's id and the
+/// export's, so the path names the export as a thing OF the inquiry.
+const EXPORT_PATH_SEGMENT: &str = "export";
+
 /// The export document a request path names, or `None` when the path is not one this
 /// service publishes.
+///
+/// Read through [`decoded_path_segments`], so every spelling of the announced path names
+/// the same export.
 pub fn parse_export_document_path(path: &str) -> Option<ExportDocumentTarget> {
-    let rest = path
-        .strip_prefix(EXPORT_DOCUMENT_PATH_PREFIX)?
-        .strip_prefix('/')?;
-    let mut segments = rest.split('/');
-    let (Some(inquiry_id), Some("export"), Some(export_id), Some(object), None) = (
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-    ) else {
+    let segments = decoded_path_segments(path, EXPORT_DOCUMENT_PATH_PREFIX)?;
+    let [inquiry_id, export_segment, export_id, object] = segments.as_slice() else {
         return None;
     };
+    if export_segment != EXPORT_PATH_SEGMENT {
+        return None;
+    }
     if inquiry_id.is_empty() || export_id.is_empty() || object.is_empty() {
         return None;
     }
     Some(ExportDocumentTarget {
-        inquiry_id: inquiry_id.to_string(),
-        export_id: export_id.to_string(),
-        object: object.to_string(),
+        inquiry_id: inquiry_id.clone(),
+        export_id: export_id.clone(),
+        object: object.clone(),
     })
 }
 
@@ -2192,7 +2230,8 @@ pub fn report_document_url(
 /// document is rather than what was asked for.
 pub fn export_document_path(inquiry_id: &str, export_id: &str) -> String {
     format!(
-        "{EXPORT_DOCUMENT_PATH_PREFIX}/{inquiry_id}/export/{export_id}/{INQUIRY_EXPORT_OBJECT}"
+        "{EXPORT_DOCUMENT_PATH_PREFIX}/{inquiry_id}/{EXPORT_PATH_SEGMENT}/{export_id}/\
+         {INQUIRY_EXPORT_OBJECT}"
     )
 }
 

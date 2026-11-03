@@ -786,23 +786,20 @@ impl DocumentPlane for ReportDocumentPlane {
 
 /// The document a data-plane path names, or `None` when the path is not one this service
 /// publishes documents at.
+///
+/// Read through the one segment reader both document planes resolve a path with
+/// ([`crate::state::decoded_path_segments`]), so every spelling of the announced path
+/// names the same document.
 fn parse_document_path(path: &str) -> Option<WantedDocument> {
-    let rest = path
-        .strip_prefix(crate::state::DOCUMENT_PATH_PREFIX)?
-        .strip_prefix('/')?;
-    let mut segments = rest.split('/');
-    let kind = segments.next()?;
-    let report_id = segments.next()?;
-    let version = segments.next()?.strip_prefix('v')?.parse::<i64>().ok()?;
-    let object = segments.next()?;
-    if segments.next().is_some() {
+    let segments = crate::state::decoded_path_segments(path, crate::state::DOCUMENT_PATH_PREFIX)?;
+    let [kind, report_id, version, object] = segments.as_slice() else {
         return None;
-    }
+    };
     Some(WantedDocument {
-        kind: smithy_server_runtime::percent_decode(kind),
-        report_id: smithy_server_runtime::percent_decode(report_id),
-        version,
-        object: smithy_server_runtime::percent_decode(object),
+        kind: kind.clone(),
+        report_id: report_id.clone(),
+        version: version.strip_prefix('v')?.parse::<i64>().ok()?,
+        object: object.clone(),
     })
 }
 
