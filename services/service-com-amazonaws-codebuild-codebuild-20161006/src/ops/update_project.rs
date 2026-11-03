@@ -273,6 +273,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let last_modified_millis = now.max(stored_modified_millis + 1);
         project.last_modified = Some(crate::state::datetime(last_modified_millis));
 
+        // A replaced setting is resolved the same way the create resolved the one it
+        // replaces: a request that hands over a source, an environment or a cache naming
+        // none of the members the service defaults leaves a project whose effective
+        // configuration still states them, so the stored record carries them.
+        crate::state::resolve_project_defaults(&mut project, &region);
+
         guard.projects.insert(
             name,
             crate::state::StoredProject {

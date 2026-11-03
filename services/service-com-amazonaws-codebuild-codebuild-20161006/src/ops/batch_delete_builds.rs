@@ -141,13 +141,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut deleted: Vec<String> = Vec::new();
         let mut not_deleted: Vec<BuildNotDeleted> = Vec::new();
         // Two entries naming the same build name one build, so each named build is
-        // reported once: without this the repeat would read as "not deleted" purely
-        // because the first occurrence had just deleted it.
-        let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
-        for id in &input.ids {
-            if !seen.insert(id.as_str()) {
-                continue;
-            }
+        // reported once ([`crate::state::distinct_identifiers`]): without this the
+        // repeat would read as "not deleted" purely because the first occurrence had
+        // just deleted it.
+        for id in crate::state::distinct_identifiers(&input.ids) {
             // AWS states no status precondition for deleting a build (unlike
             // `StopBuild`, which needs one still running), so a build is removed
             // whatever status it carries; the only build this emulator cannot delete
@@ -156,10 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `ListBuildsForProject`, and `ListBuilds` once its own stub issue is
             // closed — stops reporting it.
             if guard.remove_build(id) {
-                deleted.push(id.clone());
+                deleted.push(id.to_string());
             } else {
                 not_deleted.push(BuildNotDeleted {
-                    id: Some(id.clone()),
+                    id: Some(id.to_string()),
                     // `statusCode` is documented only as "Additional information
                     // about the build that could not be successfully deleted", and
                     // CodeBuild builds it from the request: it names the id the

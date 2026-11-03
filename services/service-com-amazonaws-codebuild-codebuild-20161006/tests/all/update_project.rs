@@ -7,6 +7,9 @@
 //! exactly the settings the request carries — each member whole, a structure never
 //! merged field by field — leaving every omitted setting and every member another
 //! operation owns as stored, and moving `lastModified` only when the call succeeds. A
+//! A setting the request replaces is stored with the members the SERVICE supplies
+//! resolved — the rule `crate::project_effective_configuration` covers — so each
+//! expectation below carries them. A
 //! name no project holds is refused with `ResourceNotFoundException`, and a resulting
 //! configuration the service cannot build from (a source declaring no input source code
 //! yet carrying no inline buildspec) is refused with `InvalidInputException`, with
@@ -135,7 +138,13 @@ async fn update_project_replaces_the_members_it_was_given_and_keeps_the_rest() {
         (
             "a new inline buildspec",
             json!({"source": {"type": "NO_SOURCE", "buildspec": "version: 0.2\nphases: {}"}}),
-            json!({"source": {"type": "NO_SOURCE", "buildspec": "version: 0.2\nphases: {}"}}),
+            // The replacement source is stored with the flags the service defaults
+            // resolved, the same way the create resolved the source it replaces.
+            json!({"source": {
+                "type": "NO_SOURCE",
+                "buildspec": "version: 0.2\nphases: {}",
+                "insecureSsl": false,
+            }}),
         ),
         (
             "a timeout at the modelled lower bound",
@@ -168,6 +177,9 @@ async fn update_project_replaces_the_members_it_was_given_and_keeps_the_rest() {
                 "type": "ARM_CONTAINER",
                 "image": "aws/codebuild/amazonlinux2-aarch64-standard:3.0",
                 "computeType": "BUILD_GENERAL1_LARGE",
+                "privilegedMode": false,
+                "imagePullCredentialsType": "CODEBUILD",
+                "environmentVariables": [],
             }}),
         ),
         (
@@ -263,7 +275,12 @@ async fn update_project_replaces_the_members_it_was_given_and_keeps_the_rest() {
                 {"type": "S3", "location": "bucket/src.zip", "sourceIdentifier": "extra"},
             ]}),
             json!({"secondarySources": [
-                {"type": "S3", "location": "bucket/src.zip", "sourceIdentifier": "extra"},
+                {
+                    "type": "S3",
+                    "location": "bucket/src.zip",
+                    "sourceIdentifier": "extra",
+                    "insecureSsl": false,
+                },
             ]}),
         ),
         (

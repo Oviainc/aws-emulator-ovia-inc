@@ -49,6 +49,8 @@ mod list_shared_report_groups;
 mod project_build_batch_lifecycle;
 #[path = "all/project_build_lifecycle.rs"]
 mod project_build_lifecycle;
+#[path = "all/project_effective_configuration.rs"]
+mod project_effective_configuration;
 #[path = "all/project_visibility.rs"]
 mod project_visibility;
 #[path = "all/read_response_shape.rs"]

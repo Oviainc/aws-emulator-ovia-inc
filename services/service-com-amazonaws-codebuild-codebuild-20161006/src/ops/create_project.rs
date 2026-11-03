@@ -271,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let project = Project {
+        let mut project = Project {
             arn: Some(arn.clone()),
             name: Some(input.name.clone()),
             description: input.description,
@@ -284,14 +284,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cache: input.cache,
             environment: Some(input.environment),
             service_role: Some(input.service_role),
-            // The one defaulted member: AWS documents 60 minutes for an absent
-            // `timeoutInMinutes`. `queuedTimeoutInMinutes` has no documented default,
-            // so an absent one stays absent.
-            timeout_in_minutes: Some(
-                input
-                    .timeout_in_minutes
-                    .unwrap_or(crate::state::DEFAULT_BUILD_TIMEOUT_MINUTES),
-            ),
+            // Every member the SERVICE resolves rather than the client supplying it —
+            // this one, `queuedTimeoutInMinutes`, `cache`, `encryptionKey`, the
+            // environment's and the source's documented defaults — is written as the
+            // request carried it and then resolved by
+            // `crate::state::resolve_project_defaults` below, so the stored project is
+            // the configuration a build of it would run with.
+            timeout_in_minutes: input.timeout_in_minutes,
             queued_timeout_in_minutes: input.queued_timeout_in_minutes,
             encryption_key: input.encryption_key,
             // A resource's tag set is always reported, `[]` when it carries no tag —
@@ -322,6 +321,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_access_role: None,
             auto_retry_limit: input.auto_retry_limit,
         };
+
+        // The service's own defaults, resolved ONCE here and persisted: a read reports
+        // the project's effective configuration rather than only what this request named.
+        crate::state::resolve_project_defaults(&mut project, &region);
 
         guard.projects.insert(
             input.name,

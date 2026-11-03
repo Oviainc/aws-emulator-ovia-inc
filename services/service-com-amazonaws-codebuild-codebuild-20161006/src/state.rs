@@ -3618,8 +3618,9 @@ pub fn default_encryption_key(region: &str) -> String {
     ::emulator_server::emulator_arn("kms", region, "alias/aws/s3")
 }
 
-/// `cache` as a started run reports it: the configured cache, or the explicit
-/// [`CACHE_TYPE_NO_CACHE`] cache of a project that configures none.
+/// `cache` as a started run — and the stored project it runs ([`resolve_project_defaults`])
+/// — reports it: the configured cache, or the explicit [`CACHE_TYPE_NO_CACHE`] cache of a
+/// project that configures none.
 pub fn effective_cache(cache: Option<ProjectCache>) -> ProjectCache {
     cache.unwrap_or_else(|| ProjectCache {
         r#type: CACHE_TYPE_NO_CACHE.to_string(),
@@ -3634,7 +3635,8 @@ pub fn effective_cache(cache: Option<ProjectCache>) -> ProjectCache {
 ///
 /// Shared by `StartBuild` and `StartBuildBatch` (and so by every read of the
 /// records they persist), which resolve the same `ProjectSource` with their own
-/// `*Override` members already applied.
+/// `*Override` members already applied, and by the stored project itself
+/// ([`resolve_project_defaults`]).
 pub fn effective_source(mut source: ProjectSource) -> ProjectSource {
     source.insecure_ssl = Some(source.insecure_ssl.unwrap_or(DEFAULT_INSECURE_SSL));
     source
@@ -3653,6 +3655,72 @@ pub fn effective_environment(mut environment: ProjectEnvironment) -> ProjectEnvi
     environment.environment_variables =
         Some(environment.environment_variables.unwrap_or_default());
     environment
+}
+
+/// How long a build may sit queued when nothing named a `queuedTimeoutInMinutes`.
+///
+/// The member's shape, `TimeOut`, is `@range(min: 5, max: 480)`, and a project that
+/// asks for no shorter window keeps a build queued for the whole of it — the eight
+/// hours CodeBuild resolves an unset queue timeout to.
+pub const DEFAULT_QUEUED_TIMEOUT_MINUTES: i32 = 480;
+
+/// Resolve every member of a build project that the SERVICE supplies rather than the
+/// client, so the stored record is the project's EFFECTIVE configuration.
+///
+/// AWS documents each of these settings with the value a project that names none runs
+/// with ([`DEFAULT_BUILD_TIMEOUT_MINUTES`], [`DEFAULT_QUEUED_TIMEOUT_MINUTES`],
+/// [`effective_cache`], [`effective_source`], [`effective_environment`],
+/// [`default_encryption_key`]), and a project is stored with those values resolved:
+/// every later read reports the configuration a build of it would run with rather than
+/// only the members the request happened to carry. Called wherever a project record is
+/// persisted — `CreateProject` and `UpdateProject` — so the defaults are resolved once,
+/// on the write, and no reader has to reinvent them.
+///
+/// `region` is the request's own (see [`request_region`]): the managed key the absent
+/// `encryptionKey` resolves to is an ARN in the caller's region and account.
+pub fn resolve_project_defaults(project: &mut Project, region: &str) {
+    project.cache = Some(effective_cache(project.cache.take()));
+    project.environment = project.environment.take().map(effective_environment);
+    // A secondary source is a stored source too, so its flags resolve the same way the
+    // primary one's do.
+    project.source = project.source.take().map(effective_source);
+    project.secondary_sources = project
+        .secondary_sources
+        .take()
+        .map(|sources| sources.into_iter().map(effective_source).collect());
+    project.encryption_key = Some(
+        project
+            .encryption_key
+            .take()
+            .unwrap_or_else(|| default_encryption_key(region)),
+    );
+    project.timeout_in_minutes = Some(
+        project
+            .timeout_in_minutes
+            .unwrap_or(DEFAULT_BUILD_TIMEOUT_MINUTES),
+    );
+    project.queued_timeout_in_minutes = Some(
+        project
+            .queued_timeout_in_minutes
+            .unwrap_or(DEFAULT_QUEUED_TIMEOUT_MINUTES),
+    );
+}
+
+/// The identifiers an operation acts on, in the order the request first named each one
+/// and with every repeat dropped.
+///
+/// For the operations whose identifier list names the SET of resources the call is about
+/// — `BatchGetProjects`' `names`, `BatchDeleteBuilds`' `ids` — naming one resource twice
+/// asks nothing more than naming it once, so the answer carries one entry per DISTINCT
+/// identifier and is not index-aligned with the request. Each caller keeps its own rule
+/// for which FORMS of an identifier name the same resource.
+pub fn distinct_identifiers(requested: &[String]) -> Vec<&str> {
+    let mut seen = ::std::collections::BTreeSet::new();
+    requested
+        .iter()
+        .map(String::as_str)
+        .filter(|identifier| seen.insert(*identifier))
+        .collect()
 }
 
 /// `defined` with `overrides` applied: an override replaces the variable of the same

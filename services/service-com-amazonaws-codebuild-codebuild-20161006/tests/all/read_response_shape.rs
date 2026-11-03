@@ -28,7 +28,10 @@ use super::project_build_lifecycle::{call, create_project, emulator, expected_ar
 /// The KMS key a run with no `encryptionKey` configured reports, from the default AWS
 /// documents on `Project$encryptionKey`: "If you don't specify a value, CodeBuild uses
 /// the managed CMK for Amazon Simple Storage Service (Amazon S3)."
-fn managed_s3_key() -> String {
+///
+/// `pub(crate)`: the project-configuration suite asserts the same resolved default on
+/// the stored project a run of it reads its configuration from.
+pub(crate) fn managed_s3_key() -> String {
     format!(
         "arn:aws:kms:{REGION}:{}:alias/aws/s3",
         engine::EMULATOR_ACCOUNT_ID
@@ -37,7 +40,10 @@ fn managed_s3_key() -> String {
 
 /// The value at a dotted `path` of `body`, or `Value::Null` when the path is absent. A
 /// segment that parses as a number indexes a list, so a path can reach into one.
-fn at(body: &Value, path: &str) -> Value {
+///
+/// `pub(crate)`: shared with the sibling suites that assert member paths of the same
+/// records.
+pub(crate) fn at(body: &Value, path: &str) -> Value {
     let mut reported = body;
     for segment in path.split('.') {
         reported = match segment.parse::<usize>() {
