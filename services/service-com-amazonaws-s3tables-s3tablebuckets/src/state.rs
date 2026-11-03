@@ -199,6 +199,24 @@ pub struct BucketEncryption {
     pub kms_key_arn: Option<String>,
 }
 
+/// The encryption every table bucket carries when no configuration of its own
+/// was ever set on it: server-side encryption with S3-managed keys, which is
+/// the service default and takes no KMS key.
+pub const DEFAULT_BUCKET_ENCRYPTION: BucketEncryption = BucketEncryption {
+    sse_algorithm: SseAlgorithm::Aes256,
+    kms_key_arn: None,
+};
+
+/// The encryption a table bucket is actually protected by: the configuration
+/// the store holds for it, else [`DEFAULT_BUCKET_ENCRYPTION`].
+///
+/// A table bucket is ALWAYS encrypted, so a read reports an algorithm whether
+/// or not a configuration was ever set — the stored `None` means "the caller
+/// asked for nothing", not "nothing protects this bucket".
+pub fn effective_bucket_encryption(stored: Option<&BucketEncryption>) -> BucketEncryption {
+    stored.cloned().unwrap_or(DEFAULT_BUCKET_ENCRYPTION)
+}
+
 /// A table bucket, as this emulator stores it.
 ///
 /// `encryption` and `storage_class` are `None` when the create named neither:
@@ -599,6 +617,12 @@ pub const NAMESPACE_ALREADY_EXISTS_MESSAGE: &str =
 /// the members the model constrains with `TableBucketARN`. FIXED text, as
 /// [`INVALID_TABLE_BUCKET_NAME_MESSAGE`].
 pub const INVALID_TABLE_BUCKET_ARN_MESSAGE: &str = "The specified table bucket ARN is not valid.";
+
+/// How this service states a table bucket the store does not hold: the
+/// `NotFoundException` (HTTP 404) the ARN-addressed operations model. FIXED
+/// text — it names the CLASS of the failure and takes nothing from the request,
+/// and it says "bucket" rather than "table bucket".
+pub const BUCKET_NOT_FOUND_MESSAGE: &str = "The specified bucket does not exist.";
 
 /// How this service states a value that cannot be a taggable resource's ARN at
 /// all — the `resourceArn` member of the tagging operations, which the model

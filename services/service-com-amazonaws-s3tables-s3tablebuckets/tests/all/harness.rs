@@ -166,6 +166,16 @@ impl Emulator {
             .await
     }
 
+    pub async fn get_table_bucket_encryption(&self, region: &str, arn: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!("/buckets/{}/encryption", encode(arn)),
+            region,
+            None,
+        )
+        .await
+    }
+
     pub async fn list_table_buckets(&self, region: &str, query: &[(&str, String)]) -> Reply {
         self.call("GET", &format!("/buckets{}", query_string(query)), region, None)
             .await

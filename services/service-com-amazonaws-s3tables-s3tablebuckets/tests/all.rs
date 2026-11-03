@@ -19,5 +19,7 @@ mod harness;
 mod namespace_and_table_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/table_bucket_encryption.rs"]
+mod table_bucket_encryption;
 #[path = "all/table_bucket_lifecycle.rs"]
 mod table_bucket_lifecycle;
