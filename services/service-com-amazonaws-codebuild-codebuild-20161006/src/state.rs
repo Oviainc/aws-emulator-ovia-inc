@@ -560,6 +560,19 @@ pub const SANDBOX_STATUS_STOPPED: &str = "STOPPED";
 /// key on it. Recorded behaviour — the model states no message for the error.
 pub const SANDBOX_NOT_FOUND_MESSAGE: &str = "Sandbox does not exist";
 
+/// What CodeBuild states as the reason a `sandboxId` resolves to no sandbox of this
+/// account on the operation that opens a connection INTO one, carried by the modelled
+/// `InvalidInputException`.
+///
+/// `StartSandboxConnection` classifies an identifier it cannot resolve as BAD INPUT rather
+/// than as a missing resource: the member is the session's whole addressing argument, so a
+/// value naming no live session is a value the operation cannot act on at all, and both
+/// errors it models are `client`/400. Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s
+/// rule — the identifier is not quoted back, so no ARN for a resource that does not exist
+/// reaches the wire. The sandbox-addressing operations that act on the sandbox itself
+/// report [`SANDBOX_NOT_FOUND_MESSAGE`] as a missing resource instead.
+pub const UNRESOLVABLE_SANDBOX_ID_MESSAGE: &str = "No sandbox found with specified ID";
+
 /// What CodeBuild states as the reason a request addresses a build project this
 /// account does not hold, carried by the modelled `ResourceNotFoundException`.
 ///
@@ -584,8 +597,51 @@ pub const WEBHOOK_NOT_FOUND_MESSAGE: &str = "Webhook does not exist for this pro
 
 /// What CodeBuild states as the reason a request addresses a report group this account
 /// does not hold — the sibling of [`PROJECT_NOT_FOUND_MESSAGE`] for the other resource
-/// kind addressed by ARN alone, and fixed text for the same reason.
+/// kind addressed by ARN alone, and fixed text for the same reason. It is the sentence
+/// the report-group MANAGEMENT operations carry; a reporting read of a group's contents
+/// quotes the ARN it was asked about instead, see
+/// [`provided_report_group_absent_message`].
 pub const REPORT_GROUP_NOT_FOUND_MESSAGE: &str = "Report group does not exist";
+
+/// What CodeBuild states as the reason a listing of ONE project's records names a project
+/// this account does not hold, carried by the modelled `ResourceNotFoundException`.
+///
+/// The per-project listings quote the project they were asked about inside this fixed
+/// sentence — by the ARN the requested name resolves to in the region the call is signed
+/// for — where the project-MANAGEMENT operations state the wholly fixed
+/// [`PROJECT_NOT_FOUND_MESSAGE`] and the build-starting operations word theirs their own
+/// way. The ARN is computed from the request, the signed region and this emulator's
+/// account, so nothing of any single exchange is baked in.
+pub fn provided_project_absent_message(region: &str, project_name: &str) -> String {
+    format!(
+        "The provided project {} does not exist.",
+        project_arn(region, project_name)
+    )
+}
+
+/// What CodeBuild states as the reason a reporting read of a report group's contents names
+/// an ARN this account holds no group under, carried by the modelled
+/// `ResourceNotFoundException`.
+///
+/// The sibling of [`provided_project_absent_message`] for the other resource a reporting
+/// operation is pointed at: the ARN asked about is quoted, because it is the whole
+/// diagnostic value of the refusal when several groups are being read, and it is taken
+/// from the request exactly as sent. The sentence ends without a period, where the
+/// project one ends with one — each is the sentence CodeBuild states for its own
+/// operation, not a shared template.
+pub fn provided_report_group_absent_message(report_group_arn: &str) -> String {
+    format!("The provided report group {report_group_arn} does not exist")
+}
+
+/// What CodeBuild states as the reason a continuation token opens no page of the listing a
+/// request asked for, carried by the modelled `InvalidInputException`.
+///
+/// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule, and the SAME sentence on every
+/// paginated operation of the service: a token is an opaque value the service handed the
+/// caller — `ListFleetsInput$nextToken` is even `@sensitive` — so it is never quoted back,
+/// and the sentence names the member by CodeBuild's user-facing term for it rather than by
+/// its wire name.
+pub const INVALID_CONTINUATION_TOKEN_MESSAGE: &str = "Invalid continuation token specified.";
 
 /// What CodeBuild states as the reason no resource-based policy is attached to the ARN
 /// a request names, carried by the modelled `ResourceNotFoundException`.
@@ -595,6 +651,16 @@ pub const REPORT_GROUP_NOT_FOUND_MESSAGE: &str = "Report group does not exist";
 /// `Resource ARN` are part of the sentence CodeBuild emits, not a substitution for the
 /// value the request sent.
 pub const RESOURCE_POLICY_NOT_FOUND_MESSAGE: &str = "Resource ARN resource policy does not exist";
+
+/// What CodeBuild states as the reason the ARN a resource-policy write names addresses no
+/// resource of this account, carried by the modelled `ResourceNotFoundException`.
+///
+/// `PutResourcePolicy` is ARN-GENERIC — it "Stores a resource policy for the ARN of a
+/// Project or ReportGroup object" — so its refusal names the ARN member at fault rather
+/// than one of the two resource kinds the value could have named: a caller attaching a
+/// policy to a project must not be told a report group is missing. Fixed text, under
+/// [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule, with the value itself never quoted back.
+pub const RESOURCE_ARN_NOT_FOUND_MESSAGE: &str = "Resource ARN does not exist";
 
 /// What CodeBuild states as the reason a value is not the ARN of a resource it can
 /// attach a resource-based policy to, carried by the modelled `InvalidInputException`.
@@ -977,14 +1043,6 @@ impl PolicyTarget {
             return Some(Self::Project);
         }
         report_group_name_from_arn(arn).is_some().then_some(Self::ReportGroup)
-    }
-
-    /// What CodeBuild states as the reason this account holds no such resource.
-    pub fn absent_message(self) -> &'static str {
-        match self {
-            Self::Project => PROJECT_NOT_FOUND_MESSAGE,
-            Self::ReportGroup => REPORT_GROUP_NOT_FOUND_MESSAGE,
-        }
     }
 
     /// The resource-type token CodeBuild names this kind of resource by when it refuses

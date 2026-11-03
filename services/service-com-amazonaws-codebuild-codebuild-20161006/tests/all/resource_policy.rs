@@ -347,7 +347,9 @@ async fn a_later_write_replaces_the_document_the_arn_already_carried() {
 }
 
 /// RULE: an ARN of the right shape that this account holds no resource for is refused
-/// with `ResourceNotFoundException`, naming the resource kind, and nothing is stored.
+/// with `ResourceNotFoundException` naming the ARN MEMBER at fault — this operation is
+/// ARN-generic, so its refusal never points the caller at one of the two resource kinds
+/// the value could have named — and nothing is stored.
 #[tokio::test]
 async fn an_arn_this_account_holds_no_resource_for_is_refused_as_not_found() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -362,45 +364,35 @@ async fn an_arn_this_account_holds_no_resource_for_is_refused_as_not_found() {
     let other_account = format!("arn:aws:codebuild:{REGION}:111122223333:project/held-project");
     let other_partition =
         format!("arn:aws-us-gov:codebuild:{REGION}:{}:project/held-project", engine::EMULATOR_ACCOUNT_ID);
-    let cases: [(&str, String, &str); 7] = [
+    // Every row states the SAME sentence, whichever resource kind the ARN names: that is
+    // the rule under test.
+    let expected = "Resource ARN does not exist";
+    let cases: [(&str, String); 7] = [
         (
             "a project never created",
             state::project_arn(REGION, "no-such-project"),
-            "Project does not exist",
         ),
         (
             "a held project in another region",
             state::project_arn("eu-west-1", "held-project"),
-            "Project does not exist",
         ),
-        (
-            "a held project in another account",
-            other_account,
-            "Project does not exist",
-        ),
-        (
-            "a held project in another partition",
-            other_partition,
-            "Project does not exist",
-        ),
+        ("a held project in another account", other_account),
+        ("a held project in another partition", other_partition),
         (
             "a held project in another case",
             state::project_arn(REGION, "HELD-PROJECT"),
-            "Project does not exist",
         ),
         (
             "a report group never created",
             state::report_group_arn(REGION, "no-such-group"),
-            "Report group does not exist",
         ),
         (
             "a held report group in another region",
             state::report_group_arn("eu-west-1", "held-group"),
-            "Report group does not exist",
         ),
     ];
 
-    for (case, arn, expected) in cases {
+    for (case, arn) in cases {
         let message = refusal(
             &router,
             case,
@@ -411,8 +403,15 @@ async fn an_arn_this_account_holds_no_resource_for_is_refused_as_not_found() {
         .await;
         assert_eq!(
             message, expected,
-            "case {case:?}: expected CodeBuild's absent-resource sentence, got {message:?}"
+            "case {case:?}: expected CodeBuild's absent-resource-ARN sentence, got {message:?}"
         );
+        for kind in ["Project", "Report group", "report-group"] {
+            assert!(
+                !message.contains(kind),
+                "case {case:?}: the sentence must not name the resource kind {kind:?}, \
+                 got {message:?}"
+            );
+        }
         // Reading it back reports the ABSENT POLICY rather than a stored one: the
         // refused write stored nothing.
         let message = refusal(

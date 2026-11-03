@@ -181,9 +181,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ListBuildBatchesForProjectErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Project cannot be found: {}",
-                            crate::state::project_arn(&region, project_name)
+                        message: Some(crate::state::provided_project_absent_message(
+                            &region,
+                            project_name,
                         )),
                     },
                 )
@@ -220,7 +220,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ListBuildBatchesForProjectErrorModeled::InvalidInputException(
                     InvalidInputException {
-                        message: Some("Invalid nextToken".to_string()),
+                        message: Some(
+                            crate::state::INVALID_CONTINUATION_TOKEN_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

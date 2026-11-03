@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some((page, next_token)) = crate::state::page(&ids, input.next_token.as_deref()) else {
             return Err(ListBuildsErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some("Invalid nextToken".to_string()),
+                    message: Some(crate::state::INVALID_CONTINUATION_TOKEN_MESSAGE.to_string()),
                 },
             )
             .into());

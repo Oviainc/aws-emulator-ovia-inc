@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(ListBuildBatchesErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some("Invalid nextToken".to_string()),
+                    message: Some(crate::state::INVALID_CONTINUATION_TOKEN_MESSAGE.to_string()),
                 },
             )
             .into());

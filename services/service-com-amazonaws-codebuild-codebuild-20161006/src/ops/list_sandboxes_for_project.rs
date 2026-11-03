@@ -157,9 +157,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ListSandboxesForProjectErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "The provided project {} does not exist.",
-                            crate::state::project_arn(&region, &input.project_name)
+                        message: Some(crate::state::provided_project_absent_message(
+                            &region,
+                            &input.project_name,
                         )),
                     },
                 )
@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(ListSandboxesForProjectErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some("Invalid nextToken".to_string()),
+                    message: Some(crate::state::INVALID_CONTINUATION_TOKEN_MESSAGE.to_string()),
                 },
             )
             .into());

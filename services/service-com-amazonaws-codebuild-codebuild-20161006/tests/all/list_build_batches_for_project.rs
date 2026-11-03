@@ -596,7 +596,7 @@ async fn list_build_batches_for_project_refuses_a_project_it_does_not_hold() {
             "case {case:?} ({project:?}): expected ResourceNotFoundException, got {body}"
         );
         let expected = format!(
-            "Project cannot be found: {}",
+            "The provided project {} does not exist.",
             expected_arn(&format!("project/{project}"))
         );
         assert_eq!(

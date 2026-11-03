@@ -14,7 +14,7 @@
 //!   being in force at the end of the wait `Sandbox$timeoutInMinutes` documents;
 //! * a sandbox whose session is not in its run phase has nothing to connect to, and is
 //!   refused naming the phase its own session is sitting in;
-//! * an id (or ARN) no sandbox of the account answers to is refused as not found.
+//! * an id (or ARN) no sandbox of the account answers to is refused as invalid input.
 //!
 //! Each suite in `tests/all/` drives the wire itself, so the harness below is this
 //! suite's own.
@@ -599,11 +599,11 @@ async fn a_sandbox_outside_its_run_phase_cannot_be_connected_to() {
     );
 }
 
-/// RULE: an id — or ARN — no sandbox of the account answers to is refused with
-/// `ResourceNotFoundException` (HTTP 400), carrying CodeBuild's fixed sandbox-not-found
-/// sentence and naming nothing of the request.
+/// RULE: an id — or ARN — no sandbox of the account answers to is refused by THIS
+/// operation as bad input: `InvalidInputException` (HTTP 400) carrying CodeBuild's fixed
+/// unresolvable-id sentence and naming nothing of the request.
 #[tokio::test]
-async fn an_unresolvable_sandbox_is_refused_as_not_found() {
+async fn an_unresolvable_sandbox_is_refused_as_invalid_input() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_on(Arc::clone(&engine));
     create_project(&router, "missing-proj", json!({})).await;
@@ -637,13 +637,13 @@ async fn an_unresolvable_sandbox_is_refused_as_not_found() {
             "case {case:?}: expected 400, got {status} with {body}"
         );
         assert!(
-            error_type(&body).contains("ResourceNotFoundException"),
-            "case {case:?}: expected ResourceNotFoundException, got {body}"
+            error_type(&body).contains("InvalidInputException"),
+            "case {case:?}: expected InvalidInputException, got {body}"
         );
         assert_eq!(
             text(&body, "message"),
-            state::SANDBOX_NOT_FOUND_MESSAGE,
-            "case {case:?}: expected CodeBuild's fixed sandbox-not-found sentence, got {body}"
+            state::UNRESOLVABLE_SANDBOX_ID_MESSAGE,
+            "case {case:?}: expected CodeBuild's unresolvable-sandbox-id sentence, got {body}"
         );
     }
 

@@ -6,7 +6,7 @@
 //!
 //! A connection is a session INTO the sandbox's live session, so it needs one to act
 //! on: a sandbox that is still queued, or that has stopped or timed out, is refused,
-//! and an id no sandbox answers to is refused as not found. Each call starts its OWN
+//! and an id no sandbox answers to is refused as invalid input. Each call starts its OWN
 //! session — a fresh session id, its own token and its own data-channel URL — and that
 //! session is persisted ([`crate::state::StoredSandboxConnection`]) for as long as it
 //! can be used, which is as long as the sandbox session it connects to lives.
@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (sandbox_id, expires_millis) = {
             let mut guard = state.lock();
             let Some(stored) = guard.settled_sandbox(store_id, now) else {
-                return Err(sandbox_not_found());
+                return Err(unresolvable_sandbox_id());
             };
             if !stored.is_running() {
                 return Err(invalid_build_phase(stored));
@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // connection started after it.
         let mut guard = state.lock();
         let Some(stored) = guard.settled_sandbox(store_id, now) else {
-            return Err(sandbox_not_found());
+            return Err(unresolvable_sandbox_id());
         };
         if !stored.is_running() {
             return Err(invalid_build_phase(stored));
@@ -221,12 +221,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The modelled refusal for a `sandboxId` no sandbox of this account answers to.
 ///
-/// Worded by the one sentence CodeBuild answers an unresolvable sandbox with
-/// ([`crate::state::SANDBOX_NOT_FOUND_MESSAGE`]), which names no identifier — so nothing
-/// about the request, and no ARN for a sandbox that does not exist, reaches the wire.
-fn sandbox_not_found() -> StartSandboxConnectionError {
-    StartSandboxConnectionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::SANDBOX_NOT_FOUND_MESSAGE.to_string()),
+/// This operation classifies an identifier it cannot resolve as BAD INPUT — the modelled
+/// `InvalidInputException` — rather than as a missing resource: the member is the whole
+/// addressing argument of the session the call would open, so a value naming no live
+/// session is a value the operation cannot act on at all. Worded by the one sentence
+/// CodeBuild answers that with ([`crate::state::UNRESOLVABLE_SANDBOX_ID_MESSAGE`]), which
+/// names no identifier — so nothing about the request, and no ARN for a sandbox that does
+/// not exist, reaches the wire.
+fn unresolvable_sandbox_id() -> StartSandboxConnectionError {
+    StartSandboxConnectionErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(crate::state::UNRESOLVABLE_SANDBOX_ID_MESSAGE.to_string()),
     })
     .into()
 }

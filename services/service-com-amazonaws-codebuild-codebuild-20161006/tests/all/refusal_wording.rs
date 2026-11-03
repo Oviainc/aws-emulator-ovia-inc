@@ -555,7 +555,9 @@ async fn an_absent_webhook_is_refused_in_codebuilds_own_words() {
 /// RULE: a `sandboxId` that resolves to no sandbox of this account is refused with 400
 /// `ResourceNotFoundException` worded `Sandbox does not exist` — wholly fixed text that
 /// names no identifier, so no ARN for a resource that does not exist is disclosed and
-/// the sentence is the same on every sandbox-addressing operation.
+/// the sentence is the same on every operation that ACTS ON a sandbox.
+/// (`StartSandboxConnection`, which opens a session into one, classifies an id it cannot
+/// resolve as invalid input instead — see `tests/all/sandbox_connection.rs`.)
 #[tokio::test]
 async fn an_absent_sandbox_is_refused_in_codebuilds_own_words() {
     let router = emulator();

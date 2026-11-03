@@ -159,9 +159,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !guard.projects.contains_key(&input.project_name) {
             return Err(ListBuildsForProjectErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Project cannot be found: {}",
-                        crate::state::project_arn(&region, &input.project_name)
+                    // A per-project LISTING quotes the project it was asked about, by
+                    // the ARN the requested name resolves to — the sentence
+                    // `crate::ops::list_sandboxes_for_project` states for the same
+                    // condition. The project-management operations state the wholly
+                    // fixed `crate::state::PROJECT_NOT_FOUND_MESSAGE` instead.
+                    message: Some(crate::state::provided_project_absent_message(
+                        &region,
+                        &input.project_name,
                     )),
                 },
             )
@@ -185,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(ListBuildsForProjectErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some("Invalid nextToken".to_string()),
+                    message: Some(crate::state::INVALID_CONTINUATION_TOKEN_MESSAGE.to_string()),
                 },
             )
             .into());

@@ -491,7 +491,8 @@ async fn a_trend_analyses_only_the_most_recent_reports_asked_for() {
 /// ARN of this service is refused as INPUT — 400 `InvalidInputException` worded
 /// `Invalid report group ARN`, fixed text quoting neither the value nor the member —
 /// while an ARN this account holds no group under is refused as NOT FOUND — 400
-/// `ResourceNotFoundException` worded `Report group does not exist`.
+/// `ResourceNotFoundException` quoting the ARN it was asked about inside CodeBuild's
+/// absent-report-group sentence.
 ///
 /// The not-found table spans the ways a well-formed group ARN can address no held group
 /// (never created, another partition, region or account, a different name, a different
@@ -550,8 +551,12 @@ async fn an_arn_that_addresses_no_held_report_group_has_no_trend() {
         );
         assert_eq!(
             stated,
-            state::REPORT_GROUP_NOT_FOUND_MESSAGE,
+            state::provided_report_group_absent_message(arn),
             "case {case:?}: expected CodeBuild's absent-report-group sentence, got {stated:?}"
+        );
+        assert!(
+            stated.contains(arn.as_str()),
+            "case {case:?}: the sentence must name the ARN asked about, got {stated:?}"
         );
     }
 

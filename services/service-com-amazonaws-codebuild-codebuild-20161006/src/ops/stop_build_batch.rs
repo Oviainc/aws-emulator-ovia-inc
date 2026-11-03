@@ -149,11 +149,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(StopBuildBatchErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    // The absent resource is named by the id the request gave, exactly
-                    // as given — the way `crate::ops::stop_build` names the build this
-                    // operation's sibling holds no record of, with this operation's own
-                    // resource kind.
-                    message: Some(format!("Build batch {} does not exist", input.id)),
+                    // The absent resource is named by its MODELLED shape name,
+                    // `BuildBatch`, followed by the id the request gave exactly as
+                    // given — the way `crate::ops::stop_build` names the single build
+                    // its sibling holds no record of, with this operation's own
+                    // resource kind and no trailing period.
+                    message: Some(format!("BuildBatch {} does not exist", input.id)),
                 },
             )
             .into());

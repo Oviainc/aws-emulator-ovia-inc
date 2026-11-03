@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/absent_resource_preconditions.rs"]
 mod absent_resource_preconditions;
+#[path = "all/absent_resource_wording.rs"]
+mod absent_resource_wording;
 #[path = "all/batch_delete_builds.rs"]
 mod batch_delete_builds;
 #[path = "all/batch_get_reports.rs"]

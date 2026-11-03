@@ -165,7 +165,7 @@ async fn stop_build_batch_ends_a_running_batch_and_leaves_a_finished_one_alone()
                 );
                 assert_eq!(
                     body["message"],
-                    Value::String(format!("Build batch {requested} does not exist")),
+                    Value::String(format!("BuildBatch {requested} does not exist")),
                     "case {target:?}: the refusal names the id the request gave, got {body}"
                 );
             }

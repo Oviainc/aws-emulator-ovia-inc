@@ -226,7 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(UpdateProjectErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Project cannot be found: {arn}")),
+                    // Project MANAGEMENT states the wholly fixed sentence, with neither
+                    // the name nor the ARN interpolated, the way the webhook operations
+                    // that resolve a project do: a client comparing messages across
+                    // calls sees the same text for every absent project. The ARN above
+                    // is the audit record's subject, not part of the wire message.
+                    message: Some(crate::state::PROJECT_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

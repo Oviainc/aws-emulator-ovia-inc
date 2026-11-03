@@ -200,7 +200,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             drop(guard);
             return Err(GetReportGroupTrendErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::REPORT_GROUP_NOT_FOUND_MESSAGE.to_string()),
+                    // A reporting read quotes the ARN it was asked about: that is the
+                    // whole diagnostic value of the refusal when several groups are
+                    // being trended. The report-group MANAGEMENT operations state the
+                    // wholly fixed `crate::state::REPORT_GROUP_NOT_FOUND_MESSAGE`.
+                    message: Some(crate::state::provided_report_group_absent_message(
+                        &input.report_group_arn,
+                    )),
                 },
             )
             .into());

@@ -218,7 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(target.absent_message().to_string()),
+                    // This operation is ARN-GENERIC, so the refusal names the ARN member
+                    // at fault rather than one of the two resource kinds the value could
+                    // have named: a caller attaching a policy to a project must not be
+                    // pointed at a report group.
+                    message: Some(crate::state::RESOURCE_ARN_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
