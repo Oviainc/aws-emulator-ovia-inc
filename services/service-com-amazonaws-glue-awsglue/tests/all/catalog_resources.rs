@@ -275,19 +275,25 @@ async fn created_catalogs_are_read_back_from_the_store() {
                 .get("TargetRedshiftCatalog")
                 .cloned()
                 .unwrap_or(Value::Null),
+            // The properties map and both default-permission lists are reported
+            // DEFINITELY: a create that configured none of them reads back as the empty
+            // map and the empty lists, never as absent members.
             "CreateTableDefaultPermissions": sent
                 .get("CreateTableDefaultPermissions")
                 .cloned()
-                .unwrap_or(Value::Null),
+                .unwrap_or_else(|| json!([])),
             "CreateDatabaseDefaultPermissions": sent
                 .get("CreateDatabaseDefaultPermissions")
                 .cloned()
-                .unwrap_or(Value::Null),
+                .unwrap_or_else(|| json!([])),
             "AllowFullTableExternalDataAccess": sent
                 .get("AllowFullTableExternalDataAccess")
                 .cloned()
                 .unwrap_or(Value::Null),
-            "CatalogProperties": sent.get("CatalogProperties").cloned().unwrap_or(Value::Null),
+            "CatalogProperties": sent
+                .get("CatalogProperties")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
         });
         assert_echoed(case, &expected, &read);
 

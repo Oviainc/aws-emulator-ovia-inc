@@ -3138,6 +3138,11 @@ pub struct Catalog {
     pub create_table_default_permissions: Option<Vec<PrincipalPermissions>>,
     pub create_database_default_permissions: Option<Vec<PrincipalPermissions>>,
     pub allow_full_table_external_data_access: Option<String>,
+    /// The identifier of this catalog, the same value as [`Self::catalog_id`].
+    pub catalog_identifier: Option<String>,
+    /// The kind of catalog this is: whether its databases live in the Glue Data Catalog
+    /// itself or come from a source outside it.
+    pub catalog_type: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.glue#CatalogPropertiesOutput")]

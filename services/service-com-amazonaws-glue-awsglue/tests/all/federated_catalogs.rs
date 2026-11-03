@@ -458,14 +458,14 @@ async fn the_accounts_own_data_catalog_is_read_by_the_account_id() {
             Some(expected.as_str()),
             "case {region}: expected the Data Catalog's own ARN {expected:?}, got {read}"
         );
-        // Nothing wrote this catalog, so it carries no definition a `CatalogInput` could
-        // have set and no instant at which it was written.
+        // No `CreateCatalog` wrote this catalog, so it carries no definition a
+        // `CatalogInput` could have set and no instant at which it was written. Its
+        // description, its kind and its collection members are Glue's own, not a
+        // client's, and are pinned by [`crate::catalog_structure`].
         for member in [
-            "Description",
             "Parameters",
             "FederatedCatalog",
             "TargetRedshiftCatalog",
-            "CatalogProperties",
             "CreateTime",
             "UpdateTime",
         ] {

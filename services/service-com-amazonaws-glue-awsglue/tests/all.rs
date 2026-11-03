@@ -59,6 +59,8 @@ mod catalog_mutations;
 mod catalog_projections;
 #[path = "all/catalog_resources.rs"]
 mod catalog_resources;
+#[path = "all/catalog_structure.rs"]
+mod catalog_structure;
 #[path = "all/catalogs.rs"]
 mod catalogs;
 #[path = "all/classifiers.rs"]

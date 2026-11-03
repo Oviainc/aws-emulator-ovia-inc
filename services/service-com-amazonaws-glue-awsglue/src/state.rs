@@ -3472,9 +3472,16 @@ impl CatalogDefinition {
     /// `ResourceArn` is minted per request rather than stored, like every other ARN this
     /// crate reports: a Glue record carries no Region of its own, so the ARN names the
     /// Region the read was served in ([`catalog_resource_arn`]).
+    ///
+    /// The members the catalog itself determines are reported DEFINITELY, so a client
+    /// never has to read an absent member as "unknown": the catalog's own identifier
+    /// ([`Self::catalog_id`]), its kind ([`Self::catalog_type`]) and — empty where nothing
+    /// is configured — its properties and both Lake Formation default-permission lists.
     pub fn to_catalog(&self, region: &str) -> crate::ops::types::Catalog {
         crate::ops::types::Catalog {
             catalog_id: Some(self.catalog_id.clone()),
+            catalog_identifier: Some(self.catalog_id.clone()),
+            catalog_type: Some(self.catalog_type().to_string()),
             name: self.name.clone(),
             resource_arn: Some(catalog_resource_arn(
                 region,
@@ -3487,23 +3494,54 @@ impl CatalogDefinition {
             update_time: Some(to_date_time(self.update_time)),
             target_redshift_catalog: self.target_redshift_catalog.clone(),
             federated_catalog: self.federated_catalog.clone(),
-            catalog_properties: self
-                .catalog_properties
-                .as_ref()
-                .map(|properties| to_catalog_properties_output(properties, self.update_time)),
-            create_table_default_permissions: self
-                .create_table_default_permissions
-                .as_ref()
-                .map(|grants| grants.iter().map(tagged_principal_permissions).collect()),
-            create_database_default_permissions: self
-                .create_database_default_permissions
-                .as_ref()
-                .map(|grants| grants.iter().map(tagged_principal_permissions).collect()),
+            catalog_properties: Some(
+                self.catalog_properties
+                    .as_ref()
+                    .map(|properties| to_catalog_properties_output(properties, self.update_time))
+                    .unwrap_or_default(),
+            ),
+            create_table_default_permissions: Some(reported_default_permissions(
+                self.create_table_default_permissions.as_deref(),
+            )),
+            create_database_default_permissions: Some(reported_default_permissions(
+                self.create_database_default_permissions.as_deref(),
+            )),
             allow_full_table_external_data_access: self
                 .allow_full_table_external_data_access
                 .clone(),
         }
     }
+
+    /// `Catalog$CatalogType`: which kind of catalog this record is, read off the source
+    /// its definition names.
+    ///
+    /// A catalog whose definition points at an entity outside the Glue Data Catalog — a
+    /// `FederatedCatalog` source or a `TargetRedshiftCatalog` resource link — is
+    /// [`CATALOG_TYPE_FEDERATED`]; one whose databases live in the Glue Data Catalog
+    /// itself is [`CATALOG_TYPE_NATIVE`].
+    pub fn catalog_type(&self) -> &'static str {
+        if self.federated_catalog.is_some() || self.target_redshift_catalog.is_some() {
+            CATALOG_TYPE_FEDERATED
+        } else {
+            CATALOG_TYPE_NATIVE
+        }
+    }
+}
+
+/// The Lake Formation default-permission grants a READ reports, from what is stored.
+///
+/// Every grant is tagged the way the catalog tags a nested structure
+/// ([`tagged_principal_permissions`]), and a catalog that configured no grants reports the
+/// EMPTY list rather than omitting the member: "no default permissions configured" and
+/// "not reported" are different answers, and only the first is true here.
+fn reported_default_permissions(
+    stored: Option<&[PrincipalPermissions]>,
+) -> Vec<PrincipalPermissions> {
+    stored
+        .unwrap_or_default()
+        .iter()
+        .map(tagged_principal_permissions)
+        .collect()
 }
 
 /// The stored `CatalogProperties` as a read REPORTS them, in the output shape of the same
@@ -12797,6 +12835,18 @@ pub fn is_known_catalog(catalog_id: &str) -> bool {
     catalog_id == ::engine::emulator_account_id()
 }
 
+/// `Catalog$CatalogType` for a catalog whose databases live in the Glue Data Catalog
+/// itself: the account's own Data Catalog is one of these.
+pub const CATALOG_TYPE_NATIVE: &str = "NATIVE";
+
+/// `Catalog$CatalogType` for a catalog whose resources come from a source OUTSIDE the
+/// Glue Data Catalog — a federated source or a Redshift resource link.
+pub const CATALOG_TYPE_FEDERATED: &str = "FEDERATED";
+
+/// `Catalog$Description` of the account's own Data Catalog: Glue's own fixed text for the
+/// catalog every account has, which no `CreateCatalog` wrote and no client can set.
+pub const DEFAULT_CATALOG_DESCRIPTION: &str = "This is the Default Catalog.";
+
 /// The account's own Data Catalog as the modelled `Catalog` shape, as addressed in
 /// `region`.
 ///
@@ -12808,14 +12858,24 @@ pub fn is_known_catalog(catalog_id: &str) -> bool {
 ///
 /// Its name and id are the account's own number, and its ARN is the Data Catalog's own
 /// ([`catalog_arn`]) rather than one naming a catalog resource inside it. It carries no
-/// definition members and no instants: no `CreateCatalog` wrote it, so there is no
-/// `CatalogInput` behind it and no write to timestamp.
+/// instants, because no `CreateCatalog` wrote it and so there is no write to timestamp,
+/// and no definition a client chose: its description is Glue's own
+/// ([`DEFAULT_CATALOG_DESCRIPTION`]), it is a [`CATALOG_TYPE_NATIVE`] catalog, and it
+/// configures no properties and no Lake Formation default permissions — reported as the
+/// empty map and the empty lists, the same way a stored catalog reports them
+/// ([`CatalogDefinition::to_catalog`]).
 pub fn account_data_catalog(region: &str) -> crate::ops::types::Catalog {
     let account_id = ::engine::emulator_account_id().to_string();
     crate::ops::types::Catalog {
         catalog_id: Some(account_id.clone()),
+        catalog_identifier: Some(account_id.clone()),
+        catalog_type: Some(CATALOG_TYPE_NATIVE.to_string()),
         name: account_id.clone(),
         resource_arn: Some(catalog_arn(region, &account_id)),
+        description: Some(DEFAULT_CATALOG_DESCRIPTION.to_string()),
+        catalog_properties: Some(CatalogPropertiesOutput::default()),
+        create_table_default_permissions: Some(Vec::new()),
+        create_database_default_permissions: Some(Vec::new()),
         ..crate::ops::types::Catalog::default()
     }
 }
