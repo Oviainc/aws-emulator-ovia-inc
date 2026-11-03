@@ -47,10 +47,20 @@ pub const MAX_TIME_SHIFT_DELAY_SECONDS: i32 = 21_600;
 /// channel tier MediaTailor assigns unless STANDARD is asked for.
 pub const DEFAULT_CHANNEL_TIER: &str = "BASIC";
 
+/// The two states `ChannelState` models, named so the operations that move a
+/// channel between them spell neither value twice: a channel is either playing
+/// or it is not, with no transient value in between — the enum's whole value
+/// set, as the generated `CHANNEL_STATE_VALUES` in `crate::ops::types`
+/// enumerates it — so the state a start or a stop leaves the channel in is
+/// reached by the call that asked for it.
+pub const RUNNING_CHANNEL_STATE: &str = "RUNNING";
+/// See [`RUNNING_CHANNEL_STATE`].
+pub const STOPPED_CHANNEL_STATE: &str = "STOPPED";
+
 /// The state a channel is in once it has been created: a new channel is not
-/// playing until `StartChannel` starts it (`ChannelState` is `RUNNING |
-/// STOPPED`, so this is the one a channel that has never been started is in).
-pub const INITIAL_CHANNEL_STATE: &str = "STOPPED";
+/// playing until `StartChannel` starts it, so this is the one a channel that
+/// has never been started is in.
+pub const INITIAL_CHANNEL_STATE: &str = STOPPED_CHANNEL_STATE;
 
 /// The number of tags one resource holds: AWS's documented tagging limit of 50
 /// tags per resource. `PutPlaybackConfiguration` and `TagResource` refuse a
@@ -199,6 +209,17 @@ impl ComAmazonawsMediatailorMediatailorState {
         };
         stored_arn == Some(arn)
     }
+}
+
+/// How this service states that `name` addresses no channel this account holds.
+///
+/// Every channel route that addresses a stored channel by name answers a miss
+/// the same way — the name the request carried is the whole reason it cannot be
+/// served, so the refusal names it — and the wording lives here once so the
+/// channel read and the start/stop writes cannot drift into two accounts of the
+/// same miss. The caller lifts it into its own modelled `BadRequestException`.
+pub fn channel_not_found_message(name: &str) -> String {
+    format!("Channel {name} not found.")
 }
 
 /// Why a tag set cannot be stored, or `None` when it can.
@@ -409,6 +430,21 @@ pub struct ChannelRecord {
 }
 
 impl ChannelRecord {
+    /// Moves this channel into `state`, which is one of
+    /// [`RUNNING_CHANNEL_STATE`] / [`STOPPED_CHANNEL_STATE`].
+    ///
+    /// A start or a stop names the state the channel is to be IN rather than a
+    /// change to apply, so the call is idempotent: one made against a channel
+    /// already in that state leaves the stored record exactly as it was,
+    /// `LastModifiedTime` included — that instant says when the channel was
+    /// last modified, so it moves only when the channel itself did.
+    pub fn set_channel_state(&mut self, state: &str, at: ::aws_smithy_types::DateTime) {
+        if self.channel_state != state {
+            self.channel_state = state.to_string();
+            self.last_modified_time = at;
+        }
+    }
+
     /// The stored channel as the create path reports it.
     ///
     /// `Tags` is ALWAYS reported: the member says what tags the channel

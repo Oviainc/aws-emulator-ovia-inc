@@ -44,35 +44,35 @@ const MIN_TIME_SHIFT_SECONDS: i64 = 0;
 const MAX_TIME_SHIFT_SECONDS: i64 = 21_600;
 
 /// One dispatched request's answer.
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     /// The `x-amzn-errortype` header restJson1 resolves an error shape from.
-    error_code: String,
+    pub(crate) error_code: String,
     /// The parsed JSON body, or `Value::Null` for an empty one.
-    body: Value,
+    pub(crate) body: Value,
 }
 
 impl Reply {
-    fn get(&self, pointer: &str) -> &Value {
+    pub(crate) fn get(&self, pointer: &str) -> &Value {
         self.body.pointer(pointer).unwrap_or(&Value::Null)
     }
 
-    fn string(&self, pointer: &str) -> String {
+    pub(crate) fn string(&self, pointer: &str) -> String {
         self.get(pointer).as_str().unwrap_or_default().to_string()
     }
 
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         self.string("/Message")
     }
 }
 
 /// The emulator under test: this one service mounted on the real router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -82,7 +82,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn request(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn request(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
         let payload = match body {
             Some(value) => bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")),
             None => bytes::Bytes::new(),
@@ -118,7 +118,7 @@ impl Emulator {
 
     /// `CreateChannel`: `ChannelName` is the `@httpLabel`, every other member
     /// travels in the body.
-    async fn create(&self, name: &str, request: &Value) -> Reply {
+    pub(crate) async fn create(&self, name: &str, request: &Value) -> Reply {
         self.request(
             "POST",
             &format!("/channel/{}", encode(name)),
@@ -127,7 +127,7 @@ impl Emulator {
         .await
     }
 
-    async fn describe(&self, name: &str) -> Reply {
+    pub(crate) async fn describe(&self, name: &str) -> Reply {
         self.request("GET", &format!("/channel/{}", encode(name)), None)
             .await
     }
@@ -160,7 +160,7 @@ impl Emulator {
 /// Percent-encode a value bound to a URI path segment or query parameter, the
 /// way an AWS SDK does: everything outside the RFC 3986 unreserved set is
 /// escaped, so an ARN's `:` and `/` stay inside one path segment.
-fn encode(value: &str) -> String {
+pub(crate) fn encode(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
@@ -172,7 +172,7 @@ fn expected_arn(name: &str) -> String {
 /// playback mode, its tier, how many outputs it has and in which playlist form,
 /// whether it carries audiences or a time-shift configuration, how many tags it
 /// has, and the form of its name.
-fn table() -> Vec<(&'static str, &'static str, Value)> {
+pub(crate) fn table() -> Vec<(&'static str, &'static str, Value)> {
     vec![
         (
             "a LOOP channel with one HLS output and no optional member",

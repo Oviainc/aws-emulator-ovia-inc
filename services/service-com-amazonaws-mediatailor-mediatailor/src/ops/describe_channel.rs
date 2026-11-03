@@ -168,7 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.channels.get(&input.channel_name) else {
             return Err(DescribeChannelErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some(format!("Channel {} not found.", input.channel_name)),
+                    message: Some(crate::state::channel_not_found_message(
+                        &input.channel_name,
+                    )),
                 },
             )
             .into());

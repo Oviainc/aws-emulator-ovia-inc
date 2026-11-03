@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopChannel`'s real behaviour. Implement it here — this is
+//! Implemented: puts the channel named by `ChannelName` out of the playing state in
+//! [`crate::state`], so every later read of that channel reports it as stopped. The
+//! operation is modelled `@idempotent` and carries an empty response, so a stop of a
+//! channel that is already stopped changes nothing and answers the same 200. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -59,25 +55,35 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{channel_not_found_message, STOPPED_CHANNEL_STATE};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
 // `StopChannelError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-mediatailor-mediatailor.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `StopChannelError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mediatailor#StopChannel")]
+/// This operation's modelled failures.
+///
+/// The model lists no error on `StopChannel` itself, so `BadRequestException`
+/// — the one client error this SERVICE declares ("A request contains unexpected
+/// data", HTTP 400) — is widened in with `extra_errors` to refuse a stop of a
+/// channel this emulator does not hold. It is the only error shape the model
+/// gives this service, so it is what a miss is answered with rather than a
+/// status and code no model declares, and it is the same refusal the channel
+/// read answers such a name with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mediatailor#StopChannel",
+    extra_errors = ["BadRequestException"]
+)]
 #[derive(Debug)]
 pub enum StopChannelErrorModeled {
+    BadRequestException(BadRequestException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::stop_channel::StopChannelError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
+/// (`crate::ops::stop_channel::StopChannelError`). The wrapper is kept for the
+/// `validation` refusal channel it carries.
 pub type StopChannelError = crate::scaffolded::Scaffolded<StopChannelErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
@@ -124,20 +130,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopChannel"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the router builds one
+            // `InMemoryEngine` and hands it to every operation. Without the
+            // store there is no channel to move, so answer the scaffold's 501
+            // rather than a success nothing backs.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StopChannel",
+            ));
+        };
+
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let mut store = state.lock();
+        let Some(record) = store.channels.get_mut(&input.channel_name) else {
+            return Err(StopChannelErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(channel_not_found_message(&input.channel_name)),
+                },
+            )
+            .into());
+        };
+
+        record.set_channel_state(STOPPED_CHANNEL_STATE, now);
+
+        Ok(StopChannelOutput {})
     }
 }
