@@ -286,6 +286,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // NEITHER has no change to apply: it leaves the record — including its
         // status and `updatedAt` — exactly as it stands, and reports it.
         let applied = input.credential.is_some() || input.tenant.is_some();
+        let now = ::std::time::SystemTime::now();
         // The record was resolved above under THIS lock, so the key is still
         // there: the arm below is unreachable by construction, and answers a
         // modelled server error rather than panicking if that ever changes.
@@ -311,14 +312,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // changed, so `ConnectAppAuthorization` has to run again. Taken from
             // whichever status the record held — the module header says why the
             // two post-handshake failure states reset too — and already being
-            // `PendingConnect` makes this the same write.
-            record.status = crate::state::APP_AUTHORIZATION_STATUS_PENDING_CONNECT.to_string();
-            record.updated_at = ::std::time::SystemTime::now();
+            // `PendingConnect` makes this the same write. An outcome the clock
+            // still owed an earlier handshake goes with it: that handshake ran
+            // on what this call has just replaced.
+            record.pending_connect(now);
         }
 
         // Read the response back out of the record this call wrote, so what the
         // caller sees is exactly what a later Get or List will see.
-        let app_authorization = record.to_app_authorization();
+        let app_authorization = record.to_app_authorization(now);
         if applied {
             crate::state::audit_resource_change(
                 ctx.parts(),

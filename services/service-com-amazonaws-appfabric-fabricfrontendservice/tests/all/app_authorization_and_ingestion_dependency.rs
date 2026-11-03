@@ -94,6 +94,18 @@ fn credential_for(auth_type: &str) -> Value {
     }
 }
 
+/// What a connect of an authorization of this `authType` leaves it reading. The
+/// handshake of an `apiKey` authorization completes with the call; an `oauth2`
+/// one has its outcome owed to the clock, so the record still awaits it for the
+/// span the handshake takes.
+fn status_after_connect(auth_type: &str) -> &'static str {
+    if auth_type == "apiKey" {
+        "Connected"
+    } else {
+        "PendingConnect"
+    }
+}
+
 /// `CreateAppAuthorization`, with no connect call after it.
 async fn create_authorization(
     emulator: &Emulator,
@@ -301,8 +313,8 @@ pub(crate) async fn bundle_with_ingestion(
 /// the state the model documents as the initial one (`PendingConnect`), carries
 /// the `admin` persona, and is reported by `GetAppAuthorization` — for either
 /// `Identifier` form — and by `ListAppAuthorizations` exactly as the create call
-/// returned it; `ConnectAppAuthorization` is the only thing that moves it to
-/// `Connected`.
+/// returned it; `ConnectAppAuthorization` is the only thing that moves it out of
+/// `PendingConnect`, to the outcome its own handshake reaches.
 ///
 /// The table spans both `AuthType` values with their matching credential kinds
 /// and applications the issue did not cite.
@@ -412,13 +424,19 @@ async fn an_app_authorization_round_trips_and_starts_pending_connect() {
             "case {case:?}: expected the connect call to succeed, got {} with body {}",
             connected.status, connected.body
         );
+        // The handshake of an `apiKey` authorization completes with the call; an
+        // `oauth2` one has nothing this emulator can redeem with the
+        // application, so its outcome is owed to the clock and the record still
+        // awaits it here (`app_authorization_connect_validation` asserts the
+        // outcome itself).
+        let after_connect = status_after_connect(auth_type);
         assert_eq!(
             connected
                 .body
                 .get("appAuthorizationSummary")
                 .and_then(|summary| summary.get("status")),
-            Some(&json!("Connected")),
-            "case {case:?}: expected the summary to report Connected, got {}",
+            Some(&json!(after_connect)),
+            "case {case:?}: expected the summary to report {after_connect}, got {}",
             connected.body
         );
         let read = get_authorization(&emulator, &bundle, &arn).await;
@@ -426,8 +444,8 @@ async fn an_app_authorization_round_trips_and_starts_pending_connect() {
             read.body
                 .get("appAuthorization")
                 .and_then(|authorization| authorization.get("status")),
-            Some(&json!("Connected")),
-            "case {case:?}: expected the connect to be persisted, got {}",
+            Some(&json!(after_connect)),
+            "case {case:?}: expected the connect's outcome to be persisted, got {}",
             read.body
         );
 

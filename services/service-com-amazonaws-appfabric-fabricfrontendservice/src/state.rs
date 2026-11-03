@@ -116,6 +116,24 @@ pub const APP_AUTHORIZATION_STATUS_PENDING_CONNECT: &str = "PendingConnect";
 /// and is ready to be used."
 pub const APP_AUTHORIZATION_STATUS_CONNECTED: &str = "Connected";
 
+/// The state the connect handshake reaches when the application answered a
+/// validation exception instead of the access token AppFabric asked it for, from
+/// the same enum, whose own documentation states it: "`ConnectionValidationFailed`:
+/// The app authorization received a validation exception when trying to connect
+/// to the application. If the app authorization is in this state, you should
+/// verify the configured credentials and try to connect the app authorization
+/// again."
+pub const APP_AUTHORIZATION_STATUS_CONNECTION_VALIDATION_FAILED: &str = "ConnectionValidationFailed";
+
+/// How long after a connect call the outcome of an OAuth2 handshake falls due.
+///
+/// A CHOSEN span, not an AWS-published duration: the model states no figure for
+/// how long the exchange with the application takes. It is non-zero on purpose —
+/// a caller reading the authorization straight after the connect call still sees
+/// it `PendingConnect`, the way it would against AppFabric, and polls until the
+/// outcome lands.
+pub const OAUTH2_HANDSHAKE_SETTLES_AFTER: Duration = Duration::from_secs(3);
+
 /// The `AuthType` whose credential is an API key, from the model's `AuthType`
 /// enum (`shared_types::AUTH_TYPE_VALUES` = `apiKey` | `oauth2`). An
 /// authorization of this type is authorized by the key the create call carried,
@@ -321,7 +339,8 @@ impl AppBundleRecord {
     }
 
     /// The same authorization, but only once it has completed the connect
-    /// handshake — the state an ingestion of that (app, tenant) pair requires.
+    /// handshake as of `now` — the state an ingestion of that (app, tenant) pair
+    /// requires.
     ///
     /// The handshake rule itself lives in
     /// [`AppAuthorizationRecord::is_connected`], which this composes with the
@@ -331,9 +350,10 @@ impl AppBundleRecord {
         &self,
         app: &str,
         tenant: &str,
+        now: SystemTime,
     ) -> Option<&AppAuthorizationRecord> {
         self.authorization_for(app, tenant)
-            .filter(|authorization| authorization.is_connected())
+            .filter(|authorization| authorization.is_connected(now))
     }
 
     /// This bundle's ingestion for one (application, tenant) pair, if it holds
@@ -414,23 +434,99 @@ pub struct AppAuthorizationRecord {
     /// The union member the caller set on `credential` (`oauth2Credential` or
     /// `apiKeyCredential`) — never the secret inside it.
     pub credential_kind: String,
+    /// The `AppAuthorizationStatus` the last call that moved this authorization
+    /// wrote. What a read REPORTS is [`AppAuthorizationRecord::status_at`],
+    /// which also accounts for a handshake outcome the clock owes but no call
+    /// has written.
     pub status: String,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
     pub tags: Vec<Tag>,
     pub sequence: u64,
+    /// The instant from which this authorization reads
+    /// `ConnectionValidationFailed` because the clock owes it the outcome of a
+    /// handshake a connect call started and the application never validated
+    /// ([`OAUTH2_HANDSHAKE_SETTLES_AFTER`] past that call). `None` when nothing
+    /// is owed. Stored rather than slept for, so a read reports the outcome the
+    /// clock already owes.
+    pub validation_fails_at: Option<SystemTime>,
 }
 
 impl AppAuthorizationRecord {
-    /// Whether this authorization has completed the connect handshake — the ONE
-    /// place that rule is spelled out.
+    /// This authorization's `AppAuthorizationStatus` at `now`: the value the
+    /// last call that moved it wrote, until the failed outcome of a handshake in
+    /// flight falls due, and `ConnectionValidationFailed` from then on.
+    pub fn status_at(&self, now: SystemTime) -> &str {
+        match self.validation_fails_at {
+            Some(due) if now >= due => APP_AUTHORIZATION_STATUS_CONNECTION_VALIDATION_FAILED,
+            _ => &self.status,
+        }
+    }
+
+    /// When this authorization last changed, as `now` sees it: a handshake
+    /// outcome the clock has already made due is a change to the record, so
+    /// from that instant on it is what `updatedAt` reports.
+    pub fn changed_at(&self, now: SystemTime) -> SystemTime {
+        match self.validation_fails_at {
+            Some(due) if now >= due && due > self.updated_at => due,
+            _ => self.updated_at,
+        }
+    }
+
+    /// Whether this authorization has completed the connect handshake at `now` —
+    /// the ONE place that rule is spelled out.
     ///
     /// AppFabric reaches an application only through an authorization in the
     /// state the model's `AppAuthorizationStatus` documents as ready to be used
     /// ([`APP_AUTHORIZATION_STATUS_CONNECTED`]), so both the ingestion
     /// dependency check and the user-access fan-out decide with this.
-    pub fn is_connected(&self) -> bool {
-        self.status == APP_AUTHORIZATION_STATUS_CONNECTED
+    pub fn is_connected(&self, now: SystemTime) -> bool {
+        self.status_at(now) == APP_AUTHORIZATION_STATUS_CONNECTED
+    }
+
+    /// Record the handshake outcome of an authorization the application
+    /// ACCEPTED, as of `now`: it is connected and ready to be used, and nothing
+    /// is owed on it any more.
+    ///
+    /// Answers whether the record changed, which is what decides whether the
+    /// call that ran the handshake dates it.
+    pub fn connected(&mut self, now: SystemTime) -> bool {
+        if self.is_connected(now) {
+            return false;
+        }
+        self.status = APP_AUTHORIZATION_STATUS_CONNECTED.to_string();
+        self.updated_at = now;
+        self.validation_fails_at = None;
+        true
+    }
+
+    /// Record the OTHER handshake outcome, as of `now`: the application answered
+    /// a validation exception, so the authorization reads
+    /// `ConnectionValidationFailed` once the handshake started at `now` falls
+    /// due ([`OAUTH2_HANDSHAKE_SETTLES_AFTER`]) rather than the instant the call
+    /// returns — the outcome is owed to the clock, not to this call, which is
+    /// why nothing is dated here.
+    ///
+    /// A handshake whose failure is already owed, or already reported, has
+    /// nothing left to apply: re-running it would only move the instant the same
+    /// outcome lands on.
+    pub fn validation_failing(&mut self, now: SystemTime) -> bool {
+        if self.validation_fails_at.is_some()
+            || self.status_at(now) == APP_AUTHORIZATION_STATUS_CONNECTION_VALIDATION_FAILED
+        {
+            return false;
+        }
+        self.validation_fails_at = Some(now + OAUTH2_HANDSHAKE_SETTLES_AFTER);
+        true
+    }
+
+    /// Put this authorization back in the state a create leaves it in, as of
+    /// `now`: it awaits the connect handshake again, and any outcome the clock
+    /// still owed an earlier handshake is dropped with it.
+    pub fn pending_connect(&mut self, now: SystemTime) {
+        self.status = APP_AUTHORIZATION_STATUS_PENDING_CONNECT.to_string();
+        self.updated_at = now;
+        self.validation_fails_at = None;
     }
 
     /// Whether this authorization is the kind whose grant runs through an OAuth
@@ -472,31 +568,31 @@ impl AppAuthorizationRecord {
         }
     }
 
-    /// The modelled `AppAuthorization` for this record.
-    pub fn to_app_authorization(&self) -> AppAuthorization {
+    /// The modelled `AppAuthorization` for this record, as `now` reads it.
+    pub fn to_app_authorization(&self, now: SystemTime) -> AppAuthorization {
         AppAuthorization {
             app_authorization_arn: self.arn.clone(),
             app_bundle_arn: self.app_bundle_arn.clone(),
             app: self.app.clone(),
             tenant: self.to_tenant(),
             auth_type: self.auth_type.clone(),
-            status: self.status.clone(),
+            status: self.status_at(now).to_string(),
             created_at: ::aws_smithy_types::DateTime::from(self.created_at),
-            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
+            updated_at: ::aws_smithy_types::DateTime::from(self.changed_at(now)),
             persona: Some(APP_AUTHORIZATION_PERSONA_ADMIN.to_string()),
             auth_url: self.auth_url(),
         }
     }
 
-    /// The modelled `AppAuthorizationSummary` for this record.
-    pub fn to_summary(&self) -> AppAuthorizationSummary {
+    /// The modelled `AppAuthorizationSummary` for this record, as `now` reads it.
+    pub fn to_summary(&self, now: SystemTime) -> AppAuthorizationSummary {
         AppAuthorizationSummary {
             app_authorization_arn: self.arn.clone(),
             app_bundle_arn: self.app_bundle_arn.clone(),
             app: self.app.clone(),
             tenant: self.to_tenant(),
-            status: self.status.clone(),
-            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
+            status: self.status_at(now).to_string(),
+            updated_at: ::aws_smithy_types::DateTime::from(self.changed_at(now)),
         }
     }
 }
@@ -1827,7 +1923,7 @@ pub fn ingestion_not_found(identifier: &str) -> ResourceNotFoundException {
 /// does not hold — a constant sentence, for the same reason.
 pub fn app_authorization_not_found(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: "The specified app authorization does not exist".to_string(),
+        message: "The app authorization was not found.".to_string(),
         resource_id: identifier.to_string(),
         resource_type: "AppAuthorization".to_string(),
     }
@@ -1953,13 +2049,11 @@ pub const APP_AUTHORIZATION_NOT_FOUND_FOR_INGESTION: &str =
 /// for, one that has not completed the connect handshake.
 ///
 /// Same error shape, and the same value-free form, with the remediation naming
-/// the connect step instead of the create step. Unlike the sentence above, this
-/// wording is NOT observed: it keeps the two refusals distinguishable (which
-/// call does the caller still owe?) without putting a request value or a stored
-/// status in either, and it stays a known divergence until the service's own
-/// text for an unconnected pair can be observed.
+/// the connect step instead of the create step: AppFabric states the handshake
+/// the pair never completed in the past tense ("was not connected"), and names
+/// neither the application nor the tenant it refused.
 pub const APP_AUTHORIZATION_NOT_CONNECTED_FOR_INGESTION: &str =
-    "The app authorization for the specified application and tenant is not connected. \
+    "The app authorization for the specified application and tenant was not connected. \
      Connect the app authorization for the application and tenant before creating an ingestion.";
 
 /// Which call a caller still owes before an ingestion of one (application,
@@ -2061,28 +2155,23 @@ pub fn associated_ingestion_still_held(
     ))
 }
 
-/// A modelled `ConflictException` refusing a `DeleteAppBundle` of a bundle that
+/// A modelled `ValidationException` refusing a `DeleteAppBundle` of a bundle that
 /// still holds app authorizations.
 ///
 /// The precondition is the one the operation documents ("You must delete all
 /// associated app authorizations before you can delete an app bundle"), and the
-/// message is that sentence: it has no variable part — it states the call the
-/// caller still owes, not which authorization is in the way — so two refusals of
-/// two different bundles read identically. The bundle travels in the shape's own
-/// required `resourceId` member, which is where a client reads it from.
-/// `ConflictException` (HTTP 409) is the precondition channel here: every member
-/// of the request is valid (the boundary validator accepted them all), so the
-/// refusal is about the STATE of the resource the request names rather than about
-/// a parameter — which is what the conflict this operation models states ("the
-/// request has created a conflict, check the request parameters and try again").
-pub fn app_authorizations_still_held(bundle_arn: &str) -> ConflictException {
-    ConflictException {
-        message: "You must delete all associated app authorizations before you can delete an \
-                  app bundle."
-            .to_string(),
-        resource_id: bundle_arn.to_string(),
-        resource_type: "AppBundle".to_string(),
-    }
+/// message is AppFabric's own sentence for a bundle that is not deletable yet:
+/// it has no variable part — it states that the bundle the request named cannot
+/// be deleted, not which authorization is in the way — so two refusals of two
+/// different bundles read identically, and the bundle a caller asked about is in
+/// its own request. `DeleteAppBundle` models both `ConflictException` (409) and
+/// `ValidationException` (400), and AppFabric answers this one as the
+/// validation error: a request that cannot succeed as written until the caller
+/// deletes the contents itself, rather than a conflict that settles on its own.
+/// `reason` is therefore `other` and no member is faulted — see
+/// [`precondition_not_met`].
+pub fn app_bundle_cannot_be_deleted() -> ValidationException {
+    precondition_not_met("The specified app bundle cannot be deleted.".to_string())
 }
 
 /// A modelled `ResourceNotFoundException` for a tagging call whose `resourceArn`

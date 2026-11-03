@@ -183,15 +183,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token is scoped to THIS bundle's authorizations, so one bundle's
         // token is not read as a position in another's listing.
         let listing = crate::state::app_authorization_listing(&bundle.id);
-        // The instant this page is answered as of: it dates the `nextToken` the
-        // page hands out and decides whether the one the caller brought has
+        // Every summary is read AS OF ONE INSTANT, so a page cannot report two
+        // authorizations as of two different clocks: a handshake outcome the
+        // clock already owes one of them shows in its summary, and this
+        // reporting call writes nothing. The same instant dates the `nextToken`
+        // the page hands out and decides whether the one the caller brought has
         // outlived its documented lifetime.
         let now = ::std::time::SystemTime::now();
         let page = crate::state::page(
             &authorizations,
             &listing,
             |authorization| authorization.sequence,
-            crate::state::AppAuthorizationRecord::to_summary,
+            |authorization: &crate::state::AppAuthorizationRecord| authorization.to_summary(now),
             input.max_results,
             input.next_token.as_deref(),
             now,

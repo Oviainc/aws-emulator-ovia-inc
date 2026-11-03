@@ -204,10 +204,14 @@ fn assert_nested_under(case: &str, child: &str, parent: &str) {
 ///
 /// The table spans the Region the parent lives in, the Region the child's create
 /// call is signed for (equal to the parent's and different from it, in both
-/// directions), the applications the `app` member documents, and both `AuthType`
-/// values, and it drives all three operations that mint a resource under an app
-/// bundle (`CreateAppAuthorization`, `CreateIngestion`,
-/// `CreateIngestionDestination`).
+/// directions) and the applications the `app` member documents, and it drives all
+/// three operations that mint a resource under an app bundle
+/// (`CreateAppAuthorization`, `CreateIngestion`, `CreateIngestionDestination`).
+/// Every row authorizes with an `apiKey`, because the ingestion each row mints
+/// needs a pair whose connect handshake completed and an `oauth2` one never does
+/// in this emulator (see `app_authorization_connect_validation`); the `authUrl` an
+/// `oauth2` authorization reports for its own Region is covered by
+/// `app_authorization_auth_url`.
 #[tokio::test]
 async fn a_nested_resource_carries_its_parents_region() {
     // (case, the Region the bundle lives in, the Region the child creates are
@@ -234,7 +238,7 @@ async fn a_nested_resource_carries_its_parents_region() {
             "us-east-1",
             "eu-west-1",
             "M365AUDITLOGS",
-            "oauth2",
+            "apiKey",
             "0",
         ),
         (
@@ -242,7 +246,7 @@ async fn a_nested_resource_carries_its_parents_region() {
             "ap-southeast-2",
             "ca-central-1",
             "CISCO",
-            "oauth2",
+            "apiKey",
             "tenant.with.dots",
         ),
         (

@@ -43,7 +43,7 @@ const DESTINATION_NOT_FOUND: (&str, &str) = (
 );
 const AUTHORIZATION_NOT_FOUND: (&str, &str) = (
     "AppAuthorization",
-    "The specified app authorization does not exist",
+    "The app authorization was not found.",
 );
 
 /// An `auditLog` processing configuration, over the model's own closed enums

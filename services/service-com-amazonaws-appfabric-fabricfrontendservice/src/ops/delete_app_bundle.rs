@@ -5,9 +5,10 @@
 //! 204 with no body: a later `GetAppBundle` on the same identifier is then
 //! `ResourceNotFoundException` and `ListAppBundles` no longer lists it.
 //!
-//! The removal is taken only once the precondition the operation documents holds:
-//! a bundle that still holds an app authorization is refused with the
-//! `ConflictException` it models (HTTP 409) and survives untouched.
+//! The removal is taken only once the precondition the operation documents
+//! holds: a bundle that still holds an app authorization cannot be deleted, so
+//! the call is refused with the `ValidationException` it models (HTTP 400) and
+//! the bundle survives untouched.
 //!
 //! @idempotent, and this operation's model declares NO `ResourceNotFoundException`
 //! — unlike `DeleteAppAuthorization`/`DeleteIngestion`, which both do — so
@@ -180,10 +181,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The precondition the operation documents: "You must delete all
         // associated app authorizations before you can delete an app bundle."
         // It is checked against the STORE, so the delete is refused — and the
-        // bundle left whole — for as long as the bundle holds one.
+        // bundle left whole — for as long as the bundle holds one. The refusal
+        // is the modelled `ValidationException` (HTTP 400): the request cannot
+        // succeed as written until the caller has deleted the contents itself,
+        // which is not a conflict that settles on its own — see
+        // [`crate::state::app_bundle_cannot_be_deleted`].
         if !bundle.app_authorizations.is_empty() {
-            return Err(DeleteAppBundleErrorModeled::ConflictException(
-                crate::state::app_authorizations_still_held(&bundle.arn),
+            return Err(DeleteAppBundleErrorModeled::ValidationException(
+                crate::state::app_bundle_cannot_be_deleted(),
             )
             .into());
         }

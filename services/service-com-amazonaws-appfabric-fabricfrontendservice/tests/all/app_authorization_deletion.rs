@@ -533,16 +533,18 @@ async fn deleting_under_an_unknown_app_bundle_is_not_found() {
 /// modelled `ValidationException` (HTTP 400) and the authorization survives;
 /// once that ingestion is gone the same call succeeds.
 ///
-/// The table spans the application and tenant of the pair, the authorization's
-/// `authType`, the identifier forms and whether the ingestion is `disabled` or
-/// `enabled` — the precondition is about the ingestion EXISTING, so its state may
-/// not change the answer.
+/// The table spans the application and tenant of the pair, the identifier forms
+/// and whether the ingestion is `disabled` or `enabled` — the precondition is
+/// about the ingestion EXISTING, so its state may not change the answer. Every
+/// row authorizes with an `apiKey`, because an ingestion exists only for a pair
+/// whose app authorization completed the connect handshake and an `oauth2` one
+/// never does in this emulator (see `app_authorization_connect_validation`).
 #[tokio::test]
 async fn deleting_an_app_authorization_with_an_associated_ingestion_is_refused() {
     // (case, app, tenant, authType, ingestion enabled, bundle form, authorization form)
     let cases: Vec<(&str, &str, &str, &str, bool, Form, Form)> = vec![
         (
-            "apiKey, disabled ingestion, both by arn",
+            "ZENDESK, disabled ingestion, both by arn",
             "ZENDESK",
             "tenant-a",
             "apiKey",
@@ -551,16 +553,16 @@ async fn deleting_an_app_authorization_with_an_associated_ingestion_is_refused()
             Form::Arn,
         ),
         (
-            "oauth2, disabled ingestion, both by uuid",
+            "SLACK, disabled ingestion, both by uuid",
             "SLACK",
             "tenant-b",
-            "oauth2",
+            "apiKey",
             false,
             Form::Uuid,
             Form::Uuid,
         ),
         (
-            "apiKey, enabled ingestion, mixed forms",
+            "DROPBOX, enabled ingestion, mixed forms",
             "DROPBOX",
             "tenant-c",
             "apiKey",
@@ -569,10 +571,10 @@ async fn deleting_an_app_authorization_with_an_associated_ingestion_is_refused()
             Form::Arn,
         ),
         (
-            "oauth2, enabled ingestion, mixed forms",
+            "M365AUDITLOGS, enabled ingestion, mixed forms",
             "M365AUDITLOGS",
             "tenant-d",
-            "oauth2",
+            "apiKey",
             true,
             Form::Arn,
             Form::Uuid,

@@ -351,10 +351,18 @@ async fn an_update_applies_only_the_supplied_members_and_requires_reconnecting()
             let arn = authorization(&emulator, &bundle, app, auth_type, "tenant-a").await;
             connect(&emulator, &bundle, &arn).await;
             let before = stored(&emulator, &bundle, &arn, &case).await;
+            // The handshake of an `apiKey` authorization completes with the
+            // connect call; an `oauth2` one has its outcome owed to the clock,
+            // so the set-up record still awaits it.
+            let setup_status = if auth_type == "apiKey" {
+                "Connected"
+            } else {
+                "PendingConnect"
+            };
             assert_eq!(
                 member(&before, "status"),
-                "Connected",
-                "case {case:?}: the set-up authorization must be Connected, got {before}"
+                setup_status,
+                "case {case:?}: the set-up authorization must read {setup_status}, got {before}"
             );
 
             // A `credential` of `null` in the table means "the kind this

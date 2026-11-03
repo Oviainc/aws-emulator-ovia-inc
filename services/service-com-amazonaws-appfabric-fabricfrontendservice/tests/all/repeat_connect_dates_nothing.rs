@@ -6,10 +6,13 @@
 //!
 //! RULE: a call dates an app authorization — the `updatedAt` its summary, its
 //! `GetAppAuthorization` record and its listing all report — only when it
-//! actually changes the stored record. The connect handshake's change is the move
-//! to `Connected`, so a connect of an authorization that already holds that
-//! status has nothing to apply: it is served with the record exactly as it
-//! stands, `updatedAt` included, and nothing records a change either.
+//! actually changes the stored record. The connect handshake of an `apiKey`
+//! authorization changes it with the call (it moves to `Connected`), so a connect
+//! of one that already holds that status has nothing to apply: it is served with
+//! the record exactly as it stands, `updatedAt` included, and nothing records a
+//! change either. The handshake of an `oauth2` authorization leaves its outcome
+//! to the clock, so the call itself dates nothing — see
+//! `app_authorization_connect_validation` for what that outcome is.
 //!
 //! Each test states that rule over a TABLE of inputs: every value of the model's
 //! `AppAuthorizationStatus` enum as the starting state, both `AuthType` values,
@@ -51,6 +54,19 @@ const APP_AUTHORIZATION_STATUSES: &[&str] = &[
 /// The two values the model's `AuthType` enum carries, which decide whether a
 /// connect has to carry an `authRequest`.
 const AUTH_TYPES: &[&str] = &["apiKey", "oauth2"];
+
+/// What a connect of an authorization of this `authType` leaves the record
+/// reading, given the `held` status it found: the handshake of an `apiKey`
+/// authorization completes with the call, while an `oauth2` one has its outcome
+/// owed to the clock, so the record still reads what it held when the call
+/// arrived.
+fn status_after_connect<'a>(auth_type: &str, held: &'a str) -> &'a str {
+    if auth_type == "apiKey" {
+        "Connected"
+    } else {
+        held
+    }
+}
 
 /// Applications from the list the model's own documentation of `app` gives
 /// (`smithy_query(query="doc", shape="CreateAppAuthorizationRequest",
@@ -257,15 +273,16 @@ async fn a_connect_dates_the_authorization_only_when_it_moves_its_status() {
                     connected.status, connected.body
                 );
                 let reported = summary(&connected, &case);
+                let expected_status = status_after_connect(auth_type, status);
                 assert_eq!(
                     member(&reported, "status"),
-                    "Connected",
-                    "case {case:?}: the summary must report Connected, got {reported}"
+                    expected_status,
+                    "case {case:?}: the summary must report {expected_status}, got {reported}"
                 );
 
                 let after = stored_record(&emulator, &bundle, &arn, &case).await;
                 let dated_after = stored_updated_at(&engine, &bundle, &arn, &case);
-                let moved = *status != "Connected";
+                let moved = expected_status != *status;
                 if moved {
                     assert!(
                         dated_after > dated_before,
@@ -311,9 +328,9 @@ async fn a_connect_dates_the_authorization_only_when_it_moves_its_status() {
 
 /// RULE (the same one, over the retries a caller actually makes): the connect
 /// call carries no idempotency token, so a client may re-send it any number of
-/// times; every send after the one that moved the status finds nothing to apply,
-/// so each is answered with the SAME summary, the stored record keeps the date of
-/// the connect that moved it, and only that one call recorded a change.
+/// times; every send after the one that changed the record finds nothing to
+/// apply, so each is answered with the SAME summary, the stored record keeps the
+/// date of the connect that moved it, and only that one call recorded a change.
 ///
 /// The table spans retry counts beyond the single repeat, both `AuthType` values
 /// and applications the issue did not cite.
@@ -370,10 +387,11 @@ async fn repeated_connects_are_answered_with_the_same_summary() {
                 // The record every reader sees is still the one the first
                 // connect wrote.
                 let record = stored_record(&emulator, &bundle, &arn, &case).await;
+                let expected_status = status_after_connect(auth_type, "PendingConnect");
                 assert_eq!(
                     member(&record, "status"),
-                    "Connected",
-                    "case {case:?}: the authorization must be Connected, got {record}"
+                    expected_status,
+                    "case {case:?}: the authorization must read {expected_status}, got {record}"
                 );
                 assert_eq!(
                     record.get("updatedAt"),

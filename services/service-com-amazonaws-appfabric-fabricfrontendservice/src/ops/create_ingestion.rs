@@ -320,8 +320,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // changed tenant moves the pair), and a retry of an ingestion that
         // already exists must never be refused by it.
         let parent = store.app_bundles.get(&bundle_key);
+        let as_of = ::std::time::SystemTime::now();
         if parent
-            .and_then(|bundle| bundle.connected_authorization(&input.app, &input.tenant_id))
+            .and_then(|bundle| {
+                bundle.connected_authorization(&input.app, &input.tenant_id, as_of)
+            })
             .is_none()
         {
             let owed = if parent

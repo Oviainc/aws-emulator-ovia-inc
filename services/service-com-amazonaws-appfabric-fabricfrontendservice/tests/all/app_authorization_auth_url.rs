@@ -15,8 +15,10 @@
 //! `app_bundle_ingestion_lifecycle` already builds.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_appfabric_fabricfrontendservice::state::OAUTH2_HANDSHAKE_SETTLES_AFTER;
 
 use crate::app_bundle_ingestion_lifecycle::{arn_of, encode, uuid_of, Answer, Emulator};
 
@@ -279,8 +281,10 @@ async fn an_oauth2_authorization_reports_its_consent_url_and_an_api_key_one_repo
 
 /// RULE: the URL an `oauth2` authorization reports is one this emulator answers:
 /// the path it names is where that authorization's connect step is served, so a
-/// caller that follows the reported URL completes the documented flow (the
-/// authorization reports `Connected` afterwards).
+/// caller that follows the reported URL has that authorization's connect
+/// handshake run (its outcome, which for an `oauth2` authorization is the
+/// modelled `ConnectionValidationFailed`, is what the record reads once the
+/// handshake falls due).
 ///
 /// The table spans applications and Regions, and both of the ways a caller can
 /// have arrived at the URL — from the create response and from a later read.
@@ -340,14 +344,17 @@ async fn the_reported_consent_url_is_the_path_the_connect_step_is_served_at() {
             "case {case:?}: following {url:?} must be served, got HTTP {} with body {}",
             followed.status, followed.body
         );
+        // The handshake the followed URL started settles on the clock, so the
+        // outcome is read once it is due.
+        tokio::time::sleep(OAUTH2_HANDSHAKE_SETTLES_AFTER + Duration::from_millis(200)).await;
         let after = get_authorization(&emulator, region, &bundle, &arn).await;
         assert_eq!(
             after
                 .body
                 .get("appAuthorization")
                 .and_then(|authorization| authorization.get("status")),
-            Some(&json!("Connected")),
-            "case {case:?}: following {url:?} must complete the flow, got {}",
+            Some(&json!("ConnectionValidationFailed")),
+            "case {case:?}: following {url:?} must run the handshake of that authorization, got {}",
             after.body
         );
     }

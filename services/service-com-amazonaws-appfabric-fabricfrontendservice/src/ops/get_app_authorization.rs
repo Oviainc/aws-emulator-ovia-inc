@@ -177,7 +177,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetAppAuthorizationOutput {
-            app_authorization: authorization.to_app_authorization(),
+            app_authorization: authorization
+                .to_app_authorization(::std::time::SystemTime::now()),
         })
     }
 }

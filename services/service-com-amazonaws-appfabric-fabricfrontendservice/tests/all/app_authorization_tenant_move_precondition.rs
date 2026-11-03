@@ -353,7 +353,11 @@ struct MoveCase {
 /// members the PATCH supplies, how the bundle's ingestion relates to the pair
 /// (the same pair, another tenant, another application, none at all), whether
 /// that ingestion is `disabled` or `enabled`, and the identifier form each path
-/// label is named by — none of which may change the outcome.
+/// label is named by — none of which may change the outcome. A row whose bundle
+/// holds an ingestion of the authorization's OWN pair authorizes with an
+/// `apiKey`, because such an ingestion exists only for a pair whose handshake
+/// completed and an `oauth2` one never does in this emulator (see
+/// `app_authorization_connect_validation`).
 #[tokio::test]
 async fn an_update_cannot_take_an_authorization_off_a_pair_with_an_ingestion() {
     let cases: Vec<MoveCase> = vec![
@@ -374,7 +378,7 @@ async fn an_update_cannot_take_an_authorization_off_a_pair_with_an_ingestion() {
         MoveCase {
             case: "a move off the associated enabled ingestion, both by uuid",
             app: "SLACK",
-            auth_type: "oauth2",
+            auth_type: "apiKey",
             from_tenant: "tenant-one",
             to_tenant: "tenant-two",
             supply_tenant: true,
@@ -416,7 +420,7 @@ async fn an_update_cannot_take_an_authorization_off_a_pair_with_an_ingestion() {
         MoveCase {
             case: "a rotated credential over the associated ingestion",
             app: "CISCO",
-            auth_type: "oauth2",
+            auth_type: "apiKey",
             from_tenant: "tenant-kept",
             to_tenant: "tenant-kept",
             supply_tenant: false,
@@ -668,10 +672,11 @@ async fn no_sequence_of_updates_leaves_an_ingestion_without_its_authorization() 
     let bundle = emulator.fixture_bundle(0).await;
 
     // Two applications, each with two tenants: the first tenant of each pair
-    // carries an ingestion, the second does not.
+    // carries an ingestion, the second does not. Both authorize with an
+    // `apiKey`, the handshake an ingestion's pair needs completed.
     let mut with_ingestion: Vec<String> = Vec::new();
     let mut without_ingestion: Vec<String> = Vec::new();
-    for (app, auth_type) in [("ASANA", "apiKey"), ("ZOOM", "oauth2")] {
+    for (app, auth_type) in [("ASANA", "apiKey"), ("ZOOM", "apiKey")] {
         for tenant in ["tenant-ingested", "tenant-bare"] {
             let arn =
                 create_authorization(&emulator, &bundle, app, auth_type, tenant, case).await;

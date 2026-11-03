@@ -7,7 +7,8 @@
 //! resources is refused — with the precondition error that operation models, and
 //! without writing anything — for as long as the parent still holds one of them.
 //! For `DeleteAppBundle` the children are the bundle's app authorizations and the
-//! modelled error is `ConflictException` (HTTP 409).
+//! refusal is the modelled `ValidationException` (HTTP 400): the request cannot
+//! succeed as written until the caller deletes them itself.
 //!
 //! The harness (the router, `Answer`, `encode`, `uuid_of`, the app-bundle and
 //! ingestion calls) is the one `app_bundle_ingestion_lifecycle` builds, and the
@@ -22,51 +23,59 @@ use crate::app_authorization_deletion::{
 };
 use crate::app_bundle_ingestion_lifecycle::{arn_of, encode, uuid_of, Answer, Emulator};
 
-/// The sentence the refusal states, which is the precondition the model's own
-/// documentation of the operation states
-/// (`smithy_query(query="doc", shape="DeleteAppBundle")`: "Deletes an app bundle.
-/// You must delete all associated app authorizations before you can delete an app
-/// bundle."). It has no variable part: it names the call the caller still owes,
-/// not which authorization is in the way.
-const PRECONDITION_MESSAGE: &str =
-    "You must delete all associated app authorizations before you can delete an app bundle.";
+/// The sentence the refusal states: AppFabric's own fixed text for an app bundle
+/// that is not deletable yet, the state its documentation of the operation
+/// describes (`smithy_query(query="doc", shape="DeleteAppBundle")`: "Deletes an
+/// app bundle. You must delete all associated app authorizations before you can
+/// delete an app bundle."). It has no variable part: it names neither the bundle
+/// it refused nor which authorization is in the way.
+const PRECONDITION_MESSAGE: &str = "The specified app bundle cannot be deleted.";
 
-/// Assert one refused `DeleteAppBundle`: the modelled conflict, its status, its
-/// wording and the members the shape requires.
+/// Assert one refused `DeleteAppBundle`: the modelled validation refusal, its
+/// status, its wording and the members the shape requires.
 fn assert_refused(case: &str, answer: &Answer, bundle: &str) {
+    // The bundle the call named is in the caller's own request, not in the
+    // refusal: nothing of it may reach the message.
+    assert!(
+        !answer.body.to_string().contains(bundle),
+        "case {case:?}: the refusal must not carry the bundle it refused, got {}",
+        answer.body
+    );
     assert_eq!(
-        answer.status, 409,
-        "case {case:?}: expected HTTP 409 while an app authorization remains, got {} with body {}",
+        answer.status, 400,
+        "case {case:?}: expected HTTP 400 while an app authorization remains, got {} with body {}",
         answer.status, answer.body
     );
     assert_eq!(
         answer.error_code(),
-        "ConflictException",
-        "case {case:?}: expected ConflictException, got {}",
+        "ValidationException",
+        "case {case:?}: expected ValidationException, got {}",
         answer.body
     );
     assert_eq!(
         answer.body.get("message").and_then(Value::as_str),
         Some(PRECONDITION_MESSAGE),
-        "case {case:?}: expected the documented precondition sentence, got {}",
+        "case {case:?}: expected the service's fixed sentence, got {}",
+        answer.body
+    );
+    // `reason` is required by the shape, and no member of the request is at
+    // fault: it is the bundle's STATE that forbids the call.
+    assert_eq!(
+        answer.body.get("reason").and_then(Value::as_str),
+        Some("other"),
+        "case {case:?}: expected the reason of a refusal that faults no member, got {}",
         answer.body
     );
     assert_eq!(
-        answer.body.get("resourceType").and_then(Value::as_str),
-        Some("AppBundle"),
-        "case {case:?}: the conflict reports the app bundle, got {}",
-        answer.body
-    );
-    assert_eq!(
-        answer.body.get("resourceId").and_then(Value::as_str),
-        Some(bundle),
-        "case {case:?}: the conflict carries the bundle it refused, got {}",
+        answer.body.get("fieldList"),
+        None,
+        "case {case:?}: a refusal that faults no member carries no fieldList, got {}",
         answer.body
     );
 }
 
-/// RULE: `DeleteAppBundle` is refused with the modelled `ConflictException`
-/// (HTTP 409) for as long as the bundle holds ANY app authorization — the
+/// RULE: `DeleteAppBundle` is refused with the modelled `ValidationException`
+/// (HTTP 400) for as long as the bundle holds ANY app authorization — the
 /// precondition its own documentation states — and the bundle and every
 /// authorization under it survive the refusal; the delete succeeds (HTTP 204)
 /// exactly once the last authorization has been deleted.

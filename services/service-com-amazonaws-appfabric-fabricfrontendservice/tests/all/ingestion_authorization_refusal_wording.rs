@@ -44,7 +44,7 @@ pub(crate) const NO_AUTHORIZATION_MESSAGE: &str =
 /// completed the connect handshake — the same value-free form with the connect
 /// step as its remediation.
 pub(crate) const NOT_CONNECTED_MESSAGE: &str =
-    "The app authorization for the specified application and tenant is not connected. \
+    "The app authorization for the specified application and tenant was not connected. \
      Connect the app authorization for the application and tenant before creating an ingestion.";
 
 /// How a bundle's app authorizations were set up before the ingestion call —

@@ -15,6 +15,8 @@
 mod app_authorization_and_ingestion_dependency;
 #[path = "all/app_authorization_auth_url.rs"]
 mod app_authorization_auth_url;
+#[path = "all/app_authorization_connect_validation.rs"]
+mod app_authorization_connect_validation;
 #[path = "all/app_authorization_deletion.rs"]
 mod app_authorization_deletion;
 #[path = "all/app_authorization_tenant_move_precondition.rs"]

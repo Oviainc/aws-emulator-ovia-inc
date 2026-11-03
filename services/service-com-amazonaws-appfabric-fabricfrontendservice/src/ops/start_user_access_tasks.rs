@@ -133,8 +133,10 @@ struct Authorization {
 
 impl Authorization {
     /// One bundle's app authorizations in creation order, so the list this
-    /// operation reports is stable across calls.
-    fn snapshot_of(bundle: &crate::state::AppBundleRecord) -> Vec<Self> {
+    /// operation reports is stable across calls. Every authorization is read AS
+    /// OF ONE INSTANT, so the fan-out cannot decide two of them by two
+    /// different clocks.
+    fn snapshot_of(bundle: &crate::state::AppBundleRecord, now: ::std::time::SystemTime) -> Vec<Self> {
         bundle
             .app_authorizations_in_order()
             .into_iter()
@@ -142,8 +144,8 @@ impl Authorization {
                 app: authorization.app.clone(),
                 tenant_identifier: authorization.tenant_identifier.clone(),
                 tenant_display_name: authorization.tenant_display_name.clone(),
-                status: authorization.status.clone(),
-                connected: authorization.is_connected(),
+                status: authorization.status_at(now).to_string(),
+                connected: authorization.is_connected(now),
             })
             .collect()
     }
@@ -207,12 +209,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // The instant the bundle's authorizations are read as of: one clock for
+        // the whole fan-out, which also dates the tasks it mints.
+        let started_at = ::std::time::SystemTime::now();
         // ONE lookup and ONE refusal: the bundle must exist before anything is
         // minted, and its authorizations are snapshotted in creation order so
         // the reported list is stable across calls.
         let Some(authorizations) = store
             .resolve_bundle(&input.app_bundle_identifier)
-            .map(Authorization::snapshot_of)
+            .map(|bundle| Authorization::snapshot_of(bundle, started_at))
         else {
             return Err(StartUserAccessTasksErrorModeled::ResourceNotFoundException(
                 crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
@@ -220,7 +225,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let started_at = ::std::time::SystemTime::now();
         // A task's status is non-terminal for a span the clock owes, so the
         // settle instant is STORED here rather than waited for.
         let settles_at = started_at + crate::state::USER_ACCESS_TASK_SETTLES_AFTER;

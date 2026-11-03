@@ -321,7 +321,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .app_bundles
                             .get(&bundle_key)
                             .and_then(|bundle| bundle.resolve_app_authorization(arn))
-                            .map(crate::state::AppAuthorizationRecord::to_app_authorization)
+                            .map(|authorization| {
+                                authorization
+                                    .to_app_authorization(::std::time::SystemTime::now())
+                            })
                     },
                 )
                 .map_err(CreateAppAuthorizationErrorModeled::ConflictException)?;
@@ -404,6 +407,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at: created_at,
             tags,
             sequence,
+            // A new authorization has run no connect handshake, so the clock
+            // owes it no outcome of one.
+            validation_fails_at: None,
         };
         bundle.app_authorizations.insert(id.clone(), record);
         // Read the response back out of the store, so what the caller sees is
@@ -411,7 +417,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = bundle
             .app_authorizations
             .get(&id)
-            .map(crate::state::AppAuthorizationRecord::to_app_authorization);
+            .map(|authorization| authorization.to_app_authorization(created_at));
 
         if let Some(token) = input.client_token.as_deref() {
             store.remember_client_token(

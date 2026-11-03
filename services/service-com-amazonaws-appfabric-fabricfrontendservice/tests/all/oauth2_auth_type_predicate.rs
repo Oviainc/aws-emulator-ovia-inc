@@ -291,10 +291,19 @@ async fn the_consent_url_and_the_connect_requirement_answer_the_same_question() 
                 carried.status, carried.body
             );
             let after = get_authorization(&emulator, region, &bundle, &arn).await;
+            // The handshake of an `apiKey` authorization completes with the
+            // call; an `oauth2` one has nothing this emulator can redeem, so
+            // its outcome is the clock's and the record still awaits it here
+            // (`app_authorization_connect_validation` asserts that outcome).
+            let expected_status = if *oauth_kind {
+                "PendingConnect"
+            } else {
+                "Connected"
+            };
             assert_eq!(
                 status_of(&after).as_deref(),
-                Some("Connected"),
-                "case {case:?}: expected the authorization to read back Connected, got {}",
+                Some(expected_status),
+                "case {case:?}: expected the authorization to read back {expected_status}, got {}",
                 after.body
             );
             // The reporting answer is unchanged by the handshake: it is the

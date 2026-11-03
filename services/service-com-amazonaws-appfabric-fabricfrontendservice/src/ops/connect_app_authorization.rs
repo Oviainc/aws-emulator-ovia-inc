@@ -1,18 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ConnectAppAuthorization
-//! Completes the connect handshake of a STORED app authorization and persists
-//! the result: the authorization it names moves to `Connected`, and the summary
-//! this call returns is read back out of the record it just wrote, so
-//! `GetAppAuthorization` and `ListAppAuthorizations` report the same state.
+//! Runs the connect handshake of a STORED app authorization and persists its
+//! outcome: the summary this call returns is read back out of the record it just
+//! wrote, so `GetAppAuthorization` and `ListAppAuthorizations` report the same
+//! state.
 //!
 //! This is the step AppFabric's resource chain puts between creating an
 //! authorization and ingesting with it (authorize → connect → ingest), so it is
-//! what makes an authorization usable by `CreateIngestion`. The transition is
-//! owed to THIS call, not to the clock: an authorization stays `PendingConnect`
-//! until a caller connects it. The call carries no idempotency token, so a repeat
-//! of it is served; one whose authorization is already `Connected` has no change
-//! left to apply, so it reports the record as it stands, `updatedAt` included.
+//! what makes an authorization usable by `CreateIngestion`. The handshake is owed
+//! to THIS call, not to the clock: an authorization stays `PendingConnect` until
+//! a caller connects it. Which of the two outcomes the model documents the
+//! handshake reaches — `Connected`, or `ConnectionValidationFailed` for an
+//! authorization the application never validated — is decided in `handle` below,
+//! and the failed one falls due shortly after the call rather than with it,
+//! because the exchange with the application runs after the answer. The call
+//! carries no idempotency token, so a repeat of it is served; one that finds its
+//! authorization's outcome already settled has no change left to apply, so it
+//! reports the record as it stands, `updatedAt` included.
 //!
 //! No credential material is read or stored: the `authRequest` the OAuth2 flow
 //! carries is `@sensitive`, and the only thing this handler takes from it is
@@ -211,29 +216,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The handshake this emulator can complete: the authorization becomes
-        // usable, which is the state the rest of the chain depends on. Connecting
-        // one that is already `Connected` has no change left to apply, so it is
-        // answered with the record exactly as it stands rather than refused —
-        // `updatedAt` dates the last CHANGE to the record (and the audit trail
-        // records changes), so a call that moves nothing moves neither. The
-        // sibling `UpdateAppAuthorization` decides the same way for the same
-        // record.
-        let moved = !authorization.is_connected();
-        if moved {
-            authorization.status = crate::state::APP_AUTHORIZATION_STATUS_CONNECTED.to_string();
-            authorization.updated_at = ::std::time::SystemTime::now();
-        }
+        let now = ::std::time::SystemTime::now();
+        // The handshake's OUTCOME, which is what this call writes. It is the
+        // application that decides it — the model's `AppAuthorizationStatus`
+        // documents the two it can leave behind: `Connected` ("connected to the
+        // application, and is ready to be used") and `ConnectionValidationFailed`
+        // ("received a validation exception when trying to connect to the
+        // application").
+        //
+        // What the two kinds of authorization need from the application differs,
+        // and that is what decides the outcome here. An `oauth2` authorization's
+        // handshake has to redeem the `authRequest` the consent step handed back
+        // — the model states what for: an `AuthRequest` "is required for Amazon
+        // Web Services AppFabric to get the OAuth2 access token for an
+        // application", by exchanging the `code` "returned by the application
+        // after permission is granted in the application OAuth page". This
+        // emulator serves no application and makes no outbound connection, so
+        // nothing ever redeems that code and no access token is ever obtained:
+        // the handshake cannot do anything BUT fail validation, and reporting it
+        // as connected would make a usable authorization out of one no
+        // application ever granted. An `apiKey` authorization has no grant to
+        // redeem — its credential is the key the create call already carried —
+        // so its handshake has nothing this emulator cannot complete.
+        //
+        // The failed outcome is owed to the CLOCK rather than to this call: the
+        // exchange with the application runs after the call is answered, so the
+        // record is left awaiting it and reads `ConnectionValidationFailed` once
+        // it falls due (see
+        // [`crate::state::AppAuthorizationRecord::validation_failing`]). A
+        // connect that reaches `Connected`, and one that finds nothing left to
+        // apply, are decided in the record too: `updatedAt` dates the last
+        // CHANGE to the record (and the audit trail records changes), so a call
+        // that moves nothing moves neither. The sibling `UpdateAppAuthorization`
+        // decides the same way for the same record.
+        let (moved, change) = if authorization.is_oauth2() {
+            (authorization.validation_failing(now), "connecting")
+        } else {
+            (authorization.connected(now), "connected")
+        };
         let id = authorization.id.clone();
         // Read the response back out of the record this call left behind.
-        let app_authorization_summary = authorization.to_summary();
+        let app_authorization_summary = authorization.to_summary(now);
         if moved {
             crate::state::audit_resource_change(
                 ctx.parts(),
                 Self::NAME,
                 "AppAuthorization",
                 &id,
-                "connected",
+                change,
             );
         }
         Ok(ConnectAppAuthorizationOutput {
