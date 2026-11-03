@@ -139,6 +139,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         /// issued is not accepted here.
         const LISTING: &str = "configs";
 
+        /// The cursor this listing WRITES, position by position: the `(configType,
+        /// configId)` pair it is ordered by, both read off optional members of a
+        /// `ConfigListItem`. A token carrying any other field list names no boundary in
+        /// that order, so it is refused rather than resumed.
+        const CURSOR: &[&[crate::state::CursorFieldShape]] = &[&[
+            crate::state::CursorFieldShape::optional_text(),
+            crate::state::CursorFieldShape::optional_text(),
+        ]];
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListConfigsErrorModeled::DependencyException(DependencyException {
                 message: Some("this service's state store is unavailable".to_string()),
@@ -168,16 +177,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(crate::state::decode_page_token(LISTING, token).ok_or_else(
-                || {
+            Some(token) => {
+                let cursor = crate::state::decode_page_token(LISTING, CURSOR, token);
+                Some(cursor.ok_or_else(|| {
                     ListConfigsErrorModeled::InvalidParameterException(InvalidParameterException {
                         message: Some(
                             "nextToken was not issued by a previous ListConfigs call".to_string(),
                         ),
                         parameter_name: Some("nextToken".to_string()),
                     })
-                },
-            )?),
+                })?)
+            }
         };
         // The boundary a token carries is the config the page ended on, by the
         // `(configType, configId)` pair the order is taken on, so a config deleted between

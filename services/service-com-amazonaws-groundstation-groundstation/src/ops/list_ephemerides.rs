@@ -157,6 +157,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         /// issued is not accepted here.
         const LISTING: &str = "ephemerides";
 
+        /// The cursor this listing WRITES, position by position: the optional creation
+        /// instant it is ordered by (an instant is held as the integer that orders as it
+        /// does), then the optional `ephemerisId` beside it. A token carrying any other
+        /// field list names no boundary in that order, so it is refused rather than
+        /// resumed.
+        const CURSOR: &[&[crate::state::CursorFieldShape]] = &[&[
+            crate::state::CursorFieldShape::optional_number(),
+            crate::state::CursorFieldShape::optional_text(),
+        ]];
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListEphemeridesErrorModeled::DependencyException(DependencyException {
                 message: Some("this service's state store is unavailable".to_string()),
@@ -190,8 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(crate::state::decode_page_token(&scope, token).ok_or_else(
-                || {
+            Some(token) => {
+                let cursor = crate::state::decode_page_token(&scope, CURSOR, token);
+                Some(cursor.ok_or_else(|| {
                     ListEphemeridesErrorModeled::InvalidParameterException(
                         InvalidParameterException {
                             message: Some(
@@ -202,8 +213,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             parameter_name: Some("nextToken".to_string()),
                         },
                     )
-                },
-            )?),
+                })?)
+            }
         };
 
         let window_start = input.start_time.as_secs_f64();

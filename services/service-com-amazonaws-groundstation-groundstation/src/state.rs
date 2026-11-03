@@ -1141,6 +1141,110 @@ impl CursorField {
     }
 }
 
+/// Which form ONE position of a listing's cursor carries — the shape of the member the
+/// listing takes that part of its order on, as it writes it.
+///
+/// One field list of a listing has a fixed arity and a fixed form per position, because
+/// every field is read off the same member of every item it covers: a required text member
+/// yields [`CursorFieldShape::text`], an optional one [`CursorFieldShape::optional_text`]
+/// (text, or [`CursorField::Absent`] where the member carries nothing), and the number and
+/// instant members the matching constructors below. A listing whose order is composed of
+/// PARTS that take their key off different members writes one field list per part, each
+/// naming its own part with a [`CursorFieldShape::marker`], and names them all to
+/// [`decode_page_token`].
+///
+/// [`decode_page_token`] reads these to tell a token the listing ISSUED from one that merely
+/// starts with its scope: a field list of another arity, or another form at some position,
+/// is not a boundary in the listing's order and is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorFieldShape {
+    /// Whether the position carries [`CursorField::Absent`] — only where the member it is
+    /// read off is optional.
+    absent: bool,
+    /// Whether the position carries [`CursorField::Number`].
+    number: bool,
+    /// The ONE number this position carries, where the listing writes a fixed value there
+    /// rather than a member's: see [`CursorFieldShape::marker`]. `None` where any number
+    /// the member can hold belongs here.
+    marker: Option<i64>,
+    /// Whether the position carries [`CursorField::Text`].
+    text: bool,
+}
+
+impl CursorFieldShape {
+    /// The shape of a position read off a REQUIRED text member
+    /// ([`CursorField::text`]).
+    pub const fn text() -> Self {
+        Self {
+            absent: false,
+            number: false,
+            marker: None,
+            text: true,
+        }
+    }
+
+    /// The shape of a position read off an OPTIONAL text member
+    /// ([`CursorField::optional_text`]).
+    pub const fn optional_text() -> Self {
+        Self {
+            absent: true,
+            number: false,
+            marker: None,
+            text: true,
+        }
+    }
+
+    /// The shape of a position read off a REQUIRED number member
+    /// ([`CursorField::Number`]), an instant among them ([`CursorField::instant`], which
+    /// holds the instant as the integer that orders as the instant does).
+    pub const fn number() -> Self {
+        Self {
+            absent: false,
+            number: true,
+            marker: None,
+            text: false,
+        }
+    }
+
+    /// The shape of a position read off an OPTIONAL number or instant member
+    /// ([`CursorField::optional_number`], [`CursorField::optional_instant`]).
+    pub const fn optional_number() -> Self {
+        Self {
+            absent: true,
+            number: true,
+            marker: None,
+            text: false,
+        }
+    }
+
+    /// The shape of a position carrying the fixed number `value`: the marker a listing
+    /// whose order is COMPOSED of parts writes to say which part an item belongs to.
+    ///
+    /// A part's field list admits only ITS marker, so the key of one part cannot be read
+    /// behind the marker of another — a field list no part writes, and no position in the
+    /// listing's order.
+    pub const fn marker(value: i64) -> Self {
+        Self {
+            absent: false,
+            number: true,
+            marker: Some(value),
+            text: false,
+        }
+    }
+
+    /// Whether this position of the listing's cursor carries `field`.
+    fn admits(&self, field: &CursorField) -> bool {
+        match field {
+            CursorField::Absent => self.absent,
+            // A marked position carries ITS number and no other.
+            CursorField::Number(number) => {
+                self.number && self.marker.is_none_or(|marker| marker == *number)
+            }
+            CursorField::Text(_) => self.text,
+        }
+    }
+}
+
 /// Where a page of a listing ENDED: the ordering key of the last item it returned, which
 /// is what its `nextToken` carries so the next page resumes after that item.
 ///
@@ -1185,14 +1289,39 @@ pub fn encode_page_token(scope: &str, cursor: &PageCursor) -> String {
 }
 
 /// The cursor a token issued by [`encode_page_token`] for `scope` carries, or `None` when
-/// the token was not issued by this service for that scope.
-pub fn decode_page_token(scope: &str, token: &str) -> Option<PageCursor> {
+/// the token was not issued by this service for that scope — including a token whose field
+/// list is not one the listing under `scope` ever writes.
+///
+/// `cursors` is every field list that listing WRITES — one per part of its order, each
+/// position by position as the listing writes it (its [`CursorFieldShape`] for the member
+/// the order is taken on there); a listing ordered on one set of members names exactly one.
+/// A token is a page boundary only in the order the listing holds its items in, and a field
+/// list of another LENGTH, or carrying another FORM at some position, names no place in that
+/// order: [`CursorField`]'s ordering would still compare it against every item's cursor — an
+/// `Absent` before all of them, a `Number` before every `Text`, a `Text` after every number
+/// — so such a token, honoured, would answer a page the sequence never had a boundary for
+/// (its first page, or none of it at all) instead of being refused. So the decoded list must
+/// match ONE of `cursors` whole — its arity, every field's form, and the marker naming the
+/// part a field list belongs to ([`CursorFieldShape::marker`]), so one part's key cannot be
+/// read behind another's marker either — and only a field list this listing issues decodes.
+pub fn decode_page_token(
+    scope: &str,
+    cursors: &[&[CursorFieldShape]],
+    token: &str,
+) -> Option<PageCursor> {
     let fields = token.strip_prefix(scope)?.strip_prefix('.')?;
-    fields
+    let cursor: Vec<CursorField> = fields
         .split('.')
         .map(CursorField::parse)
-        .collect::<Option<Vec<CursorField>>>()
-        .map(PageCursor::new)
+        .collect::<Option<Vec<CursorField>>>()?;
+    let issuable = cursors.iter().any(|written| {
+        written.len() == cursor.len()
+            && written
+                .iter()
+                .zip(cursor.iter())
+                .all(|(position, field)| position.admits(field))
+    });
+    issuable.then(|| PageCursor::new(cursor))
 }
 
 /// Largest page any listing returns, and the ceiling on a caller's `maxResults`: the

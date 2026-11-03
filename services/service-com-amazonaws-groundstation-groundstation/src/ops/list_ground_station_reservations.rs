@@ -169,6 +169,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         /// issued is not accepted here.
         const LISTING: &str = "ground-station-reservations";
 
+        /// The cursor this listing WRITES, position by position: the two required instants
+        /// the block runs between (an instant is held as the integer that orders as it
+        /// does), then the antenna, the reservation type and what the block is held for. A
+        /// token carrying any other field list names no boundary in that order, so it is
+        /// refused rather than resumed.
+        const CURSOR: &[&[crate::state::CursorFieldShape]] = &[&[
+            crate::state::CursorFieldShape::number(),
+            crate::state::CursorFieldShape::number(),
+            crate::state::CursorFieldShape::text(),
+            crate::state::CursorFieldShape::text(),
+            crate::state::CursorFieldShape::text(),
+        ]];
+
         /// The key the listing is ordered by, read off the reservation itself: when the
         /// block starts, then when it ends, then the antenna it holds, then its type and
         /// what it is held for — so the order is total and a page boundary is stable
@@ -225,8 +238,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(crate::state::decode_page_token(&scope, token).ok_or_else(
-                || {
+            Some(token) => {
+                let cursor = crate::state::decode_page_token(&scope, CURSOR, token);
+                Some(cursor.ok_or_else(|| {
                     ListGroundStationReservationsErrorModeled::InvalidParameterException(
                         InvalidParameterException {
                             message: Some(
@@ -237,8 +251,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             parameter_name: Some("nextToken".to_string()),
                         },
                     )
-                },
-            )?),
+                })?)
+            }
         };
 
         // A request that names no type filters on none: every reservation type is

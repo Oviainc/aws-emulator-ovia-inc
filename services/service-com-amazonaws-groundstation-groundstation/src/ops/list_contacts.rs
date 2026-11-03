@@ -153,6 +153,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         /// issued is not accepted here.
         const LISTING: &str = "contacts";
 
+        /// Which PART of this listing's composed order a record belongs to, as the first
+        /// field of its cursor says: the contacts the store holds come first, then the
+        /// windows an availability search computed.
+        const STORED_PART: i64 = 0;
+
+        /// See [`STORED_PART`].
+        const WINDOW_PART: i64 = 1;
+
+        /// The field lists this listing WRITES, one per part of its order: the part's own
+        /// marker, then that part's key — a stored contact's `contactId` (text), or a
+        /// computed window's optional start instant (a number). A token carrying any other
+        /// field list — another arity, another form, or one part's key behind the other's
+        /// marker — names no boundary in that order, so it is refused rather than resumed.
+        const CURSOR: &[&[crate::state::CursorFieldShape]] = &[
+            &[
+                crate::state::CursorFieldShape::marker(STORED_PART),
+                crate::state::CursorFieldShape::text(),
+            ],
+            &[
+                crate::state::CursorFieldShape::marker(WINDOW_PART),
+                crate::state::CursorFieldShape::optional_number(),
+            ],
+        ];
+
         /// Where one answered contact sits in this listing's order, which is what its
         /// page token names: the contacts the store holds first, by contact id, then the
         /// windows an availability search computed, by start time. Only an offered window
@@ -168,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         /// Where the stored contact `contact_id` sits in that order.
         fn stored_key(contact_id: &str) -> crate::state::PageCursor {
             crate::state::PageCursor::new(vec![
-                crate::state::CursorField::Number(0),
+                crate::state::CursorField::Number(STORED_PART),
                 crate::state::CursorField::text(contact_id),
             ])
         }
@@ -176,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         /// Where the offered window starting at `start_time` sits in that order.
         fn window_key(start_time: Option<::aws_smithy_types::DateTime>) -> crate::state::PageCursor {
             crate::state::PageCursor::new(vec![
-                crate::state::CursorField::Number(1),
+                crate::state::CursorField::Number(WINDOW_PART),
                 crate::state::CursorField::optional_instant(start_time),
             ])
         }
@@ -257,8 +281,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(crate::state::decode_page_token(&scope, token).ok_or_else(
-                || {
+            Some(token) => {
+                let cursor = crate::state::decode_page_token(&scope, CURSOR, token);
+                Some(cursor.ok_or_else(|| {
                     ListContactsErrorModeled::InvalidParameterException(
                         InvalidParameterException {
                             message: Some(
@@ -269,8 +294,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             parameter_name: Some("nextToken".to_string()),
                         },
                     )
-                },
-            )?),
+                })?)
+            }
         };
 
         let window_start = input.start_time.as_secs_f64();

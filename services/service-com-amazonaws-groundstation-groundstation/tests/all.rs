@@ -121,6 +121,8 @@ mod not_found_messages;
 mod owed_transition_spans;
 #[path = "all/page_boundaries.rs"]
 mod page_boundaries;
+#[path = "all/page_token_field_lists.rs"]
+mod page_token_field_lists;
 #[path = "all/placement_reads_the_clock.rs"]
 mod placement_reads_the_clock;
 #[path = "all/program_track_reference_integrity.rs"]

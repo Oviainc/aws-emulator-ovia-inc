@@ -147,6 +147,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         /// issued is not accepted here.
         const LISTING: &str = "satellites";
 
+        /// The cursor this listing WRITES, position by position: the required NORAD
+        /// catalogue number it is ordered by, then the optional `satelliteId` beside it. A
+        /// token carrying any other field list names no boundary in that order, so it is
+        /// refused rather than resumed.
+        const CURSOR: &[&[crate::state::CursorFieldShape]] = &[&[
+            crate::state::CursorFieldShape::number(),
+            crate::state::CursorFieldShape::optional_text(),
+        ]];
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListSatellitesErrorModeled::DependencyException(DependencyException {
                 message: Some("this service's state store is unavailable".to_string()),
@@ -183,8 +192,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(crate::state::decode_page_token(LISTING, token).ok_or_else(
-                || {
+            Some(token) => {
+                let cursor = crate::state::decode_page_token(LISTING, CURSOR, token);
+                Some(cursor.ok_or_else(|| {
                     ListSatellitesErrorModeled::InvalidParameterException(
                         InvalidParameterException {
                             message: Some(
@@ -194,8 +204,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             parameter_name: Some("nextToken".to_string()),
                         },
                     )
-                },
-            )?),
+                })?)
+            }
         };
         // The boundary a token carries is the record the page ended on, in the order above
         // — the catalogue number, then the `satelliteId` beside it — so an on-boarding

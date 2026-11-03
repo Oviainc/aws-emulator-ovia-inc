@@ -162,6 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         /// issued is not accepted here.
         const LISTING: &str = "ground-stations";
 
+        /// The cursor this listing WRITES, position by position: the one optional
+        /// `groundStationId` member it is ordered by. A token carrying any other field
+        /// list names no boundary in that order, so it is refused rather than resumed.
+        const CURSOR: &[&[crate::state::CursorFieldShape]] =
+            &[&[crate::state::CursorFieldShape::optional_text()]];
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListGroundStationsErrorModeled::DependencyException(DependencyException {
                 message: Some("this service's state store is unavailable".to_string()),
@@ -177,8 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let scope = crate::state::page_scope(LISTING, ::std::slice::from_ref(&satellite_filter));
         let after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(crate::state::decode_page_token(&scope, token).ok_or_else(
-                || {
+            Some(token) => {
+                let cursor = crate::state::decode_page_token(&scope, CURSOR, token);
+                Some(cursor.ok_or_else(|| {
                     ListGroundStationsErrorModeled::InvalidParameterException(
                         InvalidParameterException {
                             message: Some(
@@ -189,8 +196,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             parameter_name: Some("nextToken".to_string()),
                         },
                     )
-                },
-            )?),
+                })?)
+            }
         };
 
         // A ground station's Region is the Region the request addressed: these are the

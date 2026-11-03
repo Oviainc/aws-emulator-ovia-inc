@@ -140,6 +140,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         /// issued is not accepted here.
         const LISTING: &str = "missionprofiles";
 
+        /// The cursor this listing WRITES, position by position: the one optional
+        /// `missionProfileId` member it is ordered by. A token carrying any other field
+        /// list names no boundary in that order, so it is refused rather than resumed.
+        const CURSOR: &[&[crate::state::CursorFieldShape]] =
+            &[&[crate::state::CursorFieldShape::optional_text()]];
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListMissionProfilesErrorModeled::DependencyException(DependencyException {
                 message: Some("this service's state store is unavailable".to_string()),
@@ -165,8 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(crate::state::decode_page_token(LISTING, token).ok_or_else(
-                || {
+            Some(token) => {
+                let cursor = crate::state::decode_page_token(LISTING, CURSOR, token);
+                Some(cursor.ok_or_else(|| {
                     ListMissionProfilesErrorModeled::InvalidParameterException(
                         InvalidParameterException {
                             message: Some(
@@ -176,8 +183,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             parameter_name: Some("nextToken".to_string()),
                         },
                     )
-                },
-            )?),
+                })?)
+            }
         };
         // The boundary a token carries is the profile the page ended on, by the id the
         // order is taken on, so a profile deleted between two pages does not move the next
