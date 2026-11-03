@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResolveAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResolveAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResolveAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the fleet the stored alias routes at: the alias's own `RoutingStrategy`, as
+//! `CreateAlias`/`UpdateAlias` persisted it, decides whether this call answers a fleet
+//! (`SIMPLE`) or the modelled terminal refusal (`TERMINAL`), and an alias that points at a
+//! fleet the store no longer holds still reports the fleet it points at, since an alias
+//! outlives its targets.
 //!
 //! ## Shape of an operation
 //!
@@ -159,20 +156,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResolveAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResolveAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResolveAlias"))
+        let not_found = |message: String| -> Self::Error {
+            ResolveAliasErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ResolveAliasErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        // Reporting only: the tick materialises the status changes the clock has already
+        // made due (a fleet reaching ACTIVE, a session ending), exactly as the other reads
+        // of this store do. Nothing is written on account of the read itself.
+        state.tick(::std::time::SystemTime::now());
+
+        // "Specify a unique alias identifier": this operation acts on ONE named alias, so
+        // an identifier that names no stored alias is the modelled `NotFoundException`
+        // rather than an empty success — the refusal every operation that names one alias
+        // answers.
+        let Some(alias) = state.resolve_alias(&input.alias_id) else {
+            return Err(not_found(crate::state::alias_not_found_message(
+                &input.alias_id,
+            )));
+        };
+
+        // "If the alias has a SIMPLE routing strategy, Amazon GameLift Servers returns a
+        // fleet ID. If the alias has a TERMINAL routing strategy, the result is a
+        // TerminalRoutingStrategyException", whose own doc adds: "The message returned in
+        // this exception is the message defined in the routing strategy itself."
+        let alias_region = alias.region.clone();
+        let fleet_reference = match alias.routing() {
+            crate::state::AliasRouting::Fleet(fleet_id) => fleet_id.to_string(),
+            crate::state::AliasRouting::Terminal(message) => {
+                return Err(
+                    ResolveAliasErrorModeled::TerminalRoutingStrategyException(
+                        TerminalRoutingStrategyException {
+                            message: message.map(str::to_string),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        // A simple strategy "resolves to one specific fleet", and the alias holds the
+        // `FleetId` it was configured with: "this value is the fleet ID, not the fleet
+        // ARN" (`RoutingStrategy$FleetId`). So the fleet this call reports is the one the
+        // STORED strategy names, and `FleetArn` is "the ARN associated with the GameLift
+        // fleet resource that this alias points to" — that fleet's own ARN when the store
+        // holds the fleet, so this response and every read of the fleet can only agree,
+        // and otherwise the ARN that id names in the alias's Region, since an alias
+        // outlives the fleets it points at and neither creating nor updating one checks
+        // that its target exists.
+        let stored = state
+            .resolve_fleet_id(&fleet_reference)
+            .and_then(|fleet_id| state.fleets.get(&fleet_id));
+        let (fleet_id, fleet_arn) = match stored {
+            Some(fleet) => (fleet.fleet_id.clone(), fleet.fleet_arn.clone()),
+            None => crate::state::id_and_arn(&fleet_reference, &alias_region, "fleet"),
+        };
+
+        Ok(ResolveAliasOutput {
+            fleet_id: Some(fleet_id),
+            fleet_arn: Some(fleet_arn),
+        })
     }
 }
