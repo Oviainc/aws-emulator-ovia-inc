@@ -305,6 +305,37 @@ pub const DEFAULT_PORT_HTTPS: i32 = 443;
 /// specified, then the default value is 100."
 pub const DEFAULT_SINGLE_TARGET_GROUP_WEIGHT: i32 = 100;
 
+/// The name of the implicit DEFAULT rule every listener is created with.
+///
+/// "Each listener has a default rule for checking connection requests, but you can
+/// define additional rules" (`DeleteRule`'s own documentation; `CreateListener`'s
+/// `defaultAction` restates it as "The action for the default rule. Each listener has a
+/// default rule. The default rule is used if no other rules match."), so a listener's
+/// rule set is never empty: the create materialises that rule beside the listener
+/// ([`ComAmazonawsVpclatticeMercurycontrolplaneState::insert_default_rule`]). The name it
+/// carries is RECORDED AWS behaviour — the model states none.
+pub const DEFAULT_RULE_NAME: &str = "default";
+
+/// The priority the default rule carries.
+///
+/// It sits ABOVE every priority `RulePriority`'s `@range(1, 2000)` lets a caller ask
+/// for, which is what makes the default rule the last one evaluated and keeps a rule a
+/// caller creates from ever colliding with it. SOURCE: recorded AWS behaviour; the model
+/// states no priority for the default rule (and its own range is the range of a priority
+/// a CALLER may submit).
+pub const DEFAULT_RULE_PRIORITY: i32 = 99_999;
+
+/// How the service refuses a write against a listener's DEFAULT rule.
+///
+/// The RULE is `UpdateRule`'s own documentation: "Updates a specified rule for the
+/// listener. You can't modify a default listener rule. To modify a default listener
+/// rule, use UpdateListener." It is a service rule the model carries no trait for, so it
+/// is reported through [`service_rule_exception`] over the identifier member that names
+/// the rule, not as a modelled constraint report.
+pub const DEFAULT_RULE_NOT_MODIFIABLE_MESSAGE: &str =
+    "You can't modify a default listener rule. To modify a default listener rule, use \
+     UpdateListener.";
+
 /// The HTTP status codes a fixed-response action may carry.
 ///
 /// From `FixedResponseAction`'s `statusCode` documentation: "The HTTP response code.
@@ -336,6 +367,9 @@ pub const CREATE_TRANSITION: Duration = Duration::from_millis(500);
 const BASE36_LOWER: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 /// The uppercase base-36 alphabet a Route 53 hosted-zone id is drawn from (`[0-9A-Z]`).
 const BASE36_UPPER: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+/// The lowercase hex alphabet a rule's and a target group's id suffix is drawn from
+/// (`[0-9a-f]`); see [`id_alphabet`].
+const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 
 /// A service network: the logical boundary services and VPCs associate with.
 #[derive(Debug, Clone)]
@@ -989,6 +1023,18 @@ pub fn normalized_rule_match(
     r#match
 }
 
+/// The match a listener's DEFAULT rule carries: HTTP criteria with no condition
+/// configured, since that rule is the one "used if no other rules match"
+/// (`CreateListener`'s `defaultAction`) and so matches on nothing of its own.
+///
+/// Built through [`normalized_rule_match`], so the default rule's match is stored the
+/// way a caller's is and every projection of a rule's match agrees with the others.
+pub fn default_rule_match() -> crate::ops::types::RuleMatch {
+    normalized_rule_match(&crate::ops::types::RuleMatch::httpMatch(
+        crate::ops::types::HttpMatch::default(),
+    ))
+}
+
 /// The most `@idempotencyToken` -> resource-id entries this service remembers.
 ///
 /// Tokens are caller-supplied, so the map is caller-driven growth that holds no resource
@@ -1147,6 +1193,84 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
         self.rules
             .values()
             .find(|rule| rule.listener_id == listener_id && rule.priority == priority)
+    }
+
+    /// Materialise `listener`'s implicit DEFAULT rule, answering the rule id it minted.
+    ///
+    /// "Each listener has a default rule for checking connection requests, but you can
+    /// define additional rules" (`DeleteRule`'s documentation), so a listener is created
+    /// WITH that rule rather than acquiring one later: it is stored as a rule record like
+    /// any other — `isDefault` true, [`DEFAULT_RULE_NAME`], [`DEFAULT_RULE_PRIORITY`],
+    /// the listener's own `defaultAction` as its action and an ARN nested under the
+    /// listener's — so every path that reports a listener's rules reports it from the one
+    /// rule store, it takes part in the per-listener name and priority uniqueness rules,
+    /// and it goes with the listener when the listener or its service is deleted
+    /// ([`Self::remove_rules_of`]).
+    pub fn insert_default_rule(
+        &mut self,
+        listener: &Listener,
+        region: &str,
+        now: SystemTime,
+    ) -> String {
+        let id = mint_id(PREFIX_RULE);
+        let sequence = self.next_sequence();
+        let record = Rule {
+            arn: rule_arn(region, &listener.service_id, &listener.id, &id),
+            id: id.clone(),
+            name: DEFAULT_RULE_NAME.to_string(),
+            listener_id: listener.id.clone(),
+            service_id: listener.service_id.clone(),
+            priority: DEFAULT_RULE_PRIORITY,
+            r#match: default_rule_match(),
+            // The default rule's action IS the listener's `defaultAction`, which the
+            // listener record already holds normalised, so the two cannot disagree.
+            action: listener.default_action.clone(),
+            is_default: true,
+            tags: HashMap::new(),
+            created_at: now,
+            last_updated_at: now,
+            sequence,
+        };
+        self.name_index
+            .insert(rule_name_key(&listener.id, &record.name), id.clone());
+        self.rules.insert(id.clone(), record);
+        id
+    }
+
+    /// Apply the members an update supplies onto `rule`, answering whether any of them
+    /// changed it — and stamping `lastUpdatedAt` with `now` when one did.
+    ///
+    /// The ONE write path both update operations take: `UpdateRule` applies one rule's
+    /// members and `BatchUpdateRule` applies an entry's, and AWS documents the batch as
+    /// "Updates the listener rules in a batch", so the two cannot differ in WHAT a
+    /// supplied member does to the stored record. A member the request leaves out leaves
+    /// that part of the rule as it was ("You can also update a rule in a batch" is still
+    /// an update, not a replace), and an update that supplies nothing changes nothing, so
+    /// it leaves the timestamp where it is.
+    pub fn apply_rule_update(
+        rule: &mut Rule,
+        priority: Option<i32>,
+        r#match: Option<&crate::ops::types::RuleMatch>,
+        action: Option<&crate::ops::types::RuleAction>,
+        now: SystemTime,
+    ) -> bool {
+        let mut changed = false;
+        if let Some(priority) = priority {
+            rule.priority = priority;
+            changed = true;
+        }
+        if let Some(r#match) = r#match {
+            rule.r#match = normalized_rule_match(r#match);
+            changed = true;
+        }
+        if let Some(action) = action {
+            rule.action = normalized_rule_action(action);
+            changed = true;
+        }
+        if changed {
+            rule.last_updated_at = now;
+        }
+        changed
     }
 
     /// The listener of `service_id` that already binds `port`, if there is one.
@@ -1381,19 +1505,33 @@ pub fn rule_arn(region: &str, service_id: &str, listener_id: &str, rule_id: &str
     )
 }
 
-/// Mint a fresh resource id: `prefix` plus 17 `[0-9a-z]` characters, as the modelled
-/// id patterns require.
+/// Mint a fresh resource id: `prefix` plus 17 characters of that kind's own alphabet
+/// ([`id_alphabet`]), which is inside the `[0-9a-z]` every modelled id pattern allows.
 pub fn mint_id(prefix: &str) -> String {
     format!(
         "{prefix}{}",
-        encode_base36(fresh_entropy(), ID_SUFFIX_LEN, BASE36_LOWER)
+        encode_in(fresh_entropy(), ID_SUFFIX_LEN, id_alphabet(prefix))
     )
+}
+
+/// The alphabet the 17-character suffix of an id of `prefix`'s kind is drawn from.
+///
+/// A RULE and a TARGET GROUP are minted from lowercase hex; every other kind from base
+/// 36. Both sit inside the `[0-9a-z]` the modelled id patterns allow, so which of the two
+/// a kind uses is RECORDED AWS behaviour rather than a modelled requirement: a recorded
+/// rule id and target-group id carry only `[0-9a-f]`, while a recorded service, listener
+/// and association id carry the wider set.
+fn id_alphabet(prefix: &str) -> &'static [u8] {
+    match prefix {
+        PREFIX_RULE | PREFIX_TARGET_GROUP => HEX_LOWER,
+        _ => BASE36_LOWER,
+    }
 }
 
 /// Mint the Route 53 hosted-zone id of a service's DNS entry: `Z` plus 19 `[0-9A-Z]`
 /// characters, the shape Route 53 gives a hosted zone.
 pub fn mint_hosted_zone_id() -> String {
-    format!("Z{}", encode_base36(fresh_entropy(), 19, BASE36_UPPER))
+    format!("Z{}", encode_in(fresh_entropy(), 19, BASE36_UPPER))
 }
 
 /// The generated domain name of a service's DNS entry:
@@ -1448,13 +1586,14 @@ fn fresh_entropy() -> u128 {
 }
 
 /// `value` rendered in `alphabet`, exactly `len` characters, most significant first.
-fn encode_base36(mut value: u128, len: usize, alphabet: &[u8; 36]) -> String {
+fn encode_in(mut value: u128, len: usize, alphabet: &[u8]) -> String {
+    let radix = alphabet.len() as u128;
     let mut out = vec![alphabet[0]; len];
     for slot in out.iter_mut().rev() {
-        *slot = alphabet[(value % 36) as usize];
-        value /= 36;
+        *slot = alphabet[(value % radix) as usize];
+        value /= radix;
     }
-    String::from_utf8(out).expect("the base-36 alphabets are ASCII")
+    String::from_utf8(out).expect("the id alphabets are ASCII")
 }
 
 /// The resource id named by an identifier member, accepting both forms the model allows:

@@ -19,9 +19,9 @@
 //! 3. One stable order and a round-tripping `nextToken`: every page size reports each
 //!    rule of the listener exactly once, and `maxResults` is honoured at each published
 //!    bound of its `@range(1, 100)` while a value past either bound is refused.
-//! 4. The listing follows state: a listener holding no rules is an empty `items` list
-//!    with no `nextToken`, a rule created afterwards shows up, and deleting the service
-//!    takes its listener and rules with it.
+//! 4. The listing follows state: a listener nothing has created a rule on reports exactly
+//!    its implicit default rule with no `nextToken`, a rule created afterwards shows up,
+//!    and deleting the service takes its listener and rules with it.
 //! 5. An identifier naming no persisted service or listener is a 404
 //!    `ResourceNotFoundException` carrying this service's not-found construction, and a
 //!    `nextToken` this service never minted is a 400 `ValidationException`.
@@ -36,7 +36,7 @@ use service_com_amazonaws_vpclattice_mercurycontrolplane::state;
 
 /// `GET /services/{serviceIdentifier}/listeners/{listenerIdentifier}/rules`, with the
 /// query members this case sends.
-async fn list_page(
+pub(crate) async fn list_page(
     lattice: &Lattice,
     service_identifier: &str,
     listener_identifier: &str,
@@ -56,7 +56,7 @@ async fn list_page(
 }
 
 /// The `items` member of a page, which `ListRulesResponse` declares required.
-fn items_of(case: &str, answer: &Answer) -> Vec<serde_json::Value> {
+pub(crate) fn items_of(case: &str, answer: &Answer) -> Vec<serde_json::Value> {
     answer.body["items"].as_array().cloned().unwrap_or_else(|| {
         panic!(
             "case {case:?}: the required member items is missing from {}",
@@ -119,6 +119,37 @@ async fn list_every_rule_id(
     );
 }
 
+/// The id of the listener's implicit DEFAULT rule: "Each listener has a default rule"
+/// (`CreateListener`'s `defaultAction`), so exactly one summary of a listener's listing
+/// is the one `isDefault` marks.
+pub(crate) async fn default_rule_id(
+    lattice: &Lattice,
+    service_identifier: &str,
+    listener_identifier: &str,
+) -> String {
+    let case = format!("the default rule of {listener_identifier}");
+    let answer = list_page(lattice, service_identifier, listener_identifier, &[]).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected 200, got {} / {}",
+        answer.status, answer.body
+    );
+    let defaults: Vec<serde_json::Value> = items_of(&case, &answer)
+        .into_iter()
+        .filter(|item| item["isDefault"] == serde_json::json!(true))
+        .collect();
+    assert_eq!(
+        defaults.len(),
+        1,
+        "case {case:?}: expected exactly one rule with isDefault true, got {:?}",
+        defaults
+    );
+    defaults[0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: a default rule without an id: {:?}", defaults[0]))
+        .to_string()
+}
+
 /// Persist `rules` under one listener, answering the rule ids in creation order.
 async fn rules_under(
     lattice: &Lattice,
@@ -150,9 +181,13 @@ async fn rules_under(
 struct Topology {
     service_id: String,
     service_arn: String,
-    /// The listener the listing cases are run against, and its rules in creation order.
+    /// The listener the listing cases are run against, and its rules in creation order —
+    /// its implicit default rule first, since the listener was created with it.
     listener_id: String,
     listener_rules: Vec<String>,
+    /// The id of that listener's default rule, the one entry of `listener_rules` whose
+    /// `isDefault` is true.
+    listener_default: String,
     /// A second listener OF THE SAME service, with its own rules.
     sibling_id: String,
     sibling_rules: Vec<String>,
@@ -170,30 +205,45 @@ async fn build_topology(lattice: &Lattice) -> Topology {
     let other_listener_id =
         a_listener(lattice, &other_service_id, "list-rules-other-listener").await;
 
+    // Each listener was created WITH its default rule, so that rule is the first one of
+    // its listing; everything created here follows it.
+    let listener_default = default_rule_id(lattice, &service_id, &listener_id).await;
+    let sibling_default = default_rule_id(lattice, &service_id, &sibling_id).await;
+    let other_default = default_rule_id(lattice, &other_service_id, &other_listener_id).await;
+
     // Priorities deliberately out of order, so a listing that sorted by priority (or by
     // the hash map's order) would not match creation order.
-    let listener_rules = rules_under(
-        lattice,
-        &service_id,
-        &listener_id,
-        &[("alpha", 30), ("bravo", 7), ("charlie", 2000), ("delta", 1)],
-    )
-    .await;
-    let sibling_rules =
-        rules_under(lattice, &service_id, &sibling_id, &[("echo", 30), ("foxtrot", 7)]).await;
-    let other_rules = rules_under(
-        lattice,
-        &other_service_id,
-        &other_listener_id,
-        &[("golf", 30)],
-    )
-    .await;
+    let mut listener_rules = vec![listener_default.clone()];
+    listener_rules.extend(
+        rules_under(
+            lattice,
+            &service_id,
+            &listener_id,
+            &[("alpha", 30), ("bravo", 7), ("charlie", 2000), ("delta", 1)],
+        )
+        .await,
+    );
+    let mut sibling_rules = vec![sibling_default];
+    sibling_rules.extend(
+        rules_under(lattice, &service_id, &sibling_id, &[("echo", 30), ("foxtrot", 7)]).await,
+    );
+    let mut other_rules = vec![other_default];
+    other_rules.extend(
+        rules_under(
+            lattice,
+            &other_service_id,
+            &other_listener_id,
+            &[("golf", 30)],
+        )
+        .await,
+    );
 
     Topology {
         service_id,
         service_arn,
         listener_id,
         listener_rules,
+        listener_default,
         sibling_id,
         sibling_rules,
         other_service_id,
@@ -218,6 +268,9 @@ async fn the_listing_reports_exactly_the_rules_of_the_named_listener() {
         &topology.other_listener_id,
     );
     let empty_listener = a_listener(&lattice, &topology.service_id, "list-rules-empty").await;
+    // A listener nothing has created a rule on still holds one: its default rule.
+    let empty_listener_default =
+        default_rule_id(&lattice, &topology.service_id, &empty_listener).await;
 
     // (case, service identifier, listener identifier, the rule ids state says come back)
     let cases: Vec<(&str, String, String, Vec<String>)> = vec![
@@ -264,10 +317,10 @@ async fn the_listing_reports_exactly_the_rules_of_the_named_listener() {
             topology.other_rules.clone(),
         ),
         (
-            "a listener holding no rules",
+            "a listener no rule was created on",
             topology.service_id.clone(),
             empty_listener,
-            Vec::new(),
+            vec![empty_listener_default],
         ),
     ];
 
@@ -355,9 +408,9 @@ async fn each_summary_carries_the_persisted_rule() {
         );
         assert_eq!(
             summary["isDefault"],
-            serde_json::json!(false),
-            "case isDefault of {rule_id}: a rule CreateRule mints is not the listener's \
-             default rule, got {:?}",
+            serde_json::json!(*rule_id == topology.listener_default),
+            "case isDefault of {rule_id}: only the listener's default rule reports true, \
+             got {:?}",
             summary["isDefault"]
         );
         for member in ["createdAt", "lastUpdatedAt"] {
@@ -455,26 +508,38 @@ async fn the_listing_follows_what_is_persisted() {
     let (service_id, _) = a_service(&lattice, "list-rules-state").await;
     let listener_id = a_listener(&lattice, &service_id, "list-rules-state-listener").await;
 
-    let empty = list_page(&lattice, &service_id, &listener_id, &[]).await;
+    // A listener nothing has created a rule on reports exactly its default rule: "Each
+    // listener has a default rule" (`CreateListener`'s `defaultAction`).
+    let fresh = list_page(&lattice, &service_id, &listener_id, &[]).await;
     assert_eq!(
-        empty.status, 200,
-        "case a listener with no rules: expected 200, got {} / {}",
-        empty.status, empty.body
+        fresh.status, 200,
+        "case a listener no rule was created on: expected 200, got {} / {}",
+        fresh.status, fresh.body
+    );
+    let fresh_items = items_of("a listener no rule was created on", &fresh);
+    assert_eq!(
+        fresh_items.len(),
+        1,
+        "case a listener no rule was created on: expected only its default rule, got {}",
+        fresh.body
     );
     assert_eq!(
-        empty.body["items"],
-        serde_json::json!([]),
-        "case a listener with no rules: expected an empty items list, got {}",
-        empty.body
+        fresh_items[0]["isDefault"],
+        serde_json::json!(true),
+        "case a listener no rule was created on: expected its one rule to be the default \
+         rule, got {}",
+        fresh.body
     );
     assert!(
-        empty.body["nextToken"].is_null(),
-        "case a listener with no rules: expected no nextToken, got {}",
-        empty.body
+        fresh.body["nextToken"].is_null(),
+        "case a listener no rule was created on: expected no nextToken, got {}",
+        fresh.body
     );
 
-    // Each create adds exactly its own rule to the listing, in creation order.
-    let mut expected: Vec<String> = Vec::new();
+    // Each create adds exactly its own rule to the listing, after the default rule the
+    // listener was created with, in creation order.
+    let mut expected: Vec<String> =
+        vec![default_rule_id(&lattice, &service_id, &listener_id).await];
     for (name, priority) in [("state-one", 5_i64), ("state-two", 4), ("state-three", 3)] {
         let created = create_rule(
             &lattice,

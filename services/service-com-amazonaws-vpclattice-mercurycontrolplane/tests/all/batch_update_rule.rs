@@ -37,7 +37,12 @@
 //!    either published bound is a 400 `ValidationException` that stores nothing — as is
 //!    an entry whose `priority` falls past either bound of `RuleUpdate`'s
 //!    `@range(1, 2000)`.
+//! 7. "You can't modify a default listener rule. To modify a default listener rule, use
+//!    UpdateListener" (`UpdateRule`'s documentation, the rule for an update whichever
+//!    path carries it): an entry naming the listener's default rule is refused for the
+//!    whole call and stores nothing, as the single-rule path refuses it.
 
+use crate::list_rules::default_rule_id;
 use crate::listeners::{a_service, listener_kind, target_group};
 use crate::resource_not_found_messages::absent_id;
 use crate::rules::{
@@ -100,7 +105,7 @@ fn unsuccessful_of(case: &str, answer: &Answer) -> Vec<serde_json::Value> {
 }
 
 /// One timestamp member of a rule, as the instant it names, so two reads can be ordered.
-fn instant_of(case: &str, body: &serde_json::Value, member: &str) -> f64 {
+pub(crate) fn instant_of(case: &str, body: &serde_json::Value, member: &str) -> f64 {
     let text = body[member].as_str().unwrap_or_else(|| {
         panic!("case {case:?}: expected the instant member {member} in {body}")
     });
@@ -771,6 +776,91 @@ async fn an_action_outside_the_documented_catalog_refuses_the_call() {
                 read.body
             );
         }
+    }
+}
+
+/// Rule 7: an entry naming the listener's DEFAULT rule is refused for the whole call.
+///
+/// The rows differ along WHICH member the entry supplies and along where the default
+/// rule's entry sits in the batch, because the rule is about the rule it names and not
+/// about the member or the position: an update that would change the default rule is
+/// refused whatever it asks for, and its sibling entries are not applied either.
+#[tokio::test]
+async fn an_entry_naming_the_default_rule_refuses_the_call() {
+    let lattice = Lattice::new();
+    let (service_id, _) = a_service(&lattice, "default-rule-batch-host").await;
+    let listener_id = a_listener(&lattice, &service_id, "default-rule-batch-listener").await;
+    let default_id = default_rule_id(&lattice, &service_id, &listener_id).await;
+    let sibling_id = a_rule(&lattice, &service_id, &listener_id, "batch-sibling", 10).await;
+
+    // (case, the member the default rule's entry supplies, where that entry sits)
+    let cases: Vec<(&str, serde_json::Value, bool)> = vec![
+        (
+            "a priority on the default rule, alone",
+            serde_json::json!({ "ruleIdentifier": default_id, "priority": 7 }),
+            false,
+        ),
+        (
+            "a match on the default rule, alone",
+            serde_json::json!({
+                "ruleIdentifier": default_id,
+                "match": { "httpMatch": { "pathMatch": {
+                    "match": { "exact": "/default-batch" },
+                    "caseSensitive": true,
+                } } },
+            }),
+            false,
+        ),
+        (
+            "an action on the default rule, after a sibling entry",
+            serde_json::json!({
+                "ruleIdentifier": default_id,
+                "action": { "fixedResponse": { "statusCode": 404 } },
+            }),
+            true,
+        ),
+        (
+            "an entry on the default rule supplying nothing",
+            serde_json::json!({ "ruleIdentifier": default_id }),
+            true,
+        ),
+    ];
+
+    for (case, entry, after_a_sibling) in cases {
+        let rules = if after_a_sibling {
+            serde_json::json!([
+                { "ruleIdentifier": sibling_id, "priority": 20 },
+                entry,
+            ])
+        } else {
+            serde_json::json!([entry])
+        };
+        let answer = batch_update(&lattice, &service_id, &listener_id, rules).await;
+        assert_refused(&answer, case);
+        assert_eq!(
+            message_of(case, &answer),
+            "You can't modify a default listener rule. To modify a default listener rule, \
+             use UpdateListener.",
+            "case {case:?}: expected the sentence UpdateRule publishes for a default rule, \
+             got {}",
+            answer.body
+        );
+        // The refused call stored nothing: neither the default rule nor the sibling the
+        // batch also named moved.
+        let read_default = get_rule(&lattice, &service_id, &listener_id, &default_id).await;
+        assert_eq!(
+            read_default.body["priority"].as_i64(),
+            Some(99_999),
+            "case {case:?}: the default rule must keep its priority, got {}",
+            read_default.body
+        );
+        let read_sibling = get_rule(&lattice, &service_id, &listener_id, &sibling_id).await;
+        assert_eq!(
+            read_sibling.body["priority"].as_i64(),
+            Some(10),
+            "case {case:?}: a refused call must store nothing for the sibling either, got {}",
+            read_sibling.body
+        );
     }
 }
 

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves the rule through its listener and service, applies the members
+//! the request supplies onto the stored
+//! [`crate::state::Rule`] record — re-checking the documented per-listener priority
+//! uniqueness — stamps `lastUpdatedAt` and answers off the record it just wrote, so
+//! `GetRule` and `ListRules` report the same values next.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +136,51 @@ impl From<UpdateRuleErrorModeled> for UpdateRuleError {
     }
 }
 
+/// The answer for the stored rule — every member read off the record that was written,
+/// so it cannot disagree with what `GetRule` reports next.
+fn output_of(rule: &crate::state::Rule) -> UpdateRuleOutput {
+    UpdateRuleOutput {
+        id: Some(rule.id.clone()),
+        arn: Some(rule.arn.clone()),
+        name: Some(rule.name.clone()),
+        is_default: Some(rule.is_default),
+        r#match: Some(rule.r#match.clone()),
+        priority: Some(rule.priority),
+        action: Some(rule.action.clone()),
+    }
+}
+
+/// HTTP 404 for an identifier that names no persisted resource of `kind`, built by the
+/// service's shared error construction ([`crate::state::resource_not_found`]): AWS's
+/// not-found message over the submitted identifier, and the kind's resource-type token.
+fn not_found(identifier: &str, kind: crate::state::ResourceKind) -> UpdateRuleError {
+    UpdateRuleErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        kind, identifier,
+    ))
+    .into()
+}
+
+/// HTTP 400 for a value a documented SERVICE RULE refuses — one the model carries no
+/// constraint trait for — in the construction AWS reports those with
+/// ([`crate::state::service_rule_exception`]): the rule's own sentence over the bare
+/// member it constrains, not a modelled constraint report.
+fn refused_by_rule(violation: &crate::state::ServiceRuleViolation) -> UpdateRuleError {
+    UpdateRuleErrorModeled::ValidationException(crate::state::service_rule_exception(violation))
+        .into()
+}
+
+/// HTTP 409 for an update that conflicts with another rule of the same listener, built
+/// by the shared conflict construction, so `resourceType` is the kind's wire token and
+/// `resourceId` the rule the request conflicts with.
+fn conflict(message: String, resource_id: &str) -> UpdateRuleError {
+    UpdateRuleErrorModeled::ConflictException(crate::state::conflict(
+        crate::state::ResourceKind::Rule,
+        resource_id,
+        message,
+    ))
+    .into()
+}
+
 /// The `UpdateRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -175,18 +217,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRule"))
+        let _ = ctx;
+        // The modelled constraints the boundary CAN check — the identifier patterns,
+        // `priority`'s `@range(1, 2000)`, the match's own traits and `statusCode`'s
+        // range — are refused before this handler runs.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Every identifier is modelled as either the bare id or the resource's ARN, and a
+        // listener is a resource OF its service while a rule is a resource OF its
+        // listener: one naming nothing this store holds under the next is a 404, never an
+        // update applied somewhere else.
+        let Some(service_id) = crate::state::id_from_identifier(
+            &input.service_identifier,
+            crate::state::PREFIX_SERVICE,
+        )
+        .filter(|id| store.services.contains_key(id)) else {
+            return Err(not_found(
+                &input.service_identifier,
+                crate::state::ResourceKind::Service,
+            ));
+        };
+        let Some(listener_id) = crate::state::id_from_identifier(
+            &input.listener_identifier,
+            crate::state::PREFIX_LISTENER,
+        )
+        .filter(|id| {
+            store
+                .listeners
+                .get(id)
+                .is_some_and(|listener| listener.service_id == service_id)
+        }) else {
+            return Err(not_found(
+                &input.listener_identifier,
+                crate::state::ResourceKind::Listener,
+            ));
+        };
+        let Some(rule) = crate::state::id_from_identifier(
+            &input.rule_identifier,
+            crate::state::PREFIX_RULE,
+        )
+        .and_then(|id| store.rules.get(&id))
+        .filter(|rule| rule.listener_id == listener_id)
+        .cloned() else {
+            return Err(not_found(
+                &input.rule_identifier,
+                crate::state::ResourceKind::Rule,
+            ));
+        };
+
+        // "You can't modify a default listener rule. To modify a default listener rule,
+        // use UpdateListener" (this operation's own documentation), so a request naming
+        // the listener's default rule is refused and stores nothing.
+        if rule.is_default {
+            return Err(refused_by_rule(&crate::state::ServiceRuleViolation {
+                member: "ruleIdentifier".to_string(),
+                message: crate::state::DEFAULT_RULE_NOT_MODIFIABLE_MESSAGE.to_string(),
+            }));
+        }
+
+        // A value a documented service rule refuses is refused here the way the create
+        // path refuses it: an update is not a channel for storing an action the service
+        // would not accept.
+        if let Some(violation) = input
+            .action
+            .as_ref()
+            .and_then(|action| crate::state::check_rule_action(action).err())
+        {
+            return Err(refused_by_rule(&violation));
+        }
+
+        // "Each rule for a specific listener must have a unique priority" (the `priority`
+        // member's own documentation; this operation's restates it as "A listener can't
+        // have multiple rules with the same priority"), so a priority another rule of
+        // this listener holds conflicts with that rule's current state. Moving a rule onto
+        // the priority it already holds is no conflict — that rule is this one.
+        if let Some(priority) = input.priority {
+            if let Some(occupant) = store
+                .rule_with_priority(&listener_id, priority)
+                .filter(|occupant| occupant.id != rule.id)
+            {
+                let occupant_id = occupant.id.clone();
+                return Err(conflict(
+                    crate::state::duplicate_priority_message(priority),
+                    &occupant_id,
+                ));
+            }
+        }
+
+        // The supplied members are written onto the stored record; a member the request
+        // omits is left as it was, which is what makes a priority-only update a
+        // re-prioritisation rather than a replacement of the whole rule.
+        let Some(stored) = store.rules.get_mut(&rule.id) else {
+            return Err(not_found(
+                &input.rule_identifier,
+                crate::state::ResourceKind::Rule,
+            ));
+        };
+        // The one write path both update operations take, so a member supplied here and
+        // the same member supplied in a batch entry do the same thing to the record (the
+        // match is stored with its collections materialised, the action with the
+        // documented weight default filled in, and `lastUpdatedAt` moves only when
+        // something changed).
+        let _changed = crate::state::ComAmazonawsVpclatticeMercurycontrolplaneState::apply_rule_update(
+            stored,
+            input.priority,
+            input.r#match.as_ref(),
+            input.action.as_ref(),
+            now,
+        );
+        Ok(output_of(stored))
     }
 }

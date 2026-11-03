@@ -276,6 +276,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             targets.push(target);
         }
 
+        // "You can't modify a default listener rule. To modify a default listener rule,
+        // use UpdateListener" (`UpdateRule`'s own documentation, the rule for an update
+        // whichever path carries it): an entry naming the listener's default rule is
+        // refused for the whole call, exactly as the single-rule path refuses it, so the
+        // batch cannot be the way around a rule the service does not allow. Checked AHEAD
+        // of the action catalog below, in the order the single-rule path checks the two,
+        // so an entry that breaks both is answered with the same sentence by either path.
+        let names_the_default_rule = targets
+            .iter()
+            .flatten()
+            .filter_map(|rule_id| store.rules.get(rule_id))
+            .any(|rule| rule.is_default);
+        if names_the_default_rule {
+            return Err(BatchUpdateRuleErrorModeled::ValidationException(
+                crate::state::service_rule_exception(&crate::state::ServiceRuleViolation {
+                    member: "ruleIdentifier".to_string(),
+                    message: crate::state::DEFAULT_RULE_NOT_MODIFIABLE_MESSAGE.to_string(),
+                }),
+            )
+            .into());
+        }
+
         // A value a documented service rule refuses is refused for the whole call, the
         // way the single-rule path refuses the same value: the batch is a batch of
         // updates, not a channel for storing one the service would not accept.
@@ -357,25 +379,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(rule) = store.rules.get_mut(rule_id) else {
                 continue;
             };
-            let mut changed = false;
-            if let Some(priority) = update.priority {
-                rule.priority = priority;
-                changed = true;
-            }
-            if let Some(r#match) = &update.r#match {
-                rule.r#match = crate::state::normalized_rule_match(r#match);
-                changed = true;
-            }
-            if let Some(action) = &update.action {
-                rule.action = crate::state::normalized_rule_action(action);
-                changed = true;
-            }
-            // An update is an update: a rule this call changed carries this instant as
-            // its `lastUpdatedAt`. An entry that supplies no member changes nothing, so
-            // it leaves the timestamp where it is.
-            if changed {
-                rule.last_updated_at = now;
-            }
+            // The one write path both update operations take; see
+            // `state::ComAmazonawsVpclatticeMercurycontrolplaneState::apply_rule_update`.
+            let _changed =
+                crate::state::ComAmazonawsVpclatticeMercurycontrolplaneState::apply_rule_update(
+                    rule,
+                    update.priority,
+                    update.r#match.as_ref(),
+                    update.action.as_ref(),
+                    now,
+                );
             successful.push(success_of(rule));
         }
 

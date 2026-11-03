@@ -3,8 +3,11 @@
 //! @op CreateListener
 //!
 //! Implemented: resolves the owning service, mints a listener under it, persists it in
-//! [`crate::state::ComAmazonawsVpclatticeMercurycontrolplaneState::listeners`] and
-//! answers from what was stored (`GetListener` reads the same record back).
+//! [`crate::state::ComAmazonawsVpclatticeMercurycontrolplaneState::listeners`] together
+//! with the listener's implicit default rule
+//! ([`crate::state::ComAmazonawsVpclatticeMercurycontrolplaneState::insert_default_rule`])
+//! and answers from what was stored (`GetListener` reads the same record back, and
+//! `ListRules`/`GetRule` read that default rule).
 //!
 //! ## Shape of an operation
 //!
@@ -385,6 +388,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(key) = token {
             store.idempotency_tokens.record(key, id.clone());
         }
+        // "Each listener has a default rule. The default rule is used if no other rules
+        // match" (`defaultAction`'s own documentation), so creating the listener
+        // materialises that rule beside it: `ListRules` and `GetRule` read it out of the
+        // same rule store a created rule goes into, which is why a listener that has had
+        // no rule created on it still reports one. The listener's own answer does not
+        // carry the rule — its output models no rule member — so nothing here is read off
+        // the request.
+        store.insert_default_rule(&record, &region, now);
         store.listeners.insert(id.clone(), record);
         let stored = store
             .listeners

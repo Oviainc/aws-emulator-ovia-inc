@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/batch_update_rule.rs"]
 mod batch_update_rule;
+#[path = "all/default_rule_and_rule_update.rs"]
+mod default_rule_and_rule_update;
 #[path = "all/error_payload_construction.rs"]
 mod error_payload_construction;
 #[path = "all/list_rules.rs"]
