@@ -4924,10 +4924,11 @@ struct AddonCatalogSeed {
 /// of the Amazon EKS User Guide publishes — the ones Amazon EKS builds itself
 /// and the community projects it curates alongside them — with the name a caller
 /// installs each by, the category it is published under, the namespace its
-/// workloads run in, whether it needs IAM permissions of its own, the service
-/// account it runs as with the managed policies the guide recommends for it, and
-/// the keys its own configuration schema declares. They are owned by
-/// [`ADDON_OWNER_AWS`] and published by [`ADDON_PUBLISHER_EKS`].
+/// workloads run in, whether it needs IAM permissions of its own, EVERY service
+/// account it runs as — a driver whose controller and node components both call
+/// AWS carries one per component — with the managed policies the guide
+/// recommends for each, and the keys its own configuration schema declares. They
+/// are owned by [`ADDON_OWNER_AWS`] and published by [`ADDON_PUBLISHER_EKS`].
 ///
 /// This table is what the catalog PUBLISHES, so an add-on missing from it cannot
 /// be discovered or installed at all: a row here is the only way a caller reads
@@ -5100,10 +5101,21 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         default_namespace: ADDON_DEFAULT_NAMESPACE,
         requires_iam_permissions: true,
         required_configuration: &[],
-        pod_identity: &[(
-            "efs-csi-controller-sa",
-            &["arn:aws:iam::aws:policy/service-role/AmazonEFSCSIDriverPolicy"],
-        )],
+        // BOTH of the driver's components call Amazon EFS: the controller
+        // Deployment provisions access points and the node DaemonSet resolves the
+        // mount targets it mounts through, so the catalog carries an entry per
+        // service account the driver runs as — not just the controller's — each
+        // recommending the policy Amazon EKS publishes for the driver.
+        pod_identity: &[
+            (
+                "efs-csi-controller-sa",
+                &["arn:aws:iam::aws:policy/service-role/AmazonEFSCSIDriverPolicy"],
+            ),
+            (
+                "efs-csi-node-sa",
+                &["arn:aws:iam::aws:policy/service-role/AmazonEFSCSIDriverPolicy"],
+            ),
+        ],
         configuration_properties: &[
             ("controller", "object"),
             ("node", "object"),

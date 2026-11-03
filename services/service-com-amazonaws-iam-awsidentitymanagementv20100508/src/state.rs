@@ -5262,7 +5262,8 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ecr:GetAuthorizationToken","ecr:BatchCheckLayerAvailability","ecr:GetDownloadUrlForLayer","ecr:BatchGetImage","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}"#,
     },
     // Recommended by the EKS add-on catalog for the `aws-efs-csi-driver` add-on's
-    // `efs-csi-controller-sa` service account. The conditions are the published
+    // `efs-csi-controller-sa` and `efs-csi-node-sa` service accounts. The conditions
+    // are the published
     // policy's: the driver may create an access point only while tagging it for its
     // cluster, and may tag or delete only an access point already carrying that tag.
     AwsManagedPolicy {

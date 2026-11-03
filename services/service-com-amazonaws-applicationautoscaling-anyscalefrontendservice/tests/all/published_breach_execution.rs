@@ -285,6 +285,30 @@ async fn alarm_state(emulator: &Emulator, alarm_name: &str, case: &str) -> Strin
         .to_string()
 }
 
+/// The state CloudWatch reports for one alarm once it is `wanted`, or once the deadline is up
+/// — so a row whose alarm never reaches that state fails on what it last read.
+///
+/// A just-published datapoint is inside the alarm's evaluation range only once that range has
+/// rolled past it: the range ends one evaluation cadence behind the instant it runs, so which
+/// pass first grades the datapoint depends on where in the alarm's period the publish landed.
+/// Reading the state once a fixed span after the publish therefore races that cadence, which is
+/// why the wait is bounded and polled, the way `just_published_datapoint_grading.rs` in the
+/// CloudWatch crate waits for the grading it asserts.
+async fn awaited_alarm_state(
+    emulator: &Emulator,
+    alarm_name: &str,
+    wanted: &str,
+    case: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + CLOCK_WAIT;
+    let mut last = alarm_state(emulator, alarm_name, case).await;
+    while last != wanted && std::time::Instant::now() < deadline {
+        tokio::time::sleep(CLOCK_POLL).await;
+        last = alarm_state(emulator, alarm_name, case).await;
+    }
+    last
+}
+
 /// Wait for the ECS service's `desiredCount` to reach `expected`, answering what it last read.
 async fn await_desired_count(
     emulator: &Emulator,
@@ -417,11 +441,26 @@ async fn a_published_breach_executes_the_policy_the_alarm_names() {
             );
             // And the alarm really did grade that datapoint: under the `missing` arm an
             // evaluation that decided nothing would report INSUFFICIENT_DATA instead.
-            let state = alarm_state(&emulator, &alarm_name, case).await;
+            let state = awaited_alarm_state(&emulator, &alarm_name, "OK", case).await;
             assert_eq!(
                 state, "OK",
                 "case {case:?}: expected the alarm to grade the published datapoint into OK, \
                  got {state:?}"
+            );
+            // The grading changes nothing about what was owed: with the datapoint graded, the
+            // capacity is still where it was and the log is still empty.
+            let still_held = emulator.ecs_desired_count(cluster, service).await;
+            assert_eq!(
+                still_held, row.capacity,
+                "case {case:?}: expected the ECS desiredCount to stay at {} once the datapoint \
+                 was graded, got {still_held:?}",
+                row.capacity
+            );
+            let listed = activities(&emulator, &resource_id, case).await;
+            assert!(
+                listed.is_empty(),
+                "case {case:?}: expected no scaling activity at all once the datapoint was \
+                 graded, got {listed:?}"
             );
             continue;
         }
@@ -434,7 +473,7 @@ async fn a_published_breach_executes_the_policy_the_alarm_names() {
         );
 
         // The alarm the movement is attributable to reports the state that fired it.
-        let state = alarm_state(&emulator, &alarm_name, case).await;
+        let state = awaited_alarm_state(&emulator, &alarm_name, "ALARM", case).await;
         assert_eq!(
             state, "ALARM",
             "case {case:?}: expected the alarm that executed the policy to report ALARM, \

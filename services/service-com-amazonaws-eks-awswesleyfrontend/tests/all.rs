@@ -31,6 +31,8 @@ mod addon_deletion;
 mod addon_install_outcome;
 #[path = "all/addon_lifecycle.rs"]
 mod addon_lifecycle;
+#[path = "all/addon_pod_identity_catalog.rs"]
+mod addon_pod_identity_catalog;
 #[path = "all/addon_request_validation.rs"]
 mod addon_request_validation;
 #[path = "all/addon_update.rs"]
