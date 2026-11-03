@@ -114,6 +114,10 @@ fn assert_accepted(case: &str, answer: &Answer, arn: &str, name: &str, id: &str)
 }
 
 /// Assert `answer` is the modelled 404 for `identifier`.
+///
+/// The refusal names the resource the identifier addressed by its ARN, which is the one
+/// form every answer about a connector carries (`crate::not_found_message` states that
+/// rule over every identifier form).
 fn assert_not_found(case: &str, answer: &Answer, identifier: &str) {
     assert_eq!(
         answer.status, 404,
@@ -155,8 +159,8 @@ async fn a_repeated_delete_of_a_deleted_connector_is_accepted() {
     for (index, (case, extra_versions, completed)) in cases.iter().enumerate() {
         let router = emulator();
         let name = format!("repeat-{index}");
-        let arn = expected_arn(&name);
         let id = active_connector(&router, &name, &["subnet-0123456789abcdef0"]).await;
+        let arn = expected_arn(&id);
         append_versions(&router, &name, *extra_versions).await;
 
         let first = delete(&router, &name).await;
@@ -221,8 +225,8 @@ async fn a_repeated_delete_of_a_deleted_connector_is_accepted() {
 async fn an_identifier_that_never_named_a_connector_is_still_refused() {
     let router = emulator();
     let name = "short-lived";
-    let arn = expected_arn(name);
     let id = active_connector(&router, name, &["subnet-0123456789abcdef0"]).await;
+    let arn = expected_arn(&id);
     // Two versions, so the connector's last version number is 2.
     append_versions(&router, name, 1).await;
     let accepted = delete(&router, name).await;
@@ -271,8 +275,8 @@ async fn an_identifier_that_never_named_a_connector_is_still_refused() {
 async fn a_repeated_delete_of_a_historical_version_is_accepted() {
     let router = emulator();
     let name = "versions";
-    let arn = expected_arn(name);
     let id = active_connector(&router, name, &["subnet-0123456789abcdef0"]).await;
+    let arn = expected_arn(&id);
     // Versions 1..=4, so there are three historical versions to remove on their own.
     append_versions(&router, name, 3).await;
 
@@ -353,8 +357,8 @@ async fn a_repeated_delete_of_a_historical_version_is_accepted() {
 async fn a_freed_name_rebinds_while_the_old_id_answers_a_repeat_delete() {
     let router = emulator();
     let name = "reused";
-    let arn = expected_arn(name);
     let first_id = active_connector(&router, name, &["subnet-0123456789abcdef0"]).await;
+    let arn = expected_arn(&first_id);
     let accepted = delete(&router, name).await;
     assert_accepted("the first delete", &accepted, &arn, name, &first_id);
     wait_for_the_clock();
@@ -386,9 +390,12 @@ async fn a_freed_name_rebinds_while_the_old_id_answers_a_repeat_delete() {
         at(&by_name.body, "/Id")
     );
 
-    // The dead id is refused by the reporting operations …
+    // The dead id is refused by the reporting operations … and `GetNetworkConnector`,
+    // which REPORTS on a connector, names the resource that id determines (its ARN) where
+    // the acting operations echo the identifier — the rule
+    // `crate::not_found_message` states over every form.
     let dead = get(&router, &first_id).await;
-    assert_not_found("the dead id through Get", &dead, &first_id);
+    assert_not_found("the dead id through Get", &dead, &expected_arn(&first_id));
     let dead_update = update(
         &router,
         &first_id,
@@ -402,10 +409,17 @@ async fn a_freed_name_rebinds_while_the_old_id_answers_a_repeat_delete() {
     let repeated = delete(&router, &first_id).await;
     assert_accepted("the dead id through Delete", &repeated, &arn, name, &first_id);
 
-    // Deleting by NAME now addresses the live connector, which is the one that goes.
+    // Deleting by NAME now addresses the live connector, which is the one that goes — and
+    // it answers under its OWN ARN, whose resource segment is its own Id.
     wait_for_the_clock();
     let live = delete(&router, name).await;
-    assert_accepted("the live connector by name", &live, &arn, name, &second_id);
+    assert_accepted(
+        "the live connector by name",
+        &live,
+        &expected_arn(&second_id),
+        name,
+        &second_id,
+    );
 }
 
 /// RULE 2: the first call taken at or after the instant a transition falls due already

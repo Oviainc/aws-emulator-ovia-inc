@@ -298,12 +298,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ];
         if !deletable.contains(&connector.state.as_str()) {
             return Err(DeleteNetworkConnectorErrorModeled::ResourceConflictException(
-                crate::state::connector_conflict(format!(
-                    "The network connector {} is in {} state; it can be deleted once it is {}",
-                    connector.name,
-                    connector.state,
-                    crate::state::STATE_ACTIVE
-                )),
+                crate::state::delete_refused_in_state(&connector.state),
             )
             .into());
         }

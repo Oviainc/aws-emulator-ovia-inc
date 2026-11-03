@@ -23,6 +23,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The AWS SDK for EC2, driven over the in-process callback
+# (`OperationContext::callback`): a connector's subnets and security groups are
+# EC2's resources, so `CreateNetworkConnector` and `UpdateNetworkConnector`
+# resolve the ones a request names with `DescribeSubnets` /
+# `DescribeSecurityGroups` before they write anything. Only the generated client
+# is needed — the emulator supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
+# The AWS SDK for IAM, over the same callback: the `OperatorRole` a connector is
+# created or updated with is proved assumable and sufficiently privileged against
+# the account's IAM records.
+aws-sdk-iam = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -30,6 +41,13 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The owners of the resources this service RESOLVES, mounted beside it in the
+# test harness: Amazon EC2 holds the account's subnets and security groups, IAM
+# the role Lambda assumes to manage a connector's network interfaces, so the
+# resolution can only be driven end to end with them on the same engine.
+# DEV-ONLY: this crate depends on no other service's crate outside its tests.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true

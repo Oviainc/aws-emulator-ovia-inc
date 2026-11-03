@@ -227,6 +227,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The connector provisions elastic network interfaces in the subnets
+        // the configuration names, carrying the security groups it names, under
+        // the `OperatorRole`: all three are resolved against the services that
+        // own them BEFORE any state is written, so a request naming one the
+        // account does not hold creates nothing.
+        if let Some(refusal) =
+            crate::state::network::unresolved_reference(ctx, &region, &input.configuration).await
+        {
+            return Err(
+                CreateNetworkConnectorErrorModeled::InvalidParameterValueException(refusal).into(),
+            );
+        }
+        if let Some(refusal) = crate::state::network::unusable_operator_role(
+            ctx,
+            &region,
+            input.operator_role.as_deref(),
+        )
+        .await
+        {
+            return Err(
+                CreateNetworkConnectorErrorModeled::InvalidParameterValueException(refusal).into(),
+            );
+        }
+
         // What this request asks for, which is what its `ClientToken` stands
         // for: a later call presenting the same token is a retry only when it
         // asks for the same thing.
@@ -308,7 +332,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_connector_id();
-        let arn = crate::state::connector_arn(&region, &input.name);
+        // The ARN's resource segment is the Id this call just minted, so the
+        // two identity members of every answer about this connector name the
+        // same resource.
+        let arn = crate::state::connector_arn(&region, &id);
         // "A newly created connector starts at version 1."
         let version = 1_i64;
         // "The network connector starts in PENDING state while ENIs are

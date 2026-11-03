@@ -40,9 +40,11 @@ const REGION: &str = "eu-west-1";
 /// here so a wrong account in the implementation fails.
 const ACCOUNT: &str = "000000000000";
 
-/// The unqualified ARN the service must build for a connector named `name`.
-pub(crate) fn expected_arn(name: &str) -> String {
-    format!("arn:aws:lambda:{REGION}:{ACCOUNT}:network-connector:{name}")
+/// The unqualified ARN the service must build for the connector whose `Id` is `id`: the
+/// resource segment of a connector's ARN is the Id the service assigned it, so `Arn` and
+/// `Id` of one answer always name the same resource.
+pub(crate) fn expected_arn(id: &str) -> String {
+    format!("arn:aws:lambda:{REGION}:{ACCOUNT}:network-connector:{id}")
 }
 
 /// One emulator: a router carrying only this service, over one shared engine.
@@ -326,11 +328,17 @@ async fn a_created_connector_is_reported_from_what_was_stored() {
         );
 
         let name = text(request, "/Name");
-        let arn = expected_arn(&name);
+        let id = text(&created.body, "/Id");
+        assert!(
+            !id.is_empty() && id.len() <= 140,
+            "case {case:?}: the service allocates a NetworkConnectorId of 1..140 \
+             characters, got {id:?}"
+        );
+        let arn = expected_arn(&id);
         assert_eq!(
             text(&created.body, "/Arn"),
             arn,
-            "case {case:?}: the ARN must name the connector, the signed region and the \
+            "case {case:?}: the ARN must name the connector's Id, the signed region and the \
              emulator account, got {:?}",
             at(&created.body, "/Arn")
         );
@@ -339,12 +347,6 @@ async fn a_created_connector_is_reported_from_what_was_stored() {
             name,
             "case {case:?}: CreateNetworkConnector must report the stored name, got {:?}",
             at(&created.body, "/Name")
-        );
-        let id = text(&created.body, "/Id");
-        assert!(
-            !id.is_empty() && id.len() <= 140,
-            "case {case:?}: the service allocates a NetworkConnectorId of 1..140 \
-             characters, got {id:?}"
         );
         assert_eq!(
             at(&created.body, "/Version"),
@@ -671,7 +673,7 @@ async fn each_configuration_change_appends_a_version_and_a_no_op_does_not() {
         "the create must succeed, got {} with {:?}",
         created.status, created.body
     );
-    let arn = expected_arn("versioned");
+    let arn = expected_arn(&text(&created.body, "/Id"));
     // An update needs an ACTIVE connector, which the clock owes the new one.
     wait_for_the_clock();
 
@@ -808,7 +810,7 @@ async fn an_identifier_resolves_by_name_id_and_arn() {
     let router = emulator();
     let created = create(&router, minimal_create("resolvable")).await;
     let id = text(&created.body, "/Id");
-    let arn = expected_arn("resolvable");
+    let arn = expected_arn(&id);
 
     let found = vec![
         ("the name", "resolvable".to_string()),
@@ -952,7 +954,7 @@ async fn deleting_removes_the_connector_and_its_versions() {
     let router = emulator();
     let created = create(&router, minimal_create("doomed")).await;
     let id = text(&created.body, "/Id");
-    let arn = expected_arn("doomed");
+    let arn = expected_arn(&id);
     wait_for_the_clock();
 
     // Three versions, so there is a historical version to remove on its own.

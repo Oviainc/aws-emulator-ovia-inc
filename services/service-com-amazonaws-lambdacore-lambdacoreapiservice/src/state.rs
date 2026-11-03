@@ -14,6 +14,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
+pub mod network;
+
 use crate::ops::types::{
     InvalidParameterValueException, NetworkConnectorConfiguration, NetworkConnectorSummary,
     NetworkConnectorVersionSummary, ResourceConflictException, ResourceNotFoundException,
@@ -209,7 +211,7 @@ pub struct NetworkConnector {
     pub name: String,
     /// Minted by [`ComAmazonawsLambdacoreLambdacoreapiserviceState::mint_connector_id`].
     pub id: String,
-    /// The unqualified ARN: `arn:aws:lambda:<region>:<account>:network-connector:<Name>`.
+    /// The unqualified ARN: `arn:aws:lambda:<region>:<account>:network-connector:<Id>`.
     pub arn: String,
     /// One of `NetworkConnectorType`'s values.
     pub connector_type: String,
@@ -367,10 +369,10 @@ pub struct ParsedIdentifier {
 /// colon-separated segment is a version suffix exactly when it is a positive
 /// integer.
 pub fn parse_identifier(identifier: &str) -> ParsedIdentifier {
-    // An ARN's resource part is `network-connector:<name>[:<version>]`; the
+    // An ARN's resource part is `network-connector:<resource>[:<version>]`; the
     // segments before it (partition, region, account) say nothing about which
     // connector is meant in a single-account emulator.
-    let tail = match identifier.split_once(":network-connector:") {
+    let tail = match identifier.split_once(ARN_RESOURCE_INFIX) {
         Some((_, tail)) => tail,
         None => identifier,
     };
@@ -391,6 +393,35 @@ pub fn parse_identifier(identifier: &str) -> ParsedIdentifier {
             version: None,
         },
     }
+}
+
+/// What a connector's ARN carries before the resource it names, which is also what
+/// tells an identifier that IS an ARN from one that is a bare name or id.
+pub const ARN_RESOURCE_INFIX: &str = ":network-connector:";
+
+/// The prefix of every `NetworkConnectorId` this service assigns
+/// ([`ComAmazonawsLambdacoreLambdacoreapiserviceState::mint_connector_id`]).
+pub const CONNECTOR_ID_PREFIX: &str = "nc-";
+
+/// How many hex digits that prefix is followed by.
+const CONNECTOR_ID_DIGITS: usize = 16;
+
+/// Whether `value` has the form of a `NetworkConnectorId` this service ASSIGNS, rather
+/// than of a `NetworkConnectorName` a caller chose.
+///
+/// The two identifier forms overlap as grammars — `NetworkConnectorName` is
+/// `[a-zA-Z0-9_-]{1,64}`, which admits an id's spelling too — so what tells them apart is
+/// the form the SERVICE mints
+/// ([`ComAmazonawsLambdacoreLambdacoreapiserviceState::mint_connector_id`]): `nc-` and
+/// sixteen hex digits. It matters because an id determines the connector's ARN (the ARN's
+/// resource part IS the id) while a name determines nothing of it.
+pub fn names_a_connector_id(value: &str) -> bool {
+    value
+        .strip_prefix(CONNECTOR_ID_PREFIX)
+        .is_some_and(|digits| {
+            digits.len() == CONNECTOR_ID_DIGITS
+                && digits.bytes().all(|digit| digit.is_ascii_hexdigit())
+        })
 }
 
 /// Per-service state for com-amazonaws-lambdacore-lambdacoreapiservice. A handler reaches it through [`service_state`].
@@ -626,9 +657,17 @@ impl ComAmazonawsLambdacoreLambdacoreapiserviceState {
     }
 }
 
-/// The unqualified ARN of the connector named `name`, in `region`.
-pub fn connector_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn("lambda", region, &format!("network-connector:{name}"))
+/// The unqualified ARN of the connector whose `Id` is `id`, in `region`.
+///
+/// `Id` is "the unique identifier for a network connector, assigned by the service at
+/// creation time", and `NetworkConnectorArn`'s resource part is
+/// `network-connector:<resource>`: the resource segment is that Id, so the `Arn` and the
+/// `Id` of one answer always name the same resource and a client can build either from
+/// the other. The Id is therefore minted BEFORE the ARN; a caller that addresses the
+/// connector by name still resolves through [`parse_identifier`] and
+/// [`ComAmazonawsLambdacoreLambdacoreapiserviceState::name_of`].
+pub fn connector_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("lambda", region, &format!("network-connector:{id}"))
 }
 
 /// The region this request was signed for — what a connector ARN names.
@@ -642,14 +681,16 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// connector (or no such version of one).
 ///
 /// The message is BUILT FROM THE REQUEST: `NetworkConnectorIdentifier` is "a
-/// flexible identifier that accepts a network connector ID, name, or ARN", so
-/// the only thing the refusal can name is the identifier the caller supplied —
-/// echoed byte for byte, in whichever of those three forms it arrived, because
-/// that is what lets a caller correlate the refusal with its own request. The
-/// service states it as `Network connector not found: <identifier>`
-/// ([`NOT_FOUND_PREFIX`]), which is the form the recorded service answers, and
-/// no handler words it another way: every identifier-addressed operation
-/// refuses through this one helper.
+/// flexible identifier that accepts a network connector ID, name, or ARN", so an
+/// operation that ACTS on the connector the caller named refuses the value it was
+/// handed — echoed byte for byte, in whichever of those three forms it arrived,
+/// because that is what lets a caller correlate the refusal with its own request.
+/// The service states it as `Network connector not found: <identifier>`
+/// ([`NOT_FOUND_PREFIX`]).
+///
+/// The one operation that words it differently is the one that REPORTS on the
+/// connector, which resolves the identifier to the resource it would have
+/// reported: see [`connector_not_found_resource`].
 pub fn connector_not_found(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         // `Type` is "the exception type", a value no documented rule gives, so
@@ -657,6 +698,30 @@ pub fn connector_not_found(identifier: &str) -> ResourceNotFoundException {
         r#type: None,
         message: Some(format!("{NOT_FOUND_PREFIX}{identifier}")),
     }
+}
+
+/// The same refusal from the operation that REPORTS on a connector
+/// (`GetNetworkConnector`), which names the RESOURCE it was asked to report in the
+/// form every one of its answers carries: the connector's ARN.
+///
+/// Only two of the three identifier forms determine that ARN — an ARN is one
+/// already, and an `Id` IS an ARN's resource part ([`connector_arn`]) — so a
+/// request addressed by id is refused naming the ARN it determines, while a NAME
+/// (which gives no ARN, the resource part being the id a name does not carry) is
+/// stated exactly as supplied, as [`connector_not_found`] states it. A
+/// version-qualified identifier keeps its suffix: the version is part of what was
+/// not found.
+pub fn connector_not_found_resource(region: &str, identifier: &str) -> ResourceNotFoundException {
+    let parsed = parse_identifier(identifier);
+    if identifier.contains(ARN_RESOURCE_INFIX) || !names_a_connector_id(&parsed.key) {
+        return connector_not_found(identifier);
+    }
+    let arn = connector_arn(region, &parsed.key);
+    let addressed = match parsed.version {
+        Some(version) => format!("{arn}:{version}"),
+        None => arn,
+    };
+    connector_not_found(&addressed)
 }
 
 /// What [`connector_not_found`] states before the identifier the request carried.
@@ -685,6 +750,55 @@ pub fn duplicate_connector_name(name: &str) -> ResourceConflictException {
 /// and one the service no longer has to describe.
 pub const TOKEN_PARAMETER_MISMATCH: &str =
     "A request with the same client token but different parameters was already submitted";
+
+/// The `NetworkConnectorState` value `state` as the service SPELLS it in a sentence: the
+/// name of the state rather than the screaming-snake wire value, so each `_`-separated
+/// word is capitalised and the rest lowercased (`PENDING` -> `Pending`, `DELETE_FAILED` ->
+/// `DeleteFailed`).
+fn state_in_words(state: &str) -> String {
+    state
+        .split('_')
+        .map(|word| {
+            let mut characters = word.chars();
+            match characters.next() {
+                Some(first) => {
+                    first.to_uppercase().collect::<String>() + &characters.as_str().to_lowercase()
+                }
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+/// What an update of a connector that is not `ACTIVE` is refused with: "the connector must
+/// be in ACTIVE state to accept updates", which is what `ResourceConflictException` is
+/// modelled for ("for example, attempting to update a connector that is not in ACTIVE
+/// state").
+///
+/// The sentence is BUILT FROM THE RESOURCE: it names the connector by the `Id` the service
+/// assigned it — the identifier every answer about that connector carries, whichever of
+/// the three forms the request addressed it in — and the state it is in, spelled as the
+/// service spells a state's name ([`state_in_words`]), then states the requirement.
+pub fn update_requires_active(id: &str, state: &str) -> ResourceConflictException {
+    connector_conflict(format!(
+        "Network connector {id} is in state {} and cannot be updated. Only {STATE_ACTIVE} \
+         connectors can be updated.",
+        state_in_words(state)
+    ))
+}
+
+/// What a delete of a connector in a state it cannot be deleted from is refused with:
+/// "you can delete connectors in ACTIVE or FAILED states", so a connector in any other
+/// state conflicts with the request.
+///
+/// The sentence names the state the connector is in, as the wire value of
+/// `NetworkConnectorState` spells it, and nothing else: the deletion is refused by the
+/// state of the resource the identifier already named.
+pub fn delete_refused_in_state(state: &str) -> ResourceConflictException {
+    connector_conflict(format!(
+        "Network connector is in {state} state and cannot be deleted"
+    ))
+}
 
 /// The `ResourceConflictException` payload for a reused `ClientToken` whose
 /// parameters are not the ones it was first presented with.
