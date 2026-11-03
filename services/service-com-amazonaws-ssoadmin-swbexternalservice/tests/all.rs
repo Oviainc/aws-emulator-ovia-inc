@@ -121,6 +121,8 @@ mod instance_delete;
 mod instance_describe;
 #[path = "all/instance_encryption_default.rs"]
 mod instance_encryption_default;
+#[path = "all/instance_envelope_view.rs"]
+mod instance_envelope_view;
 #[path = "all/instance_region_addition.rs"]
 mod instance_region_addition;
 #[path = "all/instance_region_removal.rs"]

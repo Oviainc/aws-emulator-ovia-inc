@@ -17,7 +17,27 @@ pub struct DescribeInstanceInput {
     pub instance_arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ssoadmin#DescribeInstanceResponse")]
+/// What `DescribeInstance` reports: the instance's flat members, and the `Instance`
+/// envelope that repeats the instance VIEW beside them.
+///
+/// Member set, order and requiredness of the flat members from
+/// `smithy_query(query="shape",shape="com.amazonaws.ssoadmin#DescribeInstanceResponse")`,
+/// PLUS `Instance` — the structure the service serves and the on-disk model does not
+/// declare, carrying the same instance projection `ListInstances` serves
+/// ([`InstanceMetadata`], `State` included). `#[smithy_macros::smithy(shape = ...)]`
+/// admits EXACTLY the model's member list, so a field with no member behind it cannot be
+/// declared through it; these items are the ones the derive emits — one `M_<MEMBER>`
+/// member schema per member (index = that member's position in the member list), a
+/// `SCHEMA` naming them in that order, the `<SHAPE>_SCHEMA` static and the
+/// `SerializableStruct`/`DeserializableStruct` pair — from a member list this file gives,
+/// so the extra member can be appended to it. The model's own members keep the names,
+/// order and indices the model gives them and `Instance` is appended LAST, so a later
+/// model refresh that declares it only has to move it into place and put the derive back.
+///
+/// Constraint traits (`@length`, `@pattern`) are deliberately absent, as are the XML
+/// layout traits: the validating walk that reads constraints runs on operation INPUTS
+/// only and this shape is output-only, and this service speaks `awsJson1_1`, whose codec
+/// reads neither.
 #[derive(Debug, Clone, Default)]
 pub struct DescribeInstanceOutput {
     pub instance_arn: Option<String>,
@@ -32,6 +52,272 @@ pub struct DescribeInstanceOutput {
     pub regions: Option<Vec<RegionMetadata>>,
     pub encryption_configuration_details: Option<EncryptionConfigurationDetails>,
     pub permission_sets_enabled: Option<bool>,
+    /// The `Instance` envelope: the same instance this response's flat members report,
+    /// as the view `ListInstances` serves — recorded behaviour, not modelled (see the
+    /// note on this structure and on [`InstanceState`]).
+    pub instance: Option<InstanceMetadata>,
+}
+
+impl DescribeInstanceOutput {
+    pub const M_INSTANCE_ARN: ::aws_smithy_schema::Schema =
+        super::shared_types::ssoadmin_member_schema(
+            "com.amazonaws.ssoadmin#DescribeInstanceResponse$InstanceArn",
+            "InstanceArn",
+            ::aws_smithy_schema::ShapeType::String,
+            0,
+        );
+    pub const M_IDENTITY_STORE_ID: ::aws_smithy_schema::Schema =
+        super::shared_types::ssoadmin_member_schema(
+            "com.amazonaws.ssoadmin#DescribeInstanceResponse$IdentityStoreId",
+            "IdentityStoreId",
+            ::aws_smithy_schema::ShapeType::String,
+            1,
+        );
+    pub const M_IDENTITY_STORE_ARN: ::aws_smithy_schema::Schema =
+        super::shared_types::ssoadmin_member_schema(
+            "com.amazonaws.ssoadmin#DescribeInstanceResponse$IdentityStoreArn",
+            "IdentityStoreArn",
+            ::aws_smithy_schema::ShapeType::String,
+            2,
+        );
+    pub const M_OWNER_ACCOUNT_ID: ::aws_smithy_schema::Schema =
+        super::shared_types::ssoadmin_member_schema(
+            "com.amazonaws.ssoadmin#DescribeInstanceResponse$OwnerAccountId",
+            "OwnerAccountId",
+            ::aws_smithy_schema::ShapeType::String,
+            3,
+        );
+    pub const M_NAME: ::aws_smithy_schema::Schema = super::shared_types::ssoadmin_member_schema(
+        "com.amazonaws.ssoadmin#DescribeInstanceResponse$Name",
+        "Name",
+        ::aws_smithy_schema::ShapeType::String,
+        4,
+    );
+    /// `CreatedDate` targets the `Date` timestamp shape, which carries no
+    /// `@timestampFormat`, so it keeps the protocol's default encoding — the derive
+    /// chains no format call either.
+    pub const M_CREATED_DATE: ::aws_smithy_schema::Schema =
+        super::shared_types::ssoadmin_member_schema(
+            "com.amazonaws.ssoadmin#DescribeInstanceResponse$CreatedDate",
+            "CreatedDate",
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            5,
+        );
+    /// `Status` targets the `InstanceStatus` enum, which is string-encoded on the wire —
+    /// the derive classifies an enum member as a string too.
+    pub const M_STATUS: ::aws_smithy_schema::Schema = super::shared_types::ssoadmin_member_schema(
+        "com.amazonaws.ssoadmin#DescribeInstanceResponse$Status",
+        "Status",
+        ::aws_smithy_schema::ShapeType::String,
+        6,
+    );
+    pub const M_STATUS_REASON: ::aws_smithy_schema::Schema =
+        super::shared_types::ssoadmin_member_schema(
+            "com.amazonaws.ssoadmin#DescribeInstanceResponse$StatusReason",
+            "StatusReason",
+            ::aws_smithy_schema::ShapeType::String,
+            7,
+        );
+    pub const M_PRIMARY_REGION: ::aws_smithy_schema::Schema =
+        super::shared_types::ssoadmin_member_schema(
+            "com.amazonaws.ssoadmin#DescribeInstanceResponse$PrimaryRegion",
+            "PrimaryRegion",
+            ::aws_smithy_schema::ShapeType::String,
+            8,
+        );
+    pub const M_REGIONS: ::aws_smithy_schema::Schema =
+        super::shared_types::ssoadmin_member_schema(
+            "com.amazonaws.ssoadmin#DescribeInstanceResponse$Regions",
+            "Regions",
+            ::aws_smithy_schema::ShapeType::List,
+            9,
+        );
+    pub const M_ENCRYPTION_CONFIGURATION_DETAILS: ::aws_smithy_schema::Schema =
+        super::shared_types::ssoadmin_member_schema(
+            "com.amazonaws.ssoadmin#DescribeInstanceResponse$EncryptionConfigurationDetails",
+            "EncryptionConfigurationDetails",
+            ::aws_smithy_schema::ShapeType::Structure,
+            10,
+        );
+    pub const M_PERMISSION_SETS_ENABLED: ::aws_smithy_schema::Schema =
+        super::shared_types::ssoadmin_member_schema(
+            "com.amazonaws.ssoadmin#DescribeInstanceResponse$PermissionSetsEnabled",
+            "PermissionSetsEnabled",
+            ::aws_smithy_schema::ShapeType::Boolean,
+            11,
+        );
+    /// The member the model does not declare, appended last.
+    pub const M_INSTANCE: ::aws_smithy_schema::Schema =
+        super::shared_types::ssoadmin_member_schema(
+            "com.amazonaws.ssoadmin#DescribeInstanceResponse$Instance",
+            "Instance",
+            ::aws_smithy_schema::ShapeType::Structure,
+            12,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.ssoadmin#DescribeInstanceResponse",
+            "com.amazonaws.ssoadmin",
+            "DescribeInstanceResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_INSTANCE_ARN,
+            &Self::M_IDENTITY_STORE_ID,
+            &Self::M_IDENTITY_STORE_ARN,
+            &Self::M_OWNER_ACCOUNT_ID,
+            &Self::M_NAME,
+            &Self::M_CREATED_DATE,
+            &Self::M_STATUS,
+            &Self::M_STATUS_REASON,
+            &Self::M_PRIMARY_REGION,
+            &Self::M_REGIONS,
+            &Self::M_ENCRYPTION_CONFIGURATION_DETAILS,
+            &Self::M_PERMISSION_SETS_ENABLED,
+            &Self::M_INSTANCE,
+        ],
+    );
+}
+
+pub static DESCRIBE_INSTANCE_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &DescribeInstanceOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for DescribeInstanceOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // Every member is optional, so each one is written only when the instance holds
+        // it — the derive's `is_option` split.
+        if let ::std::option::Option::Some(value) = self.instance_arn.as_ref() {
+            s.write_string(&Self::M_INSTANCE_ARN, value.as_str())?;
+        }
+        if let ::std::option::Option::Some(value) = self.identity_store_id.as_ref() {
+            s.write_string(&Self::M_IDENTITY_STORE_ID, value.as_str())?;
+        }
+        if let ::std::option::Option::Some(value) = self.identity_store_arn.as_ref() {
+            s.write_string(&Self::M_IDENTITY_STORE_ARN, value.as_str())?;
+        }
+        if let ::std::option::Option::Some(value) = self.owner_account_id.as_ref() {
+            s.write_string(&Self::M_OWNER_ACCOUNT_ID, value.as_str())?;
+        }
+        if let ::std::option::Option::Some(value) = self.name.as_ref() {
+            s.write_string(&Self::M_NAME, value.as_str())?;
+        }
+        if let ::std::option::Option::Some(value) = self.created_date.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_DATE, value)?;
+        }
+        if let ::std::option::Option::Some(value) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, value.as_str())?;
+        }
+        if let ::std::option::Option::Some(value) = self.status_reason.as_ref() {
+            s.write_string(&Self::M_STATUS_REASON, value.as_str())?;
+        }
+        if let ::std::option::Option::Some(value) = self.primary_region.as_ref() {
+            s.write_string(&Self::M_PRIMARY_REGION, value.as_str())?;
+        }
+        if let ::std::option::Option::Some(value) = self.regions.as_ref() {
+            // A structure element is written against the ELEMENT shape's own schema, as
+            // the derive does, so a codec that names elements names `RegionMetadata`.
+            s.write_list(&Self::M_REGIONS, &|sl| {
+                for region in value.iter() {
+                    sl.write_struct(&RegionMetadata::SCHEMA, region)?;
+                }
+                Ok(())
+            })?;
+        }
+        if let ::std::option::Option::Some(value) = self.encryption_configuration_details.as_ref()
+        {
+            s.write_struct(&Self::M_ENCRYPTION_CONFIGURATION_DETAILS, value)?;
+        }
+        if let ::std::option::Option::Some(value) = self.permission_sets_enabled.as_ref() {
+            s.write_boolean(&Self::M_PERMISSION_SETS_ENABLED, *value)?;
+        }
+        if let ::std::option::Option::Some(value) = self.instance.as_ref() {
+            s.write_struct(&Self::M_INSTANCE, value)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for DescribeInstanceOutput {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut instance_arn = ::std::option::Option::None;
+        let mut identity_store_id = ::std::option::Option::None;
+        let mut identity_store_arn = ::std::option::Option::None;
+        let mut owner_account_id = ::std::option::Option::None;
+        let mut name = ::std::option::Option::None;
+        let mut created_date = ::std::option::Option::None;
+        let mut status = ::std::option::Option::None;
+        let mut status_reason = ::std::option::Option::None;
+        let mut primary_region = ::std::option::Option::None;
+        let mut regions = ::std::option::Option::None;
+        let mut encryption_configuration_details = ::std::option::Option::None;
+        let mut permission_sets_enabled = ::std::option::Option::None;
+        let mut instance = ::std::option::Option::None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => instance_arn = Some(d.read_string(member)?),
+                Some(1) => identity_store_id = Some(d.read_string(member)?),
+                Some(2) => identity_store_arn = Some(d.read_string(member)?),
+                Some(3) => owner_account_id = Some(d.read_string(member)?),
+                Some(4) => name = Some(d.read_string(member)?),
+                Some(5) => created_date = Some(d.read_timestamp(member)?),
+                Some(6) => status = Some(d.read_string(member)?),
+                Some(7) => status_reason = Some(d.read_string(member)?),
+                Some(8) => primary_region = Some(d.read_string(member)?),
+                Some(9) => {
+                    let mut read: Vec<RegionMetadata> = Vec::new();
+                    let mut position = 0usize;
+                    d.read_list(member, &mut |dl| {
+                        position += 1;
+                        read.push(
+                            <RegionMetadata as ::aws_smithy_schema_server::DeserializableStruct>
+                                ::deserialize(dl)?,
+                        );
+                        Ok(())
+                    })
+                    .map_err(|error| {
+                        ::aws_smithy_schema_server::within_list_element(error, position)
+                    })?;
+                    regions = Some(read);
+                }
+                Some(10) => {
+                    encryption_configuration_details = Some(
+                        <EncryptionConfigurationDetails
+                            as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    );
+                }
+                Some(11) => permission_sets_enabled = Some(d.read_boolean(member)?),
+                Some(12) => {
+                    instance = Some(
+                        <InstanceMetadata as ::aws_smithy_schema_server::DeserializableStruct>
+                            ::deserialize(d)?,
+                    );
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            instance_arn,
+            identity_store_id,
+            identity_store_arn,
+            owner_account_id,
+            name,
+            created_date,
+            status,
+            status_reason,
+            primary_region,
+            regions,
+            encryption_configuration_details,
+            permission_sets_enabled,
+            instance,
+        })
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ssoadmin#EncryptionConfigurationDetails")]
@@ -42,4 +328,3 @@ pub struct EncryptionConfigurationDetails {
     pub encryption_status: Option<String>,
     pub encryption_status_reason: Option<String>,
 }
-

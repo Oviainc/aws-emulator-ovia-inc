@@ -23,6 +23,13 @@
 //! default ([`crate::state::EncryptionConfigurationRecord::aws_owned_default`]) until an
 //! `UpdateInstance` replaces that configuration with a customer managed key.
 //!
+//! Beside those flat members the response carries the `Instance` ENVELOPE: the same
+//! instance again, as the view `ListInstances` serves for it
+//! ([`crate::state::Instance::to_metadata`]), `State` included — recorded behaviour the
+//! on-disk model does not declare, which is why that member's schema and codec are
+//! hand-written (see [`super::types::DescribeInstanceOutput`]). Both views are projected
+//! from the one instance record this handler read, so they cannot disagree.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -259,6 +266,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // organization instance, and an account instance serves none of that surface
             // until an `UpdateInstance` enables them on it.
             permission_sets_enabled: Some(instance.permission_sets_enabled),
+            // The `Instance` envelope, built from the SAME instance record the flat
+            // members above come from — the one projection `ListInstances` serves, so a
+            // client that reads the lifecycle out of `Instance.State` and one that reads
+            // it out of `Status` cannot be told two different things about one instance.
+            instance: Some(instance.to_metadata()),
         })
     }
 }
