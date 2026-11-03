@@ -6502,7 +6502,7 @@ const SECONDS_PER_HOUR: f64 = 3600.0;
 /// the factors AWS publishes for Reserved Instance size flexibility — one `large` is
 /// four units, one `xlarge` eight, and so on — and they are what makes a bigger size
 /// of one family cost proportionally more in [`on_demand_hourly_price`].
-const SIZE_NORMALIZATION_FACTORS: [(&str, f64); 15] = [
+const SIZE_NORMALIZATION_FACTORS: [(&str, f64); 17] = [
     ("nano", 0.25),
     ("micro", 0.5),
     ("small", 1.0),
@@ -6510,7 +6510,9 @@ const SIZE_NORMALIZATION_FACTORS: [(&str, f64); 15] = [
     ("large", 4.0),
     ("xlarge", 8.0),
     ("2xlarge", 16.0),
+    ("3xlarge", 24.0),
     ("4xlarge", 32.0),
+    ("6xlarge", 48.0),
     ("8xlarge", 64.0),
     ("9xlarge", 72.0),
     ("10xlarge", 80.0),
@@ -6892,9 +6894,9 @@ const GRAVITON_SINCE_ELASTICSEARCH: (u32, u32) = (7, 9);
 const OPENSEARCH_OPTIMIZED_SINCE: (u32, u32) = (2, 11);
 
 /// The OpenSearch release the SECOND OpenSearch-optimized generation is offered from:
-/// a later family of the same line, so it is offered from a later release than
+/// later families of the same line, so they are offered from a later release than
 /// [`OPENSEARCH_OPTIMIZED_SINCE`] and, like it, on no Elasticsearch release. It is the
-/// one family the recorded catalogs of two OpenSearch releases differ by, which is what
+/// generation the recorded catalogs of two OpenSearch releases differ by, which is what
 /// fixes the gate at a release rather than at the engine.
 const OPENSEARCH_OPTIMIZED_GEN2_SINCE: (u32, u32) = (2, 17);
 
@@ -6912,7 +6914,7 @@ const OPENSEARCH_OPTIMIZED_GEN2_SINCE: (u32, u32) = (2, 17);
 /// two OpenSearch releases show.
 const SEVENTH_GENERATION_INTEL_SINCE_OPENSEARCH: (u32, u32) = (2, 13);
 
-/// The OpenSearch release the Graviton4 compute family is offered from — see
+/// The OpenSearch release the Graviton4 families are offered from — see
 /// [`SEVENTH_GENERATION_INTEL_SINCE_OPENSEARCH`] for what this gate fixes and what in
 /// it is the emulator's own statement.
 const GRAVITON4_SINCE_OPENSEARCH: (u32, u32) = (2, 15);
@@ -7042,6 +7044,14 @@ fn catalog_rank(entry: &CatalogFamily) -> (u8, &'static str) {
 /// carries every value of the modelled enum and the current generations the service's
 /// answers add to it.
 ///
+/// The current generations are the ones the service's OWN accepted-value list reports —
+/// the list its refusal of an unknown instance type enumerates, which is the service's
+/// record of the types it accepts and carries families the checked-in enum does not:
+/// the seventh-generation Intel families, the Graviton3 and Graviton4 families, the
+/// dense-storage ones, and the second OpenSearch-optimized generation. A family is in
+/// this table because that list reports it, never because a release's listing happened
+/// to show it.
+///
 /// What is NOT published anywhere machine-readable, and is therefore the emulator's own
 /// statement of published content exactly as [`CLASS_HOURLY_RATE_PER_UNIT`] and
 /// [`MAXIMUM_DATA_NODE_COUNT`] are: the sizes each family is offered in, and the engine
@@ -7057,6 +7067,22 @@ fn catalog_rank(entry: &CatalogFamily) -> (u8, &'static str) {
 /// which [`publishes_every_modelled_instance_type`] holds.
 const INSTANCE_TYPE_CATALOG: &[CatalogFamily] = &[
     // General purpose.
+    CatalogFamily {
+        family: "m8g",
+        instance_types: &[
+            "m8g.medium.search",
+            "m8g.large.search",
+            "m8g.xlarge.search",
+            "m8g.2xlarge.search",
+            "m8g.4xlarge.search",
+            "m8g.8xlarge.search",
+            "m8g.12xlarge.search",
+            "m8g.16xlarge.search",
+            "m8g.24xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::SinceOpenSearch(GRAVITON4_SINCE_OPENSEARCH),
+    },
     CatalogFamily {
         family: "m7i",
         instance_types: &[
@@ -7123,6 +7149,21 @@ const INSTANCE_TYPE_CATALOG: &[CatalogFamily] = &[
     },
     // Compute optimized.
     CatalogFamily {
+        family: "c7i",
+        instance_types: &[
+            "c7i.large.search",
+            "c7i.xlarge.search",
+            "c7i.2xlarge.search",
+            "c7i.4xlarge.search",
+            "c7i.8xlarge.search",
+            "c7i.12xlarge.search",
+            "c7i.16xlarge.search",
+            "c7i.24xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::SinceOpenSearch(SEVENTH_GENERATION_INTEL_SINCE_OPENSEARCH),
+    },
+    CatalogFamily {
         family: "c8g",
         instance_types: &[
             "c8g.large.search",
@@ -7175,7 +7216,56 @@ const INSTANCE_TYPE_CATALOG: &[CatalogFamily] = &[
         roles: ROLES_DATA_AND_MASTER,
         releases: OfferedReleases::Every,
     },
-    // Memory optimized.
+    // Memory optimized. A `d` suffix names the sub-family whose data sits on storage
+    // built into the instance ([`INSTANCE_STORAGE_FAMILIES`]) rather than on an
+    // attached volume; it serves the same roles as the family it belongs to.
+    CatalogFamily {
+        family: "r8g",
+        instance_types: &[
+            "r8g.medium.search",
+            "r8g.large.search",
+            "r8g.xlarge.search",
+            "r8g.2xlarge.search",
+            "r8g.4xlarge.search",
+            "r8g.8xlarge.search",
+            "r8g.12xlarge.search",
+            "r8g.16xlarge.search",
+            "r8g.24xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::SinceOpenSearch(GRAVITON4_SINCE_OPENSEARCH),
+    },
+    CatalogFamily {
+        family: "r8gd",
+        instance_types: &[
+            "r8gd.medium.search",
+            "r8gd.large.search",
+            "r8gd.xlarge.search",
+            "r8gd.2xlarge.search",
+            "r8gd.4xlarge.search",
+            "r8gd.8xlarge.search",
+            "r8gd.12xlarge.search",
+            "r8gd.16xlarge.search",
+            "r8gd.24xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::SinceOpenSearch(GRAVITON4_SINCE_OPENSEARCH),
+    },
+    CatalogFamily {
+        family: "r7gd",
+        instance_types: &[
+            "r7gd.medium.search",
+            "r7gd.large.search",
+            "r7gd.xlarge.search",
+            "r7gd.2xlarge.search",
+            "r7gd.4xlarge.search",
+            "r7gd.8xlarge.search",
+            "r7gd.12xlarge.search",
+            "r7gd.16xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::SinceElasticsearch(GRAVITON_SINCE_ELASTICSEARCH),
+    },
     CatalogFamily {
         family: "r7i",
         instance_types: &[
@@ -7259,6 +7349,34 @@ const INSTANCE_TYPE_CATALOG: &[CatalogFamily] = &[
     // Storage optimized: an instance of one holds the domain's data on storage built
     // into it, and a coordinator node holds none, so it is not provisioned on one.
     CatalogFamily {
+        family: "i8ge",
+        instance_types: &[
+            "i8ge.large.search",
+            "i8ge.xlarge.search",
+            "i8ge.2xlarge.search",
+            "i8ge.3xlarge.search",
+            "i8ge.6xlarge.search",
+            "i8ge.12xlarge.search",
+            "i8ge.18xlarge.search",
+            "i8ge.24xlarge.search",
+        ],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::SinceOpenSearch(GRAVITON4_SINCE_OPENSEARCH),
+    },
+    CatalogFamily {
+        family: "im4gn",
+        instance_types: &[
+            "im4gn.large.search",
+            "im4gn.xlarge.search",
+            "im4gn.2xlarge.search",
+            "im4gn.4xlarge.search",
+            "im4gn.8xlarge.search",
+            "im4gn.16xlarge.search",
+        ],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::SinceElasticsearch(GRAVITON_SINCE_ELASTICSEARCH),
+    },
+    CatalogFamily {
         family: "i3",
         instance_types: &[
             "i3.large.search",
@@ -7289,6 +7407,36 @@ const INSTANCE_TYPE_CATALOG: &[CatalogFamily] = &[
         releases: OfferedReleases::Every,
     },
     // OpenSearch optimized.
+    CatalogFamily {
+        family: "om2",
+        instance_types: &[
+            "om2.medium.search",
+            "om2.large.search",
+            "om2.xlarge.search",
+            "om2.2xlarge.search",
+            "om2.4xlarge.search",
+            "om2.8xlarge.search",
+            "om2.12xlarge.search",
+            "om2.16xlarge.search",
+        ],
+        roles: ROLES_DATA_ONLY,
+        releases: OfferedReleases::SinceOpenSearch(OPENSEARCH_OPTIMIZED_GEN2_SINCE),
+    },
+    CatalogFamily {
+        family: "or2",
+        instance_types: &[
+            "or2.medium.search",
+            "or2.large.search",
+            "or2.xlarge.search",
+            "or2.2xlarge.search",
+            "or2.4xlarge.search",
+            "or2.8xlarge.search",
+            "or2.12xlarge.search",
+            "or2.16xlarge.search",
+        ],
+        roles: ROLES_DATA_ONLY,
+        releases: OfferedReleases::SinceOpenSearch(OPENSEARCH_OPTIMIZED_GEN2_SINCE),
+    },
     CatalogFamily {
         family: "oi2",
         instance_types: &[
@@ -7552,7 +7700,9 @@ pub const LIMIT_DATA_NODES_WITHOUT_MASTER: &str = "MaximumNumberOfDataNodesWitho
 /// The instance families whose data sits on storage built into the instance rather than
 /// on an attached volume, so the only storage type they publish is
 /// [`STORAGE_TYPE_INSTANCE`].
-const INSTANCE_STORAGE_FAMILIES: [&str; 5] = ["d2", "i2", "i3", "r3", "r6gd"];
+const INSTANCE_STORAGE_FAMILIES: [&str; 9] = [
+    "d2", "i2", "i3", "i8ge", "im4gn", "r3", "r6gd", "r7gd", "r8gd",
+];
 
 /// The smallest EBS volume, in GiB, every sub-type publishes — the floor a volume size
 /// is below rather than simply smaller than, whatever the instance type.

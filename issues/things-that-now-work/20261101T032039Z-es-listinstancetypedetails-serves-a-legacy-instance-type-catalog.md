@@ -53,3 +53,41 @@ The specific type names, family mixes and index counts above are this recording'
 2. Replay fixture esdef-list-instance-type-details-max-results-ignored step task#1 and compare $.InstanceTypeDetails[0] - the page size matches but the entry is from the legacy catalog.
 3. Replay fixture opensearch-domain-version-capacity-and-software-update-management step task#5 and diff InstanceTypeDetails the same way.
 4. All three steps must pass before this issue is closed.
+
+## Resolution
+
+Fixed: the catalog DATA behind the reader. The listing for a release is the catalog the
+service publishes for it, so it carries every current-generation family the service
+accepts an instance type of — not only the families the checked-in
+`OpenSearchPartitionInstanceType` snapshot enumerates. `INSTANCE_TYPE_CATALOG` in
+`services/service-com-amazonaws-opensearch-amazonopensearchservice/src/state.rs` now
+also publishes the families the service's own accepted-value list reports beyond that
+enum: the seventh-generation Intel compute family (`c7i` beside `m7i`/`r7i`), the
+Graviton4 families (`m8g`, `r8g`, `r8gd`, `i8ge` beside `c8g`), the Graviton
+dense-storage families (`im4gn`, `r7gd`) and the second OpenSearch-optimized generation
+(`om2`, `or2` beside `oi2`) — 73 instance types the listing previously omitted, each
+with the node roles an instance of its family serves, the release its family is offered
+from, its instance-storage kind and its size ladder. Every reader of an instance type
+(the listing, the limit catalog, the cluster-configuration validation) reads that one
+table, so none of them can disagree about which types exist. Held by
+`tests/all/current_generation_instance_types.rs`; `tests/all/instance_type_catalog.rs`
+gained the two size tokens the dense-storage ladder adds and the two
+OpenSearch-optimized families, so its rules stay stated over the whole catalog.
+
+Declined, as in 20261030T001859Z: the ORDER the catalog is published in, which is what
+the replay key still reports. `com.amazonaws.opensearch#InstanceTypeDetailsList` is a
+bare list with no ordering trait and no documented order, and the recorded orders differ
+between recordings of the same operation — one leads with `m7i.2xlarge.search` and
+places `c8g.12xlarge.search`, `oi2.8xlarge.search`, `r7i.12xlarge.search` at indices
+2, 3, 4, another has `r7i.12xlarge.search` at 3 and `c8g.8xlarge.search` at 4, and a
+third leads with `r5.large.search`. It is neither the modelled value set's order nor a
+sort of family, generation, size or name, so it is the per-run iteration order of the
+service's own collection rather than published content; writing those positions in would
+be a memorised prefix, not a rule. The catalog is published in the generation grouping
+AWS's supported-instance-types documentation lists (`state::catalog_rank`).
+
+Declined: `AvailabilityZones` on an entry of a request that did not ask for zones. The
+member is modelled optional, `restJson1` does not distinguish an absent member from an
+explicit `null`, and the schema serializer omits a `None` member, so there is no value a
+client reads differently. The zones are reported exactly when `retrieveAZs` asks for
+them, which is also what the service's own refusal of an AZ read without that flag says.

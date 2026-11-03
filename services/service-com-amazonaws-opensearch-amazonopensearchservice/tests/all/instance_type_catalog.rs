@@ -70,7 +70,7 @@ const VERSIONS: [&str; 12] = [
 /// sizes AWS publishes normalization factors for — `nano` is a quarter of a `small`,
 /// a `large` four of them, and each `Nxlarge` N times an `xlarge` — which is the order
 /// a family's types are published in.
-const SIZES_SMALLEST_FIRST: [&str; 15] = [
+const SIZES_SMALLEST_FIRST: [&str; 17] = [
     "nano",
     "micro",
     "small",
@@ -78,7 +78,9 @@ const SIZES_SMALLEST_FIRST: [&str; 15] = [
     "large",
     "xlarge",
     "2xlarge",
+    "3xlarge",
     "4xlarge",
+    "6xlarge",
     "8xlarge",
     "9xlarge",
     "10xlarge",
@@ -99,7 +101,7 @@ const WARM_FAMILY: &str = "ultrawarm1";
 
 /// The families whose instances hold the domain's data and are never master-eligible:
 /// the OpenSearch-optimized ones.
-const DATA_ONLY_FAMILIES: [&str; 2] = ["oi2", "or1"];
+const DATA_ONLY_FAMILIES: [&str; 4] = ["oi2", "om2", "or1", "or2"];
 
 /// The families neither encryption at rest nor node-to-node encryption is available
 /// on, whatever the version.
