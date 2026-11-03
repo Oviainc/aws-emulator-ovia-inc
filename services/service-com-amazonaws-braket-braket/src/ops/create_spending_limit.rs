@@ -211,17 +211,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         // A period whose end does not follow its start covers no time at all, so there
-        // is no window for a limit to be active over.
-        if let Some(period) = input.time_period.as_ref() {
-            let start = crate::state::date_time_as_nanos(&period.start_at);
-            let end = crate::state::date_time_as_nanos(&period.end_at);
-            if end <= start {
-                return Err(refuse(format!(
-                    "timePeriod is invalid: endAt ({}) must be after startAt ({})",
-                    period.end_at.secs(),
-                    period.start_at.secs()
-                )));
-            }
+        // is no window for a limit to be active over — the rule every door that takes a
+        // `TimePeriod` holds its caller to.
+        if let Some(message) = input
+            .time_period
+            .as_ref()
+            .and_then(crate::state::time_period_refusal)
+        {
+            return Err(refuse(message));
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

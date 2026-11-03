@@ -42,10 +42,10 @@ const REGION: &str = "eu-west-1";
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// The status Amazon Braket answers a created spending limit with.
-const CREATED: u16 = 200;
+pub(crate) const CREATED: u16 = 200;
 
 /// `POST /spending-limit`.
-async fn create_limit(braket: &Braket, body: Value) -> Reply {
+pub(crate) async fn create_limit(braket: &Braket, body: Value) -> Reply {
     braket.call("POST", "/spending-limit", Some(body)).await
 }
 
@@ -55,7 +55,7 @@ async fn search_limits(braket: &Braket, body: Value) -> Reply {
 }
 
 /// The `spendingLimits` list of a successful search.
-async fn limits_on(braket: &Braket, device_arn: &str) -> Vec<Value> {
+pub(crate) async fn limits_on(braket: &Braket, device_arn: &str) -> Vec<Value> {
     let reply = search_limits(
         braket,
         json!({
@@ -78,7 +78,7 @@ async fn limits_on(braket: &Braket, device_arn: &str) -> Vec<Value> {
 }
 
 /// The summary carrying `arn`, from a search of its device.
-async fn limit_by_arn(braket: &Braket, device_arn: &str, arn: &str) -> Value {
+pub(crate) async fn limit_by_arn(braket: &Braket, device_arn: &str, arn: &str) -> Value {
     limits_on(braket, device_arn)
         .await
         .into_iter()
@@ -87,7 +87,7 @@ async fn limit_by_arn(braket: &Braket, device_arn: &str, arn: &str) -> Value {
 }
 
 /// A `CreateSpendingLimit` body with the required members filled in.
-fn limit_body(client_token: &str, device_arn: &str, amount: &str) -> Value {
+pub(crate) fn limit_body(client_token: &str, device_arn: &str, amount: &str) -> Value {
     json!({
         "clientToken": client_token,
         "deviceArn": device_arn,
@@ -96,7 +96,7 @@ fn limit_body(client_token: &str, device_arn: &str, amount: &str) -> Value {
 }
 
 /// Seconds since the epoch, as `TimePeriod`'s `epoch-seconds` members carry.
-fn now_epoch() -> i64 {
+pub(crate) fn now_epoch() -> i64 {
     i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -107,12 +107,12 @@ fn now_epoch() -> i64 {
 }
 
 /// A `TimePeriod` JSON object.
-fn period(start: i64, end: i64) -> Value {
+pub(crate) fn period(start: i64, end: i64) -> Value {
     json!({ "startAt": start, "endAt": end })
 }
 
 /// The epoch-seconds member of a reported `TimePeriod`.
-fn period_second(limit: &Value, name: &str) -> f64 {
+pub(crate) fn period_second(limit: &Value, name: &str) -> f64 {
     limit
         .get("timePeriod")
         .and_then(|p| p.get(name))
@@ -144,7 +144,7 @@ async fn published_price(braket: &Braket, device_arn: &str) -> (f64, String) {
 }
 
 /// The ARN of a device the inventory publishes with `device_type` and `status`.
-async fn a_device(braket: &Braket, device_type: &str, status: &str) -> String {
+pub(crate) async fn a_device(braket: &Braket, device_type: &str, status: &str) -> String {
     let inventory = braket.inventory().await;
     let device = inventory
         .iter()

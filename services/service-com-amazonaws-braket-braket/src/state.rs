@@ -1642,6 +1642,27 @@ pub fn device_not_found_in_region(device_arn: &str, region: &str) -> String {
     )
 }
 
+/// How a door that takes a `TimePeriod` refuses one that covers no time at all, or
+/// `None` when the window is well formed.
+///
+/// `TimePeriod` is a window with a required start and a required end
+/// (`smithy_query(query="shape", shape="TimePeriod")`), so a period whose end does not
+/// follow its start is no window: there is no span for anything to be active over. The
+/// rule holds wherever this service takes a `TimePeriod`, so every door that takes one
+/// words it from here, with the two instants the REQUEST carried.
+#[must_use]
+pub fn time_period_refusal(period: &TimePeriod) -> Option<String> {
+    let start = date_time_as_nanos(&period.start_at);
+    let end = date_time_as_nanos(&period.end_at);
+    (end <= start).then(|| {
+        format!(
+            "timePeriod is invalid: endAt ({}) must be after startAt ({})",
+            period.end_at.secs(),
+            period.start_at.secs()
+        )
+    })
+}
+
 /// A `SystemTime` as the modelled `Timestamp` the wire carries.
 ///
 /// The conversion is deterministic — one instant always renders to the same
