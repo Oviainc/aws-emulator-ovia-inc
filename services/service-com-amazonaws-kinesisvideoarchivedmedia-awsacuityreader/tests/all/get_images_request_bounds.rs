@@ -9,18 +9,9 @@
 
 use crate::get_images_generation::{
     harness, image_bytes, images, producer_secs, reported, request, with, EMPTY_STREAM,
-    FRAME_HEIGHT, FRAME_WIDTH, IMAGES_STREAM, MAX_WIDTH_PIXELS, NO_FRAGMENTS, WINDOW_TOO_WIDE,
+    FRAME_HEIGHT, FRAME_WIDTH, IMAGES_STREAM, INCOMPLETE_RESIZE, INVALID_ARGUMENT,
+    MAX_HEIGHT_PIXELS, MAX_WIDTH_PIXELS, NO_FRAGMENTS, WINDOW_TOO_WIDE,
 };
-
-/// The sentence a request naming only one of the two output sides is refused with.
-const INCOMPLETE_RESIZE: &str = "Height and width for the images need to be provided or none.";
-
-/// The code a refused request bound carries (`InvalidArgumentException`, HTTP 400).
-const INVALID_ARGUMENT: &str = "InvalidArgumentException";
-
-/// The largest `HeightPixels` the model admits (`HeightPixels` range 1..2160), so a row
-/// sits on a published bound rather than on a number picked at random.
-const MAX_HEIGHT_PIXELS: u32 = 2_160;
 
 /// How many seconds past the documented 300-second window a row has to reach to break
 /// that bound.

@@ -72,9 +72,16 @@ const TALL_FRAME_HEIGHT: u32 = 2_048;
 
 /// The largest `WidthPixels` the model admits (`WidthPixels` range 1..3840).
 pub(crate) const MAX_WIDTH_PIXELS: u32 = 3_840;
+/// The largest `HeightPixels` the model admits (`HeightPixels` range 1..2160).
+pub(crate) const MAX_HEIGHT_PIXELS: u32 = 2_160;
 
 /// The refusal a window the archive holds no fragment in is answered with.
 pub(crate) const NO_FRAGMENTS: &str = "No fragments found in the stream for the GetImages request.";
+/// The refusal a request naming only ONE of the two output sides is answered with.
+pub(crate) const INCOMPLETE_RESIZE: &str =
+    "Height and width for the images need to be provided or none.";
+/// The code every refused request bound carries (`InvalidArgumentException`, HTTP 400).
+pub(crate) const INVALID_ARGUMENT: &str = "InvalidArgumentException";
 /// The refusal a window that does not run forwards is answered with.
 const RANGE_ORDER: &str = "StartTimestamp must be before EndTimestamp.";
 /// The refusal a window wider than the documented 300 seconds is answered with.
