@@ -131,6 +131,8 @@ mod listing_encoding_type;
 mod listing_optional_members;
 #[path = "all/multipart_checksum_type.rs"]
 mod multipart_checksum_type;
+#[path = "all/multipart_part_checksums.rs"]
+mod multipart_part_checksums;
 #[path = "all/multipart_part_copy.rs"]
 mod multipart_part_copy;
 #[path = "all/multipart_part_upload.rs"]

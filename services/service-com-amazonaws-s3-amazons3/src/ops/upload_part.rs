@@ -5,8 +5,18 @@
 //! IMPLEMENTED: this is the part-write of the multipart upload loop — it records the
 //! request's bytes as the part its `PartNumber` addresses on the upload
 //! `CreateMultipartUpload` initiated ([`crate::state::MultipartUpload`]), answers the
-//! part's own entity tag, and refuses an upload this emulator does not have in progress
-//! with `NoSuchUpload`. `ListParts` reads the recorded parts back.
+//! part's own entity tag and the digest of its own bytes under the checksum algorithm in
+//! force, refuses a declared digest that does not describe those bytes without recording
+//! the part, and refuses an upload this emulator does not have in progress with
+//! `NoSuchUpload`. `ListParts` reads the recorded parts back.
+//!
+//! A part that NAMES an algorithm other than the one the initiation settled is recorded
+//! under the algorithm it named, and its answer reports that algorithm's digest of its own
+//! bytes: this handler enforces no agreement between the two, so a completion still
+//! composes the object's checksum under the algorithm the INITIATION settled
+//! (`crate::state::multipart_checksum`), from each part's bytes rather than from the
+//! digests the parts were answered with. Refusing the disagreement instead is its own
+//! rule, with its own code and sentence, and belongs to whichever issue records it.
 //!
 //! ## Shape of an operation
 //!
@@ -327,10 +337,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reason), and `RequestPayer` asks to be charged for the request, which nothing
         // here does — `ListParts` refuses both identically.
         //
-        // The checksum members are NOT in this list: a checksum this handler neither
-        // computes nor verifies is simply not reported back, so nothing is claimed about
-        // it, exactly as `PutObject` leaves its own alone — refusing them would break
-        // every SDK that sends one by default.
+        // The checksum members are NOT in this list: the algorithm one of them names is
+        // what this write computes the PART's own digest under (see below), and a value
+        // that does not describe the bytes is refused rather than rejected as unserved —
+        // exactly as `PutObject` treats its own.
         if let Some(unserved) = unserved_feature(&input) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "UploadPart with {unserved}"
@@ -380,23 +390,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // payload actually received — first for its SHAPE, then against the digest — before
         // the part is recorded. The codes and the sentences are the store's
         // ([`crate::state::verify_declared_integrity`]), the same ones `PutObject` answers
-        // the same headers with.
-        crate::state::verify_declared_integrity(
-            input.content_md5.as_deref(),
-            &crate::state::DeclaredChecksums {
-                crc32: input.checksum_crc32.as_deref(),
-                crc32c: input.checksum_crc32_c.as_deref(),
-                crc64nvme: input.checksum_crc64_nvme.as_deref(),
-                sha1: input.checksum_sha1.as_deref(),
-                sha256: input.checksum_sha256.as_deref(),
-                sha512: input.checksum_sha512.as_deref(),
-                md5: input.checksum_md5.as_deref(),
-                xxhash64: input.checksum_xxhash64.as_deref(),
-                xxhash3: input.checksum_xxhash3.as_deref(),
-                xxhash128: input.checksum_xxhash128.as_deref(),
-            },
-            &input.body,
-        )
+        // the same headers with. A part whose digest does not describe its bytes is
+        // therefore never recorded: the slot that part number addresses is left as it was.
+        let declared = declared_checksums(&input);
+        crate::state::verify_declared_integrity(input.content_md5.as_deref(), &declared, &input.body)
         .map_err(|rejection| {
             crate::scaffolded::Scaffolded::unmodeled(
                 rejection.code(),
@@ -418,37 +415,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The part as the store records it: the bytes the request carried, the instant
-        // they were accepted, and the entity tag over those bytes — "Entity tag for the
+        // they were accepted, the entity tag over those bytes — "Entity tag for the
         // uploaded object" (`UploadPartOutput$ETag`), which for a one-part payload in a
         // general purpose bucket is the MD5 of the data, the same tag `PutObject` renders
-        // for an object it stores whole.
+        // for an object it stores whole — and the part's OWN digest.
         let etag = crate::state::object_etag(&input.body);
-        let part = crate::state::UploadedPart {
-            part_number: input.part_number,
-            etag: etag.clone(),
-            uploaded_at: ::std::time::SystemTime::now(),
-            body: input.body,
+
+        // What the UPLOAD was initiated under, read off the recorded upload so the answer
+        // is what the initiation settled rather than anything this request named: "The
+        // server-side encryption algorithm used when you store this object in Amazon S3"
+        // (`UploadPartOutput$ServerSideEncryption`), and the `ChecksumAlgorithm` the
+        // initiation asked S3 to create the object's checksum with. Read under the lock and
+        // nothing else: the digest below is computed with the lock RELEASED, so hashing a
+        // part does not hold every other request on this store behind it.
+        let (encryption, initiated_algorithm) = {
+            let store = state.lock();
+            store
+                .bucket(&input.bucket)
+                .and_then(|bucket| bucket.multipart_upload(&input.upload_id))
+                .map(|upload| (upload.encryption.clone(), upload.checksum_algorithm.clone()))
+                .unwrap_or_default()
         };
+        // The algorithm this part's digest is computed under: the one an individual
+        // `Checksum*` member named — "if you provide an individual checksum, Amazon S3
+        // ignores any provided ChecksumAlgorithm parameter"
+        // (`UploadPartRequest$ChecksumAlgorithm`) — else the `ChecksumAlgorithm` member
+        // itself, else the algorithm the INITIATION settled, because "this checksum
+        // algorithm must be the same for all parts" and the parts of such an upload each
+        // carry one.
+        let algorithm = declared
+            .named_algorithm()
+            .map(str::to_string)
+            .or_else(|| input.checksum_algorithm.clone())
+            .or(initiated_algorithm);
+        // Computed over THIS part's bytes, never over the object the parts will assemble
+        // into: "the Base64 encoded, … checksum of the part" (`UploadPartOutput`'s
+        // `Checksum*` members). An algorithm this emulator cannot compute records and
+        // reports nothing rather than a value under another one.
+        let checksum = algorithm.and_then(|algorithm| {
+            crate::state::full_object_checksum(&algorithm, &input.body).map(|value| {
+                crate::state::ObjectChecksum {
+                    algorithm,
+                    value,
+                    checksum_type: crate::state::CHECKSUM_TYPE_FULL_OBJECT.to_string(),
+                }
+            })
+        });
 
         // The store reports what the write did, because it may refuse: a bucket this
         // emulator does not hold, an upload it has none of in progress under that id and
         // key, and the two byte budgets that keep what it holds bounded whatever a caller
         // does. Each is answered as a refusal, so nothing is recorded and the caller is
         // told.
-        let (outcome, encryption) = {
+        let outcome = {
             let mut store = state.lock();
-            let outcome = store.upload_part(&input.bucket, &input.upload_id, &input.key, part);
-            // The encryption configuration the UPLOAD was initiated under, read off the
-            // recorded upload so the answer is what the initiation settled rather than
-            // anything this request named — "The server-side encryption algorithm used
-            // when you store this object in Amazon S3"
-            // (`UploadPartOutput$ServerSideEncryption`).
-            let encryption = store
-                .bucket(&input.bucket)
-                .and_then(|bucket| bucket.multipart_upload(&input.upload_id))
-                .map(|upload| upload.encryption.clone())
-                .unwrap_or_default();
-            (outcome, encryption)
+            let part = crate::state::UploadedPart {
+                part_number: input.part_number,
+                etag: etag.clone(),
+                uploaded_at: ::std::time::SystemTime::now(),
+                body: input.body,
+                checksum: checksum.clone(),
+            };
+            store.upload_part(&input.bucket, &input.upload_id, &input.key, part)
         };
         let Some(outcome) = outcome else {
             return Err(UploadPartErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
@@ -484,6 +512,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        let reported = crate::state::reported_checksums(checksum.as_ref());
         Ok(UploadPartOutput {
             // "Entity tag for the uploaded object" — the tag the store recorded for THIS
             // part, which is what a later `CompleteMultipartUpload` names the part by.
@@ -495,12 +524,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             server_side_encryption: encryption.sse_algorithm.clone(),
             ssekms_key_id: encryption.kms_key_id.clone(),
             bucket_key_enabled: encryption.bucket_key_enabled,
+            // The digest of this part's own bytes, under the member its algorithm names —
+            // mapped by the one place that mapping lives
+            // ([`crate::state::reported_checksums`]), so the value a part write answers,
+            // the one a `ListParts` reports for the same part and the one a completion
+            // composes from are one value. A part write that settled no algorithm reports
+            // none of them. `UploadPartOutput` declares no `ChecksumType` member, so the
+            // type the record carries does not reach this answer.
+            checksum_crc32: reported.crc32,
+            checksum_crc32_c: reported.crc32c,
+            checksum_crc64_nvme: reported.crc64nvme,
+            checksum_sha1: reported.sha1,
+            checksum_sha256: reported.sha256,
+            checksum_sha512: reported.sha512,
+            checksum_md5: reported.md5,
+            checksum_xxhash64: reported.xxhash64,
+            checksum_xxhash3: reported.xxhash3,
+            checksum_xxhash128: reported.xxhash128,
             // Everything else this output can carry describes something no recorded part
-            // has: the `Checksum*` members would each need a checksum this handler does
-            // not compute, the SSE-C members are refused above, and `RequestCharged`
-            // reports a Requester Pays charge nothing here makes.
+            // has: the SSE-C members are refused above, and `RequestCharged` reports a
+            // Requester Pays charge nothing here makes.
             ..UploadPartOutput::default()
         })
+    }
+}
+
+/// The `Checksum*` members of this request, as the store's one mapping from member to
+/// `ChecksumAlgorithm` reads them ([`crate::state::DeclaredChecksums`]) — the same mapping
+/// `PutObject` hands its own members over through.
+fn declared_checksums(input: &UploadPartInput) -> crate::state::DeclaredChecksums<'_> {
+    crate::state::DeclaredChecksums {
+        crc32: input.checksum_crc32.as_deref(),
+        crc32c: input.checksum_crc32_c.as_deref(),
+        crc64nvme: input.checksum_crc64_nvme.as_deref(),
+        sha1: input.checksum_sha1.as_deref(),
+        sha256: input.checksum_sha256.as_deref(),
+        sha512: input.checksum_sha512.as_deref(),
+        md5: input.checksum_md5.as_deref(),
+        xxhash64: input.checksum_xxhash64.as_deref(),
+        xxhash3: input.checksum_xxhash3.as_deref(),
+        xxhash128: input.checksum_xxhash128.as_deref(),
     }
 }
 

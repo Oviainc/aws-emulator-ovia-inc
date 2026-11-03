@@ -375,18 +375,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page = usize::try_from(max_parts).unwrap_or(0);
         let truncated = above_marker.len() > page;
         // Each part is reported from the RECORDED part: its number, the instant it was
-        // uploaded, the entity tag the upload answered for it and the size of the bytes it
-        // holds (`Part`'s own members). No `Checksum*` member is reported: nothing here
-        // computes a part's checksum, so none is claimed.
+        // uploaded, the entity tag the upload answered for it, the size of the bytes it
+        // holds (`Part`'s own members) and the digest of those bytes under the member its
+        // algorithm names — the value the part write recorded, read through the one place
+        // that mapping lives ([`crate::state::reported_checksums`]), so a part write's
+        // answer and this listing cannot report two different digests for one part. A part
+        // recorded under no checksum algorithm reports none of them.
         let parts: Vec<Part> = above_marker
             .iter()
             .take(page)
-            .map(|part| Part {
-                part_number: Some(part.part_number),
-                last_modified: Some(::aws_smithy_types::DateTime::from(part.uploaded_at)),
-                e_tag: Some(part.etag.clone()),
-                size: Some(part.size()),
-                ..Part::default()
+            .map(|part| {
+                let reported = crate::state::reported_checksums(part.checksum.as_ref());
+                Part {
+                    part_number: Some(part.part_number),
+                    last_modified: Some(::aws_smithy_types::DateTime::from(part.uploaded_at)),
+                    e_tag: Some(part.etag.clone()),
+                    size: Some(part.size()),
+                    checksum_crc32: reported.crc32,
+                    checksum_crc32_c: reported.crc32c,
+                    checksum_crc64_nvme: reported.crc64nvme,
+                    checksum_sha1: reported.sha1,
+                    checksum_sha256: reported.sha256,
+                    checksum_sha512: reported.sha512,
+                    checksum_md5: reported.md5,
+                    checksum_xxhash64: reported.xxhash64,
+                    checksum_xxhash3: reported.xxhash3,
+                    checksum_xxhash128: reported.xxhash128,
+                }
             })
             .collect();
         // "When a list is truncated, this element specifies the last part in the list, as

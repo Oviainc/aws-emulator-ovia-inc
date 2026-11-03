@@ -1142,9 +1142,15 @@ async fn a_read_of_the_object_s_attributes_reports_the_parts_it_was_assembled_fr
     );
     assert_eq!(
         read.element("ChecksumSHA256").as_deref(),
-        Some(object_checksum.as_str()),
-        "case \"every attribute of an assembled object\": expected the object's checksum \
-         container to carry the value the completion answered, got {:?}",
+        Some(
+            object_checksum
+                .rsplit_once('-')
+                .map(|(digest, _)| digest)
+                .unwrap_or(object_checksum.as_str())
+        ),
+        "case \"every attribute of an assembled object\": this reader states the part count \
+         in its own `TotalPartsCount`, so the checksum container carries the composition's \
+         digest alone, got {:?}",
         read.element("ChecksumSHA256")
     );
     assert_eq!(

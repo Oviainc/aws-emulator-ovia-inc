@@ -371,9 +371,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
         // conditional S3 itself answers `NotImplemented`.
         //
         // The checksum members are NOT in this list: each carries the client's own value for
-        // bytes this emulator holds, and the checksum the response reports is the one it
-        // computes itself from the parts it assembled, under the algorithm the initiation
-        // named — so nothing is claimed about a value that was merely sent.
+        // bytes this emulator holds, judged against the checksum this completion computes
+        // itself (see below) rather than echoed back.
         if let Some(unserved) = unserved_feature(&input) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "CompleteMultipartUpload with {unserved}"
@@ -526,6 +525,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
             &assembled,
         );
         let reported = crate::state::reported_checksums(checksum.as_ref());
+        // The `Checksum*` members THIS request declared, judged against that computed
+        // checksum: a completion's checksum member "can be used as a data integrity check
+        // to verify that the data received is the same data that was originally sent"
+        // (`CompleteMultipartUploadRequest$ChecksumCRC64NVME` and its siblings), so a value
+        // that is not the digest the assembled object carries is refused — through the one
+        // rule the store states for a declared digest that does not describe what was
+        // received ([`crate::state::verify_declared_object_checksum`]), with the code and
+        // the sentence every other mismatching digest in this service answers. Judged
+        // BEFORE the write, so a refused completion stores no object and leaves the upload
+        // in progress with every part it held.
+        crate::state::verify_declared_object_checksum(&declared_checksums(&input), checksum.as_ref())
+            .map_err(|rejection| {
+                crate::scaffolded::Scaffolded::unmodeled(
+                    rejection.code(),
+                    rejection.status(),
+                    rejection.to_string(),
+                )
+            })?;
         // How the object was assembled, kept with it: the parts are gone as parts once this
         // completion takes the upload away, so this is the only record of "a collection of
         // parts associated with a multipart upload" (`GetObjectAttributesParts`) a later read
@@ -808,6 +825,24 @@ fn unserved_feature(input: &CompleteMultipartUploadInput) -> Option<&'static str
     ]
     .into_iter()
     .find_map(|(asked, name)| asked.then_some(name))
+}
+
+/// The `Checksum*` members of this request, as the store's one mapping from member to
+/// `ChecksumAlgorithm` reads them ([`crate::state::DeclaredChecksums`]) — the same mapping
+/// `PutObject` and `UploadPart` hand their own members over through.
+fn declared_checksums(input: &CompleteMultipartUploadInput) -> crate::state::DeclaredChecksums<'_> {
+    crate::state::DeclaredChecksums {
+        crc32: input.checksum_crc32.as_deref(),
+        crc32c: input.checksum_crc32_c.as_deref(),
+        crc64nvme: input.checksum_crc64_nvme.as_deref(),
+        sha1: input.checksum_sha1.as_deref(),
+        sha256: input.checksum_sha256.as_deref(),
+        sha512: input.checksum_sha512.as_deref(),
+        md5: input.checksum_md5.as_deref(),
+        xxhash64: input.checksum_xxhash64.as_deref(),
+        xxhash3: input.checksum_xxhash3.as_deref(),
+        xxhash128: input.checksum_xxhash128.as_deref(),
+    }
 }
 
 /// The refusal a completion whose object write the store refused answers with, named the

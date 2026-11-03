@@ -394,8 +394,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // The encryption the UPLOAD was initiated under, which is what this answer reports:
         // the part is stored into that upload, so what it says about encryption is what the
-        // initiation settled rather than anything this request named.
+        // initiation settled rather than anything this request named. The
+        // `ChecksumAlgorithm` the initiation settled travels with it, because that is what
+        // the part's own digest is computed under: this operation's request carries no
+        // checksum member of its own (`smithy_query(query="operation",
+        // operation="UploadPartCopy")` declares none), so the initiation is the only thing
+        // that names one.
         let encryption = upload.encryption.clone();
+        let initiated_algorithm = upload.checksum_algorithm.clone();
 
         // The SOURCE object, copied out of the store so the part write below can borrow it
         // mutably. "If your source bucket versioning is enabled, the x-amz-copy-source header
@@ -535,11 +541,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CopyPartResult$ETag` reports and the one a later completion names the part by,
         // rendered the one way every part's is ([`crate::state::object_etag`]).
         let etag = crate::state::object_etag(&body);
+        // The digest of THIS part's own bytes, under the algorithm the initiation settled —
+        // the same per-part value `UploadPart` records for a part it received, computed
+        // through the same place, so a copied part and an uploaded one carry one kind of
+        // checksum.
+        let checksum = initiated_algorithm.and_then(|algorithm| {
+            crate::state::full_object_checksum(&algorithm, &body).map(|value| {
+                crate::state::ObjectChecksum {
+                    algorithm,
+                    value,
+                    checksum_type: crate::state::CHECKSUM_TYPE_FULL_OBJECT.to_string(),
+                }
+            })
+        });
         let part = crate::state::UploadedPart {
             part_number: input.part_number,
             etag: etag.clone(),
             uploaded_at: now,
             body,
+            checksum: checksum.clone(),
         };
 
         // Recorded through the one place a part is ever recorded, so a copied part counts
@@ -577,6 +597,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        let reported = crate::state::reported_checksums(checksum.as_ref());
         Ok(UploadPartCopyOutput {
             // "Container for all response elements" — the entity tag of the part this copy
             // recorded and the instant it was recorded at, which is what a completion names
@@ -584,9 +605,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             copy_part_result: Some(CopyPartResult {
                 e_tag: Some(etag),
                 last_modified: Some(::aws_smithy_types::DateTime::from(now)),
-                // The checksum members would each need a checksum nothing here computes for
-                // a part, so none is reported rather than invented.
-                ..CopyPartResult::default()
+                // The digest of the part this copy recorded, under the member its algorithm
+                // names — read through the one place that mapping lives
+                // ([`crate::state::reported_checksums`]), so a copied part reports the same
+                // kind of value an uploaded one does. An upload initiated with no checksum
+                // algorithm reports none.
+                checksum_crc32: reported.crc32,
+                checksum_crc32_c: reported.crc32c,
+                checksum_crc64_nvme: reported.crc64nvme,
+                checksum_sha1: reported.sha1,
+                checksum_sha256: reported.sha256,
+                checksum_sha512: reported.sha512,
+                checksum_md5: reported.md5,
+                checksum_xxhash64: reported.xxhash64,
+                checksum_xxhash3: reported.xxhash3,
+                checksum_xxhash128: reported.xxhash128,
             }),
             // "The version of the source object that was copied, if you have enabled
             // versioning on the source bucket" — read off the stored source version, so it is

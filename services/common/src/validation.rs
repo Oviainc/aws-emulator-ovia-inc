@@ -995,6 +995,9 @@ pub fn with_submitted_values_up_to(
             continue;
         }
         let Some(stored) = violation.value.as_deref() else {
+            // Nothing to read back: the member held no value, or the constraint walk
+            // WITHHELD it because the member is `@sensitive`, and a value it kept out of
+            // the violation is not this layer's to put back.
             continue;
         };
         // Only what the framework elided FROM this leaf, or — for a clause on a

@@ -8221,6 +8221,16 @@ pub struct UploadedPart {
     /// bytes of the uploaded part data" (`Part$Size`) is its length, so nothing records a
     /// size beside it that could disagree with the bytes.
     pub body: Vec<u8>,
+    /// The digest of THIS part's own bytes, under the algorithm the part write settled, or
+    /// `None` when neither the part write nor the initiation named one.
+    ///
+    /// A part-level checksum is per-part: "the Base64 encoded, … checksum of the part"
+    /// (`Part$ChecksumSHA256` and its nine siblings), never the object's composition over
+    /// the parts — so its [`ObjectChecksum::checksum_type`] is
+    /// [`CHECKSUM_TYPE_FULL_OBJECT`]: the value is the digest of ALL of the part's bytes.
+    /// Recorded by the write that received those bytes, so `UploadPart`'s answer and every
+    /// later `ListParts` report the same value.
+    pub checksum: Option<ObjectChecksum>,
 }
 
 impl UploadedPart {
@@ -8230,11 +8240,16 @@ impl UploadedPart {
         i64::try_from(self.body.len()).unwrap_or(i64::MAX)
     }
 
-    /// How many bytes this part retains: its data AND the entity tag kept beside it, the
-    /// way [`Object::retained_bytes`] counts a stored object's, so no part of an upload
-    /// escapes the budgets.
+    /// How many bytes this part retains: its data AND the strings kept beside it — the
+    /// entity tag and the recorded checksum — the way [`Object::retained_bytes`] counts a
+    /// stored object's, so no part of an upload escapes the budgets.
     pub fn retained_bytes(&self) -> usize {
-        self.body.len() + self.etag.len()
+        self.body.len()
+            + self.etag.len()
+            + self
+                .checksum
+                .as_ref()
+                .map_or(0, ObjectChecksum::retained_bytes)
     }
 }
 
@@ -9055,6 +9070,30 @@ pub struct ReportedChecksums {
     pub checksum_type: Option<String>,
 }
 
+/// `value` without the `-<parts>` suffix a COMPOSITE checksum carries.
+///
+/// A composition is reported "with the total number of parts" after a dash (Amazon S3 User
+/// Guide, *Checking object integrity*) wherever the VALUE itself is reported — the
+/// `x-amz-checksum-*` header of a write or a read, and the element a completion answers —
+/// which is what [`composite_checksum`] renders. A read of the object's ATTRIBUTES is the
+/// one place that reports the digest ALONE: `GetObjectAttributes` states how many parts the
+/// object holds in `ObjectParts$TotalPartsCount` beside the checksum container, so the count
+/// is not repeated inside the value there.
+///
+/// Only a trailing dash followed by digits is dropped: a Base64 checksum value is written in
+/// the standard alphabet, which has no `-`, so no part of a digest can be mistaken for the
+/// suffix.
+pub fn checksum_without_part_count(value: &str) -> &str {
+    match value.rsplit_once('-') {
+        Some((digest, parts))
+            if !parts.is_empty() && parts.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            digest
+        }
+        _ => value,
+    }
+}
+
 /// The members a reader reports for `checksum`, or nothing at all for an object that
 /// carries none — see [`ReportedChecksums`].
 pub fn reported_checksums(checksum: Option<&ObjectChecksum>) -> ReportedChecksums {
@@ -9329,6 +9368,92 @@ pub fn verify_declared_integrity(
 /// How many bytes an MD5 digest is wide: "the Base64 encoded 128-bit MD5 digest of the
 /// data" (`PutObjectRequest$ContentMD5`), which is 16 bytes.
 const MD5_DIGEST_BYTES: usize = 128 / 8;
+
+/// Why the `Checksum*` members a write declared for a whole MULTIPART object cannot be
+/// accepted, or `None` when they describe `computed` — the checksum the assembled object
+/// really carries ([`multipart_checksum`]).
+///
+/// The same rule [`verify_declared_integrity`] applies to the bytes of a one-shot write,
+/// over the value a COMPOSITION produces instead: a completion "can be used as a data
+/// integrity check to verify that the data received is the same data that was originally
+/// sent" (`CompleteMultipartUploadRequest$ChecksumCRC64NVME` and its siblings), and the
+/// digest the object carries is the one the initiation's algorithm and type settled — so a
+/// declared value that is not that one, and a value declared under any OTHER algorithm, is
+/// a digest the object does not have. Either is [`BAD_DIGEST_CODE`], the code that class
+/// publishes for a digest that does not describe what the service holds.
+///
+/// Declaring several at once is refused before any comparison, exactly as it is on a
+/// one-shot write: one object carries one checksum.
+pub fn verify_declared_object_checksum(
+    declared: &DeclaredChecksums<'_>,
+    computed: Option<&ObjectChecksum>,
+) -> Result<(), ObjectChecksumRejection> {
+    if declared.declared_count() > 1 {
+        return Err(ObjectChecksumRejection::MultipleChecksumTypes);
+    }
+    for (algorithm, value) in declared.pairs() {
+        let Some(value) = value else { continue };
+        let describes = computed.is_some_and(|checksum| {
+            checksum.algorithm == algorithm && checksum.value == value.trim()
+        });
+        if !describes {
+            return Err(ObjectChecksumRejection::Mismatch {
+                algorithm: algorithm.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Why the object checksum a COMPLETION declared cannot be accepted — see
+/// [`verify_declared_object_checksum`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectChecksumRejection {
+    /// A declared value that is not the digest the assembled object carries.
+    Mismatch {
+        /// The `ChecksumAlgorithm` value whose member carried it.
+        algorithm: String,
+    },
+    /// More than one `x-amz-checksum-*` header on one completion, which asks for something
+    /// no stored object can report — the condition
+    /// [`IntegrityRejection::MultipleChecksumTypes`] states for a one-shot write, worded
+    /// from the same place.
+    MultipleChecksumTypes,
+}
+
+impl ObjectChecksumRejection {
+    /// The wire error code S3 answers this rejection with: the codes
+    /// [`IntegrityRejection`] answers the same two conditions with on a one-shot write.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Mismatch { .. } => BAD_DIGEST_CODE,
+            Self::MultipleChecksumTypes => INVALID_REQUEST_CODE,
+        }
+    }
+
+    /// The HTTP status both are rendered with: 400, from that same published list.
+    pub fn status(&self) -> u16 {
+        BAD_DIGEST_STATUS
+    }
+}
+
+impl std::fmt::Display for ObjectChecksumRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The algorithm as the HEADER the value arrived on spells it — lowercase —
+            // which is how a COMPLETION names it; a one-shot write's own mismatch names the
+            // `ChecksumAlgorithm` enum value instead
+            // ([`IntegrityRejection::ChecksumMismatch`]), and the two sentences are
+            // otherwise the same words.
+            Self::Mismatch { algorithm } => write!(
+                f,
+                "The {} you specified did not match the calculated checksum.",
+                algorithm.to_ascii_lowercase()
+            ),
+            Self::MultipleChecksumTypes => write!(f, "{MULTIPLE_CHECKSUM_TYPES_MESSAGE}"),
+        }
+    }
+}
 
 /// The one `EncodingType` the model declares: `url`
 /// (`smithy_query(query="shape",shape="EncodingType")` reports exactly one value), which

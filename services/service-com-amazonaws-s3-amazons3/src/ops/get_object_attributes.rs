@@ -387,17 +387,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // computed, under the member its algorithm names and with the `ChecksumType` that
         // says how it was computed. An object stored under no checksum algorithm has none to
         // report, so the container is absent even when the request asked for it.
-        let reported = crate::state::reported_checksums(
-            object
-                .checksum
-                .as_ref()
-                .filter(|_| asked(crate::state::OBJECT_ATTRIBUTE_CHECKSUM)),
-        );
-        let checksum = object
+        //
+        // The value is the digest ALONE: this reader states how many parts the object holds
+        // in the `ObjectParts` container below, so a composition's `-<parts>` suffix is not
+        // repeated inside the checksum here
+        // ([`crate::state::checksum_without_part_count`]). Source: the recorded response of
+        // this operation for a multipart object, whose `Checksum` container carries the
+        // composition's digest with no suffix while `ObjectParts$TotalPartsCount` carries
+        // the count — a `GetObject` or a completion of the same object reports the value
+        // WITH the suffix, which is why only this reader strips it.
+        let attributed = object
             .checksum
             .as_ref()
             .filter(|_| asked(crate::state::OBJECT_ATTRIBUTE_CHECKSUM))
-            .map(|_| Checksum {
+            .map(|checksum| crate::state::ObjectChecksum {
+                algorithm: checksum.algorithm.clone(),
+                value: crate::state::checksum_without_part_count(&checksum.value).to_string(),
+                checksum_type: checksum.checksum_type.clone(),
+            });
+        let reported = crate::state::reported_checksums(attributed.as_ref());
+        let checksum = attributed.as_ref().map(|_| Checksum {
                 checksum_crc32: reported.crc32.clone(),
                 checksum_crc32_c: reported.crc32c.clone(),
                 checksum_crc64_nvme: reported.crc64nvme.clone(),
