@@ -129,5 +129,7 @@ mod state_roundtrip;
 mod tag_surface_refusal_subject;
 #[path = "all/validation_domain_superdomain.rs"]
 mod validation_domain_superdomain;
+#[path = "all/validation_mail_dispatch_span.rs"]
+mod validation_mail_dispatch_span;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;

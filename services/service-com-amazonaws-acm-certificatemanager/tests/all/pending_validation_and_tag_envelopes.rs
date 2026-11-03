@@ -67,12 +67,15 @@ const VALIDATIONS_LABEL: &str = "acm-validations";
 const CHALLENGE_TOKEN_LENGTH: usize = 32;
 
 /// How long to let the wall clock run before asserting that a pending request is STILL
-/// pending: comfortably past every span this emulator settles an outcome ACM reaches on
-/// its own in, so a request that was going to be pre-empted would have been by now.
-const PAST_EVERY_SETTLE_SPAN: Duration = Duration::from_millis(1_500);
+/// pending: past the span this emulator settles an outcome ACM reaches on its own in
+/// (the service's `VALIDATION_SETTLE_DELAY`), so a request that was going to be
+/// pre-empted would have been by now.
+const PAST_EVERY_SETTLE_SPAN: Duration = Duration::from_millis(2_500);
 
-/// How long a bounded poll may run before the test fails it.
-const POLL_BUDGET: Duration = Duration::from_secs(5);
+/// How long a bounded poll may run before the test fails it: far above every span this
+/// emulator owes a transition in, so an expired budget is a real failure rather than a
+/// tight-timing artefact.
+const POLL_BUDGET: Duration = Duration::from_secs(20);
 
 /// A certificate's `DomainValidationOptions`, by domain name.
 fn validations(case: &str, detail: &Value) -> Vec<Value> {

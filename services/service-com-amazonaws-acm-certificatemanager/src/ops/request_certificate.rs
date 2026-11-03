@@ -436,7 +436,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // span after the request is accepted, for a request that asked for email
             // validation: until then nothing has been mailed, so no mailbox is recorded
             // and the documented 72-hour resend window
-            // (`crate::state::RESEND_VALIDATION_WINDOW`) has not started.
+            // (`crate::state::RESEND_VALIDATION_WINDOW`) has not started. A request
+            // whose outcome ACM reaches without waiting on proof of domain control
+            // never gets that far: the outcome falls due first and drops the dispatch.
             validation_email_sent_at: None,
             pending_validation_email: (validation_method
                 == crate::state::VALIDATION_METHOD_EMAIL)

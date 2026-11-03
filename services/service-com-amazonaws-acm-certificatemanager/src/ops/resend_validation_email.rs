@@ -14,8 +14,8 @@
 //! `ResourceNotFoundException`, as the unknown certificate itself is.
 //! Only then does the certificate's state decide: there is mail to resend only while
 //! the certificate is still `PENDING_VALIDATION`, that domain is still awaiting proof
-//! by EMAIL, ACM has already dispatched the initial validation mail the request owes,
-//! and the 72-hour window has not elapsed — otherwise `InvalidStateException`.
+//! by EMAIL, ACM has already sent validation mail for the certificate, and the 72-hour
+//! window has not elapsed — otherwise `InvalidStateException`.
 //!
 //! ## Shape of an operation
 //!
@@ -310,24 +310,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // ACM sends the FIRST validation mail itself, a bounded span after it accepts
-        // the request: while that dispatch is still owed the request is still being
-        // processed and there is no message to RE-send yet. The sentence is ACM's own
-        // fixed text for that short-lived gate — it names nothing of the request, which
-        // is what tells it apart from the refusals above that name the certificate and
-        // the domain they were asked about.
-        if certificate.pending_validation_email.is_some() {
+        // ACM sends the FIRST validation mail itself, as part of the domain validation
+        // it performs for the request: while no mail has gone out for this certificate
+        // there is no message to RE-send yet, whether the initial dispatch is still owed
+        // or the request never earned one because ACM fixed its outcome when it accepted
+        // it. The sentence is ACM's own fixed text for that gate — it names nothing of
+        // the request, which is what tells it apart from the refusals above that name
+        // the certificate and the domain they were asked about.
+        let Some(sent_at) = certificate.validation_email_sent_at else {
             return Err(invalid_state(REQUEST_STILL_IN_PROGRESS_MESSAGE.to_string()));
-        }
+        };
 
         // "If more than 72 hours have elapsed since your original request or since
         // your last attempt to resend validation mail, you must request a new
         // certificate" (`ResendValidationEmail` doc): past the window there is nothing
         // left to resend.
-        let within_window = certificate
-            .validation_email_sent_at
-            .is_some_and(|sent_at| now <= sent_at + crate::state::RESEND_VALIDATION_WINDOW);
-        if !within_window {
+        if now > sent_at + crate::state::RESEND_VALIDATION_WINDOW {
             return Err(invalid_state(format!(
                 "More than 72 hours have elapsed since the validation mail for certificate {} was last sent, so a new certificate must be requested.",
                 input.certificate_arn
@@ -371,15 +369,16 @@ fn invalid_state(message: String) -> ResendValidationEmailError {
     .into()
 }
 
-/// The `InvalidStateException` message for a resend asked for before ACM has dispatched
-/// the certificate's first validation mail.
+/// The `InvalidStateException` message for a resend asked for while ACM has sent no
+/// validation mail for the certificate yet.
 ///
 /// `InvalidStateException` carries one modelled member (`message: String`) and the model
 /// documents no text for it, so the sentence comes from ACM's recorded behaviour for
 /// this gate: ONE constant sentence saying the request is still being processed and to
-/// try again, naming nothing of the request and terminated by no period. The gate is
-/// short-lived — the identical call succeeds once the dispatch the clock owed has
-/// happened — and this sentence is the only thing that tells it apart from the refusals
-/// that will never succeed, so it is fixed text rather than a rendering of the request.
+/// try again, naming nothing of the request and terminated by no period. It reports a
+/// request ACM has not finished processing — the identical call succeeds once the
+/// dispatch the clock owed has happened — and this sentence is the only thing that tells
+/// it apart from the refusals that name what will never succeed, so it is fixed text
+/// rather than a rendering of the request.
 const REQUEST_STILL_IN_PROGRESS_MESSAGE: &str =
     "The certificate request is still in progress. Try again later";

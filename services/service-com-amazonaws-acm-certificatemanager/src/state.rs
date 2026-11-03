@@ -188,26 +188,31 @@ pub const FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED: &str =
 ///
 /// A CHOSEN span, not a documented one: AWS takes seconds to minutes to answer either,
 /// which no client could poll through here. It is never zero, so a caller that reads
-/// straight after requesting still observes `PENDING_VALIDATION`, and it is never
-/// slept on: the due instant is stored on the record and materialised by whichever call
-/// next touches the store (see
-/// [`ComAmazonawsAcmCertificatemanagerState::materialize_due`]).
+/// straight after requesting — over the network, not in process — still observes
+/// `PENDING_VALIDATION` and the refusals that go with it, and it is never slept on: the
+/// due instant is stored on the record and materialised by whichever call next touches
+/// the store (see [`ComAmazonawsAcmCertificatemanagerState::materialize_due`]).
 ///
-/// It sits ABOVE [`VALIDATION_EMAIL_DISPATCH_DELAY`] because the two owed transitions
-/// happen in that order at AWS: ACM dispatches a request's validation mail first and
-/// only then reaches an outcome for the request, so the compressed spans keep the same
-/// order and each stays inside the observable band.
-pub const VALIDATION_SETTLE_DELAY: Duration = Duration::from_millis(750);
+/// It sits BELOW [`VALIDATION_EMAIL_DISPATCH_DELAY`], so an outcome ACM reaches
+/// without waiting on proof of domain control falls due before the initial validation
+/// mail would have: such a request never reaches the domain validation the mail belongs
+/// to, so the owed dispatch is dropped rather than sent
+/// ([`Certificate::materialize_due`]). The outcome of a request ACM DOES wait on proof
+/// for is the timeout at the end of the documented [`VALIDATION_WINDOW`], which the
+/// mail falls due long before.
+pub const VALIDATION_SETTLE_DELAY: Duration = Duration::from_secs(2);
 
-/// How long after `RequestCertificate` the initial domain-validation EMAIL falls due.
+/// How long after `RequestCertificate` the initial domain-validation EMAIL falls due,
+/// for a request ACM carries into domain validation.
 ///
-/// A CHOSEN span, not a documented one: AWS dispatches the mail itself, shortly after
-/// the request is accepted and well before the request reaches an outcome. It is never
-/// zero, so a caller that resends straight after requesting still observes the state
-/// where no mail has gone out yet, and it is never slept on: the due instant is stored
-/// on the record ([`Certificate::pending_validation_email`]) and materialised by
-/// whichever call next touches the store.
-pub const VALIDATION_EMAIL_DISPATCH_DELAY: Duration = Duration::from_millis(250);
+/// A CHOSEN span, not a documented one: AWS dispatches the mail itself, some way after
+/// the request is accepted. It is never zero, and it is longer than the time a client
+/// takes to make its next call over the network, so a caller that describes or resends
+/// straight after requesting still observes the state where no mail has gone out yet —
+/// an empty mailbox list, and the resend gate that goes with it. It is never slept on:
+/// the due instant is stored on the record ([`Certificate::pending_validation_email`])
+/// and materialised by whichever call next touches the store.
+pub const VALIDATION_EMAIL_DISPATCH_DELAY: Duration = Duration::from_secs(4);
 
 /// How long ACM waits for proof of domain control before the request times out.
 ///
@@ -946,7 +951,8 @@ pub struct Certificate {
     /// certificate it validates by EMAIL. `None` once the mail has gone out, for a
     /// certificate ACM sends no validation mail for at all, and once the request has
     /// settled with the mail still owed — a request ACM has finished processing gets no
-    /// validation mail afterwards.
+    /// validation mail afterwards, which is what a request whose outcome needs no proof
+    /// of domain control has done before this span elapses.
     ///
     /// Stored, never slept on, exactly as [`Self::pending_validation`] is: the instant
     /// is fixed by the call that accepted the request, so the mail is owed at that

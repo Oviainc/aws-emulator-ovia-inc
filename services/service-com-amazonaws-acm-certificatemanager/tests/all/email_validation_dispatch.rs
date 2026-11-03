@@ -11,6 +11,10 @@
 //! HTTP is mailed nothing, and a request that reaches its outcome before the dispatch
 //! fell due is never mailed at all.
 //!
+//! What a client sees BEFORE that dispatch — the span it has to make its next call in,
+//! and the request whose outcome falls due inside it so it is never mailed on the real
+//! clock — is in [`crate::validation_mail_dispatch_span`].
+//!
 //! Every assertion goes through `MultiServiceRouter::dispatch` on the shared harness in
 //! [`crate::certificate_lifecycle`], and reads the record back through
 //! `DescribeCertificate`, so nothing here can pass on a response the store does not
@@ -25,7 +29,6 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_acm_certificatemanager::state::{
     ComAmazonawsAcmCertificatemanagerState, VALIDATION_EMAIL_DISPATCH_DELAY,
-    VALIDATION_SETTLE_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -283,15 +286,19 @@ async fn the_dispatched_mail_is_reported_for_every_email_validated_name() {
 async fn the_initial_dispatch_is_owed_by_the_clock() {
     let (router, engine) = router_with_engine();
     let started = std::time::Instant::now();
+    // A name whose owner COULD publish the evidence, so the only outcome the clock owes
+    // the request is the 72-hour timeout: this row waits the dispatch out on the real
+    // clock, and a request whose outcome falls due inside that span is one ACM never
+    // mails at all.
     let arn = request_certificate(
         &router,
-        &json!({ "DomainName": "polled.example.com", "ValidationMethod": "EMAIL" }),
+        &json!({ "DomainName": "polled.probe-domain.com", "ValidationMethod": "EMAIL" }),
     )
     .await;
 
     // The two instants the record stores: the mail falls due first — ACM mails a
-    // request before it reaches an outcome for it — and both inside the band a caller
-    // can still observe the transient state in.
+    // request before it reaches an outcome for it — and the mail inside the band a
+    // caller can still observe the unmailed state in.
     let (mail_due, outcome_due) = owed_instants(&engine, &arn);
     let mail_due = mail_due.expect("an email-validated request owes its initial mail");
     let outcome_due = outcome_due.expect("a requested certificate owes a validation outcome");
@@ -304,7 +311,7 @@ async fn the_initial_dispatch_is_owed_by_the_clock() {
         .duration_since(SystemTime::now())
         .unwrap_or(Duration::ZERO);
     assert!(
-        due_in > Duration::ZERO && due_in <= VALIDATION_SETTLE_DELAY,
+        due_in > Duration::ZERO && due_in <= VALIDATION_EMAIL_DISPATCH_DELAY,
         "the dispatch must be owed, not instant, and inside the observable band, got \
          {due_in:?}"
     );
@@ -313,11 +320,11 @@ async fn the_initial_dispatch_is_owed_by_the_clock() {
     // needed a call to start it, this loop would never terminate. The cap is far above
     // the emulator's own span, so an expired budget is a real failure rather than a
     // tight-timing artefact.
-    let budget = VALIDATION_SETTLE_DELAY * 20;
+    let budget = VALIDATION_EMAIL_DISPATCH_DELAY * 10;
     let mut polls = 0_u32;
     let (mailboxes, status_when_mailed) = loop {
         let detail = describe(&router, &arn).await;
-        let validation = validation_for("polled certificate", &detail, "polled.example.com");
+        let validation = validation_for("polled certificate", &detail, "polled.probe-domain.com");
         let mailboxes = reported_mailboxes(&validation).unwrap_or_else(|| {
             panic!("an email-validated name reports a mailbox list, got {validation}")
         });
@@ -349,7 +356,7 @@ async fn the_initial_dispatch_is_owed_by_the_clock() {
     );
     assert_eq!(
         mailboxes,
-        expected_mailboxes("polled.example.com"),
+        expected_mailboxes("polled.probe-domain.com"),
         "expected the five role-account mailboxes at the validation domain, got {mailboxes:?}"
     );
     assert_eq!(
@@ -431,9 +438,9 @@ async fn a_request_that_settles_first_is_never_mailed() {
          list, got {validation}"
     );
 
-    // And the dropped dispatch never happens later: well past the span it would have
-    // fallen due in, the list is still empty.
-    tokio::time::sleep(VALIDATION_EMAIL_DISPATCH_DELAY * 3).await;
+    // And the dropped dispatch never happens later: past the span it would have fallen
+    // due in, the list is still empty.
+    tokio::time::sleep(VALIDATION_EMAIL_DISPATCH_DELAY + Duration::from_millis(250)).await;
     let detail = describe(&router, &arn).await;
     let validation = validation_for("well past the span", &detail, "settled.example.com");
     assert_eq!(
