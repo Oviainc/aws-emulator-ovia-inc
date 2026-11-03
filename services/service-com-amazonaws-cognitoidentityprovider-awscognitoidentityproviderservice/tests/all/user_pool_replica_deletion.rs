@@ -45,6 +45,11 @@ const REPLICA_REGION: &str = "us-west-2";
 /// pool's own Region nor the replica's.
 const UNRELATED_REGION: &str = "eu-central-1";
 
+/// A `KeyConfiguration.KmsKeyArn`-shaped ARN (`EncryptionKeyArnType`, len
+/// 20..2048) standing for the multi-Region customer-managed key a replicated
+/// pool is encrypted under.
+const MULTI_REGION_KEY_ARN: &str = "arn:aws:kms:us-east-1:123456789012:key/multi-region-example";
+
 /// Long enough that the clock has made a created replica's activation due.
 const PAST_THE_ACTIVATION: Duration =
     REPLICA_ACTIVATION_SPAN.saturating_add(Duration::from_millis(250));
@@ -133,9 +138,18 @@ fn error_message(payload: &Value) -> &str {
 }
 
 /// Create a pool and return its minted `UserPoolId`.
+///
+/// The pool is encrypted under a customer-managed key, which is what a pool has
+/// to hold to be replicated at all: "you must use a multi-region key to enable
+/// multi-region replication for a user pool"
+/// (`smithy_query(query="doc",shape="KeyConfigurationType",member="KeyType")`).
 async fn pool(router: &MultiServiceRouter, name: &str) -> String {
     let mut body = Map::new();
     body.insert("PoolName".to_string(), json!(name));
+    body.insert(
+        "KeyConfiguration".to_string(),
+        json!({ "KeyType": "CUSTOMER_MANAGED_KEY", "KmsKeyArn": MULTI_REGION_KEY_ARN }),
+    );
     let created = ok(router, "CreateUserPool", &Value::Object(body)).await;
     created["UserPool"]["Id"]
         .as_str()

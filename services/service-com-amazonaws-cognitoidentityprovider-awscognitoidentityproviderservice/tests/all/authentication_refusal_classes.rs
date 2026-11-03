@@ -115,7 +115,7 @@ const SESSION_NOT_FOR_THIS_REQUEST: &str = "Invalid session for the user.";
 
 /// The sentence a challenge response answers a `Session` that names no outstanding
 /// challenge with.
-const INVALID_AUTH_STATE: &str = "Invalid code or auth state for the user.";
+const INVALID_AUTH_STATE: &str = "Invalid code/session provided";
 
 /// The sentence `AdminLinkProviderForUser` answers a `SourceUser` naming the pool's own
 /// native provider with.

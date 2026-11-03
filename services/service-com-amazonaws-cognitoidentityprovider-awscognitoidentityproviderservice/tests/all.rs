@@ -163,6 +163,8 @@ mod post_confirmation_trigger;
 mod provisioned_limits;
 #[path = "all/public_user_not_found_message.rs"]
 mod public_user_not_found_message;
+#[path = "all/refusal_reports_the_broken_rule.rs"]
+mod refusal_reports_the_broken_rule;
 #[path = "all/resend_confirmation_code.rs"]
 mod resend_confirmation_code;
 #[path = "all/resource_server_lifecycle.rs"]

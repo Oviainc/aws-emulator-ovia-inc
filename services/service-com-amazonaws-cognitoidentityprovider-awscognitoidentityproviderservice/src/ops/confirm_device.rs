@@ -235,6 +235,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .pool_mut(&user_pool_id)
             .ok_or_else(|| user_pool_not_found(&user_pool_id))?;
         let user = pool.user_mut(&username).ok_or_else(user_not_found)?;
+        // The device's own credentials are what this request REGISTERS:
+        // `DeviceSecretVerifierConfig` is "a Secure Remote Password (SRP) value
+        // that your application generates when you register a user's device"
+        // (this service's model), which is what a later device sign-in proves
+        // itself with. A request carrying none of it registers no credentials,
+        // so it is refused for the credentials it did not supply — before the
+        // device key those credentials would be stored against is resolved,
+        // because a key this request cannot be served for says nothing about
+        // what the request itself left out.
+        if !device_credentials_given(input.device_secret_verifier_config.as_ref()) {
+            return Err(no_device_credentials());
+        }
         // Only an UNCONFIRMED device key a sign-in of THIS user minted can be
         // confirmed: the key is "an identifier used in generating the
         // `DEVICE_PASSWORD_VERIFIER`" that the sign-in handed out, not something
@@ -339,6 +351,38 @@ fn device_remembering_not_configured() -> ConfirmDeviceError {
             message: Some(crate::state::DEVICE_REMEMBERING_NOT_CONFIGURED_MESSAGE.to_string()),
         },
     )
+    .into()
+}
+
+/// Whether `configuration` supplies device credentials at all: a configuration
+/// that carries a password verifier or the salt it was generated with supplies
+/// some, and an absent one — or one whose two members are both absent or empty —
+/// supplies none.
+///
+/// Only the ABSENCE of every credential value is decided here, which is the one
+/// thing a request can get wrong without the service holding anything to compare
+/// against: the values themselves are "generate[d]" by the application (this
+/// operation's `DeviceSecretVerifierConfig`), so nothing stored says what they
+/// should be.
+fn device_credentials_given(configuration: Option<&DeviceSecretVerifierConfigType>) -> bool {
+    configuration.is_some_and(|configuration| {
+        [&configuration.password_verifier, &configuration.salt]
+            .into_iter()
+            .any(|value| value.as_deref().is_some_and(|value| !value.is_empty()))
+    })
+}
+
+/// The refusal for a request that supplied no device credentials: it names the
+/// member class at fault and why — nothing was given — and carries no value from
+/// the request, so every such refusal reads the same.
+fn no_device_credentials() -> ConfirmDeviceError {
+    ConfirmDeviceErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some("Invalid device credentials given, no credentials given".to_string()),
+        // "The reason code of the exception" (this service's model) names a
+        // further classification Amazon Cognito reports only for some refusals;
+        // none applies to device credentials, so none is invented.
+        reason_code: None,
+    })
     .into()
 }
 

@@ -586,6 +586,14 @@ async fn device_remembering_decides_whether_a_refresh_needs_a_device_key() {
                 &json!({
                     "AccessToken": token(case, &alice, "AccessToken"),
                     "DeviceKey": mine,
+                    // The device credentials a confirm registers: "a Secure
+                    // Remote Password (SRP) value that your application
+                    // generates when you register a user's device"
+                    // (`smithy_query(query="shape",shape="DeviceSecretVerifierConfigType")`).
+                    "DeviceSecretVerifierConfig": {
+                        "PasswordVerifier": "ZGV2aWNlLXBhc3N3b3JkLXZlcmlmaWVy",
+                        "Salt": "ZGV2aWNlLXNhbHQ",
+                    },
                 }),
             )
             .await;

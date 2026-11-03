@@ -129,6 +129,14 @@ const DOMAIN_NAMING_OPERATIONS: [&str; 2] = ["CreateUserPoolDomain", "UpdateUser
 /// [`served_despite`].
 const DESCRIBE_USER_POOL_DOMAIN: &str = "DescribeUserPoolDomain";
 
+/// The machine-to-machine grant, whose request PRESENTS a credential to be verified
+/// (`smithy_query(query="operation",operation="GetClientToken")`): see [`served_despite`].
+const GET_CLIENT_TOKEN: &str = "GetClientToken";
+
+/// The validation path of the `Secret` member that grant presents its app client's secret
+/// in, as the framework spells a member path.
+const SECRET_MEMBER_PATH: &str = "secret";
+
 /// The `com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -527,18 +535,36 @@ fn domain_name_prose(operation: &str, violations: &[(Violation, SubmittedEcho)])
 }
 
 /// Whether `violation` is one this service does NOT refuse on, because Amazon Cognito
-/// SERVES the request that carries it.
+/// SERVES the request that carries it — the handler then answers it from stored state.
 ///
-/// A lookup addressed BY a hosted domain name reports the domain that name holds, and a
-/// name no create could ever take holds none — so Amazon Cognito answers such a lookup with
-/// the domain it found (none) rather than refusing the name's form, even though the model
-/// declares that form on the member. The operations that ask a pool FOR a name do refuse it
-/// ([`DOMAIN_NAMING_OPERATIONS`], [`domain_name_prose`]), which is where the name has to be
-/// one the pool can take.
+/// Two kinds of member reach this:
+///
+/// * A lookup addressed BY a hosted domain name reports the domain that name holds, and a
+///   name no create could ever take holds none — so Amazon Cognito answers such a lookup with
+///   the domain it found (none) rather than refusing the name's form, even though the model
+///   declares that form on the member. The operations that ask a pool FOR a name do refuse it
+///   ([`DOMAIN_NAMING_OPERATIONS`], [`domain_name_prose`]), which is where the name has to be
+///   one the pool can take.
+/// * A member carrying a CREDENTIAL the request presents to be verified is checked against
+///   the stored secret rather than against its declared form: the machine-to-machine grant
+///   "provides its client ID and secret"
+///   (`smithy_query(query="operation",operation="GetClientToken")`) and either authenticates
+///   that pair or does not, so a presented secret of any shape is answered by the grant's
+///   own refusal, which says neither which half was wrong nor what was sent. Refusing its
+///   FORM instead would both name the wrong class and quote the submitted secret back —
+///   this service's constraint clause states the value a request carried — so a credential
+///   no caller may read off a refusal would travel in one.
+///
+/// Only the form of the presented value is served this way: a required member the request
+/// omitted carries no value to verify, so it keeps the framework's refusal.
 fn served_despite(operation: &str, violation: &Violation) -> bool {
-    operation == DESCRIBE_USER_POOL_DOMAIN
+    let presented_value = !matches!(violation.kind, ViolationKind::MissingRequiredMember);
+    (operation == DESCRIBE_USER_POOL_DOMAIN
         && violation.path == DOMAIN_MEMBER_PATH
-        && matches!(violation.kind, ViolationKind::Pattern(_))
+        && matches!(violation.kind, ViolationKind::Pattern(_)))
+        || (operation == GET_CLIENT_TOKEN
+            && violation.path == SECRET_MEMBER_PATH
+            && presented_value)
 }
 
 impl<O> WithSubmittedValues<O>

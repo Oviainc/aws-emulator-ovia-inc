@@ -108,8 +108,24 @@ fn error_message(payload: &Value) -> &str {
 }
 
 /// Create a pool named `name` and return its minted `UserPoolId` and ARN.
+///
+/// The pool is encrypted under a customer-managed key, which is what a pool has
+/// to hold to be replicated at all: "you must use a multi-region key to enable
+/// multi-region replication for a user pool"
+/// (`smithy_query(query="doc",shape="KeyConfigurationType",member="KeyType")`).
 async fn pool(router: &MultiServiceRouter, name: &str) -> (String, String) {
-    let created = ok(router, "CreateUserPool", &json!({ "PoolName": name })).await;
+    let created = ok(
+        router,
+        "CreateUserPool",
+        &json!({
+            "PoolName": name,
+            "KeyConfiguration": {
+                "KeyType": "CUSTOMER_MANAGED_KEY",
+                "KmsKeyArn": "arn:aws:kms:us-east-1:123456789012:key/multi-region-example",
+            },
+        }),
+    )
+    .await;
     let id = created["UserPool"]["Id"]
         .as_str()
         .unwrap_or_else(|| panic!("a minted pool id, got {created}"))

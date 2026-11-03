@@ -167,7 +167,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Which limit the request means is settled before anything is written, so
         // a definition that identifies no limit stores no rate.
-        let category = crate::state::api_category(&input.limit_definition).map_err(not_found)?;
+        let category =
+            crate::state::api_category(&input.limit_definition).map_err(invalid_definition)?;
 
         let mut guard = state.lock();
         let limit = guard
@@ -182,27 +183,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// How this operation renders a definition that identifies no limit.
 ///
-/// A definition naming a class or a category this account holds no limit of
-/// identifies no resource, so it is a `ResourceNotFoundException`; one that
-/// carries no identifying attribute at all is a malformed parameter instead.
-fn not_found(failure: crate::state::LimitLookupFailure) -> UpdateProvisionedLimitError {
-    use crate::state::LimitLookupFailure;
-    let message = Some(failure.message());
-    match failure {
-        LimitLookupFailure::MissingAttribute(_) => {
-            UpdateProvisionedLimitErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message,
-                    reason_code: None,
-                },
-            )
-        }
-        LimitLookupFailure::UnsupportedClass(_) | LimitLookupFailure::UnknownCategory(_) => {
-            UpdateProvisionedLimitErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException { message },
-            )
-        }
-    }
+/// A definition is the class and the attributes that "identify a specific limit"
+/// (`LimitDefinitionType` in this service's model), so one whose class, whose
+/// attributes or whose attribute VALUES identify none is a definition the request
+/// has to correct — `InvalidParameterException`, "thrown when the Amazon Cognito
+/// service encounters an invalid parameter" (this service's model) — and not a
+/// resource the account is missing: the limits this service publishes are the
+/// same for every account, so a definition that names none of them would name
+/// none in any account either. The sentence is the one both operations that
+/// resolve a definition answer with ([`crate::state::LimitLookupFailure`]).
+fn invalid_definition(failure: crate::state::LimitLookupFailure) -> UpdateProvisionedLimitError {
+    UpdateProvisionedLimitErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(failure.message()),
+        // "The reason code of the exception" (this service's model) names a
+        // further classification Amazon Cognito reports only for some refusals;
+        // none applies to a limit definition, so none is invented.
+        reason_code: None,
+    })
     .into()
 }
 

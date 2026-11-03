@@ -41,6 +41,11 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// suite creates is primary in.
 const PRIMARY_REGION: &str = "us-east-1";
 
+/// A `KeyConfiguration.KmsKeyArn`-shaped ARN (`EncryptionKeyArnType`, len
+/// 20..2048) standing for the multi-Region customer-managed key a replicated
+/// pool is encrypted under.
+const MULTI_REGION_KEY_ARN: &str = "arn:aws:kms:us-east-1:123456789012:key/multi-region-example";
+
 /// Long enough that the clock has made a created replica's activation due.
 const PAST_THE_ACTIVATION: Duration =
     REPLICA_ACTIVATION_SPAN.saturating_add(Duration::from_millis(250));
@@ -120,6 +125,11 @@ fn error_message(payload: &Value) -> &str {
 /// Create a pool on `tier` (one of the modelled `UserPoolTierType` values, or
 /// none to take the service default) and return its minted `UserPoolId` and
 /// ARN.
+///
+/// The pool is encrypted under a customer-managed key, which is what a pool has
+/// to hold to be replicated at all: "you must use a multi-region key to enable
+/// multi-region replication for a user pool"
+/// (`smithy_query(query="doc",shape="KeyConfigurationType",member="KeyType")`).
 async fn pool_in_tier(
     router: &MultiServiceRouter,
     name: &str,
@@ -127,6 +137,10 @@ async fn pool_in_tier(
 ) -> (String, String) {
     let mut body = Map::new();
     body.insert("PoolName".to_string(), json!(name));
+    body.insert(
+        "KeyConfiguration".to_string(),
+        json!({ "KeyType": "CUSTOMER_MANAGED_KEY", "KmsKeyArn": MULTI_REGION_KEY_ARN }),
+    );
     if let Some(tier) = tier {
         body.insert("UserPoolTier".to_string(), json!(tier));
     }

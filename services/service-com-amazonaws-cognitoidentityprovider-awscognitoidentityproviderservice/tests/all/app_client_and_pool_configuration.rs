@@ -136,6 +136,36 @@ async fn pool(router: &MultiServiceRouter, name: &str) -> String {
     pool_in_tier(router, name, None).await
 }
 
+/// A `KeyConfiguration.KmsKeyArn`-shaped ARN (`EncryptionKeyArnType`, len
+/// 20..2048) standing for the multi-Region customer-managed key a replicated
+/// pool is encrypted under.
+const MULTI_REGION_KEY_ARN: &str = "arn:aws:kms:us-east-1:123456789012:key/multi-region-example";
+
+/// A pool on `tier` that can be REPLICATED, and its minted id: it is encrypted
+/// under a customer-managed key, which is what a pool has to hold to be
+/// replicated at all — "you must use a multi-region key to enable multi-region
+/// replication for a user pool"
+/// (`smithy_query(query="doc",shape="KeyConfigurationType",member="KeyType")`).
+async fn replicable_pool_in_tier(router: &MultiServiceRouter, name: &str, tier: &str) -> String {
+    let created = ok(
+        router,
+        "CreateUserPool",
+        &json!({
+            "PoolName": name,
+            "UserPoolTier": tier,
+            "KeyConfiguration": {
+                "KeyType": "CUSTOMER_MANAGED_KEY",
+                "KmsKeyArn": MULTI_REGION_KEY_ARN,
+            },
+        }),
+    )
+    .await;
+    created["UserPool"]["Id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a minted pool id: {created}"))
+        .to_string()
+}
+
 /// An app client of `user_pool_id` carrying `members` beside its name, and the
 /// create's answer.
 async fn create_client(
@@ -594,7 +624,7 @@ fn replica_request(operation: &str, user_pool_id: &str, region: &str) -> Value {
 #[tokio::test]
 async fn a_region_name_that_names_no_aws_region_is_refused_by_every_replica_operation() {
     let router = router();
-    let user_pool_id = pool_in_tier(&router, "region-pool", Some("PLUS")).await;
+    let user_pool_id = replicable_pool_in_tier(&router, "region-pool", "PLUS").await;
 
     // Each operation that takes a `RegionName`, with the rest of its request.
     for operation in [

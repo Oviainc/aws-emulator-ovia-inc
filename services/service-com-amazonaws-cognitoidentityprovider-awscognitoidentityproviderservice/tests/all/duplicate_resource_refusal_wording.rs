@@ -814,8 +814,23 @@ async fn a_replica_in_the_pools_own_region_is_refused_with_the_fixed_rule() {
         ("a pool in us-west-2", "us-west-2"),
         ("a pool in eu-central-1", "eu-central-1"),
     ] {
-        let user_pool_id = pool_in(&router, region, &format!("replica-pool-{region}"), json!({}))
-            .await;
+        // The pool is encrypted under a customer-managed key, which is what a
+        // pool has to hold to be replicated at all: "you must use a
+        // multi-region key to enable multi-region replication for a user pool"
+        // (`smithy_query(query="doc",shape="KeyConfigurationType",member="KeyType")`),
+        // so the Region the replica asks for is the only thing left to refuse.
+        let user_pool_id = pool_in(
+            &router,
+            region,
+            &format!("replica-pool-{region}"),
+            json!({
+                "KeyConfiguration": {
+                    "KeyType": "CUSTOMER_MANAGED_KEY",
+                    "KmsKeyArn": "arn:aws:kms:us-east-1:123456789012:key/multi-region-example",
+                },
+            }),
+        )
+        .await;
         let (status, payload) = call_in(
             &router,
             region,

@@ -237,6 +237,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // A replicated pool's data lives in more than one Region, which the key
+        // it is encrypted under has to span: "CUSTOMER_MANAGED_KEY: a key
+        // managed by the customer in Key Management Service. You must use a
+        // multi-region key to enable multi-region replication for a user pool"
+        // (`KeyConfigurationType.KeyType` in this service's model), so a pool
+        // encrypted under the Amazon Web Services owned key
+        // ([`crate::state::DEFAULT_ENCRYPTION_KEY_TYPE`], the key type a pool
+        // that configures none holds) cannot be replicated at all. Asked of the
+        // POOL, so it is asked after the Region the request names has been
+        // shown to be one a replica could live in: a request that names no such
+        // Region is not asking for replication of this pool yet. The refusal
+        // states the key the pool needs as fixed text and interpolates nothing
+        // about the pool.
+        if !crate::state::encrypted_under_customer_managed_key(&pool.key_configuration) {
+            return Err(invalid_parameter(
+                crate::state::CUSTOMER_MANAGED_KEY_REQUIRED_MESSAGE.to_string(),
+            ));
+        }
+
         // One Region holds at most one replica of a pool, so a Region this pool
         // is already replicated to is not free.
         if pool.replicas.contains_key(&input.region_name) {

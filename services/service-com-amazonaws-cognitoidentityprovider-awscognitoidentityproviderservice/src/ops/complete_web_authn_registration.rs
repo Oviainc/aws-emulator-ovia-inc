@@ -192,24 +192,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The token is the only subject this call carries, so the pool, the user
         // and the passkeys already registered to it all come from the store.
-        let (user_pool_id, username, pool_relying_party_id, registered) = {
+        let (user_pool_id, username, pool_admits_passkeys, pool_relying_party_id, registered) = {
             let (pool, user) = guard
                 .signed_in_user(&input.access_token, now)
                 .map_err(token_rejected)?;
-
-            // A pool that does not admit the passkey factor has not enabled the
-            // feature, so it registers no passkey — whatever was started while it
-            // did.
-            if !pool.allows_first_auth_factor(crate::state::WEB_AUTHN_AUTH_FACTOR) {
-                return Err(web_authn_not_enabled());
-            }
             (
                 pool.id.clone(),
                 user.username.clone(),
+                // A pool that does not admit the passkey factor has not enabled
+                // the feature, so it registers no passkey — whatever was started
+                // while it did. Read here and asked below, after the SHAPE of
+                // the presented document.
+                pool.allows_first_auth_factor(crate::state::WEB_AUTHN_AUTH_FACTOR),
                 pool.relying_party_id(),
                 user.web_authn_credentials.len(),
             )
         };
+
+        // Whether the request carries a registration response AT ALL is settled
+        // before any precondition of the pool it would be registered against:
+        // `Credential` is "a RegistrationResponseJSON public-key credential
+        // response from the user's passkey provider" (this service's model), and
+        // a document that is not one of those is a parameter this request has to
+        // correct whatever the pool is configured for — reporting a setting of
+        // the pool instead would send the caller to change something that is not
+        // what the request got wrong. What the document SAYS — the ceremony it
+        // was collected for, the challenge it answers, the origin it was
+        // collected at — is read below, once the pool is known to register
+        // passkeys at all, because each of those is a fact about the
+        // registration rather than about the request's shape.
+        if !is_credential_document(&input.credential) {
+            return Err(invalid_credential_data());
+        }
+
+        if !pool_admits_passkeys {
+            return Err(web_authn_not_enabled());
+        }
 
         // The app client the token was issued to, which the started registration
         // recorded: the token resolved a signed-in user just above, so its record
@@ -220,8 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| not_authorized(INVALID_ACCESS_TOKEN))?;
 
         // What the passkey provider reported, read out of the presented
-        // registration response once the token has named the user it registers a
-        // passkey for.
+        // registration response.
         let presented = PresentedCredential::read(&input.credential)?;
 
         // The challenge the collected client data carries is what names the
@@ -421,6 +438,14 @@ impl PresentedCredential {
             transports: string_list(member(response, "transports")),
         })
     }
+}
+
+/// Whether `credential` is a registration-response DOCUMENT at all: a
+/// `RegistrationResponseJSON` is a JSON object (W3C Web Authentication Level 2
+/// §5.1), so a document of any other kind carries no credential to register
+/// whatever else is true of the request.
+fn is_credential_document(credential: &::aws_smithy_types::Document) -> bool {
+    matches!(credential, ::aws_smithy_types::Document::Object(_))
 }
 
 /// The member `name` of `document`, when `document` is an object that has one.

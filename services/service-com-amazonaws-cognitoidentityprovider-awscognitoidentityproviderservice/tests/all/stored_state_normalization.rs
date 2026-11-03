@@ -59,6 +59,17 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// A password satisfying a default pool's password policy.
 const GOOD_PASSWORD: &str = "Passw0rd!2024";
 
+/// The device credentials a confirm REGISTERS: "a Secure Remote Password (SRP)
+/// value that your application generates when you register a user's device"
+/// (`smithy_query(query="shape",shape="DeviceSecretVerifierConfigType")`), which
+/// `ConfirmDevice` is served only with.
+fn device_credentials() -> Value {
+    json!({
+        "PasswordVerifier": "ZGV2aWNlLXBhc3N3b3JkLXZlcmlmaWVy",
+        "Salt": "ZGV2aWNlLXNhbHQ",
+    })
+}
+
 /// The provider a `ProviderUserIdentifierType` names for a user of the pool
 /// itself: "The `ProviderName` should be set to `Cognito` for users in Cognito
 /// user pools"
@@ -925,6 +936,7 @@ async fn a_device_is_listed_while_the_user_remembers_it() {
                 "AccessToken": access_token,
                 "DeviceKey": device_key,
                 "DeviceName": "probe-device",
+                "DeviceSecretVerifierConfig": device_credentials(),
             }),
         )
         .await;
@@ -1017,7 +1029,11 @@ async fn confirm_device_refuses_every_key_that_is_not_an_unconfirmed_key_of_the_
     ok(
         &router,
         "ConfirmDevice",
-        &json!({ "AccessToken": alice_token, "DeviceKey": alice_key }),
+        &json!({
+            "AccessToken": alice_token,
+            "DeviceKey": alice_key,
+            "DeviceSecretVerifierConfig": device_credentials(),
+        }),
     )
     .await;
 
@@ -1046,7 +1062,11 @@ async fn confirm_device_refuses_every_key_that_is_not_an_unconfirmed_key_of_the_
         let (status, payload) = call(
             &router,
             "ConfirmDevice",
-            &json!({ "AccessToken": token, "DeviceKey": device_key }),
+            &json!({
+                "AccessToken": token,
+                "DeviceKey": device_key,
+                "DeviceSecretVerifierConfig": device_credentials(),
+            }),
         )
         .await;
         assert_eq!(
@@ -1061,7 +1081,11 @@ async fn confirm_device_refuses_every_key_that_is_not_an_unconfirmed_key_of_the_
     ok(
         &router,
         "ConfirmDevice",
-        &json!({ "AccessToken": bob_token, "DeviceKey": bob_key }),
+        &json!({
+            "AccessToken": bob_token,
+            "DeviceKey": bob_key,
+            "DeviceSecretVerifierConfig": device_credentials(),
+        }),
     )
     .await;
 }

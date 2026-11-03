@@ -52,6 +52,17 @@ const DEVICE_NAME_ATTRIBUTE: &str = "device_name";
 /// The modelled maximum length of a `DeviceKey` (`DeviceKeyType`, length 1..55).
 const MAX_DEVICE_KEY_LENGTH: usize = 55;
 
+/// The device credentials a confirm REGISTERS: "a Secure Remote Password (SRP)
+/// value that your application generates when you register a user's device"
+/// (`smithy_query(query="shape",shape="DeviceSecretVerifierConfigType")`), which
+/// `ConfirmDevice` is served only with.
+fn device_credentials() -> Value {
+    json!({
+        "PasswordVerifier": "ZGV2aWNlLXBhc3N3b3JkLXZlcmlmaWVy",
+        "Salt": "ZGV2aWNlLXNhbHQ",
+    })
+}
+
 /// One emulator with just this service mounted over `engine`.
 fn router_over(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
@@ -504,7 +515,11 @@ async fn a_minted_device_key_fits_the_model_in_every_region() {
         ok(
             &router,
             "ConfirmDevice",
-            &json!({ "AccessToken": access_token, "DeviceKey": device_key }),
+            &json!({
+                "AccessToken": access_token,
+                "DeviceKey": device_key,
+                "DeviceSecretVerifierConfig": device_credentials(),
+            }),
         )
         .await;
         let read = ok(
@@ -621,6 +636,10 @@ async fn confirm_device_registers_the_device_a_sign_in_minted() {
         let mut confirm = Map::new();
         confirm.insert("AccessToken".to_string(), json!(access_token));
         confirm.insert("DeviceKey".to_string(), json!(device_key));
+        confirm.insert(
+            "DeviceSecretVerifierConfig".to_string(),
+            device_credentials(),
+        );
         if let Some(device_name) = row.device_name {
             confirm.insert("DeviceName".to_string(), json!(device_name));
         }
@@ -787,7 +806,13 @@ async fn the_device_surface_refuses_what_it_cannot_serve() {
         RefusalRow {
             case: "ConfirmDevice with a device key nothing minted",
             operation: "ConfirmDevice",
-            body: |_, token| json!({ "AccessToken": token, "DeviceKey": UNKNOWN_DEVICE_KEY }),
+            body: |_, token| {
+                json!({
+                    "AccessToken": token,
+                    "DeviceKey": UNKNOWN_DEVICE_KEY,
+                    "DeviceSecretVerifierConfig": device_credentials(),
+                })
+            },
             status: 400,
             code: "InvalidParameterException",
         },
@@ -910,7 +935,11 @@ async fn the_device_surface_refuses_what_it_cannot_serve() {
         (
             "ConfirmDevice on a pool with no DeviceConfiguration",
             "ConfirmDevice",
-            json!({ "AccessToken": bare_token, "DeviceKey": UNKNOWN_DEVICE_KEY }),
+            json!({
+                "AccessToken": bare_token,
+                "DeviceKey": UNKNOWN_DEVICE_KEY,
+                "DeviceSecretVerifierConfig": device_credentials(),
+            }),
         ),
         (
             "AdminListDevices on a pool with no DeviceConfiguration",
@@ -1062,7 +1091,11 @@ async fn the_device_listing_follows_what_was_confirmed_and_forgotten() {
         ok(
             &router,
             "ConfirmDevice",
-            &json!({ "AccessToken": access_token, "DeviceKey": key }),
+            &json!({
+                "AccessToken": access_token,
+                "DeviceKey": key,
+                "DeviceSecretVerifierConfig": device_credentials(),
+            }),
         )
         .await;
     }
@@ -1073,7 +1106,11 @@ async fn the_device_listing_follows_what_was_confirmed_and_forgotten() {
     ok(
         &router,
         "ConfirmDevice",
-        &json!({ "AccessToken": bobs_token, "DeviceKey": bobs_key }),
+        &json!({
+            "AccessToken": bobs_token,
+            "DeviceKey": bobs_key,
+            "DeviceSecretVerifierConfig": device_credentials(),
+        }),
     )
     .await;
 
@@ -1214,7 +1251,11 @@ async fn updating_a_devices_status_persists_the_remembered_answer() {
             ok(
                 &router,
                 "ConfirmDevice",
-                &json!({ "AccessToken": access_token, "DeviceKey": device_key }),
+                &json!({
+                    "AccessToken": access_token,
+                    "DeviceKey": device_key,
+                    "DeviceSecretVerifierConfig": device_credentials(),
+                }),
             )
             .await;
 

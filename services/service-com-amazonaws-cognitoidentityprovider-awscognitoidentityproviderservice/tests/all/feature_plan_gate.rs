@@ -113,9 +113,19 @@ fn error_message(payload: &Value) -> &str {
 
 /// A pool named `name` on `tier`, or on the service default when `tier` is
 /// `None`, and its minted id.
+///
+/// Every pool of this suite is encrypted under a customer-managed key, so that
+/// what a gated feature's request is refused for is the pool's PLAN alone:
+/// replication additionally needs that key type — "you must use a multi-region
+/// key to enable multi-region replication for a user pool"
+/// (`smithy_query(query="doc",shape="KeyConfigurationType",member="KeyType")`).
 async fn pool_in_tier(router: &MultiServiceRouter, name: &str, tier: Option<&str>) -> String {
     let mut body = Map::new();
     body.insert("PoolName".to_string(), json!(name));
+    body.insert(
+        "KeyConfiguration".to_string(),
+        json!({ "KeyType": "CUSTOMER_MANAGED_KEY", "KmsKeyArn": MULTI_REGION_KEY_ARN }),
+    );
     if let Some(tier) = tier {
         body.insert("UserPoolTier".to_string(), json!(tier));
     }
@@ -125,6 +135,11 @@ async fn pool_in_tier(router: &MultiServiceRouter, name: &str, tier: Option<&str
         .unwrap_or_else(|| panic!("a minted pool id: {created}"))
         .to_string()
 }
+
+/// A `KeyConfiguration.KmsKeyArn`-shaped ARN (`EncryptionKeyArnType`, len
+/// 20..2048) standing for the multi-Region customer-managed key a replicated
+/// pool is encrypted under.
+const MULTI_REGION_KEY_ARN: &str = "arn:aws:kms:us-east-1:123456789012:key/multi-region-example";
 
 /// One plan-gated feature: the request that asks for it, the cheapest plan that
 /// includes it, the name a refusal gives it, and the read that shows whether

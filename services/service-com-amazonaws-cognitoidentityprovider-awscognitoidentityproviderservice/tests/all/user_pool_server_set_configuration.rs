@@ -926,8 +926,24 @@ async fn a_listing_entry_reports_the_trigger_configuration_and_the_pools_regions
     }
 
     // A pool replicated to another Region reports both Regions, so the member is
-    // computed from the pool's replicas rather than fixed.
-    let (_, replicated) = &created[0];
+    // computed from the pool's replicas rather than fixed. The pool is encrypted
+    // under a customer-managed key, which is what a pool has to hold to be
+    // replicated at all: "you must use a multi-region key to enable
+    // multi-region replication for a user pool"
+    // (`smithy_query(query="doc",shape="KeyConfigurationType",member="KeyType")`).
+    let replicated = pool_id(
+        &create(
+            &router,
+            &json!({
+                "PoolName": "listed-replicated",
+                "KeyConfiguration": {
+                    "KeyType": "CUSTOMER_MANAGED_KEY",
+                    "KmsKeyArn": "arn:aws:kms:us-east-1:123456789012:key/multi-region-example",
+                },
+            }),
+        )
+        .await,
+    );
     ok(
         &router,
         "CreateUserPoolReplica",

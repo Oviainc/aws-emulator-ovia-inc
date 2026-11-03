@@ -406,9 +406,10 @@ pub const SESSION_EXPIRED_MESSAGE: &str = "Invalid session for the user, session
 /// (`smithy_query(query="operation",operation="AdminRespondToAuthChallenge")`) —
 /// and a response carries the state of its sign-in in the `Session` beside the
 /// code, so a value that names no outstanding challenge is a mismatch of that
-/// state rather than a statement about any user. The sentence names neither the
-/// session nor the user, so every such refusal carries this one sentence.
-pub const INVALID_AUTH_STATE_MESSAGE: &str = "Invalid code or auth state for the user.";
+/// state rather than a statement about any user. The sentence reports the pair
+/// the response presented without saying which half of it was not accepted, and
+/// names neither value, so every such refusal carries this one sentence.
+pub const INVALID_AUTH_STATE_MESSAGE: &str = "Invalid code/session provided";
 
 /// `UserPoolTierType` defaults to `ESSENTIALS` (`CreateUserPool.UserPoolTier`).
 const DEFAULT_USER_POOL_TIER: &str = ESSENTIALS_USER_POOL_TIER;
@@ -6758,6 +6759,45 @@ pub const DEFAULT_ISSUER_TYPE: &str = "ORIGINAL";
 /// [`crate::ops::types::ENCRYPTION_KEY_TYPE_VALUES`].
 pub const DEFAULT_ENCRYPTION_KEY_TYPE: &str = "AWS_OWNED_KEY";
 
+/// The `KeyConfiguration.KeyType` of a pool encrypted under a key its own
+/// account manages, which is the key type multi-Region replication needs
+/// ([`encrypted_under_customer_managed_key`]). One of
+/// [`crate::ops::types::ENCRYPTION_KEY_TYPE_VALUES`].
+pub const CUSTOMER_MANAGED_KEY_TYPE: &str = "CUSTOMER_MANAGED_KEY";
+
+/// What a pool that cannot be replicated because of the key it is encrypted
+/// under is refused with.
+///
+/// `KeyConfigurationType.KeyType` documents the requirement on the key type that
+/// admits replication — "CUSTOMER_MANAGED_KEY: a key managed by the customer in
+/// Key Management Service. You must use a multi-region key to enable
+/// multi-region replication for a user pool" (this service's model) — and the
+/// sentence states the key the pool needs and the feature it needs it for,
+/// naming nothing from the request or the pool.
+pub const CUSTOMER_MANAGED_KEY_REQUIRED_MESSAGE: &str =
+    "User pool needs a customer-managed KMS key for multi-region replication";
+
+/// Whether `configuration` encrypts a pool under a customer-managed key, which
+/// is the key type a multi-Region pool's data has to live under
+/// ([`CUSTOMER_MANAGED_KEY_REQUIRED_MESSAGE`]).
+///
+/// Read off the STORED configuration, which always names a key type
+/// ([`effective_key_configuration`]), so a pool that configured none is the
+/// Amazon Web Services owned key it holds by default. A configuration naming a
+/// `KmsKeyArn` is encrypted under that key whatever key type it names beside it:
+/// "the Amazon Resource Name (ARN) of the KMS key used for encryption. If not
+/// specified, Amazon Web Services managed keys are used"
+/// (`KeyConfigurationType.KmsKeyArn` in this service's model), so the pool that
+/// specifies one is the pool whose own key is in use.
+#[must_use]
+pub fn encrypted_under_customer_managed_key(configuration: &KeyConfigurationType) -> bool {
+    configuration.key_type.as_deref() == Some(CUSTOMER_MANAGED_KEY_TYPE)
+        || configuration
+            .kms_key_arn
+            .as_deref()
+            .is_some_and(|arn| !arn.is_empty())
+}
+
 /// The `DefaultEmailOption` a pool that configures no verification message gets:
 /// a verification email carries a code rather than a clickable link, which is
 /// the option the code-bearing `{####}` template of
@@ -9047,19 +9087,22 @@ pub const API_CATEGORIES: &[ApiCategory] = &[
     },
 ];
 
-/// Why a limit definition identifies no limit this account holds.
+/// Why a limit definition identifies no limit of this service.
 ///
-/// Both operations resolve a definition the same way, so both render these; a
-/// rate refusal is [`RateRefusal`], which only the operation that requests a
-/// rate can reach.
+/// Every one of these is a defect of the DEFINITION the request carried — a
+/// class, an attribute or a value that identifies no limit this service
+/// publishes — rather than a limit the account is missing, so each is reported
+/// as a bad parameter by both operations that resolve a definition. Both
+/// operations resolve one the same way, so both render these; a rate refusal is
+/// [`RateRefusal`], which only the operation that requests a rate can reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LimitLookupFailure {
-    /// The definition names a limit class this service holds no limits of.
+    /// The definition names a limit class this service publishes no limits of.
     UnsupportedClass(String),
     /// The definition carries none of the attributes that identify which limit
     /// of its class is meant; the attribute it has to carry is named.
     MissingAttribute(&'static str),
-    /// The definition's attributes identify no limit this account holds.
+    /// The definition's attributes name no limit of its class.
     UnknownCategory(String),
 }
 
@@ -9067,18 +9110,22 @@ impl LimitLookupFailure {
     /// What a refusal tells the caller, which is the same sentence whichever
     /// operation was refused: the caller has to correct the same definition
     /// from it either way.
+    ///
+    /// A value the definition carried that names nothing is reported as
+    /// UNKNOWN, with the class it was looked up under and the value itself —
+    /// the two things the caller has to change — and nothing about the account.
     #[must_use]
     pub fn message(&self) -> String {
         match self {
             Self::UnsupportedClass(class) => {
-                format!("There is no limit of class {class} in this account.")
+                format!("Unknown limit class: {class}")
             }
             Self::MissingAttribute(attribute) => format!(
                 "The limit definition must include the attribute {attribute} to identify \
                  the {API_CATEGORY_LIMIT_CLASS} limit it means."
             ),
             Self::UnknownCategory(category) => {
-                format!("There is no limit for API category {category} in this account.")
+                format!("Unknown {API_CATEGORY_LIMIT_CLASS} category: {category}")
             }
         }
     }

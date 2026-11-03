@@ -60,6 +60,17 @@ const UNMINTED_BRANDING: &str = "2ee7b8c3-7a2b-4a4d-9c0e-3d5f7a9b1c2e";
 /// (`^[\w-]+_[0-9a-f-]+$`, from `smithy_query(query="operation",operation="AdminGetDevice")`).
 const UNMINTED_DEVICE: &str = "us-east-1_00000000-0000-4000-8000-000000000000";
 
+/// The device credentials a confirm REGISTERS: "a Secure Remote Password (SRP)
+/// value that your application generates when you register a user's device"
+/// (`smithy_query(query="shape",shape="DeviceSecretVerifierConfigType")`), which
+/// `ConfirmDevice` is served only with.
+fn device_credentials() -> Value {
+    json!({
+        "PasswordVerifier": "ZGV2aWNlLXBhc3N3b3JkLXZlcmlmaWVy",
+        "Salt": "ZGV2aWNlLXNhbHQ",
+    })
+}
+
 /// A Region of this emulator's Region catalog that no pool below is replicated to, so it
 /// names no replica. `RegionNameType` bounds only the length (5..32,
 /// `smithy_query(query="operation",operation="DeleteUserPoolReplica")`), so which values
@@ -300,7 +311,11 @@ async fn every_self_service_and_lookup_refusal_is_a_400_naming_its_error_shape()
         Refusal {
             case: "ConfirmDevice on a live token naming a device key no sign-in minted",
             operation: "ConfirmDevice",
-            body: json!({ "AccessToken": &alice_token, "DeviceKey": UNMINTED_DEVICE }),
+            body: json!({
+                "AccessToken": &alice_token,
+                "DeviceKey": UNMINTED_DEVICE,
+                "DeviceSecretVerifierConfig": device_credentials(),
+            }),
             class: "InvalidParameterException",
         },
     ];
@@ -355,6 +370,7 @@ async fn the_same_calls_are_served_for_a_token_and_resources_this_service_holds(
             "AccessToken": &alice_token,
             "DeviceKey": &alice_device,
             "DeviceName": "a-laptop",
+            "DeviceSecretVerifierConfig": device_credentials(),
         }),
     )
     .await;

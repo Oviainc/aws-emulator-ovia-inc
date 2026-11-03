@@ -308,29 +308,30 @@ async fn a_rate_outside_the_accounts_range_is_refused_and_stores_nothing() {
 async fn a_definition_that_identifies_no_limit_is_refused_by_both_operations() {
     let router = router();
 
-    // A category this account holds no limit for identifies no resource, while a
-    // definition that names no category at all identifies nothing of its class:
-    // the two carry different errors.
+    // A definition that identifies no limit is a definition the request has to
+    // correct, whichever part of it names nothing: a category value the service
+    // publishes no limit of, and attributes that name no category at all, carry
+    // the same class and differ only in the sentence.
     let rows: Vec<(String, Value, u16, &str, String)> = vec![
         (
-            "a category the account holds no limit for".to_string(),
+            "a category the service publishes no limit of".to_string(),
             definition("UserDeletion"),
             400,
-            "ResourceNotFoundException",
+            "InvalidParameterException",
             unknown_category_message("UserDeletion"),
         ),
         (
             "a category differing only in case".to_string(),
             definition("usercreation"),
             400,
-            "ResourceNotFoundException",
+            "InvalidParameterException",
             unknown_category_message("usercreation"),
         ),
         (
             "the empty category".to_string(),
             definition(""),
             400,
-            "ResourceNotFoundException",
+            "InvalidParameterException",
             unknown_category_message(""),
         ),
         (
@@ -392,9 +393,10 @@ fn above_maximum_message(requested: i64, maximum: i64) -> String {
     )
 }
 
-/// What a refusal says for a category the account holds no limit for.
+/// What a refusal says for a category value the service publishes no limit of:
+/// the class the definition looked it up under and the value itself.
 fn unknown_category_message(category: &str) -> String {
-    format!("There is no limit for API category {category} in this account.")
+    format!("Unknown API_CATEGORY category: {category}")
 }
 
 /// What a refusal says for a definition that names no category.
