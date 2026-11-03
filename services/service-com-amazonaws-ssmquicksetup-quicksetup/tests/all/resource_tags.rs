@@ -23,8 +23,10 @@
 //! key the resource does not carry as nothing to do — so a later
 //! `GetConfigurationManager` reports what is left and repeating the same request answers
 //! the same way (the operation is `@idempotent`). An ARN naming no stored resource is
-//! refused by that same stage, and a request naming no key at all is the modelled 400
-//! with nothing removed.
+//! refused by that same stage, and a request naming no key at all names no route of this
+//! endpoint — `TagKeys` is `@required` and bound to the `tagKeys` query parameter — so it
+//! is refused by the front door ahead of the handler, with nothing removed
+//! (`tests/all/unroutable_requests.rs` owns that rule).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

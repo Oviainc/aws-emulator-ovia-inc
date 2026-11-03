@@ -28,9 +28,9 @@
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
 //! - `override_routing_error` — how this service words a request that reached it
-//!   but named no modeled operation. The default returns `None`, so the entry
-//!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
-//!   404, …). Return `Some(resp)` to answer in your own envelope if desired.
+//!   but named no modeled operation. EDITED here: such a request is refused by the
+//!   front door described below, rather than with the framework's own
+//!   unimplemented-route answer.
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
@@ -82,6 +82,27 @@
 //! the definition id under a manager that does exist, the tags, the parameters, the
 //! teardown already in flight — belongs to the handler and is answered in this service's
 //! own modelled shapes.
+//!
+//! ## The front door's answer to a request that names no route
+//!
+//! A request this service claims but that resolves to NO modelled route is refused by the
+//! same front door, with the same status, wire error code and one fixed sentence: it names
+//! no operation, so nothing of this service's own — no modelled error, and no report about
+//! the emulator — is what it earns. Two shapes of request land there, and the refusal is
+//! one rule over both:
+//!
+//! * a method and path that match no route of this endpoint at all;
+//! * a method and path that match one, while the request carries no value for a `@required`
+//!   query or header member that route binds — the operation could not be invoked without
+//!   it, so the route does not match it either. `UntagResource`'s `TagKeys` is the case
+//!   this service has: `@required` and bound to the `tagKeys` query parameter, so an SDK
+//!   asked to remove an EMPTY set of keys sends `DELETE /tags/{ResourceArn}` with no query
+//!   at all, and that request names no route.
+//!
+//! [`Service::override_routing_error`] is the seam the framework offers for exactly this,
+//! and it is what [`EmulatedService`] answers it on, so the refusal is stated once for
+//! every route rather than guessed at per operation — and a handler behind the front door
+//! may rely on having been reached only by a request that named its route.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
@@ -458,14 +479,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_routing_error(&self, req: &RtRequest) -> Option<RtResponse> {
-        // The router calls this when a request reached this service but named no
-        // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // The router calls this when a request reached this service but named no modelled
+        // operation — neither `override_operation` nor the generated routing table resolved
+        // it, because its method and path match no route of this endpoint, or the route
+        // they match binds a `@required` query or header value the request does not carry,
+        // without which that operation cannot be invoked.
+        //
+        // Such a request is stopped by the same front door that judges a route's target
+        // ARN (see the module docs), and is answered the same way: the status, the wire
+        // error code and the one fixed sentence that layer states for everything it
+        // refuses. The framework's default would instead report this emulator's own
+        // unimplemented-route answer, which is not an outcome this service has — every
+        // operation it models is implemented, so a request that names no route is one its
+        // front door never admits rather than one nobody has written.
+        Some(unauthorized(self, req))
     }
 
     fn override_framework_error(

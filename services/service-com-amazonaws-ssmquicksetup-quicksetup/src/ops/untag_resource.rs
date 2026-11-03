@@ -146,9 +146,10 @@ impl From<UntagResourceErrorModeled> for UntagResourceError {
 /// * the list carries no modelled length, so its only bound is the store's own
 ///   (`crate::state::MAX_TAGS`, the most tags one configuration manager may carry): a
 ///   longer list cannot name a key any resource holds, and is refused rather than
-///   walked under the lock. An EMPTY list needs no refusal — the route matches only a
-///   request carrying the `@required` `tagKeys` parameter, and removing no key would be
-///   the same no-op as removing a key the resource does not carry;
+///   walked under the lock. An EMPTY list needs no refusal HERE — it names no route of
+///   this endpoint, because `TagKeys` is `@required` and bound to the `tagKeys` query
+///   parameter, so a request carrying none of it is refused by the front door
+///   (`crate::service`) ahead of this handler;
 /// * a key under the AWS-reserved prefix names a tag that is not the caller's to
 ///   delete, so it is refused rather than removed or silently reported as removed —
 ///   `crate::state::reserved_tag_key_rejection` is the one place that rule lives,
