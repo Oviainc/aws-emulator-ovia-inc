@@ -49,12 +49,29 @@
 //! receives the payload the template spells out rather than the record envelope
 //! ([`render_template`]).
 //!
+//! A JSON path reads a record the way the filter's patterns do — the message body in the
+//! format its producer sent it in ([`read_body`]) — so a path INTO a body spelling a JSON
+//! document selects the member it names in that document, whether the path is a
+//! placeholder of an `InputTemplate` or the value of a target parameter. Only the readers
+//! change: what a stage handed the event itself receives is the envelope with the body as
+//! sent.
+//!
 //! A batch is finished with its source only once every event derived from it has been
 //! delivered: a queue's records are deleted then and not before, so a target the pipe
 //! could not reach leaves them on the queue to reappear when their visibility timeout
 //! lapses, and a stream's read position moves on then and not before, so the same
 //! records are read again. Either way delivery is at-least-once, which is what the
 //! service promises for a stream source.
+//!
+//! A polled queue batch is a CHECKOUT, and the pipe is one consumer of that queue among
+//! others: the records a receive handed over are hidden from every other consumer for the
+//! queue's own `VisibilityTimeout`, and when that span lapses they are visible again,
+//! their delivery count raised, for whoever receives them next. So a pipe that could not
+//! move a batch waits that checkout out before it reads the source again, and leaves the
+//! records it failed visible for a grace of their own ([`source_free_again`]): a pipe
+//! retrying a delivery it keeps failing paces its reads by that rather than by the
+//! interval a healthy pipe polls at, so the release of the records it is holding is
+//! something the other consumers of its source can see and act on.
 //!
 //! The poller is started by the operations that make a pipe RUNNING (`CreatePipe`,
 //! `StartPipe`, `UpdatePipe`) and ends itself as soon as the pipe's `CurrentState` is no
@@ -119,6 +136,28 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(250);
 /// service does, and it is what lets a pipe recover when the resource comes back — but
 /// it does so at this interval rather than at the rate a healthy pipe polls.
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+
+/// How long the records a failed batch left on an Amazon SQS source are left VISIBLE,
+/// after the checkout that hid them has lapsed, before this poller reads that source
+/// again.
+///
+/// A receive is an atomic checkout shared with every other consumer of the queue, so the
+/// instant a failed batch's checkout lapses its records are the queue's to hand to
+/// whoever receives next — and a poller that re-claimed them inside its own poll interval
+/// would make that release unobservable to any other consumer. This span is the
+/// EMULATOR's choice of "paced like a service rather than like a loop": long enough that a
+/// consumer polling the queue sees the records come back and reads the delivery count they
+/// came back with, short enough that a pipe whose target recovers moves them promptly.
+const RELEASED_RECORD_GRACE: Duration = Duration::from_secs(5);
+
+/// The longest a pipe leaves its source unread after a batch it could not move.
+///
+/// The checkout a failed batch left behind is as long as the queue says
+/// (`VisibilityTimeout` reaches 12 hours), and the records that arrive while the pipe waits
+/// are not the ones it failed. This is the EMULATOR's bound on that wait, so a pipe whose
+/// target keeps refusing it still takes up what arrives afterwards instead of standing
+/// still for the whole of a long checkout.
+const MAX_SOURCE_HOLD_OFF: Duration = Duration::from_secs(60);
 
 /// How often a pipe that keeps failing says so: the first failure, and every this many
 /// after it, so one broken pipe cannot fill the log.
@@ -225,6 +264,7 @@ const MAX_DESCRIBE_STREAM_PAGES: usize = 10;
 /// ([`super::execution_role`]).
 const RECEIVE_MESSAGE_ACTION: &str = "sqs:ReceiveMessage";
 const DELETE_MESSAGE_ACTION: &str = "sqs:DeleteMessage";
+const GET_QUEUE_ATTRIBUTES_ACTION: &str = "sqs:GetQueueAttributes";
 const SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";
 const INVOKE_FUNCTION_ACTION: &str = "lambda:InvokeFunction";
 const START_SYNC_EXECUTION_ACTION: &str = "states:StartSyncExecution";
@@ -418,6 +458,11 @@ async fn poll_pipe(
     // Where a DynamoDB-stream source has been read up to, for the length of this poller.
     let mut cursors = StreamCursors::default();
     let mut failures = 0u32;
+    // When this poller may read its source again. A batch it could not move left its
+    // records checked out of that source, and they are the source's to hand to its other
+    // consumers once that checkout lapses ([`source_free_again`]), so the source is left
+    // alone until then.
+    let mut hold_source_until: Option<Instant> = None;
     loop {
         let pass = {
             let mut store = state.lock();
@@ -461,7 +506,17 @@ async fn poll_pipe(
                 // A RUNNING pipe publishes for every minute it runs, so its counters
                 // exist and read 0 for a minute in which nothing of their kind happened.
                 metrics.open_window();
-                match move_one_batch(callback, &mut clients, &mut cursors, &record, &run).await {
+                if hold_source_until.is_some_and(|until| Instant::now() < until) {
+                    // Waiting out the checkout of a batch this pipe could not move: it is
+                    // running — it keeps publishing, and it keeps re-reading its own
+                    // record — but it takes nothing from its source, so the records it
+                    // failed are the queue's to hand over when they come back.
+                    ::tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+                hold_source_until = None;
+                let moved = move_one_batch(callback, &mut clients, &mut cursors, &record, &run).await;
+                match moved {
                     Batch::Moved { events } => {
                         metrics.count(super::metrics::EVENT_COUNT_METRIC, events);
                         failures = 0;
@@ -486,6 +541,7 @@ async fn poll_pipe(
                         stage,
                         events,
                         detail,
+                        checked_out,
                     } => {
                         // The events the failed execution took from its source still
                         // entered the pipe, and the execution itself failed — at the stage
@@ -507,6 +563,17 @@ async fn poll_pipe(
                                  target; the records stay on the source and it tries again"
                             );
                         }
+                        // The records it failed are still checked out of the source: it
+                        // reads that source again once they have come back and been left
+                        // for its other consumers to take.
+                        hold_source_until = source_free_again(
+                            callback,
+                            &mut clients,
+                            &record,
+                            &run,
+                            checked_out,
+                        )
+                        .await;
                         ::tokio::time::sleep(retry_backoff(failures)).await;
                     }
                 }
@@ -521,6 +588,72 @@ fn retry_backoff(failures: u32) -> Duration {
     RETRY_BACKOFF
         .saturating_mul(failures.max(1))
         .min(MAX_RETRY_BACKOFF)
+}
+
+/// When this poller may read its source again, after a batch it could not move left
+/// records checked out of that source.
+///
+/// A polled Amazon SQS batch is a CHECKOUT: the records a receive handed over are hidden
+/// from every other consumer of the queue for the queue's own `VisibilityTimeout` — "the
+/// length of time, in seconds, that a message received from a queue will be invisible to
+/// other receiving components" (`SetQueueAttributes$Attributes`) — and when that span
+/// lapses they are visible again, their delivery count raised, for whoever receives them
+/// next. A pipe that could not move them has not finished with them, so it waits that
+/// checkout out and then leaves them to the queue for [`RELEASED_RECORD_GRACE`] rather than
+/// re-claiming them inside its own poll interval, which no other consumer could observe.
+/// The wait is capped at [`MAX_SOURCE_HOLD_OFF`], so a long checkout does not stop the pipe
+/// from taking up what arrives while it waits.
+///
+/// The queue's own timeout is read with `GetQueueAttributes`, one of the calls an Amazon SQS
+/// source's own stage makes and the role is asked about ([`LiveRecord::refusal`]). `None` —
+/// the plain [`retry_backoff`] is what paces the retry — for a failure that checked nothing
+/// out, for a source whose records are no checkout (a stream read is not), and for a queue
+/// whose timeout this pipe may not read or that did not answer: nothing is then known about
+/// when the records come back.
+async fn source_free_again(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    clients: &mut Clients,
+    record: &LiveRecord<'_>,
+    run: &RunningPipe,
+    checked_out: Option<Instant>,
+) -> Option<Instant> {
+    let checked_out = checked_out?;
+    let Source::Queue { url } = &run.source else {
+        return None;
+    };
+    if let Some(detail) = record.refusal(GET_QUEUE_ATTRIBUTES_ACTION, &run.source_arn) {
+        ::tracing::debug!(
+            queue = %url,
+            detail = %detail,
+            "a pipe could not read how long its source holds the records it failed to \
+             move; it retries at its own interval"
+        );
+        return None;
+    }
+    let answer = clients
+        .sqs(callback, &run.source_region)
+        .get_queue_attributes()
+        .queue_url(url)
+        .attribute_names(::aws_sdk_sqs::types::QueueAttributeName::VisibilityTimeout)
+        .send()
+        .await
+        .map_err(|error| {
+            ::tracing::debug!(
+                queue = %url,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "a pipe could not read its source queue's visibility timeout; it retries \
+                 at its own interval"
+            );
+        })
+        .ok()?;
+    let seconds: u64 = answer
+        .attributes
+        .as_ref()?
+        .get(&::aws_sdk_sqs::types::QueueAttributeName::VisibilityTimeout)?
+        .parse()
+        .ok()?;
+    let held = Duration::from_secs(seconds).saturating_add(RELEASED_RECORD_GRACE);
+    Some(checked_out + held.min(MAX_SOURCE_HOLD_OFF))
 }
 
 /// What the poller does next for the pipe it claims, releasing its claim when the answer
@@ -615,6 +748,11 @@ enum Batch {
         stage: Stage,
         events: usize,
         detail: String,
+        /// When the records this batch failed were checked out of their source, for a
+        /// source whose records are a checkout, so the poller knows when they are the
+        /// source's to hand over again ([`source_free_again`]). `None` when the failure
+        /// checked nothing out.
+        checked_out: Option<Instant>,
     },
 }
 
@@ -640,12 +778,16 @@ async fn move_one_batch(
                 stage: Stage::Source,
                 events: 0,
                 detail,
+                checked_out: None,
             }
         }
     };
     if polled.is_empty() {
         return Batch::Idle;
     }
+    // When the source handed these records over, for a source they are checked OUT of:
+    // every failure below leaves them there, so this is when they come back.
+    let checked_out = polled.checked_out();
     // One batch is moved under ONE configuration, and it is the pipe's own: records polled
     // under a configuration the pipe has since left are not handed to the stages that
     // configuration named, so nothing is delivered or deleted on behalf of a record that
@@ -663,6 +805,7 @@ async fn move_one_batch(
                 stage: Stage::Source,
                 events: taken,
                 detail,
+                checked_out,
             }
         }
     };
@@ -690,6 +833,7 @@ async fn move_one_batch(
                         stage: Stage::Enrichment,
                         events: taken,
                         detail,
+                        checked_out,
                     }
                 }
             };
@@ -700,6 +844,7 @@ async fn move_one_batch(
                     stage: Stage::Enrichment,
                     events: taken,
                     detail,
+                    checked_out,
                 };
             }
             match invoke_enrichment(callback, clients, enrichment, &handed).await {
@@ -709,6 +854,7 @@ async fn move_one_batch(
                         stage: Stage::Enrichment,
                         events: taken,
                         detail,
+                        checked_out,
                     }
                 }
             }
@@ -724,34 +870,47 @@ async fn move_one_batch(
                 stage: Stage::Target,
                 events: taken,
                 detail,
+                checked_out,
             };
         }
     }
 
     // One target call per event, never one call holding the array. What the target
     // RECEIVES is the event rendered through the TARGET's input template, when the pipe
-    // carries one; the target parameters are read from the event itself either way.
+    // carries one; the target parameters are read from the event itself either way. Both
+    // of those read the event through its PATHS, so both see the message body in the
+    // format its producer sent it in — while the event a target with no template is
+    // handed is the envelope itself, body as sent.
     for event in &events {
+        let read = path_view(event);
         let payload = match run.target_template.as_deref() {
-            None => ::std::borrow::Cow::Borrowed(event),
-            Some(template) => match render_template(template, event) {
-                Ok(payload) => ::std::borrow::Cow::Owned(payload),
+            None => Cow::Borrowed(event),
+            Some(template) => match render_template(template, read.as_ref()) {
+                Ok(payload) => Cow::Owned(payload),
                 Err(detail) => {
                     return Batch::Failed {
                         stage: Stage::Target,
                         events: taken,
                         detail,
+                        checked_out,
                     }
                 }
             },
         };
-        if let Err(detail) =
-            deliver_event(callback, clients, &run.target, payload.as_ref(), event).await
+        if let Err(detail) = deliver_event(
+            callback,
+            clients,
+            &run.target,
+            payload.as_ref(),
+            read.as_ref(),
+        )
+        .await
         {
             return Batch::Failed {
                 stage: Stage::Target,
                 events: taken,
                 detail,
+                checked_out,
             };
         }
     }
@@ -777,7 +936,7 @@ async fn finish_batch(
     polled: &Polled,
 ) {
     match polled {
-        Polled::Messages(messages) => {
+        Polled::Messages { messages, .. } => {
             let Source::Queue { url } = &run.source else {
                 return;
             };
@@ -897,7 +1056,14 @@ impl LiveRecord<'_> {
 /// and a stream batch holds the shard it came from and the position after it.
 enum Polled {
     /// Amazon SQS messages, in the order they were received.
-    Messages(Vec<::aws_sdk_sqs::types::Message>),
+    Messages {
+        messages: Vec<::aws_sdk_sqs::types::Message>,
+        /// When the LAST receive of this poll handed records over: a received record is
+        /// hidden from every other consumer of the queue from that instant, for the
+        /// queue's own visibility timeout, so this is where the checkout of the batch as a
+        /// whole is counted from.
+        checked_out: Instant,
+    },
     /// One shard's stream records, in the order the changes were applied.
     Records(StreamBatch),
 }
@@ -906,7 +1072,7 @@ impl Polled {
     /// How many source records this poll took.
     fn len(&self) -> usize {
         match self {
-            Self::Messages(messages) => messages.len(),
+            Self::Messages { messages, .. } => messages.len(),
             Self::Records(batch) => batch.records.len(),
         }
     }
@@ -916,11 +1082,25 @@ impl Polled {
         self.len() == 0
     }
 
+    /// When these records were checked OUT of their source, for a source a poll takes a
+    /// checkout on.
+    ///
+    /// An Amazon SQS receive is one: what it hands over is invisible to every other
+    /// consumer of the queue for the queue's visibility timeout, and comes back when that
+    /// lapses. A stream read is not: a shard iterator names a position and takes nothing
+    /// away from anyone, so there is nothing to come back and this answers `None`.
+    fn checked_out(&self) -> Option<Instant> {
+        match self {
+            Self::Messages { checked_out, .. } => Some(*checked_out),
+            Self::Records(_) => None,
+        }
+    }
+
     /// The WHOLE poll as the record envelopes a pipe hands to its stages, in the order
     /// the records were polled in.
     fn envelopes(&self, run: &RunningPipe) -> Result<Vec<Value>, String> {
         match self {
-            Self::Messages(messages) => Ok(messages
+            Self::Messages { messages, .. } => Ok(messages
                 .iter()
                 .map(|message| queue_record_envelope(message, &run.source_arn, &run.source_region))
                 .collect()),
@@ -1018,8 +1198,15 @@ async fn collect_batch(
                 return Err(detail);
             }
             let mut collected = receive(callback, clients, run, url, run.batch_size).await?;
+            // When the queue handed these records over, and therefore when it hid them
+            // from its other consumers: the LAST receive that added to the batch, because
+            // each receive hides what it hands over from the moment it is made.
+            let mut checked_out = Instant::now();
             if collected.is_empty() {
-                return Ok(Polled::Messages(collected));
+                return Ok(Polled::Messages {
+                    messages: collected,
+                    checked_out,
+                });
             }
             let deadline = Instant::now() + run.batching_window;
             // The run gate, re-read before every FURTHER read of this source (the first
@@ -1036,10 +1223,14 @@ async fn collect_batch(
                 if more.is_empty() {
                     ::tokio::time::sleep(POLL_INTERVAL).await;
                 } else {
+                    checked_out = Instant::now();
                     collected.extend(more);
                 }
             }
-            Ok(Polled::Messages(collected))
+            Ok(Polled::Messages {
+                messages: collected,
+                checked_out,
+            })
         }
         Source::Stream { starting_position } => {
             let batch =
@@ -1473,38 +1664,9 @@ struct FilterView<'a> {
 
 impl<'a> FilterView<'a> {
     /// How the filter stage reads `event`.
-    ///
-    /// The body is parsed at most once per record, and what it may be is already bounded
-    /// by the largest message its source accepts, so the parse is bounded by the poll
-    /// that collected the record.
     fn of(event: &'a Value) -> Self {
-        let Some(text) = event.get(RECORD_BODY).and_then(Value::as_str) else {
-            return Self {
-                format: None,
-                event: Cow::Borrowed(event),
-            };
-        };
-        // A body is in a JSON format when it spells a JSON DOCUMENT — an object or a
-        // list, which is what a clause names fields inside. A body spelling a bare scalar
-        // names nothing to descend into and is read as the text it is, the same reading
-        // the Amazon SQS event-source poller of a Lambda function takes.
-        let document = ::serde_json::from_str::<Value>(text)
-            .ok()
-            .filter(|body| body.is_object() || body.is_array());
-        let Some(document) = document else {
-            return Self {
-                format: Some(BodyFormat::Text),
-                event: Cow::Borrowed(event),
-            };
-        };
-        let mut view = event.clone();
-        if let Value::Object(members) = &mut view {
-            members.insert(RECORD_BODY.to_string(), document);
-        }
-        Self {
-            format: Some(BodyFormat::Document),
-            event: Cow::Owned(view),
-        }
+        let (format, event) = read_body(event);
+        Self { format, event }
     }
 
     /// Whether `pattern` admits this record, spending `budget`.
@@ -1530,6 +1692,56 @@ impl<'a> FilterView<'a> {
         };
         ::service_common::event_pattern::reads_as(pattern, RECORD_BODY, form)
     }
+}
+
+/// The record `event` as every reader that looks INSIDE it reads it: the format its
+/// message body is in, and the record with a body spelling a JSON document replaced by
+/// that document.
+///
+/// A record's message body travels as the text its producer sent, whatever that text
+/// spells, and a reader that looks inside the record — the filter's patterns
+/// ([`FilterView`]) and the JSON paths a template placeholder or a target parameter
+/// carries ([`path_view`]) — reads it in the format that text is in: a body in "a valid
+/// JSON format" is the document it parses to, so a clause or a path can name what is
+/// inside it, and a body spelling no document is the text it carries. An envelope with no
+/// message body at all — a stream record, whose change is already a document — is read
+/// exactly as it was built, and the format is then `None`.
+///
+/// The body is parsed at most once per reader per record, and what it may be is already
+/// bounded by the largest message its source accepts, so the parse is bounded by the poll
+/// that collected the record. The view lives only for the length of the reading: the
+/// payload a stage handed the event itself receives is the envelope with the body as sent.
+fn read_body(event: &Value) -> (Option<BodyFormat>, Cow<'_, Value>) {
+    let Some(text) = event.get(RECORD_BODY).and_then(Value::as_str) else {
+        return (None, Cow::Borrowed(event));
+    };
+    // A body is in a JSON format when it spells a JSON DOCUMENT — an object or a
+    // list, which is what a clause names fields inside and what a path descends into. A
+    // body spelling a bare scalar names nothing to descend into and is read as the text it
+    // is, the same reading the Amazon SQS event-source poller of a Lambda function takes.
+    let document = ::serde_json::from_str::<Value>(text)
+        .ok()
+        .filter(|body| body.is_object() || body.is_array());
+    let Some(document) = document else {
+        return (Some(BodyFormat::Text), Cow::Borrowed(event));
+    };
+    let mut view = event.clone();
+    if let Value::Object(members) = &mut view {
+        members.insert(RECORD_BODY.to_string(), document);
+    }
+    (Some(BodyFormat::Document), Cow::Owned(view))
+}
+
+/// The record `event` as a JSON PATH reads it — the reading [`read_body`] states, without
+/// the format the filter also decides by.
+///
+/// A path is resolved against this: `$.body` selects the document a valid-JSON body
+/// spells, so `$.body.<member>` selects that member of it, and a body spelling no document
+/// is the text a path selects as it was sent. It is what both readers of a path are given,
+/// the placeholders of an `InputTemplate` ([`render_template`]) and a target parameter's
+/// own value ([`resolved_parameter`]), so one pipe cannot read a record two ways.
+fn path_view(event: &Value) -> Cow<'_, Value> {
+    read_body(event).1
 }
 
 /// One polled Amazon SQS message as the record envelope a pipe hands to its enrichment
@@ -1881,8 +2093,8 @@ fn enrichment_events(returned: &[u8], arn: &str) -> Result<Vec<Value>, String> {
 /// Deliver ONE event to the target.
 ///
 /// `payload` is what the target RECEIVES — the event, or the event rendered through the
-/// target's input template — while `event` is the event itself, which the target
-/// parameters are read from.
+/// target's input template — while `event` is the event the target parameters are read
+/// from, as a path reads it ([`path_view`]).
 async fn deliver_event(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
@@ -1990,13 +2202,17 @@ fn target_body(event: &Value) -> String {
 
 /// Every event of `batch` rendered through `template`, or the batch itself when the
 /// stage carries no template.
+///
+/// Each render reads the event through its PATHS ([`path_view`]), so a placeholder naming
+/// a member of a valid-JSON message body renders that member; a stage handed the batch
+/// itself is handed the envelopes with their bodies as sent.
 fn transformed(template: Option<&str>, batch: Vec<Value>) -> Result<Vec<Value>, String> {
     let Some(template) = template else {
         return Ok(batch);
     };
     batch
         .iter()
-        .map(|event| render_template(template, event))
+        .map(|event| render_template(template, path_view(event).as_ref()))
         .collect()
 }
 
@@ -2557,7 +2773,7 @@ impl Clients {
 #[cfg(test)]
 mod tests {
     use super::{
-        enrichment_events, render_template, resolved_parameter, target_body,
+        enrichment_events, path_view, render_template, resolved_parameter, target_body,
         MAX_TEMPLATE_BYTES, MESSAGE_GROUP_ID,
     };
     use ::serde_json::{json, Value};
@@ -2843,5 +3059,176 @@ mod tests {
                 "case {case:?}: expected {expected:?}, got {body:?}"
             );
         }
+    }
+
+    /// RULE: a JSON path reads a record's message body in the format its producer sent it
+    /// in — a body spelling a JSON document is the document it parses to, so a path names
+    /// what is inside it, and a body spelling none is the text it carries — while every
+    /// other member of the envelope is read exactly as it was built.
+    ///
+    /// The rows differ along what the rule generalises over: the format of the body
+    /// (object, list, bare scalar, quoted string, plain text, not-quite-JSON), how deep
+    /// the path reaches into it, the type of the value it selects, an envelope with no
+    /// body member at all, and a path that reaches outside the body.
+    #[test]
+    fn a_path_reads_a_record_body_in_the_format_it_was_sent_in() {
+        // (case, the envelope, the path, what it selects — `None` for a path that selects
+        // no one value)
+        let rows: Vec<(&str, Value, &str, Option<Value>)> = vec![
+            (
+                "a-member-of-a-json-object-body",
+                json!({ "body": r#"{"id": "a-7", "type": "order"}"# }),
+                "$.body.id",
+                Some(json!("a-7")),
+            ),
+            (
+                "a-number-member-of-a-json-object-body",
+                json!({ "body": r#"{"count": 3}"# }),
+                "$.body.count",
+                Some(json!(3)),
+            ),
+            (
+                "a-nested-member-of-a-json-object-body",
+                json!({ "body": r#"{"order": {"id": "deep-1"}}"# }),
+                "$.body.order.id",
+                Some(json!("deep-1")),
+            ),
+            (
+                "the-whole-json-body",
+                json!({ "body": r#"{"id": "a-7"}"# }),
+                "$.body",
+                Some(json!({ "id": "a-7" })),
+            ),
+            (
+                "an-element-of-a-json-list-body",
+                json!({ "body": r#"[{"id": "first"}, {"id": "second"}]"# }),
+                "$.body[1].id",
+                Some(json!("second")),
+            ),
+            (
+                // A body spelling no document is the text it is, so a path INTO it selects
+                // nothing and the body itself is that text.
+                "a-plain-text-body",
+                json!({ "body": "not json at all" }),
+                "$.body",
+                Some(json!("not json at all")),
+            ),
+            (
+                "a-member-of-a-plain-text-body",
+                json!({ "body": "not json at all" }),
+                "$.body.id",
+                None,
+            ),
+            (
+                // A bare scalar names nothing to descend into: the body is its text.
+                "a-bare-number-body",
+                json!({ "body": "17" }),
+                "$.body",
+                Some(json!("17")),
+            ),
+            (
+                "a-quoted-json-string-body",
+                json!({ "body": "\"quoted\"" }),
+                "$.body",
+                Some(json!("\"quoted\"")),
+            ),
+            (
+                "a-body-that-is-almost-json",
+                json!({ "body": "{not-valid-json" }),
+                "$.body",
+                Some(json!("{not-valid-json")),
+            ),
+            (
+                // Every other member is read as it was built, body or no body.
+                "a-member-beside-the-body",
+                json!({ "body": r#"{"id": "a-7"}"#, "messageId": "m-1" }),
+                "$.messageId",
+                Some(json!("m-1")),
+            ),
+            (
+                "an-envelope-with-no-body-member",
+                json!({ "dynamodb": { "Keys": { "pk": { "S": "k" } } } }),
+                "$.dynamodb.Keys.pk.S",
+                Some(json!("k")),
+            ),
+        ];
+        for (case, event, path, expected) in rows {
+            let view = path_view(&event);
+            let selected = ::service_common::json_reference_path::select(path, view.as_ref());
+            assert_eq!(
+                selected, expected.as_ref(),
+                "case {case:?}: expected {path} to select {expected:?}, got {selected:?}"
+            );
+        }
+    }
+
+    /// RULE: reading a record for its paths changes nothing a stage handed the event
+    /// itself receives — the envelope keeps the message body as the producer sent it.
+    #[test]
+    fn reading_a_record_for_its_paths_leaves_the_envelope_as_sent() {
+        // (case, the body as sent)
+        let rows: Vec<(&str, &str)> = vec![
+            ("a-json-object", r#"{"id": "a-7"}"#),
+            ("a-json-list", "[1, 2, 3]"),
+            ("plain-text", "a plain body"),
+        ];
+        for (case, body) in rows {
+            let event = json!({ "body": body, "eventSource": "aws:sqs" });
+            let view = path_view(&event);
+            assert_eq!(
+                event["body"],
+                json!(body),
+                "case {case:?}: expected the envelope to keep the body as sent, got {event}"
+            );
+            assert_eq!(
+                view["eventSource"],
+                json!("aws:sqs"),
+                "case {case:?}: expected every other member read as built, got {}",
+                view.as_ref()
+            );
+        }
+    }
+
+    /// RULE: a template placeholder and a target parameter read the SAME record, so a
+    /// path into a valid-JSON message body renders the member it names through either —
+    /// and the render is the value itself, unquoted where the template does not quote it.
+    #[test]
+    fn a_path_into_a_json_body_renders_the_member_it_names() {
+        let event = json!({
+            "messageId": "4fd2-1",
+            "body": r#"{"id": "a-7", "count": 3, "group": "orders"}"#,
+            "eventSource": "aws:sqs",
+        });
+        let view = path_view(&event);
+        // (case, the template, what the stage is handed)
+        let rows: Vec<(&str, &str, Value)> = vec![
+            ("a-scalar-member", "<$.body.id>", json!("a-7")),
+            ("a-number-member", "<$.body.count>", json!(3)),
+            (
+                "a-member-inside-an-object",
+                r#"{"order": "<$.body.id>", "n": <$.body.count>}"#,
+                json!({"order": "a-7", "n": 3}),
+            ),
+            (
+                "the-parsed-body-itself",
+                "<$.body>",
+                json!({"id": "a-7", "count": 3, "group": "orders"}),
+            ),
+        ];
+        for (case, template, expected) in rows {
+            let rendered = render_template(template, view.as_ref())
+                .unwrap_or_else(|error| panic!("case {case:?}: {error}"));
+            assert_eq!(
+                rendered, expected,
+                "case {case:?}: expected {expected}, got {rendered}"
+            );
+        }
+        let resolved = resolved_parameter(MESSAGE_GROUP_ID, Some("$.body.group"), view.as_ref())
+            .unwrap_or_else(|error| panic!("case a-parameter-into-the-body: {error}"));
+        assert_eq!(
+            resolved.as_deref(),
+            Some("orders"),
+            "case a-parameter-into-the-body: expected the body's group, got {resolved:?}"
+        );
     }
 }

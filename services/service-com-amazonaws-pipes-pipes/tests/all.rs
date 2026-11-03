@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/front_door_refusals.rs"]
 mod front_door_refusals;
+#[path = "all/pipe_body_paths.rs"]
+mod pipe_body_paths;
 #[path = "all/pipe_configuration_rules.rs"]
 mod pipe_configuration_rules;
 #[path = "all/pipe_data_plane.rs"]
@@ -39,6 +41,8 @@ mod pipe_metric_attribution;
 mod pipe_metrics;
 #[path = "all/pipe_refusal_bodies.rs"]
 mod pipe_refusal_bodies;
+#[path = "all/pipe_source_checkout.rs"]
+mod pipe_source_checkout;
 #[path = "all/pipe_tagging.rs"]
 mod pipe_tagging;
 #[path = "all/pipe_target_parameter_refusal.rs"]
