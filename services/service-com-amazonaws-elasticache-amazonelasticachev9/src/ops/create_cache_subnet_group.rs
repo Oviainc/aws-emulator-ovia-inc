@@ -181,15 +181,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Describe resolve against.
         let name = input.cache_subnet_group_name.to_ascii_lowercase();
         // The name carries no modelled `@length` or `@pattern`, so the
-        // documented rule is enforced here. This operation models no
-        // invalid-parameter error, so the refusal goes through the synthetic
-        // `ValidationException`.
+        // documented rule is enforced here, worded by the one helper that rule
+        // has (`crate::state::invalid_subnet_group_name_message`) — the same
+        // sentence `DeleteCacheSubnetGroup` states it with.
+        //
+        // The CHANNEL stays the synthetic `ValidationException` this create has
+        // always answered the rule with, while the delete answers it with the
+        // modelled `InvalidParameterValueException`: which code THIS operation
+        // should refuse a malformed name with is the subject of its own open
+        // report about this service's error classification (and of the error-layer
+        // row in `tests/all/subnet_resolution_and_error_envelope.rs` that pins the
+        // current channel), so it is not changed here.
         if !crate::state::is_valid_subnet_group_name(&name) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Invalid value {} for CacheSubnetGroupName: must contain no more than 255 \
-                 alphanumeric characters or hyphens.",
-                input.cache_subnet_group_name
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::invalid_subnet_group_name_message(&input.cache_subnet_group_name),
+            ));
         }
 
         // A subnet group has to name subnets: the modelled `SubnetIds` carries

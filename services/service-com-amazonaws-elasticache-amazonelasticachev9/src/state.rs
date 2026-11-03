@@ -2678,6 +2678,42 @@ pub fn parameter_writer_group_not_found_message(name: &str) -> String {
     format!("CacheParameterGroup not found: {name}")
 }
 
+/// How ElastiCache words a `CacheSubnetGroupName` that breaks the constraint the
+/// member documents ("Must contain no more than 255 alphanumeric characters or
+/// hyphens"), built from the value the request sent.
+///
+/// One helper, so the create and the delete of a cache subnet group state the one
+/// rule the one way; the form the name must take is
+/// [`is_valid_subnet_group_name`].
+pub fn invalid_subnet_group_name_message(value: &str) -> String {
+    format!(
+        "Invalid value {value} for CacheSubnetGroupName: must contain no more than 255 \
+         alphanumeric characters or hyphens."
+    )
+}
+
+/// How ElastiCache words a cache subnet group that cannot be deleted because a
+/// cluster is placed in it: `Cache subnet group <name> is currently in use.`
+///
+/// The one variable part is the `CacheSubnetGroupName` exactly as the request
+/// spelled it, as in [`delete_subnet_group_not_found_message`] — the two refusals
+/// of one delete echo the name the one way.
+pub fn subnet_group_in_use_message(name: &str) -> String {
+    format!("Cache subnet group {name} is currently in use.")
+}
+
+/// How ElastiCache words a cache subnet group `DeleteCacheSubnetGroup` cannot
+/// find: `Cache Subnet Group <name> does not exist.`
+///
+/// The fixed text is `Cache Subnet Group ` and ` does not exist.`; the one
+/// variable part is the `CacheSubnetGroupName` exactly as the request spelled it,
+/// because the message is built from the request. This operation's wording is its
+/// own: the describe that resolves the same member answers `Cache subnet group
+/// <name> not found.`, so the two cannot be served by one template.
+pub fn delete_subnet_group_not_found_message(name: &str) -> String {
+    format!("Cache Subnet Group {name} does not exist.")
+}
+
 /// How ElastiCache refuses a change to a family's OWN default parameter group,
 /// whether the request asks to set a value or to put one back: the group's
 /// values are the engine's, so there is no change to make. Stated once, so the

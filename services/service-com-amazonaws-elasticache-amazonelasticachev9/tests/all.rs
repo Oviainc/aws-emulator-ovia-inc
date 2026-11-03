@@ -206,3 +206,7 @@ mod refusal_rule_statements;
 // final snapshot a `DeleteServerlessCache` takes).
 #[path = "all/serverless_cache_snapshots.rs"]
 mod serverless_cache_snapshots;
+
+// Appended for the same reason: the `DeleteCacheSubnetGroup` suite.
+#[path = "all/cache_subnet_group_delete.rs"]
+mod cache_subnet_group_delete;

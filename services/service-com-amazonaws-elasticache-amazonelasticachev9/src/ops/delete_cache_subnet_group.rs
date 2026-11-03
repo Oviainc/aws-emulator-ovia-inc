@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCacheSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCacheSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DeleteCacheSubnetGroup::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -63,6 +59,10 @@
 //!   use.
 //! * `CacheSubnetGroupNotFoundFault` (HTTP 400) — The requested cache subnet group name does
 //!   not refer to an existing cache subnet group.
+//! * `InvalidParameterValueException` (HTTP 400, awsQuery code `InvalidParameterValue`) —
+//!   widened in through `extra_errors` (see below): the SERVICE models it and ElastiCache
+//!   answers it for a `CacheSubnetGroupName` that breaks the constraint the member
+//!   documents, which the model's `errors` list for this operation omits.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -97,11 +97,19 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteCacheSubnetGroupOu
 // here — hence the `DeleteCacheSubnetGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.elasticache#DeleteCacheSubnetGroup")]
+// `InvalidParameterValueException` is widened in through `extra_errors`: this SERVICE
+// models it (awsQuery code `InvalidParameterValue`, HTTP 400) and it is what ElastiCache
+// answers a `CacheSubnetGroupName` the member's own constraint does not admit, but the
+// model's `errors` list for THIS operation omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.elasticache#DeleteCacheSubnetGroup",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum DeleteCacheSubnetGroupErrorModeled {
     CacheSubnetGroupInUse(CacheSubnetGroupInUse),
     CacheSubnetGroupNotFoundFault(CacheSubnetGroupNotFoundFault),
+    InvalidParameterValueException(InvalidParameterValueException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -155,18 +163,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCacheSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCacheSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCacheSubnetGroup"))
+        // "Deletes a cache subnet group" — a mutation, and the only thing read
+        // back out is whether the delete may happen at all. `ctx` carries nothing
+        // this operation needs: the group's identity is its name and the response
+        // has no members, so no Region is resolved here.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Same identity rule as `CreateCacheSubnetGroup`: `CacheSubnetGroupName`
+        // "is stored as a lowercase string", so the name this request resolves
+        // against the store is its lowercased form.
+        let name = input.cache_subnet_group_name.to_ascii_lowercase();
+        // The FORM of the name is checked before it is resolved against anything:
+        // a value the member's own constraint does not admit ("Must contain no
+        // more than 255 alphanumeric characters or hyphens") names no group this
+        // account could ever hold, so it is reported as the bad parameter it is
+        // rather than as a group that does not exist. The member carries no
+        // modelled `@length` or `@pattern`, so the boundary validator passes it
+        // and the rule is enforced here, worded as `CreateCacheSubnetGroup` words
+        // the same rule.
+        if !crate::state::is_valid_subnet_group_name(&name) {
+            return Err(
+                DeleteCacheSubnetGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::invalid_subnet_group_name_message(
+                            &input.cache_subnet_group_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // One lock spans the checks and the removal, so of two concurrent deletes
+        // of the same name exactly one can be the one that found it present.
+        let mut store = state.lock();
+
+        // "The requested cache subnet group name does not refer to an existing
+        // cache subnet group" is the modelled refusal, worded as this operation
+        // words it (`crate::state::delete_subnet_group_not_found_message`).
+        if !store.cache_subnet_groups.contains_key(&name) {
+            return Err(
+                DeleteCacheSubnetGroupErrorModeled::CacheSubnetGroupNotFoundFault(
+                    CacheSubnetGroupNotFoundFault {
+                        message: Some(crate::state::delete_subnet_group_not_found_message(
+                            &input.cache_subnet_group_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You cannot delete … one that is associated with any clusters." A cache
+        // cluster carries the subnet group it was placed in, and a replication
+        // group carries one for its member clusters, so both are what an
+        // association means in this store. A snapshot records the subnet group of
+        // the cluster it was taken from, but a snapshot is not a cluster and
+        // holds no capacity in the group, so it does not keep the group alive.
+        let in_use_by_cluster = store
+            .cache_clusters
+            .values()
+            .any(|cluster| cluster.cache_subnet_group_name.as_deref() == Some(name.as_str()));
+        let in_use_by_replication_group = store
+            .replication_groups
+            .values()
+            .any(|group| group.cache_subnet_group_name.as_deref() == Some(name.as_str()));
+        if in_use_by_cluster || in_use_by_replication_group {
+            return Err(DeleteCacheSubnetGroupErrorModeled::CacheSubnetGroupInUse(
+                CacheSubnetGroupInUse {
+                    message: Some(crate::state::subnet_group_in_use_message(
+                        &input.cache_subnet_group_name,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The group leaves the store, so a following `DescribeCacheSubnetGroups`
+        // for the name answers `CacheSubnetGroupNotFoundFault`, the quota it
+        // counted against frees up, and a create of the same name finds it vacant.
+        store.cache_subnet_groups.remove(&name);
+        // Deleting a cache subnet group is one of the events this service records,
+        // under the same source type the create records; see
+        // `crate::state::EventRecord`. The log outlives the record, so the events
+        // of a deleted group are still reported.
+        store.record_event(
+            crate::state::SOURCE_TYPE_CACHE_SUBNET_GROUP,
+            &name,
+            "Cache subnet group deleted",
+            now,
+        );
+
+        // The operation's output shape is `Unit`: there is nothing to report but
+        // the 200 and the envelope's own `ResponseMetadata`.
+        Ok(DeleteCacheSubnetGroupOutput)
     }
 }
