@@ -29,6 +29,8 @@ mod policy_alarm_association;
 mod policy_refusal_sentences;
 #[path = "all/predictive_scaling_forecast.rs"]
 mod predictive_scaling_forecast;
+#[path = "all/published_breach_execution.rs"]
+mod published_breach_execution;
 #[path = "all/recorded_refusal_wording.rs"]
 mod recorded_refusal_wording;
 #[path = "all/refusal_messages.rs"]

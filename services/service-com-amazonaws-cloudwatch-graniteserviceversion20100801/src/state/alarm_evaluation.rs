@@ -146,7 +146,10 @@ const MAX_EVALUATED_PERIODS: usize = 1_440;
 /// wider the range is depends on the period and the resolution and is not published as a
 /// number, so this factor is the emulator's own bounded choice: wide enough that a sparse
 /// series is evaluated on what it really published, and a fixed multiple of the look-back so
-/// the periods one evaluation folds stay bounded by it.
+/// the periods one evaluation folds stay bounded by it. Where the periods are finer than the
+/// granularity the series is STORED at, the width this factor gives is not enough on its own
+/// and the range covers one storage span instead ([`evaluation_range_periods`]), which is
+/// bounded too.
 ///
 /// The periods are anchored at multiples of the period and the newest of them is the one the end
 /// of the rolling range falls in ([`newest_graded_period`]), so the range reaches further back
@@ -414,6 +417,33 @@ fn graded_period(queries: &[MetricDataQuery], graded: &MetricDataQuery) -> f64 {
     }
 }
 
+/// The width of the windows ONE alarm's series is graded in, in seconds, or `None` for an
+/// alarm whose configuration names none.
+///
+/// The same width the grading itself folds that series at, read from the same members: the
+/// alarm's own `Period` for an alarm over one metric ([`State::graded_metric`]), and the period
+/// of the query a `Metrics` array returns for one configured with such an array
+/// ([`graded_period`]). It is what sizes the evaluation range
+/// ([`evaluation_range_periods`]), which has to be decided before the series is folded.
+fn graded_window_secs(alarm: &MetricAlarm) -> Option<f64> {
+    match alarm.metrics.as_deref() {
+        Some(queries) => {
+            let graded = watched_query(queries, alarm.threshold_metric_id.as_deref())?;
+            Some(graded_period(queries, graded))
+        }
+        None => alarm_period_secs(alarm),
+    }
+}
+
+/// The width of the windows an alarm over ONE metric is evaluated on: its own `Period` in
+/// seconds, or `None` for an alarm naming no period a series can be folded over at all.
+///
+/// One reader, so the fold and the range that sizes it cannot drift on what counts as a usable
+/// `Period`.
+fn alarm_period_secs(alarm: &MetricAlarm) -> Option<f64> {
+    alarm.period.filter(|period| *period >= 1).map(f64::from)
+}
+
 /// The metrics the BAND of one alarm is drawn from: the metrics the query its
 /// `ThresholdMetricId` designates reads, followed through the ids that query's expression
 /// refers to ("A math expression can use the `Id` of the other metrics or queries to refer to
@@ -591,9 +621,44 @@ fn evaluated_periods(alarm: &MetricAlarm) -> Option<usize> {
 }
 
 /// How many period windows the EVALUATION RANGE spans for a look-back of `evaluation_periods`
-/// ([`EVALUATION_RANGE_FACTOR`]).
-fn evaluation_range_periods(evaluation_periods: usize) -> usize {
-    evaluation_periods.saturating_mul(EVALUATION_RANGE_FACTOR)
+/// over windows `period` seconds wide, grading a series whose datapoints are stored at a
+/// granularity of `stored_span` seconds ([`EVALUATION_RANGE_FACTOR`]).
+///
+/// The range is deliberately wider than the look-back so that a series published more slowly
+/// than the alarm's period is still evaluated on the datapoints it really holds, and how much
+/// more slowly a series can be published is not a free choice: a datapoint is aggregated at the
+/// granularity its own `StorageResolution` stores it at
+/// ([`super::StoredDatum::aggregated_instant`]), so a series stored at regular resolution holds
+/// ONE datapoint per minute however often a client publishes into it, and an alarm whose periods
+/// are finer than that granularity has at most one real datapoint per storage span of range. A
+/// range reaching back LESS far than that span lets a datapoint published late in its span fall
+/// out of the range before any evaluation has graded it — nothing would ever grade a breach a
+/// client really published — so the range reaches back at least one whole storage span plus the
+/// lag the end of the range runs behind this instant ([`evaluation_lag_secs`]). That is the
+/// width at which every stored datapoint is graded by the evaluations running while it is the
+/// newest one the series holds.
+///
+/// Where the look-back's own multiple is already that wide the width is unchanged, which is
+/// every alarm whose period is no finer than the granularity its series is stored at. The
+/// covering term carries the same capacity bound the look-back does
+/// ([`MAX_EVALUATED_PERIODS`]), so neither term can size one evaluation's fold by more windows
+/// than this store ever grades.
+fn evaluation_range_periods(
+    evaluation_periods: usize,
+    period: Option<f64>,
+    stored_span: f64,
+) -> usize {
+    let covering_one_storage_span = period
+        .filter(|period| *period >= 1.0 && stored_span > 0.0)
+        .map_or(0, |period| {
+            let covering = (stored_span + evaluation_lag_secs(period)) / period;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let covering = covering.ceil() as usize;
+            covering.min(MAX_EVALUATED_PERIODS)
+        });
+    evaluation_periods
+        .saturating_mul(EVALUATION_RANGE_FACTOR)
+        .max(covering_one_storage_span)
 }
 
 /// How long the end of the range an evaluation grades LAGS the instant that evaluation runs,
@@ -1055,8 +1120,15 @@ impl State {
         let evaluation_periods = evaluated_periods(alarm)?;
         // The windows of the EVALUATION RANGE: window 0 is the newest period this evaluation
         // grades ([`newest_graded_period`]), window i the period before it, and the range
-        // reaches further back than the look-back ([`EVALUATION_RANGE_FACTOR`]).
-        let range_periods = evaluation_range_periods(evaluation_periods);
+        // reaches further back than the look-back ([`evaluation_range_periods`]) — how much
+        // further depends on how wide this alarm's windows are and on the granularity the
+        // series it grades is STORED at, so both are resolved from the same places the grading
+        // itself reads them from ([`graded_window_secs`], [`Self::graded_storage_span`]).
+        let range_periods = evaluation_range_periods(
+            evaluation_periods,
+            graded_window_secs(alarm),
+            self.graded_storage_span(alarm, budget),
+        );
         // The series this alarm GRADES, as the value each of those windows took, and what it
         // compares each of them against: the one number the alarm is configured with, or the
         // band the query its `ThresholdMetricId` designates draws.
@@ -1166,6 +1238,34 @@ impl State {
         )
     }
 
+    /// The COARSEST granularity any datapoint of the series this alarm reads is stored at, in
+    /// seconds, or `0.0` for an alarm over series this store holds no datapoint of. The
+    /// datapoints it visits are charged to `budget`, as every fold over a series is.
+    ///
+    /// What a datapoint's granularity is, is the datapoint's own: "Setting this to 1 specifies
+    /// this metric as a high-resolution metric […] Setting this to 60 specifies this metric as
+    /// regular resolution" (`MetricDatum$StorageResolution`), which is the span it is aggregated
+    /// into ([`super::StoredDatum::aggregated_span`]) and so the shortest interval two of its
+    /// datapoints can be apart. The coarsest of them is what the evaluation range has to reach
+    /// back over ([`evaluation_range_periods`]), and it is read over every series the alarm
+    /// reads — the one its own members name, or each metric a `Metrics` array's queries read
+    /// ([`watched_series_set`]) — because the value an expression yields is only as dense as the
+    /// coarsest series it is computed from.
+    fn graded_storage_span(&self, alarm: &MetricAlarm, budget: &mut EvaluationBudget) -> f64 {
+        let mut coarsest = 0.0_f64;
+        for (key, _) in watched_series_set(alarm) {
+            let Some(series) = self.metrics.get(&key) else {
+                continue;
+            };
+            budget.charge_datapoints(series.len());
+            coarsest = series
+                .iter()
+                .map(StoredDatum::aggregated_span)
+                .fold(coarsest, f64::max);
+        }
+        coarsest
+    }
+
     /// The series ONE alarm grades, as the value each window of its evaluation range took.
     ///
     /// Which series that is, is what the alarm's configuration says: an alarm over one metric
@@ -1196,8 +1296,7 @@ impl State {
         budget: &mut EvaluationBudget,
     ) -> Option<GradedSeries<'alarm>> {
         let statistic = AlarmStatistic::of(alarm)?;
-        let period_secs = alarm.period.filter(|period| *period >= 1)?;
-        let period = f64::from(period_secs);
+        let period = alarm_period_secs(alarm)?;
         let key = watched_series(alarm);
         // An alarm this engine evaluates names the series it watches, which `watched_series`
         // resolves from those same members.

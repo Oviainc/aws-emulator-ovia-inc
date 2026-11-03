@@ -111,6 +111,8 @@ mod insight_rule_state;
 mod insight_rule_wire_shapes;
 #[path = "all/insight_rules.rs"]
 mod insight_rules;
+#[path = "all/just_published_datapoint_grading.rs"]
+mod just_published_datapoint_grading;
 #[path = "all/list_metric_streams.rs"]
 mod list_metric_streams;
 #[path = "all/list_tags_for_resource_reads.rs"]
