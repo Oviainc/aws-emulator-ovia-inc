@@ -59,6 +59,9 @@ mod metadata_flags;
 #[path = "all/page_token_cursor_bounds.rs"]
 mod page_token_cursor_bounds;
 
+#[path = "all/read_and_delete_scope_classes.rs"]
+mod read_and_delete_scope_classes;
+
 #[path = "all/resource_error_messages.rs"]
 mod resource_error_messages;
 

@@ -2,8 +2,10 @@
 
 //! @op DeleteComponent
 //! Removes the stored component the request names and answers an empty 2xx. An id that
-//! names no component in that app environment answers the modelled
-//! `ResourceNotFoundException` (HTTP 404).
+//! names no component anywhere answers the modelled `ResourceNotFoundException`
+//! (HTTP 404) with the delete path's own message, and an id that names a component
+//! ANOTHER app environment owns answers the modelled `InvalidParameterException`
+//! (HTTP 400) — the same two failures `GetComponent` and `DeleteForm` tell apart.
 //!
 //! ## Shape of an operation
 //!

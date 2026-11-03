@@ -2,8 +2,11 @@
 
 //! @op GetComponent
 //! Reports the stored component the request names, exactly as the create or the last
-//! update persisted it. An id that names no component in that app environment answers
-//! the modelled `ResourceNotFoundException` (HTTP 404).
+//! update persisted it. The two ways the id can fail to resolve are told apart by WHERE
+//! it resolves: an id that names no component anywhere answers the modelled
+//! `ResourceNotFoundException` (HTTP 404), and an id that names a component ANOTHER app
+//! environment owns answers the modelled `InvalidParameterException` (HTTP 400) — the
+//! same two failures `GetForm` and `GetCodegenJob` tell apart.
 //!
 //! ## Shape of an operation
 //!
