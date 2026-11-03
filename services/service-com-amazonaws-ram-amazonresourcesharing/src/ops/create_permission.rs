@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a customer managed permission in [`crate::state`] and reports the stored
+//! record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The permission is created `ATTACHABLE` at version 1, which is also its default
+//! version, in the Region the request was signed for, and carries the policy template
+//! the request wrote. A repeat of the same request under the same `clientToken`
+//! creates nothing further and answers from the stored permission.
+//!
+//! Its refusals of a bad request come from the member documentation's own rules: a
+//! `resourceType` that is not a resource type a customer managed permission can be
+//! created for is `InvalidParameterException`, a template that cannot be read as one
+//! is `MalformedPolicyTemplateException`, and one whose effect is not an allow or
+//! whose actions the permission's resource type does not support is
+//! `InvalidPolicyException` ([`crate::state::policy_template_rejection`]).
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +205,192 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePermission"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePermissionErrorModeled::ServerInternalException(ServerInternalException {
+                message: "the managed permission store is unavailable".to_string(),
+            })
+        })?;
+
+        let supplied_tags = input.tags.clone().unwrap_or_default();
+        // `name` carries the modelled length and pattern constraints, which are
+        // refused before this handler runs; every rule below is one the model does
+        // not state, each rendered as the modelled error RAM words that refusal with.
+        if let Some(why) =
+            crate::state::resource_type_rejection("resourceType", &input.resource_type)
+        {
+            return Err(CreatePermissionErrorModeled::InvalidParameterException(
+                InvalidParameterException { message: why },
+            )
+            .into());
+        }
+        match crate::state::policy_template_rejection(&input.resource_type, &input.policy_template) {
+            None => {}
+            Some(crate::state::PolicyTemplateRejection::Malformed(why)) => {
+                return Err(
+                    CreatePermissionErrorModeled::MalformedPolicyTemplateException(
+                        MalformedPolicyTemplateException { message: why },
+                    )
+                    .into(),
+                )
+            }
+            Some(crate::state::PolicyTemplateRejection::InvalidPolicy(why)) => {
+                return Err(CreatePermissionErrorModeled::InvalidPolicyException(
+                    InvalidPolicyException { message: why },
+                )
+                .into())
+            }
+        }
+        // This operation models no tag-specific error, so every tag rule it applies
+        // is reported as the invalid parameter it is.
+        let tag_rejection =
+            crate::state::tags_rejection(&supplied_tags).map(|rejection| match rejection {
+                crate::state::TagRejection::Invalid(why)
+                | crate::state::TagRejection::LimitExceeded(why)
+                | crate::state::TagRejection::PolicyViolation(why) => why,
+            });
+        if let Some(why) = tag_rejection {
+            return Err(CreatePermissionErrorModeled::InvalidParameterException(
+                InvalidParameterException { message: why },
+            )
+            .into());
+        }
+        if let Some(why) = input
+            .client_token
+            .as_deref()
+            .and_then(crate::state::client_token_rejection)
+        {
+            return Err(CreatePermissionErrorModeled::InvalidClientTokenException(
+                InvalidClientTokenException { message: why },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let tags = crate::state::tag_map(&supplied_tags);
+        // Every parameter other than the token itself, so a retry of this request is
+        // told apart from a different request that reuses the token.
+        let fingerprint = crate::state::fingerprint(&[
+            &input.name,
+            &input.resource_type,
+            &input.policy_template,
+            &crate::state::fingerprint_map(&tags),
+        ]);
+
+        let mut store = state.lock();
+        let now = store.tick();
+
+        if let Some(token) = input.client_token.clone() {
+            if let Some(record) = store.client_token_record(Self::NAME, &token) {
+                if record.fingerprint != fingerprint {
+                    return Err(
+                        CreatePermissionErrorModeled::IdempotentParameterMismatchException(
+                            IdempotentParameterMismatchException {
+                                message: "clientToken was already used for a CreatePermission \
+                                          request with different parameters"
+                                    .to_string(),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                let arn = record.resource_arn.clone();
+                if let Some(summary) = store.permission(&arn).and_then(|permission| {
+                    permission
+                        .version(None)
+                        .map(|version| permission.summary(version))
+                }) {
+                    return Ok(CreatePermissionOutput {
+                        permission: Some(summary),
+                        client_token: Some(token),
+                    });
+                }
+            }
+        }
+
+        // A permission's name is unique within the Region, and its ARN carries that
+        // name, so a second permission of the same name in the same Region is the
+        // name clash RAM refuses rather than a second record.
+        let arn = crate::state::permission_arn(&region, &input.name);
+        if store.permission(&arn).is_some() {
+            return Err(
+                CreatePermissionErrorModeled::PermissionAlreadyExistsException(
+                    PermissionAlreadyExistsException {
+                        message: crate::state::permission_exists_message(&input.name, &region),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The store is finite: a create that would take it past its cap is refused
+        // rather than growing it, the way RAM refuses one past its quota.
+        if store.permissions.len() >= crate::state::MAX_PERMISSIONS {
+            return Err(
+                CreatePermissionErrorModeled::PermissionLimitExceededException(
+                    PermissionLimitExceededException {
+                        message: format!(
+                            "this account already holds the maximum of {} managed permissions in \
+                             Region {region}",
+                            crate::state::MAX_PERMISSIONS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let first_version = crate::state::FIRST_PERMISSION_VERSION;
+        store.insert_permission(crate::state::PermissionRecord {
+            arn: arn.clone(),
+            name: input.name,
+            resource_type: input.resource_type,
+            permission_type: crate::state::PERMISSION_TYPE_CUSTOMER_MANAGED.to_string(),
+            feature_set: crate::state::PERMISSION_FEATURE_SET_STANDARD.to_string(),
+            tags,
+            creation_time: now,
+            last_updated_time: now,
+            default_version: first_version,
+            // The default managed permission of a resource type is one of the
+            // permissions Amazon Web Services manages, so a customer managed one
+            // this call mints is not its resource type's default.
+            is_resource_type_default: false,
+            versions: [(
+                first_version,
+                crate::state::PermissionVersionRecord {
+                    version: first_version,
+                    policy_template: input.policy_template,
+                    status: crate::state::PERMISSION_STATUS_ATTACHABLE.to_string(),
+                    creation_time: now,
+                    last_updated_time: now,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+
+        // RAM generates a token when the request omits one and reports it either
+        // way, so a caller can repeat the call idempotently.
+        let client_token = match input.client_token {
+            Some(token) => token,
+            None => store.fresh_uuid(),
+        };
+        store.remember_client_token(Self::NAME, &client_token, fingerprint, arn.clone());
+
+        let permission = store
+            .permission(&arn)
+            .and_then(|permission| {
+                permission
+                    .version(None)
+                    .map(|version| permission.summary(version))
+            })
+            .ok_or_else(|| {
+                CreatePermissionErrorModeled::ServerInternalException(ServerInternalException {
+                    message: "the managed permission could not be read back after creation"
+                        .to_string(),
+                })
+            })?;
+        Ok(CreatePermissionOutput {
+            permission: Some(permission),
+            client_token: Some(client_token),
+        })
     }
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one version of the managed permission [`crate::state`] holds under the ARN
+//! the request names — the version it asked for, or the permission's default version
+//! when it asked for none.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read: it writes nothing, so what a create stored is what this reports.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +152,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPermission"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetPermissionErrorModeled::ServerInternalException(ServerInternalException {
+                message: "the managed permission store is unavailable".to_string(),
+            })
+        })?;
+
+        // The model constrains neither member, so both rules are applied here, each
+        // rendered as the modelled error RAM words that refusal with.
+        if let Some(why) =
+            crate::state::permission_arn_rejection("permissionArn", &input.permission_arn)
+        {
+            return Err(GetPermissionErrorModeled::MalformedArnException(
+                MalformedArnException { message: why },
+            )
+            .into());
+        }
+        // Versions are numbered upward from the first one, so a number below it names
+        // no version any permission could carry.
+        if input
+            .permission_version
+            .is_some_and(|version| version < crate::state::FIRST_PERMISSION_VERSION)
+        {
+            return Err(GetPermissionErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: format!(
+                        "permissionVersion must be {} or greater",
+                        crate::state::FIRST_PERMISSION_VERSION
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let store = state.lock();
+        let permission = store.permission(&input.permission_arn).ok_or_else(|| {
+            GetPermissionErrorModeled::UnknownResourceException(UnknownResourceException {
+                message: crate::state::unknown_permission_message(&input.permission_arn),
+            })
+        })?;
+        let version = permission
+            .version(input.permission_version)
+            .ok_or_else(|| {
+                GetPermissionErrorModeled::UnknownResourceException(UnknownResourceException {
+                    message: crate::state::unknown_permission_version_message(
+                        &input.permission_arn,
+                        input.permission_version.unwrap_or(permission.default_version),
+                    ),
+                })
+            })?;
+
+        Ok(GetPermissionOutput {
+            permission: Some(permission.detail(version)),
+        })
     }
 }

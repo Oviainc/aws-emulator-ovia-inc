@@ -351,7 +351,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .into(),
                     );
                 }
-                let arn = record.resource_share_arn.clone();
+                let arn = record.resource_arn.clone();
                 if let Some(share) = store.share(&arn) {
                     return Ok(CreateResourceShareOutput {
                         resource_share: Some(share.view()),

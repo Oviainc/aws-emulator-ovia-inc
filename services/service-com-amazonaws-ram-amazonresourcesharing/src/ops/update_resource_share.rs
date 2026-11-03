@@ -256,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 // A repeat changes nothing, so the stored share keeps the
                 // `lastUpdatedTime` the first call gave it.
-                let arn = record.resource_share_arn.clone();
+                let arn = record.resource_arn.clone();
                 if let Some(share) = store.share(&arn) {
                     return Ok(UpdateResourceShareOutput {
                         resource_share: Some(share.view()),

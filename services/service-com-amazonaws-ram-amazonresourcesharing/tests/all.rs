@@ -17,6 +17,8 @@ mod document_entries_and_removal_reports;
 mod harness;
 #[path = "all/invitation_reads.rs"]
 mod invitation_reads;
+#[path = "all/managed_permissions.rs"]
+mod managed_permissions;
 #[path = "all/mutation_reports.rs"]
 mod mutation_reports;
 #[path = "all/pending_invitation_resources.rs"]

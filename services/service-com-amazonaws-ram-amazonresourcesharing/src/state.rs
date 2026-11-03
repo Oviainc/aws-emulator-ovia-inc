@@ -25,7 +25,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     Resource, ResourceShare, ResourceShareAssociation, ResourceShareConfiguration,
-    ResourceShareInvitation, Tag, TagFilter,
+    ResourceShareInvitation, ResourceSharePermissionDetail, ResourceSharePermissionSummary, Tag,
+    TagFilter,
 };
 
 /// This service's ARN namespace and sigv4 signing name (`awsService.arnNamespace`:
@@ -288,6 +289,153 @@ pub const POLICY_EFFECT_ALLOW: &str = "Allow";
 /// an action list from; `instantiated_policy` says so where it builds the document.
 pub const POLICY_ACTION_WILDCARD: &str = "*";
 
+/// The resource portion a managed-permission ARN carries before its name
+/// (`arn:aws:ram:<region>:<account>:permission/<name>`).
+pub const PERMISSION_ARN_RESOURCE_PREFIX: &str = "permission/";
+
+/// The `PermissionType` of a permission `CreatePermission` minted.
+///
+/// From `ResourceSharePermissionSummary$permissionType`: `CUSTOMER_MANAGED` is the
+/// one "you, or another principal in your account created"; `AWS_MANAGED` is one
+/// "Amazon Web Services created and manages", which no operation in this crate can
+/// produce.
+pub const PERMISSION_TYPE_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED";
+
+/// The `PermissionFeatureSet` of a permission created through the RAM API: the one
+/// "that supports all functionality". The other two values describe a permission RAM
+/// wrote from an attached resource-based policy
+/// (`ResourceSharePermissionSummary$featureSet`).
+pub const PERMISSION_FEATURE_SET_STANDARD: &str = "STANDARD";
+
+/// The `PermissionStatus` a freshly created permission version carries: "this
+/// permission or version can be associated with resource shares"
+/// (`ResourceSharePermissionDetail$status`).
+pub const PERMISSION_STATUS_ATTACHABLE: &str = "ATTACHABLE";
+
+/// The version number a permission's first version carries, which is also its
+/// default version: versions are numbered from one upward
+/// (`GetPermission$permissionVersion`, `ListPermissionVersions`).
+pub const FIRST_PERMISSION_VERSION: i32 = 1;
+
+/// The `Effect` a managed permission's policy template must carry: "Effect: must be
+/// set to ALLOW" (`CreatePermission$policyTemplate`'s own documentation).
+pub const POLICY_TEMPLATE_EFFECT_ALLOW: &str = "ALLOW";
+
+/// The `Effect` element of a policy template.
+pub const POLICY_TEMPLATE_EFFECT_ELEMENT: &str = "Effect";
+
+/// The `Action` element of a policy template.
+pub const POLICY_TEMPLATE_ACTION_ELEMENT: &str = "Action";
+
+/// The optional `Condition` element of a policy template.
+pub const POLICY_TEMPLATE_CONDITION_ELEMENT: &str = "Condition";
+
+/// The most managed permissions this emulator's store holds. Emulator resource
+/// guard, worded as RAM's own refusal: a create past the cap answers
+/// `PermissionLimitExceededException`, which RAM raises when a create "would exceed
+/// the maximum number of permissions you can create in each Amazon Web Services
+/// Region".
+pub const MAX_PERMISSIONS: usize = 500;
+
+/// The longest policy template this emulator reads and stores. Emulator resource
+/// guard: the modelled `Policy` shape carries no length constraint, so this bounds
+/// both what one call can store and what the JSON reader is handed.
+pub const MAX_POLICY_TEMPLATE_LEN: usize = 10_240;
+
+/// One entry of this service's resource-type catalog.
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceTypeEntry {
+    /// The display name `ListResourceTypes` reports:
+    /// `<service-code>:<resource-code>`.
+    pub resource_type: &'static str,
+    /// Whether a CUSTOMER MANAGED permission can be created for this resource type.
+    /// A resource type that cannot still shares, through the managed permissions
+    /// Amazon Web Services maintains for it.
+    pub customer_managed_permissions: bool,
+}
+
+/// The resource types this service can share, with the display name
+/// `ListResourceTypes` reports for each and whether a customer managed permission can
+/// be created for it.
+///
+/// Written out here because `CreatePermission$resourceType` is checked against it
+/// ("To see the list of valid values for this parameter, query the ListResourceTypes
+/// operation. This value must match the display name of the resource (available in
+/// ListResourceTypes)"), and the model publishes no shape enumerating them. Source:
+/// the resource types AWS Resource Access Manager documents as shareable, one entry
+/// per `(service, resource)` pair it names, with the support for customer managed
+/// permissions that documentation records for each — the Amazon EC2 and Amazon VPC
+/// resources there are shared only through the permissions Amazon Web Services
+/// manages for them.
+pub const RESOURCE_TYPES: &[ResourceTypeEntry] = &[
+    resource_type_entry("appmesh:Mesh", true),
+    resource_type_entry("cloudtrail:EventDataStore", true),
+    resource_type_entry("codebuild:Project", true),
+    resource_type_entry("codebuild:ReportGroup", true),
+    resource_type_entry("codeconnections:Connection", true),
+    resource_type_entry("ec2:CapacityReservation", false),
+    resource_type_entry("ec2:CoipPool", false),
+    resource_type_entry("ec2:DedicatedHost", false),
+    resource_type_entry("ec2:Ipam", false),
+    resource_type_entry("ec2:IpamPool", false),
+    resource_type_entry("ec2:IpamResourceDiscovery", false),
+    resource_type_entry("ec2:LocalGatewayRouteTable", false),
+    resource_type_entry("ec2:NetworkInsightsAccessScope", false),
+    resource_type_entry("ec2:PlacementGroup", false),
+    resource_type_entry("ec2:PrefixList", false),
+    resource_type_entry("ec2:Subnet", false),
+    resource_type_entry("ec2:TrafficMirrorTarget", false),
+    resource_type_entry("ec2:TransitGateway", false),
+    resource_type_entry("ec2:TransitGatewayMulticastDomain", false),
+    resource_type_entry("ec2:VerifiedAccessInstance", false),
+    resource_type_entry("ec2-image-builder:Component", true),
+    resource_type_entry("ec2-image-builder:ContainerRecipe", true),
+    resource_type_entry("ec2-image-builder:Image", true),
+    resource_type_entry("ec2-image-builder:ImageRecipe", true),
+    resource_type_entry("glue:Catalog", true),
+    resource_type_entry("glue:Database", true),
+    resource_type_entry("glue:Table", true),
+    resource_type_entry("imagebuilder:Component", true),
+    resource_type_entry("imagebuilder:ContainerRecipe", true),
+    resource_type_entry("imagebuilder:Image", true),
+    resource_type_entry("imagebuilder:ImageRecipe", true),
+    resource_type_entry("license-manager:LicenseConfiguration", true),
+    resource_type_entry("network-firewall:FirewallPolicy", true),
+    resource_type_entry("network-firewall:StatefulRuleGroup", true),
+    resource_type_entry("network-firewall:StatelessRuleGroup", true),
+    resource_type_entry("network-firewall:TLSInspectionConfiguration", true),
+    resource_type_entry("networkmanager:CoreNetwork", false),
+    resource_type_entry("networkmanager:GlobalNetwork", false),
+    resource_type_entry("outposts:Outpost", true),
+    resource_type_entry("outposts:Site", true),
+    resource_type_entry("rds:Cluster", true),
+    resource_type_entry("resource-groups:Group", true),
+    resource_type_entry("route53resolver:FirewallRuleGroup", true),
+    resource_type_entry("route53resolver:ResolverQueryLogConfig", true),
+    resource_type_entry("route53resolver:ResolverRule", true),
+    resource_type_entry("s3-outposts:AccessPoint", true),
+    resource_type_entry("s3-outposts:Bucket", true),
+    resource_type_entry("s3-outposts:Endpoint", true),
+    resource_type_entry("servicecatalog:Application", true),
+    resource_type_entry("servicecatalog:AttributeGroup", true),
+    resource_type_entry("ssm-contacts:Contact", true),
+    resource_type_entry("ssm-contacts:Rotation", true),
+    resource_type_entry("ssm-incidents:ResponsePlan", true),
+    resource_type_entry("vpc-lattice:Service", true),
+    resource_type_entry("vpc-lattice:ServiceNetwork", true),
+];
+
+/// One catalog entry, so [`RESOURCE_TYPES`] reads as the table it is.
+const fn resource_type_entry(
+    resource_type: &'static str,
+    customer_managed_permissions: bool,
+) -> ResourceTypeEntry {
+    ResourceTypeEntry {
+        resource_type,
+        customer_managed_permissions,
+    }
+}
+
 /// Separates the fields of a composite page cursor or fingerprint input. A control
 /// character, so it cannot occur inside an ARN, a name or a principal id.
 const FIELD_SEPARATOR: char = '\u{1}';
@@ -523,6 +671,113 @@ impl InvitationRecord {
     }
 }
 
+/// One version of a stored managed permission: the policy template it carries and
+/// when it was written.
+///
+/// A permission's versions are its own records because every read of a permission
+/// names one — `GetPermission` "retrieves the default version" unless the request
+/// asks for another, and each version carries its own policy document and status.
+#[derive(Debug, Clone, Default)]
+pub struct PermissionVersionRecord {
+    /// This version's number, counting from [`FIRST_PERMISSION_VERSION`]; the key
+    /// this record is stored under.
+    pub version: i32,
+    /// The policy template this version was created with, stored exactly as the
+    /// request wrote it so a read reports the document that was stored.
+    pub policy_template: String,
+    /// A `PermissionStatus`: whether this version can be associated with shares.
+    pub status: String,
+    /// Epoch milliseconds; rendered as the modelled `DateTime` timestamps.
+    pub creation_time: i64,
+    pub last_updated_time: i64,
+}
+
+/// One stored managed permission, keyed by its ARN, with every version written for
+/// it.
+#[derive(Debug, Clone, Default)]
+pub struct PermissionRecord {
+    /// The permission's ARN: this record's store key.
+    pub arn: String,
+    pub name: String,
+    /// The resource type this permission applies to,
+    /// `<service-code>:<resource-code>`.
+    pub resource_type: String,
+    /// A `PermissionType`: who created and maintains this permission.
+    pub permission_type: String,
+    /// A `PermissionFeatureSet`.
+    pub feature_set: String,
+    /// Tags keyed by tag key, so a key is carried at most once and `tags` reports a
+    /// stable order.
+    pub tags: BTreeMap<String, String>,
+    /// Epoch milliseconds; rendered as the modelled `DateTime` timestamps.
+    pub creation_time: i64,
+    pub last_updated_time: i64,
+    /// The version a read that names none reports.
+    pub default_version: i32,
+    /// Whether this permission is "the default managed permission for all resources
+    /// of this resource type" (`ResourceSharePermissionSummary$isResourceTypeDefault`),
+    /// which is a property of the permission rather than of one of its versions.
+    pub is_resource_type_default: bool,
+    /// Every version written for this permission, keyed by version number: the key
+    /// order is total and stable, so a paginated read over versions has a page order.
+    pub versions: BTreeMap<i32, PermissionVersionRecord>,
+}
+
+impl PermissionRecord {
+    /// The version a request naming `version` is about: the one it asked for, or
+    /// this permission's default version when it asked for none. `None` when no such
+    /// version was ever written.
+    pub fn version(&self, version: Option<i32>) -> Option<&PermissionVersionRecord> {
+        self.versions
+            .get(&version.unwrap_or(self.default_version))
+    }
+
+    /// One version of this permission as the modelled `ResourceSharePermissionSummary`
+    /// wire shape.
+    pub fn summary(&self, version: &PermissionVersionRecord) -> ResourceSharePermissionSummary {
+        ResourceSharePermissionSummary {
+            arn: Some(self.arn.clone()),
+            // The version is reported as a string, which is what the member's target
+            // shape is, even though a request names it as an integer.
+            version: Some(version.version.to_string()),
+            default_version: Some(version.version == self.default_version),
+            name: Some(self.name.clone()),
+            resource_type: Some(self.resource_type.clone()),
+            status: Some(version.status.clone()),
+            // The times are the version's own: what a summary describes is one
+            // version of the permission.
+            creation_time: Some(to_date_time(version.creation_time)),
+            last_updated_time: Some(to_date_time(version.last_updated_time)),
+            is_resource_type_default: Some(self.is_resource_type_default),
+            permission_type: Some(self.permission_type.clone()),
+            feature_set: Some(self.feature_set.clone()),
+            // A permission carrying no tags reports `[]`, so a caller can tell "no
+            // tags" from "tags not reported".
+            tags: Some(tag_list(&self.tags)),
+        }
+    }
+
+    /// One version of this permission as the modelled `ResourceSharePermissionDetail`
+    /// wire shape: the summary's members plus the version's policy document.
+    pub fn detail(&self, version: &PermissionVersionRecord) -> ResourceSharePermissionDetail {
+        ResourceSharePermissionDetail {
+            arn: Some(self.arn.clone()),
+            version: Some(version.version.to_string()),
+            default_version: Some(version.version == self.default_version),
+            name: Some(self.name.clone()),
+            resource_type: Some(self.resource_type.clone()),
+            permission: Some(version.policy_template.clone()),
+            creation_time: Some(to_date_time(version.creation_time)),
+            last_updated_time: Some(to_date_time(version.last_updated_time)),
+            is_resource_type_default: Some(self.is_resource_type_default),
+            permission_type: Some(self.permission_type.clone()),
+            feature_set: Some(self.feature_set.clone()),
+            status: Some(version.status.clone()),
+            tags: Some(tag_list(&self.tags)),
+        }
+    }
+}
+
 /// What one `(operation, clientToken)` pair already did, so repeating the request
 /// repeats the answer instead of acting twice.
 #[derive(Debug, Clone)]
@@ -531,9 +786,10 @@ pub struct ClientTokenRecord {
     /// A later call with the same token and a different digest is the
     /// `IdempotentParameterMismatchException` case.
     pub fingerprint: String,
-    /// The resource share the first call acted on, so the repeat can answer from
-    /// the store rather than from a cached body.
-    pub resource_share_arn: String,
+    /// The ARN of the resource the first call acted on — a resource share or a
+    /// managed permission — so the repeat can answer from the store rather than from
+    /// a cached body.
+    pub resource_arn: String,
 }
 
 /// Per-service state for com-amazonaws-ram-amazonresourcesharing. A handler reaches
@@ -548,6 +804,10 @@ pub struct ComAmazonawsRamAmazonresourcesharingState {
     /// created only beside a principal association, dropped with its share, and
     /// capped per share by [`MAX_INVITATIONS_PER_SHARE`].
     pub invitations: BTreeMap<String, InvitationRecord>,
+    /// Every managed permission this account has created, keyed by its ARN. A
+    /// permission's name is unique within a Region and its ARN carries that name, so
+    /// one name in one Region is one entry here.
+    pub permissions: BTreeMap<String, PermissionRecord>,
     /// `(operation, clientToken)` -> what that token already did.
     client_tokens: HashMap<(String, String), ClientTokenRecord>,
     /// The order tokens were remembered in, so the oldest can be forgotten at the
@@ -640,6 +900,17 @@ impl ComAmazonawsRamAmazonresourcesharingState {
     /// Store a newly created share.
     pub fn insert_share(&mut self, share: ShareRecord) {
         self.resource_shares.insert(share.arn.clone(), share);
+    }
+
+    /// The managed permission `arn` names.
+    pub fn permission(&self, arn: &str) -> Option<&PermissionRecord> {
+        self.permissions.get(arn)
+    }
+
+    /// Store a newly created managed permission.
+    pub fn insert_permission(&mut self, permission: PermissionRecord) {
+        self.permissions
+            .insert(permission.arn.clone(), permission);
     }
 
     /// How many associations the share `arn` holds, which the per-share cap counts.
@@ -1039,7 +1310,7 @@ impl ComAmazonawsRamAmazonresourcesharingState {
         operation: &str,
         token: &str,
         fingerprint: String,
-        resource_share_arn: String,
+        resource_arn: String,
     ) {
         let key = (operation.to_string(), token.to_string());
         if self.client_tokens.contains_key(&key) {
@@ -1055,7 +1326,7 @@ impl ComAmazonawsRamAmazonresourcesharingState {
             key,
             ClientTokenRecord {
                 fingerprint,
-                resource_share_arn,
+                resource_arn,
             },
         );
     }
@@ -1532,6 +1803,70 @@ pub fn share_arn(region: &str, id: &str) -> String {
     )
 }
 
+/// The ARN of the customer managed permission `name` in `region`.
+///
+/// A customer managed permission is named by its own name rather than by a generated
+/// id: the name "must be unique within the Amazon Web Services Region"
+/// (`CreatePermission$name`), and it "is created in the Amazon Web Services Region in
+/// which you call the operation", so the Region and the name together identify it.
+pub fn permission_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{PERMISSION_ARN_RESOURCE_PREFIX}{name}"),
+    )
+}
+
+/// Whether `value` is an ARN of THIS service's managed-permission resource.
+pub fn is_permission_arn(value: &str) -> bool {
+    is_arn_of_resource(value, PERMISSION_ARN_RESOURCE_PREFIX)
+}
+
+/// Why a value an operation expected to name a managed permission is not one of this
+/// service's permission ARNs, or `None` when it is.
+///
+/// Worded like [`share_arn_rejection`]: a value that is not a permission ARN is
+/// malformed, whether or not any permission has it — the `MalformedArnException`
+/// case, as distinct from the `UnknownResourceException` one.
+pub fn permission_arn_rejection(member: &str, arn: &str) -> Option<String> {
+    (!is_permission_arn(arn)).then(|| {
+        format!(
+            "{member} '{}' is not a managed permission ARN of the form \
+             arn:<partition>:{ARN_SERVICE}:<region>:<account>:{PERMISSION_ARN_RESOURCE_PREFIX}<name>",
+            truncate(arn)
+        )
+    })
+}
+
+/// The message of the `UnknownResourceException` an operation on a managed permission
+/// renders when this account holds none under that ARN.
+///
+/// Worded like [`unknown_share_message`]: the error code says what is wrong with the
+/// ARN and the message says which permission it was.
+pub fn unknown_permission_message(arn: &str) -> String {
+    format!("Permission {arn} could not be found.")
+}
+
+/// The message of the `UnknownResourceException` an operation renders when the
+/// permission exists but carries no version of the number the request named.
+pub fn unknown_permission_version_message(arn: &str, version: i32) -> String {
+    format!("Permission {arn} has no version {version}.")
+}
+
+/// The message of the `PermissionAlreadyExistsException` a create renders when the
+/// Region already holds a permission of that name.
+///
+/// RAM refuses it because "a permission with the specified name already exists in the
+/// requested Amazon Web Services Region. Choose a different name"
+/// (`PermissionAlreadyExistsException`'s own documentation), so the message names the
+/// name and the Region it is taken in.
+pub fn permission_exists_message(name: &str, region: &str) -> String {
+    format!(
+        "A permission named '{}' already exists in Region {region}. Choose a different name.",
+        truncate(name)
+    )
+}
+
 /// Whether `entity` names a part of an AWS Organizations hierarchy: an organization,
 /// a root, an organizational unit, or an account inside one — either by an ARN of the
 /// `organizations` service ([`ORGANIZATIONS_ARN_SERVICE`]) or by the bare id
@@ -1662,6 +1997,199 @@ pub fn name_rejection(name: &str) -> Option<String> {
             truncate(name)
         )
     })
+}
+
+/// The service code half of a resource type: the part before the colon of a
+/// `<service-code>:<resource-code>` value.
+pub fn resource_type_service(resource_type: &str) -> Option<&str> {
+    resource_type.split_once(':').map(|(service, _)| service)
+}
+
+/// Why a `resourceType` cannot name a resource type a customer managed permission can
+/// be created for, or `None` when it can.
+///
+/// From `CreatePermission$resourceType`: "Specifies the name of the resource type
+/// that this customer managed permission applies to. The format is `:` and is case
+/// sensitive. For example, to specify an Amazon EC2 Subnet, you can use the string
+/// ec2:Subnet. To see the list of valid values for this parameter, query the
+/// ListResourceTypes operation. This value must match the display name of the
+/// resource" — so a value RAM accepts here names a service code and a resource code
+/// separated by one colon, is one of the resource types this service shares, and is
+/// one of those a CUSTOMER managed permission can be created for: a resource type
+/// shared only through the permissions Amazon Web Services manages for it takes no
+/// customer managed permission ([`RESOURCE_TYPES`]). Rendered as
+/// `InvalidParameterException`.
+pub fn resource_type_rejection(member: &str, value: &str) -> Option<String> {
+    let well_formed = resource_type_service(value).is_some_and(|service| {
+        let code = &value[service.len() + 1..];
+        !service.is_empty()
+            && !code.is_empty()
+            && service
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && code
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    });
+    if !well_formed {
+        return Some(format!(
+            "{member} '{}' is not a resource type of the form <service-code>:<resource-code>",
+            truncate(value)
+        ));
+    }
+    let Some(entry) = resource_type_entry_of(value) else {
+        return Some(format!(
+            "{member} '{}' is not a resource type that this service can share; \
+             ListResourceTypes reports the resource types it can",
+            truncate(value)
+        ));
+    };
+    (!entry.customer_managed_permissions).then(|| {
+        // RAM words this refusal without naming the member: the resource type is not
+        // one a customer managed permission can be created for at all.
+        format!("Customer managed permission is not supported for resource type {value}")
+    })
+}
+
+/// The catalog entry for `value`, or `None` when this service shares no resource type
+/// of that name.
+///
+/// Matched without regard to case, the way `Resource$type` describes a resource type
+/// ("this takes the form of: `service-code`:`resource-code`, and is case-insensitive").
+pub fn resource_type_entry_of(value: &str) -> Option<&'static ResourceTypeEntry> {
+    RESOURCE_TYPES
+        .iter()
+        .find(|entry| entry.resource_type.eq_ignore_ascii_case(value))
+}
+
+/// What is wrong with a managed permission's `policyTemplate`, told apart by the
+/// modelled error RAM words that refusal with.
+#[derive(Debug, Clone)]
+pub enum PolicyTemplateRejection {
+    /// The template cannot be read as one: `MalformedPolicyTemplateException`.
+    Malformed(String),
+    /// It reads as one, but says something a managed permission's template may not
+    /// say — an effect that is not an allow, or an action the permission's resource
+    /// type does not support: `InvalidPolicyException`.
+    InvalidPolicy(String),
+}
+
+/// Why the policy template of a permission for `resource_type` cannot be stored, or
+/// `None` when it can.
+///
+/// From `CreatePermission$policyTemplate`: it is "a string in JSON format string that
+/// contains the following elements of a resource-based policy: Effect: must be set to
+/// ALLOW. Action: specifies the actions that are allowed by this customer managed
+/// permission. The list must contain only actions that are supported by the specified
+/// resource type … Condition: (optional)". One template across every operation that
+/// takes one, so a permission and a later version of it are held to one rule.
+pub fn policy_template_rejection(
+    resource_type: &str,
+    template: &str,
+) -> Option<PolicyTemplateRejection> {
+    if template.len() > MAX_POLICY_TEMPLATE_LEN {
+        return Some(PolicyTemplateRejection::Malformed(format!(
+            "policyTemplate is longer than the {MAX_POLICY_TEMPLATE_LEN} characters this service \
+             accepts"
+        )));
+    }
+    let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(template) else {
+        return Some(PolicyTemplateRejection::Malformed(
+            "policyTemplate is not a JSON document".to_string(),
+        ));
+    };
+    let Some(elements) = document.as_object() else {
+        return Some(PolicyTemplateRejection::Malformed(format!(
+            "policyTemplate must be a JSON object carrying an {POLICY_TEMPLATE_EFFECT_ELEMENT} \
+             element and an {POLICY_TEMPLATE_ACTION_ELEMENT} element"
+        )));
+    };
+    let Some(effect) = policy_template_element(elements, POLICY_TEMPLATE_EFFECT_ELEMENT)
+        .and_then(::serde_json::Value::as_str)
+    else {
+        return Some(PolicyTemplateRejection::Malformed(format!(
+            "policyTemplate must carry a string {POLICY_TEMPLATE_EFFECT_ELEMENT} element"
+        )));
+    };
+    if !effect.eq_ignore_ascii_case(POLICY_TEMPLATE_EFFECT_ALLOW) {
+        return Some(PolicyTemplateRejection::InvalidPolicy(format!(
+            "policyTemplate {POLICY_TEMPLATE_EFFECT_ELEMENT} '{}' must be \
+             {POLICY_TEMPLATE_EFFECT_ALLOW}",
+            truncate(effect)
+        )));
+    }
+    // `Action` names one action or a list of them, as an IAM policy statement's does.
+    let actions: Vec<&str> = match policy_template_element(elements, POLICY_TEMPLATE_ACTION_ELEMENT)
+    {
+        Some(::serde_json::Value::String(action)) => vec![action.as_str()],
+        Some(::serde_json::Value::Array(entries)) => {
+            let named: Vec<&str> = entries
+                .iter()
+                .filter_map(::serde_json::Value::as_str)
+                .collect();
+            if named.len() != entries.len() {
+                return Some(PolicyTemplateRejection::Malformed(format!(
+                    "every entry of the policyTemplate {POLICY_TEMPLATE_ACTION_ELEMENT} element \
+                     must be an action name"
+                )));
+            }
+            named
+        }
+        _ => {
+            return Some(PolicyTemplateRejection::Malformed(format!(
+                "policyTemplate must carry an {POLICY_TEMPLATE_ACTION_ELEMENT} element naming one \
+                 action or a list of them"
+            )))
+        }
+    };
+    if actions.is_empty() {
+        return Some(PolicyTemplateRejection::Malformed(format!(
+            "the policyTemplate {POLICY_TEMPLATE_ACTION_ELEMENT} element must name at least one \
+             action"
+        )));
+    }
+    if let Some(condition) = policy_template_element(elements, POLICY_TEMPLATE_CONDITION_ELEMENT) {
+        if !condition.is_object() {
+            return Some(PolicyTemplateRejection::Malformed(format!(
+                "the policyTemplate {POLICY_TEMPLATE_CONDITION_ELEMENT} element must be a JSON \
+                 object of condition operators"
+            )));
+        }
+    }
+    // An action is supported by a resource type only if it belongs to the service
+    // that owns that resource type, so an action of any other service namespace is
+    // one this permission's resource type does not support — what the template says
+    // is then not a policy this permission may carry.
+    let service = resource_type_service(resource_type)?;
+    for action in actions {
+        let Some((namespace, operation)) = action.split_once(':') else {
+            return Some(PolicyTemplateRejection::InvalidPolicy(format!(
+                "policyTemplate {POLICY_TEMPLATE_ACTION_ELEMENT} '{}' is not an action of the \
+                 form <service-code>:<action>",
+                truncate(action)
+            )));
+        };
+        if operation.is_empty() || !namespace.eq_ignore_ascii_case(service) {
+            return Some(PolicyTemplateRejection::InvalidPolicy(format!(
+                "policyTemplate {POLICY_TEMPLATE_ACTION_ELEMENT} '{}' is not an action supported \
+                 by resource type '{}'",
+                truncate(action),
+                truncate(resource_type)
+            )));
+        }
+    }
+    None
+}
+
+/// One element of a policy template, looked up however the request cased its name.
+fn policy_template_element<'a>(
+    elements: &'a ::serde_json::Map<String, ::serde_json::Value>,
+    name: &str,
+) -> Option<&'a ::serde_json::Value> {
+    elements
+        .iter()
+        .find(|(element, _)| element.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value)
 }
 
 /// Why a `clientToken` is not a valid idempotency identifier, or `None`.
