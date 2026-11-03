@@ -358,6 +358,11 @@ pub struct Template {
     pub tag_propagation_configurations: Vec<TagPropagationConfiguration>,
     /// One of `TEMPLATE_STATUS_VALUES`.
     pub status: String,
+    /// Whether `DeleteTemplate` has deleted this template. The service's delete
+    /// is a SOFT delete, so the record carries a flag rather than being
+    /// dropped: a deleted template is still readable through `GetTemplate`,
+    /// refuses `UpdateTemplate`, cannot be used to create a case, and is left
+    /// out of `ListTemplates`.
     pub deleted: bool,
     /// Reserved for the tagging slice, as [`Field::tags`].
     pub tags: HashMap<String, String>,
@@ -615,13 +620,26 @@ impl Domain {
             .ok_or_else(|| not_found("Case", case_id))
     }
 
-    /// The template `template_id` names, or the modelled 404 for it. A template
-    /// that has been deleted is gone as far as a reader is concerned.
+    /// The LIVE template `template_id` names, or the modelled 404 for it. A
+    /// template that has been deleted is not one a caller can take out a new
+    /// reference to, so the paths that write through a template — an update of
+    /// it, a case created from it — resolve it here.
     pub fn template(&self, template_id: &str) -> Result<&Template, ResourceNotFoundException> {
         self.templates
             .get(template_id)
             .filter(|template| !template.deleted)
             .ok_or_else(|| not_found("Template", template_id))
+    }
+
+    /// The RECORD this domain holds for `template_id`, live or deleted, or
+    /// `None` when it holds none at all.
+    ///
+    /// A template's delete is a SOFT delete, so a deleted template is a
+    /// tombstone rather than an absence. The read the service documents as
+    /// surviving the delete resolves a template through this, and
+    /// [`Template::deleted`] on what comes back says which of the two it is.
+    pub fn template_record(&self, template_id: &str) -> Option<&Template> {
+        self.templates.get(template_id)
     }
 
     /// The live field `field_id` names, or the modelled 404 for it. A field that
@@ -664,11 +682,13 @@ impl Domain {
     }
 
     /// Every template this domain still holds, in creation order and each
-    /// Every template this domain still holds, in creation order and each
     /// paired with the key [`order_key`] builds for it, with the deleted ones
     /// left out: what a listing of templates reports before the request's own
-    /// filters narrow it. A deleted template is gone as far as a reader is
-    /// concerned, exactly as in [`Self::template`].
+    /// filters narrow it. A deleted template is left out of the LISTING only —
+    /// [`Self::template_record`] still reports the record, because
+    /// `DeleteTemplate` says a deleted template is still retrievable through
+    /// `GetTemplate` while "Deleted templates are not included in the
+    /// ListTemplates response".
     pub fn live_templates(&self) -> Vec<(String, &Template)> {
         let mut templates: Vec<(String, &Template)> = self
             .templates

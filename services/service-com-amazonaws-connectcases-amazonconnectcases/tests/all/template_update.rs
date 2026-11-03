@@ -61,7 +61,7 @@ type UpdateRow = (String, Value, Record);
 type RefusalRow = (String, String, Value, u16, &'static str);
 
 /// `CreateField` of type `Text` in `domain_id`, as its minted id.
-async fn text_field(emulator: &Emulator, domain_id: &str, name: &str) -> String {
+pub(crate) async fn text_field(emulator: &Emulator, domain_id: &str, name: &str) -> String {
     let case = format!("CreateField {name}");
     let created = emulator
         .ok(
@@ -76,7 +76,7 @@ async fn text_field(emulator: &Emulator, domain_id: &str, name: &str) -> String 
 
 /// `CreateLayout` with an empty `basic` content in `domain_id`, as its minted id.
 /// A template references a layout by id, so the content does not matter here.
-async fn layout(emulator: &Emulator, domain_id: &str, name: &str) -> String {
+pub(crate) async fn layout(emulator: &Emulator, domain_id: &str, name: &str) -> String {
     let case = format!("CreateLayout {name}");
     let created = emulator
         .ok(
@@ -90,7 +90,7 @@ async fn layout(emulator: &Emulator, domain_id: &str, name: &str) -> String {
 }
 
 /// `CreateTemplate` with `body`, as `(templateId, templateArn)`.
-async fn create_template(
+pub(crate) async fn create_template(
     emulator: &Emulator,
     case: &str,
     domain_id: &str,
@@ -106,7 +106,12 @@ async fn create_template(
 }
 
 /// `GetTemplate`'s whole body: the record every expectation below is read from.
-async fn get_template(emulator: &Emulator, case: &str, domain_id: &str, template_id: &str) -> Value {
+pub(crate) async fn get_template(
+    emulator: &Emulator,
+    case: &str,
+    domain_id: &str,
+    template_id: &str,
+) -> Value {
     emulator
         .ok(
             case,
@@ -118,7 +123,7 @@ async fn get_template(emulator: &Emulator, case: &str, domain_id: &str, template
 }
 
 /// `UpdateTemplate` that must succeed, as its answer body.
-async fn update_template(
+pub(crate) async fn update_template(
     emulator: &Emulator,
     case: &str,
     domain_id: &str,
@@ -143,7 +148,7 @@ fn number_at(json: &Value, member: &str, case: &str) -> f64 {
 }
 
 /// A `requiredFields` list over `field_ids`, in the order given.
-fn required(field_ids: &[&String]) -> Value {
+pub(crate) fn required(field_ids: &[&String]) -> Value {
     Value::Array(
         field_ids
             .iter()

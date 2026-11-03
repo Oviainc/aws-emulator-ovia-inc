@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTemplate
-//! IMPLEMENTED: reports the stored template from [`crate::state`].
+//! IMPLEMENTED: reports the stored template from [`crate::state`], deleted or not —
+//! a template's delete is a soft delete and this is the read that survives it.
 //! It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -180,9 +181,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let domain = store
             .domain(&input.domain_id)
             .map_err(GetTemplateErrorModeled::ResourceNotFoundException)?;
-        let template = domain
-            .template(&input.template_id)
-            .map_err(GetTemplateErrorModeled::ResourceNotFoundException)?;
+        // The RECORD, live or deleted: a template's delete is a soft delete, and
+        // this is the read that survives it — "After a cases template is
+        // deleted: You can still retrieve the template by calling GetTemplate"
+        // (`smithy_query(query="doc",shape="DeleteTemplate")`). The `deleted`
+        // member below is what tells the two apart.
+        let Some(template) = domain.template_record(&input.template_id) else {
+            return Err(GetTemplateErrorModeled::ResourceNotFoundException(
+                crate::state::not_found("Template", &input.template_id),
+            )
+            .into());
+        };
         // The template's required fields, with any field that has since been
         // deleted left out: a read of a template "does not return field IDs for
         // deleted fields" (`smithy_query(query="doc",shape="DeleteField")`).

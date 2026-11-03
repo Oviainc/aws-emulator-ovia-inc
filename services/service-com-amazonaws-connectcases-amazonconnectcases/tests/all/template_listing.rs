@@ -44,7 +44,7 @@ async fn template(
 }
 
 /// `ListTemplates` for `domain_id` with `query` appended verbatim.
-async fn list(emulator: &Emulator, case: &str, domain_id: &str, query: &str) -> Value {
+pub(crate) async fn list(emulator: &Emulator, case: &str, domain_id: &str, query: &str) -> Value {
     emulator
         .ok(
             case,
@@ -86,7 +86,7 @@ async fn get_template(
 }
 
 /// The `templates` member of a listing answer, as the ids it reports in order.
-fn listed_ids(case: &str, answer: &Value) -> Vec<String> {
+pub(crate) fn listed_ids(case: &str, answer: &Value) -> Vec<String> {
     answer
         .get("templates")
         .and_then(Value::as_array)
@@ -106,7 +106,7 @@ fn next_token(answer: &Value) -> Option<String> {
 
 /// The `status` query string for `statuses`: `status` is an `httpQuery` list, so
 /// each value is its own parameter.
-fn status_query(statuses: &[&str]) -> String {
+pub(crate) fn status_query(statuses: &[&str]) -> String {
     if statuses.is_empty() {
         String::new()
     } else {

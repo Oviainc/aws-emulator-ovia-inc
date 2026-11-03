@@ -43,6 +43,8 @@ mod response_and_refusal_fidelity;
 mod state_roundtrip;
 #[path = "all/system_fields.rs"]
 mod system_fields;
+#[path = "all/template_deletion.rs"]
+mod template_deletion;
 #[path = "all/template_listing.rs"]
 mod template_listing;
 #[path = "all/template_update.rs"]
