@@ -323,10 +323,12 @@ async fn omitted_members_come_back_at_their_documented_defaults() {
     }
 
     // An explicit value overrides every one of them, so the default is a fallback and
-    // not a hardcoded answer.
+    // not a hardcoded answer. The VPC placement carries a security group, which a
+    // placement in a subnet is refused without.
     let explicit = json!({
         "IpAddressType": "dualstack",
         "SubnetId": "subnet-0abc1234",
+        "SecurityGroupIds": ["sg-00000001"],
         "DirectInternetAccess": "Disabled",
         "RootAccess": "Disabled",
         "PlatformIdentifier": "notebook-al2-v1",
@@ -338,6 +340,11 @@ async fn omitted_members_come_back_at_their_documented_defaults() {
     create_in_service(&emulator, "explicit", &explicit).await;
     let described = describe(&emulator, "explicit").await;
     for (member, value) in explicit.as_object().expect("an object of members") {
+        // `SecurityGroupIds` is the one member SageMaker renames on the way out
+        // (`SecurityGroups`), which the round-trip case above covers.
+        if member == "SecurityGroupIds" {
+            continue;
+        }
         assert_eq!(
             described.get(member),
             Some(value),
@@ -496,18 +503,27 @@ async fn creating_a_name_already_in_use_is_refused_and_keeps_the_stored_instance
 /// member's own documentation), so the pairing decides the outcome and nothing else does.
 #[tokio::test]
 async fn direct_internet_access_disabled_is_refused_without_a_subnet() {
-    // Rows: every combination of the two members the rule relates.
+    // Rows: every combination of the two members the rule relates. A row that names a
+    // subnet carries a security group too, which a VPC placement is refused without.
     let cases = [
         ("disabled-without-subnet", json!({ "DirectInternetAccess": "Disabled" }), false),
         (
             "disabled-with-subnet",
-            json!({ "DirectInternetAccess": "Disabled", "SubnetId": "subnet-0abc1234" }),
+            json!({
+                "DirectInternetAccess": "Disabled",
+                "SubnetId": "subnet-0abc1234",
+                "SecurityGroupIds": ["sg-00000001"],
+            }),
             true,
         ),
         ("enabled-without-subnet", json!({ "DirectInternetAccess": "Enabled" }), true),
         (
             "enabled-with-subnet",
-            json!({ "DirectInternetAccess": "Enabled", "SubnetId": "subnet-0abc1234" }),
+            json!({
+                "DirectInternetAccess": "Enabled",
+                "SubnetId": "subnet-0abc1234",
+                "SecurityGroupIds": ["sg-00000001"],
+            }),
             true,
         ),
         ("absent-without-subnet", json!({}), true),

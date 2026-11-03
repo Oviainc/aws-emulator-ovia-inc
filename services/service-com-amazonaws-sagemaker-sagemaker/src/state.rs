@@ -115,6 +115,24 @@ pub use job::{
     JOB_STATUS_IN_PROGRESS,
 };
 
+/// The job configuration SCHEMA slice: the one schema `DescribeJobSchemaVersion` reports
+/// and `CreateJob` admits a `JobConfigDocument` against. Re-exported below for the same
+/// reason as the slice above.
+pub mod job_config_schema;
+pub use job_config_schema::{
+    document_refusal as job_config_document_refusal, schema_document as job_config_schema_document,
+    SCHEMA_VERSION as JOB_CONFIG_SCHEMA_VERSION,
+};
+
+/// The ADMISSION slice: the questions every create answers about the execution role and
+/// the network placement a request names, and the sentences it refuses each of them with.
+/// Re-exported below, so a handler names them as `crate::state::…` like every other slice.
+pub mod admission;
+pub use admission::{
+    could_not_assume_role, execution_role_is_unassumable, vpc_placement_refusal,
+    SECURITY_GROUPS_NOT_SPECIFIED, SERVICE_PRINCIPAL,
+};
+
 /// The cluster-policy slice of this state: HyperPod clusters and the cluster policies
 /// on them, with their own records, quota, status span and id mint. Reached through the
 /// single [`ComAmazonawsSagemakerSagemakerState::cluster_policies`] field.
@@ -3861,6 +3879,9 @@ pub const ENDPOINT_CONFIG_KIND_LABEL: &str = "endpoint configuration";
 /// The kind label [`could_not_find`] names an endpoint by.
 pub const ENDPOINT_KIND_LABEL: &str = "endpoint";
 
+/// The kind label [`could_not_find`] names a job configuration schema version by.
+pub const JOB_CONFIG_SCHEMA_KIND_LABEL: &str = "job config schema version";
+
 /// The entity label [`entity_does_not_exist`] names a model package by — one word, the
 /// way the service spells it for this resource.
 pub const MODEL_PACKAGE_ENTITY: &str = "ModelPackage";
@@ -3971,6 +3992,18 @@ pub const AI_BENCHMARK_JOB_ENTITY: &str = "AIBenchmarkJob";
 /// the lineage family reports a resolved ARN ([`does_not_exist`]). A reader that answers
 /// it has stored nothing under the name the request carried.
 pub const REQUESTED_RESOURCE_NOT_FOUND: &str = "Requested resource not found.";
+
+/// How SageMaker's presigned-URL call states a notebook instance this account does not
+/// hold: the resource kind as the service spells it, the ARN the request's
+/// `NotebookInstanceName` resolves to, and `does not exist` with no closing period.
+///
+/// A separate template from the `RecordNotFound. Notebook Instance Arn: <arn>` sentence the
+/// READERS of this resource answer, because the service words the two differently — the
+/// same split the processing-job family has between its read and its update templates.
+#[must_use]
+pub fn notebook_instance_does_not_exist(arn: &str) -> String {
+    format!("Notebook Instance {arn} does not exist")
+}
 
 /// How SageMaker states a hyperparameter tuning job the account does not hold: the name
 /// AS THE CALLER SENT IT, in the sentence that tells it to send another one.

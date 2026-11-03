@@ -641,8 +641,18 @@ async fn a_job_the_control_plane_created_is_sampled_through_the_whole_router() {
                 "JobName": name,
                 "JobCategory": category,
                 "JobConfigSchemaVersion": "1.0.0",
-                "JobConfigDocument": "{\"baseModel\":\"demo-model\"}",
-                "RoleArn": "arn:aws:iam::000000000000:role/service-role/AmazonSageMaker-ExecutionRole",
+                // A document conforming to the schema the service publishes, under a role
+                // of another account — which this emulator's IAM is not asked about — so
+                // this routing case turns on the ROUTING and on nothing the create admits.
+                "JobConfigDocument": serde_json::json!({
+                    "AgentConfig": {},
+                    "InputDataConfig": {},
+                    "ModelPackageConfig": { "BaseModel": "demo-model" },
+                    "OutputDataConfig": {},
+                    "TrainingConfig": {},
+                })
+                .to_string(),
+                "RoleArn": "arn:aws:iam::123456789012:role/service-role/AmazonSageMaker-ExecutionRole",
             })
             .to_string(),
         )

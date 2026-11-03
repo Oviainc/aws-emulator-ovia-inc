@@ -169,13 +169,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
+        let region = crate::state::request_region(ctx);
         // Rules the model states that the boundary validator cannot express — neither the
-        // configuration document's syntax nor the uniqueness of a tag key is a member
-        // constraint — so they are refused here, as 400 `ValidationException` and never
-        // as 501.
+        // configuration document's conformance to the service's schema nor the uniqueness
+        // of a tag key is a member constraint — so they are refused here, as 400
+        // `ValidationException` and never as 501. They are judged BEFORE the role: recorded
+        // SageMaker answers the schema diagnostic for a request that also names a role it
+        // cannot assume, so the document is what such a request is refused for.
         validate_request(&input)?;
 
-        let region = crate::state::request_region(ctx);
+        // The job RUNS AS the role the request names ("the IAM role that Amazon SageMaker
+        // assumes to perform the job"), so the role is settled before the store is locked:
+        // a role SageMaker cannot assume performs no job at all. Only what the emulator's
+        // OWN IAM ANSWERED is refused (see `crate::state::admission`).
+        if crate::state::execution_role_is_unassumable(ctx, &region, &input.role_arn).await {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::could_not_assume_role(&input.role_arn),
+            ));
+        }
+
         // `JobArn`'s pattern puts the category between the resource type and the name
         // (`…:job/<JobCategory>/<JobName>`), so the ARN carries both parts of the
         // identity every job operation takes.
@@ -262,8 +274,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// Each rule is one the model states and the boundary validator cannot express: the
 /// member constraints (lengths, patterns, list sizes and the `JobCategory` enum) are
-/// already enforced before `handle` runs, but the configuration document's SYNTAX is not
-/// a member constraint, and neither is the uniqueness of a tag key.
+/// already enforced before `handle` runs, but the configuration document's CONFORMANCE to
+/// the service's job configuration schema is not a member constraint, and neither is the
+/// uniqueness of a tag key.
 ///
 /// All of them refuse with 400 `ValidationException` — the code the real service answers
 /// for a request it understood and will not accept. This operation's three modelled errors
@@ -271,15 +284,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// none fits.
 fn validate_request(input: &CreateJobInput) -> Result<(), CreateJobError> {
     // `JobConfigDocument`: "The JSON configuration document for the job. The document
-    // must conform to the schema specified by JobConfigSchemaVersion." A document that is
-    // not JSON at all conforms to no schema, and that much is decidable from the request
-    // itself; which members a given schema version requires is
-    // `DescribeJobSchemaVersion`'s to state, and that operation is still a stub, so
-    // nothing beyond the syntax is claimed here.
-    if ::serde_json::from_str::<::serde_json::Value>(&input.job_config_document).is_err() {
-        return Err(crate::scaffolded::Scaffolded::validation(
-            "JobConfigDocument must be a JSON document.",
-        ));
+    // must conform to the schema specified by JobConfigSchemaVersion." The schema is the
+    // one this service publishes through `DescribeJobSchemaVersion`, and the refusal is
+    // the schema layer's own diagnostic over the document the request carried — both
+    // stated once in `crate::state::job_config_schema`, so the reader and this admission
+    // cannot describe different schemas.
+    if let Some(refusal) = crate::state::job_config_document_refusal(&input.job_config_document) {
+        return Err(crate::scaffolded::Scaffolded::validation(refusal));
     }
 
     // `Tags`' doc ends "Tag keys must be unique per resource", a rule the model cannot

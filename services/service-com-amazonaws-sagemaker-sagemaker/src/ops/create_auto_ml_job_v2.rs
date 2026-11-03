@@ -309,6 +309,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx);
+        // The job RUNS AS the role the request names, so the role is settled before
+        // anything is stored and before the store is locked: only what the emulator's OWN
+        // IAM ANSWERED is refused (see `crate::state::admission`).
+        if crate::state::execution_role_is_unassumable(ctx, &region, &input.role_arn).await {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::could_not_assume_role(&input.role_arn),
+            ));
+        }
         let arn = crate::state::resource_arn(&region, "automl-job", &input.auto_ml_job_name);
         let key = crate::state::entity_key(&input.auto_ml_job_name);
 

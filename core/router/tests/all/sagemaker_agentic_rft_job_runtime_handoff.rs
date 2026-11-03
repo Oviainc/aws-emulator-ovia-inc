@@ -211,7 +211,16 @@ async fn create_job(
             "JobName": name,
             "JobCategory": category,
             "JobConfigSchemaVersion": SCHEMA_VERSION,
-            "JobConfigDocument": json!({ "baseModel": "demo-model", "maxTurns": 8 }).to_string(),
+            // A document conforming to the schema `DescribeJobSchemaVersion` publishes,
+            // which `CreateJob` admits a configuration document against.
+            "JobConfigDocument": json!({
+                "AgentConfig": { "MaxTurns": 8 },
+                "InputDataConfig": { "S3Uri": "s3://prompts/train" },
+                "ModelPackageConfig": { "BaseModel": "demo-model" },
+                "OutputDataConfig": { "S3Uri": "s3://artifacts/out" },
+                "TrainingConfig": { "Epochs": 1 },
+            })
+            .to_string(),
             "RoleArn": ROLE_ARN,
         }))
         .expect("a serializable CreateJob body"),

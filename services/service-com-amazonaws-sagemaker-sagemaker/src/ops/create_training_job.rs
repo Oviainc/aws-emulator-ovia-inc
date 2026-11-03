@@ -377,6 +377,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let region = crate::state::request_region(ctx);
+        // The job RUNS AS the role the request names, so the role is settled BEFORE
+        // anything else about the request is judged and before the store is locked: a role
+        // SageMaker cannot assume backs no training run at all, so the create is refused
+        // for the role whatever else the request gets wrong, and nothing is persisted. Only
+        // what the emulator's OWN IAM ANSWERED is refused (see `crate::state::admission`),
+        // so an emulator with no IAM to ask refuses nothing.
+        if crate::state::execution_role_is_unassumable(ctx, &region, &input.role_arn).await {
+            return Err(refuse(crate::state::could_not_assume_role(&input.role_arn)));
+        }
         let arn = crate::state::resource_arn(&region, "training-job", &input.training_job_name);
         let now = ::std::time::SystemTime::now();
 

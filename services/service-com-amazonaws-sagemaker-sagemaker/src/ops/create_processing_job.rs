@@ -3,7 +3,8 @@
 //! @op CreateProcessingJob
 //! IMPLEMENTED: registers a processing job in `crate::state` under its
 //! `ProcessingJobName`, minting the `ProcessingJobArn` from the request's region, after
-//! refusing the request shapes the model's prose rules out and applying the defaults it
+//! refusing a `RoleArn` SageMaker cannot assume (see `crate::state::admission`) and the
+//! request shapes the model's prose rules out, and applying the defaults it
 //! documents. The job is accepted in `InProgress`; the move out of it is owed by the
 //! clock (`crate::state::ProcessingJob::settle_status`) and materialised by
 //! `DescribeProcessingJob`. This is the ONLY file to touch for this operation.
@@ -185,13 +186,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
+        // The job RUNS AS the role the request names, so the role is settled BEFORE
+        // anything else about the request is judged and before the store is locked: a role
+        // SageMaker cannot assume backs no run at all, so the create is refused for the
+        // role whatever else the request gets wrong, and nothing is persisted. The question
+        // is put to the emulator's OWN IAM over its OWN in-process callback (see
+        // `crate::state::admission`), and only what IAM ANSWERED is refused, so an emulator
+        // with no IAM to ask refuses nothing.
+        let region = crate::state::request_region(ctx);
+        if crate::state::execution_role_is_unassumable(ctx, &region, &input.role_arn).await {
+            return Err(refuse(crate::state::could_not_assume_role(&input.role_arn)));
+        }
+
         // The rules the model states in prose rather than in a constraint trait, so the
         // centralized validation walk cannot have refused them already.
         validate_processing_inputs(input.processing_inputs.as_deref())?;
         validate_output_config(input.processing_output_config.as_ref())?;
         let processing_resources = resolve_resources(&input.processing_resources)?;
 
-        let region = crate::state::request_region(ctx);
         let arn =
             crate::state::resource_arn(&region, "processing-job", &input.processing_job_name);
 

@@ -232,6 +232,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let region = crate::state::request_region(ctx);
+        // A placement in a VPC subnet is incomplete without a security group, and the
+        // instance's network interface cannot be attached without one: the pair is this
+        // service's own rule, stated once in `crate::state::admission`. It is judged BEFORE
+        // the role, because recorded SageMaker answers the placement for a request that
+        // also names a role it cannot assume.
+        if let Some(refusal) = crate::state::vpc_placement_refusal(
+            input.subnet_id.as_deref(),
+            input.security_group_ids.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
+
+        // The instance RUNS AS the role the request names ("SageMaker AI assumes this role
+        // to perform tasks on your behalf"), so the role is settled before anything is
+        // stored and before the store is locked: only what the emulator's OWN IAM ANSWERED
+        // is refused (see `crate::state::admission`).
+        if crate::state::execution_role_is_unassumable(ctx, &region, &input.role_arn).await {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::could_not_assume_role(&input.role_arn),
+            ));
+        }
         let arn = crate::state::resource_arn(
             &region,
             crate::state::NOTEBOOK_INSTANCE_ARN_KIND,

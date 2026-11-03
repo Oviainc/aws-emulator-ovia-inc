@@ -47,6 +47,8 @@ mod code_repository_deletion;
 mod compute_quota_lifecycle;
 #[path = "all/control_plane_preconditions.rs"]
 mod control_plane_preconditions;
+#[path = "all/create_admission.rs"]
+mod create_admission;
 #[path = "all/create_refusal_message_fidelity.rs"]
 mod create_refusal_message_fidelity;
 #[path = "all/custom_image_deletion.rs"]

@@ -160,16 +160,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .notebook_instances
             .get_mut(&input.notebook_instance_name)
         else {
-            // The same refusal this resource's readers give: the instance is this call's
-            // subject, and the operation models no not-found error of its own.
+            // The instance is this call's subject and the operation models no not-found
+            // error of its own, so the refusal is a 400 `ValidationException` carrying
+            // this call's own template (`crate::state::notebook_instance_does_not_exist`),
+            // which the service words differently from the readers' sentence.
             let arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
                 crate::state::NOTEBOOK_INSTANCE_ARN_KIND,
                 &input.notebook_instance_name,
             );
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "RecordNotFound. Notebook Instance Arn: {arn}"
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::notebook_instance_does_not_exist(&arn),
+            ));
         };
 
         // The `Pending` -> `InService` transition the clock already owed is materialised

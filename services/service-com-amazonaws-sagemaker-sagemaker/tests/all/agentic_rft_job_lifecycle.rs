@@ -34,10 +34,23 @@ const SCHEMA_VERSION: &str = "1.0.0";
 /// and `AgentRFTEvaluation`.
 const JOB_CATEGORIES: [&str; 2] = ["AgentRFT", "AgentRFTEvaluation"];
 
-/// A minimal valid `JobConfigDocument`: the member is documented as "The JSON
-/// configuration document for the job".
+/// A `JobConfigDocument` that conforms to the schema this service publishes through
+/// `DescribeJobSchemaVersion`: an object carrying every property that schema requires.
 fn config_document() -> String {
-    json!({ "baseModel": "demo-model", "maxTurns": 8 }).to_string()
+    config_document_naming("demo-model")
+}
+
+/// [`config_document`] with the base model the customization starts from, so two
+/// conforming documents can be told apart.
+fn config_document_naming(model: &str) -> String {
+    json!({
+        "AgentConfig": { "MaxTurns": 8 },
+        "InputDataConfig": { "S3Uri": "s3://prompts/train" },
+        "ModelPackageConfig": { "BaseModel": model },
+        "OutputDataConfig": { "S3Uri": "s3://artifacts/out" },
+        "TrainingConfig": { "Epochs": 1 },
+    })
+    .to_string()
 }
 
 /// A minimal valid `CreateJob` body.
@@ -233,10 +246,14 @@ async fn a_created_job_is_registered_for_the_job_runtime_data_plane() {
 async fn a_name_already_held_is_refused_as_in_use() {
     // Rows differ along what the second create changes: nothing, the category, or the
     // configuration document.
-    let rows: [(&str, &str, &str); 3] = [
-        ("the same request again", JOB_CATEGORIES[0], "{}"),
-        ("another category", JOB_CATEGORIES[1], "{}"),
-        ("another configuration", JOB_CATEGORIES[0], r#"{"baseModel":"other"}"#),
+    let rows: [(&str, &str, String); 3] = [
+        ("the same request again", JOB_CATEGORIES[0], config_document()),
+        ("another category", JOB_CATEGORIES[1], config_document()),
+        (
+            "another configuration",
+            JOB_CATEGORIES[0],
+            config_document_naming("other"),
+        ),
     ];
 
     for (case, category, document) in rows {
@@ -306,7 +323,7 @@ async fn a_request_the_model_cannot_express_is_refused_as_invalid() {
                 body["JobConfigDocument"] = json!("not a json document");
                 body
             },
-            "JobConfigDocument",
+            "failed schema validation",
         ),
         (
             "a tag key taken twice",
