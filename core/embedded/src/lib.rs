@@ -20,6 +20,7 @@ pub use emulator_server::VendedCredentials;
 use emulator_telemetry::{TelemetryClient, TelemetryOptions};
 use smithy_server_runtime::EmbeddedEmulator;
 use std::sync::Once;
+use std::time::Duration;
 
 /// The project id this emulator reports to telemetry.
 const TELEMETRY_PROJECT_ID: &str = "proj-a85d506b35244f71850223e92be29acb";
@@ -39,8 +40,8 @@ pub struct AwsEmulatorEmbedded {
 }
 
 impl AwsEmulatorEmbedded {
-    /// An emulator with `options`. Authentication applies to this emulator; telemetry, once
-    /// on, records for the whole process.
+    /// An emulator with `options`. Authentication applies to this emulator; telemetry is
+    /// process-wide, and [`Telemetry::Off`] from any emulator turns it off for the process.
     pub fn new(options: EmbeddedOptions) -> Self {
         if let Err(error) = emulator_server::set_emulator_home_dir(EMULATOR_HOME_DIR) {
             eprintln!("{error}");
@@ -99,21 +100,30 @@ impl Default for AwsEmulatorEmbedded {
     }
 }
 
-/// Starts the process's telemetry client once, unless this call says [`Telemetry::Off`] or no
-/// endpoint is compiled in — then nothing starts and nothing on disk is touched. The client
+/// Starts the process's telemetry client once, unless no endpoint is compiled in. The client
 /// records for the whole process and installs no panic hook; its final flush runs when the
 /// process exits.
+///
+/// [`Telemetry::Off`] wins for the whole process, whichever emulator says it and whenever. If
+/// the first emulator says it, nothing ever starts and nothing on disk is touched, so a later
+/// default emulator cannot turn telemetry on. If a client is already running, it is shut down
+/// at once and collects nothing more.
 fn start_telemetry(telemetry: Telemetry) {
     static START: Once = Once::new();
-    if telemetry == Telemetry::Off {
-        return;
-    }
     START.call_once(|| {
+        if telemetry == Telemetry::Off {
+            return;
+        }
         if let Some(options) = telemetry_options() {
             emulator_telemetry::init_global(TelemetryClient::start(options));
             emulator_telemetry::flush_at_process_exit();
         }
     });
+    if telemetry == Telemetry::Off {
+        if let Some(client) = emulator_telemetry::global() {
+            client.shutdown(Duration::ZERO);
+        }
+    }
 }
 
 /// The version embedded telemetry reports: the release version the release build stamps

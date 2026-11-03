@@ -16,10 +16,13 @@ use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse}
 ///
 /// Routing is a fixed two-step sequence: find the single service whose
 /// [`can_handle`](Service::can_handle) returns true, then ask that service for
-/// the operation and run it. Zero claimants is a 404 `UnknownService`; two or
-/// more is a 500 `AmbiguousService`. Ambiguity is rejected rather than resolved
-/// by registration order, because several AWS services share one SigV4 signing
-/// name and serving an arbitrary one would answer the wrong service.
+/// the operation and run it. Zero claimants is a 404 `UnknownService`. Several
+/// AWS services share one SigV4 signing name, so two or more services can claim
+/// one request; the router then keeps only the claimants whose model names an
+/// operation for it, and serves the one that remains. When none or several
+/// remain it answers 500 `AmbiguousService`. Ambiguity is never resolved by
+/// registration order, because serving an arbitrary service would answer the
+/// wrong one.
 ///
 /// `MultiServiceRouter` implements [`EmulatorService`], so it composes with the
 /// transport layer's `serve_*` paths, and it is exposed as an SDK `HttpConnector`
@@ -143,27 +146,9 @@ impl MultiServiceRouter {
         }
 
         // STEP 1 — exactly one service must claim the request.
-        let claimants: Vec<&dyn Service> = self
-            .services
-            .iter()
-            .map(|s| s.as_ref())
-            .filter(|s| s.can_handle(&parts))
-            .collect();
-
-        let svc: &dyn Service = match claimants.as_slice() {
-            [one] => *one,
-            [] => {
-                let key = emulator_server::resolve_route_key(&parts);
-                return unknown_service_response(key.as_deref());
-            }
-            ambiguous => {
-                let names: Vec<&str> = ambiguous
-                    .iter()
-                    .map(|s| s.definition().identity().signing_name())
-                    .collect();
-                let key = emulator_server::resolve_route_key(&parts);
-                return ambiguous_service_response(key.as_deref(), &names);
-            }
+        let svc = match self.select_service(&parts, &_body) {
+            Ok(svc) => svc,
+            Err(refused) => return *refused,
         };
 
         // Build the runtime-API request (parts + body) ONCE, up front: the
@@ -276,6 +261,51 @@ impl MultiServiceRouter {
 }
 
 impl MultiServiceRouter {
+    /// The one service that serves the request, or the refusal to send instead, by
+    /// the selection rule on [`MultiServiceRouter`]. A claimant "names an
+    /// operation" when [`names_operation`] says so.
+    fn select_service(
+        &self,
+        parts: &http::request::Parts,
+        body: &[u8],
+    ) -> Result<&dyn Service, Box<http::Response<bytes::Bytes>>> {
+        let claimants: Vec<&dyn Service> = self
+            .services
+            .iter()
+            .map(|s| s.as_ref())
+            .filter(|s| s.can_handle(parts))
+            .collect();
+
+        match claimants.as_slice() {
+            [one] => Ok(*one),
+            [] => {
+                let key = emulator_server::resolve_route_key(parts);
+                Err(Box::new(unknown_service_response(key.as_deref())))
+            }
+            several => {
+                // Only this branch pays for building the request: the operation
+                // lookup needs the body (a query protocol routes by its `Action`
+                // form field). It is not `aws-chunked`-decoded first; no protocol
+                // reads its routing key from a chunked body.
+                let probe = runtime_api_request_from_parts(parts, body.to_vec());
+                let modeling: Vec<&dyn Service> = several
+                    .iter()
+                    .copied()
+                    .filter(|s| names_operation(*s, &probe))
+                    .collect();
+                if let [one] = modeling.as_slice() {
+                    return Ok(*one);
+                }
+                let names: Vec<&str> = several
+                    .iter()
+                    .map(|s| s.definition().identity().signing_name())
+                    .collect();
+                let key = emulator_server::resolve_route_key(parts);
+                Err(Box::new(ambiguous_service_response(key.as_deref(), &names)))
+            }
+        }
+    }
+
     /// `Ok` when no authenticator is registered or `op` is served unsigned. The modeled operation
     /// the routing key names decides, so an author-written operation cannot weaken its schemes;
     /// an operation's own schemes count only when the model names none for the request.
@@ -339,6 +369,17 @@ fn modeled_operation<'s>(
 ) -> Option<&'s dyn ErasedOperation> {
     let key = wire.protocol().routing_key(req).ok()?;
     svc.definition().routing_table().get(key)
+}
+
+/// Whether `svc` names an operation for `req`, the way dispatch would look it up: in
+/// the protocol the request is served in, the author's
+/// [`override_operation`](Service::override_operation) first, then the model's
+/// routing table. A request in none of the service's protocols names nothing, since
+/// dispatch would refuse it before either is asked.
+fn names_operation(svc: &dyn Service, req: &RtRequest) -> bool {
+    let wire = svc.definition().wire_protocol(req);
+    !wire.is_unrecognised()
+        && (svc.override_operation(req).is_some() || modeled_operation(svc, wire, req).is_some())
 }
 
 /// The first registered authenticator, in the operation's scheme order, that recognizes the request; with no
@@ -532,15 +573,57 @@ mod tests {
         Never,
     }
 
-    /// The minimal [`ErasedServiceDefinition`] a [`SelectingService`] exposes. Only
-    /// [`identity`](ErasedServiceDefinition::identity) is real — selection reads it to
-    /// resolve and report a service's key; the protocol, routing table, and
-    /// error renderers are never reached on the selection path (a request with
-    /// zero or two-plus claimants is answered before the router looks an
-    /// operation up), so they are left `unreachable!()` rather than given stub
-    /// behaviour that could mislead.
+    /// The [`ErasedServiceDefinition`] a [`SelectingService`] exposes: its
+    /// identity, an awsJson1_0 protocol (routing key from `x-amz-target`), and a
+    /// routing table that models the operations it was built with. Selection
+    /// reads the protocol and table only to narrow several claimants; the error
+    /// renderers are never reached by these tests, so they stay `unreachable!()`.
     struct SelectingEntry {
         identity: ServiceIdentity,
+        protocol: aws_smithy_schema_server::HttpRpcServerProtocol<
+            aws_smithy_schema_server::json::JsonCodec,
+        >,
+        table: crate::service::OperationRoutingTable,
+        /// Whether the request is in a protocol this service declares; when not,
+        /// `wire_protocol` answers unrecognised, as a generated entry does.
+        speaks: bool,
+    }
+
+    impl SelectingEntry {
+        /// An entry for `signing_name` whose routing table models `operations`,
+        /// each answering with [`Answer`].
+        fn new(signing_name: &'static str, operations: &[&'static str]) -> Self {
+            let mut table = crate::service::OperationRoutingTable::new();
+            for op in operations {
+                table.add_operation(op, Box::new(Answer));
+            }
+            Self {
+                identity: ServiceIdentity::new(signing_name, signing_name),
+                protocol: aws_smithy_schema_server::AwsJson10(),
+                table,
+                speaks: true,
+            }
+        }
+    }
+
+    /// A modeled operation that answers 200 with the serving service's signing
+    /// name, so a test can tell which claimant served a request.
+    struct Answer;
+    impl ErasedOperation for Answer {
+        fn run<'r>(
+            &'r self,
+            svc: &'r dyn Service,
+            _req: &'r RtRequest,
+            _ctx: &'r OperationContext<'r>,
+        ) -> crate::BoxFuture<'r, RtResponse> {
+            let name = svc.definition().identity().signing_name().to_string();
+            Box::pin(async move {
+                RtResponse::new(
+                    aws_smithy_runtime_api::http::StatusCode::try_from(200).unwrap(),
+                    aws_smithy_types::body::SdkBody::from(name),
+                )
+            })
+        }
     }
 
     impl crate::service::ErasedServiceDefinition for SelectingEntry {
@@ -553,7 +636,7 @@ mod tests {
         }
 
         fn routing_table(&self) -> &crate::service::OperationRoutingTable {
-            unreachable!("selection answers before the routing table is read")
+            &self.table
         }
 
         fn routing_error_response(
@@ -572,16 +655,22 @@ mod tests {
         }
 
         fn wire_protocol(&self, _req: &RtRequest) -> crate::WireProtocol<'_> {
-            unreachable!("selection answers before the wire protocol is read")
+            if !self.speaks {
+                return crate::WireProtocol::unrecognised();
+            }
+            let envelope = crate::PreDispatchProtocol::Json {
+                content_type: "application/x-amz-json-1.0",
+                errortype_header: false,
+            };
+            crate::WireProtocol::new(&self.protocol, envelope)
         }
     }
 
-    /// A minimal [`Service`] that participates in routing by identity and
-    /// predicate alone. Selection reaches only `can_handle` and the entry's
-    /// `identity`: a request with zero or two-plus claimants is answered before
-    /// the router looks an operation up, so the remaining seams are never called
-    /// on this path and are left unreachable rather than given stub behaviour
-    /// that could mislead.
+    /// A minimal [`Service`] that participates in routing by identity, predicate
+    /// and the operations its routing table models. `override_operation` returns
+    /// `None`, so the table alone names its operations. The error-rendering seams
+    /// are never reached by these tests and are left unreachable rather than
+    /// given stub behaviour that could mislead.
     struct SelectingService {
         entry: SelectingEntry,
         claim: Claim,
@@ -592,20 +681,25 @@ mod tests {
         /// resolves to that name.
         fn by_signing_name(signing_name: &'static str) -> Self {
             Self {
-                entry: SelectingEntry {
-                    identity: ServiceIdentity::new(signing_name, signing_name),
-                },
+                entry: SelectingEntry::new(signing_name, &[]),
                 claim: Claim::WhenKeyMatches,
             }
         }
 
-        /// A service named `signing_name` that claims every request, for forcing
-        /// an ambiguous collision.
+        /// A service named `signing_name` that claims every request and models no
+        /// operation, for forcing an ambiguous collision.
         fn always_claiming(signing_name: &'static str) -> Self {
+            Self::always_claiming_modeling(signing_name, &[])
+        }
+
+        /// A service named `signing_name` that claims every request and models
+        /// `operations`, as two services sharing one signing name do.
+        fn always_claiming_modeling(
+            signing_name: &'static str,
+            operations: &[&'static str],
+        ) -> Self {
             Self {
-                entry: SelectingEntry {
-                    identity: ServiceIdentity::new(signing_name, signing_name),
-                },
+                entry: SelectingEntry::new(signing_name, operations),
                 claim: Claim::Always,
             }
         }
@@ -614,9 +708,7 @@ mod tests {
         /// declined request is never absorbed.
         fn never_claiming(signing_name: &'static str) -> Self {
             Self {
-                entry: SelectingEntry {
-                    identity: ServiceIdentity::new(signing_name, signing_name),
-                },
+                entry: SelectingEntry::new(signing_name, &[]),
                 claim: Claim::Never,
             }
         }
@@ -639,7 +731,9 @@ mod tests {
         }
 
         fn override_operation(&self, _req: &RtRequest) -> Option<&dyn ErasedOperation> {
-            unreachable!("selection answers before an operation is looked up")
+            // A service that does not speak the request's protocol answers every request
+            // here, so a test can prove selection does not ask it: dispatch never would.
+            (!self.entry.speaks).then_some(&Answer as &dyn ErasedOperation)
         }
 
         fn override_routing_error(&self, _req: &RtRequest) -> Option<RtResponse> {
@@ -744,6 +838,101 @@ mod tests {
         let reverse = build(["docdb", "rds"]);
         assert_eq!(forward.dispatch(signed_request("rds")).await.status(), 500);
         assert_eq!(reverse.dispatch(signed_request("rds")).await.status(), 500);
+    }
+
+    /// A signed awsJson call to `operation`: the `x-amz-target` header names it,
+    /// the SigV4 scope names `signing_name`.
+    fn signed_call(signing_name: &str, operation: &str) -> http::Request<bytes::Bytes> {
+        let (mut parts, body) = signed_request(signing_name).into_parts();
+        parts.headers.insert(
+            "x-amz-target",
+            http::HeaderValue::from_str(&format!("Service.{operation}")).unwrap(),
+        );
+        http::Request::from_parts(parts, body)
+    }
+
+    /// Two services that both claim a request, as services sharing one signing
+    /// name do (`bedrock` and `bedrock-agent` both sign as `bedrock`), registered
+    /// in `order`. Each models its own operations.
+    fn colliding_router(order: [&'static str; 2]) -> MultiServiceRouter {
+        let mut router = MultiServiceRouter::default();
+        for name in order {
+            let operations: &[&'static str] = match name {
+                "bedrock" => &["ListFoundationModels", "Shared"],
+                _ => &["ListAgents", "Shared"],
+            };
+            router.register_service(SelectingService::always_claiming_modeling(name, operations));
+        }
+        router
+    }
+
+    #[tokio::test]
+    async fn several_claimants_are_served_by_the_one_whose_model_names_the_operation() {
+        // Both services claim every request, but only one models each of these
+        // operations, so that one serves it, whichever was registered first.
+        for order in [["bedrock", "bedrock-agent"], ["bedrock-agent", "bedrock"]] {
+            let router = colliding_router(order);
+            for (operation, server) in [
+                ("ListAgents", "bedrock-agent"),
+                ("ListFoundationModels", "bedrock"),
+            ] {
+                let resp = router.dispatch(signed_call("bedrock", operation)).await;
+                assert_eq!(resp.status(), 200, "{operation} with order {order:?}");
+                assert_eq!(
+                    resp.body().as_ref(),
+                    server.as_bytes(),
+                    "{operation} is served by {server} with order {order:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn several_claimants_that_all_model_the_operation_stay_ambiguous() {
+        // When more than one claimant models the operation, the model does not
+        // separate them either, so the router still refuses rather than serving
+        // an arbitrary one, and names every claimant.
+        for order in [["bedrock", "bedrock-agent"], ["bedrock-agent", "bedrock"]] {
+            let resp = colliding_router(order)
+                .dispatch(signed_call("bedrock", "Shared"))
+                .await;
+            assert_eq!(resp.status(), 500, "order {order:?}");
+            let body = body_json(&resp);
+            assert_eq!(body["__type"], "AmbiguousService");
+            let message = body["message"].as_str().unwrap();
+            assert!(message.contains("bedrock-agent"), "{message}");
+            assert!(message.contains('2'), "claimant count named: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_claimant_that_does_not_speak_the_request_protocol_does_not_name_its_operation() {
+        // Both claimants name `Shared` (one through `override_operation`), but that
+        // one does not declare the request's protocol, so dispatch would refuse the
+        // request there before asking it: only the other names it.
+        for mute_first in [true, false] {
+            let mut router = MultiServiceRouter::default();
+            for (i, name) in ["bedrock", "bedrock-agent"].into_iter().enumerate() {
+                let mut svc = SelectingService::always_claiming_modeling(name, &["Shared"]);
+                svc.entry.speaks = (i == 0) != mute_first;
+                router.register_service(svc);
+            }
+            let resp = router.dispatch(signed_call("bedrock", "Shared")).await;
+            assert_eq!(resp.status(), 200, "mute_first {mute_first}");
+            let served = ["bedrock", "bedrock-agent"][usize::from(mute_first)];
+            assert_eq!(resp.body().as_ref(), served.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn several_claimants_none_modeling_the_operation_stay_ambiguous() {
+        // No claimant models the operation, so the model cannot pick one: the
+        // request is refused as ambiguous, not served by any of them.
+        let resp = colliding_router(["bedrock", "bedrock-agent"])
+            .dispatch(signed_call("bedrock", "DeleteEverything"))
+            .await;
+        assert_eq!(resp.status(), 500);
+        assert_eq!(body_json(&resp)["__type"], "AmbiguousService");
     }
 
     #[tokio::test]

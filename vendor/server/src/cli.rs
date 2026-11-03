@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The emulator's command line: `-b`, `-p`, `-h`, `-v`, `-t on|off`, `-a on|off`, `--idle-timeout <seconds>`.
 
+use emulator_telemetry::policy::{TELEMETRY_CLI_FLAG, TELEMETRY_CLI_SHORT_FLAG};
 use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -92,8 +93,8 @@ pub fn parse_command_line(
         match flag.as_str() {
             "-h" | "--help" => return Ok(Command::Print(USAGE.to_string())),
             "-v" | "--version" => return Ok(Command::Print(version_text(build))),
-            "-t" | "--telemetry" => {
-                options.telemetry = Some(parse_switch("--telemetry", &value()?)?)
+            TELEMETRY_CLI_SHORT_FLAG | TELEMETRY_CLI_FLAG => {
+                options.telemetry = Some(parse_switch(TELEMETRY_CLI_FLAG, &value()?)?)
             }
             "-a" | "--auth" => options.authentication = parse_switch("--auth", &value()?)?,
             "-b" | "--bind" => {

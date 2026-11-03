@@ -208,14 +208,37 @@ pub async fn http_connector_call<S: EmulatorService>(
 
     tokio::task::yield_now().await;
     let response = svc.handle_request(req).await;
-    let (parts, body_bytes) = response.into_parts();
+    let (mut parts, body_bytes) = response.into_parts();
+    set_framing_content_length(&mut parts, body_bytes.len());
 
-    Ok(
-        aws_smithy_runtime_api::client::orchestrator::HttpResponse::new(
-            parts.status.into(),
-            aws_smithy_types::body::SdkBody::from(body_bytes),
-        ),
-    )
+    // The whole response goes to the SDK: status, every header, and the body. An SDK reads
+    // most of what a call returns from the headers (an S3 `ETag`, `Content-Length` and
+    // version id, for one), so a response rebuilt from the status and body alone reaches
+    // the caller with those members absent. The conversion reports a failure as a connector
+    // error rather than a panic, as the request side does for a request it cannot convert.
+    let response =
+        http::Response::from_parts(parts, aws_smithy_types::body::SdkBody::from(body_bytes));
+    aws_smithy_runtime_api::client::orchestrator::HttpResponse::try_from(response)
+        .map_err(|e| ConnectorError::other(Box::new(e), None))
+}
+
+/// Gives an in-process response the `Content-Length` the network listeners' HTTP stack
+/// (hyper) writes on the wire: the body's length, unless the handler set one itself (an S3
+/// `HeadObject` reports the object's size) or the status carries no content (1xx, 204, 304).
+/// The SDK sees the same framing header in embedded mode as over a socket.
+fn set_framing_content_length(parts: &mut http::response::Parts, body_len: usize) {
+    let status = parts.status;
+    if status.is_informational()
+        || status == http::StatusCode::NO_CONTENT
+        || status == http::StatusCode::NOT_MODIFIED
+        || parts.headers.contains_key(http::header::CONTENT_LENGTH)
+        || parts.headers.contains_key(http::header::TRANSFER_ENCODING)
+    {
+        return;
+    }
+    parts
+        .headers
+        .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(body_len));
 }
 
 /// Generate `HttpConnector` and `HttpClient` impls for a concrete service type.
@@ -1976,6 +1999,133 @@ mod tests {
     use assert2::check;
     use parking_lot::Mutex;
     use std::collections::HashMap;
+
+    /// A service that answers every request with a fixed response.
+    #[derive(Clone)]
+    struct Fixed(http::Response<bytes::Bytes>);
+
+    impl EmulatorService for Fixed {
+        async fn handle_request(
+            &self,
+            _req: http::Request<bytes::Bytes>,
+        ) -> http::Response<bytes::Bytes> {
+            self.0.clone()
+        }
+    }
+
+    fn sdk_request() -> aws_smithy_runtime_api::client::orchestrator::HttpRequest {
+        aws_smithy_runtime_api::client::orchestrator::HttpRequest::get("http://localhost/")
+            .expect("a valid request")
+    }
+
+    /// The SDK reads an S3 `ETag`, `Content-Length` and version id, among much else, from
+    /// the response headers, so the connector must hand every header through, repeated
+    /// ones included, along with the status and the body.
+    #[tokio::test]
+    async fn the_connector_passes_the_status_every_header_and_the_body_through() {
+        let response = http::Response::builder()
+            .status(206)
+            .header("etag", "\"abc\"")
+            .header("content-length", "5")
+            .header("x-amz-version-id", "v1")
+            .header("x-amz-meta-note", "first")
+            .header("x-amz-meta-note", "second")
+            .body(bytes::Bytes::from_static(b"hello"))
+            .unwrap();
+
+        let out = http_connector_call(&Fixed(response), sdk_request())
+            .await
+            .unwrap();
+
+        check!(out.status().as_u16() == 206);
+        check!(out.headers().get("etag") == Some("\"abc\""));
+        check!(out.headers().get("content-length") == Some("5"));
+        check!(out.headers().get("x-amz-version-id") == Some("v1"));
+        check!(out.headers().get_all("x-amz-meta-note").collect::<Vec<_>>() == ["first", "second"]);
+        check!(out.body().bytes() == Some(&b"hello"[..]));
+    }
+
+    /// A response with no headers still converts, and a header value that is not valid
+    /// text is carried through without a panic.
+    #[tokio::test]
+    async fn the_connector_converts_a_headerless_response_and_a_non_text_header() {
+        let plain = http::Response::new(bytes::Bytes::from_static(b"ok"));
+        let out = http_connector_call(&Fixed(plain), sdk_request())
+            .await
+            .unwrap();
+        check!(out.status().as_u16() == 200);
+        check!(out.body().bytes() == Some(&b"ok"[..]));
+
+        let mut binary = http::Response::new(bytes::Bytes::new());
+        binary.headers_mut().insert(
+            "x-binary",
+            http::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        check!(
+            http_connector_call(&Fixed(binary), sdk_request())
+                .await
+                .is_ok()
+        );
+    }
+
+    fn with_status(status: u16, body: &'static [u8]) -> http::Response<bytes::Bytes> {
+        http::Response::builder()
+            .status(status)
+            .body(bytes::Bytes::from_static(body))
+            .unwrap()
+    }
+
+    /// Over a socket hyper frames a response with `Content-Length: <body length>`; the
+    /// in-process connector writes the same header, for a success and an error alike.
+    #[tokio::test]
+    async fn the_connector_frames_a_response_with_its_body_length() {
+        for (status, body, want) in [
+            (200, &b"{\"TableNames\":[]}"[..], "17"),
+            (
+                400,
+                &b"{\"__type\":\"ResourceNotFoundException\"}"[..],
+                "38",
+            ),
+            (200, &b""[..], "0"),
+        ] {
+            let out = http_connector_call(&Fixed(with_status(status, body)), sdk_request())
+                .await
+                .unwrap();
+            check!(out.headers().get("content-length") == Some(want));
+        }
+    }
+
+    /// A length the handler set stays as it is (an S3 `HeadObject` reports the object's
+    /// size over an empty body), and a status that carries no content gets none, as hyper
+    /// writes it.
+    #[tokio::test]
+    async fn the_connector_keeps_a_handler_length_and_adds_none_to_a_status_without_content() {
+        let mut head = with_status(200, b"");
+        head.headers_mut()
+            .insert("content-length", http::HeaderValue::from_static("5"));
+        let out = http_connector_call(&Fixed(head), sdk_request())
+            .await
+            .unwrap();
+        check!(out.headers().get("content-length") == Some("5"));
+
+        for status in [204, 304] {
+            let out = http_connector_call(&Fixed(with_status(status, b"")), sdk_request())
+                .await
+                .unwrap();
+            check!(out.headers().get("content-length").is_none());
+        }
+
+        let mut chunked = with_status(200, b"abc");
+        chunked.headers_mut().insert(
+            "transfer-encoding",
+            http::HeaderValue::from_static("chunked"),
+        );
+        let out = http_connector_call(&Fixed(chunked), sdk_request())
+            .await
+            .unwrap();
+        check!(out.headers().get("content-length").is_none());
+    }
+
 
     #[test]
     fn rustls_trusts_the_server_certificate_as_its_own_ca() {

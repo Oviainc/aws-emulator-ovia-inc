@@ -17,9 +17,9 @@ one emulator shares its state; two emulators never do.
 - `.authentication(Authentication::On)`: every request to this emulator must be
   signed with the credentials it vends, or ones its operations created; anything
   else gets 403. No credentials file is written.
-- `.telemetry(Telemetry::Off)`: this emulator does not start usage telemetry.
-  Telemetry is process-wide and never delays a test: one batch is sent when the
-  process exits. `EMULATOR_TELEMETRY=off` or the config file turn it off as well,
+- `.telemetry(Telemetry::Off)`: turns usage telemetry off for the whole process,
+  whichever emulator says it. Telemetry is process-wide and never delays a test:
+  one batch is sent when the process exits. `EMULATOR_TELEMETRY=off` or the config file turn it off as well,
   and off always wins.
 
 `credentials()` lists what this emulator's authentication accepts, empty when it is

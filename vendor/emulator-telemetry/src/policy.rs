@@ -26,10 +26,11 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 // Consent & the local master switch
 //
-// OFF WINS: telemetry runs only when NO switch source disables it. The three
+// OFF WINS: telemetry runs only when NO switch source disables it. The four
 // sources are the [`TELEMETRY_SWITCH_ENV`] environment variable, the
-// `[telemetry] enabled` flag in the emulator config file, and the embedding
-// API (`TelemetryOptions::enabled`). Any source saying off (or holding an
+// `[telemetry] enabled` flag in the emulator config file, the
+// [`TELEMETRY_CLI_FLAG`] command-line flag, and the embedding API
+// (`TelemetryOptions::embedding_opt_out`). Any source saying off (or holding an
 // invalid value, which fails safe to off) disables telemetry regardless of
 // the other sources; only when every source is silent does
 // [`TELEMETRY_DEFAULT_ENABLED`] apply.
@@ -61,7 +62,7 @@ pub enum ConsentMode {
 /// The environment master switch: any [`SWITCH_ON_TOKENS`] value enables, any
 /// [`SWITCH_OFF_TOKENS`] value disables (case-insensitive), anything else
 /// fails safe to disabled and the startup notice carries a
-/// [`invalid_switch_warning_line`] warning. One of the three off-wins switch
+/// [`invalid_switch_warning_line`] warning. One of the four off-wins switch
 /// sources; `off` here disables telemetry no matter what the config file or
 /// the embedding API say.
 pub const TELEMETRY_SWITCH_ENV: &str = "EMULATOR_TELEMETRY";
@@ -71,6 +72,15 @@ pub const SWITCH_ON: &str = "on";
 
 /// The canonical disabling value of [`TELEMETRY_SWITCH_ENV`].
 pub const SWITCH_OFF: &str = "off";
+
+/// The emulator command-line flag that switches telemetry for one run:
+/// `--telemetry off` or `--telemetry on`. One of the four off-wins switch
+/// sources and disable-only: the router turns `off` into
+/// `TelemetryOptions::embedding_opt_out`, so `on` cannot override the others.
+pub const TELEMETRY_CLI_FLAG: &str = "--telemetry";
+
+/// The short form of [`TELEMETRY_CLI_FLAG`].
+pub const TELEMETRY_CLI_SHORT_FLAG: &str = "-t";
 
 /// Every enabling [`TELEMETRY_SWITCH_ENV`] token, matched case-insensitively.
 pub const SWITCH_ON_TOKENS: &[&str] = &[SWITCH_ON, "true", "1"];
@@ -97,7 +107,7 @@ pub const CONFIG_DIR_NAME: &str = emulator_paths::DIR_NAME;
 /// enabled = false
 /// ```
 ///
-/// One of the three off-wins switch sources; `enabled = false` disables
+/// One of the four off-wins switch sources; `enabled = false` disables
 /// telemetry no matter what the environment or the embedding API say. A file
 /// without the section or the key is silent, not invalid: the file is shared
 /// emulator configuration, not telemetry-owned.
@@ -558,8 +568,8 @@ pub const SHUTDOWN_QUEUE_RETRY_PAUSE: Duration = Duration::from_millis(1);
 // ---------------------------------------------------------------------------
 
 /// Outbox retention: queued batches older than this are dropped LOCALLY.
-/// Matches the backend's 14-day dedup/retention window — anything older can
-/// no longer be deduplicated safely.
+/// Matches the backend's 14-day dedup window — anything older can no longer
+/// be deduplicated safely.
 pub const OUTBOX_MAX_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
 /// Cap on pending batches; beyond it the oldest are evicted. Bounds local
@@ -794,8 +804,9 @@ pub const README_REDISTRIBUTION_NOTE: &str = "If you distribute an application t
 pub fn outbox_retention_note() -> String {
     let retention_days = OUTBOX_MAX_AGE.as_secs() / (24 * 60 * 60);
     format!(
-        "Queued batches older than {retention_days} days are dropped locally (matches the \
-         backend retention window)."
+        "Queued batches older than {retention_days} days are dropped locally: the \
+         backend remembers sent batches for that long to drop duplicates, so an older \
+         one could be counted twice."
     )
 }
 
@@ -823,7 +834,7 @@ pub fn render_readme_telemetry_section() -> String {
     section
 }
 
-/// The switch-controls block both README renderers embed: the three off-wins
+/// The switch-controls block both README renderers embed: the four off-wins
 /// sources, the accepted tokens, per-shell examples, the standard config
 /// path, state deletion on opt-out, and the notice/restart semantics — all
 /// derived from the policy constants above.
@@ -831,7 +842,7 @@ fn render_switch_controls_block(heading: &str) -> String {
     format!(
         "{heading}\n\
          \n\
-         OFF WINS: telemetry runs only when NO source disables it. The three switch\n\
+         OFF WINS: telemetry runs only when NO source disables it. The four switch\n\
          sources are equal — any one saying off (or holding an invalid value, which\n\
          fails safe to off with a startup warning) disables telemetry regardless of\n\
          the others:\n\
@@ -852,7 +863,11 @@ fn render_switch_controls_block(heading: &str) -> String {
          {key} = false\n   \
          ```\n\
          \n\
-         3. the embedding API (`TelemetryOptions::embedding_opt_out`) — disable-only:\n   \
+         3. the emulator's command-line flag, `{cli_flag} {off}` (or `{cli_short_flag} {off}`),\n   \
+         for that run only — disable-only: `{cli_flag} {on}` cannot override the other\n   \
+         sources. An invalid value is refused and the emulator does not start.\n\
+         \n\
+         4. the embedding API (`TelemetryOptions::embedding_opt_out`) — disable-only:\n   \
          an embedding application can switch telemetry off but can never force it\n   \
          on over the end user's environment variable or config file.\n\
          \n\
@@ -877,6 +892,9 @@ fn render_switch_controls_block(heading: &str) -> String {
         on_tokens = SWITCH_ON_TOKENS.join("|"),
         off_tokens = SWITCH_OFF_TOKENS.join("|"),
         off = SWITCH_OFF,
+        on = SWITCH_ON,
+        cli_flag = TELEMETRY_CLI_FLAG,
+        cli_short_flag = TELEMETRY_CLI_SHORT_FLAG,
         file = EMULATOR_CONFIG_FILE_NAME,
         config_env = EMULATOR_CONFIG_ENV,
         section_name = CONFIG_TOML_TELEMETRY_SECTION,
