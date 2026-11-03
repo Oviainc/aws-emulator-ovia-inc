@@ -54,8 +54,9 @@ use crate::ops::test_telemetry_pipeline::{
 use crate::ops::types::{
     CentralizationRule, CentralizationRuleSummary, ConfigurationSummary, DataSource, Encryption,
     IntegrationSummary, RegionStatus, Source, TelemetryPipeline, TelemetryPipelineConfiguration,
-    TelemetryPipelineProjection, TelemetryPipelineStatusReason, TelemetryRule,
-    TelemetryRuleSummary, ACTION_VALUES, DELETION_PROTECTION_VALUES, DESTINATION_TYPE_VALUES,
+    TelemetryPipelineProjection, TelemetryPipelineStatusReason, TelemetryPipelineSummary,
+    TelemetryRule, TelemetryRuleSummary, ACTION_VALUES, DELETION_PROTECTION_VALUES,
+    DESTINATION_TYPE_VALUES,
     ENCRYPTED_LOG_GROUP_STRATEGY_VALUES, ENCRYPTION_CONFLICT_RESOLUTION_STRATEGY_VALUES,
     ENCRYPTION_SCOPE_VALUES, ENCRYPTION_STRATEGY_VALUES, FILTER_BEHAVIOR_VALUES,
     FILTER_REQUIREMENT_VALUES, LOG_TYPE_VALUES, MSK_ENHANCED_MONITORING_LEVEL_VALUES,
@@ -622,6 +623,27 @@ impl StoredTelemetryPipeline {
                 status_reason: Some(self.status_reason_at(now_ms)),
                 tags: Some(self.tag_map()),
             },
+            configuration_summary: self.configuration_summary(),
+        }
+    }
+
+    /// This record as the summary a listing reports, as it stands at `now_ms`: every
+    /// member the model's `TelemetryPipelineSummary` shape declares, each read from
+    /// the same record a `GetTelemetryPipeline` of this pipeline reports, so a listing
+    /// and a read of one pipeline never disagree.
+    ///
+    /// The shape declares no `Configuration`, so the body itself is not in a summary —
+    /// `ConfigurationSummary` is the "summary of the pipeline configuration components"
+    /// that stands in for it, and it is the one [`Self::configuration_summary`] derives
+    /// from that body.
+    pub fn summary(&self, now_ms: i64) -> TelemetryPipelineSummary {
+        TelemetryPipelineSummary {
+            created_time_stamp: Some(self.created_timestamp_ms),
+            last_update_time_stamp: Some(self.last_update_timestamp_ms),
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            status: Some(self.status_at(now_ms).to_string()),
+            tags: Some(self.tag_map()),
             configuration_summary: self.configuration_summary(),
         }
     }

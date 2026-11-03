@@ -38,6 +38,9 @@ mod success_response_projection;
 #[path = "all/telemetry_feature_status.rs"]
 mod telemetry_feature_status;
 
+#[path = "all/telemetry_pipeline_listing.rs"]
+mod telemetry_pipeline_listing;
+
 #[path = "all/telemetry_pipelines.rs"]
 mod telemetry_pipelines;
 

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTelemetryPipelines
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTelemetryPipelines`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTelemetryPipelines::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a summary of every telemetry pipeline [`crate::state`] holds in the region
+//! the request was signed for, one `@paginated` page at a time. A pure read: it writes
+//! nothing, and the status each summary carries is derived from the record's own due
+//! instant and the clock.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +112,58 @@ impl From<ListTelemetryPipelinesErrorModeled> for ListTelemetryPipelinesError {
     }
 }
 
+/// The largest page this operation will ever build, and the page size applied when
+/// the request omits `MaxResults`.
+///
+/// It is the maximum of the modelled `ListTelemetryPipelinesMaxResults` range (1..100),
+/// which the centralized walk already refuses values outside of — and the ceiling this
+/// operation's own documentation states ("Returns up to 100 results"). This handler does
+/// not depend on the walk: the size is clamped to this constant here, so the page it
+/// allocates is decided by the server, never by the request.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// A page token naming the pipeline name the NEXT page starts at.
+///
+/// `NextToken` is modelled opaque, so the name is hex-encoded rather than handed back
+/// in the clear — this makes the token opaque to a caller, not secret: hex is trivially
+/// reversible and the token carries nothing beyond a pipeline name.
+fn encode_page_token(name: &str) -> String {
+    hex::encode(name)
+}
+
+/// The pipeline name a page token names, or a 400 refusal when the token carries
+/// nothing this operation could have issued.
+///
+/// What it can decide is the FORM: every token this operation hands out carries the name
+/// of a stored pipeline, so it satisfies the modelled `TelemetryPipelineName` length
+/// (3..28) and pattern, and a token decoding to anything else is one this operation never
+/// issued. A well-formed name the store no longer holds is NOT refused: it names the
+/// first record a page did not return, and the next page resumes AT it, which is what
+/// lets a walk survive the pipeline its last page ended on being deleted between the two
+/// calls.
+fn decode_page_token(token: &str) -> Result<String, ListTelemetryPipelinesError> {
+    hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|name| {
+            (3..=28).contains(&name.chars().count())
+                && name.starts_with(|first: char| first.is_ascii_lowercase())
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        .ok_or_else(|| {
+            ListTelemetryPipelinesErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "NextToken is not a pagination token issued by ListTelemetryPipelines"
+                        .to_string(),
+                ),
+                ..Default::default()
+            })
+            .into()
+        })
+}
+
 /// The `ListTelemetryPipelines` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +200,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTelemetryPipelines` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTelemetryPipelinesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTelemetryPipelines"))
+        // `MaxResults`' 1..100 range is modelled, so the centralized walk has already
+        // refused anything outside it before this body runs. Nothing here writes.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTelemetryPipelinesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the telemetry pipeline store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        // The page size is the server's own decision: clamped into 1..=MAX_PAGE_SIZE
+        // whatever the request asked for, so no allocation below is sized by input.
+        let page_size = input.max_results.map_or(MAX_PAGE_SIZE, |requested| {
+            requested.clamp(1, MAX_PAGE_SIZE as i32) as usize
+        });
+        let start = input
+            .next_token
+            .as_deref()
+            .map(decode_page_token)
+            .transpose()?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_epoch_millis();
+
+        let store = state.lock();
+        // The store is keyed by (region, Name), so one region's pipelines are one
+        // contiguous, name-ordered run: the page starts at the name the token named and
+        // stops at the first key of another region. That order is the store's own, so
+        // the pages of one sequence neither repeat nor skip a pipeline.
+        let page_start = start.unwrap_or_default();
+        let remaining = store
+            .telemetry_pipelines
+            .range((region.clone(), page_start)..)
+            .take_while(|((pipeline_region, _), _)| *pipeline_region == region);
+
+        // Reserve no more than the store can actually yield.
+        let mut pipeline_summaries =
+            Vec::with_capacity(page_size.min(store.telemetry_pipelines.len()));
+        let mut next_token = None;
+        for ((_, name), record) in remaining {
+            // The first pipeline that does not fit becomes the next page's start, and
+            // only then is a `NextToken` emitted — the last page carries none.
+            if pipeline_summaries.len() == page_size {
+                next_token = Some(encode_page_token(name));
+                break;
+            }
+            pipeline_summaries.push(record.summary(now));
+        }
+
+        Ok(ListTelemetryPipelinesOutput {
+            pipeline_summaries: Some(pipeline_summaries),
+            next_token,
+        })
     }
 }
