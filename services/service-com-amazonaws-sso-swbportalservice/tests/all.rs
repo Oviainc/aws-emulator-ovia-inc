@@ -21,6 +21,8 @@ mod page_bound_clamp;
 mod page_token_spelling;
 #[path = "all/portal_session.rs"]
 mod portal_session;
+#[path = "all/route_path_agreement.rs"]
+mod route_path_agreement;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/unauthorized_rejection.rs"]

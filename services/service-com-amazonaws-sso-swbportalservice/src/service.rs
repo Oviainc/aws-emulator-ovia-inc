@@ -114,6 +114,10 @@ const ROLE_NAME: RequiredMember = RequiredMember {
     name: "role_name",
 };
 
+/// One route this service serves: the method and the path of an `@http` binding, and the
+/// `@required` http-bound members of that operation.
+type Route = (&'static str, &'static str, &'static [RequiredMember]);
+
 /// Every route this service serves and the `@required` http-bound members of each, as
 /// the model declares them (`OPERATIONS.md` lists the same four).
 ///
@@ -134,7 +138,7 @@ const ROLE_NAME: RequiredMember = RequiredMember {
 /// per (route, required member) pair here, so a row that disagrees with the model
 /// fails there, and `tests/all/endpoint_agnostic_routing.rs` carries one row per
 /// route.
-const ROUTES: &[(&str, &str, &[RequiredMember])] = &[
+const ROUTES: &[Route] = &[
     ("GET", "/assignment/accounts", &[ACCESS_TOKEN]),
     ("GET", "/assignment/roles", &[ACCESS_TOKEN, ACCOUNT_ID]),
     (
@@ -145,37 +149,37 @@ const ROUTES: &[(&str, &str, &[RequiredMember])] = &[
     ("POST", "/logout", &[ACCESS_TOKEN]),
 ];
 
-/// The path portion of a request URI: no scheme, no authority, no query string.
+/// The route in [`ROUTES`] that `method` and `uri` address, or `None` when they address
+/// none of them.
 ///
-/// DUPLICATION, knowingly: the framework has the same splitter in
-/// `vendor/smithy-schema-server/src/rest_xml.rs` (`pub(crate) fn request_path`), which
-/// is crate-private and so unreachable from a service crate; the vendored tree is
-/// read-only from here, so it cannot be exposed in this change. Reconcile the two by
-/// making that one public. It is used only to recognise one of this service's own four
-/// literal routes, never to bind a value out of the path.
-fn request_path(uri: &str) -> &str {
-    let without_query = uri.split('?').next().unwrap_or(uri);
-    if without_query.starts_with('/') {
-        return without_query;
-    }
-    // Absolute form (scheme, authority, then the path): the path starts at the third
-    // slash, and there is none when the URI names only an authority.
-    without_query
-        .match_indices('/')
-        .nth(2)
-        .map_or("/", |(index, _)| &without_query[index..])
+/// The ONE place this service turns a request into a route, for both callers below, so
+/// that claiming a request and wording its refusal cannot disagree about what path it
+/// named. The path is whatever `uri` reports as its path component — no scheme, no
+/// authority, no query string — whichever form the request arrived in: origin
+/// (`/assignment/accounts?max_result=1`) or absolute
+/// (`https://host/assignment/accounts?max_result=1`). Nothing is split by hand here; the
+/// URI type the `http` crate already parses this request into answers it.
+///
+/// Matching is EXACT on both halves, never a prefix: a path this model does not bind
+/// matches no route (so it stays the router's own `UnknownService`) rather than being
+/// swallowed here. It recognises one of this service's own four literal routes, never
+/// binds a value out of the path.
+fn matched_route(method: &str, uri: &http::Uri) -> Option<&'static Route> {
+    let path = uri.path();
+    ROUTES
+        .iter()
+        .find(|(route_method, route, _)| *route_method == method && *route == path)
 }
 
 /// Whether the request's query string carries `name` as a key, with or without a value
 /// — the same presence test the REST router applies to a required query binding.
-fn query_has(uri: &str, name: &str) -> bool {
-    let Some((_, query)) = uri.split_once('?') else {
-        return false;
-    };
-    query
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .any(|pair| pair.split_once('=').map_or(pair, |(key, _)| key) == name)
+fn query_has(uri: &http::Uri, name: &str) -> bool {
+    uri.query().is_some_and(|query| {
+        query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .any(|pair| pair.split_once('=').map_or(pair, |(key, _)| key) == name)
+    })
 }
 
 /// Whether `parts` addresses one of this service's own modelled routes: its method and
@@ -189,29 +193,27 @@ fn query_has(uri: &str, name: &str) -> bool {
 /// `localhost:9297`, an IP literal, a proxy) leaves nothing for the host-style tier
 /// either. Claiming by this table is what makes the service reachable there.
 ///
-/// Matching is EXACT on both halves, never a prefix: a path this model does not bind
-/// stays unclaimed (the router's own `UnknownService`) rather than being swallowed here.
+/// Matching is [`matched_route`]'s, which is also what the refusal wording below reads,
+/// so a request claimed here is a request that seam recognises.
 fn serves_route(parts: &http::request::Parts) -> bool {
-    let path = parts.uri.path();
-    ROUTES
-        .iter()
-        .any(|(method, route, _)| parts.method == *method && *route == path)
+    matched_route(parts.method.as_str(), &parts.uri).is_some()
 }
 
 /// The `@required` members of `req`'s route that are absent from it, or `None` when
 /// `req` names no route this service serves.
 fn absent_required_members(req: &aws_smithy_runtime_api::http::Request) -> Option<Vec<String>> {
-    let uri = req.uri();
-    let path = request_path(uri);
-    let (.., required) = ROUTES
-        .iter()
-        .find(|(method, route, _)| *method == req.method() && *route == path)?;
+    // The runtime-API request carries its URI as a string, so it is read back through the
+    // same URI type [`serves_route`] is handed: one spelling of "this request's path" for
+    // both seams. A string that is no URI names no route, and the framework's own routing
+    // answer stands.
+    let uri: http::Uri = req.uri().parse().ok()?;
+    let (.., required) = matched_route(req.method(), &uri)?;
     Some(
         required
             .iter()
             .filter(|member| match member.bound_in {
                 BoundIn::Header => req.headers().get(member.name).is_none(),
-                BoundIn::Query => !query_has(uri, member.name),
+                BoundIn::Query => !query_has(&uri, member.name),
             })
             .map(|member| member.member.to_string())
             .collect(),
