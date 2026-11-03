@@ -65,3 +65,61 @@ Emulator source: src/state.rs::canonical_members (`supplied.sort()`) reached fro
 2. Replay the wire corpus (replay_wire_corpus on trace set simparity-wire-aws-v1).
 3. Cause 1: replay fixture uxc-catalog-list-services, step task#1 — GET /v1/services (ListServices) with the fixture's maxResults. Compare the returned $.services array element-by-element with the recorded one: it diverges from index 5 onward (recorded 'airflow' absent, emulator serves 'amazon-mq'), ~85 indices in the page.
 4. Cause 2: replay fixture uxc-partial-update-preserves-other-fields, step task#2 — PATCH /v1/account-customizations (UpdateAccountCustomizations) with the fixture's visibleServices pair. The recorded body reports ['s3','ec2']; the emulator answers ['ec2','s3'] because the members are sorted on write. Step task#4 (GetAccountCustomizations) of the same fixture passes and must keep passing.
+
+## Resolution
+
+**Cause 1 — the `ListServices` catalog.** `SEED_SERVICE_CATALOG` in
+`services/service-com-amazonaws-uxc-awsaccountuxsetting/src/state.rs` was a list of AWS
+service names derived from the console/endpoint namespaces rather than the catalog the
+service PUBLISHES, which is what `ListServices` enumerates and what `visibleServices`
+admits. It is now reseeded from the published catalog as observed: the entries it did not
+name are gone (`greengrass`, `health`, `iotanalytics`, `iotevents`, `iotwireless`,
+`kinesisanalytics`, `location`, `lookoutmetrics`, `lookoutvision`, `migrationhub`, `msk`,
+`mwaa`, `network-firewall`, `networkmanager`, `opensearch`, `opsworks`, `panorama`,
+`pca-connector-ad`) and the entries it does name are added (`gameliftservers`,
+`gameliftstreams`, `geo`, `health-dashboard`, `infrastructure-composer`, `iq`, `kafka`,
+`managedservices`, `medical-imaging`, `mgh`, `mq`, `network-security-manager`, `nova-act`,
+`odb`, `partnercentral`, `prometheus`). Every change was kept only when the replayed page's
+agreed prefix advanced, so the served page and the recorded page now agree
+element-for-element over their first 167 entries, where they agreed over 100 before.
+`src/ops/list_services.rs` was already correct (paging, tokens) and is untouched; because the
+catalog is also the ADMISSION list, each added identifier is now settable and each removed one
+is refused with the modelled `ValidationException`.
+
+This issue's own account of indices 5-90 is REFUTED by the recording and is not implemented:
+`airflow`, `comprehend`, `comprehendmedical`, `connect-health`, `datatransferterminal`,
+`deadline`, `ds`, `elasticfilesystem`, `elasticmapreduce`, `es` and `end-user-messaging` all
+sort before index 100, and the emulator's first 100 entries — which carry `amazon-mq`,
+`deadline-cloud`, `directoryservice`, `efs` and `emr` — already matched the recording
+element-for-element before this change (the replay's first divergence was `$.services[100]`),
+so the prescribed alias rewrites (`amazon-mq`→`mq`, `mwaa`→`airflow`, `msk`→`kafka`,
+`efs`→`elasticfilesystem`, `emr`→`elasticmapreduce`, `directoryservice`→`ds`,
+`deadline-cloud`→`deadline`) would have broken 100 aligned positions. The identifiers it names
+past index 100 are all real and all now entries.
+
+DECLINED, recorded here so a later reader does not re-file it: the MEMBERSHIP of the recorded
+page past `$.services[166]` (the residue of key `uxc|ListServices|2xx->2xx|$.services[*]`).
+The replay reports the positions of the remaining divergences and withholds their values, and
+"the available services vary by Amazon Web Services partition" (the operation doc), so the
+exact membership of one partition's catalog on one day is environment data no rule derives:
+closing it would mean guessing identifier strings until one recorded page is fitted.
+
+**Cause 2 — the `UpdateAccountCustomizations` echo order. DECLINED as per-response variation,
+measured rather than argued.** The fixture records the same stored pair in two sequences with
+no write in between: the `task#2` echo in the one that is not ascending and the `task#4`
+`GetAccountCustomizations` ascending. Three candidate rules were replayed against the corpus:
+reporting the members ascending (`state::canonical_members`) reproduces the read and not the
+echo; persisting and echoing the sequence the request supplied — the fix this issue prescribes
+— leaves that echo diverging at the same two positions, which rules the request's sequence out
+too; and the only sequence left for that step is the reverse of both, which the other recorded
+update echoes contradict (the `uxc-configure-visible-regions-roundtrip` echo and both
+`uxc-configure-visible-services-roundtrip` echoes are ascending). The canonical ascending rule
+is therefore kept — same members, one sequence in the echo and in every later read, idempotent
+— and the measurement is written onto `state::canonical_members` so it is not redone.
+
+Covered by the new `tests/all/catalog_published_spellings.rs` (the published spelling of a
+service is reported, settable and read back while a near miss of it is refused, over nine rows
+spanning the class, plus the sibling-homes case) and by the existing catalog suites, whose rows
+that asserted the opposite of what the published catalog names were exchanged one for one
+(`console_identifier_namespace`, `service_catalog`, `list_setting_order`,
+`visible_service_catalog_membership`).

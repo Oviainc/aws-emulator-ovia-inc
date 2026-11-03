@@ -3,16 +3,21 @@
 //! The catalog holds ONE namespace in both directions, and the discovery list and
 //! the admission list are the same list.
 //!
-//! The rule, in one sentence: the identifiers this service publishes are the ones
-//! the Management Console addresses a service's HOME by, so for a service whose
-//! console identifier and SigV4 signing name / endpoint prefix are different
-//! strings the console identifier is published and settable while the prefix is
-//! neither, and for a service the console files under ANOTHER service's home that
-//! home is published and settable while the filed service's own identifier is
-//! neither (`smithy_query(query="doc", shape="ListServices")`: the returned
+//! The rule, in one sentence: an identifier is in this catalog because the
+//! published catalog names it, so a service is named ONCE and the near spellings
+//! of it the published catalog does not name — a SigV4 signing name / endpoint
+//! prefix for a service published under its console home, or the identifier of a
+//! service the console files under ANOTHER service's home — are neither reported
+//! nor settable (`smithy_query(query="doc", shape="ListServices")`: the returned
 //! identifiers are the ones "you can use as values for the `visibleServices`
 //! setting", which "controls only the appearance of services in the Amazon Web
 //! Services Management Console").
+//!
+//! Which of a service's own spellings is the published one is the published
+//! catalog's choice and not a rule — it names Amazon EMR `emr` and Amazon MSK
+//! `kafka` — and `catalog_published_spellings` owns that; the rows below are the
+//! services it names by their console home, so for each of them the home is the
+//! entry and the prefix is not.
 //!
 //! Why both directions in one suite: `ListServices` and
 //! `UpdateAccountCustomizations` read the same catalog — the one is a discovery
@@ -29,6 +34,11 @@
 //! differs from its endpoint prefix, or a service the console publishes no home of
 //! its own for. Every row is re-checked against the model's `Service` constraints
 //! and against the catalog the emulator actually publishes before it is relied on.
+//!
+//! [`Row`] and [`assert_row`] are this crate's ONE statement of "exactly one of
+//! these two spellings is published, settable and read back", so
+//! `catalog_published_spellings` asserts its own table through them rather than
+//! restating the pair of assertions in its own words.
 
 use crate::wire::{
     build_router, get_customizations, is_legal_service, update_customizations, whole_catalog,
@@ -47,17 +57,17 @@ const INVALID_SERVICES: &str = "Invalid services provided";
 /// must report it and the setting must accept it) and the identifier it must be
 /// published INSTEAD OF (so the catalog must not report it and the setting must
 /// refuse it).
-struct Row {
-    case: &'static str,
-    published: &'static str,
-    withheld: &'static str,
+pub(crate) struct Row {
+    pub(crate) case: &'static str,
+    pub(crate) published: &'static str,
+    pub(crate) withheld: &'static str,
 }
 
 /// The rule, over one row: both identifiers are values the model admits, exactly
 /// the published one is in the catalog, it is settable and reads back, and the
 /// withheld one is refused with the modelled `ValidationException` without
 /// disturbing what is stored.
-async fn assert_row(catalog: &[String], row: &Row) {
+pub(crate) async fn assert_row(catalog: &[String], row: &Row) {
     let Row {
         case,
         published,
@@ -131,11 +141,13 @@ async fn assert_row(catalog: &[String], row: &Row) {
 /// strings: the console identifier is the entry, the prefix is not an entry too.
 ///
 /// Rows differ along how the two spellings diverge — the console identifier
-/// longer than the prefix (`systems-manager`/`ssm`, `singlesignon`/`sso`) and
-/// shorter than it (`msk`/`kafka`, `mwaa`/`airflow`, `ds`), one segment and two,
-/// an unrelated word (`keyspaces`/`cassandra`) and an abbreviation of the same
-/// words — and in size, from the three characters of `msk` to the fifteen of
-/// `systems-manager`.
+/// longer than the prefix (`systems-manager`/`ssm`, `singlesignon`/`sso`,
+/// `directoryservice`/`ds`), one segment and two, an unrelated word
+/// (`keyspaces`/`cassandra`), an abbreviation of the same words, and a SECOND
+/// signing name of one service — its data plane (`sagemaker-runtime`) or a
+/// companion API (`cognito-identity`) — which is no more an entry than the first;
+/// and in size, from the three characters of `emr` to the seventeen of
+/// `sagemaker-runtime`.
 #[tokio::test]
 async fn one_service_is_named_once_by_its_console_identifier_and_never_by_its_prefix() {
     let catalog = whole_catalog(&build_router()).await;
@@ -147,19 +159,19 @@ async fn one_service_is_named_once_by_its_console_identifier_and_never_by_its_pr
             withheld: "ssm",
         },
         Row {
-            case: "Amazon Managed Streaming for Apache Kafka",
-            published: "msk",
-            withheld: "kafka",
-        },
-        Row {
-            case: "Amazon Managed Workflows for Apache Airflow",
-            published: "mwaa",
-            withheld: "airflow",
-        },
-        Row {
             case: "IAM Identity Center",
             published: "singlesignon",
             withheld: "sso",
+        },
+        Row {
+            case: "Amazon SageMaker's runtime signing name",
+            published: "sagemaker",
+            withheld: "sagemaker-runtime",
+        },
+        Row {
+            case: "Amazon Cognito identity pools",
+            published: "cognito",
+            withheld: "cognito-identity",
         },
         Row {
             case: "Amazon Keyspaces",
@@ -194,7 +206,7 @@ async fn one_service_is_named_once_by_its_console_identifier_and_never_by_its_pr
 /// discoverable and settable there.
 ///
 /// Rows differ along what is filed where: a feature of another service
-/// (`access-analyzer`, `kafkaconnect`), a separately-branded service with its own
+/// (`access-analyzer`, `tagging`), a separately-branded service with its own
 /// endpoint prefix (`appconfig`, `logs`), and a second service filed under one
 /// home already covered by another row (`monitoring` beside `logs`).
 #[tokio::test]
@@ -213,9 +225,9 @@ async fn a_service_filed_under_another_console_home_is_published_as_that_home() 
             withheld: "appconfig",
         },
         Row {
-            case: "Amazon MSK Connect, under the Amazon MSK console home",
-            published: "msk",
-            withheld: "kafkaconnect",
+            case: "the Resource Groups Tagging API, under the Resource Groups console home",
+            published: "resource-groups",
+            withheld: "tagging",
         },
         Row {
             case: "CloudWatch Logs, under the CloudWatch console home",

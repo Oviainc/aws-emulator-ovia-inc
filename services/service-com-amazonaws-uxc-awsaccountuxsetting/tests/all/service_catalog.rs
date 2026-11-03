@@ -79,8 +79,8 @@ async fn reported_catalog() -> Vec<String> {
 /// Rows differ along how the two namespaces diverge: a different spelling of the
 /// same service (`cognito` vs `cognito-idp`, `emr` vs `elasticmapreduce`), a
 /// service the console files under another service's home (`logs` and `monitoring`
-/// both live under `cloudwatch`), a console identifier carrying a hyphen the prefix
-/// does not (`amazon-mq` vs `mq`), and a prefix with no console home at all
+/// both live under `cloudwatch`), a console identifier much longer than the prefix
+/// (`directoryservice` vs `ds`), and a prefix with no console home at all
 /// (`sts`, `execute-api`), where the row asserts only the absence.
 #[tokio::test]
 async fn the_catalog_is_the_console_identifier_namespace_not_the_endpoint_prefix_one() {
@@ -93,9 +93,9 @@ async fn the_catalog_is_the_console_identifier_namespace_not_the_endpoint_prefix
         ("CloudWatch Logs", Some("cloudwatch"), "logs"),
         ("CloudWatch metrics", Some("cloudwatch"), "monitoring"),
         ("Amazon EMR", Some("emr"), "elasticmapreduce"),
-        ("Amazon OpenSearch Service", Some("opensearch"), "es"),
+        ("AWS Directory Service", Some("directoryservice"), "ds"),
         ("Amazon EFS", Some("efs"), "elasticfilesystem"),
-        ("Amazon MQ", Some("amazon-mq"), "mq"),
+        ("Amazon Keyspaces", Some("keyspaces"), "cassandra"),
         // Signing names with no console service home of their own.
         ("AWS STS", None, "sts"),
         ("API Gateway's data plane", None, "execute-api"),
@@ -139,7 +139,7 @@ async fn identifiers_across_the_namespace_are_reported_whatever_their_form() {
         ("letters then a version digit", "wafv2"),
         ("two hyphen-separated segments", "redshift-serverless"),
         ("two segments, the second a digit-bearing word", "workspaces-web"),
-        ("three hyphen-separated segments", "pca-connector-ad"),
+        ("three hyphen-separated segments", "network-security-manager"),
         ("one long unsegmented word", "applicationrecoverycontroller"),
     ];
 

@@ -81,12 +81,11 @@ impl AccountUxCustomization {
 /// service identifiers / Region codes after the update". So the order of these
 /// arrays is RECORDED BEHAVIOUR ONLY, and what the corpus records is a service
 /// that reports the setting in ascending member order rather than in the order a
-/// request happened to use: `uxc-configure-visible-regions-roundtrip`'s update is
-/// recorded answering the three Region codes ascending where the request named
-/// them in another sequence, and every other recorded response for either setting
-/// — the `uxc-configure-visible-services-roundtrip` echoes and reads, and the
-/// `GetAccountCustomizations` of `uxc-partial-update-preserves-other-fields` — is
-/// ascending too.
+/// request happened to use: the update of `uxc-configure-visible-regions-roundtrip`
+/// is recorded answering the three Region codes ascending, and so is every other
+/// recorded response for either setting — the
+/// `uxc-configure-visible-services-roundtrip` echoes and reads, and the
+/// `GetAccountCustomizations` of `uxc-partial-update-preserves-other-fields`.
 ///
 /// Canonicalizing on the WRITE (rather than when serializing) is what makes the
 /// update's own echo and every later `GetAccountCustomizations` report the one
@@ -104,13 +103,20 @@ impl AccountUxCustomization {
 /// # The one recorded response this does not reproduce
 ///
 /// In `uxc-partial-update-preserves-other-fields` the update at `task#2` is
-/// recorded reporting the two stored service identifiers in DESCENDING order while
-/// the `GetAccountCustomizations` at `task#4` — with no write in between — reports
-/// the same two ascending. Two different orders for one stored value, so no rule
-/// that is a function of the request can answer both: that step's order is
-/// per-response variation, and reproducing it would mean keying this write on one
-/// recorded response. The canonical order below is the one that agrees with every
-/// other recorded response, including that fixture's own later read.
+/// recorded reporting the two stored service identifiers in the one sequence that
+/// is NOT ascending, while the `GetAccountCustomizations` at `task#4` — with no
+/// write in between — reports the same two ascending, and that read is reproduced.
+/// Two different orders for one stored value, so no rule that is a function of the
+/// request and the stored record can answer both. Each candidate was measured
+/// against the corpus rather than argued: reporting the members ascending
+/// reproduces the read and not the echo; persisting and echoing the sequence the
+/// request supplied (so that the echo is the caller's own document) leaves that
+/// echo diverging at the same two positions, which is what rules the request's
+/// sequence out as well; and the only sequence left for that step is the reverse
+/// of both, which the other recorded update echoes contradict. That step's order
+/// is per-response variation, and reproducing it would mean keying this write on
+/// one recorded response. The canonical order below is the one that agrees with
+/// every other recorded response, including that fixture's own later read.
 pub fn canonical_members(mut supplied: Vec<String>) -> Vec<String> {
     supplied.sort();
     supplied
@@ -132,35 +138,54 @@ pub const ACCOUNT_COLOR_NONE: &str = "none";
 /// UpdateAccountCustomizations", and `visibleServices` "controls only the
 /// appearance of services in the Amazon Web Services Management Console"
 /// (`smithy_query(query="doc", shape="ListServices")`). The identifiers the
-/// setting keys on are therefore the CONSOLE's own service identifiers — the
-/// `console.aws.amazon.com/<identifier>` namespace a console service home is
-/// addressed by — and NOT a service's SigV4 signing name / endpoint prefix, which
-/// is the namespace a client signs and routes with. The two overlap (`s3`, `ec2`,
-/// `lambda` — the three the model's own `@examples` output lists) but they are not
-/// the same set: the console names Amazon Cognito `cognito` where the API endpoint
-/// prefix is `cognito-idp`, names CloudWatch Logs under `cloudwatch` where the
-/// prefix is `logs`, names AWS Systems Manager `systems-manager` where the prefix
-/// is `ssm`, Amazon MSK `msk` where the prefix is `kafka`, Amazon MWAA `mwaa`
-/// where the prefix is `airflow` and IAM Identity Center `singlesignon` where the
-/// prefix is `sso`, and publishes console-only entries (`activate`, `artifact`,
+/// setting keys on are therefore the ones a console service HOME is addressed by —
+/// the `console.aws.amazon.com/<identifier>` namespace — and NOT the set of SigV4
+/// signing names / endpoint prefixes a client signs and routes with. The two
+/// overlap (`s3`, `ec2`, `lambda` — the three the model's own `@examples` output
+/// lists) but they are not the same set: this catalog names Amazon Cognito
+/// `cognito` where the API endpoint prefix is `cognito-idp`, names CloudWatch Logs
+/// under `cloudwatch` where the prefix is `logs`, names AWS Systems Manager
+/// `systems-manager` where the prefix is `ssm`, Amazon EMR `emr` where the prefix
+/// is `elasticmapreduce` and IAM Identity Center `singlesignon` where the prefix is
+/// `sso`, and publishes console-only entries (`activate`, `artifact`,
 /// `aws-marketplace`, `ce`) for services with no endpoint prefix of that name at
 /// all. A catalog keyed on endpoint prefixes answers a discovery call in the wrong
 /// namespace, so an identifier a console client may legitimately set looks
 /// nonexistent.
 ///
-/// Where the two namespaces differ for one service, the console identifier is the
-/// entry and its signing name / endpoint prefix is NOT also an entry: a service is
-/// named here once, by the identifier its console home is addressed by. Where a
-/// service has no console home of its own because the console files it under
-/// another service's home, neither spelling is an entry and the HOME is.
+/// Where a service has no console home of its own because the console files it
+/// under another service's home, the filed service's own identifier is not an entry
+/// and the HOME is: `access-analyzer` is not an entry and `iam` is.
+///
+/// # Which spelling of a service is the entry
+///
+/// Not a rule — the published catalog's own choice, service by service, so the
+/// observation below decides it rather than a derivation from either namespace: the
+/// catalog names Amazon MSK `kafka` and not `msk`, Amazon Location Service `geo` and
+/// not `location`, AWS Health `health-dashboard` and not `health`, AWS Migration Hub
+/// `mgh` and not `migrationhub`, and Amazon MQ `amazon-mq` (beside `mq`). A near
+/// spelling the catalog does not publish is not an entry, so it is neither reported
+/// by `ListServices` nor settable (`catalog_published_spellings` pins the spellings
+/// and `console_identifier_namespace` the prefix contrast).
 ///
 /// # Where these entries come from
 ///
-/// Seeded from an OBSERVED console catalog of that namespace — not independently
-/// derived: the head of the list and entries such as `aws-agent-registry`,
-/// `bedrock-mantle` and `claude-platform-on-aws` are identifiers only an observed
-/// catalog names, and the rest are the identifiers AWS services' console homes are
-/// published under. Each entry satisfies the model's `Service` member constraints
+/// Seeded from an OBSERVED catalog of that namespace — not independently derived:
+/// the head of the list and entries such as `aws-agent-registry`, `bedrock-mantle`
+/// and `claude-platform-on-aws` are identifiers only an observed catalog names, and
+/// the rest are the identifiers AWS services' homes are published under. The same
+/// observation is what adds `gameliftservers` and `gameliftstreams` (the two
+/// GameLift homes beside the legacy `gamelift` one), `geo`, `health-dashboard`,
+/// `infrastructure-composer`, `iq`, `kafka`, `managedservices`, `medical-imaging`,
+/// `mgh`, `mq`, `network-security-manager`, `nova-act`, `odb`, `partnercentral` and
+/// `prometheus`, and what leaves out identifiers it does not name (`greengrass`,
+/// `health`, `iotanalytics`, `iotevents`, `iotwireless`, `kinesisanalytics`,
+/// `location`, `lookoutmetrics`, `lookoutvision`, `migrationhub`, `msk`, `mwaa`,
+/// `network-firewall`, `networkmanager`, `opensearch`, `opsworks`, `panorama`,
+/// `pca-connector-ad`) however plausible a service name they are: a catalog seeded
+/// from service names rather than from the published list reports identifiers no
+/// client of the real service can discover, and admits them as settings.
+/// Each entry satisfies the model's `Service` member constraints
 /// (`@length(1, 64)`, `@pattern ^[a-z0-9]+(-[a-z0-9]+)*$` —
 /// `smithy_query(query="shape", shape="ServiceList")`), which
 /// `catalog_entries_are_legal_service_identifiers_in_one_stable_order` re-checks
@@ -171,12 +196,12 @@ pub const ACCOUNT_COLOR_NONE: &str = "none";
 /// not something a rule can derive: this emulator serves ONE fixed, deterministic
 /// catalog of that namespace, large enough that paging over it is real (several
 /// pages at the page sizes a client asks for) rather than a single short page.
-/// Entries no console service home is published under are deliberately absent —
+/// Entries no service home is published under are deliberately absent —
 /// `access-analyzer` (IAM Access Analyzer lives under `iam`), `account`,
 /// `appconfig` (under `systems-manager`), `cognito-idp`, `kafkaconnect` (MSK
-/// Connect lives under `msk`), `logs` and `sts` — so the catalog is one namespace
-/// throughout, and every console home an omission above redirects to is itself an
-/// entry a caller can discover and set.
+/// Connect lives under the MSK home, `kafka`), `logs` and `sts` — so the catalog is
+/// one namespace throughout, and every home an omission above redirects to is
+/// itself an entry a caller can discover and set.
 ///
 /// It is the ADMISSION list as well as the discovery list: `ListServices`
 /// "returns a paginated list of ... service identifiers that you can use as
@@ -287,29 +312,30 @@ const SEED_SERVICE_CATALOG: &[&str] = &[
     "freertos",
     "fsx",
     "gamelift",
+    "gameliftservers",
+    "gameliftstreams",
+    "geo",
     "globalaccelerator",
     "glue",
     "grafana",
-    "greengrass",
     "groundstation",
     "guardduty",
-    "health",
+    "health-dashboard",
     "healthlake",
     "iam",
     "imagebuilder",
+    "infrastructure-composer",
     "inspector",
     "iot",
-    "iotanalytics",
-    "iotevents",
     "iotfleetwise",
     "iotsitewise",
     "iottwinmaker",
-    "iotwireless",
+    "iq",
     "ivs",
+    "kafka",
     "kendra",
     "keyspaces",
     "kinesis",
-    "kinesisanalytics",
     "kinesisvideo",
     "kms",
     "lakeformation",
@@ -318,42 +344,39 @@ const SEED_SERVICE_CATALOG: &[&str] = &[
     "lex",
     "license-manager",
     "lightsail",
-    "location",
     "lookoutequipment",
-    "lookoutmetrics",
-    "lookoutvision",
     "m2",
     "machinelearning",
     "macie",
     "managedblockchain",
+    "managedservices",
     "mediaconnect",
     "mediaconvert",
     "medialive",
     "mediapackage",
     "mediastore",
     "mediatailor",
+    "medical-imaging",
     "memorydb",
+    "mgh",
     "mgn",
-    "migrationhub",
     "monitron",
-    "msk",
-    "mwaa",
+    "mq",
     "neptune",
-    "network-firewall",
-    "networkmanager",
+    "network-security-manager",
     "notifications",
+    "nova-act",
+    "odb",
     "omics",
-    "opensearch",
-    "opsworks",
     "organizations",
     "outposts",
-    "panorama",
+    "partnercentral",
     "payment-cryptography",
-    "pca-connector-ad",
     "pcs",
     "personalize",
     "pinpoint",
     "polly",
+    "prometheus",
     "proton",
     "q",
     "qbusiness",

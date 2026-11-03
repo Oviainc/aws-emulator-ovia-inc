@@ -175,11 +175,11 @@ async fn the_canonical_sequence_is_the_one_written_out_in_each_row() {
             vec!["account-access", "acm"],
         ),
         // A hyphen (0x2D) sorts before a letter, and a digit (0x30-0x39) before
-        // both: `network-firewall` < `networkmanager`, and `s3` < `sagemaker`.
+        // both: `health-dashboard` < `healthlake`, and `s3` < `sagemaker`.
         (
             "visibleServices",
-            vec!["sagemaker", "networkmanager", "s3", "network-firewall"],
-            vec!["network-firewall", "networkmanager", "s3", "sagemaker"],
+            vec!["sagemaker", "healthlake", "s3", "health-dashboard"],
+            vec!["health-dashboard", "healthlake", "s3", "sagemaker"],
         ),
         (
             "visibleRegions",

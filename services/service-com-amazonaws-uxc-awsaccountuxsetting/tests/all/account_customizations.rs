@@ -79,7 +79,7 @@ async fn update_persists_and_get_reads_back_every_shape_of_setting() {
         Case {
             name: "hyphenated identifiers, several Region forms",
             color: "darkBlue",
-            services: vec!["pca-connector-ad", "network-firewall", "xray"],
+            services: vec!["medical-imaging", "network-security-manager", "xray"],
             regions: vec!["eu-west-3", "ap-southeast-2", "us-gov-west-1"],
         },
         Case {

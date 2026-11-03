@@ -267,7 +267,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // its members ascending), so this echo and every later
             // `GetAccountCustomizations` report the one same sequence. The model
             // fixes no order for either list, so the order is recorded behaviour
-            // only; the rule and its evidence live on that function.
+            // only; the rule, the evidence for it and the one recorded echo it
+            // does not reproduce live on that function.
             //
             // The reset is decided BEFORE the supplied value, because that is the
             // order of the two request forms: a member carried as `null` supplies

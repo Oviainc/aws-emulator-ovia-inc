@@ -63,7 +63,7 @@ const ENDPOINT_PREFIXES: &[&str] = &[
     "elasticfilesystem",
     "execute-api",
     "sts",
-    "mq",
+    "cassandra",
     "es",
 ];
 
