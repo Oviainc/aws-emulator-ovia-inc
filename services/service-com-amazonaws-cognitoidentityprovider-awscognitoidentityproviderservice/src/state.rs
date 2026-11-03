@@ -365,6 +365,51 @@ pub const MISSING_REQUIRED_SCOPES_MESSAGE: &str = "Access Token does not have re
 /// since invalidated.
 pub const ACCESS_TOKEN_REVOKED_MESSAGE: &str = "Access Token has been revoked";
 
+/// The message a challenge response owes a `Session` that does not belong to the request
+/// it arrived on: one started for another pool or app client, one naming another user than
+/// the response does, or one whose challenge the stored user no longer owes.
+///
+/// It reports that the session resolves no challenge THIS request can answer and names
+/// nothing of the request, so the refusal is the same whichever of those it was — and it
+/// is told apart from the replay of a spent session
+/// ([`SESSION_ALREADY_USED_MESSAGE`]), from a closed validity window
+/// ([`SESSION_EXPIRED_MESSAGE`]) and from a value this emulator never handed out
+/// ([`INVALID_AUTH_STATE_MESSAGE`]).
+pub const SESSION_NOT_FOR_THIS_REQUEST_MESSAGE: &str = "Invalid session for the user.";
+
+/// The message a challenge response owes a `Session` this emulator handed out
+/// and an earlier response ALREADY answered.
+///
+/// A `Session` is "the session identifier that maintains the state of
+/// authentication requests and challenge responses" (`RespondToAuthChallenge` in
+/// this service's model): answering its challenge is what spends it, so the
+/// state it maintained is gone and the same session cannot carry a second
+/// sign-in. The refusal says exactly that, which is a different answer from the
+/// one a value this service never handed out gets
+/// ([`INVALID_AUTH_STATE_MESSAGE`]) and from the one a session whose validity
+/// window closed gets ([`SESSION_EXPIRED_MESSAGE`]). It names no value from the
+/// request, so every such refusal carries this one sentence.
+pub const SESSION_ALREADY_USED_MESSAGE: &str =
+    "Invalid session for the user, session can only be used once.";
+
+/// The message a challenge response owes a `Session` whose validity window has
+/// closed. `CreateUserPoolClient.AuthSessionValidity` is "the duration, in
+/// minutes, of that session token" (this service's model), so a response past it
+/// resumes a challenge that is no longer outstanding.
+pub const SESSION_EXPIRED_MESSAGE: &str = "Invalid session for the user, session is expired.";
+
+/// The message a challenge response owes a `Session` that resolves to no stored
+/// challenge of this emulator at all.
+///
+/// `(Admin)RespondToAuthChallenge` declares `CodeMismatchException` — "thrown if
+/// the provided code doesn't match what the server was expecting"
+/// (`smithy_query(query="operation",operation="AdminRespondToAuthChallenge")`) —
+/// and a response carries the state of its sign-in in the `Session` beside the
+/// code, so a value that names no outstanding challenge is a mismatch of that
+/// state rather than a statement about any user. The sentence names neither the
+/// session nor the user, so every such refusal carries this one sentence.
+pub const INVALID_AUTH_STATE_MESSAGE: &str = "Invalid code or auth state for the user.";
+
 /// `UserPoolTierType` defaults to `ESSENTIALS` (`CreateUserPool.UserPoolTier`).
 const DEFAULT_USER_POOL_TIER: &str = ESSENTIALS_USER_POOL_TIER;
 
@@ -537,6 +582,35 @@ pub const MAX_LINKED_PROVIDER_IDENTITIES: usize = 5;
 /// so the refusal echoes nothing the caller submitted.
 pub const SOURCE_USER_ALREADY_LINKED_MESSAGE: &str =
     "SourceUser is already linked to DestinationUser";
+
+/// The message `AdminLinkProviderForUser`'s `InvalidParameterException` carries
+/// for a `SourceUser` that already links to a DIFFERENT local profile than the
+/// `DestinationUser` the request names.
+///
+/// A federated identity links to ONE local profile, so a request that re-points
+/// a linked identity at another profile is refused: the identity is spoken for.
+/// One fixed sentence that names the MEMBER whose value was already linked
+/// rather than the provider, the identity or either profile, so the refusal
+/// echoes nothing the caller submitted. A repeat of the link the identity
+/// already holds carries [`SOURCE_USER_ALREADY_LINKED_MESSAGE`] instead: that
+/// request names the profile the link already points at.
+pub const SOURCE_USER_LINKED_TO_ANOTHER_USER_MESSAGE: &str =
+    "SourceUser with the specified attribute value is already linked to another user";
+
+/// The message `AdminLinkProviderForUser`'s `InvalidParameterException` carries
+/// for a `SourceUser` that names one of the pool's OWN users rather than an
+/// external identity.
+///
+/// `SourceUser` is "an external IdP account for a user who doesn't exist yet in
+/// the user pool. This user must be a federated user (for example, a SAML or
+/// Facebook user), not another native user"
+/// (`smithy_query(query="doc",shape="AdminLinkProviderForUserRequest",member="SourceUser")`),
+/// so an identifier that resolves to a user pool user who signs in with a
+/// username and password identifies no external account to link. One fixed
+/// sentence, which names neither the identifier nor the user it resolved to.
+pub const INVALID_SOURCE_USER_MESSAGE: &str =
+    "Invalid SourceUser: Cognito users with a username/password may not be passed in as a \
+     SourceUser, only as a DestinationUser";
 
 /// The message a `TermsExistsException` carries for a `TermsName` the app client
 /// already holds terms documents under.
@@ -1583,10 +1657,12 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     ///
     /// Sessions the clock has already expired are swept first — the expiry was
     /// owed at this instant whether or not anybody called — which is what tells
-    /// an expired session apart from one this emulator never handed out. The
-    /// session stays stored: answering its challenge is what ends it
-    /// ([`Self::end_session`]), so a caller whose response was refused can send
-    /// a corrected one while the session still lives.
+    /// an expired session apart from one this emulator never handed out. A
+    /// session a response already answered stays stored as SPENT until the
+    /// clock expires it ([`Self::end_session`]), which is what tells a replay
+    /// apart from a value this emulator never handed out. A session that is
+    /// neither is still outstanding: a caller whose response was refused can
+    /// send a corrected one while the session lives.
     pub fn session(&mut self, token: &str, now: SystemTime) -> SessionLookup {
         let expired = self
             .auth_sessions
@@ -1595,6 +1671,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             .cloned();
         self.auth_sessions.retain(|_, stored| stored.expires_at > now);
         match self.auth_sessions.get(token) {
+            Some(stored) if stored.spent => SessionLookup::Spent(stored.clone()),
             Some(stored) => SessionLookup::Found(stored.clone()),
             None => match expired {
                 Some(stored) => SessionLookup::Expired(stored),
@@ -1603,10 +1680,17 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         }
     }
 
-    /// Forget the challenge session `token` names: a session answers its
+    /// Spend the challenge session `token` names: a session answers its
     /// challenge once.
+    ///
+    /// The record STAYS stored, marked spent, until the clock expires it — the
+    /// sweeps in [`Self::session`] and [`Self::start_session`] are what drop it
+    /// — so a caller replaying the session is answered as the replay it is
+    /// rather than as a session this emulator never issued.
     pub fn end_session(&mut self, token: &str) {
-        self.auth_sessions.remove(token);
+        if let Some(stored) = self.auth_sessions.get_mut(token) {
+            stored.spent = true;
+        }
     }
 
     /// Store a passkey registration and return the CHALLENGE value its creation
@@ -6347,6 +6431,14 @@ pub struct AuthSession {
     /// (`CreateUserPoolClient.AuthSessionValidity` is "the duration, in minutes,
     /// of that session token"), so the code's window is the session's window.
     pub code: Option<VerificationCode>,
+    /// Whether a response has already ANSWERED this session's challenge
+    /// ([`ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::end_session`]).
+    ///
+    /// A spent session stays stored until the clock expires it, which is what
+    /// tells a session a caller is replaying apart from a value this emulator
+    /// never handed out: the two owe different refusals
+    /// ([`SESSION_ALREADY_USED_MESSAGE`] and [`INVALID_AUTH_STATE_MESSAGE`]).
+    pub spent: bool,
 }
 
 /// What resolving a `Session` token found
@@ -6355,11 +6447,15 @@ pub struct AuthSession {
 /// response owes a different refusal for each.
 #[derive(Debug, Clone)]
 pub enum SessionLookup {
-    /// The stored session, still inside its validity window.
+    /// The stored session, still inside its validity window and not yet
+    /// answered.
     Found(AuthSession),
     /// A stored session whose validity window had already closed, as it was
     /// stored: which challenge it was waiting on decides the refusal it owes.
     Expired(AuthSession),
+    /// A stored session an earlier response already ANSWERED: the challenge it
+    /// maintained the state of is over, so this one is a replay.
+    Spent(AuthSession),
     /// No session of that token: this emulator never handed it out.
     Unknown,
 }

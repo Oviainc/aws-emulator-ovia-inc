@@ -106,6 +106,14 @@ fn error_code(payload: &Value) -> &str {
         .unwrap_or("<no __type>")
 }
 
+/// The `message` member of an error body.
+fn error_message(payload: &Value) -> &str {
+    payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
+}
+
 /// A created pool with one app client that allows the admin password flow.
 struct Fixture {
     user_pool_id: String,
@@ -468,14 +476,18 @@ async fn a_new_password_response_completes_the_sign_in_and_is_read_back() {
              {payload}"
         );
 
-        // The session answered its challenge, so it is spent: it is gone from
-        // state and answering with it again is refused.
+        // The session answered its challenge, so it is spent: the record stays
+        // stored, marked spent, and answering with it again is refused as the
+        // replay it is.
         {
             let service_state = state::service_state(&*engine).expect("this service's state");
             let guard = service_state.lock();
             assert!(
-                !guard.auth_sessions.contains_key(&session),
-                "case {case:?}: the answered session must be gone, {} are stored",
+                guard
+                    .auth_sessions
+                    .get(&session)
+                    .is_some_and(|stored| stored.spent),
+                "case {case:?}: the answered session must be stored as spent, {} are stored",
                 guard.auth_sessions.len()
             );
         }
@@ -492,8 +504,12 @@ async fn a_new_password_response_completes_the_sign_in_and_is_read_back() {
         )
         .await;
         assert_eq!(
-            (status, error_code(&payload)),
-            (400, "NotAuthorizedException"),
+            (status, error_code(&payload), error_message(&payload)),
+            (
+                400,
+                "NotAuthorizedException",
+                "Invalid session for the user, session can only be used once."
+            ),
             "case {case:?}: a spent session answers no second response, got {status} with \
              {payload}"
         );
@@ -632,10 +648,15 @@ async fn a_response_that_does_not_satisfy_the_challenge_is_refused_and_writes_no
             ..CORRECT
         },
         Refused {
+            // A `Session` that resolves to no stored challenge is a mismatch of
+            // the auth state a response carries beside its code, which
+            // `(Admin)RespondToAuthChallenge` declares `CodeMismatchException`
+            // for — a different class from the one a session this emulator DID
+            // hand out gets.
             case: "a Session this emulator never handed out",
             session: SessionSource::Unknown,
             status: 400,
-            code: "NotAuthorizedException",
+            code: "CodeMismatchException",
             ..CORRECT
         },
         Refused {

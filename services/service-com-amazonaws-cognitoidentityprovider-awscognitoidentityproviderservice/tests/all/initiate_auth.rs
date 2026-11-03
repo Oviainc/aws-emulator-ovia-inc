@@ -796,23 +796,23 @@ async fn the_stored_user_state_decides_the_refusal() {
             password: GOOD_PASSWORD,
             expected: refused(400, "NotAuthorizedException"),
         },
-        // The credential is checked BEFORE the user's state is reported, so a caller
-        // that does not hold the password learns nothing about the user it named: each
-        // of the states above answers the plain wrong-password refusal instead of its
-        // own, more telling one.
+        // The stored user's own state is read BEFORE the credential, so a caller that
+        // does not hold the password gets the refusal that state owes rather than the
+        // wrong-password one: the error code therefore says nothing about whether the
+        // password presented was right.
         Row {
             case: "the wrong password for an unconfirmed user",
             username: "unconfirmedwrongpassword",
             store: |user| user.status = state::UserStatus::Unconfirmed,
             password: "NotTheP4ssword!",
-            expected: refused(400, "NotAuthorizedException"),
+            expected: refused(400, "UserNotConfirmedException"),
         },
         Row {
             case: "the wrong password for a user in RESET_REQUIRED",
             username: "resetrequiredwrongpassword",
             store: |user| user.status = state::UserStatus::ResetRequired,
             password: "NotTheP4ssword!",
-            expected: refused(400, "NotAuthorizedException"),
+            expected: refused(400, "PasswordResetRequiredException"),
         },
         Row {
             case: "the wrong password for a disabled user",

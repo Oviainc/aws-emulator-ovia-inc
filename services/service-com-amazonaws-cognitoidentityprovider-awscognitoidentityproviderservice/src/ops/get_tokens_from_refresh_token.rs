@@ -360,16 +360,18 @@ fn resolve(
     //
     // "A valid refresh token that can authorize the request for new tokens"
     // (`RefreshToken`): valid is read off the record this emulator wrote when it issued
-    // the token — a refresh token, of the app client the request names, and not past
-    // its expiry.
+    // the token — a refresh token, not past its expiry — and the app client it was
+    // issued FOR is what the request has to name. A record issued for another app
+    // client is told apart from a value this service cannot resolve to a refresh token
+    // at all: the caller holds a token this service did issue, so the refusal reports
+    // that it belongs to a different app client rather than denying it was ever issued.
     let record = state
         .token(&input.refresh_token)
-        .filter(|record| {
-            record.kind == crate::state::TokenKind::Refresh
-                && record.client_id == input.client_id
-                && record.user_pool_id == user_pool_id
-        })
+        .filter(|record| record.kind == crate::state::TokenKind::Refresh)
         .ok_or_else(invalid_refresh_token)?;
+    if record.client_id != input.client_id || record.user_pool_id != user_pool_id {
+        return Err(refresh_token_different_client());
+    }
     // A record this emulator issued for this app client and has since REVOKED — a
     // sign-out of its user, or a revocation of the token itself — is refused as
     // revoked, which is a different answer from the one a value this service cannot
@@ -380,7 +382,7 @@ fn resolve(
         return Err(refresh_token_revoked());
     }
     if record.expires_at <= now {
-        return Err(invalid_refresh_token());
+        return Err(unauthorized_refresh_token());
     }
     // A token an earlier rotation replaced is answered as the reuse it is, for as long
     // as the record of it lives: `RefreshTokenReuseException` is "throw when your
@@ -398,7 +400,7 @@ fn resolve(
         .pool(&user_pool_id)
         .and_then(|pool| pool.user(&record.username))
         .filter(|user| user.sub == record.sub)
-        .ok_or_else(invalid_refresh_token)?;
+        .ok_or_else(unauthorized_refresh_token)?;
     if !user.enabled {
         return Err(not_authorized("User is disabled."));
     }
@@ -426,7 +428,7 @@ fn resolve(
             .as_deref()
             .is_none_or(|device_key| user.confirmed_device(device_key).is_none())
     {
-        return Err(invalid_refresh_token());
+        return Err(unauthorized_refresh_token());
     }
 
     Ok(Refresh {
@@ -444,10 +446,41 @@ fn client_not_found(client_id: &str) -> GetTokensFromRefreshTokenError {
     .into()
 }
 
-/// The refusal for a `RefreshToken` this emulator cannot resolve to a live refresh token
-/// of the app client the request names, or that the request is not authorized to use.
+/// The message a value this emulator cannot resolve to a refresh token at all is refused
+/// with: one it never issued, or a token of another kind presented as one. Told apart from
+/// [`UNAUTHORIZED_REFRESH_TOKEN`] — which the two differ from each other ONLY in
+/// punctuation, so neither may be edited into the other — and from the refusal of a token
+/// issued for another app client.
+const INVALID_REFRESH_TOKEN: &str = "Invalid Refresh Token";
+
+/// The message a refresh token this emulator DID issue for the app client the request
+/// names, and that still does not authorize this request, is refused with. Its own
+/// sentence, distinct from [`INVALID_REFRESH_TOKEN`], which denies the token was ever
+/// issued.
+const UNAUTHORIZED_REFRESH_TOKEN: &str = "Invalid Refresh Token.";
+
+/// The refusal for a value this emulator cannot resolve to a refresh token at all: one it
+/// never issued, or a token of another kind presented as one. One fixed sentence, which
+/// names neither the value presented nor the app client it was presented to.
 fn invalid_refresh_token() -> GetTokensFromRefreshTokenError {
-    not_authorized("Invalid Refresh Token.")
+    not_authorized(INVALID_REFRESH_TOKEN)
+}
+
+/// The refusal for a refresh token this emulator DID issue for the app client the request
+/// names and that still does not authorize this request: one past its expiry, one naming a
+/// user that is gone, and one presented without the confirmed device key a pool that
+/// remembers devices requires. Worded as its own sentence, which names nothing of the
+/// request either.
+fn unauthorized_refresh_token() -> GetTokensFromRefreshTokenError {
+    not_authorized(UNAUTHORIZED_REFRESH_TOKEN)
+}
+
+/// The refusal for a `RefreshToken` this emulator issued for ANOTHER app client than the
+/// `ClientId` the request names. Told apart from [`invalid_refresh_token`] because the
+/// token is one this service issued: what it does not authorize is this app client. The
+/// sentence names neither app client.
+fn refresh_token_different_client() -> GetTokensFromRefreshTokenError {
+    not_authorized("Refresh Token has different Client")
 }
 
 /// The refusal for a `RefreshToken` this emulator issued for the app client the request

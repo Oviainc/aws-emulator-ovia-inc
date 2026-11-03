@@ -584,11 +584,12 @@ async fn a_client_credentials_grant_is_refused_against_stored_configuration() {
         .to_string();
 
     // The message each refusal owes: the app client the request names for an id no pool
-    // holds, the one sentence a secret that proves nothing gets, the flow the app client
-    // is not configured for, and the model's own sentence about a scope.
-    let bad_secret = "Invalid client secret.";
+    // holds, the one sentence a pair this grant does not authenticate gets, the flow the
+    // app client is not configured for, and the refusal of a scope the pool defines
+    // nowhere.
+    let bad_secret = "Invalid client or secret";
     let flow_not_enabled = format!("{CLIENT_TOKEN_AUTH_FLOW} flow not enabled for this client");
-    let bad_scope = "Each scope must belong to a resource server in your user pool.";
+    let bad_scope = "Invalid scopes requested";
 
     let rows: [(&str, Value, u16, &str, String); 9] = [
         (
@@ -627,7 +628,7 @@ async fn a_client_credentials_grant_is_refused_against_stored_configuration() {
                 "Scopes": ["https://other.example.test/read"],
             }),
             400,
-            "InvalidParameterException",
+            "NotAuthorizedException",
             bad_scope.to_string(),
         ),
         (
@@ -638,7 +639,7 @@ async fn a_client_credentials_grant_is_refused_against_stored_configuration() {
                 "Scopes": ["https://api.example.test/write"],
             }),
             400,
-            "InvalidParameterException",
+            "NotAuthorizedException",
             bad_scope.to_string(),
         ),
         (
@@ -649,7 +650,7 @@ async fn a_client_credentials_grant_is_refused_against_stored_configuration() {
                 "Scopes": ["https://api.example.test"],
             }),
             400,
-            "InvalidParameterException",
+            "NotAuthorizedException",
             bad_scope.to_string(),
         ),
         (
@@ -660,7 +661,7 @@ async fn a_client_credentials_grant_is_refused_against_stored_configuration() {
                 "Scopes": ["read"],
             }),
             400,
-            "InvalidParameterException",
+            "NotAuthorizedException",
             bad_scope.to_string(),
         ),
         (
@@ -671,7 +672,7 @@ async fn a_client_credentials_grant_is_refused_against_stored_configuration() {
                 "Scopes": ["https://api.example.test/read", "https://api.example.test/admin"],
             }),
             400,
-            "InvalidParameterException",
+            "NotAuthorizedException",
             bad_scope.to_string(),
         ),
     ];

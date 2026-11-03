@@ -355,7 +355,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let session = match guard.session(&session_token, now) {
                 crate::state::SessionLookup::Found(session) => session,
                 crate::state::SessionLookup::Expired(_) => return Err(expired_session()),
-                crate::state::SessionLookup::Unknown => return Err(invalid_session()),
+                // A session an earlier response already answered is a REPLAY: its
+                // challenge is over, which is a different answer from the one a value
+                // this emulator never handed out gets. A spent session of ANOTHER pool
+                // or app client is not this caller's to be told about, so it is answered
+                // as a session that does not belong to this request.
+                crate::state::SessionLookup::Spent(spent) => {
+                    return Err(
+                        if spent.user_pool_id == input.user_pool_id
+                            && spent.client_id == input.client_id
+                        {
+                            session_already_used()
+                        } else {
+                            invalid_session()
+                        },
+                    );
+                }
+                crate::state::SessionLookup::Unknown => return Err(invalid_auth_state()),
             };
             if session.user_pool_id != input.user_pool_id
                 || session.client_id != input.client_id
@@ -604,14 +620,31 @@ fn user_not_found() -> AdminRespondToAuthChallengeError {
     .into()
 }
 
-/// The refusal for a `Session` no stored challenge answers.
+/// This operation's `CodeMismatchException` for a `Session` that resolves to no stored
+/// challenge of this emulator: the state a response carries beside its code is not one
+/// the server was expecting.
+fn invalid_auth_state() -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::CodeMismatchException(CodeMismatchException {
+        message: Some(crate::state::INVALID_AUTH_STATE_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The refusal for a `Session` an earlier response already answered.
+fn session_already_used() -> AdminRespondToAuthChallengeError {
+    not_authorized(crate::state::SESSION_ALREADY_USED_MESSAGE)
+}
+
+/// The refusal for a stored `Session` that does not belong to this request: one
+/// started for another pool or app client, for another user than the response
+/// names, or one whose challenge the stored user no longer owes.
 fn invalid_session() -> AdminRespondToAuthChallengeError {
-    not_authorized("Invalid session for the user.")
+    not_authorized(crate::state::SESSION_NOT_FOR_THIS_REQUEST_MESSAGE)
 }
 
 /// The refusal for a `Session` whose validity window has closed.
 fn expired_session() -> AdminRespondToAuthChallengeError {
-    not_authorized("Invalid session for the user, session is expired.")
+    not_authorized(crate::state::SESSION_EXPIRED_MESSAGE)
 }
 
 /// This operation's `NotAuthorizedException`, carrying `message`.

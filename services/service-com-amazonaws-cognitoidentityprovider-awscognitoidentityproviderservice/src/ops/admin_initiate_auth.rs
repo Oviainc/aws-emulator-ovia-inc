@@ -460,6 +460,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // This challenge is answered with a password the user
                         // chooses, not with a code anything delivered.
                         code: None,
+                        // Outstanding: this session has answered nothing yet.
+                        spent: false,
                     },
                 );
                 let challenge_parameters =
@@ -489,6 +491,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         username: username.clone(),
                         challenge_name: MFA_SETUP.to_string(),
                         expires_at: now + session_validity,
+                        // Outstanding: this session has answered nothing yet.
+                        spent: false,
                         // This challenge is answered by registering a factor,
                         // not with a code anything delivered.
                         code: None,

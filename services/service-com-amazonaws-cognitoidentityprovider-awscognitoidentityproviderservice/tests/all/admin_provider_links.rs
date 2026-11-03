@@ -878,13 +878,21 @@ async fn a_link_requires_a_configured_provider_and_a_stored_destination() {
             )),
         ),
         (
-            "a source naming the native provider, which is no IdP of the pool",
+            // `SourceUser` is "an external IdP account ... This user must be a
+            // federated user (for example, a SAML or Facebook user), not another
+            // native user"
+            // (`smithy_query(query="doc",shape="AdminLinkProviderForUserRequest",member="SourceUser")`),
+            // so the provider a pool's own users sign in under names no external
+            // account to link, whatever the pool's IdPs are.
+            "a source naming the native provider, which links no external identity",
             identity(NATIVE_PROVIDER, SUBJECT_ATTRIBUTE, "frank"),
             "frank".to_string(),
-            (400, "ResourceNotFoundException"),
-            Some(format!(
-                "Identity provider Cognito for tenantId {user_pool_id} does not exist."
-            )),
+            (400, "InvalidParameterException"),
+            Some(
+                "Invalid SourceUser: Cognito users with a username/password may not be passed \
+                 in as a SourceUser, only as a DestinationUser"
+                    .to_string(),
+            ),
         ),
         (
             "a destination the pool holds no user for",

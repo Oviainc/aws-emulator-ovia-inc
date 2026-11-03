@@ -494,17 +494,21 @@ async fn password_sign_in(
                 user_not_found()
             }
         })?;
-        // The stored credential, actually checked — and checked FIRST: every refusal
-        // below reports something about the user (disabled, `RESET_REQUIRED`,
-        // `UNCONFIRMED`, an expired temporary password), and a caller only learns that
-        // much once it has proved it holds the user's password. A wrong password is
-        // therefore answered the same way for every user state, which is also what
-        // `PreventUserExistenceErrors=ENABLED` asks of this operation: nothing in the
-        // answer distinguishes a user that exists from one that does not.
+        // The stored user's own state is read FIRST, as the administrative sign-in
+        // reads it: a user that never confirmed its sign-up, one Amazon Cognito put in
+        // `RESET_REQUIRED` and a disabled one cannot sign in whatever credential the
+        // request presents, so each is reported for what it is rather than as a wrong
+        // password. The credential therefore decides nothing about the ANSWER for such a
+        // user, which is what keeps the error code from telling a caller whether the
+        // password it presented was the right one.
+        refuse_unusable_user(user)?;
+        // The stored credential, actually checked. A user that exists and may sign in
+        // gets the one refusal a wrong password owes, which is also what an absent user
+        // gets where the app client hides user existence: nothing in that answer
+        // distinguishes a user that exists from one that does not.
         if user.password.as_deref() != Some(password.as_str()) {
             return Err(incorrect_credentials());
         }
-        refuse_unusable_user(user)?;
         if user.temporary_password_expired(temporary_password_validity, now) {
             return Err(not_authorized(
                 "Temporary password has expired and must be reset by an administrator.",
@@ -585,6 +589,8 @@ async fn password_sign_in(
                     username: username.clone(),
                     challenge_name: NEW_PASSWORD_REQUIRED.to_string(),
                     expires_at: now + session_validity,
+                    // Outstanding: this session has answered nothing yet.
+                    spent: false,
                     // This challenge is answered with a password the user chooses,
                     // not with a code anything delivered.
                     code: None,
@@ -617,6 +623,8 @@ async fn password_sign_in(
                     username: username.clone(),
                     challenge_name: MFA_SETUP.to_string(),
                     expires_at: now + session_validity,
+                    // Outstanding: this session has answered nothing yet.
+                    spent: false,
                     // This challenge is answered by registering a factor, not
                     // with a code anything delivered.
                     code: None,
@@ -773,6 +781,8 @@ fn email_otp_sign_in(
             challenge_name: EMAIL_OTP.to_string(),
             expires_at: now + session_validity,
             code: Some(code),
+            // Outstanding: this session has answered nothing yet.
+            spent: false,
         },
     );
 

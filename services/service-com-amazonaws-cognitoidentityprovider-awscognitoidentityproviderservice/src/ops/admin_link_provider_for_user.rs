@@ -212,6 +212,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .pool_mut(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
 
+        // "An external IdP account for a user who doesn't exist yet in the user
+        // pool. This user must be a federated user (for example, a SAML or
+        // Facebook user), not another native user" (`SourceUser` in this
+        // operation's model), so an identifier naming the provider a pool's OWN
+        // users sign in under identifies no external account to link: those
+        // users have a username and a password, and this member is for the
+        // identity that is given one. Asked before the IdP lookup, because the
+        // native provider is not one of the pool's configured IdPs and so
+        // resolves to none.
+        if source.is_native() {
+            return Err(invalid_parameter(
+                crate::state::INVALID_SOURCE_USER_MESSAGE.to_string(),
+            ));
+        }
+
         // The source "must be a federated user (for example, a SAML or Facebook
         // user), not another native user" (this operation's model), and the IdP
         // it federates through is one the pool holds — the same rule
@@ -237,9 +252,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at another profile or names the profile it already links to. The
         // caller deactivates the link it holds ("AdminDisableProviderForUser")
         // before linking that identity again.
-        if pool.linked_user_key(&source).is_some() {
+        if let Some(linked_key) = pool.linked_user_key(&source) {
             return Err(invalid_parameter(
-                crate::state::SOURCE_USER_ALREADY_LINKED_MESSAGE.to_string(),
+                if linked_key == destination_key {
+                    crate::state::SOURCE_USER_ALREADY_LINKED_MESSAGE
+                } else {
+                    crate::state::SOURCE_USER_LINKED_TO_ANOTHER_USER_MESSAGE
+                }
+                .to_string(),
             ));
         }
 

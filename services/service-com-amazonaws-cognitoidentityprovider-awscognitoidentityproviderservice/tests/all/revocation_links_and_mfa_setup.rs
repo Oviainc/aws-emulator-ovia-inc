@@ -65,8 +65,14 @@ const ACCESS_TOKEN_REVOKED: &str = "Access Token has been revoked";
 /// The sentence a refresh of a refresh token a sign-out invalidated is refused with.
 const REFRESH_TOKEN_REVOKED: &str = "Refresh Token has been revoked";
 
-/// The sentence a second link of one federated identity is refused with.
+/// The sentence a second link of one federated identity is refused with when it
+/// re-points the identity at the profile it ALREADY links to.
 const ALREADY_LINKED: &str = "SourceUser is already linked to DestinationUser";
+
+/// The sentence a second link of one federated identity is refused with when it
+/// re-points the identity at ANOTHER profile of the pool.
+const LINKED_TO_ANOTHER_USER: &str =
+    "SourceUser with the specified attribute value is already linked to another user";
 
 /// The `ChallengeNameType` value a user that must set up an MFA factor before it can
 /// sign in is answered with.
@@ -532,11 +538,18 @@ async fn a_source_identity_links_to_one_profile_only() {
         );
 
         let destination = if row.same_destination { "ada" } else { "grace" };
+        // A linked identity is spoken for either way, and the refusal says which
+        // of the two the second call asked for.
+        let expected = if row.same_destination {
+            ALREADY_LINKED
+        } else {
+            LINKED_TO_ANOTHER_USER
+        };
         let (status, payload) =
             dispatch(&emulator, "AdminLinkProviderForUser", &link(destination), true).await;
         assert_eq!(
             (status, error_code(&payload), error_message(&payload)),
-            (400, "InvalidParameterException", ALREADY_LINKED),
+            (400, "InvalidParameterException", expected),
             "case {case:?}: a second link of one identity must be refused, got {status} with \
              {payload}"
         );

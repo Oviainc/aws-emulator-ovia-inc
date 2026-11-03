@@ -220,12 +220,25 @@ struct Grant {
     scopes: Vec<String>,
 }
 
+/// The message a request this grant does not authenticate is refused with.
+///
+/// "Your app client provides its client ID and secret" (this operation's own doc), and
+/// the grant either authenticates that pair or it does not: ONE fixed sentence that says
+/// which of the two was not accepted, without saying WHICH of them was wrong, and that
+/// names neither value.
+const INVALID_CLIENT_OR_SECRET: &str = "Invalid client or secret";
+
 /// The message a request whose `Scopes` name something no resource server of the pool
-/// defines is refused with: the rule as this operation's own `Scopes` member states it in
-/// the model, word for word. It names no value from the request, so every such refusal
-/// carries this one sentence.
-const SCOPE_NOT_ON_A_RESOURCE_SERVER: &str =
-    "Each scope must belong to a resource server in your user pool.";
+/// defines is refused with.
+///
+/// "The custom scopes to authorize in the access token... Each scope must belong to a
+/// resource server in your user pool" (this operation's `Scopes` member), so a scope the
+/// pool defines nowhere is one this app client cannot be authorized for: the GRANT is
+/// refused rather than the request shape, so it carries this operation's
+/// `NotAuthorizedException`, "thrown when a user isn't authorized" (this service's
+/// model), and not the 400 class. It names no value from the request, so every such
+/// refusal carries this one sentence.
+const INVALID_SCOPES_REQUESTED: &str = "Invalid scopes requested";
 
 /// Resolve the request against stored state: the app client, its secret, the
 /// machine-to-machine configuration it has to carry, and the scopes the token is
@@ -251,7 +264,7 @@ fn resolve(state: &State, input: &GetClientTokenInput) -> Result<Grant, GetClien
     // value that is not the stored secret proves nothing either. `Secret` is a required
     // member, so the request always presents one.
     if client.client_secrets.is_empty() || !client.accepts_client_secret(Some(&input.secret)) {
-        return Err(not_authorized("Invalid client secret."));
+        return Err(not_authorized(INVALID_CLIENT_OR_SECRET));
     }
 
     // "To use this operation, you must ... enable the ALLOW_CLIENT_TOKEN_AUTH
@@ -276,7 +289,7 @@ fn resolve(state: &State, input: &GetClientTokenInput) -> Result<Grant, GetClien
         client.allowed_oauth_scopes.clone().unwrap_or_default()
     } else {
         if requested.iter().any(|scope| !pool.defines_scope(scope)) {
-            return Err(invalid_parameter(SCOPE_NOT_ON_A_RESOURCE_SERVER.to_string()));
+            return Err(not_authorized(INVALID_SCOPES_REQUESTED));
         }
         requested.to_vec()
     };

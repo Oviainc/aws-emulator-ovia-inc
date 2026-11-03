@@ -132,6 +132,14 @@ fn error_code(payload: &Value) -> &str {
         .unwrap_or("<no __type>")
 }
 
+/// The `message` member of an error body.
+fn error_message(payload: &Value) -> &str {
+    payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
+}
+
 /// Call `operation` expecting a refusal, and assert its status and wire error code.
 async fn refused(
     router: &MultiServiceRouter,
@@ -594,7 +602,16 @@ async fn device_remembering_decides_whether_a_refresh_needs_a_device_key() {
                 "case {case:?}: the refresh must be served, got {refreshed}"
             );
         } else {
-            refused(&router, case, REFRESH, &body, 400, "NotAuthorizedException").await;
+            let (status, payload) = dispatch(&router, REFRESH, &body).await;
+            // The token itself is one this service issued for this app client: what does
+            // not authorize the refresh is the DEVICE, so the refusal is the one a
+            // resolved token that does not authorize this request owes.
+            assert_eq!(
+                (status, error_code(&payload), error_message(&payload)),
+                (400, "NotAuthorizedException", "Invalid Refresh Token."),
+                "case {case:?}: expected the unauthorized-token refusal, got {status} with \
+                 {payload}"
+            );
         }
     }
 }

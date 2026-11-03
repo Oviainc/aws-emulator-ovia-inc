@@ -416,6 +416,7 @@ async fn storing_a_session_sweeps_only_what_the_clock_expired() {
                 challenge_name: "NEW_PASSWORD_REQUIRED".to_string(),
                 expires_at: *expires_at,
                 code: None,
+                spent: false,
             },
         );
     }
@@ -429,6 +430,7 @@ async fn storing_a_session_sweeps_only_what_the_clock_expired() {
             challenge_name: "NEW_PASSWORD_REQUIRED".to_string(),
             expires_at: now + Duration::from_secs(180),
             code: None,
+            spent: false,
         },
     );
 

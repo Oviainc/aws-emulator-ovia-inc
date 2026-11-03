@@ -559,7 +559,7 @@ async fn after_a_delete_the_deleted_servers_scopes_no_longer_authorize_a_client_
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (400, "InvalidParameterException"),
+        (400, "NotAuthorizedException"),
         "a deleted resource server's scope can no longer be authorized, got {status} with {payload}"
     );
 
