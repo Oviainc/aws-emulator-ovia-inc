@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComponentVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComponentVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComponentVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the versions published under one component, greater versions first,
+//! paged by an opaque cursor.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +148,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComponentVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComponentVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComponentVersions"))
+        let _ = ctx;
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(ListComponentVersionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the greengrassv2 state store is unavailable".to_string(),
+                    retry_after_seconds: 1,
+                },
+            )
+            .into());
+        };
+
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(st::MAX_PAGE_SIZE)
+                .clamp(1, st::MAX_PAGE_SIZE),
+        )
+        .unwrap_or(1);
+
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match st::decode_cursor(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListComponentVersionsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "nextToken is not a token this service issued.".to_string(),
+                            reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                            fields: Some(vec![ValidationExceptionField {
+                                name: "nextToken".to_string(),
+                                message: "the cursor could not be decoded".to_string(),
+                            }]),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let store = state.lock();
+
+        // The input ARN is the NAME-level component ARN `ListComponents` reports, so
+        // it names a component rather than one version. A component this account has
+        // published no version of carries no versions to report, and Greengrass
+        // answers that with an empty list rather than a 404 (recorded: the listing for
+        // a component that does not exist is a 200 whose `componentVersions` is
+        // empty), so the absent component and the component whose last version was
+        // deleted are answered alike.
+        let stored = st::parse_component_arn(&input.arn)
+            .and_then(|name| store.components.get(&name))
+            .filter(|component| component.name_arn == input.arn);
+
+        // "Greater versions are listed first" (the operation's own documentation), by
+        // semantic-version precedence — the order `version_cmp` states once for this
+        // service — so the page order is the one AWS documents rather than the key
+        // order the catalog is stored in.
+        let mut versions: Vec<&st::ComponentVersionEntry> =
+            stored.map(|c| c.versions.values().collect()).unwrap_or_default();
+        versions.sort_by(|a, b| st::version_cmp(&b.component_version, &a.component_version));
+
+        // A cursor resumes at the first version that is not GREATER than the one the
+        // previous page stopped before, so a version deleted between two pages costs
+        // the caller nothing: the resumed page starts where that version would have
+        // been.
+        let mut remaining = versions.iter().skip_while(|entry| {
+            resume_at.as_deref().is_some_and(|resume| {
+                st::version_cmp(&entry.component_version, resume) == ::std::cmp::Ordering::Greater
+            })
+        });
+
+        let component_versions: Vec<ComponentVersionListItem> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|entry| ComponentVersionListItem {
+                arn: Some(entry.arn.clone()),
+                component_name: Some(entry.component_name.clone()),
+                component_version: Some(entry.component_version.clone()),
+            })
+            .collect();
+        // Whatever is left begins the next page, so that version is the cursor.
+        let next_token = remaining
+            .next()
+            .map(|entry| st::encode_cursor(&entry.component_version));
+
+        Ok(ListComponentVersionsOutput {
+            component_versions: Some(component_versions),
+            next_token,
+        })
     }
 }

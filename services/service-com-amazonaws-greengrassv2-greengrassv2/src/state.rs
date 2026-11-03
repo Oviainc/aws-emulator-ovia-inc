@@ -44,6 +44,10 @@ pub const STATE_REQUESTED: &str = "REQUESTED";
 pub const STATE_DEPLOYABLE: &str = "DEPLOYABLE";
 /// `VendorGuidance` value a component version that is current carries.
 pub const VENDOR_GUIDANCE_ACTIVE: &str = "ACTIVE";
+/// What a `CloudComponentStatus` message member says when there is nothing to report:
+/// Greengrass fills `message` and `vendorGuidanceMessage` with this sentinel rather
+/// than omitting them, so a reader of either member always finds a value.
+pub const STATUS_MESSAGE_NONE: &str = "NONE";
 /// `ComponentVisibilityScope` of a component this account published.
 pub const SCOPE_PRIVATE: &str = "PRIVATE";
 /// `DeploymentStatus` of the deployment that is current for its target.
@@ -130,6 +134,29 @@ pub const MAX_COMPONENT_VERSIONS: usize = 10_000;
 
 /// The quota code reported with [`MAX_COMPONENT_VERSIONS`].
 pub const COMPONENT_VERSION_QUOTA_CODE: &str = "ComponentVersionsPerAccount";
+
+/// The most component candidates one `ResolveComponentCandidates` request may carry.
+///
+/// This is NOT an AWS quota: it is CHOSEN, well above the component count of any real
+/// deployment. Resolving one candidate walks the versions of the component it names and,
+/// for each, checks that candidate's version requirements, so the work of a request is
+/// the PRODUCT of THREE factors: this candidate count, the stored version count
+/// ([`MAX_COMPONENT_VERSIONS`]) and the requirement count
+/// ([`MAX_RESOLVE_REQUIREMENTS`]). Only a bound on all three bounds it, so all three are
+/// bounded; a breach of either caller-chosen one is answered as a 400, so the request is
+/// refused rather than served slowly.
+pub const MAX_RESOLVE_CANDIDATES: usize = 100;
+
+/// The most version requirements one `ResolveComponentCandidates` request may carry in
+/// TOTAL, across every candidate.
+///
+/// The third caller-chosen factor of the product [`MAX_RESOLVE_CANDIDATES`] describes.
+/// The model puts no `@length` on `ComponentVersionRequirementMap`, so without this the
+/// only ceiling would be the request-body size. CHOSEN: a real deployment's candidate
+/// carries one requirement per component that depends on it, and the total is bounded
+/// here rather than per candidate so a caller cannot multiply the bound by the candidate
+/// count.
+pub const MAX_RESOLVE_REQUIREMENTS: usize = 500;
 
 /// The most deployments this emulator retains in total, across every target.
 ///
@@ -583,6 +610,30 @@ pub fn parse_component_version_arn(arn: &str) -> Option<(String, String)> {
     }
 }
 
+/// The component name a NAME-level component ARN names — the shape
+/// `arn:<partition>:greengrass:<region>:<account>:components:<name>`, which is what
+/// `ListComponents` reports and `ListComponentVersions` takes.
+///
+/// The model's `ComponentARN` pattern makes `<name>` colon-free and forbids the
+/// `:versions:` tail, so a plain `:` split recovers it.
+pub fn parse_component_arn(arn: &str) -> Option<String> {
+    let fields: Vec<&str> = arn.split(':').collect();
+    match fields.as_slice() {
+        ["arn", _partition, "greengrass", _region, _account, "components", name]
+            if !name.is_empty() =>
+        {
+            Some((*name).to_string())
+        }
+        _ => None,
+    }
+}
+
+/// The account every resource this emulator serves belongs to, as the messages that
+/// name an account report it.
+pub fn account_id() -> &'static str {
+    ::emulator_server::emulator_account_id()
+}
+
 /// A fresh opaque identifier for a deployment or its IoT job.
 pub fn new_identifier() -> String {
     ::uuid::Uuid::new_v4().to_string()
@@ -607,14 +658,11 @@ pub fn to_datetime(instant: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_millis(i64::try_from(millis).unwrap_or(i64::MAX))
 }
 
-/// An optional tag map for a response: `TagMap` is `len 1..200`, so an empty set
-/// of tags is reported as an absent member rather than an empty map.
+/// An optional tag map for a response: Greengrass reports the tag set of a resource
+/// with no tags as an EMPTY map rather than omitting the member, so a client reading
+/// `tags` always finds one.
 pub fn tags_out(tags: &BTreeMap<String, String>) -> Option<std::collections::HashMap<String, String>> {
-    if tags.is_empty() {
-        None
-    } else {
-        Some(tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-    }
+    Some(tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
 }
 
 /// Collect a request's tag map into the ordered map state keeps.

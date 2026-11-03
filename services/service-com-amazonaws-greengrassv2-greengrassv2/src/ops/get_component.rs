@@ -180,9 +180,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(entry) = store.component_version(&input.arn) else {
+            // A recipe fetch names the visibility scope it searched beside the
+            // component it did not find: a component-version ARN carrying this
+            // account names a component this account published, which is the private
+            // scope.
+            let (name, version) = st::parse_component_version_arn(&input.arn)
+                .unwrap_or_else(|| (input.arn.clone(), String::new()));
             return Err(GetComponentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("The component version {} does not exist.", input.arn),
+                    message: format!(
+                        "{} component ({name}:{version}) under account {} does not exist",
+                        st::SCOPE_PRIVATE,
+                        st::account_id()
+                    ),
                     resource_id: input.arn.clone(),
                     resource_type: "COMPONENT_VERSION".to_string(),
                 },

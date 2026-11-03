@@ -181,8 +181,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let not_found = || {
+            // The delete names the component version and the account it was looked
+            // for in, both read off the request and this emulator's own account.
+            let (name, version) = st::parse_component_version_arn(&input.arn)
+                .unwrap_or_else(|| (input.arn.clone(), String::new()));
             DeleteComponentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("The component version {} does not exist.", input.arn),
+                message: format!(
+                    "Component [{name} : {version}] in the accountId [{}] does not exist",
+                    st::account_id()
+                ),
                 resource_id: input.arn.clone(),
                 resource_type: "COMPONENT_VERSION".to_string(),
             })

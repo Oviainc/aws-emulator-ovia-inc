@@ -275,9 +275,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateComponentVersionErrorModeled::ConflictException(
                 ConflictException {
+                    // Greengrass reports the version that is already published, the
+                    // account it belongs to and the state it is in, so a client
+                    // re-publishing can tell "already deployable" from "still
+                    // validating". The state is the one the clock owes at this
+                    // instant, not a stored literal.
+                    //
+                    // The fixed text is the recorded response's, verbatim, including
+                    // the brackets around all three of the component, the account and
+                    // the state:
+                    //   Component [<name> : <version>] for account [<account>] already
+                    //   exists with state: [<state>]
+                    // (the issue report's prose paraphrase of cause 2 dropped the
+                    // brackets around the account; the recorded body carries them).
                     message: format!(
-                        "The component version {}:{} already exists.",
-                        recipe.component_name, recipe.component_version
+                        "Component [{} : {}] for account [{}] already exists with state: [{}]",
+                        recipe.component_name,
+                        recipe.component_version,
+                        st::account_id(),
+                        existing
+                            .status_at(now)
+                            .component_state
+                            .unwrap_or_else(|| st::STATE_REQUESTED.to_string()),
                     ),
                     resource_id: existing.arn.clone(),
                     resource_type: "COMPONENT_VERSION".to_string(),
@@ -317,10 +336,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `componentState` is not stored: it is derived from
                 // `deployable_at` by `ComponentVersionEntry::status_at`.
                 component_state: None,
-                message: None,
-                errors: None,
+                // Greengrass reports a component version's status with every member
+                // present: the two message members carry the sentinel it words "no
+                // message" as, and `errors` is the empty map when nothing failed.
+                message: Some(st::STATUS_MESSAGE_NONE.to_string()),
+                errors: Some(::std::collections::HashMap::new()),
                 vendor_guidance: Some(st::VENDOR_GUIDANCE_ACTIVE.to_string()),
-                vendor_guidance_message: None,
+                vendor_guidance_message: Some(st::STATUS_MESSAGE_NONE.to_string()),
             },
             deployable_at: now + st::COMPONENT_VALIDATION_SPAN,
             scope: st::SCOPE_PRIVATE.to_string(),

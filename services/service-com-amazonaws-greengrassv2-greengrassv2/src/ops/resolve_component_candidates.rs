@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResolveComponentCandidates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResolveComponentCandidates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResolveComponentCandidates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves each candidate component to the greatest published version that satisfies
+//! every version requirement the request carries and that supports the platform it
+//! names, and answers with that version's recipe.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +158,275 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResolveComponentCandidates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResolveComponentCandidatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResolveComponentCandidates"))
+        let _ = ctx;
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(ResolveComponentCandidatesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the greengrassv2 state store is unavailable".to_string(),
+                    retry_after_seconds: 1,
+                },
+            )
+            .into());
+        };
+
+        let candidates = input.component_candidates.unwrap_or_default();
+        let platform = input.platform.unwrap_or_default();
+
+        // Resolving one candidate walks the versions of the component it names and
+        // checks that candidate's requirements against each, so the work is the product
+        // of the candidate count, the stored version count and the requirement count.
+        // Both caller-chosen factors are bounded HERE, before the catalog is read.
+        if candidates.len() > st::MAX_RESOLVE_CANDIDATES {
+            return Err(ResolveComponentCandidatesErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "componentCandidates must hold at most {} candidates; got {}.",
+                        st::MAX_RESOLVE_CANDIDATES,
+                        candidates.len()
+                    ),
+                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "componentCandidates".to_string(),
+                        message: format!(
+                            "at most {} candidates may be resolved in one request.",
+                            st::MAX_RESOLVE_CANDIDATES
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        }
+        let requirement_count: usize = candidates
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .version_requirements
+                    .as_ref()
+                    .map_or(0, ::std::collections::HashMap::len)
+            })
+            .sum();
+        if requirement_count > st::MAX_RESOLVE_REQUIREMENTS {
+            return Err(ResolveComponentCandidatesErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "componentCandidates must state at most {} version requirements in \
+                         total; got {requirement_count}.",
+                        st::MAX_RESOLVE_REQUIREMENTS
+                    ),
+                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "componentCandidates".to_string(),
+                        message: format!(
+                            "at most {} version requirements may be resolved in one request.",
+                            st::MAX_RESOLVE_REQUIREMENTS
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // Every version requirement is parsed BEFORE the catalog is read, so a
+        // requirement that is not a semantic-version requirement is refused as the
+        // bad input it is rather than as "no version found".
+        let mut required: Vec<(String, Vec<::semver::VersionReq>)> = Vec::new();
+        for candidate in &candidates {
+            let name = candidate.component_name.clone().unwrap_or_default();
+            let mut requirements = Vec::new();
+            for (requester, requirement) in candidate.version_requirements.iter().flatten() {
+                match ::semver::VersionReq::parse(requirement) {
+                    Ok(parsed) => requirements.push(parsed),
+                    Err(_) => {
+                        return Err(ResolveComponentCandidatesErrorModeled::ValidationException(
+                            ValidationException {
+                                message: format!(
+                                    "The version requirement {requirement} that {requester} \
+                                     states for {name} is not a semantic version requirement."
+                                ),
+                                reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                                fields: Some(vec![ValidationExceptionField {
+                                    name: "componentCandidates".to_string(),
+                                    message: format!(
+                                        "{requirement} is not a semantic version requirement."
+                                    ),
+                                }]),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+            required.push((name, requirements));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // The platform attributes the request names are read ONCE here, so nothing per
+        // stored version copies caller data.
+        let requested = platform.attributes.unwrap_or_default();
+
+        let mut resolved: Vec<ResolvedComponentVersion> = Vec::new();
+        for (candidate, (name, requirements)) in candidates.iter().zip(&required) {
+            // The store is locked per CANDIDATE and released before the next one, so a
+            // request carrying many candidates cannot hold it for the whole set, and
+            // only the ONE version that resolves is copied out of it.
+            let picked = {
+                let store = state.lock();
+                // The greatest published version that satisfies EVERY requirement the
+                // request carries and that supports the platform it names: a
+                // candidate's requirements come from the recipes of the components that
+                // depend on it, so they all have to hold at once — a set that cannot
+                // (`>2.0.0` beside `<2.0.0`) resolves to nothing, which is what the
+                // operation reports as a conflict below.
+                store
+                    .components
+                    .get(name)
+                    .and_then(|component| {
+                        component
+                            .versions
+                            .values()
+                            .filter(|entry| {
+                                satisfies(
+                                    &entry.component_version,
+                                    requirements,
+                                    candidate.component_version.as_deref(),
+                                )
+                            })
+                            .filter(|entry| {
+                                supports_platform(entry, platform.name.as_deref(), &requested)
+                            })
+                            .max_by(|a, b| {
+                                st::version_cmp(&a.component_version, &b.component_version)
+                            })
+                    })
+                    .map(|entry| {
+                        let status = entry.status_at(now);
+                        ResolvedComponentVersion {
+                            arn: Some(entry.arn.clone()),
+                            component_name: Some(entry.component_name.clone()),
+                            component_version: Some(entry.component_version.clone()),
+                            recipe: Some(entry.recipe.clone()),
+                            vendor_guidance: status.vendor_guidance,
+                            message: status.vendor_guidance_message,
+                        }
+                    })
+            };
+
+            let Some(version) = picked else {
+                return Err(no_candidate(name, candidate, requirements.len()));
+            };
+            resolved.push(version);
+
+            // Yield between candidates, with the lock released, so a timeout or a
+            // cancellation has somewhere to land in a request that carries many of
+            // them.
+            ::tokio::task::yield_now().await;
+        }
+
+        Ok(ResolveComponentCandidatesOutput {
+            resolved_component_versions: Some(resolved),
+        })
     }
+}
+
+/// Whether `version` satisfies every requirement in `requirements`, and the version the
+/// candidate names when it states no requirement at all.
+///
+/// A candidate with no requirements and no version of its own is satisfied by any
+/// published version, which leaves the greatest one resolved — the version a core
+/// device gets when nothing constrains it.
+fn satisfies(
+    version: &str,
+    requirements: &[::semver::VersionReq],
+    candidate_version: Option<&str>,
+) -> bool {
+    if requirements.is_empty() {
+        return candidate_version.is_none_or(|named| named == version);
+    }
+    // A version the recipe reference's own semantic-version rule does not admit cannot
+    // be matched against a requirement, so it resolves only where nothing is required.
+    let Ok(parsed) = ::semver::Version::parse(version) else {
+        return false;
+    };
+    requirements
+        .iter()
+        .all(|requirement| requirement.matches(&parsed))
+}
+
+/// Whether a stored component version runs on the platform a request names: its
+/// friendly `name`, if it carries one, and the attributes it reports.
+///
+/// A recipe's manifest applies to a core device when every platform attribute the
+/// manifest names is the one the device reports (the component recipe reference's
+/// platform-matching rule), so a version supports the platform when ANY of its
+/// manifests' platforms does. A version whose recipe declares no platform at all is
+/// platform-independent and supports every device; a request that names no platform
+/// constrains nothing.
+///
+/// `requested` is borrowed rather than built here: it is the caller's own map, read once
+/// per request instead of once per stored version.
+fn supports_platform(
+    entry: &crate::state::ComponentVersionEntry,
+    requested_name: Option<&str>,
+    requested: &::std::collections::HashMap<String, String>,
+) -> bool {
+    if entry.platforms.is_empty() || (requested.is_empty() && requested_name.is_none()) {
+        return true;
+    }
+    entry.platforms.iter().any(|declared| {
+        // A manifest that names the platform by its friendly name alone is matched on
+        // that name, which is how a recipe names a platform it gives no attributes.
+        let named = match (declared.name.as_deref(), requested_name) {
+            (Some(declared_name), Some(requested_name)) => declared_name == requested_name,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        named
+            && declared
+                .attributes
+                .iter()
+                .flatten()
+                .all(|(key, value)| requested.get(key) == Some(value))
+    })
+}
+
+/// The modelled failure for a candidate nothing in the catalog resolves to.
+///
+/// With requirements stated, this is the conflict the operation documents (no published
+/// version satisfies them all); with none, the component itself is absent, which is a
+/// missing resource.
+fn no_candidate(
+    name: &str,
+    candidate: &ComponentCandidate,
+    requirement_count: usize,
+) -> ResolveComponentCandidatesError {
+    let version = candidate.component_version.clone().unwrap_or_default();
+    let resource_id = if version.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}:{version}")
+    };
+    if requirement_count == 0 {
+        return ResolveComponentCandidatesErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: format!(
+                    "Component ({resource_id}) does not exist in account {}.",
+                    crate::state::account_id()
+                ),
+                resource_id,
+                resource_type: "COMPONENT_VERSION".to_string(),
+            },
+        )
+        .into();
+    }
+    ResolveComponentCandidatesErrorModeled::ConflictException(ConflictException {
+        message: format!(
+            "No published version of component {name} satisfies the version requirements \
+             of this deployment."
+        ),
+        resource_id,
+        resource_type: "COMPONENT_VERSION".to_string(),
+    })
+    .into()
 }

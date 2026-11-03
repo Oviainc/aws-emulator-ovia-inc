@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/component_publish_and_deploy.rs"]
 mod component_publish_and_deploy;
+#[path = "all/component_versions_and_resolution.rs"]
+mod component_versions_and_resolution;
 #[path = "all/shared_endpoint_routing.rs"]
 mod shared_endpoint_routing;
 #[path = "all/state_roundtrip.rs"]

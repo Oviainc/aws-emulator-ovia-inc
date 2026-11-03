@@ -166,6 +166,13 @@
 //! instance of that shape, and their shared signing name is not even their endpoint
 //! prefix, so they are told apart by [`chime_family`] instead.
 //!
+//! The two IoT Greengrass API versions are that shape taken to its limit: one endpoint,
+//! one signing name, one `arnNamespace`, and the SAME two first path segments for every
+//! route either of them binds. [`greengrass::claims_request`] is the rule there — the
+//! whole modelled route, narrowed for the eight routes the two models bind IDENTICALLY:
+//! the account- and thing-level facts both versions publish go to one declared owner, and
+//! a tagging request to the version that owns the resource its ARN names.
+//!
 //! The four `lambda`-signing services are the other instance of that shape: the Lambda
 //! control plane, Lambda Core, Lambda Web and Lambda MicroVMs each bind their own dated
 //! URI prefixes, so the first segment separates all of them EXCEPT the tagging space

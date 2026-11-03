@@ -171,9 +171,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         let Some(entry) = store.component_version(&input.arn) else {
+            // Greengrass words this operation's absent-version answer as the component
+            // it could not find in the account the request is authorized for, so the
+            // name and the version come out of the ARN the caller submitted and the
+            // account out of this emulator's own.
+            let (name, version) = st::parse_component_version_arn(&input.arn)
+                .unwrap_or_else(|| (input.arn.clone(), String::new()));
             return Err(DescribeComponentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("The component version {} does not exist.", input.arn),
+                    message: format!(
+                        "Component ({name}:{version}) does not exist in account {}.",
+                        st::account_id()
+                    ),
                     resource_id: input.arn.clone(),
                     resource_type: "COMPONENT_VERSION".to_string(),
                 },

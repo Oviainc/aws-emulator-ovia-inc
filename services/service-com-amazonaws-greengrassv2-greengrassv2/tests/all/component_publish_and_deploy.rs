@@ -410,13 +410,14 @@ async fn a_created_component_version_reads_back_exactly_as_it_was_published() {
                 case.label
             );
         }
-        if case.tags.is_empty() {
-            assert!(
-                tags.is_null(),
-                "case {:?}: an untagged component reports no tags, got {tags}",
-                case.label
-            );
-        }
+        // A component with no tags reports the EMPTY map, not an absent member, so a
+        // client reading `tags` always finds one.
+        assert_eq!(
+            tags.as_object().map(serde_json::Map::len),
+            Some(case.tags.len()),
+            "case {:?}: the tag map must hold exactly the submitted tags, got {tags}",
+            case.label
+        );
     }
 }
 

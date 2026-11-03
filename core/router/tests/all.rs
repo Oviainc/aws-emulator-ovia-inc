@@ -25,6 +25,11 @@ mod cloudformation_refuses_s3vectors_vector_buckets;
 #[path = "all/sagemaker_create_admission.rs"]
 mod sagemaker_create_admission;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `g…` span (beside the other greengrass/glue suites) are both regions
+// concurrently landing suites add their line to.
+#[path = "all/greengrass_signing_name_routing.rs"]
+mod greengrass_signing_name_routing;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions
 // concurrently landing suites add their line to.
 #[path = "all/cloudformation_deployed_domain_index_lifecycle.rs"]

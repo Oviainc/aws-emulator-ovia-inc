@@ -120,3 +120,51 @@ Model citation: smithy_query service_info on services/service-com-amazonaws-gree
 3. Replay the same fixture's task#2..task#5 for the ConflictException/ResourceNotFoundException paths of CreateComponentVersion, DescribeComponent, GetComponent and DeleteComponent.
 4. Replay greengrassv2-component-resolution-and-artifact#task#2 (ResolveComponentCandidates, expected 403 AccessDeniedException) and greengrassv2-component-version-lifecycle#task#4 / #task#5 (ListComponentVersions / ListComponents, expected 200).
 5. Observe every step returns 500 with content-type application/x-amz-json-1.1 and errortype AmbiguousService. All 8 causes must route and answer with their modeled status/code/shape before this issue is closed.
+
+## Resolution
+
+The dispatch layer all eight causes shared is FIXED, and so are the eight causes' own
+answers. Two parts of two recorded instances are DECLINED and recorded here so a later
+sweep does not have to re-derive them.
+
+- The claim rule — a service whose signing name is shared claims only the requests its
+  OWN model binds a route for, and a route BOTH models bind goes to the single claimant
+  a declared table names (the account- and thing-level facts both versions publish to one
+  owner, a tagging request to the version that owns the resource its ARN names) — lives in
+  `services/common/src/greengrass.rs` and is read by both crates' `can_handle`. That
+  module landed on mainline from the sibling connectivity-info/service-role issue while
+  this fix was in review; this fix was written against its own copy of the same rule and
+  was MERGED onto it, so the rule is stated once.
+  `core/router/tests/all/greengrass_signing_name_routing.rs` pins exactly one claimant for
+  every Greengrass route with BOTH services mounted together — the configuration
+  `core/router` ships, and the only one in which a two-claimant row is observable — and
+  that the claimant then answers from its own state.
+- `ListComponentVersions` (cause 7) and `ResolveComponentCandidates` (cause 6) are
+  implemented; `CloudComponentStatus` now carries `message`/`errors`/
+  `vendorGuidanceMessage`, an untagged resource reports the empty tag map, and
+  `CreateComponentVersion`/`DescribeComponent`/`GetComponent`/`DeleteComponent` word
+  their conflict and not-found answers as Greengrass words them. Covered by
+  `services/service-com-amazonaws-greengrassv2-greengrassv2/tests/all/component_versions_and_resolution.rs`.
+- DECLINED, `greengrass|ResolveComponentCandidates|…|{status,$headers.x-amzn-errortype,$.Message}`:
+  the recorded 403 carries its detail in `Message`, while this service's modelled
+  `AccessDeniedException` member is `message` — so that answer came from AWS's
+  authorization layer failing to name a service/operation pair for the recording
+  principal, not from the modelled service. The same message was declined for the same
+  reason in `20261022T192333Z-m2-returns-wrong-http-status-and-error-type.md`. The
+  recorded request also names a component version the fixture never published, so the
+  modelled answer for it is the 404 this emulator now gives, and the operation itself
+  resolves candidates out of the published catalog.
+- DECLINED, the `[state]` variable of cause 2's conflict message: its fixed text is now
+  AWS's exactly — `Component [<name> : <version>] for account [<account>] already exists
+  with state: [<state>]`, read off the RECORDED response body, which brackets the account
+  as well as the component and the state (the prose paraphrase in cause 2 above dropped
+  the brackets around the account; where the two disagree the recording governs). The
+  state token is read from this emulator's state. The recording shows `DEPLOYABLE`
+  because AWS's recipe validation had completed before the duplicate create arrived; the
+  emulator owes that transition over a non-zero validation span, so a duplicate create
+  issued immediately after the publish sees `REQUESTED`. No non-zero span matches that
+  recording (a 5 ms span was tried).
+- Still open, and NOT causes of this issue: `GetComponent` re-renders a stored recipe
+  into the other format with its object keys sorted rather than in document order, and
+  `DescribeComponent` reports `componentState REQUESTED` for a version read inside the
+  validation span.
