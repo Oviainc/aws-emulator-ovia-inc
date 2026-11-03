@@ -23,6 +23,10 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes the opaque `nextToken` ListInvestigationGroups hands out.
 hex = { workspace = true }
+# `iam_role`: the shared reading of a caller-supplied IAM role ARN and of what this
+# account's IAM answers about it, for the `roleArn` an investigation group runs as;
+# `iam_client` under it is the in-process hop that asks IAM.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -30,6 +34,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The role-resolution suite mounts IAM beside this service on one engine and creates the
+# roles it resolves through IAM's own wire, so the records read are the ones `CreateRole`
+# wrote.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true

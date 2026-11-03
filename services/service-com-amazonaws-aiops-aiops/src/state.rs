@@ -1321,6 +1321,74 @@ pub fn write_configuration_rejection(
         .or_else(|| collection_bounds_rejection(tag_key_boundaries, chatbot_notification_channel))
 }
 
+/// The service principal a group's `roleArn` has to let assume the role.
+///
+/// This service's OWN principal, which the model states: the service shape's
+/// `aws.api#service` trait carries `cloudTrailEventSource` `aiops.amazonaws.com`
+/// (`smithy_query(query="service_info")`) — the identity this service acts under when it
+/// assumes a caller-supplied role.
+pub const SERVICE_PRINCIPAL: &str = "aiops.amazonaws.com";
+
+/// The sentence a write naming a role this service could not act as is refused with.
+///
+/// Recorded behavior: a `CreateInvestigationGroup` whose `roleArn` names a role the
+/// service cannot assume is answered 400 `ValidationException` with this text. It states
+/// both halves of what the caller has to fix — the role has to exist and it has to be
+/// configured for this service — and, like every other 4xx this service words, it carries
+/// nothing the request sent.
+///
+/// It is NOT worded through [`validation_message`]: that envelope states which MEMBER
+/// violated which CONSTRAINT, and this refusal is not a constraint violation — the value
+/// satisfies every constraint the model declares for it, and what failed is the
+/// RESOLUTION of the role it names.
+pub const ROLE_NOT_ASSUMABLE: &str = "The InvestigationGroup could not assume the role \
+     associated with the specified account. Please validate that the role exists and is \
+     configured correctly.";
+
+/// Why the `roleArn` a write would store names a role this service could not act as, or
+/// `None` when nothing shows it could not.
+///
+/// An investigation group gathers investigation data AS this role (`roleArn`: "Specify
+/// the ARN of the IAM role that CloudWatch investigations will use when it gathers
+/// investigation data"), so the role is resolved BEFORE anything is persisted and a role
+/// the service could not assume is refused with the operation's modelled
+/// `ValidationException` ([`ROLE_NOT_ASSUMABLE`]) rather than stored on a group that
+/// could not work. ONE function for every operation that writes the member — the create
+/// and the update — so the two cannot judge the same value differently.
+///
+/// The value is unusable in either of two ways:
+///
+/// * it names no IAM role of THIS account at all
+///   ([`::service_common::iam_role::role_name`], the tree's one reading of an IAM ARN).
+///   The modelled constraints on the member (`@length 20..2048`, `^arn:.*$`) admit any
+///   ARN, so the boundary walk passes a bucket, a user or another account's role through,
+///   and none of those is a role this account's service could assume for this account's
+///   group — a fact about the VALUE, which needs no record to settle, exactly as
+///   `::service_common::iam_role::role_pass_is_unauthorized` settles it;
+/// * this account's IAM ANSWERED that the role is one this service cannot assume: it
+///   holds no role under that name, or the trust policy the role carries does not grant
+///   [`SERVICE_PRINCIPAL`] `sts:AssumeRole`. That whole question is the ONE reading every
+///   emulated service that resolves a caller-supplied execution role shares
+///   ([`::service_common::iam_role::role_is_unassumable`]), so this crate states only
+///   WHICH principal has to be admitted and WHICH operations ask.
+///
+/// IAM is reached the way any emulated service reaches another: the AWS SDK over the
+/// emulator's OWN in-process callback, so nothing here opens a socket. Everything that is
+/// not one of the two answers above is accepted — an emulator with no IAM mounted to ask
+/// included — because a refusal grounded in a record has to be grounded in what IAM
+/// actually said. Awaited with NO store guard held.
+pub async fn role_arn_rejection(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> Option<String> {
+    let names_a_role_of_this_account = ::service_common::iam_role::role_name(role_arn).is_some();
+    let unassumable = !names_a_role_of_this_account
+        || ::service_common::iam_role::role_is_unassumable(ctx, region, role_arn, SERVICE_PRINCIPAL)
+            .await;
+    unassumable.then(|| ROLE_NOT_ASSUMABLE.to_string())
+}
+
 /// Why a resource policy document is unacceptable, or `None` when it is one this
 /// service will attach.
 ///

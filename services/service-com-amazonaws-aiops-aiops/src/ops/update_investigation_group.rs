@@ -5,6 +5,11 @@
 //! request carries replaces the stored one, every member it omits is left alone, and
 //! `lastModifiedBy`/`lastModifiedAt` record the change.
 //!
+//! A request that REPLACES the group's `roleArn` is held to the same role resolution the
+//! create is — the group gathers its data as that role — so a replacement this service
+//! could not assume is refused with the modelled `ValidationException` and the stored
+//! group keeps the role it had ([`crate::state::role_arn_rejection`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -217,6 +222,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // groups of the Region it was signed for, so another Region's group is absent
         // here and cannot be updated through it.
         let region = crate::state::request_region(ctx.parts());
+
+        // The group is resolved FIRST, under its own guard, so an update addressed at a
+        // group this Region does not hold is still the modelled 404 it has always been;
+        // the role resolution below asks this emulator's own IAM over its in-process
+        // callback and so runs with NO guard held. The resolution is made again under the
+        // guard that writes, because the group can have been deleted in between.
+        if state.lock().group(&input.identifier, &region).is_none() {
+            return Err(
+                UpdateInvestigationGroupErrorModeled::ResourceNotFoundException(
+                    crate::state::investigation_group_not_found(),
+                )
+                .into(),
+            );
+        }
+
+        // A group gathers its data AS the role `roleArn` names, so a request that
+        // REPLACES that role is held to the same resolution the create is: a role this
+        // service could not assume backs no investigation, so it is refused with the
+        // modelled `ValidationException` and nothing is written
+        // (`crate::state::role_arn_rejection`). A request naming no role keeps the stored
+        // one, which the write that stored it already resolved.
+        if let Some(role_arn) = input.role_arn.as_deref() {
+            if let Some(why) = crate::state::role_arn_rejection(ctx, &region, role_arn).await {
+                return Err(UpdateInvestigationGroupErrorModeled::ValidationException(
+                    ValidationException { message: Some(why) },
+                )
+                .into());
+            }
+        }
 
         let mut store = state.lock();
         let group = store.group_mut(&input.identifier, &region).ok_or_else(|| {

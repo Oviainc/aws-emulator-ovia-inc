@@ -27,6 +27,8 @@ mod investigation_group_identifier_forms;
 mod investigation_group_name_identity;
 #[path = "all/investigation_group_policy_delete.rs"]
 mod investigation_group_policy_delete;
+#[path = "all/investigation_group_role_resolution.rs"]
+mod investigation_group_role_resolution;
 #[path = "all/investigation_group_singleton.rs"]
 mod investigation_group_singleton;
 #[path = "all/investigation_groups.rs"]

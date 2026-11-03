@@ -16,6 +16,11 @@
 //! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace or a map past
 //! [`crate::state::MAX_TAGS`], before any group is minted.
 //!
+//! A group gathers its investigation data AS the role `roleArn` names, so that role is
+//! resolved against this account's own IAM before anything is stored and a role this
+//! service could not assume is refused with the modelled `ValidationException`
+//! ([`crate::state::role_arn_rejection`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -222,7 +227,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // are applied below. The `tags` and `chatbotNotificationChannel` maps and the
         // `tagKeyBoundaries` list carry NO modelled length, so their bounds are checked
         // here, and so is the one rule the model cannot express about a cross-account
-        // source role.
+        // source role. The `roleArn` the group would RUN AS is resolved below: the model
+        // can express its form, not whether the role exists and admits this service.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateInvestigationGroupErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the investigation group store is unavailable".to_string()),
@@ -260,6 +266,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An investigation group gathers its data AS the role `roleArn` names, so the
+        // role is RESOLVED — against this account's own IAM, over the emulator's
+        // in-process callback — before any group is minted: a role this service could
+        // not assume backs no investigation at all, so the create is refused with this
+        // operation's modelled `ValidationException` and nothing is persisted. The whole
+        // rule, and which answers ground a refusal, live in
+        // `crate::state::role_arn_rejection`, which the update path applies to a
+        // replacement role too. Awaited before the store is locked.
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(why) = crate::state::role_arn_rejection(ctx, &region, &input.role_arn).await {
+            return Err(CreateInvestigationGroupErrorModeled::ValidationException(
+                ValidationException { message: Some(why) },
+            )
+            .into());
+        }
+
         // The `tags` map is a tag write, so the rules a tag write follows apply to it:
         // a key in the reserved `aws:` namespace is Amazon Web Services' own and a
         // caller may not create one, and the set is bounded by the published
@@ -282,7 +304,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let parts = ctx.parts();
-        let region = crate::state::request_region(parts);
         let principal = crate::state::caller_principal(parts);
         let created_at = crate::state::now_epoch_seconds();
 
