@@ -2,20 +2,20 @@
 
 //! The preference members the service applies to EVERY resource type.
 //!
-//! `PutRecommendationPreferences` refuses a preference member for a resource type only
-//! where that member's own documentation restricts it ("This preference can only be set
-//! for …"); a member whose documentation restricts nothing is accepted and stored for every
-//! `ResourceType` the model's enum admits. Three members are of that kind:
+//! `PutRecommendationPreferences` refuses a preference for a resource type only where that
+//! preference is restricted to a subset of them; a preference the service restricts nowhere
+//! is accepted and stored for every `ResourceType` the model's enum admits. Two members are
+//! of that kind:
 //!
 //! * `savingsEstimationMode` — every resource type's own effective-preferences shape in the
 //!   model (`EffectiveRecommendationPreferences`, `EBSEffectiveRecommendationPreferences`,
 //!   `ECSEffectiveRecommendationPreferences`, `LambdaEffectiveRecommendationPreferences`,
 //!   `RDSEffectiveRecommendationPreferences`) carries it, so the preference applies wherever
 //!   a recommendation is generated;
-//! * `enhancedInfrastructureMetrics` and `inferredWorkloadTypes` — status switches whose
-//!   documentation describes only what Active and Inactive do ("Specify the Active status to
-//!   activate the preference, or specify Inactive to deactivate the preference") and names
-//!   no resource type.
+//! * `inferredWorkloadTypes` — a status switch whose documentation describes only what Active
+//!   and Inactive do ("Specify the Active status to activate the preference, or specify
+//!   Inactive to deactivate the preference"), which names no resource type, and whose refusal
+//!   points at none either.
 //!
 //! The tables below therefore walk the whole `ResourceType` enum rather than the one
 //! resource type a recording happened to use, and each preference round-trips through
@@ -198,38 +198,37 @@ async fn preferences_are_keyed_by_resource_type_and_scope() {
     );
 }
 
-/// Each status switch, at each `EnhancedInfrastructureMetrics` /
-/// `InferredWorkloadTypesPreference` value (the model's enums: Active | Inactive), is
-/// accepted for EVERY `ResourceType` the enum admits — neither member's documentation names
-/// a resource type — and the status written is what the matching read reports back.
+/// The unrestricted status switch, at each `InferredWorkloadTypesPreference` value (the
+/// model's enum: Active | Inactive), is accepted for EVERY `ResourceType` the enum admits —
+/// nothing restricts it to any of them — and the status written is what the matching read
+/// reports back.
 #[tokio::test]
 async fn a_status_switch_preference_is_settable_for_every_resource_type() {
-    for member in ["enhancedInfrastructureMetrics", "inferredWorkloadTypes"] {
-        for status_value in ["Active", "Inactive"] {
-            for resource_type in RESOURCE_TYPES {
-                let scope = scope_for(resource_type);
-                let case = format!("{member}={status_value} on {resource_type}");
+    let member = "inferredWorkloadTypes";
+    for status_value in ["Active", "Inactive"] {
+        for resource_type in RESOURCE_TYPES {
+            let scope = scope_for(resource_type);
+            let case = format!("{member}={status_value} on {resource_type}");
 
-                // A fresh emulator per row: what the read reports is this row's write.
-                let router = emulator();
-                opt_in(&router).await;
+            // A fresh emulator per row: what the read reports is this row's write.
+            let router = emulator();
+            opt_in(&router).await;
 
-                let mut request = json!({"resourceType": resource_type, "scope": scope});
-                request[member] = json!(status_value);
-                // `put_preference` asserts HTTP 200 and the modelled empty output body.
-                put_preference(&router, &request).await;
+            let mut request = json!({"resourceType": resource_type, "scope": scope});
+            request[member] = json!(status_value);
+            // `put_preference` asserts HTTP 200 and the modelled empty output body.
+            put_preference(&router, &request).await;
 
-                let read = get_preferences(&router, resource_type, Some(&scope)).await;
-                assert_eq!(
-                    read["recommendationPreferencesDetails"],
-                    json!([{
-                        "scope": scope,
-                        "resourceType": resource_type,
-                        member: status_value,
-                    }]),
-                    "case {case:?}: expected the written preference read back, got {read}"
-                );
-            }
+            let read = get_preferences(&router, resource_type, Some(&scope)).await;
+            assert_eq!(
+                read["recommendationPreferencesDetails"],
+                json!([{
+                    "scope": scope,
+                    "resourceType": resource_type,
+                    member: status_value,
+                }]),
+                "case {case:?}: expected the written preference read back, got {read}"
+            );
         }
     }
 }

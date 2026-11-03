@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Which `ResourceType` each recommendation preference may be SET for.
+//! Which `ResourceType` each recommendation preference may be SET for, and how a request for
+//! any other one is refused.
 //!
 //! One rule, asserted over the whole cross product rather than the one resource type a
-//! recording happened to use: `PutRecommendationPreferences` stores a preference member
-//! only for the resource types the member's own documentation restricts it to, and refuses
-//! it for every other `ResourceType` the model's enum admits with
-//! `InvalidParameterValueException` (HTTP 400), storing nothing — so a refused request
-//! leaves `GetRecommendationPreferences` reporting no record.
+//! recording happened to use: `PutRecommendationPreferences` stores a preference only for the
+//! resource types that preference applies to, and refuses it for every other `ResourceType`
+//! the model's enum admits with `InvalidParameterValueException` (HTTP 400) and the service's
+//! own sentence for that preference, storing nothing — so a refused request leaves
+//! `GetRecommendationPreferences` reporting no record.
 //!
-//! The supported set of each member is stated once, in [`members`], with the source of
-//! each list on its row. A member whose documentation restricts NOTHING is settable for
-//! every resource type and is asserted in
-//! `tests/all/unrestricted_preference_resource_types.rs`.
+//! The supported set of each preference, and the sentence its refusal carries, are stated
+//! once, in [`members`], with the source of each list on its row. A preference that applies to
+//! every resource type is asserted in
+//! `tests/all/unrestricted_preference_resource_types.rs`; that the refusal below is worded the
+//! same whatever ELSE the request carries is asserted in
+//! `tests/all/preference_support_refusal_wording.rs`, and the instance-ARN refusal of the
+//! recommendation readers in `tests/all/instance_arn_refusal_wording.rs`.
 //!
 //! Every call goes through the shared wire harness (`tests/all/harness.rs`), i.e. the same
 //! `MultiServiceRouter::dispatch` the emulator's front door uses.
@@ -20,43 +24,60 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    call, emulator, error_code, get_preferences, opt_in, scope_for, RESOURCE_TYPES,
+    call, emulator, error_code, get_preferences, opt_in, scope_for, ANALYSED_PER_RESOURCE_TYPES,
+    RESOURCE_TYPES,
 };
 
-/// The resource types a preference the service analyses per resource may be set for, from
-/// `PutRecommendationPreferences$lookBackPeriod`: "You can only set this preference for the
-/// Amazon EC2 instance, Auto Scaling group, Amazon EBS volume, Amazon ECS service on
-/// Fargate, Amazon RDS DB instance, and Aurora DB cluster storage resource types" —
-/// `preferredResources` documents the same six.
-const ANALYSED_PER_RESOURCE: &[&str] = &[
-    "Ec2Instance",
-    "AutoScalingGroup",
-    "EbsVolume",
-    "EcsService",
-    "RdsDBInstance",
-    "AuroraDBClusterStorage",
-];
+/// The generic wording this service must never answer: a refusal built from a member name and
+/// the value the request carried. Asserted absent on every refused row, so a refusal that
+/// falls back to a parameter template fails whatever its remaining text says.
+const GENERIC_PARAMETER_PREFIX: &str = "The value supplied for parameter";
 
-/// One row per preference member of this operation whose documentation RESTRICTS the
-/// resource types it may be set for: the member, a value from its modelled shape, and the
-/// `ResourceType` values it may be set for.
+/// One row per preference member of this operation whose resource types are RESTRICTED: the
+/// member, a value from its modelled shape, the `ResourceType` values it may be set for, and
+/// the sentence a request that sets it for any OTHER resource type is refused with.
 ///
 /// * `externalMetricsPreference` — "This preference can only be set for the Ec2Instance
 ///   resource type."
 /// * `utilizationPreferences` — "You can only set CPU and memory utilization preferences
 ///   for the Amazon EC2 instance resource type."
 /// * `lookBackPeriod` / `preferredResources` — the six analysed-per-resource types.
+/// * `enhancedInfrastructureMetrics` — the member's own documentation enumerates none, so the
+///   model's effective-preferences shapes do: `EffectiveRecommendationPreferences` (an
+///   instance or Auto Scaling group recommendation) and `RDSEffectiveRecommendationPreferences`
+///   (an Amazon Aurora and RDS database recommendation, DB instance and storage together) are
+///   the shapes that carry it. Its sentence advises only the two compute types, which is
+///   narrower than what it accepts — so the rows assert the sentence as the service words it,
+///   not as the supported set reads.
 ///
-/// The members whose documentation restricts nothing — `savingsEstimationMode` and the two
-/// status switches `enhancedInfrastructureMetrics` and `inferredWorkloadTypes` — are
-/// asserted over the whole enum in
+/// Each sentence names the preference by its `RecommendationPreferenceName` — the model's own
+/// name for a recommendation preference — and the resource types it advises, and nothing else:
+/// no member name and no value from the request.
+///
+/// The preferences that apply to every resource type — `savingsEstimationMode` and the status
+/// switch `inferredWorkloadTypes` — are asserted over the whole enum in
 /// `tests/all/unrestricted_preference_resource_types.rs`.
-fn members() -> Vec<(&'static str, Value, &'static [&'static str])> {
+pub(crate) fn members() -> Vec<(&'static str, Value, &'static [&'static str], &'static str)> {
     vec![
+        (
+            "enhancedInfrastructureMetrics",
+            json!("Active"),
+            &[
+                "Ec2Instance",
+                "AutoScalingGroup",
+                "RdsDBInstance",
+                "AuroraDBClusterStorage",
+            ],
+            "The specified resource type is not valid for \"EnhancedInfrastructureMetrics\" \
+             preference. Specify \"Ec2Instance\" or \"AutoScalingGroup\" in your request and \
+             try again.",
+        ),
         (
             "externalMetricsPreference",
             json!({"source": "Datadog"}),
             &["Ec2Instance"],
+            "The specified resource type is not valid for \"ExternalMetricsPreference\" \
+             preference. Specify \"Ec2Instance\" in your request and try again.",
         ),
         (
             "utilizationPreferences",
@@ -65,12 +86,25 @@ fn members() -> Vec<(&'static str, Value, &'static [&'static str])> {
                 "metricParameters": {"threshold": "P95", "headroom": "PERCENT_20"},
             }]),
             &["Ec2Instance"],
+            "The specified resource type is not valid for \"UtilizationPreferences\" \
+             preference. Specify \"Ec2Instance\" in your request and try again.",
         ),
-        ("lookBackPeriod", json!("DAYS_93"), ANALYSED_PER_RESOURCE),
+        (
+            "lookBackPeriod",
+            json!("DAYS_93"),
+            ANALYSED_PER_RESOURCE_TYPES,
+            "The specified resource type is not valid for \"LookBackPeriodPreference\" \
+             preference. Specify \"Ec2Instance\", \"AutoScalingGroup\", \"EbsVolume\", \
+             \"EcsService\", \"RdsDBInstance\", or \"AuroraDBClusterStorage\" in your request \
+             and try again.",
+        ),
         (
             "preferredResources",
             json!([{"name": "Ec2InstanceTypes", "includeList": ["m5.large"]}]),
-            ANALYSED_PER_RESOURCE,
+            ANALYSED_PER_RESOURCE_TYPES,
+            "The specified resource type is not valid for \"PreferredResources\" preference. \
+             Specify \"Ec2Instance\", \"AutoScalingGroup\", \"EbsVolume\", \"EcsService\", \
+             \"RdsDBInstance\", or \"AuroraDBClusterStorage\" in your request and try again.",
         ),
     ]
 }
@@ -80,7 +114,7 @@ fn members() -> Vec<(&'static str, Value, &'static [&'static str])> {
 /// nowhere where it does not.
 #[tokio::test]
 async fn every_preference_member_is_settable_exactly_where_its_resource_types_allow() {
-    for (member, value, supported) in members() {
+    for (member, value, supported, expected) in members() {
         for resource_type in RESOURCE_TYPES {
             let scope = scope_for(resource_type);
             let case = format!("{member}={value} on {resource_type}");
@@ -112,10 +146,20 @@ async fn every_preference_member_is_settable_exactly_where_its_resource_types_al
                     "case {case:?}: expected InvalidParameterValueException, got {body}"
                 );
                 let message = body["message"].as_str().unwrap_or_default();
+                assert_eq!(
+                    message, expected,
+                    "case {case:?}: expected the service's sentence {expected:?}, got \
+                     {message:?}"
+                );
                 assert!(
-                    message.contains(member) && message.contains(resource_type),
-                    "case {case:?}: the refusal must name the preference and the resource \
-                     type, got {body}"
+                    !message.contains(GENERIC_PARAMETER_PREFIX),
+                    "case {case:?}: the refusal must not be built from a parameter template, \
+                     got {message:?}"
+                );
+                assert!(
+                    !message.contains(member) && !message.contains(resource_type),
+                    "case {case:?}: that sentence names neither the member the preference \
+                     arrived on nor the rejected resource type, got {body}"
                 );
                 assert!(
                     details.is_empty(),

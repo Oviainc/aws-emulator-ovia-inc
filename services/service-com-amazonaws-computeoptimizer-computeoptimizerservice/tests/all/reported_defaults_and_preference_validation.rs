@@ -292,11 +292,14 @@ async fn put_refuses_a_preference_the_resource_type_does_not_support_and_stores_
 
     // (case, accepted, the member the row sets, the request)
     let rows: Vec<(&str, bool, &str, Value)> = vec![
-        // `enhancedInfrastructureMetrics` and `inferredWorkloadTypes` are status switches
-        // whose documentation states no resource-type restriction, so the service accepts
-        // them for every `ResourceType` — see
+        // `inferredWorkloadTypes` is a status switch whose documentation states no
+        // resource-type restriction and whose refusal names none, so the service accepts
+        // it for every `ResourceType` — see
         // `a_status_switch_preference_is_settable_for_every_resource_type` in
         // `tests/all/unrestricted_preference_resource_types.rs` for the whole enum.
+        // `enhancedInfrastructureMetrics` is restricted to the resource types whose
+        // effective-preferences shape in the model carries it: the instance / Auto Scaling
+        // group one and the Amazon Aurora and RDS database one.
         (
             "enhanced metrics on Ec2Instance",
             true,
@@ -320,14 +323,23 @@ async fn put_refuses_a_preference_the_resource_type_does_not_support_and_stores_
             json!({"resourceType": "RdsDBInstance", "enhancedInfrastructureMetrics": "Inactive"}),
         ),
         (
-            "enhanced metrics on EbsVolume",
+            "enhanced metrics on AuroraDBClusterStorage",
             true,
+            "enhancedInfrastructureMetrics",
+            json!({
+                "resourceType": "AuroraDBClusterStorage",
+                "enhancedInfrastructureMetrics": "Active",
+            }),
+        ),
+        (
+            "enhanced metrics on EbsVolume",
+            false,
             "enhancedInfrastructureMetrics",
             json!({"resourceType": "EbsVolume", "enhancedInfrastructureMetrics": "Inactive"}),
         ),
         (
             "enhanced metrics on Idle",
-            true,
+            false,
             "enhancedInfrastructureMetrics",
             json!({"resourceType": "Idle", "enhancedInfrastructureMetrics": "Active"}),
         ),
@@ -521,9 +533,14 @@ async fn put_refuses_a_preference_the_resource_type_does_not_support_and_stores_
             );
             let message = body["message"].as_str().unwrap_or_default();
             assert!(
-                message.contains(resource_type) && message.contains(member),
-                "case {case:?}: the refusal must name the resource type and the preference, \
-                 got {body}"
+                message.starts_with("The specified resource type is not valid for "),
+                "case {case:?}: the refusal must be the service's sentence for a preference \
+                 the resource type does not support, got {body}"
+            );
+            assert!(
+                !message.contains(resource_type) && !message.contains(member),
+                "case {case:?}: that sentence names neither the rejected resource type nor \
+                 the member the preference arrived on, got {body}"
             );
             assert!(
                 details.is_empty(),

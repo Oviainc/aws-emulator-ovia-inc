@@ -429,6 +429,22 @@ pub(crate) async fn put_preference(router: &MultiServiceRouter, request: &Value)
 /// RdsDBInstance).
 pub(crate) const RESOURCE_TYPES: &[&str] = RESOURCE_TYPE_VALUES;
 
+/// The `ResourceType` values whose recommendations this service analyses per resource, which
+/// `PutRecommendationPreferences$lookBackPeriod` enumerates: "You can only set this preference
+/// for the Amazon EC2 instance, Auto Scaling group, Amazon EBS volume, Amazon ECS service on
+/// Fargate, Amazon RDS DB instance, and Aurora DB cluster storage resource types" —
+/// `preferredResources` documents the same six, in the order the service's refusal lists them.
+/// Stated once here so no suite that asserts a preference's resource types can drift from
+/// another on them.
+pub(crate) const ANALYSED_PER_RESOURCE_TYPES: &[&str] = &[
+    "Ec2Instance",
+    "AutoScalingGroup",
+    "EbsVolume",
+    "EcsService",
+    "RdsDBInstance",
+    "AuroraDBClusterStorage",
+];
+
 /// The scope a preference for `resource_type` may be written at.
 ///
 /// An Auto Scaling group preference "can only be set at the resource level by specifying a

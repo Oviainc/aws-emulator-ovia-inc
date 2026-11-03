@@ -330,50 +330,60 @@ fn request_rejection(input: &PutRecommendationPreferencesInput) -> Option<String
         return Some(crate::state::AUTO_SCALING_GROUP_SCOPE_MESSAGE.to_string());
     }
 
-    // Each preference member is settable only for the `ResourceType` values the member's
-    // own documentation RESTRICTS it to ("This preference can only be set for …", "You can
-    // only set this preference for …"), and a request that sets it for any other resource
-    // type is refused. One table so no member's restriction can drift from another's; a
-    // member whose documentation states no restriction is absent from the table and so
-    // accepted for every resource type the `ResourceType` enum admits — `savingsEstimationMode`,
-    // and the two status switches `enhancedInfrastructureMetrics` and `inferredWorkloadTypes`,
+    // Each preference is settable only for the `ResourceType` values that preference
+    // APPLIES TO — the ones the member's own documentation enumerates ("This preference can
+    // only be set for …", "You can only set this preference for …"), or, where the member
+    // enumerates none, the ones whose effective-recommendation-preferences shape in the model
+    // carries it. A request that sets a preference for any other resource type is refused
+    // with the service's own sentence for that preference ([`unsupported_resource_type`]),
+    // which points the caller at the resource types that sentence advises — the same set,
+    // except where the service words its advice more narrowly than what it accepts. One table
+    // so no preference's restriction can drift from another's, each row naming the preference
+    // as a `RecommendationPreferenceName`, the model's own name for a recommendation
+    // preference, which is how the sentence names it. A preference that applies to every
+    // resource type is absent from the table — `savingsEstimationMode`, carried by every
+    // effective-preferences shape in the model, and the status switch `inferredWorkloadTypes`,
     // whose documentation describes only the Active/Inactive semantics of the feature.
-    for (member, is_set, resource_types) in [
+    for (preference, is_set, supported, advised) in [
         (
-            "externalMetricsPreference",
+            "EnhancedInfrastructureMetrics",
+            input.enhanced_infrastructure_metrics.is_some(),
+            ENHANCED_INFRASTRUCTURE_METRICS_RESOURCE_TYPES,
+            ENHANCED_INFRASTRUCTURE_METRICS_ADVISED_RESOURCE_TYPES,
+        ),
+        (
+            "ExternalMetricsPreference",
             input.external_metrics_preference.is_some(),
+            EXTERNAL_METRICS_RESOURCE_TYPES,
             EXTERNAL_METRICS_RESOURCE_TYPES,
         ),
         (
-            "lookBackPeriod",
+            "LookBackPeriodPreference",
             input.look_back_period.is_some(),
+            PREFERENCE_AT_RESOURCE_LEVEL_RESOURCE_TYPES,
             PREFERENCE_AT_RESOURCE_LEVEL_RESOURCE_TYPES,
         ),
         (
-            "preferredResources",
+            "PreferredResources",
             input
                 .preferred_resources
                 .as_deref()
                 .is_some_and(|resources| !resources.is_empty()),
             PREFERENCE_AT_RESOURCE_LEVEL_RESOURCE_TYPES,
+            PREFERENCE_AT_RESOURCE_LEVEL_RESOURCE_TYPES,
         ),
         (
-            "utilizationPreferences",
+            "UtilizationPreferences",
             input
                 .utilization_preferences
                 .as_deref()
                 .is_some_and(|preferences| !preferences.is_empty()),
             UTILIZATION_PREFERENCES_RESOURCE_TYPES,
+            UTILIZATION_PREFERENCES_RESOURCE_TYPES,
         ),
     ] {
-        if is_set && !resource_types.contains(&input.resource_type.as_str()) {
-            return Some(format!(
-                "The value supplied for parameter resourceType is not valid: the {} resource \
-                 type does not support the {member} preference. Specify one of {} in your \
-                 request and try again.",
-                input.resource_type,
-                resource_types.join(", "),
-            ));
+        if is_set && !supported.contains(&input.resource_type.as_str()) {
+            return Some(unsupported_resource_type(preference, advised));
         }
     }
 
@@ -418,6 +428,64 @@ fn request_rejection(input: &PutRecommendationPreferencesInput) -> Option<String
 /// The `CustomizableMetricName` value whose headroom, but not threshold, is settable.
 const MEMORY_UTILIZATION: &str = "MemoryUtilization";
 
+/// What this operation answers a preference set for a `ResourceType` that preference does
+/// not apply to: the service's own constant refusal for the condition, which names the
+/// preference by its `RecommendationPreferenceName` and the resource types its advice points
+/// the caller at — and takes nothing else from the request, neither the member the preference
+/// arrived on nor the resource type that was rejected.
+fn unsupported_resource_type(preference: &str, advised: &[&str]) -> String {
+    debug_assert!(
+        !advised.is_empty(),
+        "a preference's refusal advises at least one resource type, or the sentence would \
+         advise nothing"
+    );
+    format!(
+        "The specified resource type is not valid for \"{preference}\" preference. Specify {} \
+         in your request and try again.",
+        quoted_alternatives(advised),
+    )
+}
+
+/// `values` as the sentence above lists the resource types a preference may be set for: each
+/// quoted, the last introduced by "or" — `"A"`, `"A" or "B"`, `"A", "B", or "C"`.
+fn quoted_alternatives(values: &[&str]) -> String {
+    let quoted: Vec<String> = values.iter().map(|value| format!("\"{value}\"")).collect();
+    match quoted.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, last] => format!("{first} or {last}"),
+        [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
+    }
+}
+
+/// The `ResourceType` values an `enhancedInfrastructureMetrics` preference may be set for.
+///
+/// The member's own documentation enumerates none, so the model's effective-preferences
+/// shapes are what say which resources the preference applies to: it is carried by
+/// `EffectiveRecommendationPreferences` — the effective preferences of an instance or Auto
+/// Scaling group recommendation — and by `RDSEffectiveRecommendationPreferences`, those of "an
+/// Amazon Aurora and RDS database recommendation", which reports the DB instance and its
+/// storage together; the Amazon EBS volume, Amazon ECS service and Lambda function shapes do
+/// not carry it, and the remaining resource types have no effective-preferences shape at all.
+/// That is also what the service does: it serves this preference for a database resource type
+/// and refuses it for an Amazon ECS service.
+const ENHANCED_INFRASTRUCTURE_METRICS_RESOURCE_TYPES: &[&str] = &[
+    crate::state::RESOURCE_TYPE_EC2_INSTANCE,
+    crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP,
+    crate::state::RESOURCE_TYPE_RDS_DB_INSTANCE,
+    crate::state::RESOURCE_TYPE_AURORA_DB_CLUSTER_STORAGE,
+];
+
+/// The `ResourceType` values the service's refusal for an `enhancedInfrastructureMetrics`
+/// preference points the caller at: the two compute types, which is the whole of that
+/// sentence's advice — narrower than the set above, because the preference reaches the
+/// database types through the recommendation shape they share rather than through advice the
+/// service words for them.
+const ENHANCED_INFRASTRUCTURE_METRICS_ADVISED_RESOURCE_TYPES: &[&str] = &[
+    crate::state::RESOURCE_TYPE_EC2_INSTANCE,
+    crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP,
+];
+
 /// The `ResourceType` values an `externalMetricsPreference` may be set for: "This
 /// preference can only be set for the Ec2Instance resource type."
 const EXTERNAL_METRICS_RESOURCE_TYPES: &[&str] = &[crate::state::RESOURCE_TYPE_EC2_INSTANCE];
@@ -456,6 +524,14 @@ mod tests {
     fn every_restriction_list_names_only_modelled_resource_types() {
         for (name, resource_types) in [
             (
+                "ENHANCED_INFRASTRUCTURE_METRICS_RESOURCE_TYPES",
+                super::ENHANCED_INFRASTRUCTURE_METRICS_RESOURCE_TYPES,
+            ),
+            (
+                "ENHANCED_INFRASTRUCTURE_METRICS_ADVISED_RESOURCE_TYPES",
+                super::ENHANCED_INFRASTRUCTURE_METRICS_ADVISED_RESOURCE_TYPES,
+            ),
+            (
                 "EXTERNAL_METRICS_RESOURCE_TYPES",
                 super::EXTERNAL_METRICS_RESOURCE_TYPES,
             ),
@@ -476,6 +552,46 @@ mod tests {
                     super::RESOURCE_TYPE_VALUES,
                 );
             }
+        }
+    }
+
+    /// Advice can only point at a resource type the service accepts: the types the refusal
+    /// for a preference names must be among the ones that preference may be set for, or the
+    /// sentence would send the caller to a request the service refuses in turn.
+    #[test]
+    fn the_advised_resource_types_are_ones_the_preference_may_be_set_for() {
+        for advised in super::ENHANCED_INFRASTRUCTURE_METRICS_ADVISED_RESOURCE_TYPES {
+            assert!(
+                super::ENHANCED_INFRASTRUCTURE_METRICS_RESOURCE_TYPES.contains(advised),
+                "case \"EnhancedInfrastructureMetrics\": the refusal advises {advised:?}, which \
+                 is not among the resource types it may be set for ({:?})",
+                super::ENHANCED_INFRASTRUCTURE_METRICS_RESOURCE_TYPES,
+            );
+        }
+    }
+
+    /// The resource types a preference may be set for are listed as alternatives: each
+    /// quoted, the last introduced by "or", for a list of any length.
+    #[test]
+    fn a_resource_type_list_reads_as_quoted_alternatives() {
+        for (case, values, expected) in [
+            ("one", &["Ec2Instance"][..], "\"Ec2Instance\""),
+            (
+                "two",
+                &["Ec2Instance", "AutoScalingGroup"][..],
+                "\"Ec2Instance\" or \"AutoScalingGroup\"",
+            ),
+            (
+                "three",
+                &["Ec2Instance", "EbsVolume", "EcsService"][..],
+                "\"Ec2Instance\", \"EbsVolume\", or \"EcsService\"",
+            ),
+        ] {
+            let listed = super::quoted_alternatives(values);
+            assert_eq!(
+                listed, expected,
+                "case {case:?}: expected {expected:?}, got {listed:?}"
+            );
         }
     }
 }

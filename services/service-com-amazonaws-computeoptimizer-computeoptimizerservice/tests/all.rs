@@ -61,6 +61,8 @@ mod idle_recommendations;
 mod idle_recommendations_export;
 #[path = "all/include_member_accounts.rs"]
 mod include_member_accounts;
+#[path = "all/instance_arn_refusal_wording.rs"]
+mod instance_arn_refusal_wording;
 #[path = "all/lambda_function_recommendations.rs"]
 mod lambda_function_recommendations;
 #[path = "all/lambda_function_recommendations_export.rs"]
@@ -75,6 +77,8 @@ mod organization_enrollment_statuses;
 mod preference_records_hold_a_preference;
 #[path = "all/preference_resource_type_support.rs"]
 mod preference_resource_type_support;
+#[path = "all/preference_support_refusal_wording.rs"]
+mod preference_support_refusal_wording;
 #[path = "all/rds_database_recommendation_options.rs"]
 mod rds_database_recommendation_options;
 #[path = "all/rds_database_recommendation_projected_metrics.rs"]
