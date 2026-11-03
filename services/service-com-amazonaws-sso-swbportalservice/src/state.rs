@@ -398,8 +398,11 @@ pub fn decode_cursor(scope: &str, token: &str) -> Result<String, InvalidCursor> 
 /// A `max_results` OUTSIDE the modeled `MaxResultType` range (1..100) never reaches
 /// here from the wire: the boundary validator refuses it before the handler runs, and
 /// this service words that refusal as `InvalidRequestException` (the 400 rows in
-/// `tests/all/portal_session.rs` pin it). The clamp below is therefore only a floor for
-/// a direct, non-HTTP caller, not a silent reshaping of a request a client sent.
+/// `tests/all/portal_session.rs` pin it). The clamp below is therefore only a guard for
+/// a direct, non-HTTP caller, not a silent reshaping of a request a client sent: a bound
+/// that caller NAMED is carried into the modeled range — floored at 1 below it, capped at
+/// [`MAX_PAGE_SIZE`] above it — and never folded into the "named none" case, so only the
+/// ABSENCE of a bound takes the default page.
 pub fn page_of<T>(
     sorted: impl IntoIterator<Item = (String, T)>,
     scope: &str,
@@ -410,10 +413,16 @@ pub fn page_of<T>(
         Some(token) => Some(decode_cursor(scope, token)?),
         None => None,
     };
-    let limit = max_results
-        .and_then(|requested| usize::try_from(requested).ok())
-        .unwrap_or(MAX_PAGE_SIZE)
-        .clamp(1, MAX_PAGE_SIZE);
+    let limit = match max_results {
+        // Clamped while the value is still SIGNED: `usize::try_from` fails for every
+        // negative bound, so converting first would discard the sign and leave a named
+        // bound indistinguishable from `None` — the default page, the far end of the
+        // range from the floor a too-small bound belongs at.
+        Some(requested) => usize::try_from(requested.max(1))
+            .unwrap_or(MAX_PAGE_SIZE)
+            .min(MAX_PAGE_SIZE),
+        None => MAX_PAGE_SIZE,
+    };
 
     let mut items = Vec::new();
     let mut last_key = String::new();

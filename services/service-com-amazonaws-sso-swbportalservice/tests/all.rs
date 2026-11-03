@@ -15,6 +15,8 @@
 mod bearer_token_gate;
 #[path = "all/endpoint_agnostic_routing.rs"]
 mod endpoint_agnostic_routing;
+#[path = "all/page_bound_clamp.rs"]
+mod page_bound_clamp;
 #[path = "all/page_token_spelling.rs"]
 mod page_token_spelling;
 #[path = "all/portal_session.rs"]
