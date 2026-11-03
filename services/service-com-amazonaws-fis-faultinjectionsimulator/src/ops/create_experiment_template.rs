@@ -174,6 +174,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
+        // `targets` is a member FIS requires of this REQUEST even though the model leaves
+        // it optional, so a create that omits it is refused here — and refused FIRST,
+        // because a structural requirement of the call is settled before any value the
+        // request carries is resolved against this service's catalogs or its store. A
+        // request that names the member with no entry in it has named it: an empty target
+        // map is a template that declares no target, which the rules below judge.
+        if input.targets.is_none() {
+            return Err(CreateExperimentTemplateErrorModeled::ValidationException(
+                crate::state::required_member_missing("targets"),
+            )
+            .into());
+        }
+
         // The RECORD this request builds, which is what every server-side rule below is
         // judged over — the same record `UpdateExperimentTemplate` judges once it has
         // applied its changes, so the two operations cannot disagree about which
@@ -201,6 +214,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(match refusal {
                 crate::state::TemplateRefusal::Invalid(refusal) => {
                     CreateExperimentTemplateErrorModeled::ValidationException(refusal)
+                }
+                crate::state::TemplateRefusal::NotFound(refusal) => {
+                    CreateExperimentTemplateErrorModeled::ResourceNotFoundException(refusal)
                 }
                 crate::state::TemplateRefusal::QuotaExceeded(refusal) => {
                     CreateExperimentTemplateErrorModeled::ServiceQuotaExceededException(refusal)

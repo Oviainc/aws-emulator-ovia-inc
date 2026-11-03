@@ -286,6 +286,7 @@ fn create_body(row: &Row, label: &str) -> Value {
         "description": format!("admissibility sequence: {}", row.case),
         "roleArn": ROLE_ARN,
         "stopConditions": [{ "source": "none" }],
+        "targets": {},
         "actions": { "wait": wait("PT5M") }
     });
     merge(&mut body, &row.members);
@@ -300,6 +301,7 @@ fn baseline_body(label: &str) -> Value {
         "description": format!("admissibility baseline: {label}"),
         "roleArn": ROLE_ARN,
         "stopConditions": [{ "source": "none" }],
+        "targets": {},
         "actions": { "wait": wait("PT5M") },
         "logConfiguration": {
             "logSchemaVersion": 2,

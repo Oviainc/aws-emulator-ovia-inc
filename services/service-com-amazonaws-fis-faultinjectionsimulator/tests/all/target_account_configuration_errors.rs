@@ -20,9 +20,11 @@
 //! * a target account configuration the named experiment TEMPLATE does not hold is
 //!   refused 404 `ResourceNotFoundException` with the service's constant message, which
 //!   names neither the template nor the account;
-//! * a target account configuration the named EXPERIMENT does not hold is refused 404
-//!   `ResourceNotFoundException` with a message BUILT FROM THE REQUEST: the experiment id
-//!   first, then the target account id;
+//! * an operation addressing a configuration of an EXPERIMENT resolves the PARENT first:
+//!   an `experimentId` that names no record is refused 404 `ResourceNotFoundException`
+//!   reporting the EXPERIMENT as missing, with a constant that echoes no name, and only an
+//!   experiment that resolves reports its missing CHILD configuration — that one with a
+//!   message BUILT FROM THE REQUEST: the experiment id first, then the target account id;
 //! * a `nextToken` a paginated list never issued is refused 400 `ValidationException`
 //!   with one constant message, whatever the token and whichever list it is offered to.
 //!
@@ -45,6 +47,19 @@ const ROLE_ARN_CEILING: usize = 2048;
 /// template does not hold — a constant, so neither half of the resource's name appears
 /// in it.
 const TEMPLATE_SCOPED_NOT_FOUND: &str = "TargetAccountConfiguration not found.";
+
+/// The message FIS answers for a target account configuration an EXPERIMENT that resolves
+/// does not hold: built from the request, naming the experiment and then the account.
+fn experiment_scoped_not_found(experiment_id: &str, account: &str) -> String {
+    format!(
+        "TargetAccountConfiguration for experiment {experiment_id} \
+         and target account {account} not found"
+    )
+}
+
+/// The message FIS answers for an `experimentId` that names no experiment, on an operation
+/// addressing a child of one — a constant naming the resource KIND that did not resolve.
+const EXPERIMENT_NOT_FOUND: &str = "Experiment not found.";
 
 /// The message FIS answers for a `nextToken` no call of the list issued — a constant,
 /// whatever the token and whichever list it was offered to.
@@ -152,6 +167,7 @@ fn template_body_targeting(label: &str, role_arn: &str, targeting: &str) -> Valu
         "description": format!("target account configuration refusal suite: {label}"),
         "roleArn": role_arn,
         "stopConditions": [{ "source": "none" }],
+        "targets": {},
         "experimentOptions": { "accountTargeting": targeting },
         // `aws:fis:wait` takes a required `duration` parameter (an ISO 8601 duration
         // within the documented 1 to 720 minutes), which the create refuses without.
@@ -638,7 +654,7 @@ async fn a_template_scoped_configuration_miss_answers_the_services_constant_mess
 }
 
 #[tokio::test]
-async fn an_experiment_scoped_configuration_miss_names_the_experiment_and_the_account() {
+async fn an_experiment_scoped_configuration_miss_reports_the_parent_before_the_child() {
     let router = emulator();
     let template_id = template(&router, "experiment-scoped-message").await;
     let configured_account = "707070707070";
@@ -664,26 +680,43 @@ async fn an_experiment_scoped_configuration_miss_names_the_experiment_and_the_ac
     // `@length(0..64)`.
     let unknown_experiment = "EXP000000000099";
 
-    // The rows differ along the experiment named (two distinct started experiments and an
-    // unknown id) and the account named (several, at both of `TargetAccountId`'s
-    // published bounds) — everything the request-derived message interpolates.
+    // The rows differ along which of the two names does not resolve — the PARENT experiment
+    // or the CHILD configuration — and, within each, along the experiment named (two
+    // distinct started experiments and ids of two shapes the store holds nothing for) and
+    // the account named (several, at both of `TargetAccountId`'s published bounds). The
+    // parent is resolved first, so a row whose experiment does not resolve is reported as
+    // the experiment missing, whatever account it names, and never as a configuration
+    // missing from an experiment that does not exist.
     let long_account = format!("7171717171{}", "7".repeat(38));
-    let cases: [(&str, &str, &str); 5] = [
-        ("first-experiment-unknown-account", &first, "717171717171"),
-        ("second-experiment-unknown-account", &second, "727272727272"),
+    let cases: [(&str, &str, &str, bool); 6] = [
+        ("first-experiment-unknown-account", &first, "717171717171", true),
+        ("second-experiment-unknown-account", &second, "727272727272", true),
         (
             "second-experiment-account-id-at-the-ceiling",
             &second,
             &long_account,
+            true,
         ),
         (
             "unknown-experiment-configured-account",
             unknown_experiment,
             configured_account,
+            false,
         ),
-        ("unknown-experiment-unknown-account", unknown_experiment, "737373737373"),
+        (
+            "unknown-experiment-unknown-account",
+            unknown_experiment,
+            "737373737373",
+            false,
+        ),
+        (
+            "an-id-of-the-template-collections-shape",
+            "EXT000000000001",
+            configured_account,
+            false,
+        ),
     ];
-    for (case, experiment_id, account) in cases {
+    for (case, experiment_id, account, experiment_resolves) in cases {
         let answer = get_experiment_configuration(&router, experiment_id, account).await;
         assert_eq!(
             answer.status, 404,
@@ -697,16 +730,24 @@ async fn an_experiment_scoped_configuration_miss_names_the_experiment_and_the_ac
             "case {case:?}: expected ResourceNotFoundException, got {:?}",
             answer.body
         );
-        let expected = format!(
-            "TargetAccountConfiguration for experiment {experiment_id} \
-             and target account {account} not found"
-        );
+        let expected = if experiment_resolves {
+            experiment_scoped_not_found(experiment_id, account)
+        } else {
+            EXPERIMENT_NOT_FOUND.to_string()
+        };
         assert_eq!(
             answer.message(),
             expected,
             "case {case:?}: expected message {expected:?}, got {:?}",
             answer.message()
         );
+        if !experiment_resolves {
+            assert!(
+                !answer.message().contains(experiment_id) && !answer.message().contains(account),
+                "case {case:?}: a parent miss must echo neither name, got {:?}",
+                answer.message()
+            );
+        }
     }
 
     // The configuration the experiment DOES hold is still readable, so the refusal above

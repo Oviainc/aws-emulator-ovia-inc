@@ -263,6 +263,7 @@ fn create_body(site: Site, case: &str, key: &str) -> Value {
         "description": "the map-key-bounds suite's template",
         "roleArn": ROLE_ARN,
         "stopConditions": [{ "source": "none" }],
+        "targets": {},
         "actions": { "wait": wait_action(None) },
     });
     match site {

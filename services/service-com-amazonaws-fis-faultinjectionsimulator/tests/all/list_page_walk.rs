@@ -258,6 +258,7 @@ async fn fixture() -> (MultiServiceRouter, Vec<Listing>) {
                 "description": format!("the shared page walk: {case}"),
                 "roleArn": "arn:aws:iam::000000000000:role/fis-page-walk",
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": {
                     "wait": {
                         "actionId": "aws:fis:wait",

@@ -314,6 +314,7 @@ async fn template(router: &MultiServiceRouter, case: &str, configurations: usize
             "description": format!("target account configuration page walk: {case}"),
             "roleArn": "arn:aws:iam::000000000000:role/fis-page-walk",
             "stopConditions": [{ "source": "none" }],
+            "targets": {},
             "experimentOptions": { "accountTargeting": targeting },
             "actions": {
                 "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } }

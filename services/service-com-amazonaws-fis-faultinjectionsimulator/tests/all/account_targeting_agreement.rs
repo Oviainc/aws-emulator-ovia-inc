@@ -117,6 +117,7 @@ async fn template(router: &MultiServiceRouter, label: &str, options: &Value) -> 
         "description": format!("account targeting agreement: {label}"),
         "roleArn": "arn:aws:iam::000000000000:role/fis-account-targeting",
         "stopConditions": [{ "source": "none" }],
+        "targets": {},
         // `aws:fis:wait` takes a required `duration`, an ISO 8601 duration within the
         // documented 1 to 720 minutes.
         "actions": {

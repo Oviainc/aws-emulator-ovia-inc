@@ -421,6 +421,7 @@ Outputs:
                             "Description": "the first experiment",
                             "RoleArn": role_arn,
                             "StopConditions": [{"Source": "none"}],
+                            "Targets": {},
                             "Actions": {
                                 "waitAction": {
                                     "ActionId": "aws:fis:wait",
@@ -435,6 +436,7 @@ Outputs:
                             "Description": "the second experiment",
                             "RoleArn": role_arn,
                             "StopConditions": [{"Source": "none"}],
+                            "Targets": {},
                             "Actions": {
                                 "waitAction": {
                                     "ActionId": "aws:fis:wait",
@@ -698,6 +700,7 @@ async fn deleting_the_stack_deletes_the_experiment_templates_it_created() {
                     "Description": "the first experiment",
                     "RoleArn": role_arn,
                     "StopConditions": [{"Source": "none"}],
+                    "Targets": {},
                     "Actions": {"waitAction": {
                         "ActionId": "aws:fis:wait",
                         "Parameters": {"duration": WAIT_DURATION}
@@ -710,6 +713,7 @@ async fn deleting_the_stack_deletes_the_experiment_templates_it_created() {
                     "Description": "the second experiment",
                     "RoleArn": role_arn,
                     "StopConditions": [{"Source": "none"}],
+                    "Targets": {},
                     "Actions": {"waitAction": {
                         "ActionId": "aws:fis:wait",
                         "Parameters": {"duration": WAIT_DURATION}
@@ -780,6 +784,7 @@ async fn an_update_keeps_the_id_it_still_declares_and_deletes_what_it_drops() {
                 "Description": description,
                 "RoleArn": role_arn,
                 "StopConditions": [{"Source": "none"}],
+                "Targets": {},
                 "Actions": {"waitAction": {
                     "ActionId": "aws:fis:wait",
                     "Parameters": {"duration": WAIT_DURATION}
@@ -893,6 +898,7 @@ async fn a_declaration_fis_refuses_fails_the_stack() {
                     "Description": "a refused experiment",
                     "RoleArn": "arn:aws:iam::0:r",
                     "StopConditions": [{"Source": "none"}],
+                    "Targets": {},
                     "Actions": {"waitAction": {
                         "ActionId": "aws:fis:wait",
                         "Parameters": {"duration": WAIT_DURATION}

@@ -897,6 +897,7 @@ async fn a_destination_that_does_not_resolve_does_not_fail_the_run() {
                 "description": format!("an unresolvable destination: {case}"),
                 "roleArn": ROLE_ARN,
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": {
                     "assert": {
                         "actionId": "aws:cloudwatch:assert-alarm-state",
@@ -981,6 +982,7 @@ async fn two_runs_sharing_one_destination_keep_their_records_apart() {
             "description": "two runs, one destination",
             "roleArn": ROLE_ARN,
             "stopConditions": [{ "source": "none" }],
+            "targets": {},
             "actions": {
                 "assert": {
                     "actionId": "aws:cloudwatch:assert-alarm-state",

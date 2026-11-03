@@ -213,6 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::TemplateRefusal::Invalid(refusal) => {
                     UpdateExperimentTemplateErrorModeled::ValidationException(refusal)
                 }
+                crate::state::TemplateRefusal::NotFound(refusal) => {
+                    UpdateExperimentTemplateErrorModeled::ResourceNotFoundException(refusal)
+                }
                 crate::state::TemplateRefusal::QuotaExceeded(refusal) => {
                     UpdateExperimentTemplateErrorModeled::ServiceQuotaExceededException(refusal)
                 }

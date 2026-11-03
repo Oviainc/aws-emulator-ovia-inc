@@ -120,6 +120,7 @@ async fn template(router: &MultiServiceRouter, label: &str) -> String {
             "description": format!("role ownership: {label}"),
             "roleArn": "arn:aws:iam::000000000000:role/fis-role-ownership",
             "stopConditions": [{ "source": "none" }],
+            "targets": {},
             "actions": {
                 "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": "PT5M" } }
             },

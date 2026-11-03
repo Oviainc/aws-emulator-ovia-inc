@@ -105,10 +105,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this service
         // reword it.
         //
-        // Two classes FIS words itself:
+        // Four classes FIS words itself:
         //
         // * a value longer than its member's `@length` maximum, stated as
         //   "Maximum length exceeded: <member>" — see [`max_length_message`];
+        // * a `maxResults` outside the `@range` its member declares, stated as the member
+        //   and BOTH bounds — see [`crate::state::max_results_out_of_range`];
+        // * a `resourceType` outside `TargetResourceTypeId`'s `@pattern`, which FIS does
+        //   not report as a pattern violation at all: it judges the value against its
+        //   published catalog, so a value no entry can match is refused as the type that
+        //   was not found — see [`crate::state::target_resource_type_not_found`];
         // * a safety-lever state naming a status the input enum does not admit, stated as
         //   "Invalid status: <value>" — see
         //   [`crate::state::invalid_safety_lever_status_message`].
@@ -131,6 +137,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 )
                 .then(|| max_length_message(&violation.path))
             })
+            .or_else(|| violations.iter().find_map(max_results_out_of_range))
+            .or_else(|| violations.iter().find_map(unmatchable_resource_type))
             .or_else(|| violations.iter().find_map(invalid_safety_lever_status))?;
         Some(Refused {
             code: VALIDATION_EXCEPTION.to_string(),
@@ -173,6 +181,53 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 /// SOURCE: the model's `com.amazonaws.fis#UpdateSafetyLeverStateRequest`, whose `state`
 /// member targets `UpdateSafetyLeverStateInput` and its `status`.
 const SAFETY_LEVER_STATUS_PATH: &str = "state.status";
+
+/// The member every paginated list of this service sizes its page with
+/// (`@range(min: 1, max: 100)` on each list's own `maxResults` target).
+const MAX_RESULTS_PATH: &str = "maxResults";
+
+/// The member `GetTargetResourceType` names a resource type with
+/// (`GetTargetResourceTypeRequest.resourceType`, targeting `TargetResourceTypeId`:
+/// `@length(min: 0, max: 128)`, `pattern ^[\S]+$`). A `resourceType` nested inside a
+/// template's `targets` map is reported at a path with that map in front of it, so this
+/// bare path names the catalog lookup's own member and nothing else.
+const RESOURCE_TYPE_PATH: &str = "resourceType";
+
+/// `Some(message)` when `violation` is a `maxResults` outside the `@range` its member
+/// declares, worded as FIS words it ([`crate::state::max_results_out_of_range`]); `None`
+/// for every other violation.
+///
+/// FIS states both published bounds whichever one the value crossed, and echoes no value,
+/// so the two range violations draw the one sentence.
+fn max_results_out_of_range(violation: &smithy_server_runtime::Violation) -> Option<String> {
+    (violation.path == MAX_RESULTS_PATH
+        && matches!(
+            violation.kind,
+            smithy_server_runtime::ViolationKind::MinValue(_)
+                | smithy_server_runtime::ViolationKind::MaxValue(_)
+        ))
+    .then(crate::state::max_results_out_of_range)
+}
+
+/// `Some(message)` when `violation` is a `GetTargetResourceType` `resourceType` outside
+/// `TargetResourceTypeId`'s `@pattern`; `None` for every other violation.
+///
+/// FIS judges that member against its published catalog rather than reporting the pattern:
+/// a value the pattern refuses matches no catalogued entry either, so the caller is told
+/// the type was not found ([`crate::state::target_resource_type_not_found`]) — the same
+/// refusal, in the same words, as any other id the catalog holds no entry for.
+fn unmatchable_resource_type(violation: &smithy_server_runtime::Violation) -> Option<String> {
+    if violation.path != RESOURCE_TYPE_PATH
+        || !matches!(
+            violation.kind,
+            smithy_server_runtime::ViolationKind::Pattern(_)
+        )
+    {
+        return None;
+    }
+    crate::state::target_resource_type_not_found(violation.value.as_deref().unwrap_or_default())
+        .message
+}
 
 /// `Some(message)` when `violation` is a safety-lever state naming a status outside the
 /// values `SafetyLeverStatusInput` admits, worded as FIS words it

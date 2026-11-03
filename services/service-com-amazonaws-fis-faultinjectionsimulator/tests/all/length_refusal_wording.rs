@@ -256,6 +256,7 @@ fn plain_body(case: &str) -> Value {
         "description": "the length-refusal suite's template",
         "roleArn": ROLE_ARN,
         "stopConditions": [{ "source": "none" }],
+        "targets": {},
         "actions": { "wait": wait_action(None) },
     })
 }

@@ -173,6 +173,7 @@ async fn template_targeting(
             "description": format!("target account configuration suite: {label}"),
             "roleArn": "arn:aws:iam::000000000000:role/fis-target-account-configurations",
             "stopConditions": [{ "source": "none" }],
+            "targets": {},
             "experimentOptions": { "accountTargeting": targeting },
             // `aws:fis:wait` takes a required `duration`, an ISO 8601 duration within the
             // documented 1 to 720 minutes.

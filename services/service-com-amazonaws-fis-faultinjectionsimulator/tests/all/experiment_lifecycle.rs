@@ -319,12 +319,15 @@ pub(crate) fn token(label: &str) -> String {
 fn template_cases() -> Vec<(&'static str, Value)> {
     vec![
         (
-            "minimal-one-action-no-targets",
+            "minimal-one-action-empty-targets",
             json!({
                 "clientToken": token("minimal"),
                 "description": "demo",
                 "roleArn": "arn:aws:iam::000000000000:role/fis-minimal",
                 "stopConditions": [{ "source": "none" }],
+                // `targets` is a member FIS requires of the request, so the smallest
+                // template names it with no entry in it rather than leaving it out.
+                "targets": {},
                 "actions": {
                     "stopInstances": { "actionId": "aws:ec2:stop-instances" }
                 }
@@ -415,6 +418,7 @@ fn template_cases() -> Vec<(&'static str, Value)> {
                 "description": "a template carrying an experiment report configuration",
                 "roleArn": "arn:aws:iam::000000000000:role/fis-report",
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": {
                     "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": "PT30M" } }
                 },
@@ -445,6 +449,7 @@ fn template_cases() -> Vec<(&'static str, Value)> {
                 "description": "d".repeat(DESCRIPTION_CEILING),
                 "roleArn": "arn:aws:iam::000000000000:role/fis-ceiling",
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": {
                     "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } }
                 }
@@ -613,6 +618,7 @@ async fn experiment_options_a_request_omits_report_the_documented_defaults() {
             "description": format!("experiment options: {case}"),
             "roleArn": "arn:aws:iam::000000000000:role/fis-options",
             "stopConditions": [{ "source": "none" }],
+            "targets": {},
             "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
         });
         if !options.is_null() {
@@ -665,6 +671,7 @@ async fn a_minted_arn_names_the_region_the_request_was_signed_for() {
                 "description": format!("signed for {signing_region}"),
                 "roleArn": "arn:aws:iam::000000000000:role/fis-region",
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             })),
             signing_region,
@@ -1086,6 +1093,7 @@ async fn stopping_an_experiment_moves_it_to_stopped_with_a_reason_and_an_end_tim
                 "description": format!("stop: {case}"),
                 "roleArn": "arn:aws:iam::000000000000:role/fis-stop",
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             }),
         )
@@ -1188,6 +1196,7 @@ async fn list_experiments_reports_the_persisted_experiments_and_filters_by_templ
                 "description": format!("list: {case}"),
                 "roleArn": "arn:aws:iam::000000000000:role/fis-list",
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             }),
         )
@@ -1419,6 +1428,7 @@ async fn a_request_outside_a_stated_constraint_answers_validation_exception() {
             "description": "a template to list",
             "roleArn": "arn:aws:iam::000000000000:role/fis-validation",
             "stopConditions": [{ "source": "none" }],
+            "targets": {},
             "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
         }),
     )
@@ -1436,6 +1446,7 @@ async fn a_request_outside_a_stated_constraint_answers_validation_exception() {
                 "description": "an undocumented stop condition source",
                 "roleArn": "arn:aws:iam::000000000000:role/fis-bad",
                 "stopConditions": [{ "source": "aws:cloudwatch:composite-alarm" }],
+                "targets": {},
                 "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             }),
         ),
@@ -1446,6 +1457,7 @@ async fn a_request_outside_a_stated_constraint_answers_validation_exception() {
                 "description": "an alarm stop condition with no alarm",
                 "roleArn": "arn:aws:iam::000000000000:role/fis-bad",
                 "stopConditions": [{ "source": "aws:cloudwatch:alarm" }],
+                "targets": {},
                 "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             }),
         ),
@@ -1456,6 +1468,7 @@ async fn a_request_outside_a_stated_constraint_answers_validation_exception() {
                 "description": "an account targeting value the enum does not admit",
                 "roleArn": "arn:aws:iam::000000000000:role/fis-bad",
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } },
                 "experimentOptions": { "accountTargeting": "every-account" }
             }),
@@ -1467,6 +1480,7 @@ async fn a_request_outside_a_stated_constraint_answers_validation_exception() {
                 "description": "a resolution mode the enum does not admit",
                 "roleArn": "arn:aws:iam::000000000000:role/fis-bad",
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } },
                 "experimentOptions": { "emptyTargetResolutionMode": "ignore" }
             }),
@@ -1478,6 +1492,7 @@ async fn a_request_outside_a_stated_constraint_answers_validation_exception() {
                 "description": "d".repeat(DESCRIPTION_CEILING + 1),
                 "roleArn": "arn:aws:iam::000000000000:role/fis-bad",
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             }),
         ),

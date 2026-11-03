@@ -373,6 +373,7 @@ async fn two_experiments_from_one_template_run_independently() {
             "description": "two experiments from one template",
             "roleArn": ROLE_ARN,
             "stopConditions": [{ "source": "none" }],
+            "targets": {},
             "actions": {
                 "fault": {
                     "actionId": "aws:fis:inject-api-internal-error",
@@ -528,6 +529,7 @@ async fn a_duration_that_names_no_representable_span_is_answered_and_not_run() {
                     "description": format!("an unreadable duration: {case}"),
                     "roleArn": ROLE_ARN,
                     "stopConditions": [{ "source": "none" }],
+                    "targets": {},
                     "actions": {
                         "fault": {
                             "actionId": "aws:fis:inject-api-internal-error",

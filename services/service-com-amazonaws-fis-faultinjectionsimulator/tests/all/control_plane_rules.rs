@@ -85,6 +85,7 @@ fn wait_template(label: &str, duration: &str) -> Value {
         "description": format!("control-plane rules: {label}"),
         "roleArn": ROLE_ARN,
         "stopConditions": [{ "source": "none" }],
+        "targets": {},
         "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": duration } } }
     })
 }
@@ -201,6 +202,7 @@ async fn the_wait_actions_duration_is_bounded_when_the_template_is_created() {
                 "description": format!("control-plane rules: {case}"),
                 "roleArn": ROLE_ARN,
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": { "wait": { "actionId": "aws:fis:wait" } }
             }),
         };
@@ -279,6 +281,7 @@ async fn another_actions_parameters_are_stored_as_sent() {
                 "description": format!("control-plane rules: {case}"),
                 "roleArn": ROLE_ARN,
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": {
                     "act": { "actionId": action_id, "parameters": { "duration": duration } }
                 }
@@ -347,6 +350,7 @@ async fn the_action_graph_is_bounded_and_refers_only_to_actions_the_template_dec
                 "description": format!("control-plane rules: {case}"),
                 "roleArn": ROLE_ARN,
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": actions
             }),
         )
@@ -392,6 +396,7 @@ async fn the_action_graph_is_bounded_and_refers_only_to_actions_the_template_dec
                 "description": format!("control-plane rules: {case}"),
                 "roleArn": ROLE_ARN,
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": {
                     "first": { "actionId": "aws:fis:wait", "parameters": { "duration": "PT1M" } },
                     "second": { "actionId": "aws:fis:wait", "parameters": { "duration": "PT1M" } },
@@ -1181,6 +1186,7 @@ async fn stopping_an_experiment_in_a_final_state_is_refused() {
                 "description": format!("control-plane rules: {case}"),
                 "roleArn": ROLE_ARN,
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": { "stop": { "actionId": "aws:ec2:stop-instances" } }
             }),
             _ => wait_template(&format!("final-{case}"), "PT1M"),
@@ -1414,6 +1420,7 @@ async fn a_length_refusal_names_the_member_and_echoes_no_value() {
                 "description": long_description,
                 "roleArn": ROLE_ARN,
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             }),
             Some("description"),
@@ -1425,6 +1432,7 @@ async fn a_length_refusal_names_the_member_and_echoes_no_value() {
                 "description": "d".repeat(DESCRIPTION_CEILING),
                 "roleArn": ROLE_ARN,
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             }),
             None,
@@ -1436,6 +1444,7 @@ async fn a_length_refusal_names_the_member_and_echoes_no_value() {
                 "description": "a token past its bound",
                 "roleArn": ROLE_ARN,
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             }),
             Some("clientToken"),
@@ -1447,6 +1456,7 @@ async fn a_length_refusal_names_the_member_and_echoes_no_value() {
                 "description": "a token at its bound",
                 "roleArn": ROLE_ARN,
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             }),
             None,
@@ -1458,6 +1468,7 @@ async fn a_length_refusal_names_the_member_and_echoes_no_value() {
                 "description": "a role arn past its bound",
                 "roleArn": long_role,
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             }),
             Some("roleArn"),
@@ -1469,6 +1480,7 @@ async fn a_length_refusal_names_the_member_and_echoes_no_value() {
                 "description": "more tags than the map admits",
                 "roleArn": ROLE_ARN,
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } },
                 "tags": (0..=TAG_MAP_CEILING)
                     .map(|index| (format!("Key{index}"), Value::String("value".to_string())))

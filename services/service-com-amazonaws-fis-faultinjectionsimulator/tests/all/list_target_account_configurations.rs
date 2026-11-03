@@ -148,6 +148,7 @@ async fn template(router: &MultiServiceRouter, label: &str) -> String {
             "description": format!("list target account configurations suite: {label}"),
             "roleArn": "arn:aws:iam::000000000000:role/fis-list-target-account-configurations",
             "stopConditions": [{ "source": "none" }],
+            "targets": {},
             // A target account configuration belongs to a template that targets MULTIPLE
             // accounts: `accountTargeting` and the configurations a template holds state
             // the same thing between them.

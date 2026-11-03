@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(experiment) = store.experiments.get(&input.experiment_id) else {
             return Err(
                 ListExperimentResolvedTargetsErrorModeled::ResourceNotFoundException(
-                    crate::state::experiment_not_found(&input.experiment_id),
+                    crate::state::resolved_target_experiment_not_found(),
                 )
                 .into(),
             );

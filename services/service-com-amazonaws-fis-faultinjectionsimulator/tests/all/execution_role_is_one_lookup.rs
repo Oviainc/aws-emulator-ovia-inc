@@ -279,6 +279,7 @@ fn template_body(index: usize, row: &Row) -> Value {
         "description": format!("one role lookup: {}", row.case),
         "roleArn": row.role_arn,
         "stopConditions": [{ "source": "none" }],
+        "targets": {},
         "actions": {
             ACTION_NAME: {
                 "actionId": "aws:cloudwatch:assert-alarm-state",

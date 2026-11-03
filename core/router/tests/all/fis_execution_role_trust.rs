@@ -303,6 +303,9 @@ async fn start_experiment_refuses_a_role_whose_trust_policy_withholds_fis() {
                 "description": format!("role trust: {}", row.case),
                 "roleArn": role_arn,
                 "stopConditions": [{ "source": "none" }],
+                // `targets` is a member FIS requires of a create request, so every body
+                // here names it.
+                "targets": {},
                 "actions": {
                     "wait": {
                         "actionId": "aws:fis:wait",
@@ -438,6 +441,9 @@ async fn start_experiment_accepts_a_role_arn_the_iam_store_does_not_hold() {
                 "description": format!("role not in iam: {case}"),
                 "roleArn": role_arn,
                 "stopConditions": [{ "source": "none" }],
+                // `targets` is a member FIS requires of a create request, so every body
+                // here names it.
+                "targets": {},
                 "actions": {
                     "wait": {
                         "actionId": "aws:fis:wait",

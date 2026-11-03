@@ -154,18 +154,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // later caller sees. The experiment's status is not reported here, so there is no
         // owed transition to materialise in order to answer.
         let store = state.lock();
-        let configuration = store
-            .experiments
-            .get(&input.experiment_id)
-            .and_then(|experiment| {
-                experiment
-                    .target_account_configurations
-                    .get(&input.account_id)
-            });
-        let Some(record) = configuration else {
-            // One refusal for both misses: whether the store holds no such experiment or
-            // the experiment was started with no configuration for this account, the
-            // resource the request named does not exist.
+
+        // The PARENT the path names is resolved first, so a caller is told the miss that is
+        // true: with no such experiment there is no configuration of it to be missing.
+        let Some(experiment) = store.experiments.get(&input.experiment_id) else {
+            return Err(
+                GetExperimentTargetAccountConfigurationErrorModeled::ResourceNotFoundException(
+                    crate::state::child_experiment_not_found(),
+                )
+                .into(),
+            );
+        };
+
+        // The experiment resolves, so the miss this refusal reports is the CHILD's: the
+        // experiment was started with no configuration for the account the path names.
+        let Some(record) = experiment
+            .target_account_configurations
+            .get(&input.account_id)
+        else {
             return Err(
                 GetExperimentTargetAccountConfigurationErrorModeled::ResourceNotFoundException(
                     crate::state::experiment_target_account_configuration_not_found(

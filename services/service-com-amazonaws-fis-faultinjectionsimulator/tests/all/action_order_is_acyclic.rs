@@ -167,6 +167,7 @@ fn create_body(row: &Row) -> Value {
         "description": format!("action order: {}", row.case),
         "roleArn": ROLE_ARN,
         "stopConditions": [{ "source": "none" }],
+        "targets": {},
         "actions": actions(row.graph)
     })
 }
@@ -179,6 +180,7 @@ fn baseline_body(case: &str) -> Value {
         "description": format!("action order baseline: {case}"),
         "roleArn": ROLE_ARN,
         "stopConditions": [{ "source": "none" }],
+        "targets": {},
         "actions": { "baseline": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT } } }
     })
 }

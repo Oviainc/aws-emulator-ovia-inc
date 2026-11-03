@@ -212,6 +212,7 @@ async fn template(router: &MultiServiceRouter, case: &str) -> String {
             "description": format!("start experiment token normalization: {case}"),
             "roleArn": ROLE_ARN,
             "stopConditions": [{ "source": "none" }],
+            "targets": {},
             // `aws:fis:wait` takes a required `duration`, an ISO 8601 duration within the
             // documented 1 to 720 minutes.
             "actions": {

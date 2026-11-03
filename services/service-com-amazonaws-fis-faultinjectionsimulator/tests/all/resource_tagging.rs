@@ -144,6 +144,7 @@ pub(crate) async fn new_template(
             "description": "the tagging suite's template",
             "roleArn": ROLE_ARN,
             "stopConditions": [{ "source": "none" }],
+            "targets": {},
             "actions": wait_action(),
             "tags": tags,
         }),

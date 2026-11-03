@@ -222,6 +222,12 @@ pub const ID_SUFFIX_LEN: usize = 12;
 /// modelled `@range(min: 1, max: 100)`.
 pub const PAGE_LIMIT: i32 = 100;
 
+/// The smallest page a caller may ask a paginated FIS list for: the minimum of the
+/// `@range(min: 1, max: 100)` every `maxResults` member of this service declares, whose
+/// maximum is [`PAGE_LIMIT`]. Named here because the refusal of a value outside those
+/// bounds states BOTH of them ([`max_results_out_of_range`]).
+pub const MAX_RESULTS_FLOOR: i32 = 1;
+
 /// How many experiment templates the store holds before `CreateExperimentTemplate`
 /// refuses with `ServiceQuotaExceededException`.
 ///
@@ -363,12 +369,36 @@ pub const EXPERIMENT_TEMPLATE_NOT_FOUND: &str = "ExperimentTemplate not found.";
 pub const ACTION_NOT_FOUND: &str = "Invalid actionId.";
 
 /// The message FIS answers for a target account configuration the named experiment
-/// TEMPLATE does not hold.
+/// TEMPLATE — or the named EXPERIMENT's snapshot of them — does not hold.
 ///
 /// A constant rather than a request-derived string: the identical text is recorded for
 /// different template/account pairs, so neither half of the resource's name appears in
 /// it.
 pub const TARGET_ACCOUNT_CONFIGURATION_NOT_FOUND: &str = "TargetAccountConfiguration not found.";
+
+/// The message FIS answers for an `experimentId` that resolves to no experiment, on the
+/// operations that read or enumerate a CHILD of one.
+///
+/// A constant rather than a request-derived string: the recorded text names the resource
+/// KIND that did not resolve and not the id that named it, so differently shaped ids all
+/// draw the identical refusal.
+pub const EXPERIMENT_NOT_FOUND: &str = "Experiment not found.";
+
+/// [`EXPERIMENT_NOT_FOUND`] as the resolved-target listing words it: FIS leaves that
+/// operation's sentence unterminated, so the two texts are named separately rather than
+/// one being derived from the other.
+pub const RESOLVED_TARGET_EXPERIMENT_NOT_FOUND: &str = "Experiment not found";
+
+/// The message FIS answers for a `maxResults` outside the bounds its member declares.
+///
+/// Every `maxResults` of this service targets a shape modelled `@range(min: 1, max: 100)`,
+/// and FIS states that refusal as the member and its two bounds — not as the one bound that
+/// was crossed, and without echoing the value that crossed it. The bounds come from
+/// [`MAX_RESULTS_FLOOR`] and [`PAGE_LIMIT`], so the sentence cannot drift from the page
+/// sizes this service serves.
+pub fn max_results_out_of_range() -> String {
+    format!("maxResults must be between {MAX_RESULTS_FLOOR} and {PAGE_LIMIT}")
+}
 
 /// The message FIS answers for a `nextToken` no call of the list issued.
 ///
@@ -3636,9 +3666,33 @@ pub fn target_resource_type_not_found(resource_type: &str) -> ValidationExceptio
 /// The `ResourceNotFoundException` payload for an experiment id that names no record.
 ///
 /// This one FIS builds from the request: the message names the id that was looked up.
+/// It is the wording of the operations that resolve an EXPERIMENT itself (`GetExperiment`,
+/// `StopExperiment`); an operation that reads or enumerates a CHILD of an experiment words
+/// the same miss as fixed text instead ([`child_experiment_not_found`]).
 pub fn experiment_not_found(id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("Experiment with ID {id} not found.")),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an `experimentId` that names no record, as
+/// the operations addressing a CHILD of an experiment word it — [`EXPERIMENT_NOT_FOUND`],
+/// which takes no argument.
+///
+/// Such an operation resolves the PARENT the path names before the child it names, so the
+/// miss a caller is told about is the one that is true: the experiment, not a configuration
+/// of an experiment that does not exist.
+pub fn child_experiment_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(EXPERIMENT_NOT_FOUND.to_string()),
+    }
+}
+
+/// [`child_experiment_not_found`] for the resolved-target listing, whose sentence FIS
+/// leaves unterminated ([`RESOLVED_TARGET_EXPERIMENT_NOT_FOUND`]).
+pub fn resolved_target_experiment_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(RESOLVED_TARGET_EXPERIMENT_NOT_FOUND.to_string()),
     }
 }
 
@@ -3681,13 +3735,15 @@ pub fn target_account_configuration_not_found() -> ResourceNotFoundException {
     }
 }
 
-/// The `ResourceNotFoundException` payload for an (experiment, account) pair that names
-/// no target account configuration on that experiment's snapshot — "the specified
-/// resource cannot be found".
+/// The `ResourceNotFoundException` payload for an (experiment, account) pair whose
+/// EXPERIMENT resolves but whose snapshot holds no configuration for that account.
 ///
 /// Unlike the template-scoped miss ([`target_account_configuration_not_found`], a
 /// constant), FIS builds this message FROM THE REQUEST: it names the experiment first and
-/// then the target account.
+/// then the target account. Reached only once the parent experiment has itself resolved
+/// (otherwise it is the experiment that is reported missing,
+/// [`child_experiment_not_found`]), so it never tells a caller a configuration is missing
+/// from an experiment that does not exist.
 pub fn experiment_target_account_configuration_not_found(
     experiment_id: &str,
     account_id: &str,
@@ -3697,6 +3753,29 @@ pub fn experiment_target_account_configuration_not_found(
             "TargetAccountConfiguration for experiment {experiment_id} \
              and target account {account_id} not found"
         )),
+    }
+}
+
+/// The `ValidationException` payload for a member this service requires of a REQUEST but
+/// the model leaves optional, worded as FIS words it: the member, then "is required".
+///
+/// A structural requirement of the call rather than a rule about the resource it builds, so
+/// it is reported before any value the request carries is resolved against this service's
+/// catalogs or its store.
+pub fn required_member_missing(member: &str) -> ValidationException {
+    invalid_input(format!("{member} is required"))
+}
+
+/// The `ResourceNotFoundException` payload for an action entry whose `actionId` names no
+/// action the catalog publishes — "the specified resource cannot be found".
+///
+/// An `actionId` is a REFERENCE to a resource of the catalog, so a reference that resolves
+/// to nothing is a missing resource and not a malformed request, and FIS words it after the
+/// KEY of the offending entry in the request's `actions` map: that is what tells a caller
+/// which of its actions to fix, and it keeps the unresolvable value out of the message.
+pub fn invalid_action_reference(action_name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Invalid actionId in action '{action_name}'.")),
     }
 }
 
@@ -3869,7 +3948,7 @@ fn target_parameters_refusal(
 }
 
 /// `None` when every action of the template a request builds satisfies what FIS documents
-/// for it; otherwise the `ValidationException` that refuses the request.
+/// for it; otherwise the refusal it earns, in the CLASS that refusal belongs to.
 ///
 /// Taken over the STORED actions rather than over one request's input shape, so a created
 /// and an updated template are judged by the same rule. `targets` is the SAME template's
@@ -3899,9 +3978,11 @@ fn target_parameters_refusal(
 pub fn actions_refusal(
     actions: &HashMap<String, ExperimentTemplateAction>,
     targets: &HashMap<String, ExperimentTemplateTarget>,
-) -> Option<ValidationException> {
+) -> Option<TemplateRefusal> {
     if actions.is_empty() {
-        return Some(invalid_input("actions must declare at least one action."));
+        return Some(TemplateRefusal::Invalid(invalid_input(
+            "actions must declare at least one action.",
+        )));
     }
     // The map's iteration order is not stable, so the refusal is taken over the action
     // names in order: one request always earns the same message. The entries are sorted
@@ -3916,31 +3997,31 @@ pub fn actions_refusal(
             .flatten()
             .any(|earlier| !actions.contains_key(earlier))
         {
-            return Some(invalid_input(format!(
+            return Some(TemplateRefusal::Invalid(invalid_input(format!(
                 "actions.{name}.startAfter must name actions the template declares."
-            )));
+            ))));
         }
         // An `actionId` is required on the create and inherited by an update that omits it
         // ([`ExperimentTemplateRecord::updated_actions`]), so a stored action carries one;
-        // a record without one names no published action and is refused by this rule.
+        // a record without one names no published action and is refused by this rule — as
+        // a REFERENCE that resolves to nothing, which is a missing resource and not a
+        // malformed request ([`invalid_action_reference`]).
         let action_id = action.action_id.as_deref().unwrap_or_default();
         let Some(entry) = action_catalog_entry(action_id) else {
-            return Some(invalid_input(format!(
-                "actions.{name}.actionId must be an action FIS publishes, got {action_id:?}"
-            )));
+            return Some(TemplateRefusal::NotFound(invalid_action_reference(name)));
         };
         if let Some(refusal) = action_parameters_refusal(name, action, entry) {
-            return Some(refusal);
+            return Some(TemplateRefusal::Invalid(refusal));
         }
         if let Some(refusal) = action_targets_refusal(name, action, entry, targets) {
-            return Some(refusal);
+            return Some(TemplateRefusal::Invalid(refusal));
         }
     }
     // The ordering rule is about the action graph as a WHOLE rather than about one entry,
     // so it is judged once every action is itself admissible — and after the rule above
     // that every `startAfter` names a declared action, which is what makes the edges of
     // that graph meaningful.
-    actions_cycle_refusal(actions)
+    actions_cycle_refusal(actions).map(TemplateRefusal::Invalid)
 }
 
 /// `None` when the `startAfter` ordering over `actions` is realisable — the actions form a
@@ -4151,13 +4232,16 @@ pub fn actions_quota_refusal(
 /// Why a template record is not one this service admits, carrying the error FIS answers it
 /// with.
 ///
-/// The two error CLASSES the admissibility sequence ([`template_refusal`]) produces. Which
+/// The three error CLASSES the admissibility sequence ([`template_refusal`]) produces. Which
 /// operation is being refused decides nothing here: a handler lifts the payload into its
 /// own operation's error enum, and that lift is the only per-operation part of the refusal.
 #[derive(Debug)]
 pub enum TemplateRefusal {
     /// A 400 `ValidationException`: the record describes a template FIS would not run.
     Invalid(ValidationException),
+    /// A 404 `ResourceNotFoundException`: the record REFERS to a resource that does not
+    /// resolve — an `actionId` the published catalog holds no action for.
+    NotFound(ResourceNotFoundException),
     /// A 402 `ServiceQuotaExceededException`: the record is past a published quota.
     QuotaExceeded(ServiceQuotaExceededException),
 }
@@ -4295,7 +4379,7 @@ pub fn template_refusal(template: &ExperimentTemplateRecord) -> Option<TemplateR
     // refused HERE rather than persisted: a template a call accepts is one the service
     // would run.
     if let Some(refusal) = actions_refusal(&template.actions, &template.targets) {
-        return Some(TemplateRefusal::Invalid(refusal));
+        return Some(refusal);
     }
     None
 }

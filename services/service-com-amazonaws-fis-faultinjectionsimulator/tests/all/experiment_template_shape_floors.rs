@@ -219,6 +219,7 @@ fn create_body(shape: &Shape) -> Value {
         "description": format!("template floors: {}", shape.case),
         "roleArn": ROLE_ARN,
         "stopConditions": shape.stop_conditions,
+        "targets": {},
         "actions": shape.actions
     });
     if let Some(configuration) = shape.log_configuration.clone() {
@@ -248,6 +249,7 @@ fn baseline_body(label: &str) -> Value {
         "description": format!("template floors baseline: {label}"),
         "roleArn": ROLE_ARN,
         "stopConditions": [{ "source": "none" }],
+        "targets": {},
         "actions": { "wait": wait("PT5M") },
         "logConfiguration": {
             "logSchemaVersion": BASELINE_LOG_SCHEMA_VERSION,

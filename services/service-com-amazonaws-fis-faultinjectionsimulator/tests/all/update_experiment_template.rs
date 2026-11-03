@@ -735,6 +735,7 @@ async fn a_log_configuration_needs_a_schema_version_from_somewhere() {
         "description": "update suite: a template with no log configuration",
         "roleArn": ROLE_ARN,
         "stopConditions": [{ "source": "none" }],
+        "targets": {},
         "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": "PT1M" } } }
     });
     let (id, before) = create_from(&router, case, body).await;
@@ -949,6 +950,7 @@ fn template_logging(label: &str, logs: Option<&Value>) -> Value {
         "description": format!("update suite: {label}"),
         "roleArn": ROLE_ARN,
         "stopConditions": [{ "source": "none" }],
+        "targets": {},
         "actions": {
             "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": "PT1M" } }
         }

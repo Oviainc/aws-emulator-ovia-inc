@@ -438,6 +438,8 @@ fn template_body(index: usize, row: &Row, role_arn: &str) -> Value {
         "description": format!("role permissions: {}", row.case),
         "roleArn": role_arn,
         "stopConditions": [{ "source": "none" }],
+        // `targets` is a member FIS requires of a create request.
+        "targets": {},
         "actions": { "underTest": action }
     })
 }
@@ -697,6 +699,7 @@ async fn an_experiment_whose_role_the_iam_store_does_not_hold_is_not_failed_for_
                 "description": format!("role not in iam: {case}"),
                 "roleArn": role_arn,
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": {
                     "underTest": {
                         "actionId": "aws:cloudwatch:assert-alarm-state",
@@ -842,6 +845,7 @@ async fn the_privileges_gate_is_bounded_by_the_service_and_not_by_the_request() 
                 "description": format!("a bounded gate: {case}"),
                 "roleArn": role_arn,
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": {
                     "underTest": {
                         "actionId": "aws:cloudwatch:assert-alarm-state",
@@ -999,6 +1003,7 @@ async fn an_action_the_experiment_options_skip_earns_no_privilege_failure() {
                 "description": "an under-privileged action, carried out or skipped",
                 "roleArn": role_arn,
                 "stopConditions": [{ "source": "none" }],
+                "targets": {},
                 "actions": { "underTest": action }
             }),
         ),

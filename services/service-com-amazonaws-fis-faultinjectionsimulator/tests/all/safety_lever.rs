@@ -687,6 +687,7 @@ async fn running_experiment(
             "description": format!("safety lever: {label}"),
             "roleArn": "arn:aws:iam::000000000000:role/fis-safety-lever",
             "stopConditions": [{ "source": "none" }],
+            "targets": {},
             "actions": {
                 "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } }
             }

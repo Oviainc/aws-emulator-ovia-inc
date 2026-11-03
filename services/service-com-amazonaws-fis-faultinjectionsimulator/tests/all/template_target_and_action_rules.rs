@@ -6,8 +6,10 @@
 //! The rules under test, none of them expressible as a modelled constraint — the target
 //! input models `resourceArns` and `resourceTags` as two independent optional members,
 //! `selectionMode` as a free string, `actionId` as a free string and an action's `targets`
-//! as a free `string -> string` map — so each one is refused by the service with a 400
-//! `ValidationException` that persists nothing:
+//! as a free `string -> string` map — so each one is refused by the service, persisting
+//! nothing: with a 400 `ValidationException` where the rule is about the template's own
+//! values, and with a 404 `ResourceNotFoundException` where it is about a REFERENCE that
+//! resolves to nothing:
 //!
 //! * a target identifies its resources by EXACTLY ONE of `resourceArns` or `resourceTags`
 //!   ("You must specify at least one Amazon Resource Name (ARN) or at least one resource
@@ -16,7 +18,8 @@
 //!   and `PERCENT(n)` — so a value in none of them is refused rather than resolved as the
 //!   default;
 //! * `actionId` names one of the actions FIS PUBLISHES, the same catalog `GetAction` and
-//!   `ListActions` report from;
+//!   `ListActions` report from — an id that catalog holds no action for names a resource
+//!   that does not exist, reported after the KEY of the `actions` entry that named it;
 //! * an action supplies every parameter that catalog records as `required` for it;
 //! * each entry of an action's `targets` names, under a target key that action supports, a
 //!   target the SAME template declares, of the resource type the action takes there.
@@ -47,8 +50,13 @@ use crate::experiment_lifecycle::{
 /// A well-formed IAM role ARN: every row here is about targets and actions, not the role.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/fis-target-and-action-rules";
 
-/// The wire error code every refusal in this suite carries.
+/// The wire error code a refusal about the template's own VALUES carries.
 const VALIDATION: &str = "ValidationException";
+
+/// The wire error code a refusal about a REFERENCE that resolves to nothing carries: an
+/// `actionId` naming no action the catalog publishes names a resource that does not exist,
+/// which FIS answers with HTTP 404 rather than with a malformed-request class.
+const NOT_FOUND: &str = "ResourceNotFoundException";
 
 /// The name every row gives the one action under test.
 const ACTION: &str = "underTest";
@@ -134,18 +142,24 @@ async fn stored(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
     answer.member("experimentTemplate").clone()
 }
 
-/// Assert that `answer` refuses the create with a 400 `ValidationException` whose message
+/// Assert that `answer` refuses the call with a 400 `ValidationException` whose message
 /// names every fragment in `names`.
 fn assert_refused(case: &str, answer: &Answer, names: &[&str]) {
+    assert_refused_as(case, answer, 400, VALIDATION, names);
+}
+
+/// Assert that `answer` refuses the call with HTTP `status` and error code `code`, and that
+/// its message names every fragment in `names`.
+fn assert_refused_as(case: &str, answer: &Answer, status: u16, code: &str, names: &[&str]) {
     assert_eq!(
-        answer.status, 400,
-        "case {case:?}: expected HTTP 400, got {} with {:?}",
+        answer.status, status,
+        "case {case:?}: expected HTTP {status}, got {} with {:?}",
         answer.status, answer.body
     );
     assert_eq!(
         answer.error_code(),
-        VALIDATION,
-        "case {case:?}: expected error code {VALIDATION:?}, got {:?}",
+        code,
+        "case {case:?}: expected error code {code:?}, got {:?}",
         answer.body
     );
     let stated = message(answer);
@@ -155,6 +169,19 @@ fn assert_refused(case: &str, answer: &Answer, names: &[&str]) {
             "case {case:?}: expected the refusal to name {fragment:?}, got {stated:?}"
         );
     }
+}
+
+/// Assert that `answer` refuses the call because the entry named `action_name` carries an
+/// `actionId` that resolves to no published action: a 404 `ResourceNotFoundException` worded
+/// after the KEY of that entry, with the unresolvable id NOT echoed.
+fn assert_unresolved_action(case: &str, answer: &Answer, action_name: &str) {
+    assert_refused_as(case, answer, 404, NOT_FOUND, &[]);
+    assert_eq!(
+        message(answer),
+        format!("Invalid actionId in action '{action_name}'."),
+        "case {case:?}: expected the reference miss to name the action entry, got {:?}",
+        answer.body
+    );
 }
 
 /// Create `body` and, when the row is admitted, assert the store reports back what it
@@ -510,7 +537,10 @@ async fn an_action_refers_only_to_targets_its_template_declares_and_it_supports(
 
 /// RULE: `actionId` names one of the actions FIS PUBLISHES — the catalog `GetAction` and
 /// `ListActions` report from — so an id that catalog holds no action for is refused instead
-/// of being stored and later started.
+/// of being stored and later started. It is a REFERENCE to a catalogued resource, so a
+/// reference that resolves to nothing is reported as a missing resource (404
+/// `ResourceNotFoundException`) worded after the KEY of the offending `actions` entry, and
+/// not as a malformed value.
 #[tokio::test]
 async fn an_action_id_no_published_action_names_is_refused() {
     let router = emulator();
@@ -532,17 +562,27 @@ async fn an_action_id_no_published_action_names_is_refused() {
         ("no qualified id at all", "wait"),
         ("an empty-ish id", "-"),
     ] {
-        judge(
+        let before = template_count(&router).await;
+        let answer = create_template(
             &router,
-            case,
             body(
                 case,
                 json!({}),
                 json!({ ACTION: { "actionId": action_id, "parameters": { "duration": DURATION } } }),
             ),
-            Some(&["actions.underTest.actionId", action_id]),
         )
         .await;
+        assert_unresolved_action(case, &answer, ACTION);
+        assert!(
+            !message(&answer).contains(action_id),
+            "case {case:?}: the refusal must not echo the unresolvable id, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            template_count(&router).await,
+            before,
+            "case {case:?}: a refused create must persist no template"
+        );
     }
 }
 
@@ -644,8 +684,9 @@ async fn every_published_action_needs_the_parameters_its_contract_requires() {
 /// and the same message.
 #[tokio::test]
 async fn the_same_rules_judge_an_updated_template() {
-    // One row per rule, each in the shape an update carries: the members it replaces.
-    let rows: Vec<(&str, Value)> = vec![
+    // One row per rule, each in the shape an update carries: the members it replaces,
+    // beside the class that rule's refusal belongs to (HTTP status and wire error code).
+    let rows: Vec<(&str, Value, u16, &str)> = vec![
         (
             "a target naming both resourceArns and resourceTags",
             json!({
@@ -658,6 +699,8 @@ async fn the_same_rules_judge_an_updated_template() {
                     }
                 }
             }),
+            400,
+            VALIDATION,
         ),
         (
             "a target naming neither",
@@ -666,6 +709,8 @@ async fn the_same_rules_judge_an_updated_template() {
                     "hosts": { "resourceType": "aws:ec2:instance", "selectionMode": "ALL" }
                 }
             }),
+            400,
+            VALIDATION,
         ),
         (
             "a selection mode in no documented form",
@@ -678,14 +723,20 @@ async fn the_same_rules_judge_an_updated_template() {
                     }
                 }
             }),
+            400,
+            VALIDATION,
         ),
         (
             "an action id no published action names",
             json!({ "actions": { ACTION: { "actionId": "aws:bogus:nonsense" } } }),
+            404,
+            NOT_FOUND,
         ),
         (
             "an action missing a required parameter",
             json!({ "actions": { ACTION: { "actionId": "aws:ebs:pause-volume-io" } } }),
+            400,
+            VALIDATION,
         ),
         (
             "an action naming a target the template does not declare",
@@ -698,10 +749,12 @@ async fn the_same_rules_judge_an_updated_template() {
                     }
                 }
             }),
+            400,
+            VALIDATION,
         ),
     ];
 
-    for (case, members) in rows {
+    for (case, members, status, code) in rows {
         let router = emulator();
 
         // The create's answer, over a template built from those same members.
@@ -713,7 +766,7 @@ async fn the_same_rules_judge_an_updated_template() {
             created_body[name] = value.clone();
         }
         let created = create_template(&router, created_body).await;
-        assert_refused(case, &created, &[]);
+        assert_refused_as(case, &created, status, code, &[]);
 
         // A baseline template the update replaces those members on.
         let baseline = create_template(
@@ -740,7 +793,7 @@ async fn the_same_rules_judge_an_updated_template() {
             FALLBACK_REGION,
         )
         .await;
-        assert_refused(case, &updated, &[]);
+        assert_refused_as(case, &updated, status, code, &[]);
         assert_eq!(
             message(&updated),
             message(&created),

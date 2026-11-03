@@ -170,6 +170,7 @@ async fn create_template(router: &MultiServiceRouter, label: &str, targeting: &s
             "description": format!("list experiment target account configurations: {label}"),
             "roleArn": "arn:aws:iam::000000000000:role/fis-list-experiment-target-accounts",
             "stopConditions": [{ "source": "none" }],
+            "targets": {},
             "experimentOptions": { "accountTargeting": targeting },
             // `aws:fis:wait` takes a required `duration`, an ISO 8601 duration within the
             // documented 1 to 720 minutes.

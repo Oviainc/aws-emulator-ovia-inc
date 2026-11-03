@@ -113,6 +113,7 @@ async fn template(router: &MultiServiceRouter, label: &str) -> String {
             "description": format!("target account configuration idempotency: {label}"),
             "roleArn": "arn:aws:iam::000000000000:role/fis-token-suite",
             "stopConditions": [{ "source": "none" }],
+            "targets": {},
             "experimentOptions": { "accountTargeting": "multi-account" },
             // `aws:fis:wait` takes a required `duration`, an ISO 8601 duration within the
             // documented 1 to 720 minutes.
