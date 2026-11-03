@@ -1987,6 +1987,14 @@ pub struct Cmk {
     /// cryptographic operation that succeeds writes it ([`Self::record_last_usage`]);
     /// a reporting operation never does.
     pub last_usage: Option<KeyUsage>,
+    /// The newest usage record the tracking had ALREADY produced when [`Self::last_usage`]
+    /// was written, or `None` while it had produced none.
+    ///
+    /// It is what `GetKeyLastUsage` goes on reporting while the newer use is still in the
+    /// pipeline: a record the tracking has produced is replaced by a newer one, never
+    /// erased by a use the tracking has not caught up with — see
+    /// [`Self::reported_last_usage`].
+    pub tracked_last_usage: Option<KeyUsage>,
     /// What the caller stated about the key material it imported, or `None` for a key
     /// whose material KMS generated and for one still waiting for material — see
     /// [`ImportedKeyMaterial`]. It is what the `ExpirationModel` and `ValidTo`
@@ -2159,6 +2167,7 @@ impl std::fmt::Debug for Cmk {
             .field("rotations", &self.rotations)
             .field("rotation_schedule", &self.rotation_schedule)
             .field("last_usage", &self.last_usage)
+            .field("tracked_last_usage", &self.tracked_last_usage)
             .field("imported_material", &self.imported_material)
             .field("pending_rotation_material", &self.pending_rotation_material)
             .finish()
@@ -2230,6 +2239,7 @@ impl Cmk {
             // "the KeyLastUsage response element is empty"
             // (`smithy_query(query="doc",shape="GetKeyLastUsage")`).
             last_usage: None,
+            tracked_last_usage: None,
             // A key created with no key material has not been given any yet, and a key
             // whose material KMS generated never carries imported material.
             imported_material: None,
@@ -2329,6 +2339,7 @@ impl Cmk {
             // "primary and replica keys track last usage independently"
             // (`smithy_query(query="doc",shape="GetKeyLastUsage")`).
             last_usage: None,
+            tracked_last_usage: None,
             // A replica of a key with imported material holds none until the same
             // material is imported into it, and one of a key whose material KMS
             // generated never carries imported material.
@@ -2347,14 +2358,29 @@ impl Cmk {
     ///
     /// "Returns usage information about the last successful cryptographic operation
     /// performed with a specified KMS key"
-    /// (`smithy_query(query="doc",shape="GetKeyLastUsage")`), so only the LAST one is
-    /// kept, and only a call that succeeded writes it: a refused call did not use the
-    /// key. The CloudTrail event id and the request id belong to the call that is
-    /// being recorded, so each is minted here rather than derived from the request.
+    /// (`smithy_query(query="doc",shape="GetKeyLastUsage")`), so what is reported is
+    /// always the latest use the tracking has produced a record for, and only a call that
+    /// succeeded writes one: a refused call did not use the key. The CloudTrail event id
+    /// and the request id belong to the call that is being recorded, so each is minted
+    /// here rather than derived from the request.
     pub fn record_last_usage(&mut self, operation: &str) {
+        let now = SystemTime::now();
+        // The record the tracking has already PRODUCED is kept beside the new one, so
+        // the use being recorded replaces nothing a reader has been told until the
+        // tracking produces it too: "if the KeyLastUsage response element is present,
+        // the key has been used for a successful cryptographic operation since the
+        // TrackingStartDate"
+        // (`smithy_query(query="doc",shape="GetKeyLastUsage")`) is a monotone fact
+        // about the key, so a further use never takes it back to the empty record.
+        // A use the tracking had NOT produced yet is superseded by this one instead —
+        // the pipeline coalesces the two, and only the later record is ever reported,
+        // which keeps what one key holds bounded however often it is used.
+        if let Some(produced) = self.last_usage.take().filter(|usage| usage.tracked_by(now)) {
+            self.tracked_last_usage = Some(produced);
+        }
         self.last_usage = Some(KeyUsage {
             operation: operation.to_string(),
-            at: SystemTime::now(),
+            at: now,
             cloud_trail_event_id: ::uuid::Uuid::new_v4().to_string(),
             kms_request_id: ::uuid::Uuid::new_v4().to_string(),
         });
@@ -2363,9 +2389,14 @@ impl Cmk {
     /// The usage record `GetKeyLastUsage` reports for this key at `now`.
     ///
     /// The record a use of the key wrote is reported only once the usage tracking has
-    /// produced it ([`KeyUsage::tracked_by`]); until then — and for a key that has had
-    /// no cryptographic operation at all — what is reported is the EMPTY record, every
-    /// member of which is "absent if the key has not been used since KMS began tracking"
+    /// produced it ([`KeyUsage::tracked_by`]); until then what is reported is the record
+    /// the tracking produced BEFORE it ([`Self::tracked_last_usage`]), because the
+    /// element's presence is a monotone fact about the key — a later use replaces the
+    /// reported record and never erases it. For a key no use of which the tracking has
+    /// produced a record for yet — including one whose only use is still in the pipeline,
+    /// and one that has had no cryptographic operation at all — what is reported is the
+    /// EMPTY record, every member of which is "absent if the key has not been used since
+    /// KMS began tracking"
     /// (`smithy_query(query="shape",shape="KeyLastUsageData")`). Reporting it writes
     /// nothing: whether the tracking has caught up follows from the instant the use was
     /// recorded at, so every reader agrees without one of them persisting the answer.
@@ -2373,6 +2404,7 @@ impl Cmk {
         self.last_usage
             .as_ref()
             .filter(|usage| usage.tracked_by(now))
+            .or(self.tracked_last_usage.as_ref())
             .map(KeyUsage::last_usage_data)
             .unwrap_or_default()
     }

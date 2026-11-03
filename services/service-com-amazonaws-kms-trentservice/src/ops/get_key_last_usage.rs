@@ -11,12 +11,15 @@
 //! What `KeyLastUsage` carries is a TRACKED usage record. The cryptographic operations
 //! write the record ([`crate::state::Cmk::record_last_usage`]), and the tracking that
 //! starts at `TrackingStartDate` produces it a little after the call it records
-//! ([`crate::state::USAGE_TRACKING_LAG`]) — so a caller reading straight after using the
-//! key is answered the EMPTY record, every member of which is "absent if the key has not
-//! been used since KMS began tracking"
+//! ([`crate::state::USAGE_TRACKING_LAG`]) — so a caller reading straight after the FIRST
+//! use of a key is answered the EMPTY record, every member of which is "absent if the key
+//! has not been used since KMS began tracking"
 //! (`smithy_query(query="shape",shape="KeyLastUsageData")`), which is also what a key
-//! that has had no cryptographic operation at all is answered. Whether the tracking has
-//! caught up follows from the instant the use was recorded at
+//! that has had no cryptographic operation at all is answered. Once the tracking HAS
+//! produced a record, a further use replaces it only when the tracking produces the newer
+//! one: the element's presence is a monotone fact about the key, so the reported record is
+//! held at the value a reader has been told and its timestamp only advances. Which record
+//! that is follows from the instants the uses were recorded at
 //! ([`crate::state::Cmk::reported_last_usage`]), so this read persists nothing.
 //!
 //! ## Shape of an operation
@@ -252,8 +255,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // tracking began, this response element is EMPTY" — an empty record, every
             // member of which is "absent if the key has not been used since KMS began
             // tracking". The record of a use the tracking has not produced yet is not
-            // reported either (see this module's header), so what a caller reads
-            // straight after using the key is that same empty record.
+            // reported: until it does, the answer is the record the tracking produced
+            // before it, and the empty record only while it has produced none at all
+            // (see this module's header).
             key_last_usage: Some(key.reported_last_usage(::std::time::SystemTime::now())),
             // "The date from which KMS began recording cryptographic activity for this
             // key, or the date the KMS key was created, whichever is later."

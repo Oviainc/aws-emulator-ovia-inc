@@ -8,12 +8,15 @@
 //! that record a little after the call it records
 //! (`state::USAGE_TRACKING_LAG`) — so
 //!
-//! * a read taken straight after a use of the key is answered the EMPTY record, every
-//!   member of which is "absent if the key has not been used since KMS began tracking"
+//! * a read taken straight after a use of the key the tracking has produced no record for
+//!   yet is answered the EMPTY record, every member of which is "absent if the key has not
+//!   been used since KMS began tracking"
 //!   (`smithy_query(query="shape",shape="KeyLastUsageData")`), which is also what a key
 //!   that has had no cryptographic operation at all is answered;
 //! * once the tracking has caught up the record names that operation, at an instant that
-//!   never moves backwards, with a CloudTrail event id and a KMS request id of its own;
+//!   never moves backwards, with a CloudTrail event id and a KMS request id of its own —
+//!   and from then on a record is always reported, which is
+//!   [`super::key_last_usage_monotonicity`]'s subject;
 //! * a call that is refused writes nothing, `GetKeyLastUsage` only reports, and each key
 //!   keeps its own record — including each key of a multi-Region key set.
 //!
