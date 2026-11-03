@@ -1996,6 +1996,20 @@ impl ComAmazonawsGlueAwsglueState {
             .insert(entry.id.clone(), entry);
     }
 
+    /// Remove the session `id` from the Region `region`, answering the record that was
+    /// removed, or `None` when that Region holds no session under that id.
+    ///
+    /// The whole record goes: the statements run on a session are held ON the entry
+    /// ([`SessionEntry::statements`]), so the id a delete frees carries none of them into
+    /// the next create under it. Matched by id and Region exactly as the read path matches
+    /// them ([`Self::session`]), and the removed entry is handed back rather than dropped,
+    /// for symmetry with [`Self::remove_job`].
+    pub fn remove_session(&mut self, region: &str, id: &str) -> Option<SessionEntry> {
+        self.sessions
+            .get_mut(region)
+            .and_then(|sessions| sessions.remove(id))
+    }
+
     /// Start a run of the blueprint `input` names at `now` and answer the id minted for that
     /// run, or why no run could be started.
     ///
@@ -6242,6 +6256,21 @@ pub const SESSION_STATUS_READY: &str = "READY";
 /// before session times out" (`CreateSessionRequest$IdleTimeout`) has passed. See
 /// [`SESSION_STATUS_PROVISIONING`].
 pub const SESSION_STATUS_TIMEOUT: &str = "TIMEOUT";
+
+/// The `SessionStatus` of a session a stop has begun on and whose environment is still being
+/// torn down. See [`SESSION_STATUS_PROVISIONING`].
+pub const SESSION_STATUS_STOPPING: &str = "STOPPING";
+
+/// Whether a session in `status` is still being moved between statuses by the service
+/// itself, rather than resting in one only a caller can move it out of.
+///
+/// Of the modelled `SessionStatus` values (`smithy_query shape=SessionStatus`) exactly two
+/// are such a status: the environment is being brought up
+/// ([`SESSION_STATUS_PROVISIONING`]) or taken down ([`SESSION_STATUS_STOPPING`]). The other
+/// four — `READY`, `FAILED`, `TIMEOUT` and `STOPPED` — are where a session rests.
+pub fn session_status_is_transitional(status: &str) -> bool {
+    status == SESSION_STATUS_PROVISIONING || status == SESSION_STATUS_STOPPING
+}
 
 /// How long a session stays in [`SESSION_STATUS_PROVISIONING`] before the clock owes it
 /// [`SESSION_STATUS_READY`].
@@ -12628,6 +12657,15 @@ pub mod messages {
     /// not an AWS quota, so the sentence says which ceiling was reached.
     pub fn too_many_sessions(ceiling: usize) -> String {
         format!("this endpoint holds {ceiling} sessions, which is as many as it can hold")
+    }
+
+    /// A session request that cannot act on a session the service is still moving between
+    /// statuses ([`super::session_status_is_transitional`]), which is what `DeleteSession`
+    /// refuses with its modelled `IllegalSessionStateException`. RECORDED: the sentence is
+    /// fixed text around the status the session is actually in, read off the store, and
+    /// names no session — the caller already knows which id it asked about.
+    pub fn session_in_illegal_state(status: &str) -> String {
+        format!("Session is in {status} status")
     }
 
     /// A statement run on a session whose `SessionStatus` is not

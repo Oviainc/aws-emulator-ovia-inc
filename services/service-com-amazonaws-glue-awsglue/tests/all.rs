@@ -235,6 +235,8 @@ mod schema_version_deletion;
 mod search_tables;
 #[path = "all/security_configurations.rs"]
 mod security_configurations;
+#[path = "all/session_deletion.rs"]
+mod session_deletion;
 #[path = "all/sessions.rs"]
 mod sessions;
 #[path = "all/state_roundtrip.rs"]

@@ -54,7 +54,7 @@ const ROLE: &str = "arn:aws:iam::000000000000:role/GlueSessionRole";
 const SECONDS_PER_MINUTE: u64 = 60;
 
 /// Create the session `id`, with the create body `extra` merged over the required members.
-async fn create_session(router: &MultiServiceRouter, id: &str, extra: Value) {
+pub(crate) async fn create_session(router: &MultiServiceRouter, id: &str, extra: Value) {
     let mut body = json!({
         "Id": id,
         "Role": ROLE,
@@ -69,7 +69,7 @@ async fn create_session(router: &MultiServiceRouter, id: &str, extra: Value) {
 }
 
 /// Put the instant the clock owes the session `id` its next status at `at`.
-fn set_session_due(engine: &Arc<engine::InMemoryEngine>, id: &str, at: SystemTime) {
+pub(crate) fn set_session_due(engine: &Arc<engine::InMemoryEngine>, id: &str, at: SystemTime) {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let mut store = state.lock();
     let entry = store
@@ -118,7 +118,7 @@ pub(crate) fn reach_due_instant(engine: &Arc<engine::InMemoryEngine>, id: &str) 
 
 /// Pull the session `id`'s own instants back by `elapsed`, so a suite can observe the
 /// status the clock owes it without sleeping for the span.
-fn rewind_session(engine: &Arc<engine::InMemoryEngine>, id: &str, elapsed: Duration) {
+pub(crate) fn rewind_session(engine: &Arc<engine::InMemoryEngine>, id: &str, elapsed: Duration) {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let mut store = state.lock();
     let entry = store

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Deletes the session stored under an `Id` in the Region the request is served in
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::sessions`]), so every later read of that
+//! id is a miss and the id is free for another create.
+//!
+//! The operation models no entity-miss failure, so an id this Region holds no session under
+//! is SERVED rather than refused: it reports the id it was addressed by and changes nothing,
+//! which makes a repeated delete of one session a no-op.
+//!
+//! A session the service is still moving between statuses of its own accord — its
+//! environment is being brought up, or taken down — has nothing settled for a delete to act
+//! on, so the request is refused with the operation's modelled
+//! `IllegalSessionStateException` and the record is left alone. The status the CLOCK had
+//! already made due is materialised before that is judged, so a session whose provisioning
+//! was due to finish is deleted rather than refused on a stale status.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +160,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSession"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(DeleteSessionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue session store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The name of the origin of the delete session request" names who is asking, not
+        // which session is deleted, so it changes nothing about this delete.
+        let _ = &input.request_origin;
+        // A session is served only through the endpoint that created it, so the Region and
+        // the id together are the whole address this delete resolves.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        if let Some(entry) = store.session_mut(&region, &input.id) {
+            // The only write made before the delete is judged is the one the clock had
+            // already made due: a session whose provisioning was due to finish has finished
+            // it whether or not anybody called, and that is the status this delete is
+            // allowed or refused on.
+            entry.settle_if_due(now);
+            let status = entry.status.clone();
+
+            // A session the service is itself still moving between statuses has no settled
+            // environment to tear down, so the delete is refused and the record left as it
+            // is.
+            if crate::state::session_status_is_transitional(&status) {
+                return Err(DeleteSessionErrorModeled::IllegalSessionStateException(
+                    IllegalSessionStateException {
+                        message: Some(crate::state::messages::session_in_illegal_state(&status)),
+                    },
+                )
+                .into());
+            }
+
+            // The whole record goes, statements and all, so the id is a miss for every later
+            // read and free for another create.
+            store.remove_session(&region, &input.id);
+            ::tracing::info!(
+                operation = "DeleteSession",
+                region = %region,
+                session = %input.id,
+                status = %status,
+                "deleted a Glue interactive session"
+            );
+        }
+
+        // "Returns the ID of the deleted session": the id the delete was addressed by, which
+        // an id this Region holds no session under is answered with too — the operation
+        // models no entity-miss failure, so there is nothing left to delete and nothing to
+        // refuse.
+        Ok(DeleteSessionOutput { id: Some(input.id) })
     }
 }
