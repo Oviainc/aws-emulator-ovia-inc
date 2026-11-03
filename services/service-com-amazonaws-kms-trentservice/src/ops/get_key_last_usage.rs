@@ -2,15 +2,22 @@
 
 //! @op GetKeyLastUsage
 //! IMPLEMENTED: reports when the KMS key a `KeyId` names was last used in a
-//! successful cryptographic operation. This is the ONLY file to touch for this
-//! operation.
+//! successful cryptographic operation, as KMS's OWN usage tracking records it. This is
+//! the ONLY file to touch for this operation.
 //!
 //! A REPORTING operation: it reads the key record and writes nothing, so two calls
-//! with no cryptographic operation between them answer the same. What it reports is
-//! written by the cryptographic operations themselves
-//! ([`crate::state::Cmk::record_last_usage`]), so a key that has had none answers with
-//! `KeyLastUsage` absent — which is what "the key has not been used for a successful
-//! cryptographic operation since it was created" is reported as.
+//! with no cryptographic operation between them answer the same.
+//!
+//! What `KeyLastUsage` carries is a TRACKED usage record. The cryptographic operations
+//! write the record ([`crate::state::Cmk::record_last_usage`]), and the tracking that
+//! starts at `TrackingStartDate` produces it a little after the call it records
+//! ([`crate::state::USAGE_TRACKING_LAG`]) — so a caller reading straight after using the
+//! key is answered the EMPTY record, every member of which is "absent if the key has not
+//! been used since KMS began tracking"
+//! (`smithy_query(query="shape",shape="KeyLastUsageData")`), which is also what a key
+//! that has had no cryptographic operation at all is answered. Whether the tracking has
+//! caught up follows from the instant the use was recorded at
+//! ([`crate::state::Cmk::reported_last_usage`]), so this read persists nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -242,12 +249,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             key_id: Some(key.key_id.clone()),
             // "Contains usage information about the last time the KMS key was used for
             // a successful cryptographic operation. If the key has not been used since
-            // tracking began, this response element is empty" — so the member is absent
-            // for a key with no recorded use, never an empty record.
-            key_last_usage: key
-                .last_usage
-                .as_ref()
-                .map(crate::state::KeyUsage::last_usage_data),
+            // tracking began, this response element is EMPTY" — an empty record, every
+            // member of which is "absent if the key has not been used since KMS began
+            // tracking". The record of a use the tracking has not produced yet is not
+            // reported either (see this module's header), so what a caller reads
+            // straight after using the key is that same empty record.
+            key_last_usage: Some(key.reported_last_usage(::std::time::SystemTime::now())),
             // "The date from which KMS began recording cryptographic activity for this
             // key, or the date the KMS key was created, whichever is later."
             tracking_start_date: Some(crate::state::date_time(key.tracking_start_date())),

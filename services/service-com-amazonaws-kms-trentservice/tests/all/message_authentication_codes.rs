@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 
 use super::harness::{
     alias_arn, b64, call, contains, create_alias, create_key, describe, error_code, ok, refused,
-    router, text, unb64, REGION,
+    router, text, tracked_last_usage, unb64, REGION,
 };
 
 /// The longest MAC the model lets `GenerateMac` answer: `Mac` is a `CiphertextType` of
@@ -703,8 +703,10 @@ async fn a_mac_comes_from_the_persisted_key_material() {
             "case {case}: generating a MAC must not change the key's metadata"
         );
 
-        // And the use itself is reported, which is how the store shows it was written.
-        let usage = ok(&router, "GetKeyLastUsage", &json!({"KeyId": key_id})).await;
+        // The use is recorded, and KMS's usage tracking produces that record a little
+        // after the call: once it has, the record names this operation.
+        let usage =
+            tracked_last_usage(&router, &case, &key_id, "GenerateMac", &Value::Null).await;
         assert_eq!(
             usage["KeyLastUsage"]["Operation"]
                 .as_str()
@@ -720,13 +722,14 @@ async fn a_mac_comes_from_the_persisted_key_material() {
             &verify_request(&key_id, algorithm, &message, &mac),
         )
         .await;
-        let usage = ok(&router, "GetKeyLastUsage", &json!({"KeyId": key_id})).await;
+        let after_verify =
+            tracked_last_usage(&router, &case, &key_id, "VerifyMac", &usage).await;
         assert_eq!(
-            usage["KeyLastUsage"]["Operation"]
+            after_verify["KeyLastUsage"]["Operation"]
                 .as_str()
                 .unwrap_or_default(),
             "VerifyMac",
-            "case {case}: the key's last usage must name VerifyMac, got {usage}"
+            "case {case}: the key's last usage must name VerifyMac, got {after_verify}"
         );
 
         macs.push((key_id, key_arn, mac));

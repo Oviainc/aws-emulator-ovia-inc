@@ -592,7 +592,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Both keys were just used in a successful cryptographic operation, which is
-        // what `GetKeyLastUsage` reports. A reencrypt to the same key used it once.
+        // what `GetKeyLastUsage` reports once the tracking has produced the record. A
+        // reencrypt to the same key used it once.
         state.record_last_usage(&region, &rewrapped.source_key_id, Self::NAME);
         if rewrapped.destination_key_id != rewrapped.source_key_id {
             state.record_last_usage(&region, &rewrapped.destination_key_id, Self::NAME);

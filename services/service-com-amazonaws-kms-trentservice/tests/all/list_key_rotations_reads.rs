@@ -171,11 +171,12 @@ async fn every_identifier_form_lists_the_rotations_of_the_resolved_key() {
                 for (position, entry) in listed.iter().enumerate() {
                     let case = format!("{case} entry {position}");
                     // "Unique identifier of the key": the entry names the key the
-                    // material belongs to, whichever identifier form asked for it.
+                    // material belongs to by its key ARN — the fully qualified
+                    // identifier — whichever identifier form asked for it.
                     assert_eq!(
                         entry["KeyId"],
-                        json!(key_id),
-                        "case {case:?}: expected the entry to name the key {key_id}, got {entry}"
+                        json!(key_arn),
+                        "case {case:?}: expected the entry to name the key {key_arn}, got {entry}"
                     );
                     let material = text(&case, entry, "KeyMaterialId");
                     assert_eq!(
@@ -610,6 +611,7 @@ async fn including_all_key_material_adds_the_material_the_key_was_created_with()
         let case = format!("{history} rotation(s)");
         let metadata = create_key(&router, &json!({"Description": case.clone()})).await;
         let key_id = text(&case, &metadata, "KeyId");
+        let key_arn = text(&case, &metadata, "Arn");
         let created_with = text(&case, &metadata, "CurrentKeyMaterialId");
         let rotated = rotate(&router, &case, &key_id, history).await;
 
@@ -644,8 +646,8 @@ async fn including_all_key_material_adds_the_material_the_key_was_created_with()
         );
         assert_eq!(
             first["KeyId"],
-            json!(key_id),
-            "case {case:?}: expected the entry to name the key {key_id}, got {first}"
+            json!(key_arn),
+            "case {case:?}: expected the entry to name the key {key_arn}, got {first}"
         );
         assert!(
             first["RotationDate"].is_null() && first["RotationType"].is_null(),

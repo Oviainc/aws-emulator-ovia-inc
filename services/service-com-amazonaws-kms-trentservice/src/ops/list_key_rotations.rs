@@ -299,6 +299,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // are filled from what the caller stated at the import that supplied it
         // ([`crate::state::ImportedKeyMaterial`]) and are absent for material KMS
         // generated.
+        //
+        // Every entry names the key by its key ARN: a `KeyId` member documented as
+        // "unique identifier of the key" (`smithy_query(query="shape",shape="RotationsListEntry")`)
+        // and not as the key id alone is the FULLY QUALIFIED identifier, so it is
+        // unambiguous outside the Region and account the request was made in. The ARN is
+        // the one the key record holds, so it names the Region and account of the key
+        // being listed rather than anything read off the request.
         let external = key.origin == crate::state::ORIGIN_EXTERNAL;
         // The rotations this key has had, which includes one the clock has completed
         // but the record does not hold yet ([`crate::state::Cmk::reported_rotations`]).
@@ -314,7 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .filter(|_| external && rotations.is_empty());
             listed.push(RotationsListEntry {
-                key_id: Some(key.key_id.clone()),
+                key_id: Some(key.arn.clone()),
                 key_material_state: Some(material_state(key, first_key_material_id.as_deref())),
                 key_material_id: first_key_material_id,
                 key_material_description: imported
@@ -345,7 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // about it; one onto material KMS generated has nothing to state.
             let imported = rotation.imported.as_ref().filter(|_| external);
             RotationsListEntry {
-                key_id: Some(key.key_id.clone()),
+                key_id: Some(key.arn.clone()),
                 key_material_id: rotation.key_material_id.clone(),
                 key_material_description: imported
                     .and_then(|imported| imported.description.clone()),
@@ -370,7 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|_| include_first_material)
         {
             listed.push(RotationsListEntry {
-                key_id: Some(key.key_id.clone()),
+                key_id: Some(key.arn.clone()),
                 key_material_id: key.pending_rotation_key_material_id(),
                 key_material_description: pending.imported.description.clone(),
                 import_state: Some(IMPORT_STATE_IMPORTED.to_string()),

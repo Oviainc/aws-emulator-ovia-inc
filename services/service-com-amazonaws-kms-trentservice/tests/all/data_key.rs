@@ -471,18 +471,36 @@ async fn a_request_states_exactly_one_length_or_is_refused() {
     let router = router();
     let metadata = create_key(&router, &json!({"Description": "length exclusivity"})).await;
     let key_id = text("setup", &metadata, "KeyId");
+    // The refused rows name a key of their own, which nothing ever generates a data key
+    // under: a key no successful call has used holds no usage record, so what
+    // `GetKeyLastUsage` reports for it is the empty record whenever it is asked.
+    let refused_key = create_key(&router, &json!({"Description": "nothing generated"})).await;
+    let refused_key_id = text("setup", &refused_key, "KeyId");
 
-    // A refused call is not a use of the key, so `GetKeyLastUsage` is the witness that
-    // nothing was generated: it stays empty until the first served row.
-    let fresh = ok(&router, "GetKeyLastUsage", &json!({"KeyId": key_id})).await;
-    assert!(
-        fresh["KeyLastUsage"].is_null(),
-        "case setup: a key with no cryptographic use reports no KeyLastUsage, got {fresh}"
+    let fresh = ok(
+        &router,
+        "GetKeyLastUsage",
+        &json!({"KeyId": refused_key_id}),
+    )
+    .await;
+    assert_eq!(
+        fresh["KeyLastUsage"],
+        json!({}),
+        "case setup: a key with no tracked usage record reports an empty KeyLastUsage, got \
+         {fresh}"
     );
 
     let mut served = 0usize;
     for row in exclusivity_cases() {
-        let mut body = json!({"KeyId": key_id});
+        // A row that is refused is refused for the lengths it states, so it names the
+        // key no call succeeds on; a row that is served names the key the data key is
+        // generated under.
+        let named_key = if row.bytes.is_some() {
+            &key_id
+        } else {
+            &refused_key_id
+        };
+        let mut body = json!({"KeyId": named_key});
         for (member, value) in row
             .length
             .as_object()
@@ -490,7 +508,6 @@ async fn a_request_states_exactly_one_length_or_is_refused() {
         {
             body[member] = value.clone();
         }
-        let before = ok(&router, "GetKeyLastUsage", &json!({"KeyId": key_id})).await;
         let (status, payload) = call(&router, REGION, OPERATION, &body).await;
 
         match row.bytes {
@@ -524,13 +541,19 @@ async fn a_request_states_exactly_one_length_or_is_refused() {
                     "case {:?}: a refusal must carry no data key, got {payload}",
                     row.case
                 );
-                // Nothing was generated, so nothing was done with the key: what
-                // `GetKeyLastUsage` reports is exactly what it reported before the call.
-                let after = ok(&router, "GetKeyLastUsage", &json!({"KeyId": key_id})).await;
+                // Nothing was generated, so nothing used the key the request named: it
+                // still holds no usage record, and `GetKeyLastUsage` still reports the
+                // empty one.
+                let after = ok(
+                    &router,
+                    "GetKeyLastUsage",
+                    &json!({"KeyId": refused_key_id}),
+                )
+                .await;
                 assert_eq!(
-                    after["KeyLastUsage"], before["KeyLastUsage"],
+                    after, fresh,
                     "case {:?}: a refused request must not record a use of the key, got \
-                     {after} after {before}",
+                     {after} after {fresh}",
                     row.case
                 );
             }

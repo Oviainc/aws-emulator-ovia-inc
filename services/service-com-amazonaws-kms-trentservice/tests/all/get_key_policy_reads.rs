@@ -19,7 +19,7 @@
 
 use serde_json::{json, Value};
 
-use super::harness::{b64, create_key, describe, ok, router, text};
+use super::harness::{b64, create_key, describe, ok, reported_policy, router, text};
 
 /// The only key policy name a KMS key has a policy under: "The only valid value is
 /// default" (`smithy_query(query="doc",shape="GetKeyPolicyResponse",member="PolicyName")`).
@@ -181,8 +181,9 @@ async fn the_served_document_does_not_move_when_the_key_is_written_for_another_r
     let served = read_policy(&router, &key_id, None).await;
     assert_eq!(
         served_document("setup", &served),
-        document,
-        "case setup: the reader must serve the attached document verbatim, got {served}"
+        reported_policy(&document),
+        "case setup: the reader must serve the attached document in KMS's own rendering of \
+         it, got {served}"
     );
 
     // Rows: a call that writes the key, or uses it, without touching its policy. The

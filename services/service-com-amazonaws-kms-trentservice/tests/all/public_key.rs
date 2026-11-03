@@ -662,9 +662,11 @@ async fn get_public_key_refuses_every_key_that_has_no_public_half() {
         &json!({"KeyId": signing_key_id}),
     )
     .await;
-    assert!(
-        last_usage["KeyLastUsage"].is_null(),
-        "case last usage: downloading the public key is not a use of the key, got {last_usage}"
+    assert_eq!(
+        last_usage["KeyLastUsage"],
+        json!({}),
+        "case last usage: downloading the public key is not a tracked use of the key, got \
+         {last_usage}"
     );
     // And the key itself is untouched by the read.
     let described = describe(&router, &signing_key_id).await;

@@ -27,7 +27,7 @@ use service_com_amazonaws_kms_trentservice::state::key_arn;
 
 use super::harness::{
     b64, call, create_alias, create_key, describe, error_code, failure, failure_in, ok, ok_in,
-    router, settle_key_state, text, unb64, REGION,
+    reported_policy, router, settle_key_state, text, unb64, REGION,
 };
 
 /// The metadata members a replica key SHARES with the primary key it was replicated
@@ -313,7 +313,8 @@ async fn replicate_key_creates_a_key_of_the_set_in_the_replica_region() {
         let replica_policy = text(case, &answer, "ReplicaPolicy");
         if let Some(policy) = &expected_policy {
             assert_eq!(
-                &replica_policy, policy,
+                replica_policy,
+                reported_policy(policy),
                 "case {case}: the replica's policy is the one the request gave, got \
                  {replica_policy}"
             );

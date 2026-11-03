@@ -44,7 +44,7 @@ use serde_json::{json, Value};
 use super::grant_authorization::{
     account_root_statement, assert_denied, identity_allow, policy, Emulator, ACCOUNT_KEY,
 };
-use super::harness::{b64, text};
+use super::harness::{b64, reported_policy, text};
 
 /// The plaintext every case below seals and opens again.
 const PAYLOAD: &[u8] = b"key policy deny scope payload";
@@ -433,7 +433,7 @@ async fn a_key_policy_deny_is_read_from_the_stored_policy_on_every_call() {
             .await;
         assert_eq!(
             read_back["Policy"],
-            json!(document),
+            json!(reported_policy(document)),
             "case {case:?}: the policy in force must be the one the last PutKeyPolicy \
              wrote, got {read_back:?}"
         );

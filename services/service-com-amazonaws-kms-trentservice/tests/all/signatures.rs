@@ -31,7 +31,8 @@ use aws_lc_rs::signature::{ParsedPublicKey, VerificationAlgorithm};
 use serde_json::{json, Value};
 
 use super::harness::{
-    b64, call, contains, create_key, describe, error_code, ok, router, text, unb64, REGION,
+    b64, call, contains, create_key, describe, error_code, ok, router, text, tracked_last_usage,
+    unb64, REGION,
 };
 
 /// The longest signature the model lets this operation answer:
@@ -838,8 +839,9 @@ async fn a_signature_comes_from_the_persisted_key_pair() {
             "case {case}: signing must not change the key's metadata"
         );
 
-        // And the use itself is reported, which is how the store shows it was written.
-        let usage = ok(&router, "GetKeyLastUsage", &json!({"KeyId": key_id})).await;
+        // The use is recorded, and KMS's usage tracking produces that record a little
+        // after the call: once it has, the record names this operation.
+        let usage = tracked_last_usage(&router, &case, &key_id, "Sign", &Value::Null).await;
         assert_eq!(
             usage["KeyLastUsage"]["Operation"].as_str().unwrap_or_default(),
             "Sign",

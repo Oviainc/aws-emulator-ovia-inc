@@ -169,6 +169,17 @@ pub(crate) async fn failure_in(
     (status, error_code(&payload))
 }
 
+/// The text `GetKeyPolicy` (and `ReplicateKey`'s `ReplicaPolicy`) reports for the key
+/// policy document `submitted`: KMS renders an attached policy into its own layout
+/// rather than echoing the caller's bytes, so a suite that attaches a document and reads
+/// it back compares against this. WHAT that layout is — the two-space indentation, the
+/// ` : ` separator, the inline arrays — is pinned against text written out by hand in
+/// [`super::read_projection_fidelity`]; here it is only the reference point a round trip
+/// is measured from.
+pub(crate) fn reported_policy(submitted: &str) -> String {
+    ::service_common::iam_policy::canonical_document(submitted)
+}
+
 /// The wire error code (`__type`) of an error body, without its namespace.
 pub(crate) fn error_code(payload: &Value) -> String {
     payload["__type"]
@@ -695,6 +706,57 @@ pub(crate) async fn settle_rotation_in(
             "case {case}: the on-demand rotation of {identifier} must complete, got {status}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// The whole `GetKeyLastUsage` answer for the key `identifier` names, once KMS's usage
+/// tracking has PRODUCED a record that names `operation` and is not the one `previous`
+/// carries (pass `&Value::Null` when there was none).
+///
+/// The tracking lags the call it records (`state::USAGE_TRACKING_LAG`), so a read taken
+/// straight after a cryptographic operation is answered the empty record; a case that is
+/// about WHAT was recorded waits for it here, and the empty answer a read gets in the
+/// meantime is asserted by the suite that is about that
+/// (`tests/all/key_last_usage.rs`).
+pub(crate) async fn tracked_last_usage(
+    router: &MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+    operation: &str,
+    previous: &Value,
+) -> Value {
+    tracked_last_usage_in(router, REGION, case, identifier, operation, previous).await
+}
+
+/// [`tracked_last_usage`], through the endpoint of `region`.
+pub(crate) async fn tracked_last_usage_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    identifier: &str,
+    operation: &str,
+    previous: &Value,
+) -> Value {
+    let deadline = std::time::Instant::now()
+        + service_com_amazonaws_kms_trentservice::state::USAGE_TRACKING_LAG * 20;
+    loop {
+        let answer = ok_in(
+            router,
+            region,
+            "GetKeyLastUsage",
+            &json!({"KeyId": identifier}),
+        )
+        .await;
+        let record = &answer["KeyLastUsage"];
+        if record["Operation"] == json!(operation) && *record != previous["KeyLastUsage"] {
+            return answer;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case}: the usage tracking must produce the record of the {operation} of \
+             {identifier}, got {answer}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 

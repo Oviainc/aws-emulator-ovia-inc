@@ -224,6 +224,21 @@ pub const MAX_ON_DEMAND_ROTATIONS: usize = 25;
 /// under the material it had, because that is what an in-progress rotation is.
 pub const ON_DEMAND_ROTATION_SPAN: Duration = Duration::from_millis(300);
 
+/// How long KMS's usage tracking takes to produce the record `GetKeyLastUsage`
+/// reports: "the TrackingStartDate in the GetKeyLastUsage response indicates the date
+/// from which KMS began recording cryptographic activity for a given key"
+/// (`smithy_query(query="doc",shape="GetKeyLastUsage")`) — the recording is a pipeline
+/// of its own and lags the call it records, which is why the recorded response of a
+/// `GetKeyLastUsage` made straight after a cryptographic operation carries the usage
+/// record EMPTY.
+///
+/// The documentation puts no number on that lag, so the length of the span is this
+/// emulator's, like [`ON_DEMAND_ROTATION_SPAN`]. It is NON-ZERO, so a caller reading the
+/// record straight after using the key still sees what AWS answers there — nothing
+/// recorded yet — and it is a few seconds at most, so a caller polling for the record
+/// gets it without waiting long.
+pub const USAGE_TRACKING_LAG: Duration = Duration::from_secs(3);
+
 /// The rotation period an `EnableKeyRotation` that names none gets: "If no value is
 /// specified, the default value is 365 days"
 /// (`smithy_query(query="doc",shape="EnableKeyRotationRequest",member="RotationPeriodInDays")`).
@@ -1931,8 +1946,9 @@ pub struct Cmk {
     /// [`MultiRegionTopology`]. `Some` is exactly what the `MultiRegion` metadata
     /// member reports as `true`, so the two can never disagree.
     pub multi_region_topology: Option<MultiRegionTopology>,
-    /// The key policy document, as supplied or as defaulted by
-    /// [`default_key_policy`].
+    /// The key policy document this key holds, in the layout KMS reports it in
+    /// ([`attached_key_policy`]) — the document a request attached, or the one
+    /// [`default_key_policy`] builds for a key created without one.
     pub policy: String,
     /// Set by `ScheduleKeyDeletion`, cleared while the key is not pending deletion.
     pub deletion_date: Option<SystemTime>,
@@ -1966,7 +1982,8 @@ pub struct Cmk {
     /// `GetKeyRotationStatus` reports it.
     pub rotation_schedule: Option<RotationSchedule>,
     /// The last successful cryptographic operation performed with this key, or
-    /// `None` while it has had none — the record `GetKeyLastUsage` reports. Every
+    /// `None` while it has had none — the record `GetKeyLastUsage` reports once the
+    /// usage tracking has caught up with it ([`USAGE_TRACKING_LAG`]). Every
     /// cryptographic operation that succeeds writes it ([`Self::record_last_usage`]);
     /// a reporting operation never does.
     pub last_usage: Option<KeyUsage>,
@@ -2071,8 +2088,14 @@ impl std::fmt::Debug for PendingRotationMaterial {
     }
 }
 
-/// One use of a KMS key in a successful cryptographic operation, as
-/// `GetKeyLastUsage` reports it (`smithy_query(query="shape",shape="KeyLastUsageData")`).
+/// One use of a KMS key in a successful cryptographic operation, as KMS's usage
+/// tracking records it and `GetKeyLastUsage` reports it
+/// (`smithy_query(query="shape",shape="KeyLastUsageData")`).
+///
+/// The record is written by the call it describes and reported only once the tracking
+/// that produces it has caught up ([`USAGE_TRACKING_LAG`]), which is what a reader sees
+/// as "the KeyLastUsage response element is empty" straight after a cryptographic
+/// operation.
 #[derive(Debug, Clone)]
 pub struct KeyUsage {
     /// The name of the KMS API operation that used the key.
@@ -2087,6 +2110,12 @@ pub struct KeyUsage {
 }
 
 impl KeyUsage {
+    /// Whether the usage tracking has produced this record by `now`, which is what
+    /// makes it reportable: it is due [`USAGE_TRACKING_LAG`] after the call it records.
+    pub fn tracked_by(&self, now: SystemTime) -> bool {
+        now >= self.at + USAGE_TRACKING_LAG
+    }
+
     /// This record as `GetKeyLastUsage` projects it onto the wire — the one place a
     /// usage record is serialized, so two readers cannot disagree.
     pub fn last_usage_data(&self) -> KeyLastUsageData {
@@ -2185,7 +2214,7 @@ impl Cmk {
             origin,
             key_manager: KEY_MANAGER_CUSTOMER.to_string(),
             multi_region_topology,
-            policy,
+            policy: attached_key_policy(&policy),
             deletion_date: None,
             pending_window_in_days: None,
             tags,
@@ -2280,7 +2309,7 @@ impl Cmk {
             origin: self.origin.clone(),
             key_manager: self.key_manager.clone(),
             multi_region_topology: Some(topology),
-            policy,
+            policy: attached_key_policy(&policy),
             deletion_date: None,
             pending_window_in_days: None,
             tags,
@@ -2296,7 +2325,9 @@ impl Cmk {
             // starts on the set's schedule.
             rotation_schedule: self.rotation_schedule.clone(),
             // The replica has not been used in a cryptographic operation yet; what
-            // the primary key was used for is the primary key's record.
+            // the primary key was used for is the primary key's record, because
+            // "primary and replica keys track last usage independently"
+            // (`smithy_query(query="doc",shape="GetKeyLastUsage")`).
             last_usage: None,
             // A replica of a key with imported material holds none until the same
             // material is imported into it, and one of a key whose material KMS
@@ -2327,6 +2358,33 @@ impl Cmk {
             cloud_trail_event_id: ::uuid::Uuid::new_v4().to_string(),
             kms_request_id: ::uuid::Uuid::new_v4().to_string(),
         });
+    }
+
+    /// The usage record `GetKeyLastUsage` reports for this key at `now`.
+    ///
+    /// The record a use of the key wrote is reported only once the usage tracking has
+    /// produced it ([`KeyUsage::tracked_by`]); until then — and for a key that has had
+    /// no cryptographic operation at all — what is reported is the EMPTY record, every
+    /// member of which is "absent if the key has not been used since KMS began tracking"
+    /// (`smithy_query(query="shape",shape="KeyLastUsageData")`). Reporting it writes
+    /// nothing: whether the tracking has caught up follows from the instant the use was
+    /// recorded at, so every reader agrees without one of them persisting the answer.
+    pub fn reported_last_usage(&self, now: SystemTime) -> KeyLastUsageData {
+        self.last_usage
+            .as_ref()
+            .filter(|usage| usage.tracked_by(now))
+            .map(KeyUsage::last_usage_data)
+            .unwrap_or_default()
+    }
+
+    /// Attach `policy` to this key, replacing the document it held.
+    ///
+    /// The document is stored in the layout KMS reports it in
+    /// ([`attached_key_policy`]), the same layout the constructors above store the
+    /// document they are given in, so every path that attaches a key policy leaves the
+    /// key one text and `GetKeyPolicy` has nothing to re-render.
+    pub fn attach_policy(&mut self, policy: &str) {
+        self.policy = attached_key_policy(policy);
     }
 
     /// When KMS began recording cryptographic activity for this key, which is "the
@@ -4293,22 +4351,50 @@ pub fn requested_tags(tags: &[Tag]) -> Result<BTreeMap<String, String>, String> 
 /// the KMS key permission to use it in all cryptographic operations"
 /// (`smithy_query(query="doc",shape="CreateKeyRequest",member="Policy")`). Used
 /// when `CreateKey` is given no `Policy`.
+///
+/// The document is written out and then rendered ([`attached_key_policy`]) rather than
+/// built as a parsed value: a value's members would be re-ordered by whatever map
+/// `serde_json` was built with, and this document's elements are written in the order
+/// the default policy declares them.
 pub fn default_key_policy() -> String {
     // `arn:aws:iam::<account>:root` — IAM is global, so the Region segment of the
-    // principal's ARN is empty.
-    let root = ::engine::emulator_arn("iam", "", "root");
-    ::serde_json::json!({
-        "Version": "2012-10-17",
-        "Id": "key-default-1",
-        "Statement": [{
-            "Sid": "Enable IAM User Permissions",
-            "Effect": "Allow",
-            "Principal": { "AWS": root },
-            "Action": "kms:*",
-            "Resource": "*"
-        }]
-    })
-    .to_string()
+    // principal's ARN is empty. Written as a JSON string literal, so a principal
+    // needing an escape carries one.
+    let root = ::serde_json::Value::String(::engine::emulator_arn("iam", "", "root"));
+    // The current policy language version, the first of the two the IAM policy
+    // reference documents (`::service_common::iam_policy::POLICY_VERSIONS`).
+    let version = ::service_common::iam_policy::POLICY_VERSIONS[0];
+    attached_key_policy(&format!(
+        "{{\"Version\":\"{version}\",\"Id\":\"{DEFAULT_KEY_POLICY_ID}\",\"Statement\":\
+         [{{\"Sid\":\"{DEFAULT_KEY_POLICY_SID}\",\"Effect\":\"Allow\",\
+         \"Principal\":{{\"AWS\":{root}}},\"Action\":\"kms:*\",\"Resource\":\"*\"}}]}}"
+    ))
+}
+
+/// The `Id` of the default key policy, as AWS's own default document declares it.
+const DEFAULT_KEY_POLICY_ID: &str = "key-default-1";
+
+/// The `Sid` of the one statement of the default key policy, as AWS's own default
+/// document declares it: the statement that gives the account that owns the key
+/// permission to use it.
+const DEFAULT_KEY_POLICY_SID: &str = "Enable IAM User Permissions";
+
+/// A key policy document in the layout KMS REPORTS it in, which is the layout a key
+/// holds it in: the canonical rendering of an IAM policy document
+/// ([`::service_common::iam_policy::canonical_document`]), shared with every other
+/// emulated service that attaches one.
+///
+/// KMS does not serve the caller's bytes back: it parses the document a request carries
+/// and re-serializes it, so `GetKeyPolicy` answers the same text whatever layout the
+/// document was submitted in, and a caller that re-attaches what it read reads the same
+/// text again. Applied wherever a policy is attached — `CreateKey`, `PutKeyPolicy`,
+/// `ReplicateKey` and the default document above — so no path stores a document in any
+/// other layout, and every reader of [`Cmk::policy`] reports the one rendering.
+///
+/// Text that is not a document KMS would accept is rendered as it came; which documents
+/// are acceptable is [`judge_key_policy`]'s reading, and it runs before this.
+pub fn attached_key_policy(policy: &str) -> String {
+    ::service_common::iam_policy::canonical_document(policy)
 }
 
 /// The only key policy name KMS serves: "If no policy name is specified, the

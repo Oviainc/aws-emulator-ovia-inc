@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 
 use super::harness::{
     alias_arn, b64, call, create_alias, create_key, describe, error_code, ok, refused, router,
-    text, unb64, REGION,
+    text, tracked_last_usage, unb64, REGION,
 };
 use super::signatures::{hash_of, message_of, DIGEST, RAW};
 
@@ -1078,8 +1078,9 @@ async fn verifying_uses_the_key_without_changing_it() {
         "case {case}: verifying must not change the key's metadata"
     );
 
-    // The use itself is reported, which is how the store shows it was written.
-    let usage = ok(&router, "GetKeyLastUsage", &json!({"KeyId": key_id})).await;
+    // The use is recorded, and KMS's usage tracking produces that record a little after
+    // the call: once it has, the record names this operation.
+    let usage = tracked_last_usage(&router, case, &key_id, "Verify", &Value::Null).await;
     assert_eq!(
         usage["KeyLastUsage"]["Operation"]
             .as_str()

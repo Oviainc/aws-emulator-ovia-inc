@@ -459,12 +459,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let replica = key.replica_in(
             replica_region.clone(),
             input.description.clone().unwrap_or_default(),
-            policy.clone(),
+            policy,
             tags,
         );
         let key_id = replica.key_id.clone();
         let metadata = replica.metadata();
         let replica_tags = replica.tag_list();
+        // "The key policy of the new replica key", as the RECORD holds it: the replica
+        // stores the document in the one layout KMS reports a key policy in, so this
+        // answer and a later `GetKeyPolicy` at the replica's endpoint are the same text.
+        let replica_policy = replica.policy.clone();
         state.insert_key(replica);
         // Which Regions hold a key of the set is shared by every key of it, so the
         // new member is recorded on all of them — the primary key this call named
@@ -478,7 +482,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             replica_key_metadata: Some(metadata),
             // "The key policy of the new replica key" and "the tags on the new
             // replica key", as the record now holds them.
-            replica_policy: Some(policy),
+            replica_policy: Some(replica_policy),
             replica_tags: Some(replica_tags),
         })
     }

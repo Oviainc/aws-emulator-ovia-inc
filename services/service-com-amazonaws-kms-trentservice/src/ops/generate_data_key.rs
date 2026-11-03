@@ -489,7 +489,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key_id = key.key_id.clone();
 
         // The key was just used in a successful cryptographic operation, which is what
-        // `GetKeyLastUsage` reports.
+        // `GetKeyLastUsage` reports once the tracking has produced the record.
         state.record_last_usage(&region, &key_id, Self::NAME);
 
         Ok(GenerateDataKeyOutput {

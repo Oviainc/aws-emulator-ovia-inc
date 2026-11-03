@@ -8,8 +8,9 @@
 //! The rules under test, each asserted over a TABLE of inputs rather than one call:
 //!
 //! * **R1** — attaching a key policy REPLACES the document the key held, and the key
-//!   serves that document back verbatim under the name `default`; a key's policy is
-//!   its own.
+//!   serves that document back under the name `default`, rendered in the one layout KMS
+//!   reports a key policy in (the exact text of that layout is pinned, document by
+//!   document, in [`super::read_projection_fidelity`]); a key's policy is its own.
 //! * **R2** — a key policy document is accepted exactly when it is an IAM JSON policy
 //!   document whose every statement has an `Effect` of `Allow` or `Deny` and names one
 //!   or more principals; anything else is a `MalformedPolicyDocumentException` and
@@ -28,8 +29,8 @@
 use serde_json::{json, Value};
 
 use super::harness::{
-    assert_empty, call, create_key, error_code, failure, failure_in, ok, ok_in, refused, router,
-    text, REGION,
+    assert_empty, call, create_key, error_code, failure, failure_in, ok, ok_in, refused,
+    reported_policy, router, text, REGION,
 };
 
 /// KMS's key policy document quota, "Key policy document size: 32 KB" (Quotas in the
@@ -145,7 +146,8 @@ fn policy_of_len(len: usize) -> String {
 // ---------------------------------------------------------------------------
 
 /// R1: `PutKeyPolicy` replaces the key's policy, and `GetKeyPolicy` serves the stored
-/// document back verbatim — for every shape a key policy document takes.
+/// document back, rendered in KMS's own layout — for every shape a key policy document
+/// takes.
 ///
 /// The rows differ along what the rule generalises over: how many statements the
 /// document carries, which of the two `Statement` forms it uses (one object, or a
@@ -302,9 +304,10 @@ async fn put_key_policy_replaces_the_document_get_key_policy_serves() {
         put_policy(&router, case, &key_id, &document, policy_name).await;
         let served = get_policy(&router, case, &key_id).await;
         assert_eq!(
-            served, document,
-            "case {case:?}: GetKeyPolicy must serve the attached document verbatim, got \
-             {served:?}"
+            served,
+            reported_policy(&document),
+            "case {case:?}: GetKeyPolicy must serve the attached document in KMS's own \
+             rendering, got {served:?}"
         );
         // The key itself is untouched by a policy write: its metadata is what
         // `CreateKey` reported.
@@ -350,7 +353,8 @@ async fn a_key_policy_is_the_property_of_one_key() {
     for (key_id, document) in &keys {
         let served = get_policy(&router, "per-key policies", key_id).await;
         assert_eq!(
-            &served, document,
+            served,
+            reported_policy(document),
             "case {key_id:?}: each key must serve its OWN policy, got {served:?}"
         );
     }
@@ -403,7 +407,8 @@ async fn a_fresh_key_serves_the_policy_create_key_attached() {
         let served = get_policy(&router, case, &key_id).await;
         match expected {
             Some(document) => assert_eq!(
-                served, document,
+                served,
+                reported_policy(document),
                 "case {case:?}: the explicit document must be served back, got {served:?}"
             ),
             None => {
@@ -552,7 +557,8 @@ async fn a_malformed_key_policy_is_refused_and_changes_nothing() {
         );
         let served = get_policy(&router, case, &key_id).await;
         assert_eq!(
-            served, kept,
+            served,
+            reported_policy(&kept),
             "case {case:?}: a refused write must leave the stored policy alone, got {served:?}"
         );
     }
@@ -620,7 +626,8 @@ async fn only_the_default_key_policy_name_exists() {
         }
         let served = get_policy(&router, name, &key_id).await;
         assert_eq!(
-            served, kept,
+            served,
+            reported_policy(&kept),
             "case {name:?}: a refused write must leave the stored policy alone, got {served:?}"
         );
     }
@@ -665,9 +672,11 @@ async fn a_key_policy_document_is_bounded_by_the_quota() {
         if accepted {
             put_policy(&router, &case, &key_id, &document, None).await;
             let served = get_policy(&router, &case, &key_id).await;
+            // The quota bounds the document the REQUEST carries; what the key then
+            // serves is that whole document in KMS's rendering of it.
             assert_eq!(
-                served.len(),
-                len,
+                served,
+                reported_policy(&document),
                 "case {case:?}: a document at or under the quota must be stored whole, got \
                  {} bytes",
                 served.len()
@@ -691,7 +700,8 @@ async fn a_key_policy_document_is_bounded_by_the_quota() {
             );
             let served = get_policy(&router, &case, &key_id).await;
             assert_eq!(
-                served, kept,
+                served,
+                reported_policy(&kept),
                 "case {case:?}: a refused write must leave the stored policy alone, got \
                  {served:?}"
             );
@@ -735,7 +745,8 @@ async fn the_policy_operations_resolve_every_key_identifier_form() {
             let case = format!("written through {written_through}, read through {read_through}");
             let served = get_policy(&router, &case, read_through).await;
             assert_eq!(
-                served, document,
+                served,
+                reported_policy(&document),
                 "case {case:?}: every identifier form must reach the same key's policy, got \
                  {served:?}"
             );
@@ -872,7 +883,8 @@ async fn a_key_pending_deletion_refuses_a_policy_write_but_still_serves_the_read
             put_policy(&router, case, &key_id, &document, None).await;
             let served = get_policy(&router, case, &key_id).await;
             assert_eq!(
-                served, document,
+                served,
+                reported_policy(&document),
                 "case {case:?}: a key in this state must take a policy, got {served:?}"
             );
             continue;
@@ -908,7 +920,8 @@ async fn a_key_pending_deletion_refuses_a_policy_write_but_still_serves_the_read
         put_policy(&router, case, &key_id, &document, None).await;
         let served = get_policy_in(&router, REGION, case, &key_id).await;
         assert_eq!(
-            served, document,
+            served,
+            reported_policy(&document),
             "case {case:?}: a restored key must take a policy, got {served:?}"
         );
     }

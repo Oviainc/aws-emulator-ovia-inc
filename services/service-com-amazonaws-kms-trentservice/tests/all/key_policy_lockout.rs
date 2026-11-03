@@ -25,8 +25,8 @@
 use serde_json::{json, Value};
 
 use super::harness::{
-    assert_empty, call, create_key, error_code, error_message, ok, ok_in, refused, router, text,
-    REGION,
+    assert_empty, call, create_key, error_code, error_message, ok, ok_in, refused, reported_policy,
+    router, text, REGION,
 };
 
 /// The sentence KMS refuses a locking-out key policy with: the safety check's own, which
@@ -295,7 +295,7 @@ async fn put_key_policy_refuses_a_document_that_locks_the_caller_out() {
             assert_empty(case, "PutKeyPolicy", &answer);
             assert_eq!(
                 stored_policy(&router, case, &key_id).await,
-                document,
+                reported_policy(&document),
                 "case {case:?}: the attached document must be the one served back"
             );
             // Put the opening document back, so the next row starts from the same place.
@@ -323,7 +323,7 @@ async fn put_key_policy_refuses_a_document_that_locks_the_caller_out() {
         );
         assert_eq!(
             stored_policy(&router, case, &key_id).await,
-            kept,
+            reported_policy(&kept),
             "case {case:?}: a refused write must leave the stored policy alone"
         );
 
@@ -335,7 +335,7 @@ async fn put_key_policy_refuses_a_document_that_locks_the_caller_out() {
         assert_empty(case, "PutKeyPolicy", &answer);
         assert_eq!(
             stored_policy(&router, case, &key_id).await,
-            document,
+            reported_policy(&document),
             "case {case:?}: a bypassing write must attach the document"
         );
         ok(
@@ -374,7 +374,7 @@ async fn create_key_refuses_a_policy_that_locks_the_caller_out() {
             let key_id = text(case, &metadata, "KeyId");
             assert_eq!(
                 stored_policy(&router, case, &key_id).await,
-                document,
+                reported_policy(&document),
                 "case {case:?}: the created key must serve the document it was given"
             );
             continue;
@@ -402,7 +402,7 @@ async fn create_key_refuses_a_policy_that_locks_the_caller_out() {
         let key_id = text(case, &metadata, "KeyId");
         assert_eq!(
             stored_policy(&router, case, &key_id).await,
-            document,
+            reported_policy(&document),
             "case {case:?}: a bypassing create must attach the document"
         );
     }
@@ -461,7 +461,7 @@ async fn replicate_key_refuses_a_policy_that_locks_the_caller_out() {
             let answer = ok(&router, "ReplicateKey", &request).await;
             assert_eq!(
                 text(case, &answer, "ReplicaPolicy"),
-                *document,
+                reported_policy(document),
                 "case {case:?}: the replica must carry the document the request gave"
             );
             continue;
@@ -500,7 +500,7 @@ async fn replicate_key_refuses_a_policy_that_locks_the_caller_out() {
         let answer = ok(&router, "ReplicateKey", &bypassing).await;
         assert_eq!(
             text(case, &answer, "ReplicaPolicy"),
-            *document,
+            reported_policy(document),
             "case {case:?}: a bypassing replicate must attach the document"
         );
         let replica = ok_in(
@@ -512,7 +512,7 @@ async fn replicate_key_refuses_a_policy_that_locks_the_caller_out() {
         .await;
         assert_eq!(
             text(case, &replica, "Policy"),
-            *document,
+            reported_policy(document),
             "case {case:?}: the replica's endpoint must serve the replica's own document"
         );
     }

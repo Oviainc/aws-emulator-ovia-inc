@@ -46,7 +46,7 @@ use service_com_amazonaws_kms_trentservice::state::{
 
 use super::harness::{
     b64, create_key, describe, ok, refused, rotate_on_demand, router, router_with_engine, text,
-    unb64, wrap, REGION,
+    tracked_last_usage, unb64, wrap, REGION,
 };
 
 /// The Region a row belongs to when the row is about regional scoping.
@@ -310,7 +310,9 @@ fn request_for(operation: &str, identifier: &str) -> Value {
 }
 
 /// Rule 2, continued: `GetKeyLastUsage` reports the last successful cryptographic
-/// operation performed with the key, and the identifiers it cannot resolve are refused
+/// operation performed with the key, once KMS's usage tracking has produced the record
+/// (the empty record a read taken straight after the call is answered is
+/// [`super::key_last_usage`]'s table), and the identifiers it cannot resolve are refused
 /// by the kind of failure they are.
 #[tokio::test]
 async fn get_key_last_usage_reports_the_last_cryptographic_operation() {
@@ -341,9 +343,11 @@ async fn get_key_last_usage_reports_the_last_cryptographic_operation() {
         "case fresh key: the key ARN is not the globally unique identifier this member \
          carries, got {fresh}"
     );
-    assert!(
-        fresh["KeyLastUsage"].is_null(),
-        "case fresh key: a key with no recorded use reports no KeyLastUsage, got {fresh}"
+    assert_eq!(
+        fresh["KeyLastUsage"],
+        json!({}),
+        "case fresh key: a key with no tracked usage record reports an empty KeyLastUsage, \
+         got {fresh}"
     );
     assert_eq!(
         fresh["KeyCreationDate"].as_f64().unwrap_or_default(),
@@ -358,7 +362,8 @@ async fn get_key_last_usage_reports_the_last_cryptographic_operation() {
 
     // Rows: a cryptographic operation, the request that performs it, and the operation
     // name the usage record must then name. Each row's call succeeds, so each row
-    // replaces the record the previous one left.
+    // replaces the record the previous one left — once the tracking has produced it; the
+    // read taken straight after the call is answered the empty record.
     let sealed = ok(
         &router,
         "Encrypt",
@@ -384,7 +389,7 @@ async fn get_key_last_usage_reports_the_last_cryptographic_operation() {
     let mut seen_event_ids: Vec<String> = Vec::new();
     for (operation, body) in rows {
         ok(&router, operation, &body).await;
-        let reported = ok(&router, "GetKeyLastUsage", &json!({"KeyId": key_id})).await;
+        let reported = tracked_last_usage(&router, operation, &key_id, operation, &Value::Null).await;
         let usage = reported["KeyLastUsage"].clone();
         assert_eq!(
             usage["Operation"].as_str().unwrap_or_default(),
@@ -423,7 +428,8 @@ async fn get_key_last_usage_reports_the_last_cryptographic_operation() {
     }
 
     // A refused cryptographic operation did not use the key, so it leaves the record
-    // alone.
+    // alone. The record of the last row is already produced, so nothing the clock owes
+    // can move it either.
     let before = ok(&router, "GetKeyLastUsage", &json!({"KeyId": key_id})).await;
     let (_status, code, _message) = refused(
         &router,
@@ -1816,6 +1822,7 @@ async fn an_on_demand_rotation_is_reported_by_the_rotation_reader() {
     let router = router();
     let metadata = create_key(&router, &json!({"Description": "rotate me"})).await;
     let key_id = text("setup", &metadata, "KeyId");
+    let key_arn = text("setup", &metadata, "Arn");
     let first_material = text("setup", &metadata, "CurrentKeyMaterialId");
 
     let empty = ok(&router, "ListKeyRotations", &json!({"KeyId": key_id})).await;
@@ -1848,9 +1855,9 @@ async fn an_on_demand_rotation_is_reported_by_the_rotation_reader() {
             );
             assert_eq!(
                 entry["KeyId"].as_str().unwrap_or_default(),
-                key_id,
-                "case round {round} entry {index}: expected the entry to name the key, got \
-                 {entry}"
+                key_arn,
+                "case round {round} entry {index}: expected the entry to name the key by its \
+                 ARN, got {entry}"
             );
             assert!(
                 entry["RotationDate"].as_f64().unwrap_or_default() > 0.0,

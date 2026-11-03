@@ -109,6 +109,8 @@ mod public_key;
 mod random_bytes;
 #[path = "all/re_encrypt.rs"]
 mod re_encrypt;
+#[path = "all/read_projection_fidelity.rs"]
+mod read_projection_fidelity;
 #[path = "all/refusal_and_rotation_contracts.rs"]
 mod refusal_and_rotation_contracts;
 #[path = "all/refusal_fidelity.rs"]

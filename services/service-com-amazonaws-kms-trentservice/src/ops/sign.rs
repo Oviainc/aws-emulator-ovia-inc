@@ -459,8 +459,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key_id = key.key_id.clone();
 
         // The key was just used in a successful cryptographic operation, and `Sign` is
-        // one of the operations that use is reported for
+        // one of the operations that use is recorded for
         // (`smithy_query(query="shape",shape="KeyLastUsageTrackingOperation")`).
+        // `GetKeyLastUsage` reports the record once the tracking has produced it.
         state.record_last_usage(&region, &key_id, Self::NAME);
 
         Ok(SignOutput {

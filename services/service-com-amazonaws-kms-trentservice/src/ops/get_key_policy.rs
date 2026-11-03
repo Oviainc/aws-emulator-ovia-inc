@@ -2,8 +2,10 @@
 
 //! @op GetKeyPolicy
 //! Reports the key policy a KMS key holds — the document `CreateKey` attached or
-//! `PutKeyPolicy` last replaced it with, served verbatim under the only name KMS
-//! serves a policy under (`crate::state::KEY_POLICY_NAME_DEFAULT`).
+//! `PutKeyPolicy` last replaced it with, served under the only name KMS serves a policy
+//! under (`crate::state::KEY_POLICY_NAME_DEFAULT`) and in the one layout KMS reports a
+//! key policy in (`crate::state::attached_key_policy`, which is the layout the key
+//! holds it in).
 //!
 //! A pure report: it reads the stored key and writes nothing, so a key's policy is
 //! readable in every key state its metadata is — including while the key is pending

@@ -308,9 +308,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Attaches a key policy to the specified KMS key"
         // (`smithy_query(query="doc",shape="PutKeyPolicy")`): the document the request
         // carries REPLACES the one the key held, whatever it was, and is what
-        // `GetKeyPolicy` reports from then on. It is stored verbatim — KMS serves the
-        // document as it was attached, not a re-rendering of it.
-        key.policy = input.policy;
+        // `GetKeyPolicy` reports from then on. KMS does not keep the caller's bytes: it
+        // stores the document in the one layout it reports a policy in
+        // (`crate::state::Cmk::attach_policy`), so re-attaching what `GetKeyPolicy`
+        // served stores the same text again.
+        key.attach_policy(&input.policy);
 
         Ok(PutKeyPolicyOutput)
     }

@@ -4,11 +4,18 @@
 //! over the wire through the shared [`super::harness`].
 //!
 //! The rule under test: a KMS key's last-usage record is written by the CRYPTOGRAPHIC
-//! operation that used the key and by nothing else, so every call that succeeds
-//! replaces the record with one naming itself, at an instant that never moves
-//! backwards and with a CloudTrail event id and a KMS request id of its own; a call
-//! that is refused writes nothing; `GetKeyLastUsage` only reports it; and each key
-//! keeps its own record, including each key of a multi-Region key set.
+//! operation that used the key and by nothing else, and KMS's usage tracking PRODUCES
+//! that record a little after the call it records
+//! (`state::USAGE_TRACKING_LAG`) — so
+//!
+//! * a read taken straight after a use of the key is answered the EMPTY record, every
+//!   member of which is "absent if the key has not been used since KMS began tracking"
+//!   (`smithy_query(query="shape",shape="KeyLastUsageData")`), which is also what a key
+//!   that has had no cryptographic operation at all is answered;
+//! * once the tracking has caught up the record names that operation, at an instant that
+//!   never moves backwards, with a CloudTrail event id and a KMS request id of its own;
+//! * a call that is refused writes nothing, `GetKeyLastUsage` only reports, and each key
+//!   keeps its own record — including each key of a multi-Region key set.
 //!
 //! The table's rows are EVERY operation the model tracks a use for
 //! (`smithy_query(query="shape",shape="KeyLastUsageTrackingOperation")`), so they
@@ -17,12 +24,18 @@
 //! all today: one still answering the scaffold 501 must leave the record exactly as it
 //! was. A row whose request is built from another tracked operation's answer is
 //! skipped while that producer is a scaffold stub.
+//!
+//! The rows are driven in PHASES — every row's call first, then one wait for the
+//! tracking — so the suite waits out the lag once rather than once per row.
 
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use super::harness::{b64, call, create_key, ok, ok_in, router, settle_key_state, text, REGION};
+use super::harness::{
+    b64, call, create_key, ok, ok_in, router, settle_key_state, text, tracked_last_usage,
+    tracked_last_usage_in, REGION,
+};
 
 /// Every value of the model's `KeyLastUsageTrackingOperation` enum
 /// (`smithy_query(query="shape",shape="KeyLastUsageTrackingOperation")`): the
@@ -40,6 +53,16 @@ const TRACKED_OPERATIONS: [&str; 12] = [
     "Sign",
     "Verify",
     "VerifyMac",
+];
+
+/// The members of `KeyLastUsageData`
+/// (`smithy_query(query="shape",shape="KeyLastUsageData")`), each of which only a
+/// record the tracking has produced fills.
+const USAGE_DETAIL_MEMBERS: [&str; 4] = [
+    "Operation",
+    "Timestamp",
+    "CloudTrailEventId",
+    "KmsRequestId",
 ];
 
 /// The `CreateKey` request for the key `operation` needs: the `KeySpec` and `KeyUsage`
@@ -184,8 +207,8 @@ async fn answer(
     }
 }
 
-/// The last-usage record `GetKeyLastUsage` reports for `key_id` at `region`'s endpoint,
-/// together with the whole answer the assertions report.
+/// The `GetKeyLastUsage` answer for `key_id` at `region`'s endpoint, taken as it is —
+/// without waiting for the tracking, which is what the empty-record assertions need.
 async fn last_usage_in(
     router: &smithy_server_runtime::MultiServiceRouter,
     region: &str,
@@ -199,7 +222,25 @@ async fn last_usage(router: &smithy_server_runtime::MultiServiceRouter, key_id: 
     last_usage_in(router, REGION, key_id).await
 }
 
-/// Assert the record in `reported` is one `operation` just wrote: it names that
+/// Assert `reported` carries an EMPTY last-usage record: the element is present and
+/// holds none of [`USAGE_DETAIL_MEMBERS`], which is how "the KeyLastUsage response
+/// element is empty" reads on the wire.
+fn assert_empty_record(case: &str, reported: &Value) {
+    assert_eq!(
+        reported["KeyLastUsage"],
+        json!({}),
+        "case {case}: expected an empty KeyLastUsage, got {reported}"
+    );
+    for member in USAGE_DETAIL_MEMBERS {
+        assert!(
+            reported["KeyLastUsage"][member].is_null(),
+            "case {case}: {member} is filled only by a record the tracking has produced, \
+             so it must be absent, got {reported}"
+        );
+    }
+}
+
+/// Assert the record in `reported` is the one `operation` wrote: it names that
 /// operation, carries ids of its own, and its timestamp is at or after `floor` and the
 /// record it replaced.
 fn assert_fresh_record(
@@ -242,9 +283,19 @@ fn assert_fresh_record(
     }
 }
 
-/// The rule: every tracked cryptographic operation that succeeds replaces the key's
-/// last-usage record with one naming itself, a call that is refused as unimplemented
-/// writes nothing, and reading the record never changes it.
+/// One row that was served: the operation, the key it used, the request that used it and
+/// the key's creation date, which is the floor every timestamp is measured from.
+struct Served {
+    operation: &'static str,
+    key_id: String,
+    request: Value,
+    creation_date: f64,
+}
+
+/// The rule: every tracked cryptographic operation that succeeds records a use of the
+/// key, the tracking produces that record a little later — so a read in between is
+/// answered the empty record — a call that is refused as unimplemented records nothing,
+/// and reading the record never changes it.
 #[tokio::test]
 async fn every_tracked_cryptographic_operation_writes_the_key_last_usage_record() {
     let router = router();
@@ -258,14 +309,15 @@ async fn every_tracked_cryptographic_operation_writes_the_key_last_usage_record(
         "case table: the tracked operations must be distinct, got {TRACKED_OPERATIONS:?}"
     );
 
-    let mut implemented: Vec<&str> = Vec::new();
+    // Phase 1: every row's call, with the reads that must see no record yet.
+    let mut served: Vec<Served> = Vec::new();
     for operation in TRACKED_OPERATIONS {
         let metadata = create_key(&router, &key_for(operation)).await;
         let key_id = text(operation, &metadata, "KeyId");
         let key_arn = text(operation, &metadata, "Arn");
         let creation_date = metadata["CreationDate"].as_f64().unwrap_or_default();
 
-        // A key that has had no cryptographic operation reports no usage at all, and
+        // A key that has had no cryptographic operation reports the empty record, and
         // its tracking starts when it was created.
         //
         // This response names the key by its KEY ID: `KeyId` here is "the globally
@@ -287,14 +339,16 @@ async fn every_tracked_cryptographic_operation_writes_the_key_last_usage_record(
             "case {operation}: the key ARN is not the globally unique identifier this \
              member carries, got {fresh}"
         );
-        assert!(
-            fresh["KeyLastUsage"].is_null(),
-            "case {operation}: a key with no recorded use reports no KeyLastUsage, got {fresh}"
-        );
+        assert_empty_record(operation, &fresh);
         assert_eq!(
             fresh["TrackingStartDate"].as_f64().unwrap_or_default(),
             creation_date,
             "case {operation}: tracking starts when the key is created, got {fresh}"
+        );
+        assert_eq!(
+            fresh["KeyCreationDate"].as_f64().unwrap_or_default(),
+            creation_date,
+            "case {operation}: KeyCreationDate is the key's creation date, got {fresh}"
         );
 
         let Some(request) = request_for(&router, operation, &key_id).await else {
@@ -321,31 +375,70 @@ async fn every_tracked_cryptographic_operation_writes_the_key_last_usage_record(
             status, 200,
             "case {operation}: expected HTTP 200 or 501, got {status} with {payload}"
         );
-        implemented.push(operation);
 
-        let reported = last_usage(&router, &key_id).await;
-        assert_fresh_record(operation, operation, &reported, &before, creation_date);
-
-        // Reading the record does not change it: asking again answers the same.
-        let again = last_usage(&router, &key_id).await;
-        assert_eq!(
-            again, reported,
-            "case {operation}: a second read must answer the same record"
+        // The tracking lags the call, so the read a caller takes straight after it is
+        // answered the empty record — which is what AWS answers there.
+        let straight_after = last_usage(&router, &key_id).await;
+        assert_empty_record(
+            &format!("{operation} straight after the call"),
+            &straight_after,
         );
 
-        // Calling the operation again replaces the record with the later call's, which
-        // keeps the operation and moves neither the timestamp backwards nor the ids.
-        ok(&router, operation, &request).await;
-        let second = last_usage(&router, &key_id).await;
-        assert_fresh_record(operation, operation, &second, &reported, creation_date);
+        served.push(Served {
+            operation,
+            key_id,
+            request,
+            creation_date,
+        });
     }
 
     // The suite is only evidence of the rule if some row actually performed a
     // cryptographic operation.
     assert!(
-        !implemented.is_empty(),
+        !served.is_empty(),
         "case table: no tracked operation was served, so nothing was recorded"
     );
+
+    // Phase 2: one wait for the tracking, then the record of every row.
+    let mut first: Vec<Value> = Vec::new();
+    for row in &served {
+        let reported =
+            tracked_last_usage(&router, row.operation, &row.key_id, row.operation, &Value::Null)
+                .await;
+        assert_fresh_record(
+            row.operation,
+            row.operation,
+            &reported,
+            &json!({"KeyLastUsage": Value::Null}),
+            row.creation_date,
+        );
+
+        // Reading the record does not change it: asking again answers the same.
+        let again = last_usage(&router, &row.key_id).await;
+        assert_eq!(
+            again, reported,
+            "case {}: a second read must answer the same record",
+            row.operation
+        );
+        first.push(reported);
+    }
+
+    // Phase 3: a second call per row replaces the record with the later call's, which
+    // keeps the operation and moves neither the timestamp backwards nor the ids.
+    for row in &served {
+        ok(&router, row.operation, &row.request).await;
+    }
+    for (row, previous) in served.iter().zip(&first) {
+        let second =
+            tracked_last_usage(&router, row.operation, &row.key_id, row.operation, previous).await;
+        assert_fresh_record(
+            row.operation,
+            row.operation,
+            &second,
+            previous,
+            row.creation_date,
+        );
+    }
 }
 
 /// The rule, continued: each key keeps its OWN record, so the keys of a multi-Region
@@ -380,7 +473,7 @@ async fn each_key_of_a_multi_region_set_tracks_its_own_last_usage() {
         &json!({"KeyId": key_id, "Plaintext": b64(MESSAGE)}),
     )
     .await;
-    let primary = last_usage(&router, &key_id).await;
+    let primary = tracked_last_usage(&router, "primary used", &key_id, "Encrypt", &Value::Null).await;
     assert_fresh_record(
         "primary used",
         "Encrypt",
@@ -389,10 +482,7 @@ async fn each_key_of_a_multi_region_set_tracks_its_own_last_usage() {
         creation_date,
     );
     let replica = last_usage_in(&router, replica_region, &key_id).await;
-    assert!(
-        replica["KeyLastUsage"].is_null(),
-        "case replica unused: a use of the primary key is not a use of the replica, got {replica}"
-    );
+    assert_empty_record("replica unused", &replica);
 
     // And the other way round: using the replica leaves the primary's record alone.
     ok_in(
@@ -402,7 +492,15 @@ async fn each_key_of_a_multi_region_set_tracks_its_own_last_usage() {
         &json!({"KeyId": key_id, "KeySpec": "AES_256"}),
     )
     .await;
-    let replica_used = last_usage_in(&router, replica_region, &key_id).await;
+    let replica_used = tracked_last_usage_in(
+        &router,
+        replica_region,
+        "replica used",
+        &key_id,
+        "GenerateDataKey",
+        &Value::Null,
+    )
+    .await;
     assert_fresh_record(
         "replica used",
         "GenerateDataKey",

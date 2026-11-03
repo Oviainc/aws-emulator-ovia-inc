@@ -34,7 +34,7 @@ use super::grant_authorization::{
     account_root_statement, allow_to, assert_denied, identity_allow, policy, Emulator,
     ACCOUNT_KEY,
 };
-use super::harness::{b64, error_code, text, REGION};
+use super::harness::{b64, error_code, reported_policy, text, REGION};
 
 /// The payload the cryptographic legs below seal, which the issue's own reproduction
 /// seals: 16 bytes.
@@ -458,7 +458,7 @@ async fn a_key_policy_must_reach_the_caller_whatever_the_identity_policy_says() 
         .await;
     assert_eq!(
         read_back["Policy"],
-        json!(withheld),
+        json!(reported_policy(&withheld)),
         "the policy in force must be the one the last PutKeyPolicy wrote, got {read_back}"
     );
 }
