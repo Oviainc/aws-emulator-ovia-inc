@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStandardsControls
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStandardsControls`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStandardsControls::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the controls of ONE standards subscription of the caller's hub: the
+//! controls the subscribed standard publishes (`crate::state`'s control catalog),
+//! each carrying the status that subscription holds for it — `ENABLED` as enabling
+//! the standard left it, or what `UpdateStandardsControl` last set — paged by
+//! `MaxResults` / `NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +83,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{StandardsSubscriptionKey, StandardsSubscriptionRecord};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -119,6 +118,25 @@ impl From<DescribeStandardsControlsErrorModeled> for DescribeStandardsControlsEr
     fn from(modeled: DescribeStandardsControlsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// `MaxResults`' upper bound (`@range(min: 1, max: 100)` on `MaxResults`), which is
+/// also the page size used when the caller names none.
+const MAX_RESULTS_LIMIT: usize = 100;
+
+/// Marker this list's opaque `NextToken` carries, so a token minted for another
+/// list — or a value a caller invented — is rejected rather than read as an offset.
+const NEXT_TOKEN_PREFIX: &str = "securityhub:standards-controls:";
+
+/// A `NextToken` resuming at `offset` in the standard's published control order.
+fn encode_next_token(offset: usize) -> String {
+    crate::state::encode_list_token(NEXT_TOKEN_PREFIX, offset)
+}
+
+/// The offset a `NextToken` resumes at, or `None` when it is not one this operation
+/// minted.
+fn decode_next_token(token: &str) -> Option<usize> {
+    crate::state::decode_list_token(NEXT_TOKEN_PREFIX, token)
 }
 
 /// The `DescribeStandardsControls` operation.
@@ -157,18 +175,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStandardsControls` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStandardsControlsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStandardsControls"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeStandardsControlsError::Modeled(
+                DescribeStandardsControlsErrorModeled::InternalException(InternalException {
+                    message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                    code: Some("InternalException".to_string()),
+                }),
+            )
+        })?;
+        let invalid_input = |message: String| {
+            DescribeStandardsControlsError::Modeled(
+                DescribeStandardsControlsErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(message),
+                        code: Some("InvalidInputException".to_string()),
+                    },
+                ),
+            )
+        };
+
+        let key = crate::state::hub_key(ctx);
+        let (account_id, region) = (key.0.clone(), key.1.clone());
+
+        // Whether the request is valid is decided before any state is read, so a
+        // cursor this operation never issued is refused identically on every hub.
+        // `MaxResults` is modelled `@range(min: 1, max: 100)`, so the boundary
+        // validator already refuses a value outside it; clamping here keeps the page
+        // bounded even if this handler is reached another way.
+        let page_size = input.max_results.map_or(MAX_RESULTS_LIMIT, |requested| {
+            usize::try_from(requested)
+                .unwrap_or(MAX_RESULTS_LIMIT)
+                .clamp(1, MAX_RESULTS_LIMIT)
+        });
+        let offset = match input.next_token.as_deref() {
+            Some(token) => decode_next_token(token).ok_or_else(|| {
+                invalid_input("NextToken is not a token this operation issued".to_string())
+            })?,
+            None => 0,
+        };
+
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&key) {
+            return Err(
+                DescribeStandardsControlsErrorModeled::InvalidAccessException(
+                    InvalidAccessException {
+                        message: Some(crate::state::not_subscribed_message(&account_id, &region)),
+                        code: Some("InvalidAccessException".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Reporting a subscription's controls means reporting the subscription status
+        // the clock already owes: a `PENDING` subscription whose transition fell due
+        // is `READY`, and its controls updatable, whether or not anybody called.
+        // Nothing else in this handler writes.
+        crate::state::settle_standards(&mut store, &key);
+
+        // The ARN the enabling call answered with is the subscription's address, so
+        // the lookup compares against the stored ARN rather than re-deriving one: a
+        // subscription ARN of another account or Region names no subscription here.
+        let found: Option<(&StandardsSubscriptionKey, &StandardsSubscriptionRecord)> =
+            store.standards.iter().find(|(subscription_key, record)| {
+                subscription_key.account_id == account_id
+                    && subscription_key.region == region
+                    && record.standards_subscription_arn == input.standards_subscription_arn
+            });
+        let Some((subscription_key, record)) = found else {
+            return Err(
+                DescribeStandardsControlsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::arn_does_not_exist_message(
+                            &input.standards_subscription_arn,
+                        )),
+                        code: Some("ResourceNotFoundException".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "This operation returns an empty list for standard subscriptions where
+        // StandardsControlsUpdatable has value NOT_READY_FOR_UPDATES": a standard
+        // still being enabled exposes no control yet.
+        let subscribed_controls = if crate::state::standards_controls_updatable(
+            &record.standards_status,
+        ) == crate::state::STANDARDS_CONTROLS_READY
+        {
+            crate::state::standard_by_arn(&region, &subscription_key.standards_arn)
+                .map(|definition| (definition, crate::state::standard_controls(&definition)))
+        } else {
+            None
+        };
+        let Some((definition, published)) = subscribed_controls else {
+            return Ok(DescribeStandardsControlsOutput {
+                controls: Some(Vec::new()),
+                next_token: None,
+            });
+        };
+
+        if offset > published.len() {
+            return Err(invalid_input(
+                "NextToken refers to a position past the end of the result set".to_string(),
+            ));
+        }
+        // The published control order is a total order over the standard's controls,
+        // which is what makes a `NextToken` page repeatable.
+        let page: Vec<StandardsControl> = published
+            .iter()
+            .skip(offset)
+            .take(page_size)
+            // The one definition of how a control is reported, shared with every
+            // other operation that answers with a `StandardsControl`.
+            .map(|control| {
+                crate::state::standards_control_view(&region, &definition, control, record)
+            })
+            .collect();
+        let next_offset = offset + page.len();
+        let next_token = (next_offset < published.len()).then(|| encode_next_token(next_offset));
+
+        Ok(DescribeStandardsControlsOutput {
+            controls: Some(page),
+            next_token,
+        })
     }
 }

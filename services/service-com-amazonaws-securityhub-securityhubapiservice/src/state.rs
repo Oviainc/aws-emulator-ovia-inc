@@ -20,8 +20,8 @@ use std::collections::{BTreeMap, HashMap};
 use crate::ops::types::{
     AutomationRulesAction, AutomationRulesFindingFieldsUpdate, AutomationRulesFindingFilters,
     AwsSecurityFinding, BooleanFilter, DateFilter, DateRange, FindingHistoryUpdate, Member, Note,
-    NoteUpdate, NumberFilter, Severity, Standard, StandardsManagedBy, StandardsSubscription,
-    StringFilter, Workflow,
+    NoteUpdate, NumberFilter, Severity, Standard, StandardsControl, StandardsManagedBy,
+    StandardsSubscription, StringFilter, Workflow,
 };
 
 /// The hub resource is one per account and Region, named `hub/default`.
@@ -259,6 +259,30 @@ pub struct StandardsSubscriptionRecord {
     /// transition the enabling call owes becomes due. A reporting operation
     /// materialises it once the clock passes this instant.
     pub ready_due_nanos: i128,
+    /// The instant the standard was enabled, which is when every control of the
+    /// subscription got the status it starts in — so a control nobody has touched
+    /// reports this as its `ControlStatusUpdatedAt`, stable for as long as the
+    /// subscription lives.
+    pub enabled_at: ::aws_smithy_types::DateTime,
+    /// The controls of this subscription whose status a caller has changed, keyed by
+    /// the `ControlId` the standard addresses the control by. A control absent here
+    /// still carries the status the enabling call gave it, so the map holds changes
+    /// only; it belongs to the subscription because a control's enablement is a
+    /// property of one account's subscription to one standard, and so ends with it.
+    pub control_statuses: HashMap<String, StandardsControlStatus>,
+}
+
+/// The status of one control of one standards subscription, as `UpdateStandardsControl`
+/// last set it and `DescribeStandardsControls` reports it.
+#[derive(Debug, Clone)]
+pub struct StandardsControlStatus {
+    /// A `ControlStatus` value (`ENABLED` or `DISABLED`).
+    pub control_status: String,
+    /// `StandardsControl$DisabledReason`: "The reason provided for the most recent
+    /// change in status for the control", which only a disable carries.
+    pub disabled_reason: Option<String>,
+    /// When this status was set.
+    pub control_status_updated_at: ::aws_smithy_types::DateTime,
 }
 
 /// Per-service state for com-amazonaws-securityhub-securityhubapiservice. A handler reaches it through [`service_state`].
@@ -353,6 +377,16 @@ pub const INSIGHT_NOT_FOUND_MESSAGE: &str = "Cannot find any insight for the giv
 /// the ARN the first create derived from it.
 pub fn action_target_id_conflict_message(id: &str) -> String {
     format!("Action with Id: {id} already exists")
+}
+
+/// The whole message `UpdateStandardsControl` refuses a disable that names no reason
+/// with. `DisabledReason` is "A description of the reason why you are disabling a
+/// security standard control. If you are disabling a control, then this is required"
+/// (`smithy_query(query="doc", shape="UpdateStandardsControlRequest",
+/// member="DisabledReason")`), and the refusal states that precondition followed by
+/// the control the request named, quoted back as it arrived.
+pub fn disabled_reason_required_message(standards_control_arn: &str) -> String {
+    format!("DisabledReason must be given when disabling control: {standards_control_arn}")
 }
 
 /// The message `BatchEnableStandards` refuses a batch with when one or more of its
@@ -715,6 +749,10 @@ pub fn new_standards_subscription(
             standards_status: STANDARDS_STATUS_PENDING.to_string(),
             provider: definition.provider.to_string(),
             ready_due_nanos: now_nanos() + STANDARDS_READY_AFTER_NANOS,
+            enabled_at: now_date_time(),
+            // Enabling a standard enables its controls, so no control carries a
+            // changed status until a caller changes one.
+            control_statuses: HashMap::new(),
         },
     )
 }
@@ -778,6 +816,597 @@ pub fn standards_controls_updatable(standards_status: &str) -> &'static str {
         STANDARDS_CONTROLS_READY
     } else {
         STANDARDS_CONTROLS_NOT_READY
+    }
+}
+
+/// `ControlStatus$ENABLED`: the control is checked. Every control of a standard is
+/// enabled when the standard is enabled, so this is the status a control carries
+/// until a caller disables it (`smithy_query(query="shape", shape="ControlStatus")`).
+pub const CONTROL_STATUS_ENABLED: &str = "ENABLED";
+
+/// `ControlStatus$DISABLED`: "Security Hub CSPM does not check against disabled
+/// controls" (`smithy_query(query="shape", shape="StandardsControl")`, member
+/// `ControlStatus`).
+pub const CONTROL_STATUS_DISABLED: &str = "DISABLED";
+
+/// One control of a published standard, as the AWS Security Hub user guide's
+/// "Security Hub controls reference" publishes it FOR THAT STANDARD: the `ControlId`
+/// that standard addresses the control by, the title and description that standard
+/// publishes for it, the severity of the findings it generates and the requirements of
+/// the standard's own framework it is related to.
+///
+/// The text is per standard, not per control: a standard that predates consolidated
+/// control findings (the CIS benchmark and PCI DSS entries below) publishes each
+/// control under its own numbered requirement wording, where a standard built on the
+/// security controls themselves publishes the control's own title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StandardsControlDefinition {
+    /// `StandardsControl$ControlId`: "The identifier of the security standard
+    /// control" — the last segment of the control's ARN.
+    pub control_id: &'static str,
+    pub title: &'static str,
+    pub description: &'static str,
+    /// A `SeverityRating` value (`smithy_query(query="shape",
+    /// shape="SeverityRating")`: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`).
+    pub severity_rating: &'static str,
+    /// `StandardsControl$RelatedRequirements`: "The list of requirements that are
+    /// related to this control", in the numbering of the standard's own framework.
+    /// Empty for a standard that publishes none, which reports the member as absent
+    /// rather than as an empty list.
+    pub related_requirements: &'static [&'static str],
+}
+
+/// The controls one published standard carries, keyed by the `slug` and `version` of
+/// that standard's [`StandardDefinition`].
+#[derive(Debug, Clone, Copy)]
+pub struct StandardControlSet {
+    pub slug: &'static str,
+    pub version: &'static str,
+    /// In the order the controls reference publishes them, which is the order
+    /// `DescribeStandardsControls` reports them in, so a page boundary falls in the
+    /// same place on every call.
+    pub controls: &'static [StandardsControlDefinition],
+}
+
+// The security controls this emulator publishes, from the AWS Security Hub user
+// guide's "Security Hub controls reference": one entry per control, carrying the
+// control's own id, the title and description the reference publishes for it and the
+// severity of the findings it generates. A standard built on the security controls
+// themselves addresses each one by this id, so these entries are shared by every such
+// standard's control set below rather than restated per standard.
+
+const ACM_1: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "ACM.1",
+    title: "Imported and ACM-issued certificates should be renewed after a specified time period",
+    description: "This control checks whether an AWS Certificate Manager (ACM) certificate is renewed within the specified time period. The control fails if the certificate expires within 30 days.",
+    severity_rating: "MEDIUM",
+    related_requirements: &[],
+};
+
+const CLOUDTRAIL_1: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "CloudTrail.1",
+    title: "CloudTrail should be enabled and configured with at least one multi-Region trail that includes read and write management events",
+    description: "This control checks whether an AWS CloudTrail trail is enabled in the account, and whether at least one trail is a multi-Region trail that records both read and write management events.",
+    severity_rating: "HIGH",
+    related_requirements: &[],
+};
+
+const CLOUDTRAIL_2: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "CloudTrail.2",
+    title: "CloudTrail should have encryption at-rest enabled",
+    description: "This control checks whether an AWS CloudTrail trail is configured to encrypt its log files at rest with an AWS KMS key.",
+    severity_rating: "MEDIUM",
+    related_requirements: &[],
+};
+
+const CLOUDWATCH_1: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "CloudWatch.1",
+    title: "A log metric filter and alarm should exist for usage of the \"root\" user",
+    description: "This control checks whether a CloudWatch Logs metric filter and alarm exist for use of the root user, so that use of the account's most privileged credentials is noticed.",
+    severity_rating: "LOW",
+    related_requirements: &[],
+};
+
+const CONFIG_1: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "Config.1",
+    title: "AWS Config should be enabled and use the service-linked role for resource recording",
+    description: "This control checks whether AWS Config is enabled in the account and Region, records all resources, and uses the service-linked role for recording.",
+    severity_rating: "MEDIUM",
+    related_requirements: &[],
+};
+
+const EC2_2: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "EC2.2",
+    title: "VPC default security groups should not allow inbound or outbound traffic",
+    description: "This control checks whether the default security group of a VPC allows inbound or outbound traffic. The control fails if the security group allows any inbound or outbound traffic.",
+    severity_rating: "MEDIUM",
+    related_requirements: &[],
+};
+
+const EC2_13: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "EC2.13",
+    title: "Security groups should not allow ingress from 0.0.0.0/0 or ::/0 to port 22",
+    description: "This control checks whether a security group allows unrestricted incoming traffic to port 22 from any IPv4 or IPv6 address.",
+    severity_rating: "HIGH",
+    related_requirements: &[],
+};
+
+const EC2_52: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "EC2.52",
+    title: "EC2 transit gateways should be tagged",
+    description: "This control checks whether an Amazon EC2 transit gateway carries the tag keys the control's parameters name. The control fails if the transit gateway carries none of them.",
+    severity_rating: "LOW",
+    related_requirements: &[],
+};
+
+const ECS_13: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "ECS.13",
+    title: "ECS services should be tagged",
+    description: "This control checks whether an Amazon ECS service carries the tag keys the control's parameters name. The control fails if the service carries none of them.",
+    severity_rating: "LOW",
+    related_requirements: &[],
+};
+
+const GUARDDUTY_1: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "GuardDuty.1",
+    title: "GuardDuty should be enabled",
+    description: "This control checks whether Amazon GuardDuty is enabled in the account and Region.",
+    severity_rating: "HIGH",
+    related_requirements: &[],
+};
+
+const IAM_4: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "IAM.4",
+    title: "IAM root user access key should not exist",
+    description: "This control checks whether the root user of the account has an access key. The control fails if an access key exists for the root user.",
+    severity_rating: "CRITICAL",
+    related_requirements: &[],
+};
+
+const KMS_4: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "KMS.4",
+    title: "AWS KMS key rotation should be enabled",
+    description: "This control checks whether automatic key rotation is enabled for a customer managed AWS KMS key.",
+    severity_rating: "MEDIUM",
+    related_requirements: &[],
+};
+
+const S3_1: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "S3.1",
+    title: "S3 general purpose buckets should have block public access settings enabled",
+    description: "This control checks whether the account-level Amazon S3 block public access settings are enabled. The control fails if any of the settings are turned off.",
+    severity_rating: "MEDIUM",
+    related_requirements: &[],
+};
+
+const S3_5: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "S3.5",
+    title: "S3 general purpose buckets should require requests to use SSL",
+    description: "This control checks whether an Amazon S3 bucket policy denies requests that are not made over SSL.",
+    severity_rating: "MEDIUM",
+    related_requirements: &[],
+};
+
+const BEDROCK_1: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "Bedrock.1",
+    title: "Amazon Bedrock model invocation logging should be enabled",
+    description: "This control checks whether model invocation logging is enabled for Amazon Bedrock in the account and Region, so that the prompts and responses of model invocations are recorded.",
+    severity_rating: "MEDIUM",
+    related_requirements: &[],
+};
+
+const SAGEMAKER_1: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "SageMaker.1",
+    title: "Amazon SageMaker AI notebook instances should not have direct internet access",
+    description: "This control checks whether direct internet access is disabled for an Amazon SageMaker AI notebook instance.",
+    severity_rating: "HIGH",
+    related_requirements: &[],
+};
+
+const SAGEMAKER_2: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "SageMaker.2",
+    title: "SageMaker AI notebook instances should be launched in a custom VPC",
+    description: "This control checks whether an Amazon SageMaker AI notebook instance is launched in a custom VPC rather than in the service-managed one.",
+    severity_rating: "HIGH",
+    related_requirements: &[],
+};
+
+const SAGEMAKER_3: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "SageMaker.3",
+    title: "Users should not have root access to SageMaker AI notebook instances",
+    description: "This control checks whether root access is disabled for the users of an Amazon SageMaker AI notebook instance.",
+    severity_rating: "HIGH",
+    related_requirements: &[],
+};
+
+// The controls of the standards whose provider is Azure, which evaluate Azure
+// resources and so carry the controls reference's Azure control ids.
+
+const AZURE_STORAGE_1: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "AzureStorage.1",
+    title: "Azure storage accounts should not allow public blob access",
+    description: "This control checks whether an Azure storage account allows anonymous public read access to its blob containers.",
+    severity_rating: "MEDIUM",
+    related_requirements: &[],
+};
+
+const AZURE_SQL_1: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "AzureSQL.1",
+    title: "Azure SQL servers should have auditing enabled",
+    description: "This control checks whether auditing is enabled for an Azure SQL server, so that the statements run against its databases are recorded.",
+    severity_rating: "MEDIUM",
+    related_requirements: &[],
+};
+
+const AZURE_VM_1: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "AzureVirtualMachine.1",
+    title: "Azure virtual machines should have disk encryption enabled",
+    description: "This control checks whether the attached disks of an Azure virtual machine are encrypted.",
+    severity_rating: "HIGH",
+    related_requirements: &[],
+};
+
+const AZURE_KEY_VAULT_1: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "AzureKeyVault.1",
+    title: "Azure key vaults should have purge protection enabled",
+    description: "This control checks whether purge protection is enabled for an Azure key vault, so that a deleted vault or key cannot be purged before its retention period ends.",
+    severity_rating: "MEDIUM",
+    related_requirements: &[],
+};
+
+/// The controls of the AI Security Best Practices standard: the controls of the
+/// AI services whose resources it evaluates.
+const AI_SECURITY_BEST_PRACTICES_CONTROLS: [StandardsControlDefinition; 4] =
+    [BEDROCK_1, SAGEMAKER_1, SAGEMAKER_2, SAGEMAKER_3];
+
+/// The controls of the AWS Foundational Security Best Practices standard, which
+/// addresses each one by the security control's own id.
+const FSBP_CONTROLS: [StandardsControlDefinition; 9] = [
+    ACM_1,
+    CLOUDTRAIL_1,
+    CLOUDTRAIL_2,
+    CLOUDWATCH_1,
+    CONFIG_1,
+    EC2_2,
+    GUARDDUTY_1,
+    IAM_4,
+    S3_1,
+];
+
+/// The controls of the AWS Resource Tagging Standard, which is made up of the
+/// "should be tagged" controls — the ones that check whether a resource carries the
+/// tag keys the control's parameters name.
+const RESOURCE_TAGGING_CONTROLS: [StandardsControlDefinition; 2] = [EC2_52, ECS_13];
+
+/// The controls of the Azure Foundational Security Best Practices standard.
+const AZURE_FSBP_CONTROLS: [StandardsControlDefinition; 4] =
+    [AZURE_STORAGE_1, AZURE_SQL_1, AZURE_VM_1, AZURE_KEY_VAULT_1];
+
+/// The controls of the CIS Microsoft Azure Foundations Benchmark v4.0.0 standard.
+const CIS_AZURE_FOUNDATIONS_4_0_0_CONTROLS: [StandardsControlDefinition; 3] =
+    [AZURE_STORAGE_1, AZURE_SQL_1, AZURE_VM_1];
+
+/// The controls of the CIS AWS Foundations Benchmark v1.4.0 standard: a revision
+/// built on the security controls, so it addresses each one by the control's own id
+/// rather than by the benchmark's requirement number.
+const CIS_AWS_FOUNDATIONS_1_4_0_CONTROLS: [StandardsControlDefinition; 5] =
+    [CLOUDTRAIL_1, CLOUDWATCH_1, CONFIG_1, IAM_4, S3_1];
+
+/// The controls of the CIS AWS Foundations Benchmark v3.0.0 standard.
+const CIS_AWS_FOUNDATIONS_3_0_0_CONTROLS: [StandardsControlDefinition; 5] =
+    [CLOUDTRAIL_1, CONFIG_1, EC2_2, IAM_4, KMS_4];
+
+/// The controls of the CIS AWS Foundations Benchmark v5.0.0 standard.
+const CIS_AWS_FOUNDATIONS_5_0_0_CONTROLS: [StandardsControlDefinition; 5] =
+    [CLOUDTRAIL_1, CONFIG_1, EC2_13, IAM_4, S3_1];
+
+/// The controls of the NIST Special Publication 800-171 Revision 2 standard.
+const NIST_800_171_CONTROLS: [StandardsControlDefinition; 5] =
+    [CLOUDTRAIL_1, CONFIG_1, IAM_4, KMS_4, S3_1];
+
+/// The controls of the NIST Special Publication 800-53 Revision 5 standard.
+const NIST_800_53_CONTROLS: [StandardsControlDefinition; 8] = [
+    ACM_1,
+    CLOUDTRAIL_1,
+    CLOUDTRAIL_2,
+    CONFIG_1,
+    GUARDDUTY_1,
+    IAM_4,
+    KMS_4,
+    S3_1,
+];
+
+/// The controls of the PCI DSS v4.0.1 standard: the newer revision is built on the
+/// security controls, so — unlike the v3.2.1 revision below — it addresses each one
+/// by the control's own id.
+const PCI_DSS_4_0_1_CONTROLS: [StandardsControlDefinition; 5] =
+    [CLOUDTRAIL_1, CLOUDTRAIL_2, IAM_4, S3_1, S3_5];
+
+/// The controls of the CIS AWS Foundations Benchmark v1.2.0 standard this emulator
+/// publishes, from the AWS Security Hub user guide's controls reference. This
+/// standard predates consolidated control findings: it addresses each control by the
+/// benchmark's own numbered requirement, prefixed `CIS.`, publishes the benchmark's
+/// requirement statement as the control title, and relates each control to the
+/// benchmark requirement of the same number.
+const CIS_AWS_FOUNDATIONS_1_2_0_CONTROLS: [StandardsControlDefinition; 11] = [
+    StandardsControlDefinition {
+        control_id: "CIS.1.1",
+        title: "Avoid the use of the \"root\" account",
+        description: "The root account has unrestricted access to every resource in the account. This control checks whether the root account was used in the last day.",
+        severity_rating: "LOW",
+        related_requirements: &["CIS AWS Foundations 1.1"],
+    },
+    StandardsControlDefinition {
+        control_id: "CIS.1.2",
+        title: "Ensure multi-factor authentication (MFA) is enabled for all IAM users that have a console password",
+        description: "This control checks whether multi-factor authentication is enabled for every IAM user that has a console password.",
+        severity_rating: "MEDIUM",
+        related_requirements: &["CIS AWS Foundations 1.2"],
+    },
+    StandardsControlDefinition {
+        control_id: "CIS.1.3",
+        title: "Ensure credentials unused for 90 days or greater are disabled",
+        description: "This control checks whether IAM users have passwords or access keys that have not been used within 90 days.",
+        severity_rating: "MEDIUM",
+        related_requirements: &["CIS AWS Foundations 1.3"],
+    },
+    StandardsControlDefinition {
+        control_id: "CIS.1.4",
+        title: "Ensure access keys are rotated every 90 days or less",
+        description: "This control checks whether the active access keys of IAM users are rotated at least every 90 days.",
+        severity_rating: "MEDIUM",
+        related_requirements: &["CIS AWS Foundations 1.4"],
+    },
+    StandardsControlDefinition {
+        control_id: "CIS.1.12",
+        title: "Ensure no root account access key exists",
+        description: "This control checks whether an access key exists for the root account. Removing the root account's access keys limits the damage a compromise of those keys can do.",
+        severity_rating: "CRITICAL",
+        related_requirements: &["CIS AWS Foundations 1.12"],
+    },
+    StandardsControlDefinition {
+        control_id: "CIS.1.13",
+        title: "Ensure MFA is enabled for the \"root\" account",
+        description: "This control checks whether multi-factor authentication is enabled for the root account.",
+        severity_rating: "CRITICAL",
+        related_requirements: &["CIS AWS Foundations 1.13"],
+    },
+    StandardsControlDefinition {
+        control_id: "CIS.2.1",
+        title: "Ensure CloudTrail is enabled in all regions",
+        description: "This control checks whether at least one multi-Region CloudTrail trail records management events in the account.",
+        severity_rating: "HIGH",
+        related_requirements: &["CIS AWS Foundations 2.1"],
+    },
+    StandardsControlDefinition {
+        control_id: "CIS.2.3",
+        title: "Ensure the S3 bucket used to store CloudTrail logs is not publicly accessible",
+        description: "This control checks whether the Amazon S3 bucket a CloudTrail trail delivers its log files to is publicly accessible.",
+        severity_rating: "CRITICAL",
+        related_requirements: &["CIS AWS Foundations 2.3"],
+    },
+    StandardsControlDefinition {
+        control_id: "CIS.2.5",
+        title: "Ensure AWS Config is enabled",
+        description: "This control checks whether AWS Config is enabled in the account and Region and records all resources.",
+        severity_rating: "MEDIUM",
+        related_requirements: &["CIS AWS Foundations 2.5"],
+    },
+    StandardsControlDefinition {
+        control_id: "CIS.4.1",
+        title: "Ensure no security groups allow ingress from 0.0.0.0/0 to port 22",
+        description: "This control checks whether a security group allows unrestricted incoming traffic to port 22.",
+        severity_rating: "HIGH",
+        related_requirements: &["CIS AWS Foundations 4.1"],
+    },
+    StandardsControlDefinition {
+        control_id: "CIS.4.2",
+        title: "Ensure no security groups allow ingress from 0.0.0.0/0 to port 3389",
+        description: "This control checks whether a security group allows unrestricted incoming traffic to port 3389.",
+        severity_rating: "HIGH",
+        related_requirements: &["CIS AWS Foundations 4.2"],
+    },
+];
+
+/// The controls of the PCI DSS v3.2.1 standard this emulator publishes, from the AWS
+/// Security Hub user guide's controls reference. This standard addresses each control
+/// by the security control's id prefixed `PCI.`, and relates each one to the PCI DSS
+/// requirements it covers.
+const PCI_DSS_3_2_1_CONTROLS: [StandardsControlDefinition; 5] = [
+    StandardsControlDefinition {
+        control_id: "PCI.AutoScaling.1",
+        title: "Auto Scaling groups associated with a load balancer should use health checks",
+        description: "This control checks whether an Auto Scaling group that is associated with a load balancer uses Elastic Load Balancing health checks.",
+        severity_rating: "LOW",
+        related_requirements: &["PCI DSS 2.2"],
+    },
+    StandardsControlDefinition {
+        control_id: "PCI.CloudTrail.1",
+        title: "CloudTrail logs should be encrypted at rest using AWS KMS CMKs",
+        description: "This control checks whether a CloudTrail trail encrypts its log files at rest with an AWS KMS customer managed key.",
+        severity_rating: "MEDIUM",
+        related_requirements: &["PCI DSS 3.4"],
+    },
+    StandardsControlDefinition {
+        control_id: "PCI.CloudTrail.2",
+        title: "CloudTrail should be enabled",
+        description: "This control checks whether CloudTrail is enabled in the account, so that the actions taken in it are recorded.",
+        severity_rating: "HIGH",
+        related_requirements: &["PCI DSS 10.1"],
+    },
+    StandardsControlDefinition {
+        control_id: "PCI.IAM.1",
+        title: "IAM root user access key should not exist",
+        description: "This control checks whether an access key exists for the root user of the account.",
+        severity_rating: "CRITICAL",
+        related_requirements: &["PCI DSS 2.1", "PCI DSS 7.2.1"],
+    },
+    StandardsControlDefinition {
+        control_id: "PCI.S3.1",
+        title: "S3 buckets should prohibit public write access",
+        description: "This control checks whether an Amazon S3 bucket allows public write access through its access control list or bucket policy.",
+        severity_rating: "CRITICAL",
+        related_requirements: &["PCI DSS 1.2.1", "PCI DSS 1.3.1"],
+    },
+];
+
+/// The controls this emulator publishes for each standard of [`STANDARDS_CATALOG`].
+/// `DescribeStandardsControls` reports the set of the standard its subscription
+/// names, so every published standard carries one: a subscription whose standard has
+/// controls is never reported as having none.
+///
+/// Each entry is the subset of that standard's published controls this emulator
+/// carries, in the order the reference publishes them. A standard built on the
+/// security controls addresses each control by the control's own id, so its entry
+/// names the shared control definitions above; the two revisions that predate
+/// consolidated control findings — CIS AWS Foundations Benchmark v1.2.0 and PCI DSS
+/// v3.2.1 — address a control by their own prefixed requirement id and publish their
+/// own requirement wording for it, so each of those has its own list.
+pub const STANDARDS_CONTROL_CATALOG: [StandardControlSet; 13] = [
+    StandardControlSet {
+        slug: "ai-security-best-practices",
+        version: "1.0.0",
+        controls: &AI_SECURITY_BEST_PRACTICES_CONTROLS,
+    },
+    StandardControlSet {
+        slug: "aws-foundational-security-best-practices",
+        version: "1.0.0",
+        controls: &FSBP_CONTROLS,
+    },
+    StandardControlSet {
+        slug: "aws-resource-tagging-standard",
+        version: "1.0.0",
+        controls: &RESOURCE_TAGGING_CONTROLS,
+    },
+    StandardControlSet {
+        slug: "azure-foundational-security-best-practices",
+        version: "1.0.0",
+        controls: &AZURE_FSBP_CONTROLS,
+    },
+    StandardControlSet {
+        slug: "cis-aws-foundations-benchmark",
+        version: "1.2.0",
+        controls: &CIS_AWS_FOUNDATIONS_1_2_0_CONTROLS,
+    },
+    StandardControlSet {
+        slug: "cis-aws-foundations-benchmark",
+        version: "1.4.0",
+        controls: &CIS_AWS_FOUNDATIONS_1_4_0_CONTROLS,
+    },
+    StandardControlSet {
+        slug: "cis-aws-foundations-benchmark",
+        version: "3.0.0",
+        controls: &CIS_AWS_FOUNDATIONS_3_0_0_CONTROLS,
+    },
+    StandardControlSet {
+        slug: "cis-aws-foundations-benchmark",
+        version: "5.0.0",
+        controls: &CIS_AWS_FOUNDATIONS_5_0_0_CONTROLS,
+    },
+    StandardControlSet {
+        slug: "cis-azure-foundations-benchmark",
+        version: "4.0.0",
+        controls: &CIS_AZURE_FOUNDATIONS_4_0_0_CONTROLS,
+    },
+    StandardControlSet {
+        slug: "nist-800-171",
+        version: "2.0.0",
+        controls: &NIST_800_171_CONTROLS,
+    },
+    StandardControlSet {
+        slug: "nist-800-53",
+        version: "5.0.0",
+        controls: &NIST_800_53_CONTROLS,
+    },
+    StandardControlSet {
+        slug: "pci-dss",
+        version: "3.2.1",
+        controls: &PCI_DSS_3_2_1_CONTROLS,
+    },
+    StandardControlSet {
+        slug: "pci-dss",
+        version: "4.0.1",
+        controls: &PCI_DSS_4_0_1_CONTROLS,
+    },
+];
+
+/// The controls `definition`'s standard publishes, in the published order. The single
+/// definition of which controls a standard carries, so every operation that addresses
+/// a standards control resolves the same set.
+pub fn standard_controls(
+    definition: &StandardDefinition,
+) -> &'static [StandardsControlDefinition] {
+    STANDARDS_CONTROL_CATALOG
+        .iter()
+        .find(|set| set.slug == definition.slug && set.version == definition.version)
+        .map_or(&[], |set| set.controls)
+}
+
+/// The ARN of one control of one account's subscription to a standard:
+/// `arn:aws:securityhub:<region>:<account>:control/<slug>/v/<version>/<ControlId>` —
+/// the form the `StandardsControlArn` example in this service's `smithy-model/`
+/// carries (`:control/pci-dss/v/3.2.1/PCI.AutoScaling.1`), so a control's ARN names
+/// the standard it belongs to and the account and Region whose subscription it is
+/// part of.
+pub fn standards_control_arn(
+    region: &str,
+    definition: &StandardDefinition,
+    control_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!(
+            "control/{}/v/{}/{control_id}",
+            definition.slug, definition.version
+        ),
+    )
+}
+
+/// `StandardsControl$RemediationUrl`: "A link to remediation information for the
+/// control in the Security Hub CSPM user documentation" — the console deep link the
+/// user guide publishes for a control, which carries the control's own id.
+pub fn standards_control_remediation_url(control_id: &str) -> String {
+    format!("https://docs.aws.amazon.com/console/securityhub/{control_id}/remediation")
+}
+
+/// One control of one subscription as the modelled `StandardsControl` every operation
+/// that reports a control answers with: the control's published metadata, plus the
+/// status this subscription holds for it.
+///
+/// A control the subscription holds no changed status for carries the status enabling
+/// the standard gave it — `ENABLED`, last set when the standard was enabled.
+pub fn standards_control_view(
+    region: &str,
+    definition: &StandardDefinition,
+    control: &StandardsControlDefinition,
+    record: &StandardsSubscriptionRecord,
+) -> StandardsControl {
+    let status = record.control_statuses.get(control.control_id);
+    StandardsControl {
+        standards_control_arn: Some(standards_control_arn(region, definition, control.control_id)),
+        control_status: Some(
+            status.map_or(CONTROL_STATUS_ENABLED, |status| {
+                status.control_status.as_str()
+            })
+            .to_string(),
+        ),
+        disabled_reason: status.and_then(|status| status.disabled_reason.clone()),
+        control_status_updated_at: Some(
+            status.map_or(record.enabled_at, |status| status.control_status_updated_at),
+        ),
+        control_id: Some(control.control_id.to_string()),
+        title: Some(control.title.to_string()),
+        description: Some(control.description.to_string()),
+        remediation_url: Some(standards_control_remediation_url(control.control_id)),
+        severity_rating: Some(control.severity_rating.to_string()),
+        related_requirements: (!control.related_requirements.is_empty()).then(|| {
+            control
+                .related_requirements
+                .iter()
+                .map(|requirement| (*requirement).to_string())
+                .collect()
+        }),
     }
 }
 

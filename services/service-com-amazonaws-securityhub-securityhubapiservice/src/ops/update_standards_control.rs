@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateStandardsControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateStandardsControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateStandardsControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enables or disables ONE control of one standards subscription of the caller's hub,
+//! writing the status — and, for a disable, the reason — onto that subscription in
+//! `crate::state`, which is where `DescribeStandardsControls` reads it back from.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +109,19 @@ impl From<UpdateStandardsControlErrorModeled> for UpdateStandardsControlError {
     }
 }
 
+/// Every `ControlStatus` value the model declares (`smithy_query(query="shape",
+/// shape="ControlStatus")`): the statuses a control can be put in.
+const CONTROL_STATUSES: [&str; 2] = [
+    crate::state::CONTROL_STATUS_ENABLED,
+    crate::state::CONTROL_STATUS_DISABLED,
+];
+
+/// The longest `DisabledReason` this store keeps. The model bounds neither
+/// `NonEmptyString` nor this member, so the cap is the one this crate already applies
+/// to an unbounded string member ([`crate::state::MAX_ACTION_TARGET_DESCRIPTION_LEN`]):
+/// one record's size must not grow with whatever a caller sends.
+const MAX_DISABLED_REASON_LEN: usize = crate::state::MAX_ACTION_TARGET_DESCRIPTION_LEN;
+
 /// The `UpdateStandardsControl` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -150,18 +158,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateStandardsControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateStandardsControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStandardsControl"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateStandardsControlError::Modeled(
+                UpdateStandardsControlErrorModeled::InternalException(InternalException {
+                    message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                    code: Some("InternalException".to_string()),
+                }),
+            )
+        })?;
+        let invalid_input = |message: String| {
+            UpdateStandardsControlError::Modeled(
+                UpdateStandardsControlErrorModeled::InvalidInputException(InvalidInputException {
+                    message: Some(message),
+                    code: Some("InvalidInputException".to_string()),
+                }),
+            )
+        };
+
+        let key = crate::state::hub_key(ctx);
+        let (account_id, region) = (key.0.clone(), key.1.clone());
+
+        // Whether the request is valid is decided before any state is read, so a
+        // `ControlStatus` the model does not declare, or a disable that names no
+        // reason, is refused identically on every hub.
+        if let Some(status) = input.control_status.as_deref() {
+            if !CONTROL_STATUSES.contains(&status) {
+                return Err(invalid_input(format!(
+                    "ControlStatus: {status} is not a supported control status"
+                )));
+            }
+        }
+        let disabled_reason = input.disabled_reason.clone();
+        if let Some(reason) = disabled_reason.as_deref() {
+            if reason.chars().count() > MAX_DISABLED_REASON_LEN {
+                return Err(invalid_input(format!(
+                    "DisabledReason: a reason may not exceed {MAX_DISABLED_REASON_LEN} characters"
+                )));
+            }
+        }
+        let disabling = input.control_status.as_deref()
+            == Some(crate::state::CONTROL_STATUS_DISABLED);
+        if disabling && disabled_reason.is_none() {
+            return Err(invalid_input(crate::state::disabled_reason_required_message(
+                &input.standards_control_arn,
+            )));
+        }
+
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&key) {
+            return Err(UpdateStandardsControlErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(crate::state::not_subscribed_message(&account_id, &region)),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A control is addressable only while its standard's controls are updatable,
+        // and the `PENDING` -> `READY` transition the enabling call owes decides that:
+        // materialise what the clock already made due before resolving the ARN.
+        crate::state::settle_standards(&mut store, &key);
+
+        // "Calls to this operation return a RESOURCE_NOT_FOUND_EXCEPTION error when
+        // the standard subscription for the control has StandardsControlsUpdatable
+        // value NOT_READY_FOR_UPDATES", so a subscription that is still enabling
+        // exposes none of its controls to address.
+        let resolved = store
+            .standards
+            .iter()
+            .filter(|(subscription_key, record)| {
+                subscription_key.account_id == account_id
+                    && subscription_key.region == region
+                    && crate::state::standards_controls_updatable(&record.standards_status)
+                        == crate::state::STANDARDS_CONTROLS_READY
+            })
+            .filter_map(|(subscription_key, _)| {
+                crate::state::standard_by_arn(&region, &subscription_key.standards_arn)
+                    .map(|definition| (subscription_key.clone(), definition))
+            })
+            .find_map(|(subscription_key, definition)| {
+                crate::state::standard_controls(&definition)
+                    .iter()
+                    // The ARN a control is reported under is the control's address,
+                    // so the lookup derives it the one way `standards_control_arn`
+                    // does rather than parsing the input.
+                    .find(|control| {
+                        crate::state::standards_control_arn(
+                            &region,
+                            &definition,
+                            control.control_id,
+                        ) == input.standards_control_arn
+                    })
+                    .map(|control| (subscription_key, control.control_id.to_string()))
+            });
+        let Some((subscription_key, control_id)) = resolved else {
+            return Err(
+                UpdateStandardsControlErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::arn_does_not_exist_message(
+                            &input.standards_control_arn,
+                        )),
+                        code: Some("ResourceNotFoundException".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A request that names no `ControlStatus` asks for no change: the control
+        // keeps the status it has, so nothing is written.
+        if let Some(status) = input.control_status.clone() {
+            if let Some(record) = store.standards.get_mut(&subscription_key) {
+                record.control_statuses.insert(
+                    control_id,
+                    crate::state::StandardsControlStatus {
+                        control_status: status,
+                        // A re-enabled control has no reason to report: the reason
+                        // describes the most recent change in status, and enabling a
+                        // control is not a disable.
+                        disabled_reason: if disabling { disabled_reason } else { None },
+                        control_status_updated_at: crate::state::now_date_time(),
+                    },
+                );
+            }
+        }
+
+        Ok(UpdateStandardsControlOutput::default())
     }
 }

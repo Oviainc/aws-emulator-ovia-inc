@@ -24,6 +24,9 @@ mod error_envelope;
 // Declared here for the same reason: a new suite conflicts with no other change.
 #[path = "all/member_listing.rs"]
 mod member_listing;
+// And this one, for the same reason.
+#[path = "all/standards_controls.rs"]
+mod standards_controls;
 #[path = "all/action_targets.rs"]
 mod action_targets;
 #[path = "all/automation_rules.rs"]

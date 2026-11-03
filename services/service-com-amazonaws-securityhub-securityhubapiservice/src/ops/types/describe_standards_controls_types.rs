@@ -26,7 +26,15 @@ pub struct DescribeStandardsControlsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityhub#StandardsControl")]
+/// `StandardsControl`. Its schema and codec come from
+/// [`securityhub_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `ControlStatusUpdatedAt` targets `Timestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape",
+/// shape="StandardsControl")`), and the derive does not put that trait on a member
+/// schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct StandardsControl {
     pub standards_control_arn: Option<String>,
@@ -40,4 +48,71 @@ pub struct StandardsControl {
     pub severity_rating: Option<String>,
     pub related_requirements: Option<Vec<String>>,
 }
+
+securityhub_schema_and_codec!(
+    StandardsControl,
+    STANDARDS_CONTROL_SCHEMA,
+    "com.amazonaws.securityhub#StandardsControl",
+    "com.amazonaws.securityhub",
+    "StandardsControl",
+    (
+        M_STANDARDS_CONTROL_ARN,
+        standards_control_arn,
+        "StandardsControlArn",
+        0,
+        opt,
+        string
+    ),
+    (
+        M_CONTROL_STATUS,
+        control_status,
+        "ControlStatus",
+        1,
+        opt,
+        string
+    ),
+    (
+        M_DISABLED_REASON,
+        disabled_reason,
+        "DisabledReason",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_CONTROL_STATUS_UPDATED_AT,
+        control_status_updated_at,
+        "ControlStatusUpdatedAt",
+        3,
+        opt,
+        date_time
+    ),
+    (M_CONTROL_ID, control_id, "ControlId", 4, opt, string),
+    (M_TITLE, title, "Title", 5, opt, string),
+    (M_DESCRIPTION, description, "Description", 6, opt, string),
+    (
+        M_REMEDIATION_URL,
+        remediation_url,
+        "RemediationUrl",
+        7,
+        opt,
+        string
+    ),
+    (
+        M_SEVERITY_RATING,
+        severity_rating,
+        "SeverityRating",
+        8,
+        opt,
+        string
+    ),
+    (
+        M_RELATED_REQUIREMENTS,
+        related_requirements,
+        "RelatedRequirements",
+        9,
+        opt,
+        list_of_strings
+    ),
+);
 

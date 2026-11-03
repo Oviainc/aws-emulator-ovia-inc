@@ -86,14 +86,18 @@ macro_rules! securityhub_shape_type {
     (list_of) => {
         ::aws_smithy_schema::ShapeType::List
     };
+    (list_of_strings) => {
+        ::aws_smithy_schema::ShapeType::List
+    };
 }
 
 /// One member's schema, as the vendored codegen would emit it, plus the
 /// `@timestampFormat("date-time")` chain call it cannot.
 ///
 /// `$kind` is the member's shape kind — `string` (a `string` or an `enum` shape, both
-/// string-encoded), `integer`, `boolean`, `date_time`, `struct_of(T)` or `list_of(T)`
-/// for a list whose element is the structure `T`.
+/// string-encoded), `integer`, `boolean`, `date_time`, `struct_of(T)`, `list_of(T)`
+/// for a list whose element is the structure `T`, or `list_of_strings` for a list of
+/// strings.
 macro_rules! securityhub_member_schema {
     ($ns:literal, $local:literal, $wire:literal, $idx:literal, date_time) => {
         ::aws_smithy_schema::Schema::new_member(
@@ -150,6 +154,16 @@ macro_rules! securityhub_write_member {
             Ok(())
         })?;
     };
+    // A list of strings writes each element against the MEMBER's schema, which is what
+    // the codegen does for a scalar element: the JSON codec needs no element schema.
+    ($s:ident, $m:expr, $v:expr, list_of_strings) => {
+        $s.write_list($m, &|__sl| {
+            for __it in $v.iter() {
+                __sl.write_string($m, __it.as_str())?;
+            }
+            Ok(())
+        })?;
+    };
 }
 
 /// Read one member, as the vendored codegen's `codegen::emit_read` does for that kind.
@@ -179,6 +193,14 @@ macro_rules! securityhub_read_member {
             __items.push(
                 <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(__el)?,
             );
+            Ok(())
+        })?;
+        __items
+    }};
+    ($d:ident, $m:expr, list_of_strings) => {{
+        let mut __items: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+        $d.read_list($m, &mut |__el| {
+            __items.push(__el.read_string($m)?);
             Ok(())
         })?;
         __items
