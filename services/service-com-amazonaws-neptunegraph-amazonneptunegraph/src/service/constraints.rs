@@ -156,6 +156,9 @@ pub fn constraint_violations<O: Operation>(
 /// `None` when there is nothing to refuse, and `None` for a violation class this service
 /// has no wording for, which leaves the whole refusal to the framework's own walk rather
 /// than inventing a sentence for it (see [`super::constraint_clause`]).
+///
+/// `req` is the request being refused: the framework's own renderer, the fallback when the
+/// modelled shape cannot be serialized, reads the protocol it is served in off it.
 pub fn constraint_refusal<O: Operation>(
     svc: &dyn Service,
     req: &RtRequest,

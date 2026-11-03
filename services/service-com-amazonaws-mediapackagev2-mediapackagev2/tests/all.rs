@@ -148,3 +148,5 @@ mod output_locking_mode_input_type;
 mod multiview_epoch_locking;
 #[path = "all/tag_key_character_bound.rs"]
 mod tag_key_character_bound;
+#[path = "all/sub_resource_content_scope.rs"]
+mod sub_resource_content_scope;

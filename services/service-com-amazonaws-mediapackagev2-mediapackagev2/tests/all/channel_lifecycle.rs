@@ -30,7 +30,11 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request in this suite is signed for. It travels in the SigV4
 /// credential scope, which is also what the service reads its region from.
-const REGION: &str = "us-west-2";
+///
+/// `pub(crate)` because a suite that reads this emulator's persisted store back has to
+/// address the same Region the client signs for (see
+/// `tests/all/sub_resource_content_scope.rs`).
+pub(crate) const REGION: &str = "us-west-2";
 
 /// A MediaPackageV2 emulator plus a tiny restJson1 client for it.
 ///
@@ -40,6 +44,9 @@ const REGION: &str = "us-west-2";
 /// `tests/all/channel_listing.rs` and `tests/all/channel_update.rs`).
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The one shared engine the registered service holds, kept so a suite can read this
+    /// service's PERSISTED store back — what no response projects.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -49,9 +56,22 @@ impl Emulator {
         // This suite signs nothing: it exercises handler behaviour, not authentication.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_mediapackagev2_mediapackagev2::EmulatedService::new(engine),
+            service_com_amazonaws_mediapackagev2_mediapackagev2::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// This service's store in the shared engine — the same handle every handler reaches
+    /// through `crate::state::service_state`.
+    pub(crate) fn store(
+        &self,
+    ) -> engine::ServiceState<
+        service_com_amazonaws_mediapackagev2_mediapackagev2::ComAmazonawsMediapackagev2Mediapackagev2State,
+    > {
+        service_com_amazonaws_mediapackagev2_mediapackagev2::state::service_state(&*self.engine)
+            .expect("the shared engine holds this service's store")
     }
 
     /// Send one request and return its status and parsed JSON body (`Value::Null` for an

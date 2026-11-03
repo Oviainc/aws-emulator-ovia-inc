@@ -1025,8 +1025,12 @@ impl VersionedRecord for OriginEndpoint {
         own.etag = String::new();
         own.modified_at = ::aws_smithy_types::DateTime::from_secs(0);
         let tags = ::std::mem::take(&mut own.tags);
-        // The harvest jobs are left out for the same reason the attached policy is: a
-        // sub-resource commits versions of its own.
+        // The attached policy and the harvest jobs are sub-resources of the endpoint, not
+        // endpoint members — no `OriginEndpoint*` shape in the model carries them and they
+        // take no part in the endpoint's entity tag either — and each commits versions of
+        // its own, so they are no part of its content here. The same scrubbing the channel
+        // copy above applies to the sub-resources hanging off a channel.
+        own.policy = None;
         own.harvest_jobs = BTreeMap::new();
         scrubbed_fingerprint(&own, &tags)
     }
