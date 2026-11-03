@@ -3,12 +3,16 @@
 //! @op GetBackendJob
 //!
 //! Reads back the job a mutating call recorded, by (AppId, BackendEnvironmentName,
-//! JobId). The whole address is STATE, so an address that resolves to no job answers ONE
-//! refusal whichever of its three parts is the unknown one — HTTP 404 with the error code
-//! `ResourceNotFoundException` ([`crate::state::job_not_found`]) — and this read does not
-//! run the app-identity gate: a job that does not exist is absent state, never a
-//! malformed request. Jobs outlive the environment they ran against, so a lookup after
-//! `DeleteBackend` still resolves.
+//! JobId).
+//!
+//! `AppId` names an IDENTITY and is resolved first: an app id no registered Amplify app
+//! exists for is refused with HTTP 400 `ValidationException`
+//! ([`crate::state::require_registered_app`]) before the job is looked up. Only below
+//! that gate is the rest of the address state: an environment or a job id that resolves
+//! to no job under an app that DOES exist answers ONE refusal, HTTP 404 with the error
+//! code `ResourceNotFoundException` ([`crate::state::job_not_found`]), whichever of the
+//! two is the unknown one. Jobs outlive the environment they ran against, so a lookup
+//! after `DeleteBackend` still resolves.
 //!
 //! Reporting, with ONE write: it materialises the progress the clock already made
 //! due (see `BackendJob::settle`), which was owed at that instant whether or not
@@ -163,12 +167,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        // The app-identity gate, BEFORE the job lookup: a well-formed app id that
+        // identifies no registered Amplify app is a client-input error (400
+        // `ValidationException`), not a job this app has yet to record.
+        crate::state::require_registered_app(&*self.engine, &input.app_id)?;
+
         let now = std::time::SystemTime::now();
         let mut store = state.lock();
-        // ONE lookup for the whole address, and ONE refusal for it: an unknown app, an
-        // unknown environment and a job id this app never minted are all "no job matches
-        // these parameters", so none of them is distinguished and none is answered as a
-        // client-input error.
+        // Below the gate the address is STATE: ONE lookup for what remains of it and ONE
+        // refusal for it, because an environment this app never had and a job id it never
+        // minted are both "no job matches these parameters". The app arm is the defensive
+        // arm of the same gate — an app Amplify holds that this service has no backend
+        // record for has recorded no job either.
         let job = store
             .app_mut(&input.app_id)
             .and_then(|app| app.job_mut(&input.backend_environment_name, &input.job_id))

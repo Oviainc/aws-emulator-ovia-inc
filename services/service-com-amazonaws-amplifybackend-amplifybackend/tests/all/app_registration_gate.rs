@@ -171,9 +171,9 @@ struct Op {
 /// resolves the app against this service's backend records as well as Amplify's registry,
 /// so an app this gate refuses can still be one it serves — its own suite,
 /// `tests/all/remove_all_backends.rs`, is where both answers are pinned. `GetBackendJob`
-/// is not here either: its whole address is state, so it answers ONE job-absent refusal
-/// for an unknown app exactly as for an unknown job — `tests/all/backend_job_not_found.rs`
-/// pins that rule.
+/// IS here: `AppId` names an identity on a job read too, so it is resolved before the job
+/// lookup — and `tests/all/backend_job_not_found.rs` pins the other half, that an address
+/// under an app that DOES exist answers the job-absent 404.
 fn operations(app_id: &str) -> Vec<Op> {
     vec![
         Op {
@@ -191,6 +191,17 @@ fn operations(app_id: &str) -> Vec<Op> {
             body: Some(json!({})),
             registered_status: 200,
             registered_code: "",
+        },
+        Op {
+            name: "GetBackendJob",
+            method: "GET",
+            path: format!("/backend/{app_id}/job/{ENVIRONMENT}/999"),
+            body: None,
+            // The app and the environment exist; no job with that id was ever minted.
+            // Below the identity gate that address is absent STATE, so it answers the
+            // recorded `ResourceNotFoundException` — see `src/ops/get_backend_job.rs`.
+            registered_status: 404,
+            registered_code: "ResourceNotFoundException",
         },
         Op {
             name: "DeleteBackend",

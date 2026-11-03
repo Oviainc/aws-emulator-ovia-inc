@@ -1,29 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the refusal `GetBackendJob` answers when the job it addresses
-//! does not resolve.
+//! End-to-end tests for the PRECEDENCE of the two refusals `GetBackendJob` answers for an
+//! address that resolves to no job.
 //!
-//! The rule under test: a job is addressed by (`AppId`, `BackendEnvironmentName`,
-//! `JobId`), every part of that address is STATE, and an address resolving to no job is
-//! answered as ABSENT STATE — HTTP 404 with the error code `ResourceNotFoundException`
-//! and this service's prefixed "no matching job" sentence — whichever part of it is the
-//! unknown one. There is exactly one such refusal: the read does not distinguish an app
-//! it holds no backend for from an environment or a job id that was never recorded, and
-//! it never answers a request-validation refusal, which would tell a caller its request
-//! was malformed when all that happened is that the job does not exist (yet).
+//! The rule under test: `AppId` names an IDENTITY, so it is resolved against the Amplify
+//! app registry before anything else — an app id no registered app exists for is a
+//! permanent client-input error (HTTP 400, error code `ValidationException`, the prefixed
+//! "invalid appId" sentence) whatever the rest of the request names. Only under an app
+//! that DOES exist is the rest of the address state, and there an address resolving to no
+//! job is answered as ABSENT STATE — HTTP 404 with the error code
+//! `ResourceNotFoundException` and this service's prefixed "no matching job" sentence —
+//! whether the environment or the job id is the unknown one.
 //!
-//! The rows below differ along what the rule generalises over: WHICH part of the address
-//! is unknown, and the form and the size of the unknown value. Each case drives the real
-//! wire path (`MultiServiceRouter::dispatch` with this one service registered), so the
-//! route templates, the `restJson1` codec and the handler are exercised as a served
-//! request exercises them.
+//! The rows below differ along what the rule generalises over: which SIDE of the gate the
+//! case falls on, the form and the size of the unregistered app id, and WHICH part of the
+//! address below the gate is unknown. Each case drives the real wire path
+//! (`MultiServiceRouter::dispatch` with this one service registered), so the route
+//! templates, the `restJson1` codec and the handler are exercised as a served request
+//! exercises them.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_amplifybackend_amplifybackend::state::{
-    ComAmazonawsAmplifybackendAmplifybackendState, ERROR_MESSAGE_PREFIX, MAX_IDENTIFIER_CHARS,
-    UNRESOLVABLE_JOB_SENTENCE,
+    invalid_app_id_message, ComAmazonawsAmplifybackendAmplifybackendState, ERROR_MESSAGE_PREFIX,
+    MAX_IDENTIFIER_CHARS, UNRESOLVABLE_JOB_SENTENCE,
 };
 use service_com_amazonaws_amplifybackend_amplifybackend::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -35,7 +36,8 @@ const HOST: &str = "amplifybackend.us-east-1.amazonaws.com";
 /// The wire error code a job read answers for an address that resolves to no job.
 const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 
-/// The code a request-validation refusal carries, which this read must never answer.
+/// The code the app-identity refusal carries, which an address under an app that exists
+/// must never answer.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
 /// The app this suite registers a backend for, and its two environments.
@@ -168,16 +170,49 @@ fn assert_job_absent(case: &str, status: u16, body: &Value) {
     );
 }
 
-/// Every address that resolves to no job earns the SAME refusal, whichever of its three
-/// parts is unknown and whatever form that part takes.
+/// Assert the app-identity refusal on one response.
+fn assert_app_invalid(case: &str, status: u16, body: &Value) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected 400, got {status} {body}"
+    );
+    assert_eq!(
+        field(body, "code"),
+        VALIDATION_EXCEPTION,
+        "case {case:?}: expected code {VALIDATION_EXCEPTION:?}, got {body}"
+    );
+    assert_ne!(
+        field(body, "code"),
+        RESOURCE_NOT_FOUND,
+        "case {case:?}: an app that does not exist is never reported as an absent job, got {body}"
+    );
+    assert!(
+        field(body, "__type").ends_with(VALIDATION_EXCEPTION),
+        "case {case:?}: the envelope's `__type` agrees with the code, got {body}"
+    );
+    assert_eq!(
+        field(body, "message"),
+        invalid_app_id_message(),
+        "case {case:?}: expected message {:?}, got {body}",
+        invalid_app_id_message()
+    );
+    assert!(
+        field(body, "message").starts_with(ERROR_MESSAGE_PREFIX),
+        "case {case:?}: the message carries this service's fixed prefix, got {body}"
+    );
+}
+
+/// An `AppId` no registered Amplify app exists for is refused as the permanent
+/// client-input error it is, BEFORE the job lookup — whatever form that id takes and
+/// whatever the rest of the address names, up to and including a job id another app really
+/// did mint.
 #[tokio::test]
-async fn an_unresolvable_job_address_is_one_resource_not_found() {
+async fn an_unregistered_app_id_is_refused_before_the_job_lookup() {
     let (router, _engine) = router_with_engine();
     let staging_job = seed(&router, APP, ENVIRONMENT).await;
-    let _preview_job = seed(&router, APP, OTHER_ENVIRONMENT).await;
     let other_app_job = seed(&router, OTHER_APP, ENVIRONMENT).await;
 
-    // (what is unknown about the address, the address)
+    // (the case, the address)
     //
     // The app ids no registry holds vary in FORM and SIZE: AmplifyBackend models `AppId`
     // as a bare `__string` `@httpLabel` with no pattern or length constraint
@@ -201,6 +236,10 @@ async fn an_unresolvable_job_address_is_one_resource_not_found() {
             job_path("not-an-app-id", ENVIRONMENT, &staging_job),
         ),
         (
+            "the shortest app id Amplify's pattern allows",
+            job_path("d0", ENVIRONMENT, &staging_job),
+        ),
+        (
             "an app id at this emulator's identifier length bound",
             job_path(
                 &format!("d{}", "9".repeat(MAX_IDENTIFIER_CHARS - 1)),
@@ -208,6 +247,34 @@ async fn an_unresolvable_job_address_is_one_resource_not_found() {
                 &staging_job,
             ),
         ),
+        (
+            "an unregistered app with an environment nothing ever created",
+            job_path("dneveregistered", "nosuchenvironment", "999"),
+        ),
+        (
+            "an unregistered app with a job id another app minted",
+            job_path("dneveregistered", ENVIRONMENT, &other_app_job),
+        ),
+    ];
+
+    for (case, path) in rows {
+        let (status, body) = call(&router, "GET", &path, None).await;
+        assert_app_invalid(case, status, &body);
+    }
+}
+
+/// Under an app that DOES exist, every address that resolves to no job earns the SAME
+/// job-absent refusal, whichever of the two remaining parts is unknown and whatever form
+/// that part takes.
+#[tokio::test]
+async fn an_unresolvable_job_address_is_one_resource_not_found() {
+    let (router, _engine) = router_with_engine();
+    let staging_job = seed(&router, APP, ENVIRONMENT).await;
+    let _preview_job = seed(&router, APP, OTHER_ENVIRONMENT).await;
+    let _other_app_job = seed(&router, OTHER_APP, ENVIRONMENT).await;
+
+    // (what is unknown about the address, the address)
+    let rows: Vec<(&str, String)> = vec![
         (
             "a registered app with no such environment",
             job_path(APP, "nosuchenvironment", &staging_job),
@@ -233,8 +300,8 @@ async fn an_unresolvable_job_address_is_one_resource_not_found() {
             job_path(APP, ENVIRONMENT, &format!("{staging_job}0")),
         ),
         (
-            "an unregistered app with a job id another app minted",
-            job_path("dneveregistered", ENVIRONMENT, &other_app_job),
+            "an environment name outside the form this service creates",
+            job_path(APP, "NOT-A-VALID-ENV", "999"),
         ),
     ];
 
@@ -316,21 +383,33 @@ async fn an_address_that_resolves_is_still_served() {
     );
 }
 
-/// The refusal is a REPORT: it stores nothing, registers no app, and leaves every job
+/// Either refusal is a REPORT: it stores nothing, registers no app, and leaves every job
 /// that does resolve reading back exactly as it did before.
 #[tokio::test]
 async fn a_refused_job_read_changes_nothing() {
     let (router, engine) = router_with_engine();
     let staging_job = seed(&router, APP, ENVIRONMENT).await;
 
-    let unknown = job_path("dnotregistered", ENVIRONMENT, "999");
-    let (first_status, first_body) = call(&router, "GET", &unknown, None).await;
-    assert_job_absent("the first refusal", first_status, &first_body);
-    let (second_status, second_body) = call(&router, "GET", &unknown, None).await;
-    assert_job_absent("the repeated refusal", second_status, &second_body);
+    // Both sides of the gate, each asked twice: the identity refusal and the job-absent
+    // refusal answer the same body every time and leave the store as it was.
+    let absent = job_path(APP, ENVIRONMENT, "999");
+    let (first_status, first_body) = call(&router, "GET", &absent, None).await;
+    assert_job_absent("the first job-absent refusal", first_status, &first_body);
+    let (second_status, second_body) = call(&router, "GET", &absent, None).await;
+    assert_job_absent("the repeated job-absent refusal", second_status, &second_body);
     assert_eq!(
         first_body, second_body,
-        "case \"repeated refusal\": the same address answers the same body, got {first_body} vs {second_body}"
+        "case \"repeated job-absent refusal\": the same address answers the same body, got {first_body} vs {second_body}"
+    );
+
+    let unregistered = job_path("dnotregistered", ENVIRONMENT, "999");
+    let (first_status, first_body) = call(&router, "GET", &unregistered, None).await;
+    assert_app_invalid("the first identity refusal", first_status, &first_body);
+    let (second_status, second_body) = call(&router, "GET", &unregistered, None).await;
+    assert_app_invalid("the repeated identity refusal", second_status, &second_body);
+    assert_eq!(
+        first_body, second_body,
+        "case \"repeated identity refusal\": the same address answers the same body, got {first_body} vs {second_body}"
     );
 
     {
@@ -358,11 +437,11 @@ async fn a_refused_job_read_changes_nothing() {
     .await;
     assert_eq!(
         status, 200,
-        "case \"a resolvable address after two refusals\": expected 200, got {status} {body}"
+        "case \"a resolvable address after four refusals\": expected 200, got {status} {body}"
     );
     assert_eq!(
         field(&body, "jobId"),
         staging_job,
-        "case \"a resolvable address after two refusals\": the job is unchanged, got {body}"
+        "case \"a resolvable address after four refusals\": the job is unchanged, got {body}"
     );
 }

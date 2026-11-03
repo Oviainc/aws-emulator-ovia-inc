@@ -265,12 +265,12 @@ pub const UNRESOLVABLE_JOB_SENTENCE: &str = "Unable to find matching job with pr
 /// resolves to no job: HTTP 404 with the error code `ResourceNotFoundException` and
 /// [`UNRESOLVABLE_JOB_SENTENCE`].
 ///
-/// ONE refusal for the WHOLE address. AmplifyBackend does not tell "this app is unknown"
-/// apart from "this environment or job does not exist" on a job read: every part of the
-/// address is state, so a part that resolves to nothing makes the JOB absent, which is a
-/// 404 and never a request-validation failure — hence this read does NOT run the
-/// app-identity gate ([`require_registered_app`]), and it cannot: the gate's 400 would
-/// classify absent state as a caller bug.
+/// ONE refusal for the whole address BELOW the app-identity gate. A job read resolves
+/// its `AppId` first ([`require_registered_app`]), so an app id no Amplify app exists for
+/// never reaches here; what remains of the address is state, and AmplifyBackend does not
+/// tell "this environment does not exist" apart from "this app minted no such job" — a
+/// part that resolves to nothing makes the JOB absent, which is a 404 and not a
+/// request-validation failure.
 ///
 /// Generic over the operation's modelled error enum, like the other shared refusals, so a
 /// job read cannot word it a second way.
@@ -297,8 +297,9 @@ pub fn job_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
 /// nothing but the app. An app Amplify holds that has no backend here therefore reaches
 /// its own per-resource answers rather than the identity refusal.
 ///
-/// A JOB READ is not gated at all: its whole address is state, so it answers one
-/// job-absent refusal ([`job_not_found`]) whichever part of it does not resolve.
+/// A JOB READ is gated like every other read that addresses an app: the identity refusal
+/// first, and only under an app that exists is an address matching no job answered as the
+/// absent state it is ([`job_not_found`]).
 ///
 /// `false` when that store is unreachable as well (the engine is not the shared in-memory
 /// one), which no caller can observe: every handler resolves its own [`service_state`] and

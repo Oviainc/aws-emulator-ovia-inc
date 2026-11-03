@@ -569,10 +569,9 @@ async fn a_job_lookup_is_scoped_to_its_environment() {
 ///
 /// The APP is not one of those parts for the operations below: an `AppId` that identifies
 /// no Amplify app at all is refused earlier, as HTTP 400 `ValidationException` (see
-/// `app_registration_gate.rs`), so every row below names an app that exists and is unknown
-/// in some part BELOW it. A job read is the exception — its whole address is state, so an
-/// unknown app answers the same job-absent refusal as an unknown job, which
-/// `backend_job_not_found.rs` pins over every part of that address.
+/// `app_registration_gate.rs`) — a job read included — so every row below names an app
+/// that exists and is unknown in some part BELOW it; `backend_job_not_found.rs` pins both
+/// halves of that precedence for a job read.
 #[tokio::test]
 async fn an_unknown_resource_is_a_not_found() {
     let router = router_with_apps(&["dknown"]);
