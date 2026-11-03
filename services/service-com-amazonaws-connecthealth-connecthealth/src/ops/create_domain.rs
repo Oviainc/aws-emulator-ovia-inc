@@ -12,7 +12,9 @@
 //! the repeated call is the effect of the single call. The request's identity is the
 //! digest of the parameters it carried ([`crate::state::domain_creation_fingerprint`]),
 //! stored on the record it created, so a request differing in any parameter is a
-//! different request and creates its own domain.
+//! different request and creates its own domain — including a request differing only in
+//! WHICH optional members it carries, since omitting an optional member and supplying it
+//! are two different requests whatever was supplied.
 //!
 //! ## Shape of an operation
 //!
@@ -295,14 +297,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // decided it: so a map that is also past the count cap below earns this refusal,
         // the same one `TagResource` answers for the same map. A refusal writes nothing —
         // nothing has been read, let alone minted.
-        let requested_tags =
-            crate::service::tag_bounds::accepted_entries(input.tags.unwrap_or_default()).map_err(
-                |detail| {
-                    CreateDomainErrorModeled::ValidationException(crate::state::invalid_request(
-                        detail,
-                    ))
-                },
-            )?;
+        //
+        // WHETHER the member was carried is kept, not collapsed into an empty map: the
+        // presence of an optional member is a property of the request, and the request's
+        // identity below is taken over what it carried, so an absent `tags` and a
+        // supplied empty one are two different requests. A map that is absent carries no
+        // entry for the check to decide on.
+        let requested_tags = input
+            .tags
+            .map(crate::service::tag_bounds::accepted_entries)
+            .transpose()
+            .map_err(|detail| {
+                CreateDomainErrorModeled::ValidationException(crate::state::invalid_request(detail))
+            })?;
         // The account this create is signed for, which is the account that will own the
         // domain and the one the cap below is measured against.
         let account_id = crate::state::owning_account_id();
@@ -315,11 +322,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The digest of this request's parameters is the identity of the REQUEST — what
         // tells a repeat from a different request. The tag set it is taken over is the one
         // the shared entry check handed back, in KEY order, so the same entries in a
-        // different wire order are the same set and so the same request.
+        // different wire order are the same set and so the same request — and it is
+        // handed over as the OPTION the request carried, so each of this operation's
+        // three optional members is told apart from its own absence by the one rule.
         let fingerprint = crate::state::domain_creation_fingerprint(
             &input.name,
             input.kms_key_arn.as_deref(),
-            &requested_tags,
+            requested_tags.as_ref(),
             input.web_app_setup_configuration.as_ref(),
         );
         // `@idempotent`: a request this account already created a live domain with in
@@ -373,9 +382,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // created holds no tags yet, so the set bounded here is the entries the request
         // carried, already known to be acceptable one by one. A refusal writes nothing:
         // it is raised before any id is minted.
+        // The COUNT is bounded on the entries, where an absent map and an empty one ask
+        // for the same set: the distinction above is one of request identity, not of what
+        // the new domain ends up holding.
         let tags = crate::service::tag_bounds::merged_within_cap(
             ::std::collections::BTreeMap::new(),
-            requested_tags,
+            requested_tags.unwrap_or_default(),
         )
         .map_err(|count| {
             CreateDomainErrorModeled::ServiceQuotaExceededException(

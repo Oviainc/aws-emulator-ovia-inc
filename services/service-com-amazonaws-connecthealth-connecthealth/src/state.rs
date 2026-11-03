@@ -558,15 +558,18 @@ pub fn fingerprint_of<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
 /// ([`Domain::creation_fingerprint`]) and compared by
 /// [`ComAmazonawsConnecthealthConnecthealthState::domain_created_by`].
 ///
-/// `tags` is digested in KEY order, the order the store holds the set in, so the same
-/// entries presented in a different wire order are the same request; the entry count is
-/// folded in ahead of them so the sections cannot be read into one another. An absent
-/// optional member contributes a part of its own, so omitting a member and supplying it
-/// are different requests.
+/// A SUPPLIED `tags` map is digested in KEY order, the order the store holds the set in,
+/// so the same entries presented in a different wire order are the same request; a part
+/// naming the member and the entry count are folded in ahead of the entries so the
+/// sections cannot be read into one another. An absent optional member contributes a part
+/// of its own instead — one no supplied value can produce — so omitting a member and
+/// supplying it are different requests, EVERY optional member of this operation and
+/// whatever was supplied: an absent `tags` and an empty `tags` map are two different
+/// requests, exactly as an absent `kmsKeyArn` and a supplied one are.
 pub fn domain_creation_fingerprint(
     name: &str,
     kms_key_arn: Option<&str>,
-    tags: &BTreeMap<String, String>,
+    tags: Option<&BTreeMap<String, String>>,
     web_app_setup: Option<&CreateWebAppConfiguration>,
 ) -> String {
     let mut parts: Vec<String> = vec![name.to_string()];
@@ -574,10 +577,19 @@ pub fn domain_creation_fingerprint(
         Some(arn) => parts.push(format!("kmsKeyArn:{arn}")),
         None => parts.push(String::new()),
     }
-    parts.push(tags.len().to_string());
-    for (key, value) in tags {
-        parts.push(key.clone());
-        parts.push(value.clone());
+    match tags {
+        Some(tags) => {
+            parts.push("tags".to_string());
+            // The entry count goes in AHEAD of the entries, so a set and a larger set
+            // that starts with it are different requests and this section cannot be read
+            // into whatever follows it.
+            parts.push(tags.len().to_string());
+            for (key, value) in tags {
+                parts.push(key.clone());
+                parts.push(value.clone());
+            }
+        }
+        None => parts.push(String::new()),
     }
     match web_app_setup {
         Some(setup) => {
