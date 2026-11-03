@@ -549,6 +549,56 @@ pub fn paginate<T: Clone>(
     Some((page, next))
 }
 
+/// The most tags one resource carries: the length the modelled `TagList` declares
+/// (`smithy_query shape=TagList`, len 0..200), which is the longest list a tag operation
+/// can carry for a resource and so the ceiling on what one can hold. `TagResource`'s own
+/// `Tags` doc says "the maximum tag limit may be lower than stated" without stating one,
+/// so the modelled length is the bound this store keeps.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// The first key a tag list assigns more than once, or `None` when every key is distinct.
+///
+/// "Tags are developer-defined and structured as key-value pairs", so one key cannot
+/// carry two values — a list that assigns one twice is not a tag set.
+pub fn first_repeated_tag_key(tags: &[Tag]) -> Option<&str> {
+    let mut keys = HashSet::new();
+    tags.iter()
+        .find(|tag| !keys.insert(tag.key.as_str()))
+        .map(|tag| tag.key.as_str())
+}
+
+/// What the service answers when a tag set assigns one key twice — the message of the
+/// modelled `TaggingFailedException`, whose doc names the class: "This may be due to
+/// invalid tag format".
+pub fn repeated_tag_key_message(key: &str) -> String {
+    format!(
+        "Tags assigns the key {key} more than once; a resource's tags carry each key at \
+         most once."
+    )
+}
+
+/// What the service answers when a `ResourceARN` names no taggable resource this store
+/// holds — the message of the modelled `NotFoundException` ("The resource was either not
+/// created yet or deleted"), shared by the tag operations so the same missing resource
+/// reads the same way whichever of them was called.
+///
+/// The ARN the CALLER supplied is the sentence's one variable part, and the sentence is
+/// the shape this service answers a missing resource in elsewhere
+/// ([`matchmaking_rule_set_not_found_message`]).
+pub fn tagged_resource_not_found_message(resource_arn: &str) -> String {
+    format!("Failed to find resource: {resource_arn}")
+}
+
+/// The resource segment of an ARN, split into the kind it names and the resource id:
+/// `arn:<partition>:<service>:<region>:<account>:<kind>/<id>`.
+///
+/// `None` for anything that is not an ARN with a `<kind>/<id>` resource, which names no
+/// resource of this service.
+fn arn_resource_parts(arn: &str) -> Option<(&str, &str)> {
+    let resource = arn.strip_prefix("arn:")?.splitn(5, ':').nth(4)?;
+    resource.split_once('/')
+}
+
 /// A fleet of compute resources, as `CreateFleet` persisted it.
 #[derive(Debug, Clone)]
 pub struct Fleet {
@@ -2784,6 +2834,112 @@ impl ComAmazonawsGameliftGameliftState {
             }
         }
         candidate
+    }
+
+    /// The tags assigned to the resource `resource_arn` names, or `None` when this store
+    /// holds no taggable resource under that ARN.
+    ///
+    /// Tags live ON the record they label, so this is the one place that maps an ARN to
+    /// them: the ARN's resource kind selects the collection and its resource id is that
+    /// collection's key ("the resource ID matches the `<kind>Id` value"), and the record's
+    /// own stored ARN is then compared WHOLE — so an ARN that differs from it in Region or
+    /// account names no resource here. A kind this service does not tag (a game session,
+    /// a player session) is `None` for the same reason: no record of it carries tags.
+    pub fn tags_of(&self, resource_arn: &str) -> Option<&[Tag]> {
+        let (kind, id) = arn_resource_parts(resource_arn)?;
+        let tags = match kind {
+            "fleet" => self
+                .fleets
+                .get(id)
+                .filter(|fleet| fleet.fleet_arn == resource_arn)
+                .map(|fleet| &fleet.tags),
+            "alias" => self
+                .aliases
+                .get(id)
+                .filter(|alias| alias.alias_arn == resource_arn)
+                .map(|alias| &alias.tags),
+            "build" => self
+                .builds
+                .get(id)
+                .filter(|build| build.build_arn == resource_arn)
+                .map(|build| &build.tags),
+            "script" => self
+                .scripts
+                .get(id)
+                .filter(|script| script.script_arn == resource_arn)
+                .map(|script| &script.tags),
+            "gamesessionqueue" => self
+                .game_session_queues
+                .get(id)
+                .filter(|queue| queue.queue_arn == resource_arn)
+                .map(|queue| &queue.tags),
+            "matchmakingruleset" => self
+                .matchmaking_rule_sets
+                .get(id)
+                .filter(|rule_set| rule_set.rule_set_arn == resource_arn)
+                .map(|rule_set| &rule_set.tags),
+            "matchmakingconfiguration" => self
+                .matchmaking_configurations
+                .get(id)
+                .filter(|configuration| configuration.configuration_arn == resource_arn)
+                .map(|configuration| &configuration.tags),
+            "location" => self
+                .custom_locations
+                .get(id)
+                .filter(|location| location.location_arn == resource_arn)
+                .map(|location| &location.tags),
+            _ => None,
+        };
+        tags.map(Vec::as_slice)
+    }
+
+    /// [`tags_of`](Self::tags_of) for a caller that WRITES the resource's tags, which
+    /// `TagResource` and `UntagResource` do; it resolves the ARN by the same rule.
+    pub fn tags_of_mut(&mut self, resource_arn: &str) -> Option<&mut Vec<Tag>> {
+        let (kind, id) = arn_resource_parts(resource_arn)?;
+        match kind {
+            "fleet" => self
+                .fleets
+                .get_mut(id)
+                .filter(|fleet| fleet.fleet_arn == resource_arn)
+                .map(|fleet| &mut fleet.tags),
+            "alias" => self
+                .aliases
+                .get_mut(id)
+                .filter(|alias| alias.alias_arn == resource_arn)
+                .map(|alias| &mut alias.tags),
+            "build" => self
+                .builds
+                .get_mut(id)
+                .filter(|build| build.build_arn == resource_arn)
+                .map(|build| &mut build.tags),
+            "script" => self
+                .scripts
+                .get_mut(id)
+                .filter(|script| script.script_arn == resource_arn)
+                .map(|script| &mut script.tags),
+            "gamesessionqueue" => self
+                .game_session_queues
+                .get_mut(id)
+                .filter(|queue| queue.queue_arn == resource_arn)
+                .map(|queue| &mut queue.tags),
+            "matchmakingruleset" => self
+                .matchmaking_rule_sets
+                .get_mut(id)
+                .filter(|rule_set| rule_set.rule_set_arn == resource_arn)
+                .map(|rule_set| &mut rule_set.tags),
+            "matchmakingconfiguration" => self
+                .matchmaking_configurations
+                .get_mut(id)
+                .filter(|configuration| configuration.configuration_arn == resource_arn)
+                .map(|configuration| &mut configuration.tags),
+            "location" => self
+                .custom_locations
+                .get_mut(id)
+                .filter(|location| location.location_arn == resource_arn)
+                .map(|location| &mut location.tags),
+            _ => None,
+        }
     }
 }
 

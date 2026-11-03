@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges the tags the request carries into the ones the resource its `ResourceARN` names
+//! already holds, so `ListTagsForResource` serves them back from that one stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +156,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+
+        // A resource's tags are a key-value MAP ("tags are developer-defined and
+        // structured as key-value pairs"), so one key cannot carry two values;
+        // `TaggingFailedException`'s doc: "This may be due to invalid tag format". The
+        // modelled `TagList` length (0..200) and each tag's own lengths are refused by the
+        // boundary walk before this handler runs. Refused BEFORE any state is locked, so a
+        // request that is not a tag set writes nothing.
+        if let Some(duplicate) = crate::state::first_repeated_tag_key(&input.tags) {
+            return Err(TagResourceErrorModeled::TaggingFailedException(
+                TaggingFailedException {
+                    message: Some(crate::state::repeated_tag_key_message(duplicate)),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        // A resource whose deletion the clock had already completed is gone before this
+        // call looks for it, so a tag write cannot resurrect it.
+        state.tick(::std::time::SystemTime::now());
+
+        // "To add a tag to a resource, specify the unique ARN value for the resource": an
+        // ARN that names no resource this store holds is the modelled `NotFoundException`
+        // ("The resource was either not created yet or deleted"), not an empty success.
+        // The whole merge then happens under the ONE lock, so two taggings of the same
+        // resource serialize and neither loses the other's keys.
+        let Some(tags) = state.tags_of_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::tagged_resource_not_found_message(
+                    &input.resource_arn,
+                )),
+            })
+            .into());
+        };
+
+        // What the resource would hold once merged: the keys it already carries that this
+        // request does not name, plus every key the request assigns.
+        let merged = tags
+            .iter()
+            .filter(|held| !input.tags.iter().any(|tag| tag.key == held.key))
+            .count()
+            + input.tags.len();
+        if merged > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::TaggingFailedException(
+                TaggingFailedException {
+                    message: Some(format!(
+                        "Tags would take resource {} to {merged} tags, past the maximum of \
+                         {} tags per resource.",
+                        input.resource_arn,
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The operation succeeds even if the list includes tags that are already assigned
+        // to the resource": a key the resource already carries takes the request's value,
+        // and one it does not is appended, so a tag write neither duplicates a key nor
+        // drops a key the request does not name.
+        for tag in &input.tags {
+            match tags.iter_mut().find(|held| held.key == tag.key) {
+                Some(held) => held.value = tag.value.clone(),
+                None => tags.push(tag.clone()),
+            }
+        }
+        Ok(TagResourceOutput {})
     }
 }

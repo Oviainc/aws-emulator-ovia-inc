@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the tag keys the request names from the resource its `ResourceARN` names, so
+//! `ListTagsForResource` no longer serves them from that one stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        // A resource whose deletion the clock had already completed is gone before this
+        // call looks for it, so there is nothing left on it to remove a tag from.
+        state.tick(::std::time::SystemTime::now());
+
+        // "To remove a tag from a resource, specify the unique ARN value for the resource":
+        // an ARN that names no resource this store holds is the modelled
+        // `NotFoundException` ("The resource was either not created yet or deleted"), not an
+        // empty success. The removal then happens under the ONE lock, so two taggings of
+        // the same resource serialize.
+        let Some(tags) = state.tags_of_mut(&input.resource_arn) else {
+            return Err(
+                UntagResourceErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::tagged_resource_not_found_message(
+                        &input.resource_arn,
+                    )),
+                })
+                .into(),
+            );
+        };
+        // "This operation succeeds even if the list includes tags that aren't assigned to
+        // the resource": a key the resource does not carry removes nothing, and every key
+        // it does carry is dropped, leaving the keys the request does not name untouched
+        // and in the order the resource held them.
+        tags.retain(|tag| !input.tag_keys.contains(&tag.key));
+        Ok(UntagResourceOutput {})
     }
 }

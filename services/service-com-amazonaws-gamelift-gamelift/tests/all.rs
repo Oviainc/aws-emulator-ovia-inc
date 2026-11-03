@@ -43,6 +43,8 @@ mod matchmaking_rule_set_persistence;
 mod refusal_message_wording;
 #[path = "all/resource_deletion.rs"]
 mod resource_deletion;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/resource_updates.rs"]
 mod resource_updates;
 #[path = "all/script_content_revisions.rs"]
