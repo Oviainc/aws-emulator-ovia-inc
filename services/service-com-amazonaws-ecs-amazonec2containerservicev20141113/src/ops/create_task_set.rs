@@ -334,6 +334,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let cluster_arn = cluster.arn.clone();
 
+        // "If a capacityProviderStrategy is specified, the capacity providers must already
+        // be created": a provider name this account holds none of places no task, so the
+        // create is refused and no task set is stored
+        // ([`crate::state::capacity_provider_strategy_refusal`]).
+        if let Some(message) = guard.capacity_provider_strategy_refusal(&requested_strategy, &region)
+        {
+            return Err(CreateTaskSetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let service_key = (cluster_name.clone(), service_name.clone());
         let Some(service) = guard.services.get(&service_key).cloned() else {
             return Err(CreateTaskSetErrorModeled::ServiceNotFoundException(
@@ -484,6 +497,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             None => (None, effective_strategy),
         };
+
+        // A public IP is attached to the task's OWN elastic network interface, which only
+        // the Fargate infrastructure does — so whether this task set may ask for one is
+        // decided by where its tasks are placed
+        // ([`crate::state::assign_public_ip_violation`]).
+        if let Some(message) = crate::state::assign_public_ip_violation(
+            input.network_configuration.as_ref(),
+            crate::state::places_on_fargate(
+                input.launch_type.as_deref(),
+                &capacity_provider_strategy,
+            ),
+        ) {
+            return Err(CreateTaskSetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
 
         let created_at = crate::state::now();
         let id = guard.next_task_set_id();

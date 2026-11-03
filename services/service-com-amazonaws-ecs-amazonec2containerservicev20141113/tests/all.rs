@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/accepted_request_classes.rs"]
+mod accepted_request_classes;
 #[path = "all/agent_plane.rs"]
 mod agent_plane;
 #[path = "all/arn_account_and_refusal_classes.rs"]

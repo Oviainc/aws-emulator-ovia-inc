@@ -44,10 +44,11 @@ const LAUNCH_TYPES: [(&str, &str); 4] = [
     ("MANAGED_INSTANCES", "ManagedInstances"),
 ];
 
-/// The platform versions a request may name: the Fargate platform versions the
-/// `platformVersion` doc's "Fargate platform versions" page lists (`1.4.0`, `1.3.0`,
-/// `1.2.0`, `1.1.0`, `1.0.0`) plus the `LATEST` alias the member's own doc names.
-const KNOWN_PLATFORM_VERSIONS: [&str; 6] = ["LATEST", "1.4.0", "1.3.0", "1.2.0", "1.1.0", "1.0.0"];
+/// The platform versions AWS Fargate PUBLISHES, from the `platformVersion` doc's "Fargate
+/// platform versions" page: the newest Linux one (`1.4.0`) and the newest Windows one
+/// (`1.0.0`), plus the `LATEST` alias the member's own doc names. The earlier Linux
+/// versions (`1.3.0` and below) are retired, so they are rows of the REFUSED table below.
+const KNOWN_PLATFORM_VERSIONS: [&str; 3] = ["LATEST", "1.4.0", "1.0.0"];
 
 /// The `PlatformUnknownException` sentence (`state`'s `PLATFORM_UNKNOWN_MESSAGE`): a
 /// constant of the condition, naming nothing from the request.
@@ -367,9 +368,11 @@ async fn a_platform_version_outside_the_published_list_is_refused() {
     }
 
     // Rows past the list: a version that does not exist, one just past the newest, a
-    // partial version, and the alias in the wrong case — the member is a string the
-    // service matches exactly.
-    for version in ["9.9.9", "1.5.0", "1.4", "latest", "FARGATE"] {
+    // partial version, the alias in the wrong case, and the retired Linux versions — the
+    // member is a string the service matches exactly against what Fargate publishes.
+    for version in [
+        "9.9.9", "1.5.0", "1.4", "latest", "FARGATE", "1.3.0", "1.2.0", "1.1.0",
+    ] {
         let case = format!("unknown platformVersion {version}");
         let (code, message) = refusal(
             &router,

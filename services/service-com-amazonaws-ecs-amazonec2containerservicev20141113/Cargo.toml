@@ -16,6 +16,13 @@ engine = { workspace = true }
 # store in the shared engine, so these are cross-service READS of it rather than a copy of a
 # value the request carried. No cycle: that crate does not depend on this one.
 service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { workspace = true }
+# The Cloud Map (service discovery) service, for ONE read of the namespace a Service Connect
+# request names: whether Cloud Map holds it, which decides whether a listing scoped to that
+# namespace can be walked at all (`crate::state::cloud_map_holds_namespace`). The namespace
+# is that service's resource, held in its own store in the shared engine, so this is a
+# cross-service READ rather than a copy kept here. No cycle: that crate depends on no
+# service crate.
+service-com-amazonaws-servicediscovery-route53autonaming-v20170314 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

@@ -74,7 +74,7 @@ use crate::ops::types::{
     ClusterSetting, Container, ContainerDefinition, ContainerImage, ContainerInstance,
     DaemonContainerDefinition,
     DaemonDeploymentConfiguration, DaemonSummary,
-    DaemonTaskDefinition, DaemonTaskDefinitionSummary, DaemonVolume, Deployment,
+    DaemonTaskDefinition, DaemonTaskDefinitionSummary, DaemonVolume, Defaulted, Deployment,
     DeploymentCircuitBreaker, DeploymentConfiguration, DeploymentController,
     DeploymentLifecycleHookDetail,
     ECSExpressGatewayService, EphemeralStorage, ExpressGatewayContainer,
@@ -871,6 +871,11 @@ pub const NETWORK_MODE_HOST: &str = "host";
 /// cannot specify port mappings in your container definitions".
 pub const NETWORK_MODE_NONE: &str = "none";
 
+/// The network mode that puts the containers on a docker bridge and publishes their ports
+/// on the host that runs them, from the `NetworkMode` enum — the mode a revision that names
+/// none runs under on Amazon EC2 capacity.
+pub const NETWORK_MODE_BRIDGE: &str = "bridge";
+
 /// The ELBv2 `TargetType` that registers a target by IP address, from that service's
 /// `TargetTypeEnum` (`smithy_query(query="shape", shape="TargetTypeEnum",
 /// model_path="services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10/smithy-model/com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10.json")`:
@@ -931,15 +936,19 @@ pub const STATISTICS_LAUNCH_TYPES: [(&str, &str); 4] = [
 const DOCUMENTED_STATISTICS_LAUNCH_TYPES: usize = 2;
 
 /// The platform versions this service knows, as the `platformVersion` doc's "Fargate
-/// platform versions" page lists them: the Linux platform versions `1.4.0`, `1.3.0`,
-/// `1.2.0`, `1.1.0` and `1.0.0` (the Windows one is `1.0.0` too), plus the `LATEST`
-/// alias the member's own doc names ("If one isn't specified, the LATEST platform
-/// version is used").
+/// platform versions" page publishes them: the Linux platform version `1.4.0` and the
+/// Windows one `1.0.0`, plus the `LATEST` alias the member's own doc names ("If one isn't
+/// specified, the LATEST platform version is used").
 ///
-/// A platform version outside this list names no platform, which is what
-/// `PlatformUnknownException` ("The specified platform version doesn't exist.") is
-/// modelled for.
-pub const PLATFORM_VERSIONS: [&str; 6] = ["LATEST", "1.4.0", "1.3.0", "1.2.0", "1.1.0", "1.0.0"];
+/// The earlier Linux versions (`1.3.0` and below) are RETIRED — that page keeps them only
+/// under its deprecation notice — so a request that names one names no platform a task can
+/// be placed on, which is what `PlatformUnknownException` ("The specified platform version
+/// doesn't exist.") is modelled for, exactly as a value that was never a version is.
+pub const PLATFORM_VERSIONS: [&str; 3] = [
+    PLATFORM_VERSION_LATEST,
+    LATEST_LINUX_PLATFORM_VERSION,
+    LATEST_WINDOWS_PLATFORM_VERSION,
+];
 
 /// The `platformVersion` alias that asks for whatever the newest platform version is,
 /// rather than naming one: "If one isn't specified, the LATEST platform version is used."
@@ -995,6 +1004,22 @@ pub const MANAGED_CAPACITY_PROVIDERS: [&str; 2] = ["FARGATE", "FARGATE_SPOT"];
 pub const CAPACITY_PROVIDER_NOT_FOUND_MESSAGE: &str =
     "The specified capacity provider was not found. Specify a valid capacity provider and \
      try again.";
+
+/// `InvalidParameterException$message` for a PLACEMENT request — one that says where its
+/// tasks run with a `capacityProviderStrategy` — naming a capacity provider this account
+/// holds none of.
+///
+/// The same condition as [`CAPACITY_PROVIDER_NOT_FOUND_MESSAGE`], worded as Amazon ECS
+/// words it when the provider was named by a strategy: the sentence NAMES the provider the
+/// request asked for, which is the one value the caller has to change, and is otherwise
+/// fixed. `reference` is the value as the request spelled it (a short name or an ARN), so
+/// nothing but the request reaches the body.
+pub fn capacity_provider_not_found_message(reference: &str) -> String {
+    format!(
+        "The specified capacity provider {reference} was not found. Specify a valid capacity \
+         provider and try again."
+    )
+}
 
 /// `InvalidParameterException$message` for a request that supplies BOTH a `launchType` and
 /// a `capacityProviderStrategy`. The two members name the same thing two ways — where the
@@ -1461,6 +1486,22 @@ pub const DEPLOYMENT_STRATEGY_ROLLING: &str = "ROLLING";
 /// bake time configured bakes for no time at all.
 pub const DEFAULT_BAKE_TIME_MINUTES: i32 = 0;
 
+/// The inclusive range `bakeTimeInMinutes` admits. The sibling member that states the same
+/// wait for a LINEAR deployment's steps publishes the bound — `LinearConfiguration
+/// $stepBakeTimeInMinutes`: "Valid values are 0 to 1440 minutes (24 hours)" — and a bake
+/// time is a wait of the same kind, so one day is as long as a deployment may bake. The
+/// RECORDED refusal is what fixes it as this member's bound too: a create naming a bake time
+/// outside it is answered 400 with the sentence [`bake_time_message`] renders.
+pub const BAKE_TIME_RANGE_MINUTES: (i32, i32) = (0, 1440);
+
+/// `InvalidParameterException$message` for a `bakeTimeInMinutes` outside
+/// [`BAKE_TIME_RANGE_MINUTES`]: Amazon ECS states the whole range and the deployment
+/// STRATEGY the configuration asked for, and echoes no value from the request.
+fn bake_time_message(strategy: &str) -> String {
+    let (min, max) = BAKE_TIME_RANGE_MINUTES;
+    format!("The bake time must be between {min} and {max} for {strategy} deployment strategy.")
+}
+
 /// `thresholdConfiguration.type` of a deployment circuit breaker the request gave none
 /// for. The `ThresholdConfiguration` doc: "By default, the threshold configuration uses
 /// a type of BOUNDED_PERCENT with a value of 50."
@@ -1746,18 +1787,64 @@ fn minimum_healthy_percent_message(bound: &str, limit: i32) -> String {
     format!("minimumHealthyPercent must be at {bound} {limit}")
 }
 
+/// `InvalidParameterException$message` for a create that names a `taskDefinition` for a
+/// service whose deployment controller takes the revision from a TASK SET instead.
+///
+/// "A task definition must be specified if the service uses either the ECS or CODE_DEPLOY
+/// deployment controllers" — so under the remaining controller the member belongs to
+/// `CreateTaskSet`, not here. One fixed sentence, naming nothing from the request.
+pub const TASK_DEFINITION_MUST_BE_BLANK_MESSAGE: &str = "TaskDefinition must be blank.";
+
+/// The smallest `maximumPercent` a deployment configuration may name. The member is "an
+/// upper limit on the number of your service's tasks that are allowed in the RUNNING or
+/// PENDING state during a deployment, as a percentage of the desiredCount": a deployment
+/// that may not even run the count the service wants could never finish, so the limit
+/// starts at all of it — 100%, which is what a DAEMON service's deployment is held to and
+/// the floor the REPLICA default (200%) sits above. The RECORDED refusal is what fixes the
+/// floor at 100 rather than at some other share: a create naming less is answered 400 with
+/// the sentence [`maximum_percent_message`] renders.
+pub const MIN_MAXIMUM_PERCENT: i32 = 100;
+
+/// `InvalidParameterException$message` for a `maximumPercent` outside its range, worded as
+/// the sibling percentage's refusal is: the member and the ONE bound the value crossed,
+/// echoing neither the value the request carried nor the other bound.
+fn maximum_percent_message(bound: &str, limit: i32) -> String {
+    format!("maximumPercent must be at {bound} {limit}")
+}
+
 /// The refusal a requested `deploymentConfiguration` earns when a percentage it names is
 /// outside the range that percentage admits, or `None` when every member is in range.
 ///
-/// Only `minimumHealthyPercent` is bounded here: `maximumPercent` is an UPPER limit on
-/// the tasks a deployment may run, which its own doc puts above the desired count ("a
-/// maximumPercent value of 200%"), so a value over 100 is one the member is for.
+/// `maximumPercent` is an UPPER limit on the tasks a deployment may run, which its own doc
+/// puts at or above the desired count ("a maximumPercent value of 200%"), so a value under
+/// [`MIN_MAXIMUM_PERCENT`] is refused and a value over it is one the member is for.
+/// `minimumHealthyPercent` is a share of the desired count, so it is bounded at both ends.
 ///
 /// Spelled once for every operation that takes a deployment configuration, so a
 /// configuration one of them refuses cannot be written by another.
 pub fn deployment_configuration_violation(
     configuration: &DeploymentConfiguration,
 ) -> Option<String> {
+    // "The time period when both blue and green service revisions are running
+    // simultaneously": a wait the deployment makes, bounded like every other bake time the
+    // configuration carries, and reported against the strategy the deployment runs under —
+    // the one the request named, else the rolling update the ECS controller performs.
+    if let Some(minutes) = configuration.bake_time_in_minutes {
+        let (min, max) = BAKE_TIME_RANGE_MINUTES;
+        if !(min..=max).contains(&minutes) {
+            return Some(bake_time_message(
+                configuration
+                    .strategy
+                    .as_deref()
+                    .unwrap_or(DEPLOYMENT_STRATEGY_ROLLING),
+            ));
+        }
+    }
+    if let Some(percent) = configuration.maximum_percent {
+        if percent < MIN_MAXIMUM_PERCENT {
+            return Some(maximum_percent_message("least", MIN_MAXIMUM_PERCENT));
+        }
+    }
     let percent = configuration.minimum_healthy_percent?;
     if percent < MIN_MINIMUM_HEALTHY_PERCENT {
         return Some(minimum_healthy_percent_message(
@@ -3610,19 +3697,19 @@ impl ServiceRecord {
         RESOURCE_MANAGEMENT_CUSTOMER
     }
 
-    /// Whether this service's tasks run on Fargate — the launch type the request named,
-    /// or the Fargate capacity providers a strategy names ("When you use Fargate, the
-    /// capacity providers are FARGATE or FARGATE_SPOT").
+    /// Whether this service's tasks run on Fargate — the launch type the request named, or
+    /// the Fargate capacity providers a strategy names, through the ONE predicate every
+    /// reader of that question shares ([`places_on_fargate`]).
     ///
     /// This is what gates the members AWS documents as Fargate-only: `platformFamily`
     /// ("A platform family is specified only for tasks using the Fargate launch type")
     /// and `platformVersion` ("A platform version is only specified for tasks using the
     /// Fargate launch type").
     pub fn runs_on_fargate(&self) -> bool {
-        self.launch_type.as_deref() == Some(LAUNCH_TYPE_FARGATE)
-            || self.capacity_provider_strategy.iter().any(|item| {
-                MANAGED_CAPACITY_PROVIDERS.contains(&item.capacity_provider.as_str())
-            })
+        places_on_fargate(
+            self.launch_type.as_deref(),
+            &self.capacity_provider_strategy,
+        )
     }
 
     /// Move the deployment this service currently reports as `PRIMARY` onto
@@ -6883,10 +6970,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         generations: &[(&str, DateTime)],
     ) -> Deployment {
         let tally = self.deployment_tally(&service.cluster_name, &superseded.id);
-        let fargate = superseded.launch_type.as_deref() == Some(LAUNCH_TYPE_FARGATE)
-            || superseded.capacity_provider_strategy.iter().any(|item| {
-                MANAGED_CAPACITY_PROVIDERS.contains(&item.capacity_provider.as_str())
-            });
+        let fargate = places_on_fargate(
+            superseded.launch_type.as_deref(),
+            &superseded.capacity_provider_strategy,
+        );
         let os_family = self.service_os_family(service);
         let platform_version = fargate.then(|| {
             resolved_platform_version(
@@ -6973,6 +7060,32 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 .filter_map(|name| managed_capacity_provider(name, region)),
         );
         providers
+    }
+
+    /// The refusal a `capacityProviderStrategy` a request NAMES earns, or `None` when every
+    /// entry of it names a capacity provider this account holds.
+    ///
+    /// `CapacityProviderStrategyItem$capacityProvider` is "The short name or full Amazon
+    /// Resource Name (ARN) of the capacity provider", and the item's own doc states what has
+    /// to be true of it: "If specifying a capacity provider that uses an Auto Scaling group,
+    /// the capacity provider must already be created" — a provider nothing created, and that
+    /// is not one Amazon ECS manages ([`Self::capacity_provider`]), places no task, so the
+    /// request is refused and nothing is stored. The sentence names the FIRST such entry,
+    /// the one entry the caller has to change first.
+    ///
+    /// The strategy a CLUSTER holds as its default is not checked here: it was resolved
+    /// against the same set when it was set on the cluster.
+    pub fn capacity_provider_strategy_refusal(
+        &self,
+        strategy: &[CapacityProviderStrategyItem],
+        region: &str,
+    ) -> Option<String> {
+        strategy.iter().find_map(|item| {
+            let name = capacity_provider_name_from_reference(&item.capacity_provider);
+            self.capacity_provider(&name, region)
+                .is_none()
+                .then(|| capacity_provider_not_found_message(&item.capacity_provider))
+        })
     }
 
     /// The cluster an operation may act IN: one that exists and has not been deleted.
@@ -7398,10 +7511,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // "A platform family is specified only for tasks that use the Fargate launch
         // type", and so is a platform version — the same rule a service's projection
         // follows, read off the capacity THIS task set runs on.
-        let fargate = task_set.launch_type.as_deref() == Some(LAUNCH_TYPE_FARGATE)
-            || task_set.capacity_provider_strategy.iter().any(|item| {
-                MANAGED_CAPACITY_PROVIDERS.contains(&item.capacity_provider.as_str())
-            });
+        let fargate = places_on_fargate(
+            task_set.launch_type.as_deref(),
+            &task_set.capacity_provider_strategy,
+        );
         let os_family = self
             .task_definitions
             .get(&task_set.task_definition)
@@ -9291,6 +9404,49 @@ pub fn deployment_configuration(
     configuration
 }
 
+/// The deployment configuration an UPDATE leaves the service with: the members its request
+/// supplied, over the ones the service already holds.
+///
+/// Every member of `DeploymentConfiguration` is optional, so an update carries just the
+/// knobs it changes — and a member it does not carry is not a request to clear that knob,
+/// it is one the service keeps: `UpdateService`'s own statement for the members beside it,
+/// "If you do not want to override the value that was set when the service was created, you
+/// can set this to null when performing this action", holds for the members INSIDE the
+/// structure too. The merge is per MEMBER and one level deep: a member the request does
+/// supply replaces the one it stood for, structure or not, because that member is one
+/// value.
+pub fn merged_deployment_configuration(
+    stored: &DeploymentConfiguration,
+    requested: DeploymentConfiguration,
+) -> DeploymentConfiguration {
+    DeploymentConfiguration {
+        deployment_circuit_breaker: requested
+            .deployment_circuit_breaker
+            .or_else(|| stored.deployment_circuit_breaker.clone()),
+        maximum_percent: requested.maximum_percent.or(stored.maximum_percent),
+        minimum_healthy_percent: requested
+            .minimum_healthy_percent
+            .or(stored.minimum_healthy_percent),
+        alarms: requested.alarms.or_else(|| stored.alarms.clone()),
+        strategy: requested.strategy.or_else(|| stored.strategy.clone()),
+        bake_time_in_minutes: requested
+            .bake_time_in_minutes
+            .or(stored.bake_time_in_minutes),
+        lifecycle_hooks: requested
+            .lifecycle_hooks
+            .or_else(|| stored.lifecycle_hooks.clone()),
+        linear_configuration: requested
+            .linear_configuration
+            .or_else(|| stored.linear_configuration.clone()),
+        canary_configuration: requested
+            .canary_configuration
+            .or_else(|| stored.canary_configuration.clone()),
+        early_success_criteria: requested
+            .early_success_criteria
+            .or_else(|| stored.early_success_criteria.clone()),
+    }
+}
+
 /// The deployment circuit breaker a service that configured none carries: off, with the
 /// documented failure threshold.
 ///
@@ -9299,16 +9455,16 @@ pub fn deployment_configuration(
 /// turned off and rolls nothing back. `resetOnHealthyTask`: "The default is true".
 /// `ThresholdConfiguration`: "By default, the threshold configuration uses a type of
 /// BOUNDED_PERCENT with a value of 50."
-fn default_deployment_circuit_breaker() -> DeploymentCircuitBreaker {
-    DeploymentCircuitBreaker {
+fn default_deployment_circuit_breaker() -> Defaulted<DeploymentCircuitBreaker> {
+    Defaulted(DeploymentCircuitBreaker {
         enable: false,
         rollback: false,
         reset_on_healthy_task: Some(CIRCUIT_BREAKER_RESETS_ON_HEALTHY_TASK),
-        threshold_configuration: Some(ThresholdConfiguration {
+        threshold_configuration: Some(Defaulted(ThresholdConfiguration {
             r#type: THRESHOLD_BOUNDED_PERCENT.to_string(),
             value: THRESHOLD_DEFAULT_VALUE,
-        }),
-    }
+        })),
+    })
 }
 
 /// The status a failure-detection mechanism of a rollout reports.
@@ -9523,7 +9679,10 @@ fn deployment_circuit_breaker_view(
 /// threshold", and `BOUNDED_PERCENT` additionally clamps the product "to a minimum of `3`
 /// and a maximum of `200`". A breaker that configured no threshold takes the documented
 /// default, [`THRESHOLD_BOUNDED_PERCENT`] with [`THRESHOLD_DEFAULT_VALUE`].
-fn circuit_breaker_threshold(breaker: Option<&DeploymentCircuitBreaker>, desired_count: i32) -> i32 {
+fn circuit_breaker_threshold(
+    breaker: Option<&Defaulted<DeploymentCircuitBreaker>>,
+    desired_count: i32,
+) -> i32 {
     let configuration = breaker.and_then(|breaker| breaker.threshold_configuration.as_ref());
     let kind = configuration.map_or(THRESHOLD_BOUNDED_PERCENT, |configuration| {
         configuration.r#type.as_str()
@@ -10219,6 +10378,63 @@ pub fn tags_per_resource_limit_message(merged_count: usize) -> String {
 /// values (`smithy_query(query="shape", shape="AssignPublicIp")`).
 pub const ASSIGN_PUBLIC_IP_DISABLED: &str = "DISABLED";
 
+/// The other value of the `AssignPublicIp` enum: the task's elastic network interface is
+/// given a public IP address.
+pub const ASSIGN_PUBLIC_IP_ENABLED: &str = "ENABLED";
+
+/// `InvalidParameterException$message` for a placement that asks for a public IP on
+/// infrastructure that cannot give one. One fixed sentence, naming neither the launch type
+/// nor the member.
+pub const ASSIGN_PUBLIC_IP_UNSUPPORTED_MESSAGE: &str =
+    "Assign public IP is not supported for this launch type.";
+
+/// Whether a placement runs its tasks on FARGATE: the launch type it names, and otherwise
+/// the capacity providers its strategy names — "When you use Fargate, the capacity providers
+/// are FARGATE or FARGATE_SPOT" ([`MANAGED_CAPACITY_PROVIDERS`]). A placement that names
+/// neither runs on the capacity registered to the cluster ([`DEFAULT_LAUNCH_TYPE`]), which
+/// is not Fargate.
+///
+/// `capacityProvider` is "The short name or full Amazon Resource Name (ARN) of the capacity
+/// provider", so each entry is read as the provider it REFERS to
+/// ([`capacity_provider_name_from_reference`]) rather than as the string it was spelled in.
+///
+/// ONE predicate for every reader: the refusal of a request that asks for what only Fargate
+/// does ([`assign_public_ip_violation`]) and the projections that report the Fargate-only
+/// members (`Service$platformFamily`, `$platformVersion`, and the same two on a deployment
+/// and a task set) must not disagree about where a service's tasks run.
+pub fn places_on_fargate(
+    launch_type: Option<&str>,
+    strategy: &[CapacityProviderStrategyItem],
+) -> bool {
+    launch_type == Some(LAUNCH_TYPE_FARGATE)
+        || strategy.iter().any(|item| {
+            MANAGED_CAPACITY_PROVIDERS
+                .contains(&capacity_provider_name_from_reference(&item.capacity_provider).as_str())
+        })
+}
+
+/// The refusal a `networkConfiguration` earns when it asks for a public IP on a placement
+/// that is not on Fargate, or `None` when it asks for none (or the tasks run on Fargate).
+///
+/// `AwsVpcConfiguration$assignPublicIp` gives the task's own elastic network interface a
+/// public address, which only the Fargate infrastructure attaches: a task on Amazon EC2 or
+/// external capacity is reached through the instance that runs it, whose addressing belongs
+/// to the instance and not to this request.
+pub fn assign_public_ip_violation(
+    network_configuration: Option<&NetworkConfiguration>,
+    fargate: bool,
+) -> Option<&'static str> {
+    if fargate {
+        return None;
+    }
+    let requested = network_configuration?
+        .awsvpc_configuration
+        .as_ref()?
+        .assign_public_ip
+        .as_deref()?;
+    (requested == ASSIGN_PUBLIC_IP_ENABLED).then_some(ASSIGN_PUBLIC_IP_UNSUPPORTED_MESSAGE)
+}
+
 /// The network configuration a service STORES: the one the request carried, with the
 /// members Amazon ECS fills in filled in, so every later read reports the same rendered
 /// configuration rather than only what the caller sent.
@@ -10279,6 +10495,70 @@ pub fn network_configuration_violation(
         )),
         _ => None,
     }
+}
+
+/// The refusal a `serviceRegistries` list earns against the revision whose tasks it would
+/// register, or `None` when every entry names what that revision and its network mode need.
+///
+/// `ServiceRegistry$containerName`: "If the task definition that your service task
+/// specifies uses the `bridge` or `host` network mode, you must specify a `containerName`
+/// and `containerPort` combination from the task definition" — a task on the host's or the
+/// bridge's network is reached at the PORT the container was published on, so a registry
+/// that names neither has nothing to register. Under `awsvpc` the task has its own
+/// interface and the entry may instead carry a `port`, so that mode is not held to the
+/// first half of the rule.
+///
+/// The second half holds whichever mode the revision declares: a pair the entry does name
+/// has to be one the revision declares — the container one of its `containerDefinitions`
+/// and the port one that container publishes — which is the same "from the task definition"
+/// rule a load-balancer binding is held to ([`load_balancer_binding_violation`]), stated in
+/// the same sentences.
+pub fn service_registry_binding_violation(
+    definition: Option<&TaskDefinitionRecord>,
+    registries: &[ServiceRegistry],
+) -> Option<String> {
+    let definition = definition?;
+    let mode = definition.network_mode.as_str();
+    let on_the_host_network = mode == NETWORK_MODE_HOST || mode == NETWORK_MODE_BRIDGE;
+    for registry in registries {
+        if on_the_host_network
+            && (registry.container_name.is_none() || registry.container_port.is_none())
+        {
+            return Some(format!(
+                "When specifying '{NETWORK_MODE_HOST}' or '{NETWORK_MODE_BRIDGE}' for \
+                 networkMode, values for 'containerName' and 'containerPort' must be \
+                 specified from the task definition. Registry: {}",
+                registry.registry_arn.as_deref().unwrap_or_default()
+            ));
+        }
+        let Some(container_name) = registry.container_name.as_deref() else {
+            continue;
+        };
+        let Some(container) = definition
+            .container_definitions
+            .iter()
+            .find(|container| container.name.as_deref() == Some(container_name))
+        else {
+            return Some(format!(
+                "The container {container_name} does not exist in the task definition."
+            ));
+        };
+        let Some(container_port) = registry.container_port else {
+            continue;
+        };
+        let declared = container
+            .port_mappings
+            .iter()
+            .flatten()
+            .any(|mapping| port_mapping_covers(mapping, container_port));
+        if !declared {
+            return Some(format!(
+                "The container {container_name} did not have a container port \
+                 {container_port} defined."
+            ));
+        }
+    }
+    None
 }
 
 /// The refusal an exec-enabled launch earns when the task definition it runs declares no
@@ -10756,6 +11036,110 @@ pub fn target_group_type_refusal(
         }
     }
     None
+}
+
+/// `ClientException$message` for a `serviceRegistries` entry naming a Cloud Map service
+/// that service holds no record of.
+///
+/// `ServiceRegistry$registryArn` is "The Amazon Resource Name (ARN) of the service registry
+/// ... currently supported ... is Cloud Map", and Amazon ECS validates the entry by asking
+/// Cloud Map for it: the refusal it answers reports that the registry could not be
+/// validated and quotes the error Route 53 / Cloud Map gave back, and names no value from
+/// the request.
+pub const SERVICE_REGISTRY_NOT_FOUND_MESSAGE: &str =
+    "The service registry could not be validated. Route 53 error: \"ServiceNotFound.\"";
+
+/// The Cloud Map service id each `serviceRegistries` entry names: the last segment of the
+/// `registryArn` (`arn:aws:servicediscovery:<region>:<account>:service/<id>`), which is
+/// what Cloud Map stores a service under, and the value itself when it carries no path.
+pub fn requested_registry_ids(registries: &[ServiceRegistry]) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    for registry in registries {
+        let Some(arn) = registry.registry_arn.as_deref() else {
+            continue;
+        };
+        let id = arn.rsplit('/').next().unwrap_or(arn).to_string();
+        if seen.insert(id.clone()) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// Which of `ids` the Cloud Map (service discovery) service still holds a service for, read
+/// from THAT service's own store through the one shared engine — so a registry created or
+/// deleted over its API is seen here with no propagation step and no second copy of it kept
+/// in this service's state.
+///
+/// `None` when that store is unreachable (the engine is not the shared in-memory one),
+/// which a handler answers with the same modelled server error it uses for its own store
+/// being unreachable.
+///
+/// LOCK ORDER: as [`cloud_map_holds_namespace`] — the Cloud Map store's lock is taken with
+/// no guard of ours held, and owned values come back.
+pub fn cloud_map_services<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ids: &[String],
+) -> Option<HashSet<String>> {
+    let state =
+        ::service_com_amazonaws_servicediscovery_route53autonaming_v20170314::state::service_state(
+            engine,
+        )?;
+    let store = state.lock();
+    Some(
+        ids.iter()
+            .filter(|id| store.services.contains_key(*id))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// The refusal a `serviceRegistries` list a request NAMES earns, or `None` when Cloud Map
+/// holds the service every entry names.
+///
+/// `known` is what [`cloud_map_services`] read for [`requested_registry_ids`] of the same
+/// list: an id it does not hold names a registry Amazon ECS cannot validate, so the request
+/// is refused and the service is neither created nor changed.
+pub fn service_registry_refusal(
+    registries: &[ServiceRegistry],
+    known: &HashSet<String>,
+) -> Option<&'static str> {
+    requested_registry_ids(registries)
+        .into_iter()
+        .any(|id| !known.contains(&id))
+        .then_some(SERVICE_REGISTRY_NOT_FOUND_MESSAGE)
+}
+
+/// Whether the Cloud Map (service discovery) service holds the namespace `reference`
+/// refers to, read from THAT service's own store through the one shared engine — so a
+/// namespace created over its API is seen here with no propagation step and no second copy
+/// of it kept in this service's state.
+///
+/// A Cloud Map namespace is not an Amazon ECS resource: `ServiceConnectConfiguration
+/// $namespace` is "The namespace name or full Amazon Resource Name (ARN) of the Cloud Map
+/// namespace", so what resolves one is the namespace's own store, whether or not any ECS
+/// service has joined it yet. The reference may be a name or an ARN, and the id in an ARN
+/// is what a namespace is stored under ([`namespace_key`]), so both forms are looked up.
+///
+/// `None` when that store is unreachable (the engine is not the shared in-memory one),
+/// which a handler answers with the same modelled server error it uses for its own store
+/// being unreachable.
+///
+/// LOCK ORDER: this takes the Cloud Map store's lock, holds no other while it does, and
+/// hands back an owned value — so it is called with NO guard of this service's store held,
+/// which is what keeps a lock cycle between the two stores unreachable.
+pub fn cloud_map_holds_namespace<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    reference: &str,
+) -> Option<bool> {
+    let state =
+        ::service_com_amazonaws_servicediscovery_route53autonaming_v20170314::state::service_state(
+            engine,
+        )?;
+    let store = state.lock();
+    let key = namespace_key(reference);
+    Some(store.namespaces.contains_key(key) || store.namespace_by_http_name(key).is_some())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

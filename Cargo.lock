@@ -9246,6 +9246,7 @@ dependencies = [
  "http",
  "serde_json",
  "service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10",
+ "service-com-amazonaws-servicediscovery-route53autonaming-v20170314",
  "sha2 0.10.9",
  "tokio",
  "tracing",

@@ -486,6 +486,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )?
         };
 
+        // A `serviceRegistries` list this update NAMES is validated the way the create's is:
+        // every entry names a CLOUD MAP service, READ from that service's store here, before
+        // ours is locked ([`crate::state::cloud_map_services`]). A request that names no list
+        // changes no registry, so neither store is read for it. What the read says is acted
+        // on after the cluster and the service have resolved, so this update is still refused
+        // for a cluster or a service that is not there first.
+        let requested_registries = input.service_registries.clone().unwrap_or_default();
+        let known_registries = if requested_registries.is_empty() {
+            ::std::collections::HashSet::new()
+        } else {
+            crate::state::cloud_map_services(
+                &*self.engine,
+                &crate::state::requested_registry_ids(&requested_registries),
+            )
+            .ok_or_else(|| {
+                UpdateServiceErrorModeled::ServerException(ServerException {
+                    message: Some("the Cloud Map store is unavailable".to_string()),
+                })
+            })?
+        };
+
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -521,6 +542,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let snapshot = stored.clone();
         let daemon = snapshot.scheduling_strategy == crate::state::SCHEDULING_DAEMON;
         let scheduler_owned = snapshot.places_tasks();
+
+        // The registry read taken before the lock, acted on now that the cluster and the
+        // service have resolved: an entry naming a Cloud Map service that service holds no
+        // record of registers nothing, so nothing of the update is written for it.
+        if let Some(message) =
+            crate::state::service_registry_refusal(&requested_registries, &known_registries)
+        {
+            return Err(UpdateServiceErrorModeled::ClientException(ClientException {
+                message: Some(message.to_string()),
+            })
+            .into());
+        }
+
+        // "If a capacityProviderStrategy is specified, the capacity providers must already
+        // be created": a provider name this account holds none of places no task, so the
+        // update is refused and nothing of it is written
+        // ([`crate::state::capacity_provider_strategy_refusal`]).
+        if let Some(message) = guard.capacity_provider_strategy_refusal(
+            input.capacity_provider_strategy.as_deref().unwrap_or(&[]),
+            &region,
+        ) {
+            return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // The deployment controller a service deploys through can be changed, but only on
         // a service the new controller has something to take over: the controllers that are
@@ -655,6 +704,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // The registries this update ATTACHES are held to the same rule the create's
+            // are, against the revision the service will run: what an entry must name is
+            // decided by that revision's `networkMode`
+            // ([`crate::state::service_registry_binding_violation`]).
+            if let Some(message) = crate::state::service_registry_binding_violation(
+                Some(definition),
+                &requested_registries,
+            ) {
+                return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
         }
         // A CODE_DEPLOY-controlled service shifts traffic between two target groups, so it
         // has to stay BEHIND a load balancer — whether it already deploys through that
@@ -694,6 +758,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+
+        // A public IP is attached to the task's OWN elastic network interface, which only
+        // the Fargate infrastructure does, so an update that sets one is held to the same
+        // rule the create was — against the placement the service will have once this
+        // update lands: the strategy the request names, else the one the service already
+        // holds ([`crate::state::assign_public_ip_violation`]).
+        let effective_capacity_strategy = match input.capacity_provider_strategy.as_deref() {
+            Some(strategy) if !strategy.is_empty() => strategy,
+            _ => &snapshot.capacity_provider_strategy,
+        };
+        if let Some(message) = crate::state::assign_public_ip_violation(
+            input.network_configuration.as_ref(),
+            crate::state::places_on_fargate(effective_launch_type, effective_capacity_strategy),
+        ) {
+            return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
         }
 
         // A `loadBalancers` list this request NAMES is validated whole — every target
@@ -832,11 +917,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         if let Some(configuration) = input.deployment_configuration.clone() {
-            service.deployment_configuration = crate::state::deployment_configuration(
-                Some(configuration),
-                daemon,
-                scheduler_owned,
+            // An update carries only the deployment parameters it changes, so what it
+            // supplies is merged over the configuration the service already holds rather
+            // than put in its place
+            // ([`crate::state::merged_deployment_configuration`]).
+            let merged = crate::state::merged_deployment_configuration(
+                &service.deployment_configuration,
+                configuration,
             );
+            service.deployment_configuration =
+                crate::state::deployment_configuration(Some(merged), daemon, scheduler_owned);
         }
         // "For update service requests, when no value is specified for
         // AvailabilityZoneRebalancing, Amazon ECS defaults to the existing service's

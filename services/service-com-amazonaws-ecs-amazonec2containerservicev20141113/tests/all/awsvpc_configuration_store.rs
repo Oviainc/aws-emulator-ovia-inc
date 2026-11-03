@@ -58,6 +58,10 @@ struct ConfigurationCase {
     assign_public_ip: Option<&'static str>,
     /// The `assignPublicIp` every read must report.
     expected_assign_public_ip: &'static str,
+    /// The launch type the row places its tasks with. A public IP is attached to the
+    /// task's own elastic network interface, which only Fargate does, so the row that asks
+    /// for one is placed there and every other row runs on the cluster's own capacity.
+    launch_type: &'static str,
 }
 
 impl ConfigurationCase {
@@ -80,7 +84,9 @@ impl ConfigurationCase {
     }
 }
 
-/// Register one `awsvpc` revision of `family`, which every launch below runs.
+/// Register one `awsvpc` revision of `family`, which every launch below runs. Task-level
+/// `cpu` and `memory` make it Fargate-capable as well, so the row that asks for a public IP
+/// can be placed there (`RegisterTaskDefinition$cpu`: the task size Fargate requires).
 async fn register_awsvpc_definition(router: &MultiServiceRouter, family: &str, case: &str) {
     ok(
         router,
@@ -88,6 +94,8 @@ async fn register_awsvpc_definition(router: &MultiServiceRouter, family: &str, c
         json!({
             "family": family,
             "networkMode": "awsvpc",
+            "cpu": "256",
+            "memory": "512",
             "containerDefinitions": [crate::task_lifecycle::container("web", IMAGE)],
         }),
         case,
@@ -206,6 +214,7 @@ fn cases() -> Vec<ConfigurationCase> {
             security_groups: None,
             assign_public_ip: None,
             expected_assign_public_ip: "DISABLED",
+            launch_type: "EC2",
         },
         ConfigurationCase {
             name: "the documented maximum of sixteen subnets, neither optional member",
@@ -213,6 +222,7 @@ fn cases() -> Vec<ConfigurationCase> {
             security_groups: None,
             assign_public_ip: None,
             expected_assign_public_ip: "DISABLED",
+            launch_type: "EC2",
         },
         ConfigurationCase {
             name: "an explicitly empty security-group list",
@@ -220,6 +230,7 @@ fn cases() -> Vec<ConfigurationCase> {
             security_groups: Some(0),
             assign_public_ip: None,
             expected_assign_public_ip: "DISABLED",
+            launch_type: "EC2",
         },
         ConfigurationCase {
             name: "one security group",
@@ -227,6 +238,7 @@ fn cases() -> Vec<ConfigurationCase> {
             security_groups: Some(1),
             assign_public_ip: None,
             expected_assign_public_ip: "DISABLED",
+            launch_type: "EC2",
         },
         ConfigurationCase {
             name: "the documented maximum of five security groups across two subnets",
@@ -234,13 +246,15 @@ fn cases() -> Vec<ConfigurationCase> {
             security_groups: Some(5),
             assign_public_ip: None,
             expected_assign_public_ip: "DISABLED",
+            launch_type: "EC2",
         },
         ConfigurationCase {
-            name: "no security groups, assignPublicIp ENABLED",
+            name: "no security groups, assignPublicIp ENABLED on Fargate",
             subnets: 1,
             security_groups: None,
             assign_public_ip: Some("ENABLED"),
             expected_assign_public_ip: "ENABLED",
+            launch_type: "FARGATE",
         },
         ConfigurationCase {
             name: "no security groups, the default assignPublicIp named explicitly",
@@ -248,6 +262,7 @@ fn cases() -> Vec<ConfigurationCase> {
             security_groups: None,
             assign_public_ip: Some("DISABLED"),
             expected_assign_public_ip: "DISABLED",
+            launch_type: "EC2",
         },
     ]
 }
@@ -270,7 +285,7 @@ async fn create_service_stores_an_awsvpc_configuration_with_the_members_ecs_fill
                 "serviceName": name,
                 "taskDefinition": "awsvpcsvcfamily",
                 "desiredCount": 0,
-                "launchType": "EC2",
+                "launchType": test.launch_type,
                 "networkConfiguration": test.request(),
             }),
             case,
@@ -335,7 +350,7 @@ async fn create_task_set_stores_an_awsvpc_configuration_with_the_members_ecs_fil
                 "cluster": cluster,
                 "service": service_name,
                 "taskDefinition": "awsvpcsetfamily",
-                "launchType": "EC2",
+                "launchType": test.launch_type,
                 "networkConfiguration": test.request(),
             }),
             case,

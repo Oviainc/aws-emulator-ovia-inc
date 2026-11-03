@@ -496,6 +496,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // And the other way about: a service the EXTERNAL controller deploys takes the
+        // revision its tasks run from the TASK SET that controller creates
+        // (`CreateTaskSet$taskDefinition`), so the service itself has none to name.
+        if !needs_definition && input.task_definition.is_some() {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::TASK_DEFINITION_MUST_BE_BLANK_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
 
         // A caller-supplied tag may not write into the namespace Amazon Web Services keeps
         // for its own tags, whichever operation carries the `tags` list.
@@ -555,6 +566,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
+        // "The details of the service discovery registry to associate with this service":
+        // the registry is a CLOUD MAP service, so whether this one can be registered into is
+        // READ from that service's store here — before ours is locked, for the same reason
+        // the target-group reads are ([`crate::state::cloud_map_services`]). What the read
+        // says is not acted on until the cluster has been resolved, so a create that names
+        // no cluster of this account is still refused for the cluster first.
+        let requested_registries = input.service_registries.clone().unwrap_or_default();
+        let known_registries = if requested_registries.is_empty() {
+            // A create that names no registry resolves none, so neither store is read for
+            // it and an engine that holds no Cloud Map store cannot refuse it.
+            ::std::collections::HashSet::new()
+        } else {
+            crate::state::cloud_map_services(
+                &*self.engine,
+                &crate::state::requested_registry_ids(&requested_registries),
+            )
+            .ok_or_else(|| {
+                CreateServiceErrorModeled::ServerException(ServerException {
+                    message: Some("the Cloud Map store is unavailable".to_string()),
+                })
+            })?
+        };
+
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -575,6 +609,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let cluster_arn = cluster.arn.clone();
         let cluster_default_strategy = cluster.default_capacity_provider_strategy.clone();
+
+        // "If a capacityProviderStrategy is specified, the capacity providers must already
+        // be created": every provider the REQUEST names is resolved against the ones this
+        // account holds, and a name none of them carries places nothing — so the create is
+        // refused and no service is stored
+        // ([`crate::state::capacity_provider_strategy_refusal`]).
+        if let Some(message) = guard.capacity_provider_strategy_refusal(&requested_strategy, &region)
+        {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // And the registry read taken before the lock, acted on now that the cluster has
+        // resolved: a `serviceRegistries` entry naming a Cloud Map service that service
+        // holds no record of registers nothing, so nothing is stored for it.
+        if let Some(message) =
+            crate::state::service_registry_refusal(&requested_registries, &known_registries)
+        {
+            return Err(CreateServiceErrorModeled::ClientException(ClientException {
+                message: Some(message.to_string()),
+            })
+            .into());
+        }
 
         // "The family and revision (family:revision) or full ARN of the task definition
         // to run in your service. If a revision isn't specified, the latest ACTIVE
@@ -642,6 +703,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.enable_execute_command,
                 Some(definition),
                 crate::state::EXECUTE_COMMAND_SERVICE_SUBJECT,
+            ) {
+                return Err(CreateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+            // A registry registers the task's own published port, so what each entry has to
+            // name is decided by the revision's `networkMode`
+            // ([`crate::state::service_registry_binding_violation`]).
+            if let Some(message) = crate::state::service_registry_binding_violation(
+                Some(definition),
+                &requested_registries,
             ) {
                 return Err(CreateServiceErrorModeled::InvalidParameterException(
                     InvalidParameterException {
@@ -771,6 +846,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => (None, effective_strategy),
         };
 
+        // A public IP is attached to the task's OWN elastic network interface, which only
+        // the Fargate infrastructure does — so whether the service may ask for one is
+        // decided by where its tasks are placed, the launch type it named or the capacity
+        // providers its strategy did
+        // ([`crate::state::assign_public_ip_violation`]).
+        if let Some(message) = crate::state::assign_public_ip_violation(
+            input.network_configuration.as_ref(),
+            crate::state::places_on_fargate(
+                input.launch_type.as_deref(),
+                &capacity_provider_strategy,
+            ),
+        ) {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         let created_at = crate::state::now();
         let deployment_id = guard.next_deployment_id();
         // The service revision this deployment rolls out is minted with the deployment.
@@ -795,7 +890,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the role doc says one is required, which the projection resolves.
             role_arn: crate::state::requested_role_arn(input.role.as_deref()),
             load_balancers: load_balancers.clone(),
-            service_registries: input.service_registries.clone().unwrap_or_default(),
+            service_registries: requested_registries.clone(),
             deployment_configuration: crate::state::deployment_configuration(
                 input.deployment_configuration.clone(),
                 daemon,

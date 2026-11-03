@@ -11,6 +11,158 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ecs-amazonec2containerservicev20141113.json");
 
+// ---------------------------------------------------------------------------
+// Structures a request may send partially, because the model gives their
+// members defaults
+// ---------------------------------------------------------------------------
+
+/// A modelled structure read with the model's DEFAULT for every member the request left
+/// out, rather than refused for leaving one out.
+///
+/// `@default` on a member states the value the structure carries when a request does not
+/// carry that member, so a caller may send the one member it means and leave the rest of
+/// the structure to the model — and the answer reports the whole structure, the defaults
+/// filled in. The reader generated for a shape refuses an absent member that is both
+/// `@required` and `@default`, so a structure whose defaulted members a caller may omit is
+/// held in this wrapper instead: it starts from [`DefaultedStructure::modelled_defaults`]
+/// and reads into it each member the request DID carry, through the shape's OWN generated
+/// schema ([`DefaultedStructure::schema`]).
+///
+/// It is DEFAULTS this relaxes and nothing else: a member the model gives no usable default
+/// ([`DefaultedStructure::MEMBERS_WITHOUT_DEFAULTS`]) is still the modelled validation
+/// failure when a request omits it, answered with the same `missing_member` the generated
+/// reader answers.
+///
+/// Nothing else about such a shape is hand-written: its schema, its member names and its
+/// writer stay generated, and this wrapper writes exactly what the shape writes — so the
+/// structure that reaches the wire, in a request echo or a later read, is unchanged.
+///
+/// It exists only because the decision belongs to the generator and a service crate cannot
+/// change it; a core issue is filed to move it there, after which these impls and this
+/// wrapper can be deleted and the member types put back to the plain shape.
+#[derive(Debug, Clone, Default)]
+pub struct Defaulted<T>(pub T);
+
+/// A modelled structure [`Defaulted`] can read member by member.
+pub trait DefaultedStructure: Sized {
+    /// The members this shape declares that the model gives NO usable `@default`, in the
+    /// order the shape declares them. A request that omits one of these omits a value this
+    /// wrapper may not invent, so reading refuses it.
+    const MEMBERS_WITHOUT_DEFAULTS: &'static [&'static str];
+
+    /// This shape's schema, as the `#[smithy(...)]` macro generated it from the model: the
+    /// member names, their wire names and their constraints all come from there.
+    fn schema() -> &'static ::aws_smithy_schema::Schema;
+
+    /// This structure with every member at the value the MODEL declares for its absence —
+    /// each member's `@default`, and absent (or empty, for a member whose absence reading
+    /// refuses anyway) for a member the model gives none.
+    fn modelled_defaults() -> Self;
+
+    /// Read the one member `member` names out of `deserializer` into `self`. Every member
+    /// the shape's schema declares is placed by the implementations below, so a member that
+    /// matches none of them is one the shape GREW later, which reading refuses rather than
+    /// dropping the value the request carried.
+    fn read_member(
+        &mut self,
+        member: &::aws_smithy_schema::Schema,
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError>;
+}
+
+/// Read one [`Defaulted`] structure nested inside another, for a member whose own type is
+/// one — the call a [`DefaultedStructure::read_member`] makes for such a member.
+pub fn read_defaulted<T: DefaultedStructure>(
+    deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+) -> ::std::result::Result<Defaulted<T>, ::aws_smithy_schema::serde::SerdeError> {
+    <Defaulted<T> as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(deserializer)
+}
+
+/// The error a member a shape declares with no usable `@default` earns when the request
+/// omits it: the one the generated reader answers for the same absence, so a caller cannot
+/// tell the two readers apart.
+fn missing_undefaulted_member(
+    member_name: &str,
+) -> ::aws_smithy_schema::serde::SerdeError {
+    ::aws_smithy_schema_server::missing_member(member_name)
+}
+
+/// The error a member a shape GREW after its [`DefaultedStructure`] was written earns: the
+/// value the request carried for it has nowhere to go, and dropping it would answer success
+/// for a member nothing stored, so reading fails instead.
+fn unplaced_member(
+    shape: &str,
+    member_name: Option<&str>,
+) -> ::aws_smithy_schema::serde::SerdeError {
+    ::aws_smithy_schema::serde::SerdeError::custom(format!(
+        "{shape} member {} is not read by this service",
+        member_name.unwrap_or_default()
+    ))
+}
+
+impl<T: DefaultedStructure> ::aws_smithy_schema_server::DeserializableStruct for Defaulted<T> {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut value = T::modelled_defaults();
+        // The members that have no default to fall back on, struck off as the request's own
+        // members arrive; whatever is left is what the request failed to carry.
+        let mut awaited: ::std::vec::Vec<&'static str> =
+            T::MEMBERS_WITHOUT_DEFAULTS.to_vec();
+        deserializer.read_struct(T::schema(), &mut |member, deserializer| {
+            if let Some(name) = member.member_name() {
+                awaited.retain(|awaited| *awaited != name);
+            }
+            // A value that cannot be read names the member it sat in as the error passes
+            // back out, so the trail reads from the operation input inwards — the same
+            // position a generated reader reports.
+            value.read_member(member, deserializer).map_err(|error| {
+                ::aws_smithy_schema_server::within_member(
+                    error,
+                    member.member_name().unwrap_or_default(),
+                )
+            })
+        })?;
+        // The FIRST member still awaited is the one the caller has to add, as the generated
+        // reader reports the first unfilled slot in the shape's own member order.
+        if let Some(member_name) = awaited.first() {
+            return Err(missing_undefaulted_member(member_name));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<T: ::aws_smithy_schema::serde::SerializableStruct> ::aws_smithy_schema::serde::SerializableStruct
+    for Defaulted<T>
+{
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.0.serialize_members(serializer)
+    }
+}
+
+impl<T> ::std::convert::From<T> for Defaulted<T> {
+    fn from(value: T) -> Self {
+        Self(value)
+    }
+}
+
+impl<T> ::std::ops::Deref for Defaulted<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> ::std::ops::DerefMut for Defaulted<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.ecs#AccessDeniedException")]
 #[derive(Debug, Clone, Default)]
 pub struct AccessDeniedException {
@@ -956,16 +1108,16 @@ pub struct GatewayTestTrafficHeader {
 #[smithy_macros::smithy(shape = "com.amazonaws.ecs#DeploymentConfiguration")]
 #[derive(Debug, Clone, Default)]
 pub struct DeploymentConfiguration {
-    pub deployment_circuit_breaker: Option<DeploymentCircuitBreaker>,
+    pub deployment_circuit_breaker: Option<Defaulted<DeploymentCircuitBreaker>>,
     pub maximum_percent: Option<i32>,
     pub minimum_healthy_percent: Option<i32>,
-    pub alarms: Option<DeploymentAlarms>,
+    pub alarms: Option<Defaulted<DeploymentAlarms>>,
     pub strategy: Option<String>,
     pub bake_time_in_minutes: Option<i32>,
     pub lifecycle_hooks: Option<Vec<DeploymentLifecycleHook>>,
     pub linear_configuration: Option<LinearConfiguration>,
     pub canary_configuration: Option<CanaryConfiguration>,
-    pub early_success_criteria: Option<DeploymentEarlySuccessCriteria>,
+    pub early_success_criteria: Option<Defaulted<DeploymentEarlySuccessCriteria>>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ecs#DeploymentCircuitBreaker")]
@@ -974,7 +1126,53 @@ pub struct DeploymentCircuitBreaker {
     pub enable: bool,
     pub rollback: bool,
     pub reset_on_healthy_task: Option<bool>,
-    pub threshold_configuration: Option<ThresholdConfiguration>,
+    pub threshold_configuration: Option<Defaulted<ThresholdConfiguration>>,
+}
+
+impl DefaultedStructure for DeploymentCircuitBreaker {
+    /// Every member of this shape either carries a `@default` (`enable`, `rollback`) or is
+    /// optional, so a request may carry none of them.
+    const MEMBERS_WITHOUT_DEFAULTS: &'static [&'static str] = &[];
+
+    fn schema() -> &'static ::aws_smithy_schema::Schema {
+        &Self::SCHEMA
+    }
+
+    /// `enable` and `rollback` are `@default: false`, so a breaker a request says nothing
+    /// about neither trips a deployment nor rolls one back; the two members that are not
+    /// defaulted are absent until a request carries them.
+    fn modelled_defaults() -> Self {
+        Self {
+            enable: false,
+            rollback: false,
+            reset_on_healthy_task: None,
+            threshold_configuration: None,
+        }
+    }
+
+    fn read_member(
+        &mut self,
+        member: &::aws_smithy_schema::Schema,
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match member.member_name() {
+            Some("enable") => self.enable = deserializer.read_boolean(member)?,
+            Some("rollback") => self.rollback = deserializer.read_boolean(member)?,
+            Some("resetOnHealthyTask") => {
+                self.reset_on_healthy_task = Some(deserializer.read_boolean(member)?);
+            }
+            Some("thresholdConfiguration") => {
+                self.threshold_configuration = Some(read_defaulted(deserializer)?);
+            }
+            other => {
+                return ::std::result::Result::Err(unplaced_member(
+                    "DeploymentCircuitBreaker",
+                    other,
+                ))
+            }
+        }
+        Ok(())
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ecs#ThresholdConfiguration")]
@@ -984,12 +1182,96 @@ pub struct ThresholdConfiguration {
     pub value: i32,
 }
 
+impl DefaultedStructure for ThresholdConfiguration {
+    /// `type` carries no `@default`, so a threshold configuration a request supplies has to
+    /// name it: "Determines how Amazon ECS uses `value` to calculate the failure threshold",
+    /// which no default fills in.
+    const MEMBERS_WITHOUT_DEFAULTS: &'static [&'static str] = &["type"];
+
+    fn schema() -> &'static ::aws_smithy_schema::Schema {
+        &Self::SCHEMA
+    }
+
+    /// `value` is `@default: 0`. `type` has no default and reading refuses a request that
+    /// omits it, so the empty string it starts at never reaches a stored configuration.
+    fn modelled_defaults() -> Self {
+        Self {
+            r#type: String::new(),
+            value: 0,
+        }
+    }
+
+    fn read_member(
+        &mut self,
+        member: &::aws_smithy_schema::Schema,
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match member.member_name() {
+            Some("type") => self.r#type = deserializer.read_string(member)?,
+            Some("value") => self.value = deserializer.read_integer(member)?,
+            other => {
+                return ::std::result::Result::Err(unplaced_member(
+                    "ThresholdConfiguration",
+                    other,
+                ))
+            }
+        }
+        Ok(())
+    }
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.ecs#DeploymentAlarms")]
 #[derive(Debug, Clone, Default)]
 pub struct DeploymentAlarms {
     pub alarm_names: Vec<String>,
     pub rollback: bool,
     pub enable: bool,
+}
+
+impl DefaultedStructure for DeploymentAlarms {
+    /// `alarmNames` carries no `@default` — "One or more CloudWatch alarm names" is what the
+    /// alarms WATCH, and no default fills that in — so alarms a request supplies have to
+    /// name the list, even an empty one.
+    const MEMBERS_WITHOUT_DEFAULTS: &'static [&'static str] = &["alarmNames"];
+
+    fn schema() -> &'static ::aws_smithy_schema::Schema {
+        &Self::SCHEMA
+    }
+
+    /// `rollback` and `enable` are `@default: false`, so alarms a request says nothing
+    /// about watch nothing and roll nothing back. `alarmNames` has no default and reading
+    /// refuses a request that omits it, so the empty list it starts at never reaches a
+    /// stored configuration.
+    fn modelled_defaults() -> Self {
+        Self {
+            alarm_names: Vec::new(),
+            rollback: false,
+            enable: false,
+        }
+    }
+
+    fn read_member(
+        &mut self,
+        member: &::aws_smithy_schema::Schema,
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match member.member_name() {
+            Some("alarmNames") => {
+                let mut names = Vec::new();
+                deserializer.read_list(member, &mut |element| {
+                    names.push(element.read_string(member)?);
+                    Ok(())
+                })?;
+                self.alarm_names = names;
+            }
+            Some("rollback") => self.rollback = deserializer.read_boolean(member)?,
+            Some("enable") => self.enable = deserializer.read_boolean(member)?,
+            other => {
+                return ::std::result::Result::Err(unplaced_member("DeploymentAlarms", other))
+            }
+        }
+        Ok(())
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ecs#DeploymentLifecycleHook")]
@@ -1030,6 +1312,49 @@ pub struct DeploymentEarlySuccessCriteria {
     pub enable: bool,
     pub healthy_percent: Option<i32>,
     pub source_service_revision_cleanup: Option<String>,
+}
+
+impl DefaultedStructure for DeploymentEarlySuccessCriteria {
+    /// `enable` carries a `@default` and the other two members are optional, so a request
+    /// may carry none of them.
+    const MEMBERS_WITHOUT_DEFAULTS: &'static [&'static str] = &[];
+
+    fn schema() -> &'static ::aws_smithy_schema::Schema {
+        &Self::SCHEMA
+    }
+
+    /// `enable` is `@default: false`: "The default value is `false`", so criteria a request
+    /// says nothing about end no deployment early. Neither other member is defaulted.
+    fn modelled_defaults() -> Self {
+        Self {
+            enable: false,
+            healthy_percent: None,
+            source_service_revision_cleanup: None,
+        }
+    }
+
+    fn read_member(
+        &mut self,
+        member: &::aws_smithy_schema::Schema,
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match member.member_name() {
+            Some("enable") => self.enable = deserializer.read_boolean(member)?,
+            Some("healthyPercent") => {
+                self.healthy_percent = Some(deserializer.read_integer(member)?);
+            }
+            Some("sourceServiceRevisionCleanup") => {
+                self.source_service_revision_cleanup = Some(deserializer.read_string(member)?);
+            }
+            other => {
+                return ::std::result::Result::Err(unplaced_member(
+                    "DeploymentEarlySuccessCriteria",
+                    other,
+                ))
+            }
+        }
+        Ok(())
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ecs#TaskSet")]

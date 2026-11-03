@@ -412,9 +412,9 @@ async fn a_described_deployment_reports_the_rollout_its_release_recorded() {
         old["stoppedAt"].is_null(),
         "case {case:?}: a rollout that completed was not stopped, got {old}"
     );
-    // The update replaced the service's deployment configuration, so the two rollouts
-    // report two different ones: the rollout that already ran keeps the mechanisms it was
-    // carried out under.
+    // The update changed one member of the service's deployment configuration, so the two
+    // rollouts report two different ones: the rollout that already ran keeps the mechanisms
+    // it was carried out under.
     assert_eq!(
         (
             string(&old["alarms"], "status", case),
@@ -426,14 +426,17 @@ async fn a_described_deployment_reports_the_rollout_its_release_recorded() {
         ),
         "case {case:?}: the replaced rollout kept the mechanisms it ran under, got {old}"
     );
+    // The update named only the circuit breaker, so the alarms the service was created with
+    // are still in its configuration and still watching, while the breaker the update
+    // turned off watches nothing: a member an update leaves out is one the service keeps.
     assert_eq!(
         (
             string(&new["alarms"], "status", case),
             string(&new["deploymentCircuitBreaker"], "status", case),
         ),
-        ("DISABLED".to_string(), "DISABLED".to_string()),
-        "case {case:?}: the new rollout monitors nothing its configuration turned off, \
-         got {new}"
+        ("MONITORING".to_string(), "DISABLED".to_string()),
+        "case {case:?}: the new rollout is watched by the alarms the update left alone and \
+         by no breaker, got {new}"
     );
 
     // A THIRD release, while the second rollout is still under way: that rollout never

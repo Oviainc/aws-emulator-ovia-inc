@@ -46,6 +46,11 @@ const EC2_API_VERSION: &str = "2016-11-15";
 const CLUSTER: &str = "awsvpcnetwork";
 const FAMILY: &str = "awsvpcnetworkfamily";
 
+/// The Fargate-capable `awsvpc` revision the row that asks for a PUBLIC IP runs: a public
+/// address is attached to the task's own elastic network interface, which only Fargate
+/// does, so that row cannot be placed on the cluster's EC2 capacity.
+const FARGATE_FAMILY: &str = "awsvpcnetworkfargatefamily";
+
 /// The image the family's one container starts from; irrelevant to the rule.
 const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
 
@@ -207,7 +212,9 @@ async fn ec2_network(router: &MultiServiceRouter) -> Network {
     }
 }
 
-/// Create the cluster and register the one `awsvpc` revision every launch below runs.
+/// Create the cluster and register the revisions every launch below runs: the `awsvpc`
+/// revision validated against the EC2 launch type, and the Fargate-capable one (task-level
+/// `cpu` and `memory`) the public-IP row needs.
 async fn seed_ecs(router: &MultiServiceRouter) {
     ecs_ok(router, "CreateCluster", json!({ "clusterName": CLUSTER }), "setup").await;
     ecs_ok(
@@ -217,6 +224,24 @@ async fn seed_ecs(router: &MultiServiceRouter) {
             "family": FAMILY,
             "networkMode": "awsvpc",
             "requiresCompatibilities": ["EC2"],
+            "containerDefinitions": [{
+                "name": "web",
+                "image": IMAGE,
+                "memory": 128,
+            }],
+        }),
+        "setup",
+    )
+    .await;
+    ecs_ok(
+        router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": FARGATE_FAMILY,
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
             "containerDefinitions": [{
                 "name": "web",
                 "image": IMAGE,
@@ -240,9 +265,21 @@ struct ConfigurationCase {
     assign_public_ip: Option<&'static str>,
     /// The `assignPublicIp` every read must report.
     expected_assign_public_ip: &'static str,
+    /// The launch type this row places its tasks with — the row that asks for a public IP
+    /// on Fargate, every other row on the cluster's own EC2 capacity.
+    launch_type: &'static str,
 }
 
 impl ConfigurationCase {
+    /// The revision this row runs: the one validated against the launch type it places with.
+    fn family(&self) -> &'static str {
+        if self.launch_type == "FARGATE" {
+            FARGATE_FAMILY
+        } else {
+            FAMILY
+        }
+    }
+
     /// The subnets this row names, in order.
     fn named_subnets(&self, network: &Network) -> Vec<String> {
         network.subnets[..self.subnets].to_vec()
@@ -268,8 +305,9 @@ impl ConfigurationCase {
 }
 
 /// The rows: they differ along how many of EC2's subnets the configuration names, whether
-/// it names `securityGroups` at all (omitted, an explicitly empty list, one group, two)
-/// and whether it names `assignPublicIp`.
+/// it names `securityGroups` at all (omitted, an explicitly empty list, one group, two),
+/// whether it names `assignPublicIp` and — because only Fargate attaches a public address
+/// to the task's own interface — which launch type the row places with.
 fn cases() -> Vec<ConfigurationCase> {
     vec![
         ConfigurationCase {
@@ -278,6 +316,7 @@ fn cases() -> Vec<ConfigurationCase> {
             security_groups: None,
             assign_public_ip: None,
             expected_assign_public_ip: DEFAULT_ASSIGN_PUBLIC_IP,
+            launch_type: "EC2",
         },
         ConfigurationCase {
             name: "two subnets, neither optional member",
@@ -285,6 +324,7 @@ fn cases() -> Vec<ConfigurationCase> {
             security_groups: None,
             assign_public_ip: None,
             expected_assign_public_ip: DEFAULT_ASSIGN_PUBLIC_IP,
+            launch_type: "EC2",
         },
         ConfigurationCase {
             name: "an explicitly empty security-group list",
@@ -292,6 +332,7 @@ fn cases() -> Vec<ConfigurationCase> {
             security_groups: Some(0),
             assign_public_ip: None,
             expected_assign_public_ip: DEFAULT_ASSIGN_PUBLIC_IP,
+            launch_type: "EC2",
         },
         ConfigurationCase {
             name: "one of EC2's security groups",
@@ -299,6 +340,7 @@ fn cases() -> Vec<ConfigurationCase> {
             security_groups: Some(1),
             assign_public_ip: None,
             expected_assign_public_ip: DEFAULT_ASSIGN_PUBLIC_IP,
+            launch_type: "EC2",
         },
         ConfigurationCase {
             name: "both of EC2's security groups across both subnets",
@@ -306,13 +348,15 @@ fn cases() -> Vec<ConfigurationCase> {
             security_groups: Some(2),
             assign_public_ip: None,
             expected_assign_public_ip: DEFAULT_ASSIGN_PUBLIC_IP,
+            launch_type: "EC2",
         },
         ConfigurationCase {
-            name: "no security groups, assignPublicIp ENABLED",
+            name: "no security groups, assignPublicIp ENABLED on Fargate",
             subnets: 1,
             security_groups: None,
             assign_public_ip: Some("ENABLED"),
             expected_assign_public_ip: "ENABLED",
+            launch_type: "FARGATE",
         },
         ConfigurationCase {
             name: "no security groups, the default assignPublicIp named explicitly",
@@ -320,6 +364,7 @@ fn cases() -> Vec<ConfigurationCase> {
             security_groups: None,
             assign_public_ip: Some(DEFAULT_ASSIGN_PUBLIC_IP),
             expected_assign_public_ip: DEFAULT_ASSIGN_PUBLIC_IP,
+            launch_type: "EC2",
         },
     ]
 }
@@ -406,9 +451,9 @@ async fn a_service_in_ec2_subnets_reads_its_awsvpc_configuration_back_whole() {
             json!({
                 "cluster": CLUSTER,
                 "serviceName": name,
-                "taskDefinition": FAMILY,
+                "taskDefinition": test.family(),
                 "desiredCount": 0,
-                "launchType": "EC2",
+                "launchType": test.launch_type,
                 "networkConfiguration": test.request(&network),
             }),
             case,

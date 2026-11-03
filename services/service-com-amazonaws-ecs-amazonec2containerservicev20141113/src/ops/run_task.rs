@@ -409,6 +409,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cluster_arn = cluster.arn.clone();
         let cluster_default_strategy = cluster.default_capacity_provider_strategy.clone();
 
+        // "If a capacityProviderStrategy is specified, the capacity providers must already
+        // be created": a provider name this account holds none of places no task, so the
+        // run is refused and no task is created
+        // ([`crate::state::capacity_provider_strategy_refusal`]).
+        if let Some(message) = guard.capacity_provider_strategy_refusal(&strategy, &region) {
+            return Err(RunTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // "If a revision isn't specified, the latest ACTIVE revision is used", and a
         // revision this run NAMES has to be one it may use: "You can't use an INACTIVE
         // task definition to run new tasks."
@@ -506,6 +519,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => (Some(crate::state::DEFAULT_LAUNCH_TYPE.to_string()), None),
             },
         };
+
+        // A public IP is attached to the task's OWN elastic network interface, which only
+        // the Fargate infrastructure does — so whether this run may ask for one is decided
+        // by where the task is placed, the launch type it named or the capacity providers
+        // its strategy did ([`crate::state::assign_public_ip_violation`]).
+        if let Some(message) = crate::state::assign_public_ip_violation(
+            input.network_configuration.as_ref(),
+            crate::state::places_on_fargate(input.launch_type.as_deref(), &effective_strategy),
+        ) {
+            return Err(RunTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
 
         // "The EC2 launch type runs your tasks on Amazon EC2 instances registered to
         // your cluster" (and `EXTERNAL` on the on-premises capacity registered to it), so

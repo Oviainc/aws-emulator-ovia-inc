@@ -209,12 +209,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // "all of the services that are associated with a Cloud Map namespace": the
+        // namespace is Cloud Map's resource, so whether this listing has a namespace to
+        // walk is read from THAT service's store — before this one is locked, so the
+        // cross-service read holds no guard of ours
+        // ([`crate::state::cloud_map_holds_namespace`]).
+        let in_cloud_map = crate::state::cloud_map_holds_namespace(&*self.engine, &input.namespace)
+            .ok_or_else(|| {
+                ListServicesByNamespaceErrorModeled::ServerException(ServerException {
+                    message: Some("the Cloud Map store is unavailable".to_string()),
+                })
+            })?;
+
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
-        // A namespace nothing in this account is in is not a namespace this listing can
-        // walk, and this operation models that condition as its own error.
-        if !guard.knows_namespace(&input.namespace) {
+        // A namespace nothing in this account holds is not a namespace this listing can
+        // walk, and this operation models that condition as its own error. A namespace
+        // Cloud Map holds IS one, however few ECS services have joined it — "no services in
+        // it" is an empty list, not a missing namespace.
+        if !in_cloud_map && !guard.knows_namespace(&input.namespace) {
             return Err(
                 ListServicesByNamespaceErrorModeled::NamespaceNotFoundException(
                     NamespaceNotFoundException {

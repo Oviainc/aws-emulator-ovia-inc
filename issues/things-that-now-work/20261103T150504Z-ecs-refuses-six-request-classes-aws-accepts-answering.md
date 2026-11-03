@@ -6,19 +6,26 @@ Issue-Corpus: simparity-wire-aws-v1
 Issue-Corpus-Kind: wire
 Issue-Trace-Ids: ecs-ecscm-traj-create-service-launch-mistakes ecs-ecsdep-traj-create-deployment-configuration-refusals ecs-escc-traj-mirror-custom-service-create-refusals ecs-ecscm-traj-cloudmap-service-deleted-under-ecs-service ecs-ecscm-traj-registry-triplet-mistakes-bridge ecs-ecsnrt-traj-run-task-awsvpc-network-configuration-mistakes ecs-ecsnrt-traj-run-task-launch-selection-mistakes ecs-ecscm-traj-private-dns-srv-reference-path ecs-ecscm-traj-reference-http-namespace-registry ecs-ecsdep-traj-update-circuit-breaker-partial-struct ecs-ecsnrt-traj-fargate-unpullable-tag-stopped-record ecs-ecsnrt-traj-task-listing-and-describe-mistakes
 Issue-Shape-Id: com.amazonaws.ecs#AmazonEC2ContainerServiceV20141113
-Issue-Key: ecs|CreateService|2xx->4xx|$.service
-Issue-Key: ecs|CreateService|2xx->4xx|status
-Issue-Key: ecs|DeleteCluster|2xx->4xx|status
-Issue-Key: ecs|DeleteService|2xx->4xx|status
 Issue-Key: ecs|ListServicesByNamespace|2xx->4xx|$.serviceArns
 Issue-Key: ecs|ListServicesByNamespace|2xx->4xx|status
 Issue-Key: ecs|UpdateService|2xx->4xx|$.service
 Issue-Key: ecs|UpdateService|2xx->4xx|status
-Issue-Key: ecs|ListTasks|2xx->4xx|$.taskArns
-Issue-Key: ecs|ListTasks|2xx->4xx|status
 Issue-Commit: 34977689197ee7e7ec3a117f2c4937da4e6f0436
 
 # ECS refuses six request classes AWS accepts, answering 400 instead of 200
+
+> _RESOLUTION: causes 4 (`ListServicesByNamespace` for a Cloud Map namespace with no ECS
+> service in it, now resolved against the Cloud Map store) and 5 (`UpdateService` with a
+> partial `deploymentConfiguration`, now accepted with the model's defaults and merged over
+> the stored configuration) are fixed, and their keys pass; causes 1 and 2 are fixed for the
+> step each was filed against — the bound step `ecs-ecscm-traj-create-service-launch-mistakes#task#11`
+> is answered 200, and the teardown's `DeleteCluster` passes in 2 of its 4 units — because a
+> create AWS refuses now stores no service. The keys that do NOT pass (causes 1 and 2's
+> remaining units, and causes 3 and 6 in full) are re-filed, with everything this fix
+> established about them, as
+> `issues/things-that-do-not-work/20261104T000000Z-ecs-4-of-the-6-refused-request-classes-remain-open.md`,
+> and the `Issue-Key` lines for them have been removed from this report so they are not
+> recorded as working._
 
 > _Note: this issue was identified against the code base at commit `34977689197ee7e7ec3a117f2c4937da4e6f0436`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 

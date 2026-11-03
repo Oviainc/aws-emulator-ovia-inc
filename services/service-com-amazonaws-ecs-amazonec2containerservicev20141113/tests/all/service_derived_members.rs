@@ -302,10 +302,10 @@ async fn a_named_platform_version_is_kept_and_a_non_fargate_service_carries_neit
         (
             "a named platform version is kept by both",
             json!({ "taskDefinition": "platformsfargate", "launchType": "FARGATE",
-                    "platformVersion": "1.3.0" }),
+                    "platformVersion": "1.4.0" }),
             Some("Linux"),
-            Some("1.3.0"),
-            Some("1.3.0"),
+            Some("1.4.0"),
+            Some("1.4.0"),
         ),
         (
             "LATEST named explicitly resolves on the deployment",
@@ -917,7 +917,7 @@ async fn an_update_starts_a_new_deployment_for_exactly_the_rolling_members() {
         ),
         (
             "platformVersion",
-            json!({ "platformVersion": "1.3.0" }),
+            json!({ "platformVersion": "1.4.0" }),
             true,
         ),
         (
