@@ -271,9 +271,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The shared refusal, as THIS operation's error channel names it.
 fn refuse(refusal: AssociationRefusal) -> AssociatePackagesError {
     match refusal {
-        AssociationRefusal::NotFound(payload) => {
-            AssociatePackagesErrorModeled::ResourceNotFoundException(payload)
-        }
         AssociationRefusal::Conflict(payload) => {
             AssociatePackagesErrorModeled::ConflictException(payload)
         }

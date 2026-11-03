@@ -447,14 +447,14 @@ async fn an_association_disappears_from_the_domain_on_the_clock() {
         // same pair has nothing to remove.
         let (again, _) = dissociate(&emulator, form, domain, &ids[0..1]).await;
         assert_eq!(
-            again.status, 409,
-            "case {case}(again): expected 409, got {} with {:?}",
+            again.status, 400,
+            "case {case}(again): expected 400, got {} with {:?}",
             again.status, again.body
         );
         assert_eq!(
             error_code(&again),
-            "ResourceNotFoundException",
-            "case {case}(again): expected the modelled not-found refusal, got {:?}",
+            "ValidationException",
+            "case {case}(again): expected the modelled validation refusal, got {:?}",
             again.body
         );
 
@@ -578,11 +578,11 @@ async fn a_request_that_cannot_be_served_dissociates_nothing() {
     with_associations(&emulator, sibling, &ids, &[2]).await;
 
     // One row per way a request cannot be served, each with the status and error code
-    // the model declares for it: `ResourceNotFoundException` at HTTP 409 and
-    // `ValidationException` at 400. A `DomainName` that resolves to no domain and a
-    // `PackageID` that resolves to no package are read from the request like any other
-    // value, so each is the validation refusal — the same one the associate path
-    // answers; a link the domain does not hold is the missing resource itself. A list
+    // the model declares for it: `ValidationException` at HTTP 400. A `DomainName` that
+    // resolves to no domain and a `PackageID` that resolves to no package are read from
+    // the request like any other value, so each is the validation refusal — the same one
+    // the associate path answers; a link the domain does not hold is a relationship the
+    // request names and the service cannot dissolve, so it is the same refusal. A list
     // longer than the packages the account can hold is refused by its first entry that
     // resolves to nothing, which is what keeps a call's work bounded by the store rather
     // than by the request.
@@ -611,20 +611,20 @@ async fn a_request_that_cannot_be_served_dissociates_nothing() {
         (
             "a stored package the domain never had",
             json!({ "DomainName": domain, "PackageList": [ids[3]] }),
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a package associated with another domain",
             json!({ "DomainName": domain, "PackageList": [ids[2]] }),
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a batch whose last package the domain never had",
             json!({ "DomainName": domain, "PackageList": [ids[0], ids[1], ids[3]] }),
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "the same package named twice",
@@ -692,15 +692,15 @@ async fn a_request_that_cannot_be_served_dissociates_nothing() {
             "a stored package the domain never had",
             domain,
             &ids[3],
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a package associated with another domain",
             domain,
             &ids[2],
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
     ] {
         let answer = dissociate_one(&emulator, name, package_id).await;

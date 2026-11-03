@@ -9,7 +9,9 @@
 //! `GetUpgradeHistory` reports; the version a domain can be upgraded to is
 //! [`crate::state::compatible_target_versions`]'s answer, the same relation
 //! `GetCompatibleVersions` publishes, so a target that table does not offer is refused
-//! rather than started.
+//! rather than started — on the service's generic error envelope, and before anything
+//! about what the domain is busy with, because the eligibility of a target is decided
+//! from the request and the version the domain runs alone.
 //!
 //! A check performs nothing, so performing it again records nothing: the domain holds
 //! at most one eligibility-check run per engine version it runs, and a repeat check
@@ -200,6 +202,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        // "OpenSearch or Elasticsearch version to which you want to upgrade": an
+        // upgrade only ever goes to a version the domain's current one can be upgraded
+        // to — the same relation `GetCompatibleVersions` publishes — so a target
+        // outside that set names an upgrade the service does not offer. This holds for
+        // an eligibility check too: whether that upgrade is possible is the whole of
+        // what the check answers.
+        //
+        // It is decided from the request and the version the domain RUNS alone, so it
+        // is answered before anything about what the domain is busy with: a target the
+        // service never offers is refused the same way whether or not the domain is
+        // quiet, and the refusal is the service's generic envelope rather than the
+        // request-validation one.
+        if !crate::state::compatible_target_versions(&domain.engine_version)
+            .iter()
+            .any(|candidate| candidate == &input.target_version)
+        {
+            return Err(UpgradeDomainErrorModeled::BaseException(
+                crate::state::incompatible_target_version(
+                    &domain.engine_version,
+                    &input.target_version,
+                ),
+            )
+            .into());
+        }
+
         // "Allows you to either upgrade your domain or perform an upgrade eligibility
         // check": the service performs one run at a time, so a call landing while one
         // is still being performed names that run rather than starting a second.
@@ -224,26 +251,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if domain.work_in_flight() {
             return Err(UpgradeDomainErrorModeled::BaseException(
                 crate::state::upgrade_blocked_by_background_tasks(),
-            )
-            .into());
-        }
-
-        // "OpenSearch or Elasticsearch version to which you want to upgrade": an
-        // upgrade only ever goes to a version the domain's current one can be upgraded
-        // to — the same relation `GetCompatibleVersions` publishes — so a target
-        // outside that set is a malformed request rather than a run that goes nowhere.
-        // This holds for an eligibility check too: whether that upgrade is possible is
-        // the whole of what the check answers.
-        if !crate::state::compatible_target_versions(&domain.engine_version)
-            .iter()
-            .any(|candidate| candidate == &input.target_version)
-        {
-            return Err(UpgradeDomainErrorModeled::ValidationException(
-                crate::state::incompatible_target_version(
-                    &domain.domain_name,
-                    &domain.engine_version,
-                    &input.target_version,
-                ),
             )
             .into());
         }

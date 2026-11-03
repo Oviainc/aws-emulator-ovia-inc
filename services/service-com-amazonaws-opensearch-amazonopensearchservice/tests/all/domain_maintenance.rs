@@ -19,8 +19,9 @@
 //!   publishes, another domain's node and a request naming no node at all;
 //! * an accepted action is a RECORD: the id the call hands out addresses it, it
 //!   reports the action and node the request named, and the clock — not a reader —
-//!   walks it from `PENDING` through `IN_PROGRESS` to `COMPLETED`, over every
-//!   `MaintenanceType` value the model publishes;
+//!   walks it from `PENDING` through `IN_PROGRESS` to the terminal status the service
+//!   reports a finished action with, over every `MaintenanceType` value the model
+//!   publishes;
 //! * the listing reports those same records, each once and newest first, narrowed by
 //!   `Action` and by `Status` — over every published value of each — and paged by
 //!   every page size from one record per page up to more than the domain holds.
@@ -29,21 +30,33 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    MAINTAINABLE_DATA_NODES, MAINTENANCE_STATUS_COMPLETED, MAINTENANCE_STATUS_IN_PROGRESS,
-    MAINTENANCE_STATUS_PENDING, NODE_TYPE_DATA, NODE_TYPE_MASTER, NODE_TYPE_ULTRAWARM,
+    MAINTAINABLE_DATA_NODES, MAINTENANCE_STATUS_IN_PROGRESS, MAINTENANCE_STATUS_PENDING,
+    MAINTENANCE_STATUS_SUCCESS, NODE_TYPE_DATA, NODE_TYPE_MASTER, NODE_TYPE_ULTRAWARM,
 };
 
 use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX, SETTLE_WAIT};
 
 /// The `MaintenanceType` values the model publishes (`smithy_query(query="shape",
 /// shape="MaintenanceType")`), every one of which names a process on a node.
-const MAINTENANCE_TYPES: [&str; 3] = ["REBOOT_NODE", "RESTART_SEARCH_PROCESS", "RESTART_DASHBOARD"];
+pub(crate) const MAINTENANCE_TYPES: [&str; 3] =
+    ["REBOOT_NODE", "RESTART_SEARCH_PROCESS", "RESTART_DASHBOARD"];
 
 /// A `NodeId` no census publishes, inside `NodeId`'s `@length(min: 10, max: 40)`.
 const ABSENT_NODE_ID: &str = "0123456789abcdef0123456789abcdef";
 
+/// The `MaintenanceStatus` value the MODEL carries for a finished action
+/// (`smithy_query(query="shape", shape="MaintenanceStatus")` lists `COMPLETED`,
+/// `FAILED`, `IN_PROGRESS`, `PENDING` and `TIMED_OUT`), which the service's own
+/// terminal status is not: a filter on it therefore selects no action at all.
+const MODELLED_FINISHED_STATUS: &str = "COMPLETED";
+
 /// `POST /2021-01-01/opensearch/domain/{DomainName}/domainMaintenance`.
-async fn start(emulator: &Emulator, name: &str, action: &str, node_id: Option<&str>) -> Answer {
+pub(crate) async fn start(
+    emulator: &Emulator,
+    name: &str,
+    action: &str,
+    node_id: Option<&str>,
+) -> Answer {
     let mut body = json!({ "Action": action });
     if let Some(node_id) = node_id {
         body["NodeId"] = json!(node_id);
@@ -58,7 +71,7 @@ async fn start(emulator: &Emulator, name: &str, action: &str, node_id: Option<&s
 }
 
 /// `GET /2021-01-01/opensearch/domain/{DomainName}/domainMaintenance?maintenanceId=`.
-async fn status(emulator: &Emulator, name: &str, maintenance_id: &str) -> Answer {
+pub(crate) async fn status(emulator: &Emulator, name: &str, maintenance_id: &str) -> Answer {
     emulator
         .call(
             "GET",
@@ -71,7 +84,7 @@ async fn status(emulator: &Emulator, name: &str, maintenance_id: &str) -> Answer
 }
 
 /// `GET /2021-01-01/opensearch/domain/{DomainName}/domainMaintenances{query}`.
-async fn list(emulator: &Emulator, name: &str, query: &str) -> Answer {
+pub(crate) async fn list(emulator: &Emulator, name: &str, query: &str) -> Answer {
     emulator
         .call(
             "GET",
@@ -87,7 +100,7 @@ async fn list(emulator: &Emulator, name: &str, query: &str) -> Answer {
 /// Every case below reads or acts on a NODE of the domain, and a domain with work in
 /// flight publishes no node census — so each row waits for the create to land before
 /// the call under test, rather than asserting on a domain that is still coming up.
-async fn create(emulator: &Emulator, name: &str, cluster: Value) {
+pub(crate) async fn create(emulator: &Emulator, name: &str, cluster: Value) {
     let answer = emulator
         .create(json!({ "DomainName": name, "ClusterConfig": cluster }))
         .await;
@@ -101,7 +114,7 @@ async fn create(emulator: &Emulator, name: &str, cluster: Value) {
 
 /// The nodes of `name`, as `DescribeDomainNodes` publishes them: (NodeId, NodeType)
 /// per node.
-async fn census(emulator: &Emulator, name: &str) -> Vec<(String, String)> {
+pub(crate) async fn census(emulator: &Emulator, name: &str) -> Vec<(String, String)> {
     let answer = emulator
         .call(
             "GET",
@@ -141,7 +154,7 @@ async fn node_of(emulator: &Emulator, name: &str, node_type: &str) -> String {
 /// A cluster configuration with `data_nodes` data nodes, dedicated masters and warm
 /// nodes turned on — so the census publishes a node of every `NodeType` this service
 /// reports.
-fn every_role(data_nodes: i32) -> Value {
+pub(crate) fn every_role(data_nodes: i32) -> Value {
     json!({
         "InstanceType": "r6g.large.search",
         "InstanceCount": data_nodes,
@@ -355,7 +368,7 @@ async fn an_accepted_action_is_read_back_and_walked_by_the_clock() {
     }
 
     // The clock, not the reader, walks the action: `PENDING` then `IN_PROGRESS` then
-    // `COMPLETED`, each step dated.
+    // the terminal status, each step dated.
     let (maintenance_id, action, _) = &started[0];
     let created = status(&emulator, "maintained-domain", maintenance_id)
         .await
@@ -378,17 +391,17 @@ async fn an_accepted_action_is_read_back_and_walked_by_the_clock() {
     }
     assert_eq!(
         seen.last().map(String::as_str),
-        Some(MAINTENANCE_STATUS_COMPLETED),
+        Some(MAINTENANCE_STATUS_SUCCESS),
         "the action finishes once its spans have passed, got {seen:?}"
     );
     assert!(
         seen.iter().all(|status| [
             MAINTENANCE_STATUS_PENDING,
             MAINTENANCE_STATUS_IN_PROGRESS,
-            MAINTENANCE_STATUS_COMPLETED
+            MAINTENANCE_STATUS_SUCCESS
         ]
         .contains(&status.as_str())),
-        "every status is one MaintenanceStatus publishes, got {seen:?}"
+        "every status is one this service reports, got {seen:?}"
     );
 
     // An id this domain holds no action for, and an id another domain's action
@@ -516,9 +529,9 @@ async fn the_listing_reports_every_action_once_and_narrows_by_action_and_status(
             "every action is still pending",
         ),
         (
-            format!("?status={MAINTENANCE_STATUS_COMPLETED}"),
+            format!("?status={MODELLED_FINISHED_STATUS}"),
             0,
-            "none has completed yet",
+            "no action carries the model's finished status",
         ),
         (
             format!("?action={}&status={MAINTENANCE_STATUS_PENDING}", MAINTENANCE_TYPES[0]),

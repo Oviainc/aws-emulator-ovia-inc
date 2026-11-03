@@ -6337,8 +6337,13 @@ pub const MAINTENANCE_STATUS_PENDING: &str = "PENDING";
 /// `MaintenanceStatus`'s `IN_PROGRESS` value: the action is running on the node.
 pub const MAINTENANCE_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 
-/// `MaintenanceStatus`'s `COMPLETED` value: the action has finished.
-pub const MAINTENANCE_STATUS_COMPLETED: &str = "COMPLETED";
+/// `MaintenanceStatus`'s terminal value for an action that finished.
+///
+/// The modelled enum lists `COMPLETED` for this, but the service answers a finished
+/// action with `SUCCESS` — a value the enum does not carry — and a client waits for
+/// what the service sends, so this is the value the store holds and every read path
+/// reports.
+pub const MAINTENANCE_STATUS_SUCCESS: &str = "SUCCESS";
 
 /// How long each step of a maintenance action takes.
 ///
@@ -6390,7 +6395,7 @@ impl Maintenance {
         }
         if let Some(due) = self.completes_at.filter(|due| now >= *due) {
             self.completes_at = None;
-            self.status = MAINTENANCE_STATUS_COMPLETED.to_string();
+            self.status = MAINTENANCE_STATUS_SUCCESS.to_string();
             self.updated_at = due;
         }
     }
@@ -8847,11 +8852,15 @@ pub fn package_in_use() -> ValidationException {
     }
 }
 
-/// The `ResourceNotFoundException` payload for a dissociation of a package the
-/// domain is not holding: the link the call asks to remove does not exist, so the
-/// refusal names both the package and the domain it is not on.
-pub fn package_not_associated(package_id: &str, domain_name: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
+/// The refusal payload for a dissociation of a package the domain is not holding:
+/// the link the call asks to remove does not exist, so the refusal names both the
+/// package and the domain it is not on.
+///
+/// A request naming a relationship that cannot be dissolved is refused as a bad
+/// REQUEST rather than as a missing resource: both the package and the domain it
+/// names exist, and it is the link between them the service has nothing to act on.
+pub fn package_not_associated(package_id: &str, domain_name: &str) -> ValidationException {
+    ValidationException {
         message: Some(format!(
             "Package {package_id} is not associated with domain {domain_name}."
         )),
@@ -8967,14 +8976,11 @@ pub struct AssociationRequest {
 /// though the error channels do not.
 #[derive(Debug)]
 pub enum AssociationRefusal {
-    /// The link the call asks to remove is not there — the domain holds no
-    /// association with the package named.
-    NotFound(ResourceNotFoundException),
     /// The package or the association is in a status that cannot serve the call.
     Conflict(ConflictException),
     /// The request is not one the domain can serve as asked — a value it carries
-    /// (the domain, the package, one of its prerequisites) resolves to nothing, or
-    /// the request contradicts itself.
+    /// (the domain, the package, one of its prerequisites) resolves to nothing, the
+    /// link it names is not there, or the request contradicts itself.
     Validation(ValidationException),
 }
 
@@ -10075,7 +10081,7 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         // A removal needs a link to remove: a package the domain is not holding is
         // nothing this call can take off it.
         if !domain.package_associations.contains_key(package_id) {
-            return Err(AssociationRefusal::NotFound(package_not_associated(
+            return Err(AssociationRefusal::Validation(package_not_associated(
                 package_id,
                 domain_name,
             )));
@@ -11148,30 +11154,23 @@ pub fn informational_insight_details(
     ]
 }
 
-/// The `ValidationException` payload for an upgrade whose `TargetVersion` is not a
-/// version the domain can be upgraded to: it names the version the domain runs, the
-/// one that was asked for and the ones it could have been
-/// ([`compatible_target_versions`]), so the caller can fix the request from the
-/// refusal alone.
+/// The refusal payload for an upgrade whose `TargetVersion` is not a version the
+/// domain can be upgraded to ([`compatible_target_versions`]).
+///
+/// The service answers an ineligible target on its GENERIC envelope — "an error
+/// occurred while processing the request" — rather than on the request-validation
+/// one, and states the two versions the eligibility was decided from: the version the
+/// domain runs, read from its stored record, and the version the request asked for.
+/// Nothing else of the request is named and nothing of the domain's state moves.
 pub fn incompatible_target_version(
-    domain_name: &str,
     source_version: &str,
     target_version: &str,
-) -> ValidationException {
-    let targets = compatible_target_versions(source_version);
-    ValidationException {
-        message: Some(if targets.is_empty() {
-            format!(
-                "Domain {domain_name} runs {source_version} and cannot be upgraded to \
-                 {target_version}: there is no version to upgrade it to."
-            )
-        } else {
-            format!(
-                "Domain {domain_name} runs {source_version} and cannot be upgraded to \
-                 {target_version}. Compatible target versions: {}.",
-                targets.join(", ")
-            )
-        }),
+) -> BaseException {
+    BaseException {
+        message: Some(format!(
+            "Failed to submit upgrade. Upgrade from {source_version} to {target_version} \
+             not supported."
+        )),
     }
 }
 

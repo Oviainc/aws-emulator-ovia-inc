@@ -201,6 +201,8 @@ mod upgrade_status;
 mod upgrade_status_envelope;
 #[path = "all/upgrade_status_reporting.rs"]
 mod upgrade_status_reporting;
+#[path = "all/upgrade_target_and_maintenance_outcome.rs"]
+mod upgrade_target_and_maintenance_outcome;
 #[path = "all/version_catalog.rs"]
 mod version_catalog;
 #[path = "all/vpc_access_endpoints.rs"]

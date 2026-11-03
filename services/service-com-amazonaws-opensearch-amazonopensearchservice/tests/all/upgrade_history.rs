@@ -577,8 +577,8 @@ async fn an_upgrade_only_ever_goes_to_a_version_the_domain_can_reach() {
         );
         assert_eq!(
             error_code(&answer),
-            "ValidationException",
-            "case {name} ({why}): expected the modelled validation refusal, got {:?}",
+            "BaseException",
+            "case {name} ({why}): expected the service's generic refusal, got {:?}",
             answer.body
         );
         // A refused upgrade is not a run: it records nothing and moves nothing.
@@ -601,7 +601,7 @@ async fn an_upgrade_only_ever_goes_to_a_version_the_domain_can_reach() {
         let as_check = upgrade(&emulator, name, target, true).await;
         assert_eq!(
             error_code(&as_check),
-            "ValidationException",
+            "BaseException",
             "case {name} ({why}) as a check: expected the same refusal, got {:?}",
             as_check.body
         );

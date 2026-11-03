@@ -196,14 +196,14 @@ async fn a_call_acts_on_exactly_the_packages_it_names_and_the_clock_owes_every_o
         // that refusal takes nothing else off the domain.
         let again = dissociate_many(&emulator, body).await;
         assert_eq!(
-            again.status, 409,
-            "case {}(again): expected 409, got {} with {:?}",
+            again.status, 400,
+            "case {}(again): expected 400, got {} with {:?}",
             row.case, again.status, again.body
         );
         assert_eq!(
             error_code(&again),
-            "ResourceNotFoundException",
-            "case {}(again): expected the modelled not-found refusal, got {:?}",
+            "ValidationException",
+            "case {}(again): expected the modelled validation refusal, got {:?}",
             row.case, again.body
         );
         assert_eq!(
