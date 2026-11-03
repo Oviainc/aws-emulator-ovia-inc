@@ -65,7 +65,18 @@ const EVALUATION_JOB_IDENTIFIER: &str =
 
 /// `AdvancedPromptOptimizationJobIdentifier`'s `@pattern`, unanchored. Model:
 /// `^((arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:advanced-prompt-optimization-job/)?[a-z0-9]{12})$`.
-const APO_JOB_IDENTIFIER: &str = r"((arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:advanced-prompt-optimization-job/)?[a-z0-9]{12})";
+///
+/// `pub(crate)` because `tests/all/refused_subject_follows_the_member_shape.rs` quotes the
+/// same expression for the same member rather than keeping a second copy of it.
+pub(crate) const APO_JOB_IDENTIFIER: &str = r"((arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:advanced-prompt-optimization-job/)?[a-z0-9]{12})";
+
+/// `AutomatedReasoningPolicyTestCaseId`'s `@pattern`, unanchored. Model (`query="shape"`,
+/// shape `AutomatedReasoningPolicyTestCaseId`): `^[0-9A-Z]{12}$`, `@length(max: 12)`.
+///
+/// `pub(crate)` because `tests/all/refused_subject_follows_the_member_shape.rs` and
+/// `tests/all/path_label_values_are_not_echoed.rs` quote the same expression for the same
+/// member rather than keeping a second copy of it.
+pub(crate) const TEST_CASE_ID: &str = r"[0-9A-Z]{12}";
 
 /// `TaggableResourcesArn`'s `@pattern`, which the model anchors INSIDE each of its
 /// alternatives rather than at the ends (it opens `(^[a-zA-Z0-9]…` and closes `…)`), so
@@ -91,7 +102,9 @@ pub(crate) fn pattern_requirement(expression: &str) -> String {
 
 /// The subject a clause opens with: the value the request carried, quoted, for a member the
 /// model binds to the request URI, and the position ALONE for one the service reads out of
-/// the request body (`src/service/validation.rs`, rule 2).
+/// the request body or whose SHAPE this service states by position alone
+/// (`src/service/validation.rs`, rule 2 — the shapes are the rule of
+/// `tests/all/refused_subject_follows_the_member_shape.rs`).
 fn subject(value: Option<&str>) -> String {
     match value {
         Some(value) => format!("Value '{value}'"),
@@ -103,7 +116,10 @@ fn subject(value: Option<&str>) -> String {
 /// `@length(max: 1011)` — no declared minimum, so the minimum stated is `0` — and the
 /// identifier `@pattern` (`query="shape"`,
 /// shape `AdvancedPromptOptimizationJobIdentifiers`).
-fn apo_element_set() -> String {
+///
+/// `pub(crate)` because `tests/all/refused_subject_follows_the_member_shape.rs` states the
+/// same set for the same member rather than keeping a second copy of it.
+pub(crate) fn apo_element_set() -> String {
     format!(
         "Member must have length less than or equal to 1011, \
          Member must have length greater than or equal to 0, \
@@ -195,8 +211,9 @@ async fn refuse(
 /// The rejected value differs per row along what the rule generalises over: which pattern
 /// the member declares, which operation and member carry it, and whether the model anchors
 /// the expression at its ends at all. Whether the clause QUOTES that value is rule 2's
-/// question, answered by the member's binding: the URI-bound rows quote it, the body row
-/// does not.
+/// question, answered by the shape and then by the member's binding: the URI-bound rows
+/// quote it, the body row does not, and neither do the two rows whose shape this service
+/// states by position alone.
 #[tokio::test]
 async fn a_reported_pattern_is_the_expression_the_whole_value_must_match() {
     let emulator = emulator();
@@ -259,6 +276,9 @@ async fn a_reported_pattern_is_the_expression_the_whole_value_must_match() {
             EVALUATION_JOB_IDENTIFIER,
         ),
         pattern_row(
+            // The same member NAME over the advanced-prompt-optimization job's identifier
+            // shape, which this service states by position alone wherever it is reached
+            // (`tests/all/refused_subject_follows_the_member_shape.rs` is the rule).
             "GetAdvancedPromptOptimizationJob jobIdentifier outside its pattern",
             "GET",
             format!(
@@ -266,7 +286,7 @@ async fn a_reported_pattern_is_the_expression_the_whole_value_must_match() {
                 label("arn:aws:bedrock:us-east-1:000000000000:advanced-prompt-optimization-job/nope")
             ),
             None,
-            Some("arn:aws:bedrock:us-east-1:000000000000:advanced-prompt-optimization-job/nope"),
+            None,
             "jobIdentifier",
             APO_JOB_IDENTIFIER,
         ),
@@ -275,7 +295,7 @@ async fn a_reported_pattern_is_the_expression_the_whole_value_must_match() {
             "POST",
             format!("/advanced-prompt-optimization-jobs/{}/stop", label("UPPERCASE123")),
             None,
-            Some("UPPERCASE123"),
+            None,
             "jobIdentifier",
             APO_JOB_IDENTIFIER,
         ),

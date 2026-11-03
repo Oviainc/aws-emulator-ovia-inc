@@ -15,7 +15,10 @@
 //!    parameter, a path label, a top-level body member, a member nested in a body
 //!    structure, an element of a body collection) and the CONSTRAINT CLASS that failed (a
 //!    `@pattern`, an enum's value set, a `@range` bound, a `@length` bound), over nine
-//!    operations — the subject is decided by the first and never by the second.
+//!    operations — the subject is decided by the first and never by the second. The
+//!    identifier SHAPES this service is recorded reporting by position alone whatever their
+//!    binding are the rule of `tests/all/refused_subject_follows_the_member_shape.rs`, and
+//!    no row below reaches one.
 //! 2. **A reported `@pattern` is the expression the WHOLE value must match**: the model's
 //!    expression with the `^` / `$` at its ends stripped where it anchors the match, and
 //!    between the unconstrained runs a Smithy `@pattern`'s partial match admits — spelled

@@ -29,7 +29,7 @@
 //!   ([`refused_policy_entry_quota`]); every other request refused for breaking a modelled
 //!   input constraint is worded by the ONE formatter in [`validation`]: a `@pattern` is
 //!   quoted as the expression the whole value must match, the value a member held is quoted
-//!   only where the model binds that member to the request URI, and a violation on a
+//!   for the shapes and bindings this service is recorded quoting it for, and a violation on a
 //!   collection's ELEMENT is reported at the collection member with that element shape's
 //!   whole constraint set. See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
@@ -242,8 +242,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // a member that is not an ARN at all, an absent required member — is worded by the
         // ONE formatter in [`validation`], which states the AWS envelope with the rules the
         // framework's generic wording does not: a `@pattern` quoted as the expression the
-        // WHOLE value must match, the value a member held quoted only where the model binds
-        // that member to the request URI, and a violation on an ELEMENT of a
+        // WHOLE value must match, the value a member held quoted for the shapes and the
+        // bindings this service is recorded quoting it for, and a violation on an ELEMENT of a
         // collection reported against the collection MEMBER carrying that element shape's
         // whole constraint set rather than against an indexed element position. Either way
         // the code is the modelled `ValidationException` (HTTP 400) the framework would

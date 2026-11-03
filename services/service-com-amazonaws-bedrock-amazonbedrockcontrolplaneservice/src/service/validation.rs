@@ -19,16 +19,31 @@
 //! 1. the envelope is AWS's `N validation error(s) detected: ` over one clause per
 //!    offending member, joined with `; `, in the order the walk found them
 //!    ([`envelope`]);
-//! 2. a clause states its member's dotted path and the requirement it failed, and QUOTES
-//!    the value the member held only where the model binds that member to the request URI —
-//!    a `@httpLabel` path segment or a `@httpQuery` parameter, the tokens the service reads
-//!    off the request line ([`quotes_the_value`], [`URI_BOUND_MEMBERS`]). A member the
-//!    service reads out of the request BODY is reported by its position alone
+//! 2. a clause states its member's dotted path and the requirement it failed, and whether
+//!    it also QUOTES the value the member held is decided by the SHAPE reached at that
+//!    member and then by the member's HTTP binding ([`quotes_the_value`]): a shape whose
+//!    refusals this service is recorded stating without a value ([`VALUE_FREE_SHAPES`]) is
+//!    reported by its position alone, and every other member is quoted exactly where the
+//!    model binds it to the request URI — a `@httpLabel` path segment or a `@httpQuery`
+//!    parameter, the tokens the service reads off the request line
+//!    ([`URI_BOUND_MEMBERS`]). A member the service reads out of the request BODY is
+//!    reported by its position alone either way
 //!    (`Value at '<path>' failed to satisfy constraint: …`), so no body content a caller
-//!    submitted reaches the sentence. The decision is the MEMBER's binding, not the
-//!    violation's class, so one rule covers a `@length`, a `@range`, a `@pattern` and an
-//!    enum alike, wherever that member is reached; a member the request OMITTED held no
-//!    value at all and is stated as `Value null` whatever its binding;
+//!    submitted reaches the sentence. Neither decision is the violation's CLASS, so one
+//!    rule covers a `@length`, a `@range`, a `@pattern` and an enum alike; a member the
+//!    request OMITTED held no value at all and is stated as `Value null` whatever its
+//!    binding.
+//!
+//!    What the SHAPE half rests on is the shape being KNOWN, which a violation's path alone
+//!    is not enough for: it is known from the expression a `@pattern` violation carries, and
+//!    otherwise only where every shape the model declares at that path is the same one
+//!    ([`DECLARED_PATTERNS`]). So a member whose name the model declares over several shapes
+//!    — `jobIdentifier` is an evaluation-job, a model-invocation-job and an
+//!    advanced-prompt-optimization-job identifier — keeps the binding rule for a violation
+//!    that names no expression, a `@length` on it say, which is the one case where two
+//!    clauses about one such member can state their subject differently. Closing it needs
+//!    the violation to carry the shape it came from, which is the framework's
+//!    [`Violation`] rather than this seam;
 //! 3. a reported `@pattern` is the expression the WHOLE value must match
 //!    ([`whole_value_expression`]), with the two ends decided independently: an end the
 //!    model ANCHORS carries its `^` / `$` away with it, which is the model's way of making
@@ -250,19 +265,125 @@ fn render_bound(bound: f64) -> String {
     }
 }
 
-/// Whether a clause reported at `member_path` QUOTES the value the request carried there.
+/// The `@pattern` the model declares for an identifier shape whose refusals this service
+/// states WITHOUT the value ([`VALUE_FREE_SHAPES`]).
 ///
-/// Decided by WHERE the service read that value, which is what the model's HTTP binding
-/// says: a member bound to the request URI — a `@httpLabel` path segment or a `@httpQuery`
-/// parameter — is a token read off the request line and quoted back, and a member read
-/// anywhere else (the request body, a header) is reported by its position alone
-/// ([`URI_BOUND_MEMBERS`]). The binding is a property of the MEMBER, so one decision
-/// covers every constraint class and every operation reaching that member rather than the
-/// class a single report happened to cite; a member NESTED inside a body structure is never
-/// URI-bound, so its path reaches this with no entry and is reported by position.
-fn quotes_the_value(member_path: &str) -> bool {
+/// `AdvancedPromptOptimizationJobIdentifier` (`query="shape"`, shape
+/// `AdvancedPromptOptimizationJobIdentifier`): reached as the `jobIdentifier` label of the
+/// job's read and stop, and as the element of its `jobIdentifiers` batch-delete list.
+const ADVANCED_PROMPT_OPTIMIZATION_JOB_IDENTIFIER: &str =
+    "^((arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:advanced-prompt-optimization-job/)?[a-z0-9]{12})$";
+
+/// `AutomatedReasoningPolicyTestCaseId` (`query="shape"`, shape
+/// `AutomatedReasoningPolicyTestCaseId`): the `testCaseId` label of the test case's read,
+/// update and delete and of a test result's read, and the element of the
+/// `testCaseIds` list a test workflow takes.
+const AUTOMATED_REASONING_POLICY_TEST_CASE_ID: &str = "^[0-9A-Z]{12}$";
+
+/// The SHAPES whose refusals this service states by the member's position alone, each as
+/// the `@pattern` the model declares for it — the shape's identity in the model, and what a
+/// `@pattern` violation carries, which is how [`crate::service`]'s own ARN seam identifies
+/// the member a violation came from.
+///
+/// Whether a refusal quotes the value is not derivable from the model: this service states
+/// `Value '<the identifier>' at 'guardrailIdentifier' …` for a guardrail it will not read
+/// and `Value at 'jobIdentifier' …` for an advanced-prompt-optimization job, over two
+/// members the model declares the same way — a pattern-constrained identifier in a
+/// `@httpLabel`. It is service metadata the public model does not carry, the way
+/// [`VALUE_LISTINGS`] is, and the only source for it is what the service's refusals are
+/// recorded stating. So it is recorded HERE, beside the one formatter every constrained
+/// member of every operation goes through, rather than in an operation handler.
+///
+/// Keyed by the SHAPE rather than by the member NAME: that is what lets `jobIdentifier` be
+/// stated both ways — the model declares that one name over an evaluation-job identifier, a
+/// model-invocation-job identifier and this one — and what applies an entry to every
+/// operation, binding, member path and constraint class reaching the shape rather than to
+/// the one a report happened to cite, as far as the shape is knowable from a violation
+/// (rule 2's note on [`DECLARED_PATTERNS`]).
+const VALUE_FREE_SHAPES: &[&str] = &[
+    ADVANCED_PROMPT_OPTIMIZATION_JOB_IDENTIFIER,
+    AUTOMATED_REASONING_POLICY_TEST_CASE_ID,
+];
+
+/// Whether `pattern` is the expression a shape this service states by position alone
+/// declares.
+fn value_free_shape(pattern: &str) -> bool {
+    VALUE_FREE_SHAPES.contains(&pattern)
+}
+
+/// Whether a clause reported at `member_path` QUOTES the value the request carried there,
+/// given the `@pattern`s the shapes reached at that path declare (`declared`).
+///
+/// Two rules, in order:
+///
+/// 1. the SHAPE decides it where this service is recorded stating that shape's refusals
+///    without a value ([`VALUE_FREE_SHAPES`]) — whatever constraint class failed, whatever
+///    binding carried it, and whichever operation reached it. Only when EVERY shape the
+///    clause can be about is such a shape: `declared` holds the expressions the clause's own
+///    violations carried, which name the shape the request actually broke, and falls back to
+///    the ones the model declares at that path ([`DECLARED_PATTERNS`]) for a clause whose
+///    violations carry none — so one member NAME the model declares over several shapes is
+///    reported for the shape that failed, and keeps the binding rule below when its shape
+///    cannot be told apart;
+/// 2. otherwise WHERE the service read the value decides it, which is what the model's HTTP
+///    binding says: a member bound to the request URI — a `@httpLabel` path segment or a
+///    `@httpQuery` parameter, the tokens the service reads off the request line — is quoted
+///    back, and a member read anywhere else (the request body, a header) is reported by its
+///    position alone ([`URI_BOUND_MEMBERS`]). The binding is a property of the MEMBER, so
+///    one decision covers every constraint class reaching it; a member NESTED inside a body
+///    structure is never URI-bound, so its path reaches this with no entry and is reported
+///    by position.
+fn quotes_the_value(member_path: &str, declared: &[&str]) -> bool {
+    let model = DECLARED_PATTERNS.get(member_path);
+    // The shapes the clause can be about: the ones its violations named, else the ones the
+    // model declares at that path.
+    let shapes: &[&str] = if declared.is_empty() {
+        model.map(Vec::as_slice).unwrap_or_default()
+    } else {
+        declared
+    };
+    if !shapes.is_empty() && shapes.iter().all(|pattern| value_free_shape(pattern)) {
+        return false;
+    }
     URI_BOUND_MEMBERS.contains(member_path)
 }
+
+/// The `@pattern`s this service's input shapes declare at each member path — the member's
+/// own, and its ELEMENT's for a collection member — so a clause about a member no `@pattern`
+/// violation opened still knows which shapes its path can be reporting.
+///
+/// Built once off the generated schemas, the way [`ELEMENT_CONSTRAINTS`] is, and read only
+/// when the violations themselves carry no declared expression: a request that broke the
+/// `@pattern` names the shape exactly, while one that broke only a `@length` of the same
+/// member names it no more precisely than the model does.
+static DECLARED_PATTERNS: LazyLock<HashMap<String, Vec<&'static str>>> = LazyLock::new(|| {
+    let mut catalog: HashMap<String, Vec<&'static str>> = HashMap::new();
+    for schema in input_schemas() {
+        for member in schema.members() {
+            let Some(name) = member.member_name() else {
+                continue;
+            };
+            let Some(traits) = member.traits() else {
+                continue;
+            };
+            let element = constraint_trait::<ElementConstraintsTrait>(
+                traits,
+                &ElementConstraintsTrait::TRAIT_ID,
+            )
+            .and_then(|wrapper| {
+                constraint_trait::<PatternTrait>(wrapper.inner(), &PatternTrait::TRAIT_ID)
+            });
+            let own = constraint_trait::<PatternTrait>(traits, &PatternTrait::TRAIT_ID);
+            for pattern in [own, element].into_iter().flatten() {
+                let declared = catalog.entry(constraints::path::member(name)).or_default();
+                if !declared.contains(&pattern.regex) {
+                    declared.push(pattern.regex);
+                }
+            }
+        }
+    }
+    catalog
+});
 
 /// The top-level members of this service's input shapes the model binds to the request URI,
 /// keyed by the member path the validation walk reports them under.
@@ -716,6 +837,23 @@ pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
         .map(|(path, failures)| (*path, element_constraint_set(path, failures).join(", ")))
         .collect();
 
+    // The SHAPES each member path can be reporting, as the `@pattern`s the violations
+    // themselves carry — which name the shape the request actually broke. Resolved once per
+    // path, so every clause about one member decides its subject the same way; a path whose
+    // violations carry no expression is left to the shapes the model declares there
+    // ([`quotes_the_value`]).
+    let mut declared: HashMap<&str, Vec<&str>> = HashMap::new();
+    for violation in violations {
+        let (path, _) = collapsed(&violation.path);
+        if let ViolationKind::Pattern(pattern) = &violation.kind {
+            let patterns = declared.entry(path).or_default();
+            let pattern: &str = pattern;
+            if !patterns.contains(&pattern) {
+                patterns.push(pattern);
+            }
+        }
+    }
+
     let mut order: Vec<(String, String)> = Vec::new();
     let mut clauses: HashMap<(String, String), Clause> = HashMap::new();
     // Every distinct clause the request produced, including the ones past the render cap:
@@ -751,9 +889,13 @@ pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
                     depth,
                     values: Vec::new(),
                     verbatim,
-                    // A property of the MEMBER the clause is reported at, so it is the same
-                    // for every violation that folds into this clause.
-                    quotes_value: quotes_the_value(path),
+                    // A property of the SHAPE the clause is reported about, else of the
+                    // MEMBER's binding, so it is the same for every violation that folds
+                    // into this clause.
+                    quotes_value: quotes_the_value(
+                        path,
+                        declared.get(path).map(Vec::as_slice).unwrap_or_default(),
+                    ),
                     withheld: false,
                 })
             }
@@ -1150,10 +1292,10 @@ mod tests {
         }
     }
 
-    /// The members whose clause quotes the value are exactly the ones this MODEL binds to
-    /// the request URI, and every one of them is a top-level member path.
+    /// The subject a clause opens with is decided by the SHAPE reached at the member, and
+    /// otherwise by the member's HTTP binding; every URI-bound member is a top-level path.
     #[test]
-    fn the_members_that_quote_a_value_are_the_models_uri_bound_ones() {
+    fn the_subject_follows_the_shape_then_the_models_binding() {
         let bound = &*URI_BOUND_MEMBERS;
         assert!(
             !bound.is_empty(),
@@ -1165,27 +1307,80 @@ mod tests {
                 "case {path:?}: only a top-level member carries an HTTP binding"
             );
         }
-        // A query parameter and a path label of this model, against a body member of it, a
-        // member nested in one, and a member NAME the model binds both ways
-        // (`smithy_query(query="operation")`: `ListCustomModels` binds `modelStatus` to the
-        // query string, `GetGuardrail` binds `guardrailIdentifier` to a path label,
-        // `CreateGuardrail` carries `name` in the body, `CreateModelInvocationJob` reaches
-        // `s3Uri` inside it, and `resourceArn` is a path label on the resource-policy
-        // operations while other operations carry it in the body — a violation's path cannot
-        // tell those apart, so an ambiguous name keeps the body form).
-        for (path, quotes) in [
-            ("modelStatus", true),
-            ("maxResults", true),
-            ("guardrailIdentifier", true),
-            ("name", false),
-            ("modelSourceIdentifier", false),
-            ("inputDataConfig.s3InputDataConfig.s3Uri", false),
-            ("resourceArn", false),
+        // Every entry of the recorded shape catalog is an expression the model declares at
+        // some input member, so no entry is dead; and the member paths it reaches are what
+        // the entry applies to, whatever operation or binding gets there.
+        for declared in VALUE_FREE_SHAPES {
+            let reached: Vec<&String> = DECLARED_PATTERNS
+                .iter()
+                .filter(|(_, patterns)| patterns.contains(declared))
+                .map(|(path, _)| path)
+                .collect();
+            assert!(
+                !reached.is_empty(),
+                "case {declared:?}: no input member of this model declares that pattern, so \
+                 the entry reaches nothing"
+            );
+            for path in reached {
+                assert!(
+                    !quotes_the_value(path, &[declared]),
+                    "case {declared:?}: the entry must reach every member declaring it, \
+                     {path:?} quotes its value"
+                );
+            }
+        }
+        // (the member path, the `@pattern`s its clause can be reporting, the subject).
+        // A recorded shape against the OTHER shapes the same member name is declared over,
+        // a query parameter, a path label, a body member, a member nested in one, and the
+        // member names the model binds both ways (`smithy_query(query="operation")`:
+        // `ListCustomModels` binds `modelStatus` and `maxResults` to the query string;
+        // `GetGuardrail` binds `guardrailIdentifier` and `GetEvaluationJob` `jobIdentifier`
+        // to a path label; `CreateGuardrail` carries `name` in the body and
+        // `CreateModelInvocationJob` reaches `s3Uri` inside it; `resourceArn` is a path
+        // label on the resource-policy operations and a body member on others, which a
+        // violation's path cannot tell apart, so an ambiguous name keeps the body form).
+        let evaluation_job_identifier =
+            "^(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:evaluation-job/[a-z0-9]{12})$";
+        let guardrail_identifier = "^(([a-z0-9]+)|(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:\
+                                    [0-9]{12}:guardrail/[a-z0-9]+))$";
+        for (path, declared, quotes) in [
+            // The recorded shapes: no value, whatever broke and wherever they are reached.
+            (
+                "jobIdentifier",
+                vec![ADVANCED_PROMPT_OPTIMIZATION_JOB_IDENTIFIER],
+                false,
+            ),
+            (
+                "jobIdentifiers",
+                vec![ADVANCED_PROMPT_OPTIMIZATION_JOB_IDENTIFIER],
+                false,
+            ),
+            (
+                "testCaseId",
+                vec![AUTOMATED_REASONING_POLICY_TEST_CASE_ID],
+                false,
+            ),
+            // The same member NAME over another shape: the binding decides it again.
+            ("jobIdentifier", vec![evaluation_job_identifier], true),
+            ("guardrailIdentifier", vec![guardrail_identifier], true),
+            // A clause whose violations carry no expression falls back to the shapes the
+            // model declares at that path: unanimous for `testCaseId`, several for
+            // `jobIdentifier`.
+            ("testCaseId", vec![], false),
+            ("jobIdentifier", vec![], true),
+            ("modelStatus", vec![], true),
+            ("maxResults", vec![], true),
+            ("sortOrder", vec![], true),
+            ("name", vec![], false),
+            ("modelSourceIdentifier", vec![], false),
+            ("inputDataConfig.s3InputDataConfig.s3Uri", vec![], false),
+            ("resourceArn", vec![], false),
         ] {
-            let actual = quotes_the_value(path);
+            let actual = quotes_the_value(path, &declared);
             assert_eq!(
                 actual, quotes,
-                "case {path:?}: expected quotes_the_value {quotes}, got {actual}"
+                "case {path:?} over {declared:?}: expected quotes_the_value {quotes}, got \
+                 {actual}"
             );
         }
     }
