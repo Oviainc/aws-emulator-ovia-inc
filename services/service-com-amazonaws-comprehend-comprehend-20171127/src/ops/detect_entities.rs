@@ -11,6 +11,15 @@
 //! lexicon-based — the same class of engine as the VADER analyser behind
 //! `DetectSentiment` — and the rules it applies are stated on each table below.
 //!
+//! A reported entity is the WHOLE mention the document writes: its span runs from the
+//! mention's first character to one past its last, so a date expression written with
+//! the modifier that places it and the day part that narrows it is reported with all
+//! of them, which is what a client highlighting or redacting the mention needs. Its
+//! `Score` is computed from THAT detection's own evidence ([`Evidence`]) — how much
+//! the rule that fired constrains the characters, how much of the mention it accounts
+//! for, and what else the same characters could be — so it is a per-detection
+//! confidence rather than a constant of the rule class or of the type.
+//!
 //! The operation holds NO state: the answer is a function of the submitted document
 //! alone, so repeating the call returns the same entities, and nothing a later caller
 //! reads is changed by calling it.
@@ -168,6 +177,15 @@ pub(crate) const ANALYSABLE_LANGUAGES: &[&str] = &["en"];
 /// many tokens.
 const MAX_SPAN_TOKENS: usize = 12;
 
+/// How far either side of a matched date form [`complete_date_mention`] looks for the
+/// rest of the mention.
+///
+/// The modifiers and day parts a date expression carries are a handful of short
+/// words, so this window holds the longest run English writes while keeping the
+/// completion a CONSTANT cost per date: a document carrying thousands of dates costs
+/// a constant each rather than a scan of everything in front of it.
+const MENTION_COMPLETION_WINDOW_BYTES: usize = 64;
+
 /// How long the CALLER waits for the recogniser before this operation answers its
 /// own modelled server error instead of being left waiting.
 ///
@@ -197,33 +215,75 @@ const TYPE_QUANTITY: &str = "QUANTITY";
 const TYPE_TITLE: &str = "TITLE";
 const TYPE_OTHER: &str = "OTHER";
 
-/// Confidence of a rule whose evidence is a closed-form lexical pattern — an
-/// ISO-8601 date, an email address, a percentage: the span's own characters are the
-/// whole of the evidence, so nothing but the form can be wrong.
-const WEIGHT_PATTERN: f32 = 0.99;
-
-/// Confidence of a rule whose evidence is a lexicon entry naming the span.
-const WEIGHT_GAZETTEER: f32 = 0.95;
-
-/// Confidence of a rule whose evidence is a cue token — a legal-form designator
-/// inside the span, an honorific in front of it.
-const WEIGHT_CUE: f32 = 0.90;
-
-/// Confidence of the fallback: the span is named (a capitalized phrase in running
-/// text) but no rule places it in a category, so it is reported with the modelled
-/// `OTHER` type, which is what that value means.
-const WEIGHT_UNPLACED: f32 = 0.50;
-
-/// The confidence a rule reports for one span.
+/// How much evidence ONE level of a closed form's specificity holds.
 ///
-/// A rule's weight is its precision class (above); the span then keeps the share of
-/// it that the evidence covers, so a lexicon entry naming the whole span scores the
-/// full weight and one naming a single token of a three-token span scores less.
-/// Formally `weight * (0.5 + 0.5 * evidence_tokens / span_tokens)`, which stays
-/// inside `(0, 1]` for every weight above.
-fn confidence(weight: f32, evidence_tokens: usize, span_tokens: usize) -> f32 {
-    let coverage = (evidence_tokens as f32 / span_tokens.max(1) as f32).clamp(0.0, 1.0);
-    weight * (0.5 + 0.5 * coverage)
+/// A lexical form constrains the characters it matches, and the more of them it
+/// constrains the less else the span can be: the `priority` each rule in
+/// [`pattern_rules`] carries orders its form by exactly that — an ISO-8601 date
+/// fixes the separators and the field widths, a bare run of digits fixes nothing but
+/// that the characters are digits — so the level a rule sits at is weighed, rather
+/// than every rule of the class sharing one number.
+const EVIDENCE_PER_SPECIFICITY_LEVEL: f64 = 5.0;
+
+/// Evidence one token of a matched closed form holds: every further token the form
+/// fixed is a further constraint the span satisfied, so a date written with its year
+/// is read with more confidence than the same date without it.
+const EVIDENCE_PER_FORM_TOKEN: f64 = 2.0;
+
+/// Evidence a lexicon entry holds, per token of the span it names: a name the
+/// lexicon spells out is the strongest evidence this recogniser has, and a longer
+/// entry (`Bank of America`) is less likely to be a coincidence than a one-word one.
+const EVIDENCE_PER_LEXICON_TOKEN: f64 = 9.0;
+
+/// Evidence one cue token holds — a legal-form designator inside the span, an
+/// honorific in front of it, a thoroughfare type after it. Cues that agree add up.
+const EVIDENCE_PER_CUE_TOKEN: f64 = 6.0;
+
+/// Evidence the orthography of one capitalized token holds: in running English text a
+/// capital marks a name, which is weak on its own and corroborates every rule above.
+const EVIDENCE_PER_CAPITALIZED_TOKEN: f64 = 1.5;
+
+/// The weight of the reading in which the span names nothing at all.
+///
+/// Always open, because no rule-and-lexicon recogniser excludes it: this is what
+/// keeps every reported confidence strictly below 1.
+const READING_NOT_AN_ENTITY: f64 = 0.4;
+
+/// The weight of the reading in which a span that IS a name belongs to a category no
+/// rule could read. Open only for the `OTHER` fallback, which is the reading that the
+/// span is a name of no listed category.
+const READING_UNTYPED_NAME: f64 = 3.0;
+
+/// The weight, per span token no evidence names, of the reading in which the span is
+/// longer than the entity inside it: a lexicon entry or a cue covering one token of a
+/// three-token span leaves the other two unaccounted for.
+const READING_UNNAMED_TOKEN: f64 = 1.5;
+
+/// What one candidate span's own evidence weighs, for and against the reading it is
+/// reported with.
+///
+/// The recogniser reports [`Self::confidence`], the SUPPORTED reading's share of
+/// everything the span's evidence leaves open — the same shape of calibration the
+/// service's part-of-speech tagger reports a tag with. So the confidence follows the
+/// detection: the rules that fired on it, how much of the span they account for, and
+/// what else the same characters could have been.
+#[derive(Debug, Clone, Default)]
+struct Evidence {
+    /// Total weight of the evidence FOR the reading reported.
+    support: f64,
+    /// Total weight of the readings that evidence does not close off: the span's
+    /// unaccounted tokens, and the typings of the same characters this one outranked.
+    competing: f64,
+}
+
+impl Evidence {
+    /// The confidence this span is reported with: the supported reading's share of
+    /// the whole, which is strictly inside `(0, 1)` for any span carrying evidence,
+    /// since [`READING_NOT_AN_ENTITY`] is never closed off.
+    fn confidence(&self) -> f32 {
+        let total = self.support + self.competing + READING_NOT_AN_ENTITY;
+        (self.support / total.max(f64::MIN_POSITIVE)) as f32
+    }
 }
 
 /// English closed-class function words: they are never an entity on their own, they
@@ -572,10 +632,26 @@ const CURRENCY_PATTERN: &str = "usd|eur|gbp|jpy|chf|cad|aud|cny|inr|dollars?|eur
 /// Source: the currency signs of the major ISO 4217 currencies (USD, EUR, GBP, JPY).
 const CURRENCY_SIGNS: &str = r"[$€£¥]";
 
-/// Date expressions that name a day relative to the moment of writing, as a regex.
-const RELATIVE_DATE_PATTERN: &str = "(?i)\\b(?:yesterday|today|tomorrow|tonight|\
-     last\\s+(?:night|week|month|year)|next\\s+(?:week|month|year)|\
-     this\\s+(?:morning|afternoon|evening|week|month|year))\\b";
+/// The modifiers that place a date expression relative to the moment of writing, as
+/// a regex alternation.
+///
+/// Source: the English deictic determiners of time. Such a modifier is part of the
+/// date expression it stands in front of — it is what says WHICH Friday, which week
+/// or which January the expression names — so it is inside the reported span.
+const DATE_DEICTIC_PATTERN: &str = "last|next|this|coming|upcoming|past|previous|following";
+
+/// The periods a deictic modifier can name, as a regex alternation: the calendar and
+/// clock spans English writes with one.
+const DATE_PERIOD_PATTERN: &str = "night|weekend|week|month|quarter|year|decade|century|\
+     morning|afternoon|evening|spring|summer|autumn|fall|winter";
+
+/// The parts of a day a date expression can carry after the day it names (`Friday
+/// morning`, `tomorrow night`): also part of the expression, and so inside the span.
+const DAY_PART_PATTERN: &str = "morning|afternoon|evening|night";
+
+/// Date expressions that name a day relative to the moment of writing without naming
+/// a period, as a regex.
+const RELATIVE_DATE_PATTERN: &str = "(?i)\\b(?:yesterday|today|tomorrow|tonight)\\b";
 
 /// A token of the submitted document, in BYTE offsets into it.
 #[derive(Debug)]
@@ -597,7 +673,9 @@ struct Recognised {
     start: usize,
     end: usize,
     entity_type: &'static str,
-    score: f32,
+    /// What the span's own evidence weighs for and against this reading, which is
+    /// what the reported confidence is computed from.
+    evidence: Evidence,
     /// Which rule class typed the span: the tie-break when two candidates cover
     /// exactly the same characters, so a closed-form lexical pattern outranks a
     /// capitalized-phrase reading of the same characters.
@@ -728,7 +806,17 @@ fn pattern_rules() -> &'static [PatternRule] {
                 5,
             ),
             PatternRule::new(&format!(r"(?i)\b(?:{WEEKDAY_PATTERN})\b"), TYPE_DATE, 3),
-            PatternRule::new(RELATIVE_DATE_PATTERN, TYPE_DATE, 3),
+            PatternRule::new(RELATIVE_DATE_PATTERN, TYPE_DATE, 4),
+            // A period a deictic modifier places: `next week`, `this morning`, `last
+            // quarter`, `next January`. The modifier is what makes the phrase name a
+            // day at all, so it is part of the mention rather than context beside it.
+            PatternRule::new(
+                &format!(
+                    r"(?i)\b(?:{DATE_DEICTIC_PATTERN})\s+(?:{DATE_PERIOD_PATTERN}|{MONTH_PATTERN})\b"
+                ),
+                TYPE_DATE,
+                4,
+            ),
             // A bare four-digit number in the Gregorian year range reads as a year.
             PatternRule::new(r"\b[12]\d{3}\b", TYPE_DATE, 3),
             // Quantified amounts: the modelled `QUANTITY`.
@@ -982,6 +1070,98 @@ fn continues_span(previous: &Token, gap: &str) -> bool {
     !gap.contains('.') || is_abbreviation(previous)
 }
 
+/// A date expression's whole mention, out of the span its rule matched.
+///
+/// RULE: the span reported for an entity covers the complete mention, so a date
+/// expression written with the deictic modifier that says WHICH day it names
+/// (`next Friday`) or with the part of the day that narrows it (`Friday morning`)
+/// is reported whole, with `BeginOffset` at the modifier's first character — the
+/// offsets a client highlights or redacts the mention with have to cover all of it,
+/// and `Text` is the characters they delimit.
+///
+/// Both sides are extended over whitespace WITHIN a line only, since a line break
+/// ends a mention, and over words that are never entities of their own, so no
+/// extension can swallow a neighbouring entity.
+fn complete_date_mention(text: &str, start: usize, end: usize) -> (usize, usize) {
+    static PREFIX: OnceLock<Regex> = OnceLock::new();
+    static SUFFIX: OnceLock<Regex> = OnceLock::new();
+    // A run of modifiers, since English stacks them (`this coming Monday`), and all
+    // of the run belongs to the one expression.
+    let prefix = PREFIX.get_or_init(|| {
+        Regex::new(&format!(r"(?i)\b(?:(?:{DATE_DEICTIC_PATTERN})[ \t]+)+$"))
+            .expect("a valid date modifier pattern")
+    });
+    let suffix = SUFFIX.get_or_init(|| {
+        Regex::new(&format!(r"(?i)^[ \t]+(?:{DAY_PART_PATTERN})\b"))
+            .expect("a valid day part pattern")
+    });
+
+    // Each side is searched over a WINDOW of the document rather than over all of it
+    // in front of (or behind) every date, so a document carrying thousands of dates
+    // costs a constant per date instead of a scan of the whole text.
+    let start = match prefix.find(&text[window_start(text, start)..start]) {
+        Some(modifier) => {
+            let candidate = window_start(text, start) + modifier.start();
+            // The window may cut a longer word down to a modifier (`unnext`), which
+            // the slice's own start reads as a word boundary; the document's
+            // character in front of it is what decides.
+            if text[..candidate]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+            {
+                start
+            } else {
+                candidate
+            }
+        }
+        None => start,
+    };
+    let end = match suffix.find(&text[end..window_end(text, end)]) {
+        Some(day_part) => {
+            let candidate = end + day_part.end();
+            // Likewise behind: a day part the window cut short (`mornings`) is not
+            // one, whatever the slice's end looks like to the pattern.
+            if text[candidate..]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphanumeric)
+            {
+                end
+            } else {
+                candidate
+            }
+        }
+        None => end,
+    };
+    (start, end)
+}
+
+/// Where the lookbehind of [`complete_date_mention`] starts: at most
+/// [`MENTION_COMPLETION_WINDOW_BYTES`] before `start`, on a character boundary.
+///
+/// A modifier run is a handful of short words, so the window is a constant and no
+/// mention is completed out of text far away from it.
+fn window_start(text: &str, start: usize) -> usize {
+    let mut floor = start.saturating_sub(MENTION_COMPLETION_WINDOW_BYTES);
+    while floor < start && !text.is_char_boundary(floor) {
+        floor += 1;
+    }
+    floor
+}
+
+/// Where the lookahead of [`complete_date_mention`] ends: the counterpart of
+/// [`window_start`].
+fn window_end(text: &str, end: usize) -> usize {
+    let mut ceiling = end
+        .saturating_add(MENTION_COMPLETION_WINDOW_BYTES)
+        .min(text.len());
+    while ceiling > end && !text.is_char_boundary(ceiling) {
+        ceiling -= 1;
+    }
+    ceiling
+}
+
 /// Every entity a lexical pattern rule finds.
 fn pattern_entities(text: &str) -> Vec<Recognised> {
     let mut found = Vec::new();
@@ -1021,6 +1201,8 @@ fn pattern_entities(text: &str) -> Vec<Recognised> {
             {
                 continue;
             }
+            // The rule's own guards are about the form it MATCHED, so they are
+            // applied before the span is completed out to the whole mention.
             let matched_tokens: Vec<&str> = token_regex()
                 .find_iter(&text[start..end])
                 .map(|token| token.as_str())
@@ -1035,16 +1217,26 @@ fn pattern_entities(text: &str) -> Vec<Recognised> {
             {
                 continue;
             }
-            let span_tokens = matched_tokens.len().max(1);
+            // A date expression's modifier and day part belong to the mention, so
+            // the span is completed out to it before it is reported or weighed.
+            let (start, end) = if rule.entity_type == TYPE_DATE {
+                complete_date_mention(text, start, end)
+            } else {
+                (start, end)
+            };
+            let span_tokens = token_regex().find_iter(&text[start..end]).count().max(1);
             found.push(Recognised {
                 start,
                 end,
                 entity_type: rule.entity_type,
-                // A pattern rule's evidence is the span's own characters, so its
-                // coverage is total by construction and the confidence is the rule
-                // class's weight: `confidence` is still what computes it, so every
-                // rule reports its score the one way.
-                score: confidence(WEIGHT_PATTERN, span_tokens, span_tokens),
+                // A closed form's evidence is the span's own characters: how much it
+                // constrains them (the rule's specificity level) and how many tokens
+                // of the mention it accounts for.
+                evidence: Evidence {
+                    support: EVIDENCE_PER_SPECIFICITY_LEVEL * f64::from(rule.priority)
+                        + EVIDENCE_PER_FORM_TOKEN * span_tokens as f64,
+                    competing: 0.0,
+                },
                 priority: rule.priority,
             });
         }
@@ -1196,6 +1388,19 @@ fn divide_phrase(tokens: &[Token], phrase: Range<usize>) -> Vec<Range<usize>> {
     parts
 }
 
+/// How many of a phrase's tokens carry the capital that marks a name in running
+/// English text.
+///
+/// At least one, because a candidate phrase is anchored on a capitalized token: the
+/// orthographic evidence of a candidate span is never nil.
+fn capitalized_tokens(tokens: &[Token], phrase: Range<usize>) -> usize {
+    tokens[phrase]
+        .iter()
+        .filter(|token| token.capitalized)
+        .count()
+        .max(1)
+}
+
 /// Type one capitalized phrase from the evidence around and inside it, in order of
 /// the evidence's precision. A phrase no rule places is reported as `OTHER` — unless
 /// it is a lone word opening a sentence, where the capital is orthography rather than
@@ -1218,7 +1423,14 @@ fn classify_phrase(text: &str, tokens: &[Token], phrase: Range<usize>) -> Option
                 start: written_start,
                 end: written_end,
                 entity_type,
-                score: confidence(WEIGHT_GAZETTEER, written_tokens, written_tokens),
+                // The lexicon names every token of the span, so nothing in it is
+                // unaccounted for; the orthography of the name corroborates it.
+                evidence: Evidence {
+                    support: EVIDENCE_PER_LEXICON_TOKEN * written_tokens as f64
+                        + EVIDENCE_PER_CAPITALIZED_TOKEN
+                            * capitalized_tokens(tokens, phrase.clone()) as f64,
+                    competing: 0.0,
+                },
                 priority: 1,
             });
         }
@@ -1259,44 +1471,77 @@ fn classify_phrase(text: &str, tokens: &[Token], phrase: Range<usize>) -> Option
         .map(|token| token.lower.clone())
         .collect();
     let span_tokens = normalised.len();
-    let typed = |entity_type: &'static str, weight: f32, evidence: usize| {
+    let capitalized = capitalized_tokens(tokens, phrase.clone());
+    // One typed reading of the span, weighed from the evidence that typed it: the
+    // weight the rule's own evidence holds, corroborated by the span's orthography,
+    // against the reading in which the tokens that evidence does NOT name are no part
+    // of the entity.
+    let typed = |entity_type: &'static str, evidence_weight: f64, evidence_tokens: usize| {
         Some(Recognised {
             start,
             end,
             entity_type,
-            score: confidence(weight, evidence, span_tokens),
+            evidence: Evidence {
+                support: evidence_weight + EVIDENCE_PER_CAPITALIZED_TOKEN * capitalized as f64,
+                competing: READING_UNNAMED_TOKEN
+                    * span_tokens.saturating_sub(evidence_tokens) as f64,
+            },
             priority: 1,
         })
     };
 
     if let Some(cues) = cue_tokens(&normalised, organization_designators()) {
-        return typed(TYPE_ORGANIZATION, WEIGHT_CUE, cues);
+        return typed(
+            TYPE_ORGANIZATION,
+            EVIDENCE_PER_CUE_TOKEN * cues as f64,
+            cues,
+        );
     }
     if title_cue {
-        return typed(TYPE_PERSON, WEIGHT_CUE, 1);
+        return typed(TYPE_PERSON, EVIDENCE_PER_CUE_TOKEN, 1);
     }
     if let Some(cues) = cue_tokens(&normalised, geographic_designators()) {
-        return typed(TYPE_LOCATION, WEIGHT_CUE, cues);
+        return typed(TYPE_LOCATION, EVIDENCE_PER_CUE_TOKEN * cues as f64, cues);
     }
     if let Some(cues) = cue_tokens(&normalised, event_designators()) {
-        return typed(TYPE_EVENT, WEIGHT_CUE, cues);
+        return typed(TYPE_EVENT, EVIDENCE_PER_CUE_TOKEN * cues as f64, cues);
     }
     let lexicon_hit = lexicon_match(&normalised);
     // A lexicon entry naming the WHOLE phrase outranks the given-name rule, so a
     // place that is also a given name reads as the place.
     if let Some((length, entity_type)) = lexicon_hit {
         if length == span_tokens {
-            return typed(entity_type, WEIGHT_GAZETTEER, length);
+            return typed(
+                entity_type,
+                EVIDENCE_PER_LEXICON_TOKEN * length as f64,
+                length,
+            );
         }
     }
     if given_names().contains(normalised[0].as_str()) {
-        return typed(TYPE_PERSON, WEIGHT_CUE, 1);
+        return typed(TYPE_PERSON, EVIDENCE_PER_CUE_TOKEN, 1);
     }
     if let Some((length, entity_type)) = lexicon_hit {
-        return typed(entity_type, WEIGHT_GAZETTEER, length);
+        return typed(
+            entity_type,
+            EVIDENCE_PER_LEXICON_TOKEN * length as f64,
+            length,
+        );
     }
     if span_tokens >= 2 || !tokens[phrase.start].sentence_initial {
-        return typed(TYPE_OTHER, WEIGHT_UNPLACED, span_tokens);
+        // The span is a name — that is what its orthography says — but no rule
+        // places it in a category, so the modelled `OTHER` is the reading reported
+        // and the typed readings nothing could confirm stay open.
+        return Some(Recognised {
+            start,
+            end,
+            entity_type: TYPE_OTHER,
+            evidence: Evidence {
+                support: EVIDENCE_PER_CAPITALIZED_TOKEN * capitalized as f64,
+                competing: READING_UNTYPED_NAME,
+            },
+            priority: 1,
+        });
     }
     None
 }
@@ -1305,18 +1550,38 @@ fn classify_phrase(text: &str, tokens: &[Token], phrase: Range<usize>) -> Option
 /// longest reading of the same start, and at equal length the rule class with the
 /// higher precision. Overlapping candidates behind the one kept are dropped, so the
 /// returned list is ordered by position and never double-reports a character.
+///
+/// A dropped candidate covering EXACTLY the kept span's characters with another type
+/// is a reading of that mention the evidence left open, so its weight stays in the
+/// kept entity's confidence: a mention two rules read two ways is reported with less
+/// certainty than one only a single rule can read. A candidate of the same type, or
+/// one covering part of the span, is a reading the kept one already accounts for and
+/// weighs nothing further.
 fn resolve_overlaps(mut found: Vec<Recognised>) -> Vec<Recognised> {
     found.sort_by(|left, right| {
         left.start
             .cmp(&right.start)
             .then((right.end - right.start).cmp(&(left.end - left.start)))
             .then(right.priority.cmp(&left.priority))
-            .then(right.score.total_cmp(&left.score))
+            .then(
+                right
+                    .evidence
+                    .support
+                    .total_cmp(&left.evidence.support),
+            )
     });
     let mut kept: Vec<Recognised> = Vec::new();
     for candidate in found {
-        if kept.last().is_none_or(|last| candidate.start >= last.end) {
-            kept.push(candidate);
+        match kept.last_mut() {
+            Some(last) if candidate.start < last.end => {
+                if last.entity_type != candidate.entity_type
+                    && candidate.start == last.start
+                    && candidate.end == last.end
+                {
+                    last.evidence.competing += candidate.evidence.support;
+                }
+            }
+            _ => kept.push(candidate),
         }
     }
     kept
@@ -1324,12 +1589,14 @@ fn resolve_overlaps(mut found: Vec<Recognised>) -> Vec<Recognised> {
 
 /// Every entity the recogniser finds in `text`, as the modelled `Entity` list:
 /// ordered by position, each carrying the characters it covers, the modelled type,
-/// the zero-based CHARACTER offsets of that stretch and the confidence of the rule
-/// that typed it.
+/// the zero-based CHARACTER offsets of that stretch and the confidence its own
+/// evidence leaves that reading ([`Evidence::confidence`]) — a per-detection value,
+/// not a constant of the rule class that typed it.
 ///
 /// The offsets are consistent with the text by construction: `BeginOffset` is the
 /// character index the entity starts at and `EndOffset` the index one past its last
-/// character, so the entity's `Text` is exactly the substring they delimit.
+/// character, so the entity's `Text` is exactly the substring they delimit, and the
+/// span covers the WHOLE mention the document writes.
 pub fn detect_entities(text: &str) -> Vec<Entity> {
     let char_starts: Vec<usize> = text.char_indices().map(|(index, _)| index).collect();
     let char_offset = |byte: usize| char_starts.partition_point(|&start| start < byte) as i32;
@@ -1338,7 +1605,7 @@ pub fn detect_entities(text: &str) -> Vec<Entity> {
     resolve_overlaps(found)
         .into_iter()
         .map(|entity| Entity {
-            score: Some(entity.score),
+            score: Some(entity.evidence.confidence()),
             r#type: Some(entity.entity_type.to_string()),
             text: Some(text[entity.start..entity.end].to_string()),
             begin_offset: Some(char_offset(entity.start)),

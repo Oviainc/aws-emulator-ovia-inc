@@ -41,6 +41,8 @@ mod dominant_language_jobs;
 mod endpoints;
 #[path = "all/entity_detection.rs"]
 mod entity_detection;
+#[path = "all/entity_mention_spans.rs"]
+mod entity_mention_spans;
 // Declared beside the suite it backs rather than under `s`: `scratch_dump` holds the
 // whole-document baselines that `entity_detection` asserts the rules of.
 #[path = "all/scratch_dump.rs"]
