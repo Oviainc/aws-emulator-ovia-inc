@@ -609,13 +609,13 @@ async fn widening_the_query_radius_reaches_more_places() {
             case: "space-needle-block",
             anchor: [-122.3493, 47.6205],
             ladder: &[20, 40, 85, 2_000],
-            expected: &[2, 3, 5, 10],
+            expected: &[2, 3, 5, 12],
         },
         RadiusRow {
             case: "seattle-city",
             anchor: [-122.330_062, 47.603_832],
             ladder: &[100, 2_000, 20_000],
-            expected: &[2, 8, 14],
+            expected: &[2, 8, 16],
         },
         RadiusRow {
             case: "paris-city",

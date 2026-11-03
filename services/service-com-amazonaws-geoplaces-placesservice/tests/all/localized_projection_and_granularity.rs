@@ -354,10 +354,10 @@ async fn a_position_resolves_to_the_finest_place_that_covers_it() {
             finest: "SubRegion",
         },
         GranularityRow {
-            // Off the Atlantic coast of Africa: inside the country extent the
-            // catalog holds for France and inside nothing finer.
+            // Inland western France: inside the country's own bounding box and
+            // inside no region, county or settlement the catalog holds.
             case: "country",
-            at: [-10.000_0, 32.000_0],
+            at: [-1.500_0, 47.200_0],
             finest: "Country",
         },
     ];

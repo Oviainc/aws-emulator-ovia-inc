@@ -17,6 +17,8 @@ mod autocomplete_completions;
 mod catalog_coverage_and_position_resolution;
 #[path = "all/localized_projection_and_granularity.rs"]
 mod localized_projection_and_granularity;
+#[path = "all/place_handles_and_extents.rs"]
+mod place_handles_and_extents;
 #[path = "all/places_catalog.rs"]
 mod places_catalog;
 #[path = "all/result_item_composition.rs"]

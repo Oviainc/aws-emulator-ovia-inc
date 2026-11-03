@@ -695,14 +695,17 @@ async fn search_text_answers_only_the_places_its_query_names() {
     let rows: Vec<(&str, &str, Vec<&str>)> = vec![
         (
             // The chain has several stores, and the query names the chain: every
-            // store it names, and no neighbour of one.
+            // store it names, and no neighbour of one. A chain store is titled
+            // with the brand name the place data writes.
             "brand",
             "Starbucks",
             vec![
-                "Starbucks",
-                "Starbucks",
-                "Starbucks",
-                "Starbucks Reserve Roastery",
+                "STARBUCKS",
+                "STARBUCKS",
+                "STARBUCKS",
+                "STARBUCKS",
+                "STARBUCKS",
+                "STARBUCKS RESERVE ROASTERY",
             ],
         ),
         ("name", "Space Needle", vec!["Space Needle"]),
@@ -712,14 +715,16 @@ async fn search_text_answers_only_the_places_its_query_names() {
             "category",
             "Coffee",
             vec![
-                "Blue Bottle Coffee",
+                "BLUE BOTTLE COFFEE",
+                "COMPASS COFFEE",
                 "Cafe de Flore",
-                "Compass Coffee",
+                "STARBUCKS",
+                "STARBUCKS",
+                "STARBUCKS",
+                "STARBUCKS",
+                "STARBUCKS",
+                "STARBUCKS RESERVE ROASTERY",
                 "Seattle Coffee Works",
-                "Starbucks",
-                "Starbucks",
-                "Starbucks",
-                "Starbucks Reserve Roastery",
                 "Victrola Coffee Roasters",
             ],
         ),
@@ -729,9 +734,9 @@ async fn search_text_answers_only_the_places_its_query_names() {
             "Pike Street Seattle",
             vec![
                 "Pike Place Market",
+                "STARBUCKS",
+                "STARBUCKS RESERVE ROASTERY",
                 "Seattle Coffee Works",
-                "Starbucks",
-                "Starbucks Reserve Roastery",
                 "Victrola Coffee Roasters",
             ],
         ),

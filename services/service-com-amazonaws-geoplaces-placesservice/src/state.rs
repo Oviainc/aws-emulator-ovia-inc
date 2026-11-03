@@ -264,6 +264,36 @@ const EARTH_RADIUS_M: f64 = 6_371_008.8;
 /// around a point.
 const METRES_PER_DEGREE_LAT: f64 = EARTH_RADIUS_M * std::f64::consts::PI / 180.0;
 
+/// Decimal places a reported WGS 84 coordinate carries.
+///
+/// Every coordinate this service reports — `Position`, `MapView`, `AccessPoints` —
+/// is a `Double` the service rounds to this many fractional degrees (about a metre
+/// of latitude), so a response carries a coordinate and not the full binary
+/// expansion of whatever arithmetic produced it.
+const COORDINATE_DECIMALS: u32 = 5;
+
+/// `degrees` at the precision a reported coordinate carries
+/// ([`COORDINATE_DECIMALS`]).
+fn coordinate(degrees: f64) -> f64 {
+    let scale = 10_f64.powi(COORDINATE_DECIMALS as i32);
+    (degrees * scale).round() / scale
+}
+
+/// A `[longitude, latitude]` pair at reported coordinate precision.
+fn coordinate_pair(position: [f64; 2]) -> [f64; 2] {
+    [coordinate(position[0]), coordinate(position[1])]
+}
+
+/// A `[west, south, east, north]` box at reported coordinate precision.
+fn coordinate_box(box_: [f64; 4]) -> [f64; 4] {
+    [
+        coordinate(box_[0]),
+        coordinate(box_[1]),
+        coordinate(box_[2]),
+        coordinate(box_[3]),
+    ]
+}
+
 /// A `[longitude, latitude]` pair taken from a modeled `Position` list, or `None`
 /// when the list is not exactly two elements (the modeled `len 2..2` is refused at
 /// the boundary, so that part only guards an in-process caller) or the pair is not
@@ -307,13 +337,19 @@ pub fn distance_metres(from: [f64; 2], to: [f64; 2]) -> i64 {
     metres.round().clamp(0.0, DISTANCE_MAX as f64) as i64
 }
 
-/// The `MapView` box enclosing a point place: `extent_metres` either side of the
-/// position, rendered as `[west, south, east, north]` the way the modeled
-/// `BoundingBox` documents.
-fn map_view_around(position: [f64; 2], extent_metres: f64) -> [f64; 4] {
-    let latitude_delta = extent_metres / METRES_PER_DEGREE_LAT;
+/// The `MapView` box of a place whose geometry is a POINT — an address, a point of
+/// interest, an access point: "the bounding box enclosing the geometric shape (area
+/// or line) that an individual result covers" degenerates to the point itself, so
+/// the box the service reports is the small viewport it frames that point with,
+/// [`POINT_EXTENT_M`] either side of it, rendered as `[west, south, east, north]`
+/// the way the modeled `BoundingBox` documents.
+///
+/// A place with real AREA carries its own box instead
+/// ([`PlaceRecord::with_map_view`]): nothing derives an area from a `PlaceType`.
+fn point_view(position: [f64; 2]) -> [f64; 4] {
+    let latitude_delta = POINT_EXTENT_M / METRES_PER_DEGREE_LAT;
     let cosine = position[1].to_radians().cos().abs().max(1e-6);
-    let longitude_delta = extent_metres / (METRES_PER_DEGREE_LAT * cosine);
+    let longitude_delta = POINT_EXTENT_M / (METRES_PER_DEGREE_LAT * cosine);
     [
         position[0] - longitude_delta,
         position[1] - latitude_delta,
@@ -321,6 +357,10 @@ fn map_view_around(position: [f64; 2], extent_metres: f64) -> [f64; 4] {
         position[1] + latitude_delta,
     ]
 }
+
+/// Half the side of the viewport a point feature's [`point_view`] is framed with,
+/// in metres.
+const POINT_EXTENT_M: f64 = 150.0;
 
 // ---------------------------------------------------------------------------
 // Positions a caller supplies
@@ -1392,9 +1432,16 @@ pub struct PlaceRecord {
     /// claim is unresolved carries none of these, so every view reports the same
     /// [`Self::address`].
     pub political_attributions: BTreeMap<String, AddressRecord>,
-    /// `[longitude, latitude]`, WGS 84, as the modeled `Position` orders them.
+    /// `[longitude, latitude]`, WGS 84, as the modeled `Position` orders them, at
+    /// the precision the service reports a coordinate to
+    /// ([`COORDINATE_DECIMALS`]).
     pub position: [f64; 2],
-    /// `[west, south, east, north]`, as the modeled `BoundingBox` orders them.
+    /// The box enclosing the geometric shape this place covers: `[west, south,
+    /// east, north]`, as the modeled `BoundingBox` orders them.
+    ///
+    /// It is this place's OWN extent — an area's real bounding box, a point
+    /// feature's viewport ([`point_view`]) — so it is neither derived from the
+    /// place's `PlaceType` nor symmetric about [`Self::position`].
     pub map_view: [f64; 4],
     pub categories: Vec<CategoryRecord>,
     pub food_types: Vec<String>,
@@ -1424,15 +1471,18 @@ pub struct PlaceRecord {
 }
 
 impl PlaceRecord {
-    /// A catalog record for `title` at `position`, with a `MapView` extending
-    /// `extent_metres` either side of that position.
+    /// A catalog record for `title` at `position`.
+    ///
+    /// The record's `MapView` starts as the viewport of a POINT feature
+    /// ([`point_view`]); a place with real area carries its own box instead, named
+    /// beside it with [`Self::with_map_view`].
     fn new(
         title: &str,
         place_type: &str,
         position: [f64; 2],
         address: AddressRecord,
-        extent_metres: f64,
     ) -> Self {
+        let position = coordinate_pair(position);
         Self {
             place_id: synthesize_place_id(title, position),
             place_type: place_type.to_string(),
@@ -1442,7 +1492,7 @@ impl PlaceRecord {
             address,
             political_attributions: BTreeMap::new(),
             position,
-            map_view: map_view_around(position, extent_metres),
+            map_view: coordinate_box(point_view(position)),
             categories: Vec::new(),
             food_types: Vec::new(),
             business_chains: Vec::new(),
@@ -1455,6 +1505,15 @@ impl PlaceRecord {
             completion_terms: Vec::new(),
             places_covered: 0,
         }
+    }
+
+    /// The box enclosing the area this place covers, as `[west, south, east,
+    /// north]`: the geometry of a feature with real extent — a district, a
+    /// settlement, a county, a state, a country — which is neither square nor
+    /// centred on the place's own position.
+    fn with_map_view(mut self, map_view: [f64; 4]) -> Self {
+        self.map_view = coordinate_box(map_view);
+        self
     }
 
     /// The place's other names: see [`PlaceRecord::alternate_names`].
@@ -1516,7 +1575,10 @@ impl PlaceRecord {
     }
 
     fn with_access_points(mut self, access_points: &[[f64; 2]]) -> Self {
-        self.access_points = access_points.to_vec();
+        self.access_points = access_points
+            .iter()
+            .map(|point| coordinate_pair(*point))
+            .collect();
         self
     }
 
@@ -1694,14 +1756,16 @@ impl PlaceRecord {
         box_contains(self.map_view, position)
     }
 
-    /// `Position`, as a modeled `Position` list.
+    /// `Position`, as a modeled `Position` list, at the precision the service
+    /// reports a coordinate to ([`COORDINATE_DECIMALS`]).
     pub fn position_modeled(&self) -> Vec<f64> {
-        self.position.to_vec()
+        coordinate_pair(self.position).to_vec()
     }
 
-    /// `MapView`, as a modeled `BoundingBox` list.
+    /// `MapView`, as a modeled `BoundingBox` list, at the precision the service
+    /// reports a coordinate to ([`COORDINATE_DECIMALS`]).
     pub fn map_view_modeled(&self) -> Vec<f64> {
-        self.map_view.to_vec()
+        coordinate_box(self.map_view).to_vec()
     }
 
     /// `Categories`, or `None` when this place has none: the modeled list is
@@ -1803,7 +1867,9 @@ impl PlaceRecord {
         }])
     }
 
-    /// `AccessPoints`, or `None` when this place has none recorded.
+    /// `AccessPoints`, or `None` when this place has none recorded. Each position
+    /// is reported at the precision the service reports a coordinate to
+    /// ([`COORDINATE_DECIMALS`]).
     pub fn access_points_modeled(&self) -> Option<Vec<AccessPoint>> {
         if self.access_points.is_empty() {
             return None;
@@ -1813,7 +1879,7 @@ impl PlaceRecord {
                 .iter()
                 .enumerate()
                 .map(|(rank, point)| AccessPoint {
-                    position: Some(point.to_vec()),
+                    position: Some(coordinate_pair(*point).to_vec()),
                     r#type: None,
                     primary: Some(rank == 0),
                     label: None,
@@ -2042,18 +2108,58 @@ pub fn box_contains(box_: [f64; 4], position: [f64; 2]) -> bool {
     within_longitude && latitude >= south && latitude <= north
 }
 
-/// The opaque `PlaceId` of a record: an uppercase hex digest of what the record IS
-/// (its title and its position to six decimal places), so the same catalog always
-/// hands out the same ids and an id from one operation resolves in another.
-fn synthesize_place_id(title: &str, position: [f64; 2]) -> String {
-    /// Characters of the digest a `PlaceId` carries. The modeled `PlaceId` allows
-    /// up to 500.
-    const PLACE_ID_LEN: usize = 40;
+/// The version header every place handle this service hands out opens with: the
+/// handle's leading bytes, which come out of [`place_id_token`] as the fixed
+/// character prefix a client sees on every id.
+///
+/// The header is a whole number of 3-byte base64 groups, so it encodes to a prefix
+/// that does not shift with the payload behind it.
+const PLACE_ID_VERSION: [u8; 6] = [0x01, 0x00, 0x00, 0x00, 0x38, 0x00];
 
-    let digest = Sha256::digest(
-        format!("{title}|{:.6}|{:.6}", position[0], position[1]).as_bytes(),
-    );
-    hex::encode_upper(digest)[..PLACE_ID_LEN].to_string()
+/// Bytes of per-place payload a place handle carries behind its
+/// [`PLACE_ID_VERSION`] header. Header plus payload encode to a 126-character
+/// token, well inside the modeled `PlaceId` `length(0, 500)`.
+const PLACE_ID_PAYLOAD_BYTES: usize = 88;
+
+/// `bytes` as one unpadded base64url token, so the whole handle is URL- and
+/// path-safe — a `PlaceId` travels in `GET /v2/place/{PlaceId}`.
+///
+/// The encoding is the runtime's own base64 encoder; base64url (RFC 4648 section
+/// 5, "base64url") is that same encoding over an alphabet whose last two
+/// characters are `-` and `_` instead of `+` and `/`, written without the `=`
+/// padding, which is the whole of the adjustment made here.
+fn place_id_token(bytes: &[u8]) -> String {
+    ::aws_smithy_types::base64::encode(bytes)
+        .trim_end_matches('=')
+        .replace('+', "-")
+        .replace('/', "_")
+}
+
+/// The opaque `PlaceId` of a record: the service's version header followed by a
+/// payload derived from what the record IS (its title and its position), rendered
+/// as one opaque base64url token of a fixed length class.
+///
+/// The handle is a HANDLE: the model documents nothing about its content
+/// (`SensitiveString`, `length(0, 500)`), and a client reads it as an opaque token
+/// it persists, logs, de-duplicates on and hands back to GetPlace. Deriving the
+/// payload from the record keeps it stable across runs, so one operation's id still
+/// resolves in another, while the header and the length class make every id the
+/// same shape whatever place it names.
+fn synthesize_place_id(title: &str, position: [f64; 2]) -> String {
+    let seed = format!("{title}|{:.6}|{:.6}", position[0], position[1]);
+    let mut bytes = PLACE_ID_VERSION.to_vec();
+    // The payload is longer than one digest, so it is expanded a digest at a time,
+    // each block keyed by its own index.
+    let mut block: u32 = 0;
+    while bytes.len() < PLACE_ID_VERSION.len() + PLACE_ID_PAYLOAD_BYTES {
+        let mut digest = Sha256::new();
+        digest.update(seed.as_bytes());
+        digest.update(block.to_be_bytes());
+        bytes.extend_from_slice(&digest.finalize());
+        block += 1;
+    }
+    bytes.truncate(PLACE_ID_VERSION.len() + PLACE_ID_PAYLOAD_BYTES);
+    place_id_token(&bytes)
 }
 
 /// How well a query matches a set of indexed terms, or `None` when it does not
@@ -3208,29 +3314,6 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 // The seeded catalog
 // ---------------------------------------------------------------------------
 
-/// `MapView` extent for a point place (an address or a point of interest).
-const POINT_EXTENT_M: f64 = 150.0;
-
-/// `MapView` extent for a district, which covers a neighbourhood.
-const DISTRICT_EXTENT_M: f64 = 3_000.0;
-
-/// `MapView` extent for a locality, which covers a whole settlement.
-const LOCALITY_EXTENT_M: f64 = 12_000.0;
-
-/// `MapView` extent for a RURAL district reported at locality granularity (a
-/// raion): the area covers a cluster of villages rather than one built-up place,
-/// so it is wider than a town's extent and narrower than the sub-region holding it.
-const RURAL_DISTRICT_EXTENT_M: f64 = 40_000.0;
-
-/// `MapView` extent for a sub-region (a county).
-const SUB_REGION_EXTENT_M: f64 = 60_000.0;
-
-/// `MapView` extent for a region (a state).
-const REGION_EXTENT_M: f64 = 350_000.0;
-
-/// `MapView` extent for a country.
-const COUNTRY_EXTENT_M: f64 = 2_000_000.0;
-
 /// The operations whose `PricingBucket` this service seeds. Every one of the
 /// service's modeled operations declares the member as `@required`.
 const PRICED_OPERATIONS: [&str; 7] = [
@@ -3359,6 +3442,15 @@ fn street_in(
 /// The catalog holds no place at postal-code granularity, so a structured
 /// postal-code query answers with no items rather than with a place of the wrong
 /// granularity.
+///
+/// The records carry the place data's OWN values, not prettified ones: a place with
+/// real area carries the box that encloses it ([`PlaceRecord::with_map_view`]),
+/// which is neither square nor centred on the place's position; a store of a
+/// business chain is titled with the brand name as the data writes it, in the
+/// chain's upper-case brand form, while an independent business keeps its own
+/// name; and a street address carries the postal code the data holds for that
+/// delivery segment, which in the United States is a ZIP+4 where the data has the
+/// add-on and the five-digit code where it does not.
 ///
 /// The category ids and names are this catalog's own: the model carries no
 /// enumeration of AWS's place categories, only the `Category` structure shape.
@@ -3531,7 +3623,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 address_number: Some("1600".to_string()),
                 ..washington.clone()
             },
-            POINT_EXTENT_M,
         )
         .with_categories(&[
             ("tourist_attraction", "Tourist Attraction"),
@@ -3551,7 +3642,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 address_number: Some("1600".to_string()),
                 ..washington.clone()
             },
-            POINT_EXTENT_M,
         )
         .with_access_points(&[[-77.036_530, 38.897_600]])
         .with_time_zone(eastern.0, eastern.1, eastern.2),
@@ -3565,7 +3655,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 address_number: Some("600".to_string()),
                 ..washington.clone()
             },
-            POINT_EXTENT_M,
         )
         .with_categories(&[("museum", "Museum"), ("tourist_attraction", "Tourist Attraction")])
         .with_contacts(&["+1 202-633-2214"], &["https://airandspace.si.edu"])
@@ -3581,7 +3670,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 address_number: Some("2".to_string()),
                 ..washington.clone()
             },
-            POINT_EXTENT_M,
         )
         .with_categories(&[("monument", "Monument"), ("tourist_attraction", "Tourist Attraction")])
         .with_time_zone(eastern.0, eastern.1, eastern.2),
@@ -3595,7 +3683,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 address_number: Some("1924".to_string()),
                 ..washington.clone()
             },
-            POINT_EXTENT_M,
         )
         .with_categories(&[("restaurant", "Restaurant")])
         .with_food_types(&["American"])
@@ -3607,8 +3694,8 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_LOCALITY,
             [-77.036_871, 38.907_192],
             washington.clone(),
-            LOCALITY_EXTENT_M,
         )
+        .with_map_view([-77.119_76, 38.791_65, -76.909_40, 38.995_55])
         .with_time_zone(eastern.0, eastern.1, eastern.2),
         PlaceRecord::new(
             "Space Needle",
@@ -3621,7 +3708,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 district: Some("Lower Queen Anne".to_string()),
                 ..seattle.clone()
             },
-            POINT_EXTENT_M,
         )
         .with_categories(&[
             ("tourist_attraction", "Tourist Attraction"),
@@ -3642,7 +3728,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 district: Some("Lower Queen Anne".to_string()),
                 ..seattle.clone()
             },
-            POINT_EXTENT_M,
         )
         .with_time_zone(pacific.0, pacific.1, pacific.2),
         PlaceRecord::new(
@@ -3656,14 +3741,13 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 district: Some("Downtown".to_string()),
                 ..seattle.clone()
             },
-            POINT_EXTENT_M,
         )
         .with_categories(&[("market", "Market"), ("tourist_attraction", "Tourist Attraction")])
         .with_contacts(&["+1 206-682-7453"], &["https://www.pikeplacemarket.org"])
         .with_opening_hours(&["Mon-Sun: 09:00 - 18:00"])
         .with_time_zone(pacific.0, pacific.1, pacific.2),
         PlaceRecord::new(
-            "Starbucks Reserve Roastery",
+            "STARBUCKS RESERVE ROASTERY",
             PLACE_TYPE_POINT_OF_INTEREST,
             [-122.327_290, 47.614_040],
             AddressRecord {
@@ -3673,7 +3757,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 district: Some("Capitol Hill".to_string()),
                 ..seattle.clone()
             },
-            POINT_EXTENT_M,
         )
         .with_categories(&[("coffee_shop", "Coffee Shop"), ("restaurant", "Restaurant")])
         .with_food_types(&["Coffee"])
@@ -3684,10 +3767,10 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
         PlaceRecord::new(
             "Seattle",
             PLACE_TYPE_LOCALITY,
-            [-122.330_062, 47.603_832],
+            [-122.329_45, 47.603_57],
             seattle.clone(),
-            LOCALITY_EXTENT_M,
         )
+        .with_map_view([-122.436_13, 47.495_58, -122.236_48, 47.734_16])
         .with_time_zone(pacific.0, pacific.1, pacific.2),
         PlaceRecord::new(
             "Tour Eiffel",
@@ -3700,7 +3783,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 district: Some("7e Arrondissement".to_string()),
                 ..paris.clone()
             },
-            POINT_EXTENT_M,
         )
         .with_alternate_names(&["La Tour Eiffel"])
         // The landmark's name as other languages write it: a query naming it by
@@ -3723,8 +3805,8 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_LOCALITY,
             [2.352_222, 48.856_613],
             paris.clone(),
-            LOCALITY_EXTENT_M,
         )
+        .with_map_view([2.224_20, 48.815_57, 2.469_92, 48.902_15])
         .with_time_zone(central_european.0, central_european.1, central_european.2),
         // The administrative levels a structured query resolves at: a district, a
         // sub-region (county), the regions (states) and the countries.
@@ -3737,8 +3819,8 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 postal_code: "98102".to_string(),
                 ..seattle.clone()
             },
-            DISTRICT_EXTENT_M,
         )
+        .with_map_view([-122.327_20, 47.609_00, -122.303_00, 47.641_80])
         .with_time_zone(pacific.0, pacific.1, pacific.2),
         PlaceRecord::new(
             "King County",
@@ -3749,8 +3831,8 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 postal_code: String::new(),
                 ..seattle.clone()
             },
-            SUB_REGION_EXTENT_M,
         )
+        .with_map_view([-122.541_00, 47.077_60, -121.065_60, 47.780_40])
         .with_time_zone(pacific.0, pacific.1, pacific.2),
         PlaceRecord::new(
             "Washington",
@@ -3762,8 +3844,8 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 postal_code: String::new(),
                 ..seattle.clone()
             },
-            REGION_EXTENT_M,
         )
+        .with_map_view([-124.848_97, 45.543_54, -116.915_99, 49.002_49])
         .with_time_zone(pacific.0, pacific.1, pacific.2),
         PlaceRecord::new(
             "District of Columbia",
@@ -3775,8 +3857,8 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 postal_code: String::new(),
                 ..washington.clone()
             },
-            LOCALITY_EXTENT_M,
         )
+        .with_map_view([-77.119_76, 38.791_65, -76.909_40, 38.995_55])
         .with_time_zone(eastern.0, eastern.1, eastern.2),
         PlaceRecord::new(
             "Ile-de-France",
@@ -3788,34 +3870,33 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 postal_code: String::new(),
                 ..paris.clone()
             },
-            REGION_EXTENT_M,
         )
+        .with_map_view([1.446_10, 48.120_30, 3.559_20, 49.241_20])
         .with_time_zone(central_european.0, central_european.1, central_european.2),
         PlaceRecord::new(
             "United States",
             PLACE_TYPE_COUNTRY,
             [-98.579_500, 39.828_300],
             united_states,
-            COUNTRY_EXTENT_M,
-        ),
+        )
+        .with_map_view([-124.784_40, 24.396_30, -66.885_44, 49.384_36]),
         PlaceRecord::new(
             "France",
             PLACE_TYPE_COUNTRY,
             [2.209_667, 46.232_193],
             france,
-            COUNTRY_EXTENT_M,
-        ),
+        )
+        .with_map_view([-5.142_22, 41.333_00, 9.561_56, 51.089_00]),
     ];
 
     // --- Washington DC: a second city with a coffee shop, so a category search
     // --- is not answered out of one city alone.
     places.push(
         PlaceRecord::new(
-            "Compass Coffee",
+            "COMPASS COFFEE",
             PLACE_TYPE_POINT_OF_INTEREST,
             [-77.021_100, 38.902_500],
             street_in(&washington, "1535", "7th St NW", "20001", Some("Shaw")),
-            POINT_EXTENT_M,
         )
         .with_categories(&[("coffee_shop", "Coffee Shop")])
         .with_food_types(&["Coffee"])
@@ -3842,7 +3923,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 "98109",
                 Some("Lower Queen Anne"),
             ),
-            POINT_EXTENT_M,
         )
         .with_alternate_names(&["Seattle Center Monorail Station"])
         .with_categories(&[("transit_station", "Transit Station")])
@@ -3859,7 +3939,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 "98109",
                 Some("Lower Queen Anne"),
             ),
-            POINT_EXTENT_M,
         )
         .with_categories(&[("museum", "Museum"), ("tourist_attraction", "Tourist Attraction")])
         .with_contacts(&["+1 206-753-4940"], &["https://www.chihulygardenandglass.com"])
@@ -3876,17 +3955,54 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 "98109",
                 Some("Lower Queen Anne"),
             ),
-            POINT_EXTENT_M,
         )
         .with_categories(&[("food_court", "Food Court")])
         .with_opening_hours(&["Mon-Sun: 07:00 - 21:00"])
         .in_time_zone(pacific),
+        // The chain's stores around the Seattle Center, each under the BRAND NAME
+        // the place data writes, with the ZIP+4 of the delivery segment its street
+        // address sits on where the data carries one.
         PlaceRecord::new(
-            "Starbucks",
+            "STARBUCKS",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-122.347_26, 47.624_72],
+            street_in(
+                &seattle,
+                "500",
+                "Mercer St",
+                "98109-4654",
+                Some("Lower Queen Anne"),
+            ),
+        )
+        .with_categories(&[("coffee_shop", "Coffee Shop")])
+        .with_food_types(&["Coffee"])
+        .with_business_chains(&["Starbucks"])
+        .with_contacts(&["+1 206-298-3034"], &["https://www.starbucks.com"])
+        .with_opening_hours(&["Mon-Sun: 05:00 - 20:30"])
+        .in_time_zone(pacific),
+        PlaceRecord::new(
+            "STARBUCKS",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-122.335_81, 47.622_76],
+            street_in(
+                &seattle,
+                "442",
+                "Terry Ave N",
+                "98109-5210",
+                Some("South Lake Union"),
+            ),
+        )
+        .with_categories(&[("coffee_shop", "Coffee Shop")])
+        .with_food_types(&["Coffee"])
+        .with_business_chains(&["Starbucks"])
+        .with_contacts(&["+1 206-624-4521"], &["https://www.starbucks.com"])
+        .with_opening_hours(&["Mon-Fri: 05:30 - 18:00"])
+        .in_time_zone(pacific),
+        PlaceRecord::new(
+            "STARBUCKS",
             PLACE_TYPE_POINT_OF_INTEREST,
             [-122.340_622, 47.610_100],
             street_in(&seattle, "1912", "Pike Pl", "98101", Some("Downtown")),
-            POINT_EXTENT_M,
         )
         .with_categories(&[("coffee_shop", "Coffee Shop")])
         .with_food_types(&["Coffee"])
@@ -3895,11 +4011,10 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
         .with_opening_hours(&["Mon-Sun: 06:00 - 21:00"])
         .in_time_zone(pacific),
         PlaceRecord::new(
-            "Starbucks",
+            "STARBUCKS",
             PLACE_TYPE_POINT_OF_INTEREST,
             [-122.339_500, 47.608_200],
             street_in(&seattle, "102", "Pike St", "98101", Some("Downtown")),
-            POINT_EXTENT_M,
         )
         .with_categories(&[("coffee_shop", "Coffee Shop")])
         .with_food_types(&["Coffee"])
@@ -3907,11 +4022,10 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
         .with_opening_hours(&["Mon-Sun: 05:30 - 20:00"])
         .in_time_zone(pacific),
         PlaceRecord::new(
-            "Starbucks",
+            "STARBUCKS",
             PLACE_TYPE_POINT_OF_INTEREST,
             [-122.330_600, 47.604_400],
             street_in(&seattle, "701", "5th Ave", "98104", Some("Downtown")),
-            POINT_EXTENT_M,
         )
         .with_categories(&[("coffee_shop", "Coffee Shop")])
         .with_food_types(&["Coffee"])
@@ -3923,7 +4037,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_POINT_OF_INTEREST,
             [-122.341_900, 47.609_600],
             street_in(&seattle, "107", "Pike St", "98101", Some("Downtown")),
-            POINT_EXTENT_M,
         )
         .with_categories(&[("coffee_shop", "Coffee Shop")])
         .with_food_types(&["Coffee"])
@@ -3935,7 +4048,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_POINT_OF_INTEREST,
             [-122.312_900, 47.614_900],
             street_in(&seattle, "310", "E Pike St", "98122", Some("Capitol Hill")),
-            POINT_EXTENT_M,
         )
         .with_categories(&[("coffee_shop", "Coffee Shop")])
         .with_food_types(&["Coffee"])
@@ -3956,7 +4068,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 "94129",
                 Some("Presidio"),
             ),
-            POINT_EXTENT_M,
         )
         .with_categories(&[("tourist_attraction", "Tourist Attraction"), ("bridge", "Bridge")])
         .with_contacts(&["+1 415-921-5858"], &["https://www.goldengate.org"])
@@ -3973,13 +4084,12 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 "94133",
                 Some("Fisherman's Wharf"),
             ),
-            POINT_EXTENT_M,
         )
         .with_categories(&[("tourist_attraction", "Tourist Attraction"), ("market", "Market")])
         .with_opening_hours(&["Mon-Sun: 10:00 - 21:00"])
         .in_time_zone(pacific),
         PlaceRecord::new(
-            "Blue Bottle Coffee",
+            "BLUE BOTTLE COFFEE",
             PLACE_TYPE_POINT_OF_INTEREST,
             [-122.402_000, 37.776_400],
             street_in(
@@ -3989,7 +4099,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 "94103",
                 Some("South of Market"),
             ),
-            POINT_EXTENT_M,
         )
         .with_categories(&[("coffee_shop", "Coffee Shop")])
         .with_food_types(&["Coffee"])
@@ -4001,24 +4110,24 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_LOCALITY,
             [-122.419_416, 37.774_929],
             san_francisco.clone(),
-            LOCALITY_EXTENT_M,
         )
+        .with_map_view([-122.514_93, 37.708_08, -122.357_03, 37.833_24])
         .in_time_zone(pacific),
         PlaceRecord::new(
             "San Francisco County",
             PLACE_TYPE_SUB_REGION,
             [-122.431_297, 37.773_972],
             sub_region_of(&san_francisco),
-            SUB_REGION_EXTENT_M,
         )
+        .with_map_view([-123.173_83, 37.639_83, -122.281_78, 37.929_82])
         .in_time_zone(pacific),
         PlaceRecord::new(
             "California",
             PLACE_TYPE_REGION,
             [-119.681_564, 36.116_203],
             above_locality(&san_francisco),
-            REGION_EXTENT_M,
         )
+        .with_map_view([-124.409_59, 32.534_16, -114.131_21, 42.009_52])
         .in_time_zone(pacific),
     ]);
 
@@ -4029,7 +4138,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_POINT_OF_INTEREST,
             [-74.044_500, 40.689_200],
             street_in(&new_york, "", "Liberty Island", "10004", None),
-            POINT_EXTENT_M,
         )
         .with_categories(&[("monument", "Monument"), ("tourist_attraction", "Tourist Attraction")])
         .with_contacts(&["+1 212-363-3200"], &["https://www.nps.gov/stli"])
@@ -4041,7 +4149,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_POINT_OF_INTEREST,
             [-73.985_664, 40.748_817],
             street_in(&new_york, "20", "W 34th St", "10001", Some("Manhattan")),
-            POINT_EXTENT_M,
         )
         .with_categories(&[
             ("tourist_attraction", "Tourist Attraction"),
@@ -4059,32 +4166,32 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 postal_code: "10024".to_string(),
                 ..new_york.clone()
             },
-            DISTRICT_EXTENT_M,
         )
+        .with_map_view([-74.047_29, 40.679_55, -73.907_00, 40.882_21])
         .in_time_zone(eastern),
         PlaceRecord::new(
             "New York",
             PLACE_TYPE_LOCALITY,
             [-74.006_000, 40.712_800],
             new_york.clone(),
-            LOCALITY_EXTENT_M,
         )
+        .with_map_view([-74.259_09, 40.477_40, -73.700_27, 40.917_58])
         .in_time_zone(eastern),
         PlaceRecord::new(
             "New York County",
             PLACE_TYPE_SUB_REGION,
             [-73.971_200, 40.776_700],
             sub_region_of(&new_york),
-            SUB_REGION_EXTENT_M,
         )
+        .with_map_view([-74.047_29, 40.679_55, -73.907_00, 40.882_21])
         .in_time_zone(eastern),
         PlaceRecord::new(
             "New York",
             PLACE_TYPE_REGION,
             [-75.421_000, 42.945_900],
             above_locality(&new_york),
-            REGION_EXTENT_M,
         )
+        .with_map_view([-79.762_15, 40.496_10, -71.856_21, 45.015_87])
         .in_time_zone(eastern),
     ]);
 
@@ -4095,24 +4202,24 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_LOCALITY,
             [-95.555_513, 33.660_942],
             paris_texas.clone(),
-            LOCALITY_EXTENT_M,
         )
+        .with_map_view([-95.626_70, 33.616_10, -95.466_10, 33.731_80])
         .in_time_zone(CENTRAL),
         PlaceRecord::new(
             "Lamar County",
             PLACE_TYPE_SUB_REGION,
             [-95.571_000, 33.666_000],
             sub_region_of(&paris_texas),
-            SUB_REGION_EXTENT_M,
         )
+        .with_map_view([-95.838_70, 33.436_50, -95.306_40, 33.878_70])
         .in_time_zone(CENTRAL),
         PlaceRecord::new(
             "Texas",
             PLACE_TYPE_REGION,
             [-99.901_813, 31.968_599],
             above_locality(&paris_texas),
-            REGION_EXTENT_M,
         )
+        .with_map_view([-106.645_65, 25.837_38, -93.508_29, 36.500_70])
         .in_time_zone(CENTRAL),
     ]);
 
@@ -4124,7 +4231,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_POINT_OF_INTEREST,
             [2.337_644, 48.860_611],
             street_in(&paris, "", "Rue de Rivoli", "75001", Some("1er Arrondissement")),
-            POINT_EXTENT_M,
         )
         .with_alternate_names(&["The Louvre"])
         .with_localized_titles(&[("en", "Louvre Museum"), ("es", "Museo del Louvre")])
@@ -4143,7 +4249,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
                 "75006",
                 Some("6e Arrondissement"),
             ),
-            POINT_EXTENT_M,
         )
         .with_categories(&[("coffee_shop", "Coffee Shop"), ("restaurant", "Restaurant")])
         .with_food_types(&["Coffee", "French"])
@@ -4165,8 +4270,8 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_SUB_REGION,
             [34.100_000, 45.300_000],
             crimea_ukraine,
-            SUB_REGION_EXTENT_M,
         )
+        .with_map_view([32.492_10, 44.386_50, 36.648_50, 46.219_10])
         .with_alternate_names(&["Crimea", "Krym", "Крым"])
         .with_political_attribution("RUS", crimea_russia)
         .in_time_zone(EASTERN_EUROPEAN),
@@ -4175,8 +4280,8 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_LOCALITY,
             [34.102_417, 44.952_117],
             simferopol_ukraine,
-            LOCALITY_EXTENT_M,
         )
+        .with_map_view([34.027_50, 44.899_10, 34.188_80, 45.019_90])
         .with_alternate_names(&["Simferopol", "Симферополь"])
         .with_political_attribution("RUS", simferopol_russia)
         .in_time_zone(EASTERN_EUROPEAN),
@@ -4185,8 +4290,8 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_LOCALITY,
             [33.859_39, 45.714_2],
             pervomaiske_ukraine,
-            RURAL_DISTRICT_EXTENT_M,
         )
+        .with_map_view([33.526_92, 45.343_03, 34.122_77, 45.809_53])
         .with_alternate_names(&["Pervomaiske", "Первомайский район"])
         .with_political_attribution("RUS", pervomaiske_russia)
         .in_time_zone(EASTERN_EUROPEAN),
@@ -4195,8 +4300,8 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_COUNTRY,
             [31.165_581, 48.379_433],
             ukraine,
-            COUNTRY_EXTENT_M,
         )
+        .with_map_view([22.137_16, 44.386_46, 40.227_17, 52.379_19])
         .with_alternate_names(&["Ukraine", "Украина"])
         .in_time_zone(EASTERN_EUROPEAN),
     ]);
