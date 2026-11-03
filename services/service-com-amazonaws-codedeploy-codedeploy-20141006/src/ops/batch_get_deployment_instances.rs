@@ -321,8 +321,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `errorMessage` reports "errors that might have occurred during the
             // API call": this batch either reports the instances the deployment
             // holds or is refused outright with the modelled error for why, so
-            // there is no partial failure left to describe here.
-            error_message: None,
+            // there is no partial failure left to describe here. The member is
+            // still ANSWERED — as the empty string, the no-error text — exactly
+            // as the other batch readers of this service answer it.
+            error_message: Some(String::new()),
             instances_summary: Some(outcome?),
         })
     }

@@ -192,9 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // documentation means by "if the output contains no data ... CodeDeploy
             // successfully removed all corresponding Auto Scaling lifecycle event
             // hooks". This emulator installs no hook on anything, so there is never
-            // one left behind and the modelled "no data" answer is the correct one —
-            // the same answer `UpdateDeploymentGroup` gives for the same member.
-            hooks_not_cleaned_up: None,
+            // one left behind — and "no data" is the EMPTY list, answered for every
+            // deletion, so a caller iterates the member instead of handling an
+            // absent one. The same answer `UpdateDeploymentGroup` gives for the
+            // same member.
+            hooks_not_cleaned_up: Some(Vec::new()),
         })
     }
 }

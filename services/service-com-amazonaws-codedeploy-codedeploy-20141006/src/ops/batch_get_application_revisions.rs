@@ -263,8 +263,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `errorMessage` reports "errors that might have occurred during the
             // API call": this batch either answers every revision it was asked
             // about or is refused outright with the modelled error for why, so
-            // there is never a partial failure left to describe here.
-            error_message: None,
+            // there is never a partial failure left to describe here. The member
+            // is still ANSWERED — as the empty string, the no-error text — so a
+            // caller reads one member instead of distinguishing absent from
+            // no-error.
+            error_message: Some(String::new()),
             revisions: Some(revisions),
         })
     }

@@ -72,10 +72,10 @@ async fn summaries(emulator: &Emulator, deployment_id: &str, instance_ids: &[&st
         status, 200,
         "case {instance_ids:?}: expected the batch to be answered, got {status} {body:?}"
     );
-    assert!(
-        body["errorMessage"].is_null(),
-        "case {instance_ids:?}: expected a batch that was answered to carry no errorMessage, got \
-         {body:?}"
+    assert_eq!(
+        body["errorMessage"], "",
+        "case {instance_ids:?}: expected a batch that was answered to carry the no-error \
+         errorMessage, got {body:?}"
     );
     body["instancesSummary"]
         .as_array()

@@ -91,6 +91,8 @@ mod resource_tagging;
 mod state_roundtrip;
 #[path = "all/stop_deployment.rs"]
 mod stop_deployment;
+#[path = "all/success_response_members.rs"]
+mod success_response_members;
 #[path = "all/tagging_arn_resource_types.rs"]
 mod tagging_arn_resource_types;
 #[path = "all/update_application.rs"]

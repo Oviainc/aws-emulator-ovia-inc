@@ -77,8 +77,9 @@ async fn delete_group(emulator: &Emulator, application: &str, group: &str, case:
             json!({"applicationName": application, "deploymentGroupName": group}),
         )
         .await;
-    assert!(
-        answered["hooksNotCleanedUp"].is_null(),
+    assert_eq!(
+        answered["hooksNotCleanedUp"],
+        json!([]),
         "case {case:?}: expected no Auto Scaling hook left behind, got {answered:?}"
     );
 }

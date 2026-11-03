@@ -376,8 +376,9 @@ async fn an_update_replaces_only_the_members_it_names() {
                 update_request(&application, GROUP, patch),
             )
             .await;
-        assert!(
-            answered["hooksNotCleanedUp"].is_null(),
+        assert_eq!(
+            answered["hooksNotCleanedUp"],
+            json!([]),
             "case {case:?}: expected no hooks left behind, got {answered:?}"
         );
 

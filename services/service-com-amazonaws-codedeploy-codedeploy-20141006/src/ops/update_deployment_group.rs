@@ -648,8 +648,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `hooksNotCleanedUp` reports the Auto Scaling groups whose
             // CodeDeploy lifecycle hooks could NOT be removed. This emulator
             // installs no hooks on anything, so there is never one left behind,
-            // and the modelled "no data" answer is the correct one.
-            hooks_not_cleaned_up: None,
+            // and "no data" is the EMPTY list, answered for every update, as
+            // `DeleteDeploymentGroup` answers the same member.
+            hooks_not_cleaned_up: Some(Vec::new()),
         })
     }
 }
