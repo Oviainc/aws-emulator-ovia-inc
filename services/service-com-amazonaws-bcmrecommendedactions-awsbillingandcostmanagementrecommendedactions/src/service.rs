@@ -28,8 +28,15 @@
 //!   wording. See the inline note on that method for how to reword.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
-//!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
-//!   404, …). Return `Some(resp)` to answer in your own envelope if desired.
+//!   renders the protocol-correct default, which for the awsJson protocol this
+//!   model declares is **501 `NotImplemented`** in the media type that protocol
+//!   declares (`application/x-amz-json-1.0`). This is the one place in this crate
+//!   that states that status — the seam below points here rather than restating
+//!   it, and `tests/all/unrouted_operation.rs` pins it on the wire; the
+//!   per-protocol table it comes from lives in
+//!   [`smithy_server_runtime::pre_dispatch`], which is where to look for a
+//!   protocol other than this one. Return `Some(resp)` to answer in your own
+//!   envelope if desired.
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
@@ -396,8 +403,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
-        // modeled operation. Left to the entry's protocol-correct default (awsJson ->
-        // 404 in the media type the model's protocol declares): naming no operation
+        // modeled operation. Left to the entry's protocol-correct default, whose
+        // status and media type the module docs above state once: naming no operation
         // is refused in FRONT of the service, like an unmodelled member value, so it
         // is not a response the service produced.
         let _ = req;

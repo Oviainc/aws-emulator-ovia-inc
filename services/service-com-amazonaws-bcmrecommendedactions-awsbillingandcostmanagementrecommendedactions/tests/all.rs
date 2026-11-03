@@ -23,3 +23,5 @@ mod recommended_action_catalog;
 mod state_roundtrip;
 #[path = "all/unreadable_input.rs"]
 mod unreadable_input;
+#[path = "all/unrouted_operation.rs"]
+mod unrouted_operation;
