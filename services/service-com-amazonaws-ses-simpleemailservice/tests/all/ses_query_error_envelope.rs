@@ -38,50 +38,10 @@
 //! A success is a row as well, in the negative: it is no error envelope, and its one id
 //! stays in `<ResponseMetadata>`.
 
-use crate::harness::{element, emulator, field, form_encode, Field, AUTHORIZATION, VERSION};
-use smithy_server_runtime::MultiServiceRouter;
-
-/// The header AWS reports a response's request id in, beside the envelope element.
-const REQUEST_ID_HEADER: &str = "x-amzn-requestid";
-
-/// One answer from the emulator: what a client reads before it parses anything.
-struct Answer {
-    status: u16,
-    /// The `x-amzn-requestid` header, empty when the response carries none.
-    request_id_header: String,
-    body: String,
-}
-
-/// One awsQuery call, as [`crate::harness::call`] makes it, with the response HEADERS kept:
-/// this suite asserts on the header AWS repeats the envelope's id in, which the shared
-/// helper's `(status, body)` pair does not carry.
-async fn call(router: &MultiServiceRouter, action: &str, params: &[Field]) -> Answer {
-    let mut body = format!("Action={action}&Version={VERSION}");
-    for (name, value) in params {
-        body.push('&');
-        body.push_str(&form_encode(name));
-        body.push('=');
-        body.push_str(&form_encode(value));
-    }
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("http://localhost/")
-        .header("authorization", AUTHORIZATION)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(bytes::Bytes::from(body))
-        .expect("the request builds");
-    let response = router.dispatch(request).await;
-    Answer {
-        status: response.status().as_u16(),
-        request_id_header: response
-            .headers()
-            .get(REQUEST_ID_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string(),
-        body: String::from_utf8_lossy(response.body()).into_owned(),
-    }
-}
+use crate::harness::{
+    call_keeping_headers as call, element, emulator, field, is_request_id, Field,
+    REQUEST_ID_HEADER,
+};
 
 /// One refusal row: the request, and what the service must answer.
 struct Row {
@@ -99,19 +59,6 @@ struct Row {
 /// How many times `needle` occurs in `text`.
 fn occurrences(text: &str, needle: &str) -> usize {
     text.matches(needle).count()
-}
-
-/// Whether `id` has the 8-4-4-4-12 lowercase-hex form of an AWS request id, which is what
-/// the success path's `ResponseMetadata/RequestId` carries too.
-fn is_request_id(id: &str) -> bool {
-    let groups: Vec<&str> = id.split('-').collect();
-    groups.len() == 5
-        && groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
-        && groups.iter().all(|group| {
-            group
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
-        })
 }
 
 /// The `Template.*` form fields a template-plane write carries.

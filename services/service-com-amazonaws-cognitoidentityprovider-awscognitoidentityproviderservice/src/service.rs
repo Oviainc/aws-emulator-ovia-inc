@@ -440,7 +440,7 @@ impl<O> WithSubmittedValues<O> {
 /// text rather than losing the clause.
 fn quoting_the_submitted_value(violation: Violation, echo: SubmittedEcho) -> Violation {
     let quoted = quoting_the_whole_submitted_value(
-        quoting_the_submitted_collection(violation, echo.clone()),
+        quoting_the_submitted_collection(withheld_value_quoted(violation, &echo), echo.clone()),
         &echo,
     );
     match &quoted.kind {
@@ -449,6 +449,32 @@ fn quoting_the_submitted_value(violation: Violation, echo: SubmittedEcho) -> Vio
             ..quoted
         },
         _ => quoted,
+    }
+}
+
+/// `violation` with the clause's value half restored where the framework WITHHELD it.
+///
+/// The framework's constraint walk drops the value of a `@sensitive` member from the
+/// violation and says so on it, so its clause names the member alone. Amazon Cognito quotes
+/// the value a request carried in that clause anyway — `ClientIdType` is `@sensitive` and
+/// its recorded refusal states `Value '<the client id>' at 'clientId' …` — so the value this
+/// service's clause states is restored from the echo, the one bounded rendering of the
+/// submitted value, and the withholding is cleared with it so the renderer states what was
+/// restored.
+///
+/// A violation the walk did not withhold, and one whose echo the bounds declined to render,
+/// are handed back untouched.
+fn withheld_value_quoted(violation: Violation, echo: &SubmittedEcho) -> Violation {
+    let SubmittedEcho::Rendered(submitted) = echo else {
+        return violation;
+    };
+    if !violation.sensitive {
+        return violation;
+    }
+    Violation {
+        value: Some(submitted.clone()),
+        sensitive: false,
+        ..violation
     }
 }
 

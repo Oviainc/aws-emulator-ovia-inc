@@ -44,6 +44,7 @@ use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse}
 use aws_smithy_schema_server::ProtocolError;
 use smithy_server_runtime::{
     ErasedServiceDefinition, OperationRoutingTable, Refused, ServerHttpProtocol, ServiceIdentity,
+    WireProtocol,
 };
 
 /// The code the authentication layer reports when the request's access key id resolved to no
@@ -159,7 +160,7 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for AuthenticationRefus
         self.inner.refusal_response(error, chosen.or(stated), req)
     }
 
-    fn wire_protocol(&self, req: &RtRequest) -> ::smithy_server_runtime::WireProtocol<'_> {
+    fn wire_protocol(&self, req: &RtRequest) -> WireProtocol<'_> {
         self.inner.wire_protocol(req)
     }
 }

@@ -85,6 +85,8 @@ mod ses_receipt_rule_set_deletion;
 mod ses_receipt_rule_set_listing;
 #[path = "all/ses_receipt_rule_sets.rs"]
 mod ses_receipt_rule_sets;
+#[path = "all/ses_refusal_names_the_refused_request.rs"]
+mod ses_refusal_names_the_refused_request;
 #[path = "all/ses_reorder_receipt_rule_set.rs"]
 mod ses_reorder_receipt_rule_set;
 #[path = "all/ses_send_bulk_templated_email.rs"]

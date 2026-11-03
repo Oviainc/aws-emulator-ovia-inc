@@ -162,11 +162,13 @@ enum Clause {
     Single(Violation),
     /// Every violation found on the scalar elements of ONE list member, reported at
     /// that member: `constraints` is the set its element shape declares and `values`
-    /// the offending elements, in the order the walk met them.
+    /// the offending elements, in the order the walk met them. `withheld` is the
+    /// framework's own reading of whether the member's values may be shown at all.
     ListMember {
         member: String,
         constraints: Vec<String>,
         values: Vec<String>,
+        withheld: bool,
     },
 }
 
@@ -234,6 +236,7 @@ fn group_violations(violations: &[Violation]) -> Vec<Clause> {
             member: member.to_string(),
             constraints,
             values: violation.value.clone().into_iter().collect(),
+            withheld: violation.sensitive,
         });
     }
     clauses
@@ -252,6 +255,7 @@ fn render_clause(clause: &Clause) -> String {
             member,
             constraints,
             values,
+            withheld,
         } => {
             // The value a list member failed on is the collection: the offending
             // elements, bracketed, so the clause names the member the constraint is
@@ -260,7 +264,7 @@ fn render_clause(clause: &Clause) -> String {
             let shown = (!values.is_empty()).then(|| format!("[{}]", values.join(", ")));
             format!(
                 "{} at '{member}'{CONSTRAINT_SEPARATOR}Member must satisfy constraint: [{}]",
-                value_fragment(member, shown.as_deref(), is_sensitive(member)),
+                value_fragment(member, shown.as_deref(), *withheld),
                 constraints.join(", ")
             )
         }
@@ -273,12 +277,14 @@ fn render_clause(clause: &Clause) -> String {
 ///
 /// `withheld` is the violation's own answer to "was this value withheld": the validating
 /// walk drops a `@sensitive` member's value as it records the violation, so an empty
-/// value half is not by itself evidence that the member was absent.
+/// value half is not by itself evidence that the member was absent. [`is_sensitive`] is
+/// the same reading off the PATH, for a violation this service built itself and the
+/// framework never walked.
 fn value_fragment(path: &str, value: Option<&str>, withheld: bool) -> String {
-    if withheld {
-        return "Value".to_string();
-    }
     match value {
+        // A sensitive member's value reaches here as `None`, so the two are told apart by
+        // the flag rather than by the absence: only an absent member states `null`.
+        None if withheld => "Value".to_string(),
         None => "Value null".to_string(),
         Some(_) if is_sensitive(path) => "Value".to_string(),
         Some(shown) => format!("Value '{shown}'"),

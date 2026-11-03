@@ -110,6 +110,74 @@ pub async fn call(router: &MultiServiceRouter, action: &str, params: &[Field]) -
     (status, String::from_utf8_lossy(response.body()).into_owned())
 }
 
+/// The header AWS reports a response's request id in, beside the `<RequestId>`
+/// element an awsQuery body carries.
+pub const REQUEST_ID_HEADER: &str = "x-amzn-requestid";
+
+/// One answer from the emulator: what a client reads before it parses anything.
+///
+/// Here rather than in one suite because more than one suite asserts on the
+/// response HEADERS, which [`call`]'s `(status, body)` pair does not carry.
+pub struct Answer {
+    /// The HTTP status.
+    pub status: u16,
+    /// The [`REQUEST_ID_HEADER`] header, empty when the response carries none.
+    pub request_id_header: String,
+    /// The response body.
+    pub body: String,
+}
+
+/// One awsQuery call, exactly as [`call`] makes it, with the response HEADERS
+/// kept.
+pub async fn call_keeping_headers(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[Field],
+) -> Answer {
+    let mut body = format!("Action={action}&Version={VERSION}");
+    for (name, value) in params {
+        body.push('&');
+        body.push_str(&form_encode(name));
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://localhost/")
+        .header("authorization", AUTHORIZATION)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(bytes::Bytes::from(body))
+        .expect("the request builds");
+    let response = router.dispatch(request).await;
+    Answer {
+        status: response.status().as_u16(),
+        request_id_header: response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+        body: String::from_utf8_lossy(response.body()).into_owned(),
+    }
+}
+
+/// Whether `id` has the 8-4-4-4-12 lowercase-hex form of an AWS request id,
+/// which is the form the success path's `ResponseMetadata/RequestId` carries
+/// too.
+///
+/// Here rather than in one suite for the same reason [`Answer`] is: the form is
+/// the service's, not one suite's.
+pub fn is_request_id(id: &str) -> bool {
+    let groups: Vec<&str> = id.split('-').collect();
+    groups.len() == 5
+        && groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+        && groups.iter().all(|group| {
+            group
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        })
+}
+
 /// The destination an event destination publishes to, as the form fields that
 /// name it on the wire.
 ///
