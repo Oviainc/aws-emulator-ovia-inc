@@ -41,6 +41,9 @@ mod telemetry_feature_status;
 #[path = "all/telemetry_pipeline_listing.rs"]
 mod telemetry_pipeline_listing;
 
+#[path = "all/telemetry_pipeline_updates.rs"]
+mod telemetry_pipeline_updates;
+
 #[path = "all/telemetry_pipelines.rs"]
 mod telemetry_pipelines;
 

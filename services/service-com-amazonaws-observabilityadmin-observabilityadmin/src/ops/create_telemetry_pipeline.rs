@@ -271,6 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The pipeline is `CREATING` until this instant and `ACTIVE` from it on, so
             // a caller reading straight after this create still observes `CREATING`.
             active_at_ms: created_at.saturating_add(crate::state::PIPELINE_ACTIVATION_DELAY_MS),
+            transition: crate::state::PipelineTransition::Creating,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
         });
         drop(store);

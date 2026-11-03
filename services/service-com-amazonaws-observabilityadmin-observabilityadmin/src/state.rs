@@ -210,6 +210,13 @@ pub const PIPELINE_STATUS_CREATING: &str = "CREATING";
 /// Status of a pipeline whose creation has come due.
 pub const PIPELINE_STATUS_ACTIVE: &str = "ACTIVE";
 
+/// Status of a pipeline whose accepted configuration update has not come due yet.
+/// One of `TelemetryPipelineStatus`' own values
+/// (`TELEMETRY_PIPELINE_STATUS_VALUES`), reported for the same span, and for the same
+/// reason, as [`PIPELINE_STATUS_CREATING`]: the work an accepted update starts is not
+/// finished the instant the call returns.
+pub const PIPELINE_STATUS_UPDATING: &str = "UPDATING";
+
 /// The `StatusReason$Description` a read reports for an ACTIVE pipeline.
 ///
 /// Wholly fixed text, with no part of the request or of the record in it: the sentence
@@ -220,6 +227,17 @@ pub const PIPELINE_ACTIVE_STATUS_REASON: &str = "Pipeline is active and processi
 /// come due yet. Only the ACTIVE sentence is recorded; this one is this emulator's own,
 /// in the same form, for the status it reports in the meantime.
 pub const PIPELINE_CREATING_STATUS_REASON: &str = "Pipeline is being created";
+
+/// The `StatusReason$Description` a read reports while an accepted update has not come
+/// due yet. This emulator's own sentence, in the same form as the one above, for the
+/// status it reports in the meantime.
+pub const PIPELINE_UPDATING_STATUS_REASON: &str = "Pipeline is being updated";
+
+/// The `ValidationException` message a telemetry-pipeline operation refuses a
+/// configuration with: fixed text, with no part of the request in it, because the
+/// per-field detail travels in `ValidationException$Errors` — "[t]he errors in the
+/// input which caused the exception" — rather than in the sentence.
+pub const PIPELINE_VALIDATION_ERRORS_MESSAGE: &str = "Validation errors found";
 
 /// The value a data source's `Type` carries when the configuration document names none
 /// and the source is one that reads log events AWS vends (see
@@ -526,6 +544,32 @@ impl StoredTelemetryRule {
 /// signed for.
 pub type PipelineKey = (String, String);
 
+/// Which call started the transition a pipeline record's due instant belongs to, and
+/// so which status the pipeline reports until that instant arrives.
+///
+/// `TelemetryPipelineStatus` carries a transient value either side of `ACTIVE` —
+/// `CREATING` and `UPDATING` — and they are told apart by what started the work, not
+/// by the clock: one record therefore carries one due instant and this, rather than
+/// two instants that could both be pending at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PipelineTransition {
+    /// The create that minted the record started it.
+    #[default]
+    Creating,
+    /// An accepted `UpdateTelemetryPipeline` started it.
+    Updating,
+}
+
+impl PipelineTransition {
+    /// The `Status` a pipeline reports while this transition has not come due.
+    pub fn transient_status(self) -> &'static str {
+        match self {
+            Self::Creating => PIPELINE_STATUS_CREATING,
+            Self::Updating => PIPELINE_STATUS_UPDATING,
+        }
+    }
+}
+
 /// One stored telemetry pipeline.
 #[derive(Debug, Clone, Default)]
 pub struct StoredTelemetryPipeline {
@@ -543,10 +587,13 @@ pub struct StoredTelemetryPipeline {
     pub created_timestamp_ms: i64,
     /// `LastUpdateTimeStamp`, in epoch milliseconds.
     pub last_update_timestamp_ms: i64,
-    /// The instant the pipeline's `CREATING` -> `ACTIVE` transition comes due. The
-    /// status a read reports is derived from this and the clock, which is why no
-    /// read has to write and no operation has to sleep.
+    /// The instant the pipeline's transition to `ACTIVE` comes due. The status a read
+    /// reports is derived from this and the clock, which is why no read has to write
+    /// and no operation has to sleep.
     pub active_at_ms: i64,
+    /// Which call started the transition `active_at_ms` belongs to, and so which
+    /// transient status a read reports until it comes due.
+    pub transition: PipelineTransition,
     pub tags: BTreeMap<String, String>,
 }
 
@@ -556,11 +603,11 @@ impl StoredTelemetryPipeline {
         (self.region.clone(), self.name.clone())
     }
 
-    /// This pipeline's `Status` at `now_ms`: `CREATING` until the transition the
-    /// create started comes due, `ACTIVE` from then on.
+    /// This pipeline's `Status` at `now_ms`: the transient status of the transition in
+    /// flight until that transition comes due, `ACTIVE` from then on.
     pub fn status_at(&self, now_ms: i64) -> &'static str {
         if now_ms < self.active_at_ms {
-            PIPELINE_STATUS_CREATING
+            self.transition.transient_status()
         } else {
             PIPELINE_STATUS_ACTIVE
         }
@@ -576,6 +623,7 @@ impl StoredTelemetryPipeline {
     pub fn status_reason_at(&self, now_ms: i64) -> TelemetryPipelineStatusReason {
         let description = match self.status_at(now_ms) {
             PIPELINE_STATUS_CREATING => PIPELINE_CREATING_STATUS_REASON,
+            PIPELINE_STATUS_UPDATING => PIPELINE_UPDATING_STATUS_REASON,
             PIPELINE_STATUS_ACTIVE => PIPELINE_ACTIVE_STATUS_REASON,
             // Unreachable while a stored pipeline reports one of the two statuses
             // above: a status added here needs its own sentence rather than
@@ -705,6 +753,32 @@ fn configuration_summary(record: &StoredTelemetryPipeline) -> Option<Configurati
         processors: Some(processors),
         sinks: Some(sinks),
     })
+}
+
+/// The SOURCE TYPES a configuration document declares, each with the full dotted path
+/// of the declaration in the document.
+///
+/// A pipeline's source type is the plugin its section's `source` property names — the
+/// token `ConfigurationSummary$Sources` reports as a `Source$Type` — so this is the
+/// same walk [`configuration_summary`] makes, through the one bounded reader this crate
+/// has, and it spans every section the document declares. A body the reader cannot read
+/// declares none: there is no document to read a source type out of.
+pub fn declared_source_types(body: &str) -> Vec<(String, String)> {
+    let Ok(root) = parse_configuration(body) else {
+        return Vec::new();
+    };
+    let mut declared = Vec::new();
+    for (section, node) in declared_sections(&root) {
+        for (plugin, _) in plugins_declared(node.get(SOURCE_KEY)) {
+            let path = if section.is_empty() {
+                format!("{SOURCE_KEY}.{plugin}")
+            } else {
+                format!("{section}.{SOURCE_KEY}.{plugin}")
+            };
+            declared.push((path, plugin.to_string()));
+        }
+    }
+    declared
 }
 
 /// The plugins one `source` or `sink` property declares, each with the options it
@@ -1473,6 +1547,29 @@ impl ComAmazonawsObservabilityadminObservabilityadminState {
         self.pipeline_arn_index
             .insert(record.arn.clone(), record.key());
         self.telemetry_pipelines.insert(record.key(), record);
+    }
+
+    /// Replace the configuration body of the pipeline at `key` with `body`, bump its
+    /// `LastUpdateTimeStamp` and start the transition the accepted update owes, so a
+    /// read inside the span reports `UPDATING` and one past it reports `ACTIVE`.
+    ///
+    /// The record's name, id, ARN, creation instant and tags are left where they are:
+    /// an update changes the configuration, and the pipeline's name and ARN are
+    /// immutable. A key no record answers is left alone — every caller resolves the
+    /// record under this same lock first, so there is no such key to answer for.
+    pub fn replace_pipeline_configuration(
+        &mut self,
+        key: &PipelineKey,
+        body: String,
+        now_ms: i64,
+    ) {
+        let Some(record) = self.telemetry_pipelines.get_mut(key) else {
+            return;
+        };
+        record.configuration_body = body;
+        record.last_update_timestamp_ms = now_ms;
+        record.transition = PipelineTransition::Updating;
+        record.active_at_ms = now_ms.saturating_add(PIPELINE_ACTIVATION_DELAY_MS);
     }
 
     /// Remove the pipeline `identifier` names in `region`, answering the record that

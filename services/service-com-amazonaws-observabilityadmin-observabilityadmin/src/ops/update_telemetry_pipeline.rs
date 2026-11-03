@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTelemetryPipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTelemetryPipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Replaces the configuration of the one stored telemetry pipeline
+//! `PipelineIdentifier` names — by bare name or by full ARN — in the region the request
+//! was signed for, or refuses the new configuration when it would change something a
+//! pipeline's configuration may not change.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTelemetryPipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What an update may change, and what it may not
+//!
+//! This operation's own documentation fixes three attributes "after pipeline creation":
+//! the pipeline's NAME, its ARN — neither of which this operation even takes — and its
+//! SOURCE TYPE: "[o]nce a pipeline is created with a specific source type (such as S3,
+//! CloudWatch Logs, GitHub, or third-party sources), it cannot be changed to a different
+//! source type", while "[p]rocessors can be added, removed, or modified". A
+//! configuration declaring a source type the stored one does not is therefore refused
+//! 400 `ValidationException`, and the stored configuration is left exactly as it was: the
+//! refusal is decided before anything is written. A configuration that keeps the source
+//! type is stored VERBATIM, as the create stores it, and the pipeline reports the
+//! transition the accepted update owes until it comes due.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +179,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTelemetryPipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTelemetryPipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTelemetryPipeline"))
+        // `PipelineIdentifier`'s presence with its 1..512 length, and `Configuration`'s
+        // presence with its required `Body` of 1..24000 characters, are modelled, so the
+        // centralized request walk has already refused anything outside them before this
+        // body runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateTelemetryPipelineErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the telemetry pipeline store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // The presented access-key id is an identifier, never a secret: it is what the
+        // audit record below attributes this state-changing call to.
+        let principal = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let now = crate::state::now_epoch_millis();
+
+        let mut store = state.lock();
+        let Some(record) = store.pipeline(&region, &input.pipeline_identifier) else {
+            // The refusal is the service's own fixed sentence; the identifier the
+            // request carried is reported as `ResourceId`, the member modelled for it,
+            // and `ResourceType` names the resource in the API's own words.
+            return Err(
+                UpdateTelemetryPipelineErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::PIPELINE_NOT_FOUND_MESSAGE.to_string()),
+                        resource_id: Some(input.pipeline_identifier),
+                        resource_type: Some(crate::state::PIPELINE_RESOURCE_TYPE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let key = record.key();
+        let stored_body = record.configuration_body.clone();
+
+        let errors = source_type_defects(&stored_body, &input.configuration.body);
+        if !errors.is_empty() {
+            drop(store);
+            ::tracing::info!(
+                target: "audit",
+                operation = Self::NAME,
+                outcome = "rejected-immutable-source-type",
+                principal = %principal,
+                region = %region,
+                resource = %key.1,
+                findings = errors.len(),
+                "refused a telemetry pipeline update"
+            );
+            // The sentence is fixed text: the per-field detail is what `Errors` — "the
+            // errors in the input which caused the exception" — carries, one entry per
+            // declaration at fault. Nothing was written: the store is left as it was.
+            return Err(UpdateTelemetryPipelineErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::PIPELINE_VALIDATION_ERRORS_MESSAGE.to_string()),
+                    errors: Some(errors),
+                },
+            )
+            .into());
+        }
+
+        store.replace_pipeline_configuration(&key, input.configuration.body, now);
+        drop(store);
+
+        // Audit record for a state-changing call: who asked, what changed, and how it
+        // ended. The configuration body is deliberately not in it.
+        ::tracing::info!(
+            target: "audit",
+            operation = Self::NAME,
+            outcome = "updated",
+            principal = %principal,
+            region = %region,
+            resource = %key.1,
+            "updated a telemetry pipeline configuration"
+        );
+
+        Ok(UpdateTelemetryPipelineOutput {})
     }
+}
+
+/// One `ValidationError` per source type the submitted configuration declares that the
+/// pipeline's stored configuration does not — the declarations that would change the
+/// pipeline's source type, which "cannot be changed to a different source type".
+///
+/// The source types of both documents are read through the one bounded reader this
+/// crate has ([`crate::state::declared_source_types`]), so the types compared here are
+/// the ones a read reports as the pipeline's `Sources`. Each defect is pinned to the
+/// declaration at fault, so its `FieldMap` carries that declaration's full dotted
+/// document path, the same key shape every other report about a configuration document
+/// uses.
+///
+/// A stored document the reader cannot read declares no source type at all, so no
+/// submitted type can be shown to differ from it and nothing is refused: a defect here
+/// would be a verdict about a document that was never read.
+fn source_type_defects(stored: &str, submitted: &str) -> Vec<ValidationError> {
+    let stored_types: ::std::collections::BTreeSet<String> =
+        crate::state::declared_source_types(stored)
+            .into_iter()
+            .map(|(_, source_type)| source_type)
+            .collect();
+    if stored_types.is_empty() {
+        return Vec::new();
+    }
+    let created_with = stored_types
+        .iter()
+        .map(|source_type| format!("'{source_type}'"))
+        .collect::<Vec<String>>()
+        .join(", ");
+    crate::state::declared_source_types(submitted)
+        .into_iter()
+        .filter(|(_, source_type)| !stored_types.contains(source_type))
+        .map(|(path, source_type)| {
+            crate::ops::validate_telemetry_pipeline_configuration::at_path(
+                &path,
+                crate::ops::validate_telemetry_pipeline_configuration::REASON_VALIDATION_ERROR,
+                format!(
+                    "the source type of a pipeline cannot be changed after it is created: this \
+                     pipeline was created with the source type {created_with}, and the \
+                     configuration declares '{source_type}'"
+                ),
+            )
+        })
+        .collect()
 }

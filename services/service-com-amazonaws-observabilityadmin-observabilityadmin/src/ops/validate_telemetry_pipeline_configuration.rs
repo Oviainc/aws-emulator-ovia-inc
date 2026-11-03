@@ -247,7 +247,12 @@ const NAME_KEY: &str = "name";
 /// The `FieldMap` key every other defect of a property is reported under: WHERE in the
 /// document the property is written, which is what tells two properties of one name
 /// apart.
-const PATH_KEY: &str = "path";
+///
+/// `pub(crate)` because the key shape belongs to the report, not to one check: the
+/// other operations that answer `ValidationError`s about a configuration document
+/// ([`crate::ops::update_telemetry_pipeline`]) key theirs here too, so a client reads
+/// one contract.
+pub(crate) const PATH_KEY: &str = "path";
 
 /// The one property a configuration document carries beside its pipeline sections:
 /// the format's version key.
@@ -284,7 +289,7 @@ const REASON_PARSE_ERROR: &str = "PIPELINE_CONFIGURATION_PARSE_ERROR";
 
 /// `ValidationError$Reason` for a document that WAS parsed and declares something a
 /// pipeline definition may not — the same category, for the stage after parsing.
-const REASON_VALIDATION_ERROR: &str = "PIPELINE_CONFIGURATION_VALIDATION_ERROR";
+pub(crate) const REASON_VALIDATION_ERROR: &str = "PIPELINE_CONFIGURATION_VALIDATION_ERROR";
 
 /// `ValidationError$Reason` for a field whose value does not have the form that field
 /// takes.
@@ -512,31 +517,21 @@ fn missing_field(property: &str) -> ValidationError {
 /// validator words it. The `FieldMap` carries the path the property is written at,
 /// which is what tells two properties of one name apart.
 fn unknown_property(property: &str, path: &str) -> ValidationError {
-    ValidationError {
-        message: Some(format!(
+    at_path(
+        path,
+        REASON_UNKNOWN_PROPERTY,
+        format!(
             "property '{property}' is not defined in the schema and the schema does not allow \
              additional properties"
-        )),
-        reason: Some(REASON_UNKNOWN_PROPERTY.to_string()),
-        field_map: Some(HashMap::from([(
-            PATH_KEY.to_string(),
-            path.to_string(),
-        )])),
-    }
+        ),
+    )
 }
 
 /// The defect of a processor position this emulator cannot run: the refusal the
 /// processor's own compile answered, reported under this emulator's own category, with
 /// the `FieldMap` carrying the position's path in the document.
 fn unsupported_processor(path: &str, why: String) -> ValidationError {
-    ValidationError {
-        message: Some(why),
-        reason: Some(REASON_UNSUPPORTED_PROCESSOR.to_string()),
-        field_map: Some(HashMap::from([(
-            PATH_KEY.to_string(),
-            path.to_string(),
-        )])),
-    }
+    at_path(path, REASON_UNSUPPORTED_PROCESSOR, why)
 }
 
 /// The defect of a property carrying more items than the schema allows for it, worded
@@ -548,31 +543,21 @@ fn unsupported_processor(path: &str, why: String) -> ValidationError {
 /// service answers for a plain item-count violation is not in the model — so nothing
 /// here claims it was verified.
 fn too_many_items(path: &str, found: usize) -> ValidationError {
-    ValidationError {
-        message: Some(format!(
-            "must have at most {MAX_PLUGINS_PER_PROPERTY} items but found {found}"
-        )),
-        reason: Some(REASON_VALIDATION_ERROR.to_string()),
-        field_map: Some(HashMap::from([(
-            PATH_KEY.to_string(),
-            path.to_string(),
-        )])),
-    }
+    at_path(
+        path,
+        REASON_VALIDATION_ERROR,
+        format!("must have at most {MAX_PLUGINS_PER_PROPERTY} items but found {found}"),
+    )
 }
 
 /// The defect of a property carrying fewer items than the schema allows for it, worded
 /// and keyed the way [`too_many_items`] is.
 fn too_few_items(path: &str, found: usize) -> ValidationError {
-    ValidationError {
-        message: Some(format!(
-            "must have at least {MIN_PLUGINS_PER_PROPERTY} items but found {found}"
-        )),
-        reason: Some(REASON_VALIDATION_ERROR.to_string()),
-        field_map: Some(HashMap::from([(
-            PATH_KEY.to_string(),
-            path.to_string(),
-        )])),
-    }
+    at_path(
+        path,
+        REASON_VALIDATION_ERROR,
+        format!("must have at least {MIN_PLUGINS_PER_PROPERTY} items but found {found}"),
+    )
 }
 
 /// One defect per field of the document whose NAME names an ARN and whose value is
@@ -684,13 +669,32 @@ fn plugins_named(node: &Node) -> usize {
     }
 }
 
-/// One reported defect: what is wrong, which category it falls in, and the field of
-/// the configuration it is about.
+/// One reported defect about the document as a WHOLE: what is wrong, which category it
+/// falls in, and the input member the document arrived in — a body that was never read,
+/// or a set of sections that do not form one chain, is about no single field of it.
 fn defect(field: &str, reason: &str, message: String) -> ValidationError {
     ValidationError {
         message: Some(message.clone()),
         reason: Some(reason.to_string()),
         field_map: Some(HashMap::from([(field.to_string(), message)])),
+    }
+}
+
+/// One reported defect PINNED TO A FIELD of the document: what is wrong, which category
+/// it falls in, and WHERE in the document the field is.
+///
+/// The `FieldMap` carries that location under the report's own [`PATH_KEY`], whose value
+/// is the field's full dotted document path — never the field's own bare name, which
+/// says nothing about which of two fields of that name the defect is about and is not
+/// the key a client following the report's contract reads.
+pub(crate) fn at_path(path: &str, reason: &str, message: String) -> ValidationError {
+    ValidationError {
+        message: Some(message),
+        reason: Some(reason.to_string()),
+        field_map: Some(HashMap::from([(
+            PATH_KEY.to_string(),
+            path.to_string(),
+        )])),
     }
 }
 
@@ -700,9 +704,8 @@ fn defect(field: &str, reason: &str, message: String) -> ValidationError {
 /// an empty value, which is what it has.
 fn pattern_defect(path: &str, value: &Node, constraint: ArnConstraint) -> ValidationError {
     let shown = scalar_text(value);
-    let field = path.rsplit('.').next().unwrap_or_default();
-    defect(
-        field,
+    at_path(
+        path,
         REASON_INVALID_PATTERN,
         format!(
             "Value '{shown}' at '{path}' failed to satisfy constraint: Member must satisfy \

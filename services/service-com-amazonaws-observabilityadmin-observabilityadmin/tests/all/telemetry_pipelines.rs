@@ -569,6 +569,7 @@ async fn a_create_past_either_cap_is_refused_and_stores_nothing() {
                     created_timestamp_ms: 1_700_000_000_000,
                     last_update_timestamp_ms: 1_700_000_000_000,
                     active_at_ms: 1_700_000_000_000,
+                    transition: Default::default(),
                     tags: Default::default(),
                 });
             }

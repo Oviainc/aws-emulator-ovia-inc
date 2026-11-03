@@ -335,9 +335,11 @@ async fn a_body_the_reader_cannot_parse_is_one_parse_error_defect() {
 /// reports two.
 ///
 /// A defect in how the document assembles its pipeline is reported against
-/// `Configuration.Body`, the document itself; one in a field the document declares is
-/// reported against that field's name, with the message saying where in the document
-/// it is.
+/// `Configuration.Body`, the document itself; one PINNED TO A FIELD the document
+/// declares is reported under the report's own `path` key, carrying that field's full
+/// dotted document path — never the field's own bare name, which cannot tell two fields
+/// of that name apart — and an absent required property under the report's `name` key,
+/// which is the name of the property to add.
 #[tokio::test]
 async fn every_defect_of_a_document_is_reported_against_its_field() {
     let emulator = emulator();
@@ -449,33 +451,33 @@ async fn every_defect_of_a_document_is_reported_against_its_field() {
             "source:\n  http: {}\nsink:\n  - cloudwatch_logs:\n      \
                sts_role_arn: TelemetryPipelineRole\n"
                 .to_string(),
-            vec![(INVALID_PATTERN, "sts_role_arn")],
+            vec![(INVALID_PATTERN, "path")],
         ),
         (
             "a role ARN whose account id is not twelve digits",
             "source:\n  http: {}\nsink:\n  - cloudwatch_logs:\n      \
                sts_role_arn: \"arn:aws:iam::12345:role/Example\"\n"
                 .to_string(),
-            vec![(INVALID_PATTERN, "sts_role_arn")],
+            vec![(INVALID_PATTERN, "path")],
         ),
         (
             "a role ARN field carrying no value",
             "source:\n  http: {}\nsink:\n  - cloudwatch_logs:\n      sts_role_arn:\n".to_string(),
-            vec![(INVALID_PATTERN, "sts_role_arn")],
+            vec![(INVALID_PATTERN, "path")],
         ),
         (
             "a role ARN field carrying a mapping rather than an ARN",
             "source:\n  http: {}\nsink:\n  - cloudwatch_logs:\n      sts_role_arn:\n        \
                name: Example\n"
                 .to_string(),
-            vec![(INVALID_PATTERN, "sts_role_arn")],
+            vec![(INVALID_PATTERN, "path")],
         ),
         (
             "an empty role ARN under the source's aws block",
             "source:\n  s3:\n    aws:\n      sts_role_arn: \"\"\nsink:\n  \
                - cloudwatch_logs: {}\n"
                 .to_string(),
-            vec![(INVALID_PATTERN, "sts_role_arn")],
+            vec![(INVALID_PATTERN, "path")],
         ),
         (
             "a bucket_arn, a field the same rule covers, that is not an ARN",
@@ -483,27 +485,27 @@ async fn every_defect_of_a_document_is_reported_against_its_field() {
                 "source:\n  http: {{}}\nsink:\n  - s3:\n      bucket_arn: telemetry-archive\n      \
                  sts_role_arn: \"{ROLE_ARN}\"\n"
             ),
-            vec![(INVALID_PATTERN, "bucket_arn")],
+            vec![(INVALID_PATTERN, "path")],
         ),
         (
             "a role ARN that is a well-formed ARN but not an IAM role's",
             format!(
                 "source:\n  http: {{}}\nsink:\n  - s3:\n      sts_role_arn: \"{BUCKET_ARN}\"\n"
             ),
-            vec![(INVALID_PATTERN, "sts_role_arn")],
+            vec![(INVALID_PATTERN, "path")],
         ),
         (
             "a role field spelled the way JSON writes it, carrying no ARN",
             "{\"source\": {\"http\": {}}, \"sink\": [{\"s3\": {\"stsRoleArn\": \"pipeline-role\"}}]}"
                 .to_string(),
-            vec![(INVALID_PATTERN, "stsRoleArn")],
+            vec![(INVALID_PATTERN, "path")],
         ),
         (
             "an ARN defect AND a structural one, each reported in its own right",
             "source:\n  http: {}\n  s3: {}\nsink:\n  - cloudwatch_logs:\n      \
                sts_role_arn: not-an-arn\n"
                 .to_string(),
-            vec![(INVALID_PATTERN, "sts_role_arn"), (VALIDATION_ERROR, "path")],
+            vec![(INVALID_PATTERN, "path"), (VALIDATION_ERROR, "path")],
         ),
     ] {
         let (status, response) = validate(&emulator, &configuration).await;
