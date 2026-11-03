@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDialRequestBatch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDialRequestBatch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Takes a batch of dial requests into the buffer of one running campaign. The campaign
+//! must be stored (else `ResourceNotFoundException`) and must be `Running` (else
+//! `ConflictException` naming the state it is in); each request of an accepted batch is
+//! then reported on its own, in `successfulRequests` or `failedRequests`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDialRequestBatch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this campaign cannot dial — a destination outside the shape the model
+//! declares for it, or an expiration the clock has already passed — is one of those
+//! per-request failures, not a refusal of the call.
+//!
+//! The operation is idempotent per `clientToken`: a token the campaign's buffer already
+//! holds is answered with the `DialRequestId` it was given then and stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +158,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDialRequestBatch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDialRequestBatchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutDialRequestBatchErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the campaign store is unavailable".to_string(),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // One instant for the whole batch, so every request of it is weighed against
+        // the same clock reading.
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // Resolving the campaign and judging whether it takes dial requests at all is
+        // the store's own decision (`crate::state::dialable_campaign`), so this handler
+        // and any later reader of the dial plane cannot disagree about which campaign
+        // dials. What belongs here is only the mapping from a rejection to the error
+        // variant this operation's model declares.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDialRequestBatch"))
+        // The resolve and the per-request walk below happen under the one lock this
+        // handler holds, so a concurrent lifecycle call or delete cannot leave a request
+        // buffered on a campaign that no longer takes one.
+        if let Err(rejected) = store.dialable_campaign(&input.id) {
+            return Err(match rejected {
+                crate::state::DialRejected::NoSuchCampaign => {
+                    PutDialRequestBatchErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::campaign_absent_message(&input.id),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into()
+                }
+                crate::state::DialRejected::NotDialable(current) => {
+                    PutDialRequestBatchErrorModeled::ConflictException(ConflictException {
+                        message: crate::state::campaign_invalid_state_message(&input.id, current),
+                        x_amz_error_type: None,
+                    })
+                    .into()
+                }
+            });
+        }
+
+        let mut successful_requests = Vec::new();
+        let mut failed_requests = Vec::new();
+        for request in &input.dial_requests {
+            // A destination outside the shape the model declares for it is one this
+            // campaign cannot dial, so it is reported on this request's own failure
+            // channel — the batch is not refused for it, and the rest of it is taken.
+            // `InvalidInput` and `RequestThrottled` below are both from the model's own
+            // `FailureCode` catalog (`FAILURE_CODE_VALUES` in `crate::ops::types`).
+            if !crate::state::dialable_phone_number(&request.phone_number) {
+                failed_requests.push(FailedRequest {
+                    client_token: Some(request.client_token.clone()),
+                    id: None,
+                    failure_code: Some("InvalidInput".to_string()),
+                });
+                continue;
+            }
+            let outcome = store.take_dial_request(
+                &input.id,
+                &request.client_token,
+                &request.phone_number,
+                &request.attributes,
+                request.expiration_time,
+                now,
+            );
+            match outcome {
+                Some(crate::state::DialRequestOutcome::Taken(id)) => {
+                    successful_requests.push(SuccessfulRequest {
+                        client_token: Some(request.client_token.clone()),
+                        id: Some(id),
+                    });
+                }
+                // A request whose `expirationTime` has already passed is one the campaign
+                // can never dial, so it is reported on the per-request failure channel
+                // and the rest of the batch is unaffected.
+                Some(crate::state::DialRequestOutcome::Expired) => {
+                    failed_requests.push(FailedRequest {
+                        client_token: Some(request.client_token.clone()),
+                        id: None,
+                        failure_code: Some("InvalidInput".to_string()),
+                    });
+                }
+                Some(crate::state::DialRequestOutcome::BufferFull) => {
+                    failed_requests.push(FailedRequest {
+                        client_token: Some(request.client_token.clone()),
+                        id: None,
+                        failure_code: Some("RequestThrottled".to_string()),
+                    });
+                }
+                // The campaign was resolved above under the guard this walk still holds,
+                // so it cannot have gone; answered rather than panicked on.
+                None => {
+                    return Err(PutDialRequestBatchErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: format!(
+                                "campaign {} went missing while its dial batch was being taken",
+                                input.id
+                            ),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into())
+                }
+            }
+        }
+        drop(store);
+
+        crate::state::audit_campaign_change(
+            ctx.parts(),
+            "PutDialRequestBatch",
+            &input.id,
+            // Only wire metadata and counts: never a phone number, an attribute or a
+            // caller's `clientToken`.
+            &format!(
+                "taken {} failed {}",
+                successful_requests.len(),
+                failed_requests.len()
+            ),
+        );
+
+        // Both lists are always present, including when one is empty: a client reads the
+        // outcome of every request it sent out of them.
+        Ok(PutDialRequestBatchOutput {
+            successful_requests: Some(successful_requests),
+            failed_requests: Some(failed_requests),
+        })
     }
 }

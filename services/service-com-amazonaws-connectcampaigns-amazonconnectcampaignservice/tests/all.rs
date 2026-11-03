@@ -19,6 +19,8 @@ mod campaign_plane_refusals;
 mod campaign_state_batch;
 #[path = "all/common.rs"]
 mod common;
+#[path = "all/dial_request_batch.rs"]
+mod dial_request_batch;
 #[path = "all/input_constraint_refusals.rs"]
 mod input_constraint_refusals;
 #[path = "all/instance_onboarding.rs"]

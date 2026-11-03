@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-connectcampaigns-amazonconnectcampaignservice service.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
@@ -65,6 +65,25 @@ impl CampaignState {
             Self::Stopped => "Stopped",
         }
     }
+
+    /// The spelling this state takes inside a state-conflict refusal's sentence: the
+    /// model's enum value in UPPER CASE, which is how the recorded refusals of that
+    /// class name the state a campaign is in.
+    ///
+    /// Derived from [`Self::as_wire`] rather than listed a second time, so a state
+    /// cannot be named one way in a response member and another in a refusal.
+    pub fn as_upper_wire(self) -> String {
+        self.as_wire().to_uppercase()
+    }
+
+    /// Whether a campaign in this state takes dial requests.
+    ///
+    /// Only a RUNNING campaign is dialling, so only a running one has a run for a
+    /// submitted dial request to join; the dial plane of a campaign in any other state
+    /// is refused as the state conflict it is.
+    pub fn takes_dial_requests(self) -> bool {
+        matches!(self, Self::Running)
+    }
 }
 
 /// A stored campaign: every member of the modelled `Campaign` shape plus the run
@@ -91,6 +110,66 @@ pub struct StoredCampaign {
     /// Assigned by [`ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::insert_campaign`];
     /// whatever a caller puts here is overwritten.
     pub sequence: u64,
+    /// The dial requests this campaign has pending, keyed by the `clientToken` they
+    /// were submitted under — which is what makes `PutDialRequestBatch` idempotent: a
+    /// token this buffer already holds is answered with the id it was given then and
+    /// nothing is written.
+    ///
+    /// A request leaves this buffer once its `expirationTime` has passed, which the
+    /// clock alone owes ([`StoredCampaign::expire_dial_requests`]): an expired request
+    /// is no longer dialable, so it neither occupies a buffer slot nor keeps answering
+    /// for its token.
+    pub dial_requests: BTreeMap<String, StoredDialRequest>,
+}
+
+impl StoredCampaign {
+    /// Drop every dial request this campaign's buffer holds whose `expirationTime` has
+    /// passed at `now`, reporting how many left.
+    ///
+    /// The buffer holds PENDING requests, so a request past its expiration is not in it.
+    /// That removal is owed to the clock alone — it was due at the same instant whether
+    /// or not anybody called — which is why a reporting path may materialise it.
+    pub fn expire_dial_requests(&mut self, now: SystemTime) -> usize {
+        let before = self.dial_requests.len();
+        self.dial_requests
+            .retain(|_, request| !deadline_passed(request.expires_at, now));
+        before - self.dial_requests.len()
+    }
+}
+
+/// One dial request a campaign's buffer holds: the id this service minted for it, and
+/// what the request asked to dial exactly as it was submitted.
+///
+/// `phoneNumber` and `attributes` are `@sensitive` in the model and no operation of this
+/// service reports them back; they are kept because they are what the pending request IS,
+/// so the buffer says what each pending request is for and not merely that one is
+/// pending.
+#[derive(Debug, Clone)]
+pub struct StoredDialRequest {
+    /// The `DialRequestId` this service minted for the request, which
+    /// `PutDialRequestBatch` reports in its `successfulRequests`.
+    pub id: String,
+    pub phone_number: String,
+    pub attributes: HashMap<String, String>,
+    /// The instant after which the request can no longer be dialled, as the request
+    /// carried it.
+    pub expires_at: ::aws_smithy_types::DateTime,
+}
+
+/// `at` as the `(seconds, nanoseconds)` pair an `::aws_smithy_types::DateTime` reports an
+/// instant as, so a wall-clock instant and a modelled timestamp compare exactly rather
+/// than through a lossy float.
+fn instant_parts(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
+    (at.secs(), at.subsec_nanos())
+}
+
+/// Whether the instant `deadline` has passed at `now`, compared exactly through
+/// [`instant_parts`] rather than rounded to whole seconds.
+///
+/// The one place a deadline a caller sent is weighed against the clock, so every reader
+/// of a stored deadline draws the line at the same instant.
+fn deadline_passed(deadline: ::aws_smithy_types::DateTime, now: SystemTime) -> bool {
+    instant_parts(::aws_smithy_types::DateTime::from(now)) >= instant_parts(deadline)
 }
 
 /// Per-service state for com-amazonaws-connectcampaigns-amazonconnectcampaignservice. A handler reaches it through [`service_state`].
@@ -115,6 +194,9 @@ pub struct ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState {
     pub arn_index: HashMap<String, String>,
     /// Creation counter: the `sequence` the next stored campaign takes.
     pub next_sequence: u64,
+    /// Dial-request counter: the position the next `DialRequestId` this store mints
+    /// carries. Store-wide, so no two dial requests of any campaign share an id.
+    pub next_dial_sequence: u64,
 }
 
 impl ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState {
@@ -145,28 +227,114 @@ impl ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState {
         Some(removed)
     }
 
-    /// Move one campaign's run state from any of `allowed_from` to `to`, returning the
-    /// state it now holds.
+    /// Move one campaign's run state into `to`, from any of `allowed_from`, and report
+    /// what that did.
     ///
     /// The one place a run-state transition is applied, so start, pause and stop cannot
     /// disagree about what a transition does: each names only the states it may move
-    /// from. A campaign already in `to` is NOT a special case — a request to enter the
-    /// state it is already in is refused unless `to` is itself in `allowed_from`.
+    /// from, and the rule they all share lives here.
+    ///
+    /// A campaign ALREADY in `to` is accepted and nothing is written
+    /// ([`TransitionApplied::Unchanged`]): a request asking a campaign to enter the state
+    /// it already holds has nothing left to do, so a retry after a timeout and two
+    /// callers racing to the same state each succeed. A campaign in any OTHER state
+    /// outside `allowed_from` is refused, and nothing is written then either.
     pub fn transition_campaign(
         &mut self,
         id: &str,
         allowed_from: &[CampaignState],
         to: CampaignState,
-    ) -> Result<CampaignState, TransitionRefused> {
+    ) -> Result<TransitionApplied, TransitionRefused> {
         let campaign = self
             .campaigns
             .get_mut(id)
             .ok_or(TransitionRefused::NoSuchCampaign)?;
+        if campaign.state == to {
+            return Ok(TransitionApplied::Unchanged(to));
+        }
         if !allowed_from.contains(&campaign.state) {
             return Err(TransitionRefused::InvalidState(campaign.state));
         }
         campaign.state = to;
-        Ok(to)
+        Ok(TransitionApplied::Moved(to))
+    }
+
+    /// Whether the campaign `id` names takes dial requests right now, or the refusal the
+    /// caller owes instead.
+    ///
+    /// The one place the dialability rule of this service lives, so the dial plane and
+    /// any later reader of it cannot disagree about which campaign dials. Nothing is
+    /// written on either refusal, and the refusal names the state it judged so the
+    /// caller's sentence can report it.
+    pub fn dialable_campaign(&self, id: &str) -> Result<(), DialRejected> {
+        let Some(stored) = self.campaigns.get(id) else {
+            return Err(DialRejected::NoSuchCampaign);
+        };
+        if !stored.state.takes_dial_requests() {
+            return Err(DialRejected::NotDialable(stored.state));
+        }
+        Ok(())
+    }
+
+    /// The position the next `DialRequestId` this store mints carries.
+    ///
+    /// Minted from the store's own counter, never from anything in the request. The text
+    /// it is rendered into is within `DialRequestId`'s pattern `^[a-zA-Z0-9_\-.]*$` and
+    /// its 0..256 length bound.
+    fn next_dial_request_id(&mut self) -> String {
+        let sequence = self.next_dial_sequence;
+        self.next_dial_sequence = self.next_dial_sequence.saturating_add(1);
+        format!("dial-{sequence:012}")
+    }
+
+    /// Take the dial request submitted under `client_token` into the buffer of the
+    /// campaign `campaign_id` names, and report what became of it (see
+    /// [`DialRequestOutcome`]). `None` when no campaign is stored under that id.
+    ///
+    /// A `client_token` the campaign has already taken stores nothing and reports the id
+    /// it was given then, which is what makes a repeated batch idempotent.
+    ///
+    /// `expires_at` is weighed against `now` first: a request whose expiration has
+    /// already passed can never be dialled, so it is not taken at all, mints no id and
+    /// occupies no slot. The expiries the clock already owes the buffer are materialised
+    /// at the same instant ([`StoredCampaign::expire_dial_requests`]), so a slot and a
+    /// `clientToken` are both held only while their request is still pending.
+    pub fn take_dial_request(
+        &mut self,
+        campaign_id: &str,
+        client_token: &str,
+        phone_number: &str,
+        attributes: &HashMap<String, String>,
+        expires_at: ::aws_smithy_types::DateTime,
+        now: SystemTime,
+    ) -> Option<DialRequestOutcome> {
+        {
+            let stored = self.campaigns.get_mut(campaign_id)?;
+            stored.expire_dial_requests(now);
+            if deadline_passed(expires_at, now) {
+                return Some(DialRequestOutcome::Expired);
+            }
+            if let Some(taken) = stored.dial_requests.get(client_token) {
+                return Some(DialRequestOutcome::Taken(taken.id.clone()));
+            }
+            if stored.dial_requests.len() >= MAX_DIAL_REQUESTS_PER_CAMPAIGN {
+                return Some(DialRequestOutcome::BufferFull);
+            }
+        }
+        // Only now, past every refusal, is an id minted — so a request that was not
+        // taken consumes no id and leaves no gap in the sequence.
+        let id = self.next_dial_request_id();
+        let stored = self.campaigns.get_mut(campaign_id)?;
+        stored.dial_requests.insert(
+            client_token.to_string(),
+            StoredDialRequest {
+                id: id.clone(),
+                phone_number: phone_number.to_string(),
+                attributes: attributes.clone(),
+                expires_at,
+            },
+        );
+        Some(DialRequestOutcome::Taken(id))
     }
 
     /// Start the onboarding job of `connect_instance_id`, persisting `encryption_config`
@@ -226,8 +394,137 @@ pub enum TransitionRefused {
     /// No campaign with that id is stored (`ResourceNotFoundException`, HTTP 404).
     NoSuchCampaign,
     /// The campaign is in a state this transition cannot be made from
-    /// (`InvalidCampaignStateException`, HTTP 409), carrying the state it is in.
+    /// (`ConflictException`, HTTP 409, worded by [`campaign_invalid_state_message`]),
+    /// carrying the state it is in.
     InvalidState(CampaignState),
+}
+
+/// What a requested run-state transition DID, as
+/// [`ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::transition_campaign`]
+/// reports it.
+///
+/// Both variants are successes; they are kept apart because only one of them changed
+/// anything, and a transition that did not happen is not audited as one that did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionApplied {
+    /// The campaign moved into the state the operation asked for and now holds it.
+    Moved(CampaignState),
+    /// The campaign already held that state, so nothing was written.
+    Unchanged(CampaignState),
+}
+
+/// Why this store took no dial request for a campaign, as
+/// [`ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::dialable_campaign`]
+/// reports it. Nothing is written in either case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialRejected {
+    /// No campaign with that id is stored, so there is no buffer to take the batch into:
+    /// the modelled `ResourceNotFoundException` (HTTP 404).
+    NoSuchCampaign,
+    /// The campaign is in a state that takes no dial requests (see
+    /// [`CampaignState::takes_dial_requests`]), carrying that state: the modelled
+    /// `ConflictException` (HTTP 409), worded by [`campaign_invalid_state_message`].
+    NotDialable(CampaignState),
+}
+
+/// What became of one dial request of a batch, as
+/// [`ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::take_dial_request`]
+/// reports it.
+///
+/// A per-request outcome, not a refusal of the call: the batch operation reports each of
+/// these on its own, through `successfulRequests` or `failedRequests`, and the rest of
+/// the batch is unaffected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialRequestOutcome {
+    /// The request is in the campaign's buffer under this `DialRequestId` — which is the
+    /// id it was given the first time its `clientToken` was seen.
+    Taken(String),
+    /// Its `expirationTime` had already passed, so it can never be dialled and was not
+    /// taken: reported with the model's `InvalidInput` failure code.
+    Expired,
+    /// The campaign's buffer already holds [`MAX_DIAL_REQUESTS_PER_CAMPAIGN`] pending
+    /// requests: reported with the model's `RequestThrottled` failure code.
+    BufferFull,
+}
+
+/// The most dial requests one campaign's buffer in this emulator's store holds, past
+/// which a further request of a batch is reported as throttled instead of taken.
+///
+/// AWS publishes no such number: this is the emulator's own memory bound, because the
+/// buffer lives in memory and grows one record per accepted request. The model's own
+/// `FailureCode` catalog names what a buffer that cannot take another answers with —
+/// `RequestThrottled`, documented as "Request throttled due to large number of pending
+/// dial requests" — so that is the code reported, set far above any plausible batch.
+pub const MAX_DIAL_REQUESTS_PER_CAMPAIGN: usize = 10_000;
+
+/// `DestinationPhoneNumber`'s own constraints as the trait map the framework's constraint
+/// walk reads them from: `@length(min 0, max 20)` and `@pattern("^[\d\-+]*$")`, from
+/// `smithy_query(query="shape", shape="DestinationPhoneNumber")`.
+static DESTINATION_PHONE_NUMBER_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::LengthTrait::new(Some(0), Some(20)),
+        ));
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::PatternTrait::new(r"^[\d\-+]*$"),
+        ));
+        traits
+    });
+
+/// The schema a submitted destination number is judged against: one string carrying
+/// `DestinationPhoneNumber`'s own constraints.
+///
+/// It is NOT the member schema the request was deserialized against, deliberately: those
+/// constraints are enforced on this request alone rather than at the boundary, because a
+/// destination this service cannot dial is reported on that request's own failure channel
+/// and the rest of the batch is served (see [`dialable_phone_number`]).
+static DESTINATION_PHONE_NUMBER_SCHEMA: ::std::sync::LazyLock<::aws_smithy_schema::Schema> =
+    ::std::sync::LazyLock::new(|| {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.connectcampaigns#DialRequest$phoneNumber",
+                "com.amazonaws.connectcampaigns",
+                "phoneNumber",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "phoneNumber",
+            0,
+        )
+        .with_traits(&DESTINATION_PHONE_NUMBER_TRAITS)
+    });
+
+/// Whether `phone_number` is a destination a campaign can dial: a value the
+/// `DestinationPhoneNumber` shape admits.
+///
+/// Judged by the framework's own leaf walk against
+/// [`DESTINATION_PHONE_NUMBER_SCHEMA`], so a number is weighed by the very code the
+/// boundary weighs a constrained string member with and the rules enforced are the
+/// model's declared ones rather than a second, hand-rolled reading of them. The one
+/// place this service decides whether a submitted number is dialable.
+pub fn dialable_phone_number(phone_number: &str) -> bool {
+    use ::aws_smithy_schema::serde::ShapeSerializer as _;
+
+    let mut validator = ::aws_smithy_schema_server::constraints::ValidatingSerializer::new();
+    validator.set_fail_fast(true);
+    // Infallible: the validator accumulates violations instead of failing.
+    let _ = validator.write_string(&DESTINATION_PHONE_NUMBER_SCHEMA, phone_number);
+    validator.into_violations().is_empty()
+}
+
+/// What this service answers when a campaign is in a run state the change a request asks
+/// for cannot be made from: a lifecycle transition the state machine does not admit, or
+/// a dial request for a campaign that is not running.
+///
+/// Composed from the request and from service state — the id the caller addressed and
+/// the state the campaign is in, spelled as [`CampaignState::as_upper_wire`] renders it.
+/// The one text every refusal of this class shares, so the lifecycle operations and the
+/// dial plane cannot word one state conflict four ways.
+pub fn campaign_invalid_state_message(id: &str, state: CampaignState) -> String {
+    format!(
+        "Campaign: {id} is in invalid state: {}",
+        state.as_upper_wire()
+    )
 }
 
 /// The `InstanceOnboardingJobStatusCode` value an onboarding job that has not finished

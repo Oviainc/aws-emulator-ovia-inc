@@ -199,9 +199,9 @@ async fn a_batch_read_reports_the_state_each_resolved_id_is_in() {
         ("a paused campaign", vec!["start", "pause"], "Paused"),
         ("a stopped campaign", vec!["start", "stop"], "Stopped"),
         (
-            "a campaign started again after a stop",
-            vec!["start", "stop", "start"],
-            "Running",
+            "a campaign stopped from paused",
+            vec!["start", "pause", "stop"],
+            "Stopped",
         ),
     ];
 

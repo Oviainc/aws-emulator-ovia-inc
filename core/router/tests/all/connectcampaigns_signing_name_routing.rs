@@ -327,13 +327,19 @@ async fn each_connect_campaigns_api_version_serves_its_own_route_space() {
             Expect::JobJustStarted,
         ),
         (
-            "v1 PutDialRequestBatch (still a stub)",
+            // v1 implements this one now, so its answer is its own dial-plane refusal
+            // over ITS store: the id named here is one no v1 campaign carries, so the
+            // batch comes back as v1's own run-state not-found — which neither a router
+            // refusal nor the V2 version, whose every route is `/v2/`-prefixed, can
+            // produce for this path. `expirationTime` is the RFC3339 date-time string the
+            // member's `@timestampFormat("date-time")` declares.
+            "v1 PutDialRequestBatch",
             "PUT",
             "/campaigns/000000000000/dial-requests",
             r#"{"dialRequests":[{"clientToken":"token-1","phoneNumber":"+15550100",
-                "expirationTime":1767225600,"attributes":{}}]}"#,
-            501,
-            Expect::Error("NotImplemented"),
+                "expirationTime":"2099-01-01T00:00:00Z","attributes":{}}]}"#,
+            404,
+            Expect::Error("ResourceNotFoundException"),
         ),
         (
             "v1 ListTagsForResource (still a stub)",

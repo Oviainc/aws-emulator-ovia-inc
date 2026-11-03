@@ -2,8 +2,8 @@
 
 //! @op PauseCampaign
 //! Moves a stored campaign's run state to `Paused`. Only a running campaign can be
-//! paused; a campaign in any other state is refused with
-//! `InvalidCampaignStateException` carrying the state it is in.
+//! paused; a campaign already paused is answered as the no-op it is, and a campaign in
+//! any other state is refused with `ConflictException` naming the state it is in.
 //!
 //! ## Shape of an operation
 //!
@@ -175,7 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // Only a campaign that is running has anything to pause.
+        // Only a campaign that is running has a run to pause; a campaign already paused
+        // is already in the state the call asks for, so the transition rule accepts it
+        // as the no-op it is.
         let outcome = state.lock().transition_campaign(
             &input.id,
             &[crate::state::CampaignState::Running],
@@ -183,7 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         match outcome {
-            Ok(now) => {
+            // A transition that happened is audited; one the campaign did not make —
+            // because it already held the state asked for — is not, since there is no
+            // change to record.
+            Ok(crate::state::TransitionApplied::Moved(now)) => {
                 crate::state::audit_campaign_change(
                     ctx.parts(),
                     "PauseCampaign",
@@ -192,6 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
                 Ok(PauseCampaignOutput)
             }
+            Ok(crate::state::TransitionApplied::Unchanged(_)) => Ok(PauseCampaignOutput),
             Err(crate::state::TransitionRefused::NoSuchCampaign) => Err(
                 PauseCampaignErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: crate::state::campaign_absent_message(&input.id),
@@ -200,17 +206,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             ),
             Err(crate::state::TransitionRefused::InvalidState(current)) => Err(
-                PauseCampaignErrorModeled::InvalidCampaignStateException(
-                    InvalidCampaignStateException {
-                        state: current.as_wire().to_string(),
-                        message: format!(
-                            "Campaign {} cannot be paused while it is {}",
-                            input.id,
-                            current.as_wire()
-                        ),
-                        x_amz_error_type: None,
-                    },
-                )
+                PauseCampaignErrorModeled::ConflictException(ConflictException {
+                    message: crate::state::campaign_invalid_state_message(&input.id, current),
+                    x_amz_error_type: None,
+                })
                 .into(),
             ),
         }

@@ -13,11 +13,11 @@
 //! * CreateCampaign mints an id and the ARN naming it, and stores every member it was
 //!   given, so a read-back returns what was created (whatever dialer config variant,
 //!   outbound call config, tag set, name or instance id it was given).
-//! * The run state is a state machine: start moves a campaign that has never run or has
-//!   stopped to Running, pause moves a Running one to Paused, stop moves a Running or
-//!   Paused one to Stopped; every other request is refused with
-//!   `InvalidCampaignStateException` (409) carrying the state the campaign is in, and
-//!   changes nothing.
+//! * The run state is a state machine: start moves a campaign that has never run to
+//!   Running, pause moves a Running one to Paused, stop moves a Running or Paused one to
+//!   Stopped, and a request asking a campaign to enter the state it already holds is an
+//!   idempotent success that changes nothing; every other request is refused with
+//!   `ConflictException` (409) naming the state the campaign is in, and changes nothing.
 //! * Every id-taking operation answers `ResourceNotFoundException` (404) for an id the
 //!   store does not hold, including after a delete.
 //! * ListCampaigns enumerates the stored campaigns in creation order, filtered by
@@ -433,6 +433,7 @@ async fn campaign_in_state(router: &MultiServiceRouter, target: &str) -> String 
         "Stopped" => &["start", "stop"],
         other => panic!("no lifecycle path to {other}"),
     };
+
     for action in path {
         let answer = lifecycle_call(router, &id, action).await;
         assert_eq!(
@@ -455,21 +456,23 @@ async fn campaign_in_state(router: &MultiServiceRouter, target: &str) -> String 
 async fn the_run_state_machine_allows_only_its_own_transitions() {
     // Every (state, operation) pair of the run-state machine: the state the campaign is
     // in, the lifecycle operation called on it, and the state it must be in afterwards —
-    // `None` meaning the request is refused with InvalidCampaignStateException and the
-    // campaign does not move.
+    // `None` meaning the request is refused with ConflictException and the campaign does
+    // not move. A pair whose operation asks for the state the campaign already holds is a
+    // success that leaves it there, which is why `Running`/start, `Paused`/pause and
+    // `Stopped`/stop name their own state rather than `None`.
     let rows: &[(&str, &str, Option<&str>)] = &[
         ("Initialized", "start", Some("Running")),
         ("Initialized", "pause", None),
         ("Initialized", "stop", None),
-        ("Running", "start", None),
+        ("Running", "start", Some("Running")),
         ("Running", "pause", Some("Paused")),
         ("Running", "stop", Some("Stopped")),
         ("Paused", "start", None),
-        ("Paused", "pause", None),
+        ("Paused", "pause", Some("Paused")),
         ("Paused", "stop", Some("Stopped")),
-        ("Stopped", "start", Some("Running")),
+        ("Stopped", "start", None),
         ("Stopped", "pause", None),
-        ("Stopped", "stop", None),
+        ("Stopped", "stop", Some("Stopped")),
     ];
 
     let router = service_router();
@@ -502,15 +505,17 @@ async fn the_run_state_machine_allows_only_its_own_transitions() {
                 );
                 assert_eq!(
                     error_code(&answer),
-                    "InvalidCampaignStateException",
-                    "case {case:?}: expected InvalidCampaignStateException, got {:?}",
+                    "ConflictException",
+                    "case {case:?}: expected ConflictException, got {:?}",
                     answer.body
                 );
+                let expected_message =
+                    format!("Campaign: {id} is in invalid state: {}", from.to_uppercase());
                 assert_eq!(
-                    answer.string_member("state"),
-                    Some(*from),
-                    "case {case:?}: expected the refusal to carry the state the campaign is \
-                     in, got {:?}",
+                    answer.string_member("message"),
+                    Some(expected_message.as_str()),
+                    "case {case:?}: expected the refusal to name the campaign and the \
+                     upper-case state it is in, got {:?}",
                     answer.body
                 );
                 let state = campaign_state(&router, &id).await;

@@ -263,6 +263,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 created_at: ::std::time::SystemTime::now(),
                 // Replaced by the store's own creation counter.
                 sequence: 0,
+                // A campaign nobody has dialled through yet holds no dial request; the
+                // dial plane fills this buffer.
+                dial_requests: ::std::collections::BTreeMap::new(),
             })
         };
 
