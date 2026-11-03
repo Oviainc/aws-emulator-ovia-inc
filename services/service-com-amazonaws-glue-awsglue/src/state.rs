@@ -664,6 +664,31 @@ pub const TRIGGER_TYPE_SCHEDULED: &str = "SCHEDULED";
 /// CONDITIONAL" — `CreateTriggerRequest$Predicate`).
 pub const TRIGGER_TYPE_CONDITIONAL: &str = "CONDITIONAL";
 
+/// The `TriggerType` of a trigger that fires on the events EventBridge hands the workflow
+/// it belongs to, as its `EventBatchingCondition` decides: "Number of events that must be
+/// received from Amazon EventBridge before EventBridge event trigger fires"
+/// (`EventBatchingCondition$BatchSize`). The one type whose firing comes from OUTSIDE this
+/// service.
+pub const TRIGGER_TYPE_EVENT: &str = "EVENT";
+
+/// The batch size an EVENT trigger counts deliveries against when its
+/// `EventBatchingCondition` names none at all.
+///
+/// `BatchSize` is `@required` INSIDE the condition but the condition itself is optional, so
+/// a trigger carrying no condition batches nothing: it fires on the first event it is
+/// handed, which is the lower bound of the member's `@range 1..100`.
+pub const DEFAULT_EVENT_BATCH_SIZE: i32 = 1;
+
+/// The window an EVENT trigger's open batch is given when its `EventBatchingCondition`
+/// names no `BatchWindow`.
+///
+/// "Window of time in seconds after which EventBridge event trigger fires. Window starts
+/// when first event is received" (`EventBatchingCondition$BatchWindow`, `@range 1..900`):
+/// Glue documents 900 seconds — the member's upper bound — as the window an event trigger
+/// batches over by default, so a condition that names only a `BatchSize` waits that long
+/// for the batch to fill before firing with what it has.
+pub const DEFAULT_EVENT_BATCH_WINDOW_SECONDS: u64 = 900;
+
 /// The `NodeType` of a workflow-graph node that stands for a trigger. One of the modelled
 /// `NodeType` values, whose published list the generated
 /// [`crate::ops::types::NODE_TYPE_VALUES`] carries (`CRAWLER`, `JOB`, `TRIGGER`).
@@ -2466,6 +2491,163 @@ impl ComAmazonawsGlueAwsglueState {
             });
         }
         begun
+    }
+
+    /// The EVENT trigger of the Region `region` that the events delivered to the workflow
+    /// `workflow_name` are counted against, or `None` when that workflow has none.
+    ///
+    /// An EVENT trigger is the one kind driven from outside this service: the events an
+    /// EventBridge rule hands a workflow are counted against the `EventBatchingCondition`
+    /// of the EVENT trigger that belongs to it ("number of events that must be received
+    /// from Amazon EventBridge before EventBridge event trigger fires",
+    /// `EventBatchingCondition$BatchSize`), so this is the trigger an ingress resolves. A
+    /// trigger is served only through the endpoint that created it, so the search is over
+    /// THIS Region's triggers, bounded by [`MAX_TRIGGERS`] and taken in name order (the map
+    /// is ordered), so one workflow resolves to the same trigger on every call — the same
+    /// way [`Self::starting_trigger`] resolves an entry point.
+    pub fn event_trigger(&self, region: &str, workflow_name: &str) -> Option<&TriggerEntry> {
+        self.triggers.get(region)?.values().find(|trigger| {
+            trigger.workflow_name.as_deref() == Some(workflow_name)
+                && trigger.trigger_type == TRIGGER_TYPE_EVENT
+        })
+    }
+
+    /// Count ONE event EventBridge delivered to the workflow `workflow_name` against that
+    /// workflow's EVENT trigger, and answer what became of the delivery.
+    ///
+    /// The ingress AWS exposes as `glue:notifyEvent`: an EventBridge rule whose target is a
+    /// Glue workflow hands every matched event to that workflow, and the workflow's EVENT
+    /// trigger is what turns those events into runs — "batch condition that must be met
+    /// (specified number of events received or batch time window expired) before
+    /// EventBridge event trigger fires" (`EventBatchingCondition`). So one delivery is
+    /// counted ([`TriggerEntry::receive_event`]) and the trigger fires EXACTLY ONCE when
+    /// the count reaches its `BatchSize`, beginning one run of the workflow and initiating
+    /// that trigger's actions — the same firing [`Self::fire_event_trigger`] performs for a
+    /// window that ran out.
+    ///
+    /// Before the event is counted, a batch whose window the clock has already run out
+    /// fires on its own, so an event arriving after the window belongs to the next batch
+    /// rather than to the one it closed.
+    pub fn notify_workflow_event(
+        &mut self,
+        region: &str,
+        workflow_name: &str,
+        now: SystemTime,
+    ) -> WorkflowEventDelivery {
+        if self.workflow(workflow_name).is_none() {
+            return WorkflowEventDelivery::NoWorkflow;
+        }
+        self.settle_due_event_batches(region, workflow_name, now);
+        let Some(trigger) = self.event_trigger(region, workflow_name) else {
+            return WorkflowEventDelivery::NoEventTrigger;
+        };
+        if !trigger.batches_events() {
+            return WorkflowEventDelivery::Deactivated;
+        }
+        let trigger_name = trigger.name.clone();
+        let fires = self
+            .trigger_mut(region, &trigger_name)
+            .is_some_and(|trigger| trigger.receive_event(now));
+        if !fires {
+            let (received, batch_size) = self
+                .trigger(region, &trigger_name)
+                .map_or((0, 0), |trigger| {
+                    (trigger.batched_events, trigger.event_batch_size())
+                });
+            return WorkflowEventDelivery::Counted {
+                received,
+                batch_size,
+            };
+        }
+        self.fire_event_trigger(region, &trigger_name, now)
+    }
+
+    /// Fire the batch of the EVENT trigger of the workflow `workflow_name` that the CLOCK
+    /// has already run the window out on, at `now`.
+    ///
+    /// "Window of time in seconds after which EventBridge event trigger fires. Window
+    /// starts when first event is received" (`EventBatchingCondition$BatchWindow`): a batch
+    /// that has received at least one event and whose window has run out fires with the
+    /// events it holds, and it was owed that firing at the instant the window ran out
+    /// whether or not anybody called — so a read of the workflow's runs materialises it
+    /// exactly as it materialises the statuses those runs were owed
+    /// ([`WorkflowEntry::settle_due_runs`]), and the run begins at the DUE instant rather
+    /// than at the instant of the read. Nothing else moves, and a batch still inside its
+    /// window fires nothing.
+    pub fn settle_due_event_batches(
+        &mut self,
+        region: &str,
+        workflow_name: &str,
+        now: SystemTime,
+    ) {
+        let Some(trigger) = self.event_trigger(region, workflow_name) else {
+            return;
+        };
+        if !trigger.batches_events() {
+            return;
+        }
+        let trigger_name = trigger.name.clone();
+        let Some(due) = trigger
+            .batch_window_due_at()
+            .filter(|due| now >= *due)
+        else {
+            return;
+        };
+        if let Some(trigger) = self.trigger_mut(region, &trigger_name) {
+            trigger.close_event_batch();
+        }
+        self.fire_event_trigger(region, &trigger_name, due);
+    }
+
+    /// Begin the one run of its workflow that the trigger `trigger_name` of `region` FIRING
+    /// starts, at `now`, and answer what became of it.
+    ///
+    /// A firing begins a run of the workflow the trigger belongs to and initiates "the
+    /// actions initiated by this trigger" (`Trigger$Actions`) inside it, which is what
+    /// `StartWorkflowRun` does for the entry point a caller starts: the run is recorded
+    /// through the ONE place a run of a workflow is recorded
+    /// ([`WorkflowEntry::begin_run`]), so a run a trigger began is counted against the same
+    /// concurrency ceiling as one a caller started and reported identically by every later
+    /// read.
+    fn fire_event_trigger(
+        &mut self,
+        region: &str,
+        trigger_name: &str,
+        now: SystemTime,
+    ) -> WorkflowEventDelivery {
+        // The workflow the firing runs and the actions it initiates, resolved before the
+        // workflow is borrowed to write to.
+        let Some((workflow_name, actions)) = self.trigger(region, trigger_name).and_then(|trigger| {
+            trigger
+                .workflow_name
+                .clone()
+                .map(|workflow_name| (workflow_name, trigger.actions.clone()))
+        }) else {
+            return WorkflowEventDelivery::NoWorkflow;
+        };
+        let total_actions = i32::try_from(actions.len()).unwrap_or(i32::MAX);
+        let Some(workflow) = self.workflow_mut(&workflow_name) else {
+            return WorkflowEventDelivery::NoWorkflow;
+        };
+        // A firing passes no run properties of its own, so the run carries the workflow's
+        // own defaults.
+        let run_id = match workflow.begin_run(None, now, total_actions) {
+            Ok(run_id) => run_id,
+            // "If you leave this parameter blank, there is no limit to the number of
+            // concurrent workflow runs": past a ceiling the workflow named, the firing
+            // begins no run, exactly as a caller's start is refused past it.
+            Err(ceiling) => return WorkflowEventDelivery::ConcurrentRunsExceeded { ceiling },
+        };
+        let begun_job_runs = self.initiate_trigger_actions(region, trigger_name, &actions, now);
+        self.record_workflow_run_job_runs(&workflow_name, &run_id, &begun_job_runs);
+        ::tracing::info!(
+            trigger = %trigger_name,
+            workflow = %workflow_name,
+            run = %run_id,
+            job_runs = begun_job_runs.len(),
+            "a Glue EVENT trigger's batch fired and began a workflow run"
+        );
+        WorkflowEventDelivery::Fired { run_id }
     }
 
     /// Whether the store can hold another schema registry, i.e. is below
@@ -4872,6 +5054,22 @@ pub struct TriggerEntry {
     /// fire", absent for a trigger created without one.
     pub predicate: Option<Predicate>,
     pub event_batching_condition: Option<EventBatchingCondition>,
+    /// How many events EventBridge has delivered to this trigger's workflow since its
+    /// current batch opened, and `0` when no batch is open.
+    ///
+    /// Server-set and reported by no member of the `Trigger` shape: it is the accounting
+    /// the `EventBatchingCondition` is read against — "Number of events that must be
+    /// received from Amazon EventBridge before EventBridge event trigger fires"
+    /// ([`EventBatchingCondition$BatchSize`]) — so what a client observes of it is the
+    /// workflow run the batch starts and not the count itself. See [`Self::receive_event`].
+    ///
+    /// [`EventBatchingCondition$BatchSize`]: EventBatchingCondition
+    pub batched_events: i32,
+    /// When this trigger's current batch opened, and `None` when no batch is open:
+    /// "Window starts when first event is received" (`EventBatchingCondition$BatchWindow`),
+    /// so this is the instant the FIRST event of the open batch arrived and the window is
+    /// measured from it.
+    pub batch_window_opened_at: Option<SystemTime>,
     /// The request's `StartOnCreation`, as the create that stored this record sent it.
     ///
     /// Kept beside the definition because it is a member of the REQUEST rather than of the
@@ -4901,6 +5099,10 @@ impl TriggerEntry {
             actions: input.actions.clone(),
             predicate: input.predicate.clone(),
             event_batching_condition: input.event_batching_condition.clone(),
+            // A trigger a create registered has been handed no event yet, so no batch of
+            // one is open.
+            batched_events: 0,
+            batch_window_opened_at: None,
             start_on_creation: input.start_on_creation,
             tags: input.tags.clone().unwrap_or_default(),
         }
@@ -4990,6 +5192,105 @@ impl TriggerEntry {
         self.actions = update.actions.clone().unwrap_or_default();
         self.predicate = update.predicate.clone();
         self.event_batching_condition = update.event_batching_condition.clone();
+        // The batch open under the PREVIOUS condition was counted against the batch size
+        // and window that condition named, and this update overwrites both, so it is
+        // closed rather than carried over: the next event delivered opens a batch under
+        // the condition now in force.
+        self.close_event_batch();
+    }
+
+    /// Whether EventBridge deliveries to this trigger's workflow are counted against it.
+    ///
+    /// Only an `EVENT` trigger batches events — every other `TriggerType` fires on a
+    /// caller, the clock or a predicate — and a trigger a stop deactivated fires on
+    /// nothing at all ("Stops a specified trigger", `StopTrigger`), so a delivery is
+    /// counted against neither.
+    pub fn batches_events(&self) -> bool {
+        self.trigger_type == TRIGGER_TYPE_EVENT && self.state != TRIGGER_STATE_DEACTIVATED
+    }
+
+    /// How many events have to arrive before this trigger fires: "Number of events that
+    /// must be received from Amazon EventBridge before EventBridge event trigger fires"
+    /// (`EventBatchingCondition$BatchSize`), and [`DEFAULT_EVENT_BATCH_SIZE`] for a trigger
+    /// carrying no condition.
+    ///
+    /// Held at the member's lower bound (`@range 1..100`), so a stored zero cannot make the
+    /// trigger unfireable — the same floor a concurrency ceiling gets.
+    pub fn event_batch_size(&self) -> i32 {
+        self.event_batching_condition
+            .as_ref()
+            .map_or(DEFAULT_EVENT_BATCH_SIZE, |condition| {
+                condition.batch_size.max(DEFAULT_EVENT_BATCH_SIZE)
+            })
+    }
+
+    /// How long this trigger's open batch waits for the rest of its events: "Window of
+    /// time in seconds after which EventBridge event trigger fires"
+    /// (`EventBatchingCondition$BatchWindow`), and
+    /// [`DEFAULT_EVENT_BATCH_WINDOW_SECONDS`] for a condition that names none.
+    ///
+    /// Held at the member's lower bound of one second for the reason
+    /// [`Self::event_batch_size`] gives.
+    pub fn event_batch_window(&self) -> Duration {
+        let seconds = self
+            .event_batching_condition
+            .as_ref()
+            .and_then(|condition| condition.batch_window)
+            .and_then(|window| u64::try_from(window).ok())
+            .unwrap_or(DEFAULT_EVENT_BATCH_WINDOW_SECONDS);
+        Duration::from_secs(seconds.max(1))
+    }
+
+    /// Count ONE event EventBridge delivered to this trigger's workflow, and answer
+    /// whether the batch is now COMPLETE — i.e. whether the trigger fires.
+    ///
+    /// "Batch condition that must be met (specified number of events received or batch time
+    /// window expired) before EventBridge event trigger fires"
+    /// (`EventBatchingCondition`): this is the count half of that condition, so the batch
+    /// completes on the delivery that reaches [`Self::event_batch_size`] and the trigger
+    /// fires ONCE for it, however many events the batch coalesced. A delivery that does not
+    /// complete the batch fires nothing, which is what setting a batch size is FOR.
+    ///
+    /// The first event of a batch also opens its window, because "window starts when first
+    /// event is received" ([`Self::batch_window_due_at`]); a completed batch closes, so the
+    /// next event opens a new one.
+    pub fn receive_event(&mut self, now: SystemTime) -> bool {
+        self.batched_events = self.batched_events.saturating_add(1);
+        if self.batch_window_opened_at.is_none() {
+            self.batch_window_opened_at = Some(now);
+        }
+        if self.batched_events < self.event_batch_size() {
+            return false;
+        }
+        self.close_event_batch();
+        true
+    }
+
+    /// When the clock fires this trigger's open batch on its own, and `None` when no batch
+    /// is open: the instant its window runs out, which is the window measured from the
+    /// first event the batch received.
+    ///
+    /// The due instant is STORED (as the window's opening instant) rather than waited for:
+    /// the firing it owes is materialised by whichever later call reads the workflow's runs
+    /// ([`ComAmazonawsGlueAwsglueState::settle_due_event_batches`]), so nothing sleeps.
+    pub fn batch_window_due_at(&self) -> Option<SystemTime> {
+        if self.batched_events <= 0 {
+            return None;
+        }
+        Some(self.batch_window_opened_at? + self.event_batch_window())
+    }
+
+    /// Whether the clock has already run this trigger's open batch window out at `now`, so
+    /// the batch fires with the events it has.
+    pub fn batch_window_expired(&self, now: SystemTime) -> bool {
+        self.batch_window_due_at().is_some_and(|due| now >= due)
+    }
+
+    /// Close the open batch: the events it held have fired the trigger (or the window they
+    /// were waiting in has), so the next delivery opens a new batch and a new window.
+    fn close_event_batch(&mut self) {
+        self.batched_events = 0;
+        self.batch_window_opened_at = None;
     }
 
     /// Rebuild the modelled `Trigger` output shape from what is stored.
@@ -5009,6 +5310,47 @@ impl TriggerEntry {
             event_batching_condition: self.event_batching_condition.clone(),
         }
     }
+}
+
+/// What became of ONE event EventBridge delivered to a Glue workflow
+/// ([`ComAmazonawsGlueAwsglueState::notify_workflow_event`]).
+///
+/// The delivery is the `glue:notifyEvent` ingress, so this says whether the event was
+/// counted into a batch that has not filled yet, whether it completed the batch and began a
+/// run, and why no batch could be counted at all — which is what lets the caller that made
+/// the delivery report a handover the workflow accepted apart from one it could not make.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowEventDelivery {
+    /// The event was counted against the trigger's batch, which is not complete yet:
+    /// `received` of the `batch_size` events the condition asks for have arrived, so
+    /// nothing has fired.
+    Counted {
+        /// How many events the open batch now holds.
+        received: i32,
+        /// The `BatchSize` the batch is counted against
+        /// ([`TriggerEntry::event_batch_size`]).
+        batch_size: i32,
+    },
+    /// The event completed the batch, and the trigger fired: this run of the workflow
+    /// began.
+    Fired {
+        /// The `WorkflowRunId` of the run the firing began.
+        run_id: String,
+    },
+    /// The workflow's EVENT trigger is stopped, so nothing counts the event and nothing
+    /// fires — the delivery itself was still accepted.
+    Deactivated,
+    /// This account holds no workflow of that name, so there is nothing to deliver to.
+    NoWorkflow,
+    /// The workflow holds no EVENT trigger in this Region, so no batch exists for the event
+    /// to be counted against.
+    NoEventTrigger,
+    /// The batch completed, but the workflow is already running as many runs as its
+    /// `MaxConcurrentRuns` allows, so the firing began none.
+    ConcurrentRunsExceeded {
+        /// The ceiling the workflow named.
+        ceiling: i32,
+    },
 }
 
 /// Whether two action lists are the same actions, in the same order. The modelled `Action`

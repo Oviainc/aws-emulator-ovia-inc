@@ -61,6 +61,8 @@ mod global_endpoint;
 mod global_endpoint_deletion;
 #[path = "all/global_endpoint_identity.rs"]
 mod global_endpoint_identity;
+#[path = "all/glue_workflow_target_delivery.rs"]
+mod glue_workflow_target_delivery;
 #[path = "all/implicit_default_bus.rs"]
 mod implicit_default_bus;
 #[path = "all/input_transformation.rs"]

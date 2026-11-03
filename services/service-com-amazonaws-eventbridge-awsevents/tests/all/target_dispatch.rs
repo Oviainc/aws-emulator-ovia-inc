@@ -93,6 +93,12 @@ pub(crate) fn emulator() -> Emulator {
     router.register_service(
         service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService::new(Arc::clone(&engine)),
     );
+    // Glue: a rule target that is a workflow is delivered to by counting the event
+    // against that workflow's EVENT trigger, and the run it starts is read back through
+    // Glue's own `GetWorkflowRuns`.
+    router.register_service(
+        service_com_amazonaws_glue_awsglue::EmulatedService::new(Arc::clone(&engine)),
+    );
     Emulator { router, engine }
 }
 

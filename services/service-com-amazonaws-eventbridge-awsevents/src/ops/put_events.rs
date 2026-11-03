@@ -447,10 +447,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The other stores of this same engine this request reaches: the
-        // account's IAM records, which decide what a delivery may do, and the
-        // CloudWatch store this service's own metrics live in.
+        // account's IAM records, which decide what a delivery may do, the
+        // CloudWatch store this service's own metrics live in, and the Glue
+        // store a workflow target's event is counted in.
         let iam = crate::state::iam_state(&*self.engine);
         let cloudwatch = crate::state::cloudwatch_state(&*self.engine);
+        let glue = crate::state::glue_state(&*self.engine);
+        let stores = Stores {
+            iam: iam.as_ref(),
+            cloudwatch: cloudwatch.as_ref(),
+            glue: glue.as_ref(),
+        };
 
         // Every pattern match is counted on the matched rule's own
         // `MatchedEvents` and `TriggeredRules` metrics: the match is a fact about
@@ -552,8 +559,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             ctx,
                             &dispatch.region,
                             &mut clients,
-                            iam.as_ref(),
-                            cloudwatch.as_ref(),
+                            &stores,
                             &handover,
                             &mut budget,
                         )
@@ -1514,8 +1520,7 @@ pub(crate) async fn deliver(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     clients: &mut Clients,
-    iam: Option<&::engine::ServiceState<crate::state::IamState>>,
-    cloudwatch: Option<&::engine::ServiceState<crate::state::CloudWatchState>>,
+    stores: &Stores<'_>,
     handover: &Handover<'_>,
     budget: &mut DeliveryBudget,
 ) -> Option<crate::state::InvocationOutcome> {
@@ -1577,11 +1582,13 @@ pub(crate) async fn deliver(
         action: kind.action(),
         resource: &target.arn,
     };
-    let outcome = match role_refusal(iam, role_arn, &attempt) {
+    let outcome = match role_refusal(stores.iam, role_arn, &attempt) {
         Some((code, message)) => crate::state::InvocationOutcome::Failed { code, message },
         None => {
-            kind.invoke(ctx, clients, region, handover, body, &mut retries, budget)
-                .await
+            kind.invoke(
+                ctx, clients, stores, region, handover, body, &mut retries, budget,
+            )
+            .await
         }
     };
 
@@ -1593,9 +1600,101 @@ pub(crate) async fn deliver(
     // Every handover that reached the target's API is counted on the rule's own
     // invocation metrics, whichever way it went — a rule that is delivering is
     // as observable as one that is failing.
-    count_invocation(cloudwatch, handover, &outcome);
+    count_invocation(stores.cloudwatch, handover, &outcome);
     Some(outcome)
 }
+
+/// The stores of OTHER services in this same shared engine that one delivery
+/// reaches, carried together so each of them is resolved ONCE per request.
+///
+/// `None` for any of them is an engine with that service not mounted, which is
+/// evidence of nothing: the delivery goes ahead where the store only DECIDES it
+/// (IAM), and is recorded as not attempted where the store is what the delivery
+/// is MADE INTO (Glue).
+pub(crate) struct Stores<'a> {
+    /// The account's IAM records, which decide what a delivery may do.
+    pub(crate) iam: Option<&'a ::engine::ServiceState<crate::state::IamState>>,
+    /// The CloudWatch store this service's own invocation metrics live in.
+    pub(crate) cloudwatch: Option<&'a ::engine::ServiceState<crate::state::CloudWatchState>>,
+    /// The Glue store a workflow target's event is counted in.
+    pub(crate) glue: Option<&'a ::engine::ServiceState<crate::state::GlueState>>,
+}
+
+/// Hand ONE routed event to the Glue workflow `arn` names, and answer what came
+/// of the handover.
+///
+/// The rule AWS follows: an EventBridge rule whose target is a Glue workflow
+/// delivers every event it matched to that workflow, where the workflow's EVENT
+/// trigger counts it against its `EventBatchingCondition` and starts exactly one
+/// workflow run per completed batch. The counting and the firing belong to Glue —
+/// they are properties of the trigger, not of the rule — so they live in that
+/// service's own store ([`crate::state::GlueState::notify_workflow_event`]) and
+/// this is only the handover.
+///
+/// A handover Glue could not accept is a FAILED invocation carrying the error
+/// Glue states for the missing entity, so it is dead-lettered and counted on the
+/// rule's `FailedInvocations` like any other delivery the target refused; an
+/// engine with no Glue store at all is a gap in this emulator rather than a
+/// refusal, so nothing is attempted and nothing is invented for it.
+fn notify_workflow(
+    glue: Option<&::engine::ServiceState<crate::state::GlueState>>,
+    region: &str,
+    arn: &str,
+) -> crate::state::InvocationOutcome {
+    use ::service_com_amazonaws_glue_awsglue::state::{messages, WorkflowEventDelivery};
+
+    let Some(name) = ::service_common::arn::resource_id_of_type(arn, WORKFLOW_RESOURCE_TYPE)
+        .filter(|name| !name.is_empty())
+    else {
+        return crate::state::InvocationOutcome::NotAttempted(
+            "the target ARN names no workflow".to_string(),
+        );
+    };
+    let Some(glue) = glue else {
+        return crate::state::InvocationOutcome::NotAttempted(
+            "this emulator carries no Glue store to deliver the event to".to_string(),
+        );
+    };
+    // The guard is held for the handover alone, which is one counted event and at
+    // most the one run a completed batch starts.
+    let delivered = glue
+        .lock()
+        .notify_workflow_event(region, name, ::std::time::SystemTime::now());
+    match delivered {
+        // The workflow took the event: it is in the open batch, it completed the
+        // batch and started a run, or the workflow's trigger is stopped and
+        // nothing is waiting for it. Each is a delivery the target accepted.
+        WorkflowEventDelivery::Counted { .. }
+        | WorkflowEventDelivery::Fired { .. }
+        | WorkflowEventDelivery::Deactivated => crate::state::InvocationOutcome::Invoked,
+        WorkflowEventDelivery::NoWorkflow => crate::state::InvocationOutcome::Failed {
+            code: GLUE_ENTITY_NOT_FOUND_CODE.to_string(),
+            message: messages::workflow_not_found(name),
+        },
+        WorkflowEventDelivery::NoEventTrigger => crate::state::InvocationOutcome::Failed {
+            code: GLUE_ENTITY_NOT_FOUND_CODE.to_string(),
+            message: format!(
+                "Workflow {name} has no EVENT trigger to receive the event delivered to it."
+            ),
+        },
+        WorkflowEventDelivery::ConcurrentRunsExceeded { .. } => {
+            crate::state::InvocationOutcome::Failed {
+                code: GLUE_CONCURRENT_RUNS_EXCEEDED_CODE.to_string(),
+                message: messages::concurrent_workflow_runs_exceeded(name),
+            }
+        }
+    }
+}
+
+/// The error code Glue answers for an entity a request names and this account
+/// does not hold (`EntityNotFoundException`, "A specified entity does not
+/// exist"), which is what a handover to a workflow that is not there fails with.
+const GLUE_ENTITY_NOT_FOUND_CODE: &str = "EntityNotFoundException";
+
+/// The error code Glue answers for a run past a workflow's own ceiling
+/// (`ConcurrentRunsExceededException`), which is what a completed batch that
+/// could begin no run fails with.
+const GLUE_CONCURRENT_RUNS_EXCEEDED_CODE: &str = "ConcurrentRunsExceededException";
 
 /// Send the event to the target's dead-letter queue when `outcome` is a refusal,
 /// and do nothing for any other outcome.
@@ -1980,6 +2079,11 @@ enum TargetKind {
     /// endpoint the destination holds, carrying the event as the body (see
     /// [`invoke_api_destination`]).
     ApiDestination,
+    /// An AWS Glue workflow: the event is handed to that workflow's EVENT
+    /// trigger, which counts it against its `EventBatchingCondition` and starts
+    /// a workflow run once the batch is complete
+    /// ([`crate::state::GlueState::notify_workflow_event`]).
+    Workflow,
 }
 
 /// The ARN namespace of Amazon SQS, whose queues a rule delivers to.
@@ -1992,6 +2096,8 @@ const SNS_ARN_NAMESPACE: &str = "sns";
 const STATES_ARN_NAMESPACE: &str = "states";
 /// The ARN namespace of Amazon Kinesis, whose data streams a rule writes to.
 const KINESIS_ARN_NAMESPACE: &str = "kinesis";
+/// The ARN namespace of AWS Glue, whose workflows a rule drives.
+const GLUE_ARN_NAMESPACE: &str = "glue";
 
 /// The resource type a Lambda function ARN names.
 const FUNCTION_RESOURCE_TYPE: &str = "function";
@@ -2001,6 +2107,8 @@ const STATE_MACHINE_RESOURCE_TYPE: &str = "stateMachine";
 const API_DESTINATION_RESOURCE_TYPE: &str = "api-destination";
 /// The resource type a Kinesis data stream ARN names.
 const STREAM_RESOURCE_TYPE: &str = "stream";
+/// The resource type a Glue workflow ARN names.
+const WORKFLOW_RESOURCE_TYPE: &str = "workflow";
 
 impl TargetKind {
     /// The kind `arn` names, or `None` when this emulator has no invocation for
@@ -2046,6 +2154,16 @@ impl TargetKind {
             {
                 Some(Self::ApiDestination)
             }
+            // A workflow's ARN names the workflow directly (`workflow/<name>`):
+            // a resource carrying a further segment addresses something within a
+            // workflow (one of its runs) rather than the workflow, so no event
+            // is handed to it.
+            GLUE_ARN_NAMESPACE
+                if ::service_common::arn::resource_id_of_type(arn, WORKFLOW_RESOURCE_TYPE)
+                    .is_some_and(|name| !name.is_empty() && !name.contains(['/', ':'])) =>
+            {
+                Some(Self::Workflow)
+            }
             _ => None,
         }
     }
@@ -2060,6 +2178,10 @@ impl TargetKind {
             Self::StateMachine => "states:StartExecution",
             Self::Stream => "kinesis:PutRecord",
             Self::ApiDestination => "events:InvokeApiDestination",
+            // The action AWS requires of the role a Glue workflow target names,
+            // and the one no operation of the Glue model serves: the ingress
+            // EventBridge notifies a workflow's EVENT trigger through.
+            Self::Workflow => "glue:notifyEvent",
         }
     }
 
@@ -2075,6 +2197,7 @@ impl TargetKind {
         self,
         ctx: &smithy_server_runtime::OperationContext<'_>,
         clients: &mut Clients,
+        stores: &Stores<'_>,
         region: &str,
         handover: &Handover<'_>,
         body: &str,
@@ -2211,6 +2334,13 @@ impl TargetKind {
                 // decide nothing but which emulated service claims it.
                 invoke_api_destination(ctx, target, body, retries, budget).await
             }
+            // A Glue workflow is reached through the store of the Glue service
+            // in this SAME engine rather than through a client: the ingress
+            // EventBridge uses, `glue:notifyEvent`, is served by no operation of
+            // the Glue model, so there is no API call to make — the event is
+            // counted against the workflow's EVENT trigger where Glue's own
+            // readers read it.
+            Self::Workflow => notify_workflow(stores.glue, region, arn),
         }
     }
 
@@ -2223,6 +2353,7 @@ impl TargetKind {
             Self::StateMachine => STATES_ARN_NAMESPACE,
             Self::Stream => KINESIS_ARN_NAMESPACE,
             Self::ApiDestination => crate::state::ARN_NAMESPACE,
+            Self::Workflow => GLUE_ARN_NAMESPACE,
         }
     }
 
@@ -2242,8 +2373,9 @@ impl TargetKind {
             // An API destination is invoked under the target's role as well:
             // EventBridge needs `events:InvokeApiDestination` on the
             // destination, and the `RoleArn` the target names is what carries
-            // it.
-            Self::StateMachine | Self::ApiDestination | Self::Stream => true,
+            // it — and so is a Glue workflow, which needs `glue:notifyEvent` on
+            // the workflow off that same role.
+            Self::StateMachine | Self::ApiDestination | Self::Stream | Self::Workflow => true,
             Self::Queue | Self::Function | Self::Topic => false,
         }
     }
@@ -2829,13 +2961,14 @@ mod tests {
     /// along the resource type within a service, and along the forms that name no
     /// invocable resource at all.
     ///
-    /// The four kinds, and the action each needs, are the ones the EventBridge
+    /// The kinds, and the action each needs, are the ones the EventBridge
     /// targets reference states for them: `sqs:SendMessage` for a queue,
     /// `lambda:InvokeFunction` for a function, `sns:Publish` for a topic,
-    /// `states:StartExecution` for a state machine and `kinesis:PutRecord` for a
-    /// data stream. Which of them is invoked under the target's role is that
-    /// reference's other sentence: a role for a state machine and a Kinesis data
-    /// stream, a resource-based policy for a queue, a topic and a function.
+    /// `states:StartExecution` for a state machine, `kinesis:PutRecord` for a
+    /// data stream and `glue:notifyEvent` for a workflow. Which of them is
+    /// invoked under the target's role is that reference's other sentence: a role
+    /// for a state machine, a Kinesis data stream and a Glue workflow, a
+    /// resource-based policy for a queue, a topic and a function.
     #[test]
     fn a_target_arn_names_the_invocation_its_service_is_reached_by() {
         let account = ::engine::emulator_account_id();
@@ -2890,6 +3023,30 @@ mod tests {
                 Some(TargetKind::Stream),
                 Some("kinesis:PutRecord"),
                 true,
+            ),
+            (
+                "a Glue workflow",
+                format!("arn:aws:glue:eu-west-2:{account}:workflow/nightly"),
+                Some(TargetKind::Workflow),
+                Some("glue:notifyEvent"),
+                true,
+            ),
+            // A resource WITHIN a workflow rather than the workflow: a run is
+            // not something an event is delivered to.
+            (
+                "a Glue workflow run",
+                format!("arn:aws:glue:eu-west-2:{account}:workflow/nightly/run/wr_1"),
+                None,
+                None,
+                false,
+            ),
+            // A resource of the same service that is not a workflow at all.
+            (
+                "a Glue table",
+                format!("arn:aws:glue:eu-west-2:{account}:table/sales/orders"),
+                None,
+                None,
+                false,
             ),
             // A resource WITHIN a stream rather than the stream: a consumer is
             // not something a record is written to.

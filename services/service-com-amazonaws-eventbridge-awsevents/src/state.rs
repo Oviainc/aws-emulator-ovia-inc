@@ -3527,6 +3527,27 @@ pub fn cloudwatch_state<Eng: Send + Sync + 'static>(
 pub type MetricSeriesKey =
     ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::MetricKey;
 
+/// The Glue store a rule's WORKFLOW target is delivered to.
+///
+/// It is the Glue service's OWN state struct, reached through the SAME shared
+/// engine this service's store lives in, so a delivery is counted against the
+/// very EVENT trigger `CreateTrigger` wrote and the run it starts is the one
+/// `GetWorkflowRuns` reports. Glue publishes no API for the ingress EventBridge
+/// uses — the action a target's role carries is `glue:notifyEvent`, which no
+/// operation of the Glue model serves — so the delivery reaches that store
+/// directly, the way this service's own metrics reach CloudWatch's
+/// ([`count_rule_metric`]).
+pub type GlueState = ::service_com_amazonaws_glue_awsglue::ComAmazonawsGlueAwsglueState;
+
+/// The Glue store in the SAME shared engine, which is where a workflow and its
+/// triggers live. `None` means the engine carries no such store — a deployment
+/// with no Glue to deliver to, which is evidence of nothing.
+pub fn glue_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<GlueState>> {
+    ::service_com_amazonaws_glue_awsglue::state::service_state(engine)
+}
+
 /// Count ONE undeliverable event on the rule's `FailedInvocations` metric.
 ///
 /// "FailedInvocations: the number of invocations that failed permanently"

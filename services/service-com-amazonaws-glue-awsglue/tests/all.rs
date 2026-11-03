@@ -133,6 +133,8 @@ mod etl_connections;
 mod etl_jobs_and_connections;
 #[path = "all/event_batching_conditions.rs"]
 mod event_batching_conditions;
+#[path = "all/event_trigger_batch_firing.rs"]
+mod event_trigger_batch_firing;
 #[path = "all/federated_catalogs.rs"]
 mod federated_catalogs;
 #[path = "all/form_type_deletion.rs"]

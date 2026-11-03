@@ -160,6 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
+        // A batch of events this workflow's EVENT trigger was holding fires on its own once
+        // its window has run out, and the run that firing begins is a run of this workflow
+        // like any other — so it is materialised here, before the run is resolved, exactly
+        // as the statuses the runs already recorded were owed are.
+        store.settle_due_event_batches(&region, &input.name, now);
         // `Name` and `RunId` are both `@required` with `length 1..255`, so an absent or
         // over-long one is refused at the boundary: reaching here, the only question is
         // whether this account holds that workflow and that workflow holds that run.

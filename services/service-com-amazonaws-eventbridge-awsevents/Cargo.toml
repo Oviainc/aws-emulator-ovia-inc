@@ -62,6 +62,13 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # the identity the access key id a client's `PutEvents` presents speaks for,
 # together with that identity's own policies (`state::authorization`).
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# A rule target that is a Glue WORKFLOW is delivered to by counting the event
+# against that workflow's EVENT trigger in the Glue store of this same shared
+# engine (`ops::put_events`). Glue serves no API for that ingress — the action a
+# target's role carries, `glue:notifyEvent`, belongs to no operation of the Glue
+# model — so the delivery writes the very store `GetWorkflowRuns` reads, exactly
+# as this service's own metrics are written into CloudWatch's.
+service-com-amazonaws-glue-awsglue = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

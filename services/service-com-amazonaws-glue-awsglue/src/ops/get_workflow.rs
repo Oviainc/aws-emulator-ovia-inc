@@ -160,6 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
+        // A batch of events this workflow's EVENT trigger was holding fires on its own once
+        // its window has run out, and the run that firing begins is "the information about
+        // the last execution of the workflow" this read reports — so it is materialised
+        // here, before the workflow is read, exactly as the statuses its runs were owed are.
+        store.settle_due_event_batches(&region, &input.name, now);
         let Some(entry) = store.workflow_mut(&input.name) else {
             return Err(GetWorkflowErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
