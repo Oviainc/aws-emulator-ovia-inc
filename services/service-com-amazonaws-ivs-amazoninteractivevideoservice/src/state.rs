@@ -2,7 +2,8 @@
 
 //! Engine state for the com-amazonaws-ivs-amazoninteractivevideoservice service,
 //! plus the few rules more than one operation in the channel lifecycle applies
-//! (ARN minting, id minting, pagination tokens, the two type-dependent `Channel`
+//! (ARN minting, id minting, generating the secrets a caller ingests with,
+//! pagination tokens, the two type-dependent `Channel`
 //! rules the model documents, how this service WORDS the failures it answers, and
 //! the modelled constraints it enforces in its own handlers).
 
@@ -418,14 +419,21 @@ pub fn stream_key_count(
 /// Shared by `CreateChannel` (which mints a channel's first key) and
 /// `CreateStreamKey` (which adds another), so both produce keys of one form and
 /// both land in the one `stream_keys` map `ListStreamKeys` reads.
+///
+/// `None` when no secret was generated for the key's value; see
+/// [`generated_secret`].
 pub fn mint_stream_key(
     state: &mut ComAmazonawsIvsAmazoninteractivevideoserviceState,
+    credentials: &::emulator_server::CredentialStore,
     region: &str,
     channel_arn: &str,
     tags: Option<std::collections::HashMap<String, String>>,
-) -> StreamKey {
+) -> Option<StreamKey> {
     let id = state.mint_hex("stream-key", 6);
-    let secret = state.mint_hex("stream-key-value", 16);
+    // The key's last field is the ingest SECRET, so it is generated rather than
+    // derived (see [`generated_secret`]); the `[0-9a-f]` alphabet and the width are
+    // the ones this service's stream keys carry.
+    let secret = generated_secret(credentials, STREAM_KEY_SECRET_ALPHABET, STREAM_KEY_SECRET_LEN)?;
     let arn = stream_key_arn(region, &id);
     let key = StreamKey {
         arn: Some(arn.clone()),
@@ -434,7 +442,82 @@ pub fn mint_stream_key(
         tags: Some(tags.unwrap_or_default()),
     };
     state.stream_keys.insert(arn, key.clone());
-    key
+    Some(key)
+}
+
+/// Which characters a secret this service hands out is written in.
+///
+/// Neither of the two shapes that carry one (`StreamKeyValue` and `SrtPassphrase`) is
+/// constrained by the model — `smithy_query(query="shape",
+/// shape="StreamKeyValue,SrtPassphrase")` gives a bare `@sensitive` string for each — so
+/// the alphabet of each is this service's own, kept here beside the mint that applies it.
+type SecretAlphabet = fn(&char) -> bool;
+
+/// A stream key's last field reads as lowercase hexadecimal.
+const STREAM_KEY_SECRET_ALPHABET: SecretAlphabet = is_lowercase_hex;
+
+/// How many characters that field carries.
+const STREAM_KEY_SECRET_LEN: usize = 32;
+
+/// An `Srt` passphrase reads as mixed-case alphanumerics: the class AWS's auto-generated
+/// SRT ingest passphrase is shown in, and an alphabet an SRT client passes through
+/// unescaped in the `passphrase` parameter of its ingest URL.
+const SRT_PASSPHRASE_ALPHABET: SecretAlphabet = char::is_ascii_alphanumeric;
+
+/// How many characters an `Srt` passphrase carries.
+///
+/// The model states no width for `SrtPassphrase`, and SRT itself admits a passphrase of
+/// 10 to 79 characters, so this is the width of this service's generated ingest secrets —
+/// the same as [`STREAM_KEY_SECRET_LEN`], well inside what an SRT client accepts.
+const SRT_PASSPHRASE_LEN: usize = 32;
+
+fn is_lowercase_hex(character: &char) -> bool {
+    character.is_ascii_digit() || matches!(*character, 'a'..='f')
+}
+
+/// The auto-generated `passphrase` of a channel's `Srt` block: the one secret that
+/// enables encryption on this channel's SRT ingest.
+///
+/// `None` when no secret was generated for it; see [`generated_secret`].
+pub fn mint_srt_passphrase(credentials: &::emulator_server::CredentialStore) -> Option<String> {
+    generated_secret(credentials, SRT_PASSPHRASE_ALPHABET, SRT_PASSPHRASE_LEN)
+}
+
+/// `len` characters over `alphabet`, cut from a freshly GENERATED secret.
+///
+/// A stream key's value and an `Srt` passphrase are secrets handed to a caller — an
+/// encoder presents them to ingest — but neither is a credential of this emulator and
+/// neither may ever be accepted as one. Nothing in a service may construct a secret
+/// itself, so the characters come from a secret minted by the one component that
+/// generates them, the emulator's credential store, which is then removed from that store
+/// again: the caller gets the secret, the emulator keeps no credential it would accept,
+/// and nothing accumulates per call. Only the characters `alphabet` admits are kept,
+/// because the shape being filled carries no others.
+///
+/// This is what separates a secret from an id: [`ComAmazonawsIvsAmazoninteractivevideoserviceState::mint_hex`]
+/// derives an id from the store's mint counter, the clock and the process id, which makes
+/// ids unique by construction — fine for a channel id or a host label, and wrong for a
+/// secret, which must not be reproducible from the sequence of calls that produced it.
+///
+/// `None` when the store generated no secret, or one holding fewer than `len` usable
+/// characters, which leaves the operation to refuse ([`secret_unavailable`]) rather than
+/// report a value it made up.
+fn generated_secret(
+    credentials: &::emulator_server::CredentialStore,
+    alphabet: SecretAlphabet,
+    len: usize,
+) -> Option<String> {
+    let minted = credentials.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let secret: String = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .unwrap_or_default()
+        .chars()
+        .filter(alphabet)
+        .take(len)
+        .collect();
+    // Neither secret is a credential of this emulator; see above.
+    let _ = credentials.delete(&minted.id);
+    (secret.chars().count() == len).then_some(secret)
 }
 
 /// The `StreamState` of a channel that is ingesting, from the modelled
@@ -994,6 +1077,26 @@ pub fn store_unavailable<E>(variant: fn(InternalServerException) -> E) -> Scaffo
 /// The text [`store_unavailable`] states. AWS documents no message for this (it is an
 /// emulator fault, not a service behaviour), so it says plainly what failed.
 pub const STORE_UNAVAILABLE_MESSAGE: &str = "the IVS store is unavailable";
+
+/// The `InternalServerException` (HTTP 500) a create answers when the emulator's
+/// credential store generated no secret for the ingest credential it owes the caller —
+/// the emulator's own failure, like [`store_unavailable`]. A service never constructs a
+/// secret itself, so a create that cannot obtain one refuses rather than reporting a
+/// value it made up.
+pub fn secret_unavailable<E>(variant: fn(InternalServerException) -> E) -> Scaffolded<E> {
+    let message = SECRET_UNAVAILABLE_MESSAGE.to_string();
+    Scaffolded::stated(
+        variant(InternalServerException {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
+}
+
+/// The text [`secret_unavailable`] states, worded like [`STORE_UNAVAILABLE_MESSAGE`]:
+/// AWS documents no message for an emulator fault.
+pub const SECRET_UNAVAILABLE_MESSAGE: &str = "the IVS ingest secret generator is unavailable";
 
 /// The same fault as [`store_unavailable`] for the two BATCH reads, whose model declares
 /// `ServiceUnavailable` and not `InternalServerException`

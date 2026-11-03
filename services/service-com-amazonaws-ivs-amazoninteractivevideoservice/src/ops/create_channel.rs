@@ -230,7 +230,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let channel_id = store.mint_hex("channel", 6);
         let ingest_id = store.mint_hex("ingest", 6);
-        let srt_passphrase = store.mint_hex("srt-passphrase", 24);
+        // The passphrase is the channel's ingest SECRET, so it is generated rather than
+        // derived from the store's mint counter the way an id is.
+        let srt_passphrase = crate::state::mint_srt_passphrase(ctx.credential_store())
+            .ok_or_else(|| {
+                crate::state::secret_unavailable(
+                    CreateChannelErrorModeled::InternalServerException,
+                )
+            })?;
         let arn = crate::state::channel_arn(&region, &channel_id);
         let ingest_endpoint = format!("{ingest_id}.global-contribute.live-video.net");
         let channel = Channel {
@@ -259,8 +266,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             container_format: Some(container_format),
             ad_configuration_arn: Some(input.ad_configuration_arn.unwrap_or_default()),
         };
+        // The channel's first stream key is minted BEFORE the channel is persisted, so a
+        // call that cannot obtain the key's secret persists neither half of what AWS
+        // creates together.
+        let stream_key = crate::state::mint_stream_key(
+            &mut store,
+            ctx.credential_store(),
+            &region,
+            &arn,
+            None,
+        )
+        .ok_or_else(|| {
+            crate::state::secret_unavailable(CreateChannelErrorModeled::InternalServerException)
+        })?;
         store.channels.insert(arn.clone(), channel.clone());
-        let stream_key = crate::state::mint_stream_key(&mut store, &region, &arn, None);
 
         Ok(CreateChannelOutput {
             channel: Some(channel),

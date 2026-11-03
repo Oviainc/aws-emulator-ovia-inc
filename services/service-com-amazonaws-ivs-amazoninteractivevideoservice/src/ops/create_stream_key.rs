@@ -186,8 +186,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::arn_region(&input.channel_arn)
             .map(str::to_string)
             .unwrap_or_else(|| crate::state::request_region(ctx.parts()));
-        let stream_key =
-            crate::state::mint_stream_key(&mut store, &region, &input.channel_arn, input.tags);
+        let stream_key = crate::state::mint_stream_key(
+            &mut store,
+            ctx.credential_store(),
+            &region,
+            &input.channel_arn,
+            input.tags,
+        )
+        .ok_or_else(|| {
+            crate::state::secret_unavailable(CreateStreamKeyErrorModeled::InternalServerException)
+        })?;
 
         Ok(CreateStreamKeyOutput {
             stream_key: Some(stream_key),

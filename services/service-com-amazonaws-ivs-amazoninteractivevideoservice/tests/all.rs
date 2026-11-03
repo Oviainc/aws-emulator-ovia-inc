@@ -27,6 +27,8 @@ mod channel_lifecycle;
 mod default_sub_structures;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/generated_ingest_secrets.rs"]
+mod generated_ingest_secrets;
 #[path = "all/live_stream_reads.rs"]
 mod live_stream_reads;
 #[path = "all/playback_key_pair_import.rs"]
