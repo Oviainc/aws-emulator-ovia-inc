@@ -57,6 +57,8 @@ mod catalog_import_status;
 mod catalog_mutations;
 #[path = "all/catalog_projections.rs"]
 mod catalog_projections;
+#[path = "all/catalog_resource_deletion.rs"]
+mod catalog_resource_deletion;
 #[path = "all/catalog_resources.rs"]
 mod catalog_resources;
 #[path = "all/catalog_structure.rs"]

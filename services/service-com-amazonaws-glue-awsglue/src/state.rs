@@ -1795,6 +1795,29 @@ impl ComAmazonawsGlueAwsglueState {
             .and_then(|catalog| catalog.definition.as_ref())
     }
 
+    /// Remove the catalog RESOURCE `reference` names, handing back the entry that held
+    /// it, or `None` when this store holds no catalog of that name in that account — the
+    /// delete counterpart of [`Self::catalog_definition`], keyed the same way, so a
+    /// delete reaches a catalog under any casing of its name.
+    ///
+    /// The WHOLE entry goes, not just its definition: what a catalog holds is stored
+    /// inside it, which is the cascade a catalog delete describes ("you no longer have
+    /// access to the databases, tables ... and the user-defined functions in the deleted
+    /// catalog" — `DeleteCatalog`). An entry carrying no definition is a container no
+    /// create wrote — the account's own Data Catalog — and so no catalog resource a
+    /// delete addresses; it is left where it is.
+    pub fn remove_catalog(&mut self, reference: &CatalogReference) -> Option<Catalog> {
+        let key = child_catalog_id(&reference.account_id, &fold_name(&reference.name));
+        if self
+            .catalogs
+            .get(&key)
+            .is_none_or(|catalog| catalog.definition.is_none())
+        {
+            return None;
+        }
+        self.catalogs.remove(&key)
+    }
+
     /// The Data Catalog encryption settings `catalog_id` REPORTS: the record a
     /// `PutDataCatalogEncryptionSettings` stored for it, with each setting the stored
     /// record left unset filled in with that setting's default
@@ -12030,6 +12053,18 @@ pub mod messages {
     /// deliberately withheld — like [`DATABASE_ALREADY_EXISTS`] and unlike
     /// [`database_not_found`], whose recorded wording does name its resource.
     pub const CATALOG_NOT_FOUND: &str = "Catalog not found.";
+
+    /// A `DeleteCatalog` whose `CatalogId` addresses the account's own Data Catalog — the
+    /// catalog every account HAS, which holds the catalogs a create registers and is not
+    /// one of them.
+    ///
+    /// Recorded constant: that catalog is never deletable, and the refusal is the
+    /// operation's modelled `InvalidInputException` stating the rule a deletable catalog's
+    /// name satisfies, as whole fixed text — it interpolates nothing from the request or
+    /// from the store — rather than the miss a name holding no catalog earns
+    /// ([`CATALOG_NOT_FOUND`]).
+    pub const ROOT_CATALOG_NOT_DELETABLE: &str =
+        "Only lowercase letters, numbers, underscores and hyphens are allowed for catalog name";
 
     /// `CreateCatalog` for a `CatalogInput` that names no source outside the Glue Data
     /// Catalog. Recorded constant: the whole sentence is fixed text, naming neither the
