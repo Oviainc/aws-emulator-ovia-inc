@@ -11,6 +11,11 @@
 //! write stores nothing; a secret left on the Amazon Web Services managed key names
 //! no key a caller can act on, so nothing stands between its reads and its value.
 //!
+//! Pointing a secret at another key moves the versions the service's own staging
+//! labels reach to that key, re-encrypting each under it, so the key they came from
+//! is no longer needed to read them while a deprecated version keeps the key its own
+//! data key was wrapped by.
+//!
 //! The rows span what the rule generalises over rather than one recorded request:
 //! the FORM the secret names its key in (key ARN, bare key id, alias name, alias
 //! ARN), the member and size of the value (a short string, a large JSON document, a
@@ -673,77 +678,209 @@ async fn a_secret_on_the_service_managed_key_needs_no_customer_key() {
 }
 
 #[tokio::test]
-async fn each_version_opens_under_the_key_it_was_sealed_with() {
-    let emulator = Emulator::new();
-    let case = "a secret pointed at a second key";
-    let (first_key, _) = emulator.create_key(case).await;
-    let (second_key, _) = emulator.create_key(case).await;
-    let name = "re-keyed";
-    let original = ValueCase::string("the first value", "under-the-first-key");
-    emulator
-        .sm_ok(
-            "CreateSecret",
-            &create_body(name, Some(&first_key), &original),
-            case,
-        )
-        .await;
+async fn a_key_change_moves_the_staged_versions_to_the_new_key() {
+    // "The ARN, key ID, or alias of the KMS key that Secrets Manager uses to
+    // encrypt new secret versions as well as any existing versions with the
+    // staging labels AWSCURRENT, AWSPENDING, or AWSPREVIOUS."
+    // (`UpdateSecretRequest$KmsKeyId`, this service's Smithy model.) So pointing a
+    // secret at another key re-encrypts the versions those labels reach, and the
+    // key they came from is no longer needed to read them; a DEPRECATED version
+    // carries none of those labels, so it keeps opening under the key its own data
+    // key was wrapped by.
+    //
+    // The rows span the key the update names — another customer managed key, and
+    // the Amazon Web Services managed key, which the empty string names — and
+    // whether the same call also stores a value, since the key change is what
+    // moves the versions either way.
+    for (form, names_a_customer_key) in [
+        ("another customer managed key", true),
+        ("the Amazon Web Services managed key", false),
+    ] {
+        for carries_a_value in [false, true] {
+            let case = format!("{form}, carrying a value: {carries_a_value}");
+            let emulator = Emulator::new();
+            let (first_key, _) = emulator.create_key(&case).await;
+            let (second_key, _) = emulator.create_key(&case).await;
+            let name = format!(
+                "re-keyed-{}-{carries_a_value}",
+                if names_a_customer_key { "cmk" } else { "managed" }
+            );
 
-    // "If you change the KMS key, Secrets Manager does not re-encrypt existing
-    // secret versions with the new key" (`UpdateSecretRequest$KmsKeyId`, this
-    // service's Smithy model): the new version is sealed under the new key and the
-    // old one keeps the key it was sealed under.
-    let replacement = ValueCase::string("the second value", "under-the-second-key");
+            // Three versions under the FIRST key, which leaves the oldest
+            // deprecated: AWSCURRENT on the third, AWSPREVIOUS on the second, no
+            // label at all on the first.
+            let deprecated = ValueCase::string("the deprecated value", "value-one");
+            let created = emulator
+                .sm_ok(
+                    "CreateSecret",
+                    &create_body(&name, Some(&first_key), &deprecated),
+                    &case,
+                )
+                .await;
+            let deprecated_id = version_id_of(&created, &case);
+            let previous = ValueCase::string("the previous value", "value-two");
+            let previous_id = version_id_of(
+                &emulator
+                    .sm_ok("PutSecretValue", &value_body(&name, &previous), &case)
+                    .await,
+                &case,
+            );
+            let current = ValueCase::string("the current value", "value-three");
+            let current_id = version_id_of(
+                &emulator
+                    .sm_ok("PutSecretValue", &value_body(&name, &current), &case)
+                    .await,
+                &case,
+            );
+
+            // The key change, with or without a value of its own.
+            let written = ValueCase::string("the written value", "value-four");
+            let named_key = if names_a_customer_key {
+                second_key.clone()
+            } else {
+                String::new()
+            };
+            let mut body = Map::new();
+            body.insert("SecretId".to_string(), json!(name.clone()));
+            body.insert("KmsKeyId".to_string(), json!(named_key));
+            if carries_a_value {
+                if let Value::Object(members) = written.wire_members() {
+                    body.extend(members);
+                }
+            }
+            emulator
+                .sm_ok("UpdateSecret", &Value::Object(body), &case)
+                .await;
+            // Only a value creates a version, so a key change stages nothing: the
+            // label a rotation would stage resolves nothing at all.
+            let (code, message) = emulator
+                .sm_err(
+                    "GetSecretValue",
+                    &json!({"SecretId": name.clone(), "VersionStage": "AWSPENDING"}),
+                    &case,
+                )
+                .await;
+            assert_eq!(
+                code, "ResourceNotFoundException",
+                "case {case:?}: expected the key change to stage no version, got {code} with \
+                 {message:?}"
+            );
+            assert_eq!(
+                message,
+                "Secrets Manager can't find the specified secret value for staging label: \
+                 AWSPENDING",
+                "case {case:?}: expected the staging-label sentence, got {message:?}"
+            );
+            // The secret is on the named key, so its current version is held as
+            // that key holds a value: sealed under a customer managed key, and as
+            // sent on the key no caller can act on.
+            assert_eq!(
+                emulator.current_version_is_sealed(&name, &case),
+                names_a_customer_key,
+                "case {case:?}: expected the current version to be sealed only under a customer \
+                 managed key"
+            );
+
+            // With the FIRST key disabled, every version the labels reached is
+            // still readable: the change moved them off that key.
+            emulator
+                .kms_ok("DisableKey", &json!({"KeyId": first_key.clone()}), &case)
+                .await;
+            let expected_current = if carries_a_value { &written } else { &current };
+            expected_current.assert_round_trip(
+                &emulator
+                    .sm_ok("GetSecretValue", &json!({"SecretId": name.clone()}), &case)
+                    .await,
+                &case,
+            );
+            for (labelled, value) in [(&current_id, &current), (&previous_id, &previous)] {
+                value.assert_round_trip(
+                    &emulator
+                        .sm_ok(
+                            "GetSecretValue",
+                            &json!({"SecretId": name.clone(), "VersionId": labelled.clone()}),
+                            &case,
+                        )
+                        .await,
+                    &case,
+                );
+            }
+
+            // The deprecated version carried none of those labels, so it was left
+            // under the key it was sealed with and that key's state refuses it.
+            let (code, message) = emulator
+                .sm_err(
+                    "GetSecretValue",
+                    &json!({"SecretId": name.clone(), "VersionId": deprecated_id.clone()}),
+                    &case,
+                )
+                .await;
+            assert_eq!(
+                code, "DecryptionFailure",
+                "case {case:?}: expected the version the change left under the disabled key to \
+                 be refused, got {code} with {message:?}"
+            );
+            assert_relays_kms(
+                &message,
+                DECRYPTION_SENTENCE,
+                "DisabledException",
+                "is disabled.",
+                &case,
+            );
+            assert!(
+                message.contains(&first_key),
+                "case {case:?}: expected the relayed refusal to name the key {first_key}, got \
+                 {message:?}"
+            );
+
+            // And the key the versions moved TO is now the one their reads depend
+            // on — while a secret moved to the managed key names no key a caller
+            // can act on, so nothing stands between its reads and its value.
+            emulator
+                .kms_ok("DisableKey", &json!({"KeyId": second_key.clone()}), &case)
+                .await;
+            if names_a_customer_key {
+                let (code, message) = emulator
+                    .sm_err("GetSecretValue", &json!({"SecretId": name.clone()}), &case)
+                    .await;
+                assert_eq!(
+                    code, "DecryptionFailure",
+                    "case {case:?}: expected the read to depend on the new key, got {code} with \
+                     {message:?}"
+                );
+                assert!(
+                    message.contains(&second_key),
+                    "case {case:?}: expected the relayed refusal to name the new key \
+                     {second_key}, got {message:?}"
+                );
+            } else {
+                expected_current.assert_round_trip(
+                    &emulator
+                        .sm_ok("GetSecretValue", &json!({"SecretId": name.clone()}), &case)
+                        .await,
+                    &case,
+                );
+            }
+        }
+    }
+}
+
+/// The `VersionId` a write reported.
+fn version_id_of(body: &Value, case: &str) -> String {
+    body["VersionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no VersionId in {body}"))
+        .to_string()
+}
+
+/// A write body naming `name` and carrying this value.
+fn value_body(name: &str, value: &ValueCase) -> Value {
     let mut body = Map::new();
     body.insert("SecretId".to_string(), json!(name));
-    body.insert("KmsKeyId".to_string(), json!(second_key));
-    if let Value::Object(members) = replacement.wire_members() {
+    if let Value::Object(members) = value.wire_members() {
         body.extend(members);
     }
-    emulator
-        .sm_ok("UpdateSecret", &Value::Object(body), case)
-        .await;
-
-    let current = emulator
-        .sm_ok("GetSecretValue", &json!({"SecretId": name}), case)
-        .await;
-    replacement.assert_round_trip(&current, case);
-    let previous = emulator
-        .sm_ok(
-            "GetSecretValue",
-            &json!({"SecretId": name, "VersionStage": "AWSPREVIOUS"}),
-            case,
-        )
-        .await;
-    original.assert_round_trip(&previous, case);
-
-    // Disabling the FIRST key refuses the version that key sealed, and only that
-    // one: each version is opened under the key its own data key was wrapped by.
-    emulator
-        .kms_ok("DisableKey", &json!({"KeyId": first_key}), case)
-        .await;
-    let (code, message) = emulator
-        .sm_err(
-            "GetSecretValue",
-            &json!({"SecretId": name, "VersionStage": "AWSPREVIOUS"}),
-            case,
-        )
-        .await;
-    assert_eq!(
-        code, "DecryptionFailure",
-        "case {case:?}: expected the version sealed under the disabled key to be refused, got \
-         {code} with {message:?}"
-    );
-    assert_relays_kms(
-        &message,
-        DECRYPTION_SENTENCE,
-        "DisabledException",
-        "is disabled.",
-        case,
-    );
-    let still_current = emulator
-        .sm_ok("GetSecretValue", &json!({"SecretId": name}), case)
-        .await;
-    replacement.assert_round_trip(&still_current, case);
+    Value::Object(body)
 }
 
 #[tokio::test]

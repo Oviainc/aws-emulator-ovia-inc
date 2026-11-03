@@ -58,6 +58,22 @@ pub fn is_reserved_stage(stage: &str) -> bool {
     matches!(stage, STAGE_CURRENT | STAGE_PREVIOUS | STAGE_PENDING)
 }
 
+/// Whether a version claiming the staging labels `claimed` cancels a pending
+/// one.
+///
+/// `AWSPENDING` "indicates the version of the secret that contains new secret
+/// information that will become the next current version when rotation
+/// finishes" (`DescribeSecretResponse$VersionIdsToStages`, this service's Smithy
+/// model), so the label names a candidate for the CURRENT value. Minting a new
+/// current version decides that value without that candidate, which leaves
+/// nothing for the label to name: the candidate is cancelled, and the version it
+/// sat on carries no label at all. A write that re-stages `AWSPENDING` on the
+/// version it mints names its own candidate instead, so it cancels nothing.
+fn cancels_pending_version(claimed: &[String]) -> bool {
+    claimed.iter().any(|stage| stage == STAGE_CURRENT)
+        && !claimed.iter().any(|stage| stage == STAGE_PENDING)
+}
+
 /// Secrets Manager appends "a hyphen and six random characters after the secret
 /// name at the end of the ARN" (`CreateSecretRequest$Name`, this service's
 /// Smithy model).
@@ -1331,6 +1347,46 @@ impl Secret {
         self.versions.iter().find(|v| v.has_stage(stage))
     }
 
+    /// The stored value of every version that carries one of the staging labels
+    /// the service itself moves, by version id.
+    ///
+    /// These are the versions a change of the secret's key moves to that key:
+    /// `KmsKeyId` is "the KMS key that Secrets Manager uses to encrypt new
+    /// secret versions as well as any existing versions with the staging labels
+    /// AWSCURRENT, AWSPENDING, or AWSPREVIOUS" (`UpdateSecretRequest$KmsKeyId`,
+    /// this service's Smithy model) — a deprecated version carries none of them
+    /// and keeps the key it was sealed under.
+    pub fn staged_version_values(&self) -> Vec<(String, envelope::StoredValue)> {
+        self.versions
+            .iter()
+            .filter(|version| {
+                version
+                    .version_stages
+                    .iter()
+                    .any(|held| is_reserved_stage(held))
+            })
+            .map(|version| (version.version_id.clone(), version.value.clone()))
+            .collect()
+    }
+
+    /// Replace the stored value of the version `version_id` with `value`, the
+    /// same plaintext sealed under the key the secret is now on.
+    ///
+    /// Only a re-encryption reaches here: a version's VALUE is never otherwise
+    /// modified ("You can't modify an existing version, you can only create a
+    /// new version", `UpdateSecret`, this service's Smithy model), so what this
+    /// changes is the key the bytes are held under and nothing a caller reads.
+    /// A version that has since gone is left alone.
+    pub fn reseal_version(&mut self, version_id: &str, value: envelope::StoredValue) {
+        if let Some(version) = self
+            .versions
+            .iter_mut()
+            .find(|version| version.version_id == version_id)
+        {
+            version.value = value;
+        }
+    }
+
     /// Every version that still carries a staging label, mapped to its labels.
     /// A version with no label is deprecated and is left out, which is what
     /// makes this map the live staging state rather than a version history.
@@ -1627,6 +1683,11 @@ impl Secret {
     /// every time — the caller is refused with the modelled quota error rather
     /// than growing the store.
     ///
+    /// A put that cancels a pending version ([`cancels_pending_version`]) takes
+    /// `AWSPENDING` away too, so it frees a version that carried only that
+    /// label: the two have to agree about what the put takes away, or a write
+    /// that does make room is refused by the quota.
+    ///
     /// [`put_version`]: Secret::put_version
     pub fn has_room_for_version(&self, claimed: &[String]) -> bool {
         if self.versions.len() < VERSIONS_PER_SECRET {
@@ -1634,11 +1695,11 @@ impl Secret {
         }
         let demotes = claimed.iter().any(|stage| stage == STAGE_CURRENT)
             && !claimed.iter().any(|stage| stage == STAGE_PREVIOUS);
+        let cancels_pending = cancels_pending_version(claimed);
         self.versions.iter().any(|existing| {
-            let freed = existing
-                .version_stages
-                .iter()
-                .all(|held| claimed.contains(held));
+            let freed = existing.version_stages.iter().all(|held| {
+                claimed.contains(held) || (cancels_pending && held == STAGE_PENDING)
+            });
             freed && !(demotes && existing.has_stage(STAGE_CURRENT))
         })
     }
@@ -1653,8 +1714,22 @@ impl Secret {
     /// left with no label stays stored (it is still addressable by `VersionId`)
     /// but is deprecated, and is the first thing evicted once the secret holds
     /// more than [`VERSIONS_PER_SECRET`] versions.
+    ///
+    /// A new version that takes `AWSCURRENT` without re-staging `AWSPENDING`
+    /// also takes `AWSPENDING` off whichever version held it, and releases a
+    /// rotation's reservation of it: see [`cancels_pending_version`].
     pub fn put_version(&mut self, version: SecretVersion, at: SystemTime) {
         let claimed = version.version_stages.clone();
+        // Minting the current value from somewhere other than the pending
+        // candidate cancels that candidate, so the version it sat on is left
+        // carrying no staging label — its value stays addressable by
+        // `VersionId` like any deprecated version's.
+        if cancels_pending_version(&claimed) {
+            for existing in &mut self.versions {
+                existing.version_stages.retain(|held| held != STAGE_PENDING);
+            }
+            self.pending_rotation_version_id = None;
+        }
         // A rotation reserves the id of the version its rotation function will
         // create and stakes `AWSPENDING` on it, so a version arriving under that
         // id — or any version claiming that label — is that label moving onto a

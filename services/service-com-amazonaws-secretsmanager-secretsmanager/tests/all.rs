@@ -25,6 +25,8 @@ mod secret_error_responses;
 mod secret_kms_key_state;
 #[path = "all/secret_lifecycle.rs"]
 mod secret_lifecycle;
+#[path = "all/secret_pending_eviction.rs"]
+mod secret_pending_eviction;
 #[path = "all/secret_policy_validation.rs"]
 mod secret_policy_validation;
 #[path = "all/secret_public_policy_message.rs"]

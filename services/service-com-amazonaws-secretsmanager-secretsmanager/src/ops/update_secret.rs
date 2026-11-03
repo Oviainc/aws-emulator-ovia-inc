@@ -8,8 +8,12 @@
 //! That new version is stored under the key this call leaves the secret on, so
 //! storing it means encrypting it under that key ([`crate::state::envelope`]): a
 //! key KMS will not encrypt with makes this update `EncryptionFailure`, and changes
-//! nothing. A call carrying no value encrypts nothing and is not affected by the
-//! key's state.
+//! nothing.
+//!
+//! A call that names another `KmsKeyId` moves the secret's staged versions to that
+//! key as well, re-encrypting each one under it, so the key the secret came from is
+//! no longer needed to read them. A call carrying neither a value nor another key
+//! encrypts nothing and is not affected by any key's state.
 //!
 //! ## Shape of an operation
 //!
@@ -294,7 +298,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What this update is refused for, and the key the new value is to be
         // stored under, decided under the store's guard; sealing that value is a
         // call to KMS, which cannot be made while the guard is held.
-        let target = {
+        let (target, staged) = {
             let mut store = state.lock();
             let now = ::std::time::SystemTime::now();
             // The permanent removal the clock has already made due, materialised
@@ -305,12 +309,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // rather than succeed.
             store.expire_due(now);
 
-            admit(
+            let target = admit(
                 store.get(&input.secret_id),
                 &version_id,
                 value.as_ref(),
                 input.kms_key_id.as_deref(),
-            )?
+            )?;
+            // The versions a key change moves to the new key, carried out of the
+            // guard with the values they are held as: re-encrypting one is a pair
+            // of KMS calls, which cannot be made while the guard is held.
+            let staged = store
+                .get(&input.secret_id)
+                .filter(|secret| {
+                    moves_to_another_key(
+                        secret.kms_key_id.as_deref(),
+                        target.kms_key_id.as_deref(),
+                    )
+                })
+                .map(crate::state::Secret::staged_version_values)
+                .unwrap_or_default();
+            (target, staged)
         };
 
         // The new value is stored under that key, so storing it means encrypting it
@@ -332,6 +350,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             None => None,
         };
+
+        // "The ARN, key ID, or alias of the KMS key that Secrets Manager uses to
+        // encrypt new secret versions as well as any existing versions with the
+        // staging labels AWSCURRENT, AWSPENDING, or AWSPREVIOUS."
+        // (`UpdateSecretRequest$KmsKeyId`, this service's Smithy model.) Pointing
+        // the secret at another key therefore re-encrypts those versions under it:
+        // each is opened under the key holding it and sealed again under the new
+        // one, which is what leaves the key the secret came from no longer needed
+        // to read them.
+        let resealed = reseal_staged(ctx, &region, &target, staged).await?;
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -371,6 +399,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             secret.secret_type = input.r#type.clone();
         }
         secret.last_changed_date = now;
+
+        // The staged versions, now held under the key this call leaves the secret
+        // on. The bytes a caller reads are the same ones; only the key they are
+        // sealed under changed.
+        for (staged_id, staged_value) in resealed {
+            secret.reseal_version(&staged_id, staged_value);
+        }
 
         // "If you include SecretString or SecretBinary to create a new secret
         // version, Secrets Manager automatically moves the staging label
@@ -496,6 +531,76 @@ fn admit(
 fn missing_client_request_token() -> UpdateSecretError {
     UpdateSecretErrorModeled::InvalidRequestException(InvalidRequestException {
         message: Some(crate::state::MISSING_CLIENT_REQUEST_TOKEN_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// Whether this call leaves the secret on a KMS key other than the one its stored
+/// versions are held under, and so has to move them to it.
+///
+/// A secret names its key in any of the forms `KmsKeyId` accepts, and every
+/// spelling of the Amazon Web Services managed key names the one key no caller can
+/// act on, so what is compared is the customer managed key each value NAMES rather
+/// than the two strings (see [`crate::state::envelope::customer_managed_key`]).
+fn moves_to_another_key(held_under: Option<&str>, resolved: Option<&str>) -> bool {
+    crate::state::envelope::customer_managed_key(held_under)
+        != crate::state::envelope::customer_managed_key(resolved)
+}
+
+/// Re-encrypt `staged` — the versions carrying the staging labels the service
+/// moves — under the key this call leaves the secret on, answering each version
+/// with the value it is now held as.
+///
+/// A version is opened under the key that holds it and sealed again under the new
+/// one: the plaintext is unchanged, so nothing a caller reads moves. A version
+/// the new key will not encrypt is left out and stays under the key already
+/// holding it — "If you don't have kms:Encrypt permission to the new key, Secrets
+/// Manager does not re-encrypt existing secret versions with the new key"
+/// (`UpdateSecretRequest$KmsKeyId`, this service's Smithy model) — while a version
+/// that cannot be OPENED at all refuses this update with `DecryptionFailure`,
+/// since a value this service cannot read is one it cannot move to another key.
+async fn reseal_staged(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    target: &Target,
+    staged: Vec<(String, crate::state::envelope::StoredValue)>,
+) -> Result<Vec<(String, crate::state::envelope::StoredValue)>, UpdateSecretError> {
+    let mut resealed = Vec::with_capacity(staged.len());
+    for (staged_id, stored) in staged {
+        let context = crate::state::envelope::ValueContext::new(&target.arn, &staged_id);
+        let opened = crate::state::envelope::open(ctx, region, &context, &stored)
+            .await
+            .map_err(decryption_failure)?;
+        match crate::state::envelope::seal(
+            ctx,
+            region,
+            target.kms_key_id.as_deref(),
+            &context,
+            &opened,
+        )
+        .await
+        {
+            Ok(sealed) => resealed.push((staged_id, sealed)),
+            Err(refusal) => {
+                ::tracing::debug!(
+                    version_id = %staged_id,
+                    refusal = ?refusal,
+                    "the new key did not encrypt this version, which stays under the key \
+                     holding it"
+                );
+            }
+        }
+    }
+    Ok(resealed)
+}
+
+/// `DecryptionFailure` — "Secrets Manager can't decrypt the protected secret text
+/// using the provided KMS key." — for a stored version this update had to read,
+/// to move it to another key, and whose key would not decrypt it, relaying the KMS
+/// refusal (see [`crate::state::envelope::KmsRefusal`]).
+fn decryption_failure(refusal: crate::state::envelope::KmsRefusal) -> UpdateSecretError {
+    UpdateSecretErrorModeled::DecryptionFailure(DecryptionFailure {
+        message: Some(refusal.decryption_failure_message()),
     })
     .into()
 }

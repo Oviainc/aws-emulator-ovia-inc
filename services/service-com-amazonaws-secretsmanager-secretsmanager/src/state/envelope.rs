@@ -205,10 +205,10 @@ enum Content {
 #[derive(Clone)]
 struct Sealed {
     /// The `CiphertextBlob` KMS wrapped the data key as. Only the key that wrapped
-    /// it can unwrap it, and the blob names that key, so a version stays readable
-    /// after the secret is pointed at another key — "Secrets Manager does not
-    /// re-encrypt existing secret versions with the new key"
-    /// (`UpdateSecretRequest$KmsKeyId`, this service's Smithy model).
+    /// it can unwrap it, and the blob names that key, so a version is opened under
+    /// the key it was sealed with whatever key the secret names now — which is what
+    /// keeps a version the secret's key change did not re-encrypt readable (see
+    /// [`crate::ops::update_secret`]).
     wrapped_data_key: Vec<u8>,
     nonce: [u8; NONCE_LEN],
     body: Vec<u8>,
@@ -433,7 +433,7 @@ pub async fn open(
 /// Secrets Manager uses the Amazon Web Services managed key `aws/secretsmanager`"
 /// (`CreateSecretRequest$KmsKeyId`, this service's Smithy model), which an empty
 /// string names too (`UpdateSecretRequest$KmsKeyId`).
-fn customer_managed_key(kms_key_id: Option<&str>) -> Option<&str> {
+pub fn customer_managed_key(kms_key_id: Option<&str>) -> Option<&str> {
     kms_key_id.filter(|key| !key.is_empty() && !super::names_default_kms_key(key))
 }
 
