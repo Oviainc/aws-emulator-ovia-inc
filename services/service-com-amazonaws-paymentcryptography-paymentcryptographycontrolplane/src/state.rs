@@ -564,6 +564,44 @@ impl StoredKey {
         self.usage_stop_timestamp = None;
     }
 
+    /// Add or replace `tags` on this key, leaving every tag it carries under another
+    /// key where it is.
+    ///
+    /// From `TagResource`'s own documentation: "To add a tag, specify a new tag key
+    /// and a tag value. To edit a tag, specify an existing tag key and a new tag
+    /// value" — so this is a per-tag-key merge, not a replacement of the whole set.
+    /// Nothing is written when the request is refused: the merged set is judged
+    /// first, so a refused call leaves the key's tags exactly as they were.
+    pub fn apply_tags(&mut self, tags: &[Tag]) -> Result<(), TagRejection> {
+        let updates = tag_map(tags)?;
+        let mut merged = self.tags.clone();
+        merged.extend(updates);
+        if merged.len() > MAX_TAGS {
+            return Err(TagRejection::QuotaExceeded(format!(
+                "a key cannot carry more than {MAX_TAGS} tags, and this request would \
+                 leave it carrying {}",
+                merged.len()
+            )));
+        }
+        self.tags = merged;
+        Ok(())
+    }
+
+    /// Remove every tag in `tag_keys` from this key and answer how many were
+    /// removed.
+    ///
+    /// From `UntagResource`'s `TagKeys` documentation: "If the Amazon Web Services
+    /// Payment Cryptography key doesn't have the specified tag key, Amazon Web
+    /// Services Payment Cryptography doesn't throw an exception or return a
+    /// response" — so a key this record does not carry removes nothing and is not a
+    /// failure.
+    pub fn remove_tags(&mut self, tag_keys: &[String]) -> usize {
+        tag_keys
+            .iter()
+            .filter(|tag_key| self.tags.remove(*tag_key).is_some())
+            .count()
+    }
+
     /// Replicate this key to `regions` from `now`, and answer `None` — storing
     /// nothing — when that would take it past [`MAX_KEY_REPLICATION_REGIONS`].
     ///
@@ -748,6 +786,28 @@ pub enum MintRejection {
     Invalid(String),
     /// The store is full; the message says so.
     QuotaExceeded(String),
+}
+
+/// Why a tag list could not be stored on a key.
+///
+/// Separate from [`MintRejection`] because a tag update is judged by the same two
+/// rules whether it arrives with a create or on its own, and each handler answers
+/// the modelled error its own operation declares for that class.
+#[derive(Debug, Clone)]
+pub enum TagRejection {
+    /// The tag list is inadmissible; the message says why, naming the member.
+    Invalid(String),
+    /// Storing it would take the key past [`MAX_TAGS`]; the message says so.
+    QuotaExceeded(String),
+}
+
+impl From<TagRejection> for MintRejection {
+    fn from(rejection: TagRejection) -> Self {
+        match rejection {
+            TagRejection::Invalid(why) => MintRejection::Invalid(why),
+            TagRejection::QuotaExceeded(why) => MintRejection::QuotaExceeded(why),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1288,9 +1348,9 @@ fn key_class_rejection(attributes: &KeyAttributes) -> Option<String> {
 /// an Amazon Web Services Payment Cryptography key with the same tag key." The
 /// `aws:` prefix is reserved for tags AWS itself sets, across every service, so a
 /// caller-supplied key carrying it is refused rather than stored.
-fn tag_map(tags: &[Tag]) -> Result<BTreeMap<String, String>, MintRejection> {
+fn tag_map(tags: &[Tag]) -> Result<BTreeMap<String, String>, TagRejection> {
     if tags.len() > MAX_TAGS {
-        return Err(MintRejection::Invalid(format!(
+        return Err(TagRejection::Invalid(format!(
             "Tags carries {} entries, more than the {MAX_TAGS} this service accepts",
             tags.len()
         )));
@@ -1298,14 +1358,14 @@ fn tag_map(tags: &[Tag]) -> Result<BTreeMap<String, String>, MintRejection> {
     let mut map = BTreeMap::new();
     for tag in tags {
         if tag.key.to_ascii_lowercase().starts_with(RESERVED_TAG_PREFIX) {
-            return Err(MintRejection::Invalid(format!(
+            return Err(TagRejection::Invalid(format!(
                 "Tags carries the tag key '{}', and the '{RESERVED_TAG_PREFIX}' prefix \
                  is reserved",
                 tag.key
             )));
         }
         if map.insert(tag.key.clone(), tag.value.clone()).is_some() {
-            return Err(MintRejection::Invalid(format!(
+            return Err(TagRejection::Invalid(format!(
                 "Tags carries the tag key '{}' more than once; a key may carry each \
                  tag key only once",
                 tag.key
@@ -1458,6 +1518,14 @@ pub fn record_mutation(parts: &::http::request::Parts, operation: &str, resource
     );
 }
 
+/// One tag as the modelled `Tag` structure.
+pub fn tag(key: &str, value: &str) -> Tag {
+    Tag {
+        key: key.to_string(),
+        value: value.to_string(),
+    }
+}
+
 /// An alias as the modelled `Alias` structure.
 pub fn alias(name: &str, key_arn: Option<&String>) -> Alias {
     Alias {
@@ -1490,6 +1558,36 @@ pub fn decode_page_token(token: &str, expected_prefix: &str) -> Option<String> {
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .filter(|start| start.len() <= MAX_TOKEN_TARGET_LEN && start.starts_with(expected_prefix))
 }
+
+/// A `ListTagsForResource` page token naming the tag key the NEXT page starts at.
+///
+/// The name is prefixed before it is encoded, so the prefix check
+/// [`decode_page_token`] already applies keeps a token one list operation handed out
+/// from being accepted by another: a tag token's payload names a tag key, a key
+/// token's names a key ARN and an alias token's an alias name.
+pub fn encode_tag_page_token(tag_key: &str) -> String {
+    encode_page_token(&format!("{TAG_TOKEN_PREFIX}{tag_key}"))
+}
+
+/// The tag key a page token names, or `None` when the token is not one
+/// `ListTagsForResource` issued: it must carry [`TAG_TOKEN_PREFIX`] and name a tag
+/// key inside the modelled `TagKey` 1..128 length
+/// (`smithy_query(query="shape",shape="TagKey")`).
+pub fn decode_tag_page_token(token: &str) -> Option<String> {
+    let payload = decode_page_token(token, TAG_TOKEN_PREFIX)?;
+    let tag_key = payload.strip_prefix(TAG_TOKEN_PREFIX)?.to_string();
+    (1..=MAX_TAG_KEY_LEN)
+        .contains(&tag_key.len())
+        .then_some(tag_key)
+}
+
+/// What a tag page token's payload starts with. Not a tag key itself: tag keys carry
+/// no modelled prefix, so this one is the emulator's own token namespace.
+const TAG_TOKEN_PREFIX: &str = "tag/";
+
+/// The longest tag key a tag page token may name: the maximum of the modelled
+/// `TagKey` length (1..128).
+const MAX_TAG_KEY_LEN: usize = 128;
 
 /// The longest store key a page token may name: the maximum length of the modelled
 /// `KeyArnOrKeyAliasType`, which bounds both a `KeyArn` (150) and an alias name

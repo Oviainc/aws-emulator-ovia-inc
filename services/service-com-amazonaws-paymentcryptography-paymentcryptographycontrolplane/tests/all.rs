@@ -17,5 +17,7 @@ mod export_and_replication_parameters;
 mod key_lifecycle;
 #[path = "all/key_usage_and_replication.rs"]
 mod key_usage_and_replication;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

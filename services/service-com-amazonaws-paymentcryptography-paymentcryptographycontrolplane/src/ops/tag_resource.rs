@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds or edits the tags on one stored key: a per-tag-key merge onto the key's
+//! stored tag set, which is what `ListTagsForResource` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +180,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // `ResourceArn`'s own pattern and 70..150 length and the `Tags` 0..200
+        // length, with each tag key's 1..128 and each value's 1..256, are modelled,
+        // so the centralized walk refuses anything outside them before this body
+        // runs. What is left for this body is what the model cannot say: that a tag
+        // key appears only once, that it is not in the namespace AWS reserves, and
+        // that the merged set stays inside what one key may carry.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the payment cryptography key store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        let key = store.key_mut(&input.resource_arn).ok_or_else(|| {
+            TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                resource_id: Some(input.resource_arn.clone()),
+            })
+        })?;
+
+        // "To add a tag, specify a new tag key and a tag value. To edit a tag,
+        // specify an existing tag key and a new tag value" (this operation's own
+        // documentation): the update is merged per tag key onto the ONE stored key
+        // record, so every tag this call does not name survives it and
+        // `ListTagsForResource` reports exactly what is stored.
+        key.apply_tags(&input.tags).map_err(|rejection| match rejection {
+            crate::state::TagRejection::Invalid(why) => TagResourceError::from(
+                TagResourceErrorModeled::ValidationException(ValidationException {
+                    message: Some(why),
+                }),
+            ),
+            crate::state::TagRejection::QuotaExceeded(why) => TagResourceError::from(
+                TagResourceErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException { message: Some(why) },
+                ),
+            ),
+        })?;
+
+        let key_arn = key.key_arn.clone();
+        crate::state::record_mutation(ctx.parts(), Self::NAME, &key_arn);
+        Ok(TagResourceOutput {})
     }
 }

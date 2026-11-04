@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of the tags stored on one key, in tag-key order with an opaque
+//! `NextToken` naming the tag the next page starts at.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +174,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // `ResourceArn`'s own pattern and 70..150 length, `MaxResults`' 1..100 range
+        // and `NextToken`'s 1..8192 length are modelled, so the centralized walk
+        // refuses anything outside them before this body runs. REPORTING only: the
+        // tags a key carries are read from its one stored record and nothing here
+        // writes, so what a later caller sees is unchanged.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the payment cryptography key store is unavailable".to_string()),
+            })
+        })?;
+
+        let page_size = crate::state::page_size(input.max_results);
+        let start = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_tag_page_token(token).ok_or_else(|| {
+                // This operation declares its own `ValidationException`, so the
+                // refusal carries the service's error shape rather than the
+                // framework's synthetic one.
+                ListTagsForResourceError::from(
+                    ListTagsForResourceErrorModeled::ValidationException(ValidationException {
+                        message: Some(
+                            "NextToken is not a pagination token issued by ListTagsForResource"
+                                .to_string(),
+                        ),
+                    }),
+                )
+            })?),
+            None => None,
+        };
+
+        let store = state.lock();
+        let key = store.key(&input.resource_arn).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                resource_id: Some(input.resource_arn.clone()),
+            })
+        })?;
+
+        let remaining = match &start {
+            Some(tag_key) => key.tags.range(tag_key.clone()..),
+            None => key.tags.range::<String, _>(..),
+        };
+
+        // Reserve no more than this key can actually yield.
+        let mut tags = Vec::with_capacity(page_size.min(key.tags.len()));
+        let mut next_token = None;
+        for (tag_key, value) in remaining {
+            // The first tag that does not fit becomes the next page's start, and only
+            // then is a `NextToken` emitted — the last page carries none.
+            if tags.len() == page_size {
+                next_token = Some(crate::state::encode_tag_page_token(tag_key));
+                break;
+            }
+            tags.push(crate::state::tag(tag_key, value));
+        }
+
+        Ok(ListTagsForResourceOutput { tags, next_token })
     }
 }
