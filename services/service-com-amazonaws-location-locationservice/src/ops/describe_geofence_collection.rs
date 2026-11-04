@@ -214,8 +214,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             create_time: crate::state::to_date_time(collection.create_time),
             update_time: crate::state::to_date_time(collection.update_time),
             // "The number of geofences in the geofence collection": however many
-            // the collection holds, read from the store rather than assumed.
-            geofence_count: Some(collection.geofences.len() as i32),
+            // the collection holds, read from the store rather than assumed. The
+            // conversion is checked, so a length no `i32` can carry saturates
+            // rather than wrapping into a negative count.
+            geofence_count: Some(
+                i32::try_from(collection.geofences.len()).unwrap_or(i32::MAX),
+            ),
         })
     }
 }
