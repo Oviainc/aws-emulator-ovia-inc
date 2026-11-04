@@ -1179,11 +1179,9 @@ fn is_arn_account_field(field: &str) -> bool {
     field.len() == ARN_ACCOUNT_ID_DIGITS && field.chars().all(|c| c.is_ascii_digit())
 }
 
-/// Every field an Interconnect connection ARN carries, plus the ARN itself.
+/// Every field an Interconnect connection ARN carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionArn<'a> {
-    /// The ARN as the request carried it.
-    pub text: &'a str,
     /// The partition field (`aws`, `aws-cn`, …).
     pub partition: &'a str,
     /// The Region field.
@@ -1225,7 +1223,6 @@ pub fn parse_connection_arn(arn: &str) -> Option<ConnectionArn<'_>> {
         return None;
     }
     Some(ConnectionArn {
-        text: arn,
         partition,
         region,
         account,
@@ -1245,30 +1242,44 @@ pub fn not_a_connection_arn_message(arn: &str) -> String {
     format!("{REFUSAL_ENVELOPE}{arn} is not the ARN of an Interconnect {ARN_RESOURCE_TYPE}")
 }
 
+/// How the ACCOUNT field of an `AmazonResourceName` is named in the refusal of an ARN
+/// that does not address the caller's scope: the twelve-digit account id
+/// ([`is_arn_account_field`]) is an "account ID".
+const ARN_ACCOUNT_FIELD_LABEL: &str = "account ID";
+
+/// How the PARTITION field is named in that same refusal.
+const ARN_PARTITION_FIELD_LABEL: &str = "partition";
+
 /// Why `parsed` does not address the scope the request it arrived on is for — or
-/// `None` when its partition and account are both that scope's.
+/// `None` when its account and partition are both that scope's.
 ///
-/// The scope an ARN addresses is its PARTITION and its ACCOUNT: an ARN carrying
+/// The scope an ARN addresses is its ACCOUNT and its PARTITION: an ARN carrying
 /// either of another scope names a resource the caller is not talking to at all, which
 /// is a fault in the REQUEST rather than a resource this scope is missing. The Region
 /// segment is NOT part of that judgement — the member's pattern leaves it
 /// unconstrained (`[^:]+`), so any spelling of it is a well-formed value of the member
 /// and the resource it names is resolved like any other
-/// ([`ComAmazonawsInterconnectInterconnectState::connection_in_for_arn`]). The message
-/// is built from the request — the field that differs, the value the ARN carried for it
-/// and the value this request is for — so a caller can see WHICH field put the ARN
-/// elsewhere.
-pub fn arn_scope_violation(parsed: &ConnectionArn<'_>) -> Option<String> {
+/// ([`ComAmazonawsInterconnectInterconnectState::connection_in_for_arn`]).
+///
+/// The refusal is worded the way an ARN-scope mismatch is worded service-wide: the ARN
+/// FIELD that differs, the value the ARN carried for it, the value the CALLER is (its
+/// own account as `GetCallerIdentity` reports it), and `request_shape` — the name of
+/// the input shape the ARN arrived in (`TagResourceRequest`,
+/// `ListTagsForResourceRequest`, `UntagResourceRequest`), which is what says WHICH
+/// request carried the offending ARN. It carries neither this service's
+/// [`REFUSAL_ENVELOPE`] nor the ARN text, so a refusal reproduces nothing of the ARN
+/// the caller supplied. The ACCOUNT is judged first, so an ARN of another account is
+/// always answered with the account mismatch even when its partition differs too.
+pub fn arn_scope_violation(parsed: &ConnectionArn<'_>, request_shape: &str) -> Option<String> {
     let account = ::emulator_server::emulator_account_id();
     let (field, carried, addressed) = [
-        ("partition", parsed.partition, ARN_PARTITION),
-        ("account", parsed.account, account),
+        (ARN_ACCOUNT_FIELD_LABEL, parsed.account, account),
+        (ARN_PARTITION_FIELD_LABEL, parsed.partition, ARN_PARTITION),
     ]
     .into_iter()
     .find(|(_, carried, addressed)| carried != addressed)?;
     Some(format!(
-        "{REFUSAL_ENVELOPE}{} is in {field} {carried}, and this request is for {field} {addressed}",
-        parsed.text
+        "ARN {field} ({carried}) does not match caller {field} ({addressed}) for {request_shape}"
     ))
 }
 

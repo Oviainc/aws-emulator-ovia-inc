@@ -97,6 +97,15 @@ impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     }
 }
 
+/// The name the model gives this operation's input shape
+/// (`smithy_query(query="operation",operation="ListTagsForResource")` -> `input_shape`:
+/// `ListTagsForResourceRequest`).
+///
+/// A refusal of an `arn` that does not address the caller's scope names it, so the
+/// message says WHICH request carried the offending ARN
+/// ([`crate::state::arn_scope_violation`]).
+const REQUEST_SHAPE: &str = "ListTagsForResourceRequest";
+
 /// The `ListTagsForResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -176,13 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // The scope an ARN addresses is its partition and its account, so one
+        // The scope an ARN addresses is its account and its partition, so one
         // carrying either of another scope names a resource the caller is not talking
-        // to at all — a fault in the REQUEST, refused as invalid input. The Region
-        // segment is not judged here: the member's pattern leaves it unconstrained,
-        // so it is resolved rather than scope-checked.
+        // to at all — a fault in the REQUEST, refused as invalid input naming the
+        // field that differs, the value the ARN carried for it, the caller's own and
+        // this request's input shape. The Region segment is not judged here: the
+        // member's pattern leaves it unconstrained, so it is resolved rather than
+        // scope-checked.
         let region = crate::state::request_region(ctx);
-        if let Some(message) = crate::state::arn_scope_violation(&parsed) {
+        if let Some(message) = crate::state::arn_scope_violation(&parsed, REQUEST_SHAPE) {
             return Err(
                 ListTagsForResourceErrorModeled::InterconnectValidationException(
                     InterconnectValidationException { message },

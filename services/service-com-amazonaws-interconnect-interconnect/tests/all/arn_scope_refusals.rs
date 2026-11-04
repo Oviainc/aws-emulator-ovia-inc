@@ -8,7 +8,9 @@
 //! the two ways that ARN can fail to address one. An ARN whose PARTITION or ACCOUNT is
 //! not the one the request addresses names a resource the caller is not talking to at
 //! all: a fault in the request, HTTP 400 `InterconnectValidationException`, whichever
-//! of the three operations carried it. An ARN of that scope which resolves to no
+//! of the three operations carried it, worded with the ARN field that differs, the
+//! value the ARN carried for it, the caller's own value and the name of the input
+//! shape the ARN arrived in. An ARN of that scope which resolves to no
 //! resource is not a malformed request at all: the two tag WRITES refuse it as this
 //! service's own client fault (HTTP 400 `InterconnectClientException`, worded with a
 //! fixed sentence carrying nothing of the ARN), and the `@readonly` LISTING answers
@@ -35,7 +37,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use service_com_amazonaws_interconnect_interconnect::state::{
-    arn_resource_absent_message, arn_scope_violation, parse_connection_arn,
+    arn_resource_absent_message, parse_connection_arn,
 };
 
 use crate::emulator::{
@@ -125,18 +127,62 @@ impl Fault {
         }
     }
 
-    /// How this service words the refusal of `arn` in this class.
-    pub(crate) fn message(self, arn: &str) -> String {
+    /// How this service words the refusal of `arn` in this class, on `operation`.
+    pub(crate) fn message(self, operation: &str, arn: &str) -> String {
         match self {
             Fault::OutOfScope => {
                 let parsed = parse_connection_arn(arn)
                     .expect("the row's ARN is a well-formed Interconnect connection ARN");
-                arn_scope_violation(&parsed)
-                    .expect("the row's ARN is outside the scope the request addresses")
+                if parsed.account != ACCOUNT_ID {
+                    scope_mismatch_message(
+                        ARN_ACCOUNT_FIELD,
+                        parsed.account,
+                        ACCOUNT_ID,
+                        operation,
+                    )
+                } else {
+                    scope_mismatch_message(
+                        ARN_PARTITION_FIELD,
+                        parsed.partition,
+                        PARTITION,
+                        operation,
+                    )
+                }
             }
             Fault::NoSuchConnection => arn_resource_absent_message(),
         }
     }
+}
+
+/// How the ACCOUNT field of an ARN is named in a scope-mismatch refusal.
+pub(crate) const ARN_ACCOUNT_FIELD: &str = "account ID";
+
+/// How the PARTITION field of an ARN is named in that same refusal.
+pub(crate) const ARN_PARTITION_FIELD: &str = "partition";
+
+/// The name the model gives `operation`'s input shape: each ARN-addressed operation's
+/// `input_shape` is its own name with `Request` appended
+/// (`smithy_query(query="operation",operation="ListTagsForResource,TagResource,UntagResource")`
+/// -> `input_shape` `ListTagsForResourceRequest`, `TagResourceRequest`,
+/// `UntagResourceRequest`).
+pub(crate) fn request_shape(operation: &str) -> String {
+    format!("{operation}Request")
+}
+
+/// How an ARN that does not address the caller's scope is refused: the ARN FIELD that
+/// differs, the value the ARN carried for it, the value the CALLER is, and the input
+/// shape the ARN arrived in — with neither this service's refusal envelope nor the ARN
+/// text.
+pub(crate) fn scope_mismatch_message(
+    field: &str,
+    carried: &str,
+    caller: &str,
+    operation: &str,
+) -> String {
+    format!(
+        "ARN {field} ({carried}) does not match caller {field} ({caller}) for {}",
+        request_shape(operation)
+    )
 }
 
 /// Assert `(status, body)` is what `operation` answers an `arn` of class `fault`: the
@@ -175,7 +221,7 @@ pub(crate) fn assert_answers_fault(
     );
     assert_eq!(
         message(body),
-        fault.message(arn),
+        fault.message(operation, arn),
         "case {case:?} on {operation}: expected this service's own wording for the class, got {:?}",
         message(body)
     );

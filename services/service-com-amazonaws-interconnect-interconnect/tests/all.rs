@@ -23,6 +23,8 @@ mod arn_region_segment_is_not_a_scope;
 mod arn_scope_refusals;
 #[path = "all/arn_scope_is_relative_to_the_request.rs"]
 mod arn_scope_is_relative_to_the_request;
+#[path = "all/arn_scope_mismatch_wording.rs"]
+mod arn_scope_mismatch_wording;
 #[path = "all/attach_point_arn_is_scoped_to_the_request.rs"]
 mod attach_point_arn_is_scoped_to_the_request;
 #[path = "all/attach_point_arn_needs_provisioned_connectivity.rs"]

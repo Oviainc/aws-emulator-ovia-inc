@@ -395,7 +395,9 @@ async fn list_tags_for_resource_answers_the_empty_set_for_an_arn_that_names_no_c
     }
 
     // ARNs the request may not address at all — another account, another partition —
-    // are faults in the REQUEST, and say which field put them elsewhere.
+    // are faults in the REQUEST, and say which field put them elsewhere, the value the
+    // ARN carried for it, the caller's own value and the input shape the ARN arrived
+    // in, while reproducing nothing of the ARN itself.
     let out_of_scope = vec![
         (
             "another account",
@@ -417,8 +419,13 @@ async fn list_tags_for_resource_answers_the_empty_set_for_an_arn_that_names_no_c
             &body,
         );
         assert!(
-            message(&body).contains(&arn),
-            "case {name:?}: expected the scope refusal to name the requested ARN, got {:?}",
+            !message(&body).contains(&arn),
+            "case {name:?}: expected the scope refusal not to reproduce the requested ARN, got {:?}",
+            message(&body)
+        );
+        assert!(
+            message(&body).ends_with(" for ListTagsForResourceRequest"),
+            "case {name:?}: expected the scope refusal to name this request's input shape, got {:?}",
             message(&body)
         );
     }
