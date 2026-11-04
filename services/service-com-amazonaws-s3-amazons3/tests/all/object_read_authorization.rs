@@ -20,16 +20,17 @@
 //!   serves, and so does a `Deny` whose condition this service cannot judge: the emulator
 //!   answers the condition keys it knows (the secure transport every one of its endpoints
 //!   serves) and refuses only a deny it could decide.
-//! * WHICH refusal it is depends on what the address resolved to. A version the read did
-//!   resolve, whose read the policy denies, is refused the read itself with the published
-//!   `Access Denied`. An address holding NOTHING is answered by what the caller may learn
-//!   about the bucket's contents at all: "if the object that you request doesn't exist, the
-//!   error that Amazon S3 returns depends on whether you also have the `s3:ListBucket`
-//!   permission. If you have the `s3:ListBucket` permission on the bucket, Amazon S3 returns
-//!   an HTTP status code 404 Not Found error. If you don't have the `s3:ListBucket`
-//!   permission, Amazon S3 returns an HTTP status code 403 Access Denied error"
-//!   (`GetObject`'s own documentation) — the 403 carrying the sentence IAM publishes for an
-//!   explicit deny, which names the caller, the action and the resource ARN.
+//! * WHICH refusal it is depends on what the address resolved to, and both are worded as the
+//!   explicit deny they are, naming the action the policy denied. A version the read did
+//!   resolve is refused the read itself (`s3:GetObject` on that object). An address holding
+//!   NOTHING is answered by what the caller may learn about the bucket's contents at all:
+//!   "if the object that you request doesn't exist, the error that Amazon S3 returns depends
+//!   on whether you also have the `s3:ListBucket` permission. If you have the
+//!   `s3:ListBucket` permission on the bucket, Amazon S3 returns an HTTP status code 404 Not
+//!   Found error. If you don't have the `s3:ListBucket` permission, Amazon S3 returns an HTTP
+//!   status code 403 Access Denied error" (`GetObject`'s own documentation) — the 403
+//!   carrying the sentence IAM publishes for an explicit deny, which names the caller, the
+//!   action and the resource ARN.
 //! * The same permission authorizes a HEAD of the object — "a HEAD request has the same
 //!   options as a GET operation on an object" (`HeadObject`'s own documentation) — which
 //!   carries no body, so the status is its whole answer.
@@ -107,6 +108,13 @@ fn explicit_deny_message(action: &str, resource: &str) -> String {
     )
 }
 
+/// The sentence a read of the HELD object is refused with when the policy explicitly denies
+/// it: the explicit deny over `s3:GetObject` on that object, whose ARN is the bucket's own
+/// with the key as the rest of the resource part.
+fn denied_read_message(bucket: &str) -> String {
+    explicit_deny_message("s3:GetObject", &format!("arn:aws:s3:::{bucket}/{HELD_KEY}"))
+}
+
 /// What a read must answer: the status, and the error document's code and message (both
 /// empty for a read that is served with the object's bytes).
 struct Expected {
@@ -173,7 +181,7 @@ fn rows() -> Vec<Row> {
             expected: Expected {
                 status: 403,
                 code: ACCESS_DENIED,
-                message: ACCESS_DENIED_MESSAGE.to_string(),
+                message: denied_read_message("read-authz-deny-all-keys"),
             },
         },
         Row {
@@ -189,7 +197,7 @@ fn rows() -> Vec<Row> {
             expected: Expected {
                 status: 403,
                 code: ACCESS_DENIED,
-                message: ACCESS_DENIED_MESSAGE.to_string(),
+                message: denied_read_message("read-authz-deny-one-key"),
             },
         },
         Row {
@@ -205,7 +213,7 @@ fn rows() -> Vec<Row> {
             expected: Expected {
                 status: 403,
                 code: ACCESS_DENIED,
-                message: ACCESS_DENIED_MESSAGE.to_string(),
+                message: denied_read_message("read-authz-deny-account"),
             },
         },
         Row {
@@ -221,7 +229,7 @@ fn rows() -> Vec<Row> {
             expected: Expected {
                 status: 403,
                 code: ACCESS_DENIED,
-                message: ACCESS_DENIED_MESSAGE.to_string(),
+                message: denied_read_message("read-authz-deny-every-action"),
             },
         },
         Row {
@@ -293,7 +301,7 @@ fn rows() -> Vec<Row> {
             expected: Expected {
                 status: 403,
                 code: ACCESS_DENIED,
-                message: ACCESS_DENIED_MESSAGE.to_string(),
+                message: denied_read_message("read-authz-secure-transport"),
             },
         },
         Row {

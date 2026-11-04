@@ -60,6 +60,13 @@
 //! diagnostics beside its code and message). [`sigv4`] holds that rule; a refusal it
 //! declines to word still renders through the entry's own protocol-correct default.
 
+// What AUTHORIZES one request: the bucket's own policy, evaluated with the condition keys
+// the request carries, and the account the request says owns the bucket — see
+// `service/authorization.rs`.
+pub mod authorization;
+// What an object WRITE must satisfy about the key it names and the class it asks for, before
+// anything is stored — see `service/object_write.rs`.
+pub mod object_write;
 pub mod sigv4;
 pub mod wire;
 

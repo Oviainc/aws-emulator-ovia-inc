@@ -335,6 +335,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The confused-deputy guard the request itself asks for: "if the account ID that you
+        // provide does not match the actual owner of the bucket, the request fails with the
+        // HTTP status code 403 Forbidden (access denied)"
+        // (`DeleteObjectRequest$ExpectedBucketOwner`), judged through the one rule every
+        // operation of this service judges it by and before the store is reached, so a
+        // mismatched guard says nothing about what the bucket holds.
+        if let Some(refusal) = crate::service::authorization::expected_bucket_owner_refusal(
+            input.expected_bucket_owner.as_deref(),
+        ) {
+            return Err(refusal);
+        }
         // The pair of ids that name this request: the response below carries them in its
         // `x-amz-request-id` / `x-amz-id-2` headers, and every notification this delete
         // owes names the call it came of by them.

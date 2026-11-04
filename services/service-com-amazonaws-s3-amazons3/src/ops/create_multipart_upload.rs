@@ -360,20 +360,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // "If the account ID that you provide does not match the actual owner of the
-        // bucket, the request fails with the HTTP status code 403 Forbidden (access
-        // denied)" — `CreateMultipartUploadRequest$ExpectedBucketOwner`, judged the way
-        // `PutObject` and `HeadObject` judge it: this emulator serves one account, so the
-        // owner of every bucket it holds is that account.
-        if input
-            .expected_bucket_owner
-            .as_deref()
-            .is_some_and(|expected| expected != ::engine::emulator_account_id())
-        {
+        // The confused-deputy guard the request itself asks for: "if the account ID that you
+        // provide does not match the actual owner of the bucket, the request fails with the
+        // HTTP status code 403 Forbidden (access denied)" —
+        // `CreateMultipartUploadRequest$ExpectedBucketOwner`, judged through the one rule
+        // every operation of this service judges it by.
+        if let Some(refusal) = crate::service::authorization::expected_bucket_owner_refusal(
+            input.expected_bucket_owner.as_deref(),
+        ) {
+            return Err(refusal);
+        }
+
+        // The KEY the finished object will carry, judged on its bytes alone before anything
+        // is recorded: a name S3 cannot store names no object this upload could become
+        // ([`crate::service::object_write::key_refusal`] holds both published rules, and the
+        // store's own ceiling answers the same code below).
+        if let Some((code, message)) = crate::service::object_write::key_refusal(&input.key) {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
-                "AccessDenied",
-                403,
-                "Access Denied",
+                code,
+                crate::service::object_write::KEY_REFUSAL_STATUS,
+                message,
             ));
         }
 
@@ -545,6 +551,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             requested.clone()
         };
 
+        // The CLASS the finished object will be stored in has to be one the addressed bucket
+        // can host, the same division a one-shot write into it is judged by: "when you
+        // initiate a multipart upload, you specify the options you want on the finished
+        // object", so a class the bucket cannot hold is refused here rather than at the
+        // completion. A bucket this emulator does not hold is answered by the initiation
+        // below instead.
+        {
+            let store = state.lock();
+            if let Some(message) = store.bucket(&input.bucket).and_then(|bucket| {
+                crate::service::object_write::storage_class_refusal(
+                    bucket,
+                    input.storage_class.as_deref(),
+                )
+            }) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::service::object_write::INVALID_STORAGE_CLASS_CODE,
+                    crate::service::object_write::INVALID_STORAGE_CLASS_STATUS,
+                    message,
+                ));
+            }
+        }
+
         let upload = crate::state::MultipartUpload {
             key: input.key.clone(),
             // Read here, where the upload comes into being, so `Initiated` is the moment
@@ -626,15 +654,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is `KeyTooLongError` with HTTP 400 (Amazon S3 "Error responses", list of
             // error codes); the model declares no shape for it, so it goes out through the
             // unmodelled channel with the code and status S3 sends.
-            crate::state::MultipartUploadCreation::KeyTooLong { bytes } => {
+            crate::state::MultipartUploadCreation::KeyTooLong { .. } => {
                 return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    "KeyTooLongError",
-                    400,
-                    format!(
-                        "Your key is too long: {bytes} bytes, past the {} bytes a key may \
-                         carry",
-                        crate::state::MAX_OBJECT_KEY_BYTES
-                    ),
+                    crate::service::object_write::KEY_TOO_LONG_CODE,
+                    crate::service::object_write::KEY_REFUSAL_STATUS,
+                    crate::service::object_write::KEY_TOO_LONG_MESSAGE,
                 ));
             }
             // "Within the PUT request header, the user-defined metadata is limited to 2

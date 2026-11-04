@@ -453,23 +453,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             }
         }
 
-        // "If the account ID that you provide does not match the actual owner of the
-        // destination bucket, the request fails with the HTTP status code 403 Forbidden"
-        // (`CopyObjectRequest$ExpectedBucketOwner`, and the same sentence for the source
-        // bucket on `ExpectedSourceBucketOwner`), judged exactly as `HeadObject` and
-        // `PutObject` judge it: this emulator serves one account, so the owner of every
-        // bucket it holds is that account.
+        // The confused-deputy guard for either bucket, judged through the one rule every
+        // operation of this service judges it by: "if the account ID that you provide does
+        // not match the actual owner of the destination bucket, the request fails with the
+        // HTTP status code 403 Forbidden" (`CopyObjectRequest$ExpectedBucketOwner`, and the
+        // same sentence for the source bucket on `ExpectedSourceBucketOwner`).
         for expected in [
             input.expected_bucket_owner.as_deref(),
             input.expected_source_bucket_owner.as_deref(),
         ] {
-            if expected.is_some_and(|account| account != ::engine::emulator_account_id()) {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    "AccessDenied",
-                    403,
-                    "Access Denied",
-                ));
+            if let Some(refusal) =
+                crate::service::authorization::expected_bucket_owner_refusal(expected)
+            {
+                return Err(refusal);
             }
+        }
+
+        // The DESTINATION key this copy writes, judged on its bytes alone before anything
+        // else: a name S3 cannot store is refused whatever the source is
+        // ([`crate::service::object_write::key_refusal`] holds both published rules).
+        if let Some((code, message)) = crate::service::object_write::key_refusal(&input.key) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                code,
+                crate::service::object_write::KEY_REFUSAL_STATUS,
+                message,
+            ));
         }
 
         // The second documented form of a copy source names the object "as accessed
@@ -617,6 +625,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             ));
         }
 
+        // WHO is asking, for the WRITE half of this copy: the destination bucket's own
+        // policy is in force on it exactly as it is on a `PutObject` of the same object, and
+        // the condition context is this request's own members — the copy source and the
+        // metadata directive included, since a policy may be written over either.
+        let write_context = crate::service::authorization::ObjectWriteContext {
+            acl: input.acl.as_deref(),
+            storage_class: input.storage_class.as_deref(),
+            server_side_encryption: input.server_side_encryption.as_deref(),
+            kms_key_id: input.ssekms_key_id.as_deref(),
+            copy_source: Some(input.copy_source.as_str()),
+            metadata_directive: input.metadata_directive.as_deref(),
+        };
+        if let Some(message) = crate::service::authorization::policy_denial(
+            destination.policy.as_deref(),
+            PUT_OBJECT_ACTION,
+            &crate::state::object_arn(&input.bucket, &input.key),
+            &write_context.conditions(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
+
+        // The CLASS this copy asks the destination object to be stored in has to be one the
+        // destination bucket can host, the same division a `PutObject` into it is judged by.
+        if let Some(message) = crate::service::object_write::storage_class_refusal(
+            destination,
+            input.storage_class.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::service::object_write::INVALID_STORAGE_CLASS_CODE,
+                crate::service::object_write::INVALID_STORAGE_CLASS_STATUS,
+                message,
+            ));
+        }
+
         // The SOURCE object, copied out of the store so the write below can borrow it
         // mutably. "If your source bucket versioning is enabled, the x-amz-copy-source
         // header by default identifies the current version of an object to copy. If the
@@ -632,6 +678,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             )
             .naming_bucket(&source.bucket));
         };
+
+        // WHO is asking, for the READ half of this copy. "You must have READ access to the
+        // source object" (`CopyObject`'s own documentation), which is `s3:GetObject` on the
+        // object `x-amz-copy-source` names — a permission the SOURCE bucket's own policy
+        // decides, separately from the destination write judged above. A caller the source
+        // policy denies the read to is refused, and no destination object is created: a
+        // principal that may write a bucket cannot otherwise copy into it any object it can
+        // name.
+        if let Some(message) = crate::service::authorization::policy_denial(
+            source_bucket.policy.as_deref(),
+            crate::state::GET_OBJECT_ACTION,
+            &crate::state::object_arn(&source.bucket, &source.key),
+            &crate::service::authorization::read_conditions(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
         let held = match source.version_id.as_deref() {
             None => source_bucket.object(&source.key).cloned(),
             Some(version_id) => {
@@ -895,12 +961,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         };
         match outcome {
             crate::state::ObjectWrite::Created | crate::state::ObjectWrite::Replaced => {}
-            // An over-long destination key and user-defined metadata past the published
-            // 2 KB are each a parameter that is not valid for this request, which is what
-            // the modelled `InvalidRequest` reports; AWS's own `KeyTooLongError` and
-            // `MetadataTooLarge` are not shapes in this model.
-            crate::state::ObjectWrite::KeyTooLong { .. }
-            | crate::state::ObjectWrite::MetadataTooLarge { .. } => {
+            // An over-long destination key is refused above, on the key's bytes alone, with
+            // the `KeyTooLongError` S3 answers it with; the store's ceiling is the same one,
+            // so this arm carries the same answer rather than a different code. User-defined
+            // metadata past the published 2 KB is a header that is not valid for the
+            // request, which is what the modelled `InvalidRequest` reports (AWS's own
+            // `MetadataTooLarge` is not a shape in this model).
+            crate::state::ObjectWrite::KeyTooLong { .. } => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::service::object_write::KEY_TOO_LONG_CODE,
+                    crate::service::object_write::KEY_REFUSAL_STATUS,
+                    crate::service::object_write::KEY_TOO_LONG_MESSAGE,
+                ));
+            }
+            crate::state::ObjectWrite::MetadataTooLarge { .. } => {
                 return Err(CopyObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
             }
             // The emulator's own ceilings, not AWS quotas, so no AWS error code describes
@@ -1062,6 +1136,20 @@ const DIRECTIVE_EXCLUDE: &str = "EXCLUDE";
 /// `http {method: "PUT", uri: "/{Bucket}/{Key+}?x-id=CopyObject"}`) — which is what a
 /// `MethodNotAllowed` document reports as the `<Method>` it refused.
 const COPY_METHOD: &str = "PUT";
+
+/// The code and status S3 answers a copy its authorization refuses with, whichever half of
+/// the copy the refusal is about: the read of the source, or the write of the destination.
+/// The message is the one that refusal words
+/// ([`crate::service::authorization::policy_denial`]).
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The IAM action the WRITE half of a copy is performed under: a copy stores an object at
+/// the destination, which is what `s3:PutObject` authorizes ("you must have WRITE access to
+/// the destination bucket", `CopyObject`'s own documentation). The read half is authorized
+/// under [`crate::state::GET_OBJECT_ACTION`].
+const PUT_OBJECT_ACTION: &str = "s3:PutObject";
 
 /// The four copy-source conditional members this request carried, for the one rule every
 /// copy in this service judges them by

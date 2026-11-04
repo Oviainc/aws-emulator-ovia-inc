@@ -15,9 +15,17 @@
 //!   a version whose storage class is an archive one has a copy to restore: every other
 //!   storage class is refused with HTTP 403 `InvalidObjectState` and the message S3 words
 //!   for that cause, and nothing is recorded. The archive classes are
-//!   [`ARCHIVED_STORAGE_CLASSES`]; the refusal table spans every OTHER value of the
-//!   `StorageClass` enum the model publishes ([`STORAGE_CLASS_VALUES`]).
-//! * A restore the service takes answers 200 and is NOT complete when the call returns —
+//!   [`ARCHIVED_STORAGE_CLASSES`]; the refusal table spans every OTHER class a general
+//!   purpose bucket can host ([`GENERAL_PURPOSE_STORAGE_CLASSES`]).
+//! * A retrieval `Tier` the object's own class does not OFFER is refused the same way: S3
+//!   Glacier Flexible Retrieval offers Expedited, Standard and Bulk, S3 Glacier Deep Archive
+//!   offers Standard and Bulk alone (Amazon S3 User Guide, *Archive retrieval options*), so
+//!   each row below names a tier its class offers and
+//!   [`super::object_write_refusals`] spans the pairs it does not.
+//! * A restore the service takes answers the status its own documentation states for what
+//!   the call DID: "if the object is not previously restored, then Amazon S3 returns `202
+//!   Accepted` in the response. If the object is previously restored, Amazon S3 returns `200
+//!   OK` in the response." Either way the retrieval is NOT complete when the call returns —
 //!   "you must first initiate a restore request, and then wait until a temporary copy of
 //!   the object is available" — so a reader reports `ongoing-request="true"` until the
 //!   retrieval falls due and then `ongoing-request="false", expiry-date="…"`, the expiry
@@ -39,7 +47,8 @@ use std::time::{Duration, SystemTime};
 
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
-use service_com_amazonaws_s3_amazons3::ops::types::{STORAGE_CLASS_VALUES, TIER_VALUES};
+use service_com_amazonaws_s3_amazons3::ops::types::TIER_VALUES;
+use service_com_amazonaws_s3_amazons3::service::object_write::GENERAL_PURPOSE_STORAGE_CLASSES;
 use service_com_amazonaws_s3_amazons3::state::{
     ARCHIVED_STORAGE_CLASSES, DEFAULT_STORAGE_CLASS, MALFORMED_XML_MESSAGE,
     RESTORE_ALREADY_IN_PROGRESS_MESSAGE, RESTORE_COMPLETION_DELAY, RESTORE_NOT_ALLOWED_MESSAGE,
@@ -192,18 +201,18 @@ type RestoreRow = (&'static str, &'static str, &'static str, i32, TierNamedIn);
 fn restore_rows() -> Vec<RestoreRow> {
     vec![
         (
-            "glacier, one day, Standard named in the container",
+            "glacier, one day, Expedited named in the container",
             "flat-key",
             "GLACIER",
             1,
-            TierNamedIn::Request("Standard"),
+            TierNamedIn::Request("Expedited"),
         ),
         (
-            "deep archive, a week, Expedited named in the container",
+            "deep archive, a week, Standard named in the container",
             "archive/weekly.bin",
             "DEEP_ARCHIVE",
             7,
-            TierNamedIn::Request("Expedited"),
+            TierNamedIn::Request("Standard"),
         ),
         (
             "glacier, a year, Bulk named in the Glacier job parameters",
@@ -271,8 +280,9 @@ async fn restoring_an_archived_object_reports_an_ongoing_retrieval_then_an_avail
         )
         .await;
         assert_eq!(
-            initiated.status, 200,
-            "case {case:?}: expected the modelled 200 from RestoreObject, got {} with body {:?}",
+            initiated.status, 202,
+            "case {case:?}: expected the 202 of a retrieval this call initiated, got {} with \
+             body {:?}",
             initiated.status,
             text(&initiated)
         );
@@ -369,16 +379,18 @@ async fn restoring_an_object_that_is_not_archived_is_refused_for_its_storage_cla
     let router = router();
     bucket(&router, "restore-not-allowed").await;
 
-    // Every storage class the model publishes that is NOT an archive one, plus the class a
-    // write that named none is stored in — the whole catalog the rule divides.
-    let not_archived: Vec<&str> = STORAGE_CLASS_VALUES
+    // Every storage class a general purpose bucket can host that is NOT an archive one, plus
+    // the class a write that named none is stored in — the whole catalog the rule divides. A
+    // class belonging to another kind of bucket never reaches a restore at all: the write
+    // naming it is itself refused.
+    let not_archived: Vec<&str> = GENERAL_PURPOSE_STORAGE_CLASSES
         .iter()
         .copied()
         .filter(|class| !ARCHIVED_STORAGE_CLASSES.contains(class))
         .collect();
     assert_eq!(
         not_archived.len(),
-        STORAGE_CLASS_VALUES.len() - ARCHIVED_STORAGE_CLASSES.len(),
+        GENERAL_PURPOSE_STORAGE_CLASSES.len() - ARCHIVED_STORAGE_CLASSES.len(),
         "the catalog must divide into archive and non-archive classes, got {not_archived:?}"
     );
     assert!(
@@ -446,8 +458,8 @@ async fn a_restore_while_one_is_in_progress_is_refused_and_a_later_one_restates_
     )
     .await;
     assert_eq!(
-        first.status, 200,
-        "case first: the restore must be initiated, got {} with body {:?}",
+        first.status, 202,
+        "case first: the restore must be initiated with a 202, got {} with body {:?}",
         first.status,
         text(&first)
     );
@@ -502,7 +514,8 @@ async fn a_restore_while_one_is_in_progress_is_refused_and_a_later_one_restates_
     .await;
     assert_eq!(
         again.status, 200,
-        "case restating the lifetime: expected HTTP 200, got {} with body {:?}",
+        "case restating the lifetime: a version whose copy is already there answers 200, got \
+         {} with body {:?}",
         again.status,
         text(&again)
     );
@@ -551,8 +564,9 @@ async fn a_restore_belongs_to_the_object_version_it_names() {
     )
     .await;
     assert_eq!(
-        initiated.status, 200,
-        "case the older version: the restore must be initiated, got {} with body {:?}",
+        initiated.status, 202,
+        "case the older version: the restore must be initiated with a 202, got {} with body \
+         {:?}",
         initiated.status,
         text(&initiated)
     );

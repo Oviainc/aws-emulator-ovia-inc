@@ -1230,7 +1230,78 @@ fn with_partial_content_status(response: Response) -> Response {
     if response.status().as_u16() != 200 || response.headers().get("content-range").is_none() {
         return response;
     }
-    let Ok(partial) = StatusCode::try_from(PARTIAL_CONTENT_STATUS) else {
+    with_status(response, PARTIAL_CONTENT_STATUS)
+}
+
+/// The status a response carrying part of the selected representation is sent with — see
+/// [`with_partial_content_status`].
+const PARTIAL_CONTENT_STATUS: u16 = 206;
+
+/// The operation whose success status depends on what the call DID, and the status it
+/// answers for a retrieval it newly initiated.
+///
+/// `RestoreObject`'s own documentation states both: "a successful action returns either the
+/// `200 OK` or `202 Accepted` status code … if the object is not previously restored, then
+/// Amazon S3 returns `202 Accepted` in the response … if the object is previously restored,
+/// Amazon S3 returns `200 OK` in the response." The model declares the one success status an
+/// operation may have (`http {code: 200}`,
+/// `smithy_query(query="operation",operation="RestoreObject")`), so the handler cannot state
+/// the other one itself: it records what its call did ([`note_restore_initiated`]) and the
+/// promotion happens here, the way a served byte range is promoted above.
+const RESTORE_OBJECT_OPERATION: &str = "RestoreObject";
+/// See [`RESTORE_OBJECT_OPERATION`].
+const ACCEPTED_STATUS: u16 = 202;
+
+thread_local! {
+    /// Whether the restore the operation serving this thread's request took was one the
+    /// addressed version had no restored copy for — the `202 Accepted` case.
+    ///
+    /// A request-scoped note, held for the same reason and under the same discipline as the
+    /// request-correlation pair ([`crate::state::request_ids`]): the handler records it as
+    /// the last thing it does and the request walk serializes the output in the same poll,
+    /// the serializer TAKES it before anything that can fail, and every request this service
+    /// deserializes clears whatever this thread may still hold. So the note a response reads
+    /// is its own request's or none at all.
+    static RESTORE_INITIATED: ::std::cell::Cell<bool> = const { ::std::cell::Cell::new(false) };
+}
+
+/// Record that the restore this request took had no restored copy before it, so the response
+/// is the `202 Accepted` `RestoreObject` answers for a retrieval it initiated.
+pub fn note_restore_initiated() {
+    RESTORE_INITIATED.with(|slot| slot.set(true));
+}
+
+/// The note for the response now being serialized, TAKEN rather than read, so a note one
+/// response left behind can never promote a later one.
+fn restore_initiated() -> bool {
+    RESTORE_INITIATED.with(|slot| slot.replace(false))
+}
+
+/// Drop whatever note this thread may still hold, called at the START of every request this
+/// service deserializes — the same discipline
+/// [`crate::state::request_ids::forget_any_unanswered`] holds the correlation pair under.
+fn forget_any_unanswered_restore() {
+    let _ = restore_initiated();
+}
+
+/// `response` with the status a retrieval this call INITIATED is answered with, when it is
+/// one — see [`RESTORE_OBJECT_OPERATION`]. Only a 200 is promoted, and only for the one
+/// operation whose documentation states the pair of statuses.
+fn with_accepted_status(response: Response, operation_name: &str, initiated: bool) -> Response {
+    if !initiated || operation_name != RESTORE_OBJECT_OPERATION {
+        return response;
+    }
+    with_status(response, ACCEPTED_STATUS)
+}
+
+/// `response` re-sent with `status`, keeping every header the serializer wrote, or unchanged
+/// for a status no HTTP response can carry (neither of this module's two ever is) or a
+/// response whose status is not the 200 the promotion is from.
+fn with_status(response: Response, status: u16) -> Response {
+    if response.status().as_u16() != 200 {
+        return response;
+    }
+    let Ok(promoted_status) = StatusCode::try_from(status) else {
         return response;
     };
     let headers: Vec<(String, String)> = response
@@ -1238,20 +1309,15 @@ fn with_partial_content_status(response: Response) -> Response {
         .iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))
         .collect();
-    let mut promoted = Response::new(partial, response.into_body());
+    let mut promoted = Response::new(promoted_status, response.into_body());
     for (name, value) in headers {
         // `append`, not `insert`: a header name the serializer wrote twice keeps both of its
-        // values. The headers came off a response the serializer built, so every one of them
-        // is already representable; a value the HTTP layer refuses is dropped rather than
-        // turning a served range into a transport failure.
+        // values, and a value the HTTP layer refuses is dropped rather than turning a served
+        // response into a transport failure.
         let _ = promoted.headers_mut().try_append(name, value);
     }
     promoted
 }
-
-/// The status a response carrying part of the selected representation is sent with — see
-/// [`with_partial_content_status`].
-const PARTIAL_CONTENT_STATUS: u16 = 206;
 
 /// The response headers this model binds to a TIMESTAMP whose `timestampFormat` is
 /// `date-time`, which is the format each of them has to go out in.
@@ -1571,6 +1637,9 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // before this request's handler can record its own pair, so no response can ever
         // be named by another request's id (see [`crate::state::request_ids`]).
         crate::state::request_ids::forget_any_unanswered();
+        // And whatever restore note it may hold, for the same reason: the note a response
+        // reads has to be its own request's (see [`with_accepted_status`]).
+        forget_any_unanswered_restore();
         // The BUCKET this request addresses, recorded for the one thing that needs it once
         // the handler has returned: the `BucketName` a bucket-scoped error document names
         // the bucket by when the refusal did not name one itself
@@ -1762,6 +1831,9 @@ impl ServerProtocol for UnwrappedXmlRestXml {
     ) -> Result<Self::Response, ProtocolError> {
         // Taken FIRST, before anything that can fail: see [`answering_request`].
         let correlation = answering_request();
+        // The same, for the note that decides which of the two statuses one operation's
+        // success is answered with (see [`with_accepted_status`]).
+        let accepted = restore_initiated();
         if UNWRAPPED_XML_OUTPUT_OPERATIONS.contains(&operation_name) {
             if let Some(body) =
                 unwrapped_document(output, output_schema).map_err(ProtocolError::Serde)?
@@ -1790,13 +1862,19 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // A member the model marks `@xmlAttribute` has been written as an element; it
         // belongs on its parent's start tag, where the API publishes it and where a
         // namespace-aware parser can read it. And a response that reports a
-        // `Content-Range` carries PART of the object, which HTTP answers with 206. A
+        // `Content-Range` carries PART of the object, which HTTP answers with 206, while a
+        // retrieval one operation INITIATED is the 202 its documentation states. A
         // timestamp header the model binds in the `date-time` format is re-rendered in it.
         // An output that binds nothing to the body answers with no body at all.
         Ok(with_request_correlation(
             without_unbound_body(
-                with_date_time_timestamp_headers(with_partial_content_status(
-                    with_served_root_element(with_attribute_members(response), operation_name),
+                with_date_time_timestamp_headers(with_accepted_status(
+                    with_partial_content_status(with_served_root_element(
+                        with_attribute_members(response),
+                        operation_name,
+                    )),
+                    operation_name,
+                    accepted,
                 )),
                 output_schema,
             ),
@@ -1811,6 +1889,17 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         error_code: &str,
         http_status: u16,
     ) -> Result<Self::Response, ProtocolError> {
+        // One refusal of this service carries NO error document: a request S3 rejects before
+        // its API layer answers the bare status and an empty body, which is what an SDK
+        // reports the status itself as the code it saw. The handler names it by
+        // [`crate::service::object_write::ERRORLESS_REFUSAL_CODE`], and writing an `<Error>`
+        // for it would hand a client a code AWS never sent.
+        if error_code == crate::service::object_write::ERRORLESS_REFUSAL_CODE {
+            let status = StatusCode::try_from(http_status).map_err(|_| {
+                ProtocolError::Malformed(format!("the unusable refusal status {http_status}"))
+            })?;
+            return Ok(Response::new(status, SdkBody::empty()));
+        }
         // The error envelope's correlation pair is NOT this service's to choose. This
         // model sets `noErrorWrapping` ([`NO_ERROR_WRAPPING`]), so the inner serializer
         // writes ONE pair into both the `<RequestId>` / `<HostId>` elements of the body and

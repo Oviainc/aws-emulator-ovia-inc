@@ -409,6 +409,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreObject<Eng
             })
             .unwrap_or_else(|| crate::state::DEFAULT_RESTORE_TIER.to_string());
 
+        // The TIER has to be one the object's own storage class offers. "When restoring an
+        // archived object, you can specify one of the following data access tier options"
+        // (`RestoreRequest$Tier`), and the options differ by class: S3 Glacier Flexible
+        // Retrieval offers Expedited, Standard and Bulk, while S3 Glacier Deep Archive offers
+        // Standard and Bulk alone (Amazon S3 User Guide, *Archive retrieval options*). A tier
+        // the class does not offer is a retrieval option that is not valid for this object,
+        // which S3 answers with `InvalidTier`, and it is refused BEFORE the retrieval is
+        // recorded, so no caller is told an Expedited restore is under way for a class that
+        // cannot do one.
+        if !tiers_offered_by(&object.storage_class).contains(&tier.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                INVALID_TIER_CODE,
+                INVALID_TIER_STATUS,
+                RETRIEVAL_OPTION_UNSUPPORTED_MESSAGE,
+            ));
+        }
+
+        // Whether this version was PREVIOUSLY restored, which is what decides the status the
+        // caller is answered with: "if the object is not previously restored, then Amazon S3
+        // returns 202 Accepted in the response. If the object is previously restored, Amazon
+        // S3 returns 200 OK in the response" (`RestoreObject`'s own documentation of its
+        // responses). A version with a temporary copy available at this instant is the second
+        // case — the restore reissued on it "updates the restoration period relative to the
+        // current time" — and a version with none, whether it was never restored or its copy
+        // has since expired, is the first: it is archived again and this call initiates the
+        // retrieval. Read BEFORE the write, off the version as it stands.
+        //
+        // A retrieval still running was refused above, so neither status is answered for one.
+        let previously_restored = !object.archived_at(now);
+
         // The retrieval starts now and falls due a span later: "you must first initiate a
         // restore request, and then wait until a temporary copy of the object is available",
         // so the instant it becomes available is recorded and nothing waits for it here.
@@ -500,6 +530,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreObject<Eng
         drop(store);
         crate::state::notifications::publish(ctx, pending);
 
+        // The status this answer goes out with: the 202 of a retrieval this call INITIATED,
+        // or the modelled 200 for a reissue over a copy that was already there. Recorded
+        // LAST, with nothing awaited after it, because the request walk serializes this
+        // output in the same poll (see [`crate::service::wire::note_restore_initiated`]).
+        if !previously_restored {
+            crate::service::wire::note_restore_initiated();
+        }
+
         Ok(RestoreObjectOutput {
             // "If present, indicates that the requester was successfully charged for the
             // request" (`RestoreObjectOutput$RequestCharged`) — Requester Pays is not
@@ -529,3 +567,34 @@ const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
 /// `http {method: "POST", uri: "/{Bucket}/{Key+}?restore"}`) — what a `MethodNotAllowed`
 /// document reports as the `<Method>` it refused.
 const RESTORE_METHOD: &str = "POST";
+
+/// The code S3 answers a retrieval tier the object's storage class does not offer with: the
+/// `Tier` the request named is not one this object can be retrieved at, which is what
+/// `InvalidTier` states — a refusal about the VALUE the request carried, so it is a 400
+/// rather than the 403 the object's own state earns.
+const INVALID_TIER_CODE: &str = "InvalidTier";
+/// See [`INVALID_TIER_CODE`].
+const INVALID_TIER_STATUS: u16 = 400;
+
+/// The sentence S3 refuses a retrieval the object's storage class does not offer with: fixed
+/// text, naming neither the tier nor the class, because the code and this sentence are the
+/// whole answer.
+const RETRIEVAL_OPTION_UNSUPPORTED_MESSAGE: &str =
+    "Retrieval option is not supported by this storage class.";
+
+/// The retrieval tiers the storage class `storage_class` OFFERS, empty for a class no
+/// retrieval can be asked of at all.
+///
+/// Amazon S3 User Guide, *Archive retrieval options*: S3 Glacier Flexible Retrieval (the
+/// `GLACIER` class) offers "Expedited", "Standard" and "Bulk" retrievals, while S3 Glacier
+/// Deep Archive (`DEEP_ARCHIVE`) offers "Standard" and "Bulk" — an Expedited retrieval of a
+/// Deep Archive object is not among its options. Every other class holds no archived copy to
+/// retrieve, which the refusal ahead of this one already answers
+/// ([`crate::state::ARCHIVED_STORAGE_CLASSES`]).
+fn tiers_offered_by(storage_class: &str) -> &'static [&'static str] {
+    match storage_class {
+        "GLACIER" => &["Expedited", "Standard", "Bulk"],
+        "DEEP_ARCHIVE" => &["Standard", "Bulk"],
+        _ => &[],
+    }
+}

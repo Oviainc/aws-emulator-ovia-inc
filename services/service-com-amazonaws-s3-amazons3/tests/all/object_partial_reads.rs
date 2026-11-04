@@ -31,7 +31,7 @@
 
 use std::time::Duration;
 
-use service_com_amazonaws_s3_amazons3::ops::types::STORAGE_CLASS_VALUES;
+use service_com_amazonaws_s3_amazons3::service::object_write::GENERAL_PURPOSE_STORAGE_CLASSES;
 use service_com_amazonaws_s3_amazons3::state::{ARCHIVED_STORAGE_CLASSES, RESTORE_COMPLETION_DELAY};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -548,17 +548,17 @@ async fn a_read_of_an_archived_object_is_refused_until_a_copy_is_restored() {
     let router = router();
     bucket(&router, "archived-bucket").await;
 
-    // Every storage class the model publishes, written both ways an object comes to be in
-    // one: a one-shot write naming `x-amz-storage-class`, and a multipart upload whose
-    // INITIATION named it (which is where the finished object's class is settled). The two
-    // archived classes are refused and every other class is served, so what decides the
-    // refusal is the class rather than the write.
+    // Every storage class a general purpose bucket can host, written both ways an object
+    // comes to be in one: a one-shot write naming `x-amz-storage-class`, and a multipart
+    // upload whose INITIATION named it (which is where the finished object's class is
+    // settled). The two archived classes are refused and every other class is served, so what
+    // decides the refusal is the class rather than the write.
     assert!(
-        STORAGE_CLASS_VALUES.len() > ARCHIVED_STORAGE_CLASSES.len(),
-        "the model must publish more storage classes than the archived ones, got {:?}",
-        STORAGE_CLASS_VALUES
+        GENERAL_PURPOSE_STORAGE_CLASSES.len() > ARCHIVED_STORAGE_CLASSES.len(),
+        "a general purpose bucket must host more storage classes than the archived ones, got \
+         {GENERAL_PURPOSE_STORAGE_CLASSES:?}"
     );
-    for storage_class in STORAGE_CLASS_VALUES {
+    for storage_class in GENERAL_PURPOSE_STORAGE_CLASSES {
         let archived = ARCHIVED_STORAGE_CLASSES.contains(storage_class);
         let key = format!("{}.bin", storage_class.to_ascii_lowercase());
         let payload = sized_payload(2_048);

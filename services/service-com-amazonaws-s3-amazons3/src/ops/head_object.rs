@@ -426,8 +426,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // everyone ([`crate::state::Bucket::anonymous_object_read_refusal`] carries that
         // rule, over the `s3:GetObject` permission a HEAD of an object needs too); one
         // presenting a credential speaks for this account, and the bucket's own policy is in
-        // force on it too ([`crate::state::Bucket::caller_object_read_refusal`]), so an
-        // explicit deny refuses the HEAD whatever the store holds. Either way the refusal is
+        // force on it too ([`crate::service::authorization::caller_object_read_refusal`]), so
+        // an explicit deny refuses the HEAD whatever the store holds. Either way the refusal
+        // is
         // answered with S3's authorization status — ahead of the 404 below, so it says
         // nothing about whether the key is there. A HEAD carries no body, so the status is
         // the whole answer.
@@ -436,7 +437,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 true => bucket
                     .anonymous_object_read_refusal(&input.bucket, &input.key, object)
                     .map(str::to_string),
-                false => bucket.caller_object_read_refusal(&input.bucket, &input.key, object),
+                false => crate::service::authorization::caller_object_read_refusal(
+                    bucket,
+                    &input.bucket,
+                    &input.key,
+                    object,
+                ),
             }
         });
         if let Some(message) = refused {

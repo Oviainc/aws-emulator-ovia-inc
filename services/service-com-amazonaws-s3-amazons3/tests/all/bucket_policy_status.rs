@@ -18,9 +18,10 @@
 //!   (Amazon S3 User Guide, Blocking public access). A condition whose operand names every
 //!   value the key could take — the bare wildcard, or the whole address space for
 //!   `aws:SourceIp` — restricts nothing, so the grant stays public.
-//! * A bucket carrying NO policy grants the public nothing through one, so it reports
-//!   `IsPublic` false in a 200 rather than the `NoSuchBucketPolicy` the document readers
-//!   answer: this operation's output member carries the answer for that state.
+//! * A bucket carrying NO policy has no policy status to report: this operation states
+//!   something ABOUT a policy, so the bucket without one is refused `NoSuchBucketPolicy`
+//!   (404) exactly as the document readers are — which is what keeps "no policy" from being
+//!   answered as "a policy that is not public".
 //! * Reading the status changes nothing: the document reads back unchanged afterwards and
 //!   a second read reports the same status.
 //! * Block Public Access does not enter the answer. Its switches govern what S3 lets a
@@ -488,7 +489,7 @@ async fn the_policy_status_reports_whether_the_stored_policy_grants_public_acces
 }
 
 #[tokio::test]
-async fn a_bucket_with_no_policy_reports_a_status_rather_than_refusing() {
+async fn a_bucket_with_no_policy_is_refused_the_way_the_document_readers_refuse_it() {
     let router = router();
     // Several buckets, differing in name length and form, one of them outside `us-east-1`:
     // the status of a bucket without a policy is not a property of the bucket.
@@ -506,28 +507,60 @@ async fn a_bucket_with_no_policy_reports_a_status_rather_than_refusing() {
             String::from_utf8_lossy(&created.body)
         );
 
-        // The document reader has nothing to report for this state and refuses it; the
-        // status reader has an answer for it.
-        let read = get_bucket_policy(&router, bucket).await;
-        assert_eq!(
-            read.error_code(),
-            "NoSuchBucketPolicy",
-            "case {bucket:?}: a fresh bucket carries no policy, got {} with body {:?}",
-            read.status,
-            String::from_utf8_lossy(&read.body)
-        );
+        // Both readers answer the same absent subresource the same way: there is no policy,
+        // so there is neither a document nor a status for one.
+        for (reader, answer) in [
+            ("GetBucketPolicy", get_bucket_policy(&router, bucket).await),
+            (
+                "GetBucketPolicyStatus",
+                get_bucket_policy_status(&router, bucket, &[]).await,
+            ),
+        ] {
+            assert_eq!(
+                answer.status, 404,
+                "case {bucket:?}/{reader}: expected HTTP 404, got {} with body {:?}",
+                answer.status,
+                String::from_utf8_lossy(&answer.body)
+            );
+            assert_eq!(
+                answer.error_code(),
+                "NoSuchBucketPolicy",
+                "case {bucket:?}/{reader}: a fresh bucket carries no policy, got {:?}",
+                answer.error_code()
+            );
+            assert_eq!(
+                reported_is_public(&answer),
+                None,
+                "case {bucket:?}/{reader}: a refusal reports no status, got body {:?}",
+                String::from_utf8_lossy(&answer.body)
+            );
+        }
 
+        // Once a policy IS there, the same read answers the status of THAT document.
+        let attached = put_bucket_policy(
+            &router,
+            bucket,
+            "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\
+             \"arn:aws:iam::111122223333:root\"},\"Action\":\"s3:GetObject\"}]}",
+        )
+        .await;
+        assert_eq!(
+            attached.status, 204,
+            "case {bucket:?}: the document must be accepted, got {} with body {:?}",
+            attached.status,
+            String::from_utf8_lossy(&attached.body)
+        );
         let answer = get_bucket_policy_status(&router, bucket, &[]).await;
         assert_eq!(
             answer.status, 200,
-            "case {bucket:?}: expected HTTP 200, got {} with body {:?}",
+            "case {bucket:?}: expected HTTP 200 once a policy is stored, got {} with body {:?}",
             answer.status,
             String::from_utf8_lossy(&answer.body)
         );
         assert_eq!(
             reported_is_public(&answer),
             Some(false),
-            "case {bucket:?}: a bucket with no policy is not public, got body {:?}",
+            "case {bucket:?}: a policy granting one account is not public, got body {:?}",
             String::from_utf8_lossy(&answer.body)
         );
     }
@@ -671,7 +704,21 @@ async fn a_policy_status_read_is_refused_for_a_missing_bucket_or_another_owner()
     }
 
     // The owner's own account id in that header is accepted, so the 403 above is about the
-    // MISMATCH and not about the header being present.
+    // MISMATCH and not about the header being present. The bucket carries a policy by then,
+    // since the status is a statement about one.
+    let attached = put_bucket_policy(
+        &router,
+        bucket,
+        "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\
+         \"arn:aws:iam::111122223333:root\"},\"Action\":\"s3:GetObject\"}]}",
+    )
+    .await;
+    assert_eq!(
+        attached.status, 204,
+        "the document must be accepted, got {} with body {:?}",
+        attached.status,
+        String::from_utf8_lossy(&attached.body)
+    );
     let as_owner =
         get_bucket_policy_status(&router, bucket, &[("x-amz-expected-bucket-owner", owner)]).await;
     assert_eq!(
@@ -683,7 +730,8 @@ async fn a_policy_status_read_is_refused_for_a_missing_bucket_or_another_owner()
     assert_eq!(
         reported_is_public(&as_owner),
         Some(false),
-        "case \"the owner's own account id\": a bucket with no policy is not public, got body {:?}",
+        "case \"the owner's own account id\": a policy granting one account is not public, got \
+         body {:?}",
         String::from_utf8_lossy(&as_owner.body)
     );
 }

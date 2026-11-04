@@ -255,9 +255,9 @@ async fn a_call_barred_by_the_objects_storage_class_is_refused_with_that_storage
     .await;
     assert_eq!(
         asked.status,
-        200,
-        "case \"a restore of the archived source\": expected the modelled 200 from \
-         RestoreObject, got {} with body {:?}",
+        202,
+        "case \"a restore of the archived source\": expected the 202 of a retrieval this call \
+         initiated, got {} with body {:?}",
         asked.status,
         text(&asked)
     );

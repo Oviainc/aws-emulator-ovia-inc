@@ -431,14 +431,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what the bucket grants to everyone
         // ([`crate::state::Bucket::anonymous_object_read_refusal`] carries that rule); one
         // presenting a credential speaks for this account, and the bucket's own policy is in
-        // force on it too ([`crate::state::Bucket::caller_object_read_refusal`]) — an
+        // force on it too ([`crate::service::authorization::caller_object_read_refusal`]) — an
         // explicit deny refuses the read whatever the store holds. Either way the refusal is
         // S3's authorization code.
         let refusal = match crate::state::request_is_anonymous(ctx.parts()) {
             true => bucket
                 .anonymous_object_read_refusal(&input.bucket, &input.key, addressed)
                 .map(str::to_string),
-            false => bucket.caller_object_read_refusal(&input.bucket, &input.key, addressed),
+            false => crate::service::authorization::caller_object_read_refusal(
+                bucket,
+                &input.bucket,
+                &input.key,
+                addressed,
+            ),
         };
         if let Some(message) = refusal {
             return Err(crate::scaffolded::Scaffolded::unmodeled(

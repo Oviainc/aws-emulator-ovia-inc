@@ -184,13 +184,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // A bucket with no policy grants the public nothing through one, so it is not
-        // public: unlike the other policy readers, this operation has an answer for that
-        // state and so does not refuse it.
-        let is_public = bucket
-            .policy
-            .as_deref()
-            .is_some_and(crate::state::policy_grants_public_access);
+        // "PolicyStatus — The policy status for the specified bucket" is a statement ABOUT a
+        // policy, so a bucket carrying none has nothing to report: the subresource is not
+        // there, which is what `NoSuchBucketPolicy` (404) states — the same refusal
+        // `GetBucketPolicy` answers for the same bucket, read off the same record. Answering
+        // `IsPublic: false` instead would make "no policy" indistinguishable from "a policy
+        // that is not public", which is exactly the distinction this operation reports.
+        let Some(policy) = bucket.policy.as_deref() else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_BUCKET_POLICY_CODE,
+                404,
+                crate::state::NO_SUCH_BUCKET_POLICY_MESSAGE,
+            ));
+        };
+        let is_public = crate::state::policy_grants_public_access(policy);
 
         Ok(GetBucketPolicyStatusOutput {
             policy_status: Some(PolicyStatus {

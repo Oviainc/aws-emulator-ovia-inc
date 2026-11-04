@@ -10,7 +10,7 @@
 //! ([`remember`], called from this service's routing seam, which the framework reaches
 //! before it authenticates) and answered once ([`refusal_for`]).
 //!
-//! Three conditions, each with its own answer:
+//! Five conditions, each with its own answer:
 //!
 //! 1. The validity window a SigV4 QUERY-authenticated (presigned) URL asks for is outside
 //!    the range query-string authentication accepts — `X-Amz-Expires` must be a
@@ -25,7 +25,13 @@
 //!    verify.
 //! 2. The window is inside that range but has PASSED. The signature is intact and the
 //!    request is refused for the EXPIRY, which S3 states as such.
-//! 3. The credential resolves — the key id names one this emulator ISSUED — so the caller
+//! 3. The instant the request says it was signed at is outside the window S3 accepts around
+//!    its own clock ([`MAX_REQUEST_SKEW`]). A signature is only as good as the moment it
+//!    covers, so a request stamped too far from now is refused for its TIME, whatever its
+//!    signature computes to — [`CLOCK_SKEW_CODE`], with the request's own instant and the
+//!    service's beside the window, which is what tells a caller whose clock has drifted that
+//!    the clock is what to fix.
+//! 4. The credential resolves — the key id names one this emulator ISSUED — so the caller
 //!    is known and what failed is the signature computed under that credential's secret.
 //!    S3's answer to that one carries, beside the code and the sentence, the SIGNING
 //!    DIAGNOSTICS: the access key id the request named, the string S3 signed, the canonical
@@ -33,7 +39,7 @@
 //!    request itself presented. They are the only way a caller (or a human debugging a
 //!    presigner) can tell WHICH canonical request the service signed from a wrong secret
 //!    key, so they are what makes a signing bug diagnosable at all.
-//! 4. The request presented NO credential at all — the ANONYMOUS caller, which is a caller
+//! 5. The request presented NO credential at all — the ANONYMOUS caller, which is a caller
 //!    S3 serves ("if you grant READ access to the anonymous user, the `GetObject` operation
 //!    returns the object without using an authorization header", `GetObject`'s own
 //!    documentation) rather than one that failed to sign. Nothing was signed, so there is no
@@ -129,6 +135,22 @@ const EXPIRES_OVER_CEILING_MESSAGE: &str =
 /// The sentence AWS answers a presigned URL asking for a NEGATIVE validity window — the
 /// other end of the same range. Fixed text, for the same reason.
 const EXPIRES_NEGATIVE_MESSAGE: &str = "X-Amz-Expires must be non-negative";
+
+/// The error code AWS answers a request whose signing instant is outside the window it
+/// accepts around its own clock (Amazon S3 "Error responses", list of error codes:
+/// "RequestTimeTooSkewed — The difference between the request time and the current time is
+/// too large", HTTP 403).
+const CLOCK_SKEW_CODE: &str = "RequestTimeTooSkewed";
+
+/// How AWS words that one. Fixed text; the instants and the window it carries travel beside
+/// it as the elements S3's own document holds them in ([`Skew`]).
+const CLOCK_SKEW_MESSAGE: &str =
+    "The difference between the request time and the current time is too large.";
+
+/// How far from this clock a request's signing instant may be, in either direction: fifteen
+/// minutes ("the difference between the request time and the current time cannot be more
+/// than 15 minutes", Amazon S3 API Reference, *Signing and authenticating REST requests*).
+const MAX_REQUEST_SKEW: Duration = Duration::from_secs(15 * 60);
 
 /// The error code AWS answers a presigned URL whose validity window has passed: the
 /// signature is intact and the caller resolved, so what refused it is the window.
@@ -299,6 +321,68 @@ impl Presented {
             .checked_add(Duration::from_secs(expires_secs))
             .is_none_or(|valid_until| valid_until < SystemTime::now())
     }
+
+    /// How far outside the accepted window around `now` this request's signing instant is, or
+    /// `None` for one inside it.
+    ///
+    /// Judged only for a request that SIGNED an instant and carries a credential: a request
+    /// with no stamp states no time to compare, and an anonymous one presented no signature
+    /// for a stamp to cover. A PRESIGNED URL is not judged here either — it carries its own
+    /// validity window ([`Self::window_passed`]), which is what decides how long it stays
+    /// usable, so a URL signed hours ago and valid for a week is not a skewed request.
+    fn skew_outside_window(&self, now: SystemTime) -> Option<Skew> {
+        if !self.carries_credential || self.stated_expires.is_some() {
+            return None;
+        }
+        let signed_at = self.signed_at?;
+        let difference = match now.duration_since(signed_at) {
+            Ok(behind) => behind,
+            Err(ahead) => ahead.duration(),
+        };
+        (difference > MAX_REQUEST_SKEW).then(|| Skew::of(signed_at, now))
+    }
+}
+
+/// The instants S3's clock-skew refusal states, each rendered the way its own element carries
+/// it: the request's own time, this service's time, and the window between them that is
+/// allowed.
+struct Skew {
+    /// `<RequestTime>` — the instant the request signed, in the SigV4 stamp form it signed it
+    /// in.
+    request_time: String,
+    /// `<ServerTime>` — this service's clock when it judged the request, in ISO 8601.
+    server_time: String,
+    /// `<MaxAllowedSkewMilliseconds>` — [`MAX_REQUEST_SKEW`] in the unit the element names.
+    max_allowed_skew_milliseconds: String,
+}
+
+impl Skew {
+    /// The elements for a request signed at `signed_at` and judged at `now`. Both instants
+    /// come from the request and from this service's own clock; nothing here is a stored or
+    /// recorded value.
+    fn of(signed_at: SystemTime, now: SystemTime) -> Self {
+        Self {
+            request_time: amz_stamp(signed_at),
+            server_time: rendered(now, ::aws_smithy_types::date_time::Format::DateTime),
+            max_allowed_skew_milliseconds: MAX_REQUEST_SKEW.as_millis().to_string(),
+        }
+    }
+}
+
+/// `instant` in `format`, or the empty string for an instant no calendar can render — which
+/// leaves the element empty rather than failing the refusal that carries it.
+fn rendered(instant: SystemTime, format: ::aws_smithy_types::date_time::Format) -> String {
+    ::aws_smithy_types::DateTime::from(instant)
+        .fmt(format)
+        .unwrap_or_default()
+}
+
+/// `instant` as a SigV4 stamp, `YYYYMMDDTHHMMSSZ` — the form a request writes its own signing
+/// instant in, which is the form the refusal states it back in. Rendered from the instant
+/// through the library's calendar ([`rendered`]) with the separators SigV4 omits removed,
+/// rather than echoed from the header text.
+fn amz_stamp(instant: SystemTime) -> String {
+    rendered(instant, ::aws_smithy_types::date_time::Format::DateTime).replace(['-', ':'], "")
 }
 
 /// What the request's signature was computed over: the canonical request's own six lines,
@@ -582,9 +666,10 @@ fn amz_instant(stamp: &str) -> Option<SystemTime> {
 /// The order is AWS's: a query string the service cannot use is answered before anything
 /// about the caller, so a presigned URL whose window is outside the accepted range is
 /// refused for the URL whether or not its signature verifies; then the window that has
-/// passed, which refuses an intact signature; then the request that presented no credential
-/// at all, which has neither; and last the signature itself, which is the only condition
-/// left once the credential has resolved.
+/// passed, which refuses an intact signature; then the signing INSTANT, which a signature
+/// cannot rescue either; then the request that presented no credential at all, which has
+/// neither; and last the signature itself, which is the only condition left once the
+/// credential has resolved.
 pub(super) fn refusal_for(
     presented: &Presented,
     issued: &dyn Fn(&str) -> bool,
@@ -600,6 +685,7 @@ pub(super) fn refusal_for(
             status: QUERY_PARAMETERS_STATUS,
             message,
             diagnostics: None,
+            skew: None,
         });
     }
     if presented.window_passed() {
@@ -608,6 +694,19 @@ pub(super) fn refusal_for(
             status: UNAUTHENTICATED_STATUS,
             message: REQUEST_EXPIRED_MESSAGE,
             diagnostics: None,
+            skew: None,
+        });
+    }
+    // The signing INSTANT, before anything about the signature: a stamp too far from this
+    // clock is refused for its time whatever the signature computes to, which is what lets a
+    // caller tell a drifted clock from a wrong secret.
+    if let Some(skew) = presented.skew_outside_window(SystemTime::now()) {
+        return Some(AuthRefusal {
+            code: CLOCK_SKEW_CODE,
+            status: UNAUTHENTICATED_STATUS,
+            message: CLOCK_SKEW_MESSAGE,
+            diagnostics: None,
+            skew: Some(skew),
         });
     }
     if !presented.carries_credential {
@@ -622,6 +721,7 @@ pub(super) fn refusal_for(
             status: UNAUTHENTICATED_STATUS,
             message: anonymous_message(presented.addressed_bucket.as_deref()),
             diagnostics: None,
+            skew: None,
         });
     }
     if !issued(&presented.access_key_id) {
@@ -635,6 +735,7 @@ pub(super) fn refusal_for(
             .signing
             .as_ref()
             .map(|signing| Diagnostics::of(presented, signing)),
+        skew: None,
     })
 }
 
@@ -678,6 +779,8 @@ pub(super) struct AuthRefusal {
     message: &'static str,
     /// The SigV4 signing diagnostics, for the one refusal that carries them.
     diagnostics: Option<Diagnostics>,
+    /// The instants and the accepted window, for the one refusal that carries them.
+    skew: Option<Skew>,
 }
 
 /// The signing diagnostics S3's signature refusal carries, every one of them derived from
@@ -752,6 +855,14 @@ diagnostic_member!(
     "CanonicalRequestBytes",
     6
 );
+diagnostic_member!(REQUEST_TIME, "requestTime", "RequestTime", 7);
+diagnostic_member!(SERVER_TIME, "serverTime", "ServerTime", 8);
+diagnostic_member!(
+    MAX_ALLOWED_SKEW,
+    "maxAllowedSkewMilliseconds",
+    "MaxAllowedSkewMilliseconds",
+    9
+);
 
 /// The shape of this service's authentication-refusal document.
 ///
@@ -774,15 +885,24 @@ pub(super) static REFUSAL_SCHEMA: Schema = Schema::new_struct(
         &STRING_TO_SIGN_BYTES,
         &CANONICAL_REQUEST,
         &CANONICAL_REQUEST_BYTES,
+        &REQUEST_TIME,
+        &SERVER_TIME,
+        &MAX_ALLOWED_SKEW,
     ],
 );
 
-/// The document: the message, and — for the signature refusal alone — the diagnostics, in
-/// the order S3's own `<Error>` carries them. The `<Code>` and the request-correlation
-/// elements around them are the envelope's, written by the protocol.
+/// The document: the message, the instants a clock-skew refusal states, and — for the
+/// signature refusal alone — the diagnostics, in the order S3's own `<Error>` carries them.
+/// The `<Code>` and the request-correlation elements around them are the envelope's, written
+/// by the protocol.
 impl SerializableStruct for AuthRefusal {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
         s.write_string(&MESSAGE, self.message)?;
+        if let Some(skew) = &self.skew {
+            s.write_string(&REQUEST_TIME, &skew.request_time)?;
+            s.write_string(&SERVER_TIME, &skew.server_time)?;
+            s.write_string(&MAX_ALLOWED_SKEW, &skew.max_allowed_skew_milliseconds)?;
+        }
         let Some(diagnostics) = &self.diagnostics else {
             return Ok(());
         };
@@ -805,6 +925,89 @@ impl SerializableStruct for AuthRefusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The accepted window around this service's clock, at both its bounds and one second
+    /// past each of them, for a request that signed an instant and carries a credential.
+    #[test]
+    fn the_accepted_signing_window_is_the_published_one() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let rows: [(&str, Duration, bool, bool); 8] = [
+            ("signed at this instant", Duration::ZERO, false, false),
+            ("signed a minute ago", Duration::from_secs(60), false, false),
+            ("signed at the window's edge", MAX_REQUEST_SKEW, false, false),
+            (
+                "signed one second past the window",
+                MAX_REQUEST_SKEW + Duration::from_secs(1),
+                false,
+                true,
+            ),
+            (
+                "signed far behind the clock",
+                Duration::from_secs(1_500),
+                false,
+                true,
+            ),
+            (
+                "stamped at the window's edge AHEAD of the clock",
+                MAX_REQUEST_SKEW,
+                true,
+                false,
+            ),
+            (
+                "stamped one second past the window AHEAD of the clock",
+                MAX_REQUEST_SKEW + Duration::from_secs(1),
+                true,
+                true,
+            ),
+            (
+                "stamped an hour AHEAD of the clock",
+                Duration::from_secs(3_600),
+                true,
+                true,
+            ),
+        ];
+        for (case, difference, ahead, refused) in rows {
+            let signed_at = match ahead {
+                true => now + difference,
+                false => now - difference,
+            };
+            let presented = Presented {
+                access_key_id: "EMULATORKEY".to_string(),
+                stated_expires: None,
+                signed_at: Some(signed_at),
+                signing: None,
+                carries_credential: true,
+                addressed_bucket: None,
+            };
+            let skew = presented.skew_outside_window(now);
+            assert_eq!(
+                skew.is_some(),
+                refused,
+                "case {case:?}: expected refused={refused}, got {}",
+                skew.is_some()
+            );
+        }
+    }
+
+    /// A PRESIGNED URL is judged by the window it asked for, not by the signing instant: one
+    /// signed long ago and valid for a week is not a skewed request.
+    #[test]
+    fn a_presigned_url_is_not_judged_for_its_signing_instant() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let presented = Presented {
+            access_key_id: "EMULATORKEY".to_string(),
+            stated_expires: Some("604800".to_string()),
+            signed_at: Some(now - Duration::from_secs(3_600)),
+            signing: None,
+            carries_credential: true,
+            addressed_bucket: None,
+        };
+        assert!(
+            presented.skew_outside_window(now).is_none(),
+            "a presigned URL inside the window it asked for must not be refused for its \
+             signing instant"
+        );
+    }
 
     /// The range SigV4 query-string authentication accepts, at both its bounds and one past
     /// each of them.

@@ -237,6 +237,10 @@ mod object_torrent;
 mod object_versioning;
 #[path = "all/object_write_and_read_back.rs"]
 mod object_write_and_read_back;
+#[path = "all/object_write_authorization.rs"]
+mod object_write_authorization;
+#[path = "all/object_write_refusals.rs"]
+mod object_write_refusals;
 #[path = "all/object_write_tagging_header.rs"]
 mod object_write_tagging_header;
 #[path = "all/objects.rs"]
@@ -261,6 +265,8 @@ mod refusal_codes;
 mod refusal_detail_members;
 #[path = "all/request_integrity_headers.rs"]
 mod request_integrity_headers;
+#[path = "all/request_time_skew.rs"]
+mod request_time_skew;
 #[path = "all/refusal_messages_published.rs"]
 mod refusal_messages_published;
 #[path = "all/refusal_resource_naming.rs"]

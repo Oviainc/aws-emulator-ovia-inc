@@ -195,6 +195,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The confused-deputy guard the request itself asks for: "if the account ID that you
+        // provide does not match the actual owner of the bucket, the request fails with the
+        // HTTP status code 403 Forbidden (access denied)"
+        // (`PutBucketNotificationConfigurationRequest$ExpectedBucketOwner`), judged through
+        // the one rule every operation of this service judges it by and before the store is
+        // reached, so a mismatched guard changes nothing about the bucket.
+        if let Some(refusal) = crate::service::authorization::expected_bucket_owner_refusal(
+            input.expected_bucket_owner.as_deref(),
+        ) {
+            return Err(refusal);
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The store is unreachable only when this service is mounted on an engine that
             // is not the shared `InMemoryEngine`; nothing can then be persisted, and

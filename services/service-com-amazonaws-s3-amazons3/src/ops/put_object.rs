@@ -348,6 +348,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `x-amz-request-id` / `x-amz-id-2` headers, and every notification this write
         // owes names the call it came of by them.
         let correlation = crate::state::request_ids::RequestCorrelation::mint();
+
+        // The confused-deputy guard the request itself asks for, judged before the store is
+        // reached through the one rule every operation of this service judges it by, so a
+        // mismatched guard says nothing about what the bucket holds.
+        if let Some(refusal) = crate::service::authorization::expected_bucket_owner_refusal(
+            input.expected_bucket_owner.as_deref(),
+        ) {
+            return Err(refusal);
+        }
+
+        // The KEY this write names, judged on its bytes alone before anything else about the
+        // request: a name S3 cannot store is refused whatever the bucket or the payload is
+        // ([`crate::service::object_write::key_refusal`] holds both published rules).
+        if let Some((code, message)) = crate::service::object_write::key_refusal(&input.key) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                code,
+                crate::service::object_write::KEY_REFUSAL_STATUS,
+                message,
+            ));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Without the store the object cannot be recorded at all, and none of the
             // modelled errors says that, so the scaffold's 501 carries what is true:
@@ -572,6 +593,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             requested
         };
+
+        // WHO is asking, before the write commits. A bucket policy is a RESOURCE-BASED
+        // policy, so it is in force on this write too: "an explicit deny in any policy
+        // overrides any allow" (IAM's own evaluation order), which is what makes a policy
+        // that requires an encryption header — or any other condition over the request's own
+        // members — mandatory rather than advisory. The context is the request's own
+        // ([`crate::service::authorization::ObjectWriteContext`]), so a clause over one of
+        // those members is decided by what THIS request carried: the encryption header as
+        // sent, never the bucket default resolved above, since the policy is about the
+        // request. Judged before anything is stored, so a refused write leaves whatever was
+        // at the key exactly as it was.
+        let write_context = crate::service::authorization::ObjectWriteContext {
+            acl: input.acl.as_deref(),
+            storage_class: input.storage_class.as_deref(),
+            server_side_encryption: input.server_side_encryption.as_deref(),
+            kms_key_id: input.ssekms_key_id.as_deref(),
+            ..crate::service::authorization::ObjectWriteContext::default()
+        };
+        if let Some(message) = crate::service::authorization::policy_denial(
+            bucket_record.policy.as_deref(),
+            PUT_OBJECT_ACTION,
+            &crate::state::object_arn(&input.bucket, &input.key),
+            &write_context.conditions(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
+
+        // The CLASS this write asks for has to be one the addressed bucket can host: a
+        // class belonging to another kind of bucket is refused `InvalidStorageClass` and
+        // nothing is written ([`crate::service::object_write::storage_class_refusal`] holds
+        // the published division).
+        if let Some(message) = crate::service::object_write::storage_class_refusal(
+            bucket_record,
+            input.storage_class.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::service::object_write::INVALID_STORAGE_CLASS_CODE,
+                crate::service::object_write::INVALID_STORAGE_CLASS_STATUS,
+                message,
+            ));
+        }
+
         // A retention and a legal hold are the two halves of S3 Object Lock, which a bucket
         // has only once an Object Lock configuration is on it: the configuration's rule "will
         // be applied by default to every new object placed in the specified bucket"
@@ -815,12 +882,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match outcome {
             crate::state::ObjectWrite::Created | crate::state::ObjectWrite::Replaced => {}
             // "The name for a key is a sequence of Unicode characters whose UTF-8
-            // encoding is at most 1,024 bytes long" (Amazon S3 User Guide). A longer key
-            // is a parameter that is not valid for this request, which is what the
-            // modelled `InvalidRequest` reports; AWS's own `KeyTooLongError` is not a
-            // shape in this model and so cannot be rendered.
+            // encoding is at most 1,024 bytes long" (Amazon S3 User Guide) — refused above,
+            // on the key's bytes alone, with the `KeyTooLongError` S3 answers it with. The
+            // store's own ceiling is the same one, so this arm is the one that cannot be
+            // reached from here; it carries the same answer rather than a different code.
             crate::state::ObjectWrite::KeyTooLong { .. } => {
-                return Err(PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::service::object_write::KEY_TOO_LONG_CODE,
+                    crate::service::object_write::KEY_REFUSAL_STATUS,
+                    crate::service::object_write::KEY_TOO_LONG_MESSAGE,
+                ));
             }
             // "Within the PUT request header, the user-defined metadata is limited to 2 KB
             // in size" (Amazon S3 User Guide). Past it the request carries a header that
@@ -1056,9 +1127,10 @@ fn requested_acl(
     Ok(None)
 }
 
-/// The code and status the Block Public Access guardrail denies a write carrying a public
-/// ACL with; the message is the guardrail's own
-/// ([`crate::state::block_public_acls_denial`]).
+/// The code and status S3 answers a write its authorization refuses with: the Block Public
+/// Access guardrail barring a public ACL, and the bucket policy's own explicit deny. The
+/// message is the one that refusal words ([`crate::state::block_public_acls_denial`] and
+/// [`crate::service::authorization::policy_denial`]).
 const ACCESS_DENIED_CODE: &str = "AccessDenied";
 /// See [`ACCESS_DENIED_CODE`].
 const ACCESS_DENIED_STATUS: u16 = 403;

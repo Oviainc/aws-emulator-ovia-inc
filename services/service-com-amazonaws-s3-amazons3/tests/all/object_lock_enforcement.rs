@@ -422,7 +422,10 @@ fn bypass_rows() -> Vec<BypassRow> {
         (
             "a deny of a different action, which the bypass is not",
             "denied-another-action",
-            Some(policy("Deny", "*", "s3:PutObject", every_object)),
+            // An action nothing in this row's sequence is authorized under: the write of the
+            // version and the delete of it are each judged against the policy too, so a row
+            // about the BYPASS names an action neither of them needs.
+            Some(policy("Deny", "*", "s3:GetObjectTagging", every_object)),
             204,
         ),
         (
