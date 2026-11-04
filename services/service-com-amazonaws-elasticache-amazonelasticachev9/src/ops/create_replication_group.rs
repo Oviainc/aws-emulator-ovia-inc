@@ -818,7 +818,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         CreateReplicationGroupErrorModeled::CacheParameterGroupNotFoundFault(
                             CacheParameterGroupNotFoundFault {
                                 message: Some(
-                                    crate::state::cache_parameter_group_not_found_message(name),
+                                    crate::service::cache_parameter_group_not_found::spaced_message(
+                                        name,
+                                    ),
                                 ),
                             },
                         )

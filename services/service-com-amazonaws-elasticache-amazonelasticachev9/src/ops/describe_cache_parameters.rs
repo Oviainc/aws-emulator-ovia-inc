@@ -221,15 +221,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The requested cache parameter group name does not refer to an
         // existing cache parameter group" is the modelled 404, resolved through
         // the one lookup every handler naming a `CacheParameterGroupName`
-        // shares.
+        // shares. The service words that fault with one of two sibling
+        // templates and this operation answers the first
+        // (`crate::service::cache_parameter_group_not_found`).
         let name = input.cache_parameter_group_name;
         let Some(group) = store.parameter_group(&name) else {
             return Err(
                 DescribeCacheParametersErrorModeled::CacheParameterGroupNotFoundFault(
                     CacheParameterGroupNotFoundFault {
-                        message: Some(crate::state::cache_parameter_group_not_found_message(
-                            &name,
-                        )),
+                        message: Some(
+                            crate::service::cache_parameter_group_not_found::joined_message(&name),
+                        ),
                     },
                 )
                 .into(),

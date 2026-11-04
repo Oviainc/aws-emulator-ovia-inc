@@ -209,11 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Whichever member carries a rule list, it is the engine's own ACL
         // syntax: one that names something that is not a rule is refused rather
-        // than stored as a permission set no engine could apply. The same test
-        // `CreateUser` applies (`crate::state::access_string_rejection`), so the
-        // two cannot drift about which rule lists the service accepts — nor
-        // about the words the refusal carries, which name neither the offending
-        // rule nor the member it arrived on.
+        // than stored as a permission set no engine could apply, and one that
+        // names a command category the engine does not publish is refused as
+        // THAT. The same test `CreateUser` applies
+        // (`crate::service::access_string_categories`), so the two cannot drift
+        // about which rule lists the service accepts — nor about which of the two
+        // refusals a list gets, neither of which names the offending rule or the
+        // member it arrived on.
         for value in [
             input.access_string.as_deref(),
             input.append_access_string.as_deref(),
@@ -221,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .into_iter()
         .flatten()
         {
-            if let Some(message) = crate::state::access_string_rejection(value) {
+            if let Some(message) = crate::service::access_string_categories::refusal(value) {
                 return Err(ModifyUserErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
                         message: Some(message.to_string()),
@@ -368,8 +370,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An append makes the stored list the one thing a caller can grow
             // from call to call, so the bound is checked on the RESULT rather
             // than on the rules the request added; it is the same bound a whole
-            // access string is accepted under (`crate::state::access_string_rejection`).
-            if let Some(message) = crate::state::access_string_rejection(&next) {
+            // access string is accepted under
+            // (`crate::service::access_string_categories`).
+            if let Some(message) = crate::service::access_string_categories::refusal(&next) {
                 return Err(ModifyUserErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
                         message: Some(message.to_string()),

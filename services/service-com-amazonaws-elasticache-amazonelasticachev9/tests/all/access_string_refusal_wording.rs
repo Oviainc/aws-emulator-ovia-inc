@@ -14,10 +14,14 @@
 //!
 //! The refused rows vary along WHAT is wrong with the list (a word that is no rule, a
 //! near-miss keyword, a pattern with no glob, a qualifier outside the published letters, a
-//! category name the grammar does not admit, a selector that is never closed, one that is
-//! empty, one whose inner rule is no rule) and along the ENTRY POINT the list arrives
-//! through (`CreateUser`, `ModifyUser$AccessString`, `ModifyUser$AppendAccessString`), so
-//! no single recorded request is what makes them pass.
+//! selector that is never closed, one that is empty, one whose inner rule is no rule) and
+//! along the ENTRY POINT the list arrives through (`CreateUser`,
+//! `ModifyUser$AccessString`, `ModifyUser$AppendAccessString`), so no single recorded
+//! request is what makes them pass.
+//!
+//! A rule list whose syntax reads as one but which names a command CATEGORY the engine
+//! does not publish is the service's OTHER refusal, worded its own way, and belongs to
+//! [`crate::access_string_category_refusal`] rather than here.
 //!
 //! Every assertion goes over the wire through [`crate::harness`], and each accepted row is
 //! read back through `DescribeUsers`. The expected sentence is written out here on
@@ -57,10 +61,6 @@ const NOT_RULE_LISTS: &[(&str, &str)] = &[
     (
         "a read/write qualifier outside the published letters",
         "on %X~app:* +@all",
-    ),
-    (
-        "a category name carrying a character the grammar does not admit",
-        "on ~* +@read_write",
     ),
     ("a selector that is never closed", "on ~* (+get ~key1"),
     ("a selector with no rule in it", "on ~* () +@read"),

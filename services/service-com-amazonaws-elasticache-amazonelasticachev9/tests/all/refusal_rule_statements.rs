@@ -229,7 +229,7 @@ async fn a_parameter_group_name_is_held_against_the_grammar_before_it_is_resolve
         &absent,
         404,
         "CacheParameterGroupNotFound",
-        "CacheParameterGroup not found: never-created",
+        "CacheParameterGroupnot found: never-created",
     );
     let created = create_parameter_group(&emulator, "resettable", "redis7").await;
     assert_eq!(

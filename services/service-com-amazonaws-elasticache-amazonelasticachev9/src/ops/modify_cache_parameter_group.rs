@@ -125,6 +125,48 @@ fn invalid_parameter_value(message: String) -> ModifyCacheParameterGroupError {
     .into()
 }
 
+/// How ElastiCache words a value the parameter's published
+/// `Parameter$AllowedValues` do not cover: the fixed text `value:` and
+/// ` is outside of range:`, around the value the request asked for and the
+/// published set as a read reports it.
+///
+/// The message is the only place the REJECTED value is reported, which is what
+/// tells a client which of several `ParameterNameValues` of one request was
+/// refused; both variable parts come from the request and from the service's own
+/// parameter metadata.
+fn value_outside_published_set(value: &str, allowed_values: &str) -> String {
+    format!("value:{value} is outside of range:{allowed_values}")
+}
+
+/// Why the published catalog row `parameter` does not take `value`, worded the
+/// way the service words that class of refusal, or `None` when it does take it.
+///
+/// The catalog row IS the rule and `crate::state::check_parameter_value` is where
+/// it is applied, so nothing about which values a parameter takes is restated
+/// here; what this adds is WHICH of the refusals the row gives. A value the
+/// published set does not cover is worded as outside that set
+/// ([`value_outside_published_set`]); a value refused for anything else — a value
+/// that is not one of the parameter's own data type, a parameter no customer may
+/// set — keeps the wording the check itself carries. Asking the same check again
+/// with the published set removed is what tells those two apart.
+fn parameter_value_refusal(
+    parameter: &crate::state::ParameterRecord,
+    value: &str,
+) -> Option<String> {
+    let refusal = crate::state::check_parameter_value(parameter, value).err()?;
+    // A parameter constrained to no published set has none to be outside of, so
+    // its refusal is whatever the check gave.
+    let Some(allowed_values) = parameter.allowed_values.as_deref() else {
+        return Some(refusal);
+    };
+    let mut unconstrained = parameter.clone();
+    unconstrained.allowed_values = None;
+    if crate::state::check_parameter_value(&unconstrained, value).is_err() {
+        return Some(refusal);
+    }
+    Some(value_outside_published_set(value, allowed_values))
+}
+
 /// The `ModifyCacheParameterGroup` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -201,15 +243,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The requested cache parameter group name does not refer to an
         // existing cache parameter group" is the modelled 404, resolved through
         // the one lookup every handler naming a `CacheParameterGroupName`
-        // shares.
+        // shares. This operation answers the second of the service's two
+        // templates for that fault
+        // (`crate::service::cache_parameter_group_not_found`).
         let requested_name = input.cache_parameter_group_name;
         let Some(group) = store.parameter_group(&requested_name) else {
             return Err(
                 ModifyCacheParameterGroupErrorModeled::CacheParameterGroupNotFoundFault(
                     CacheParameterGroupNotFoundFault {
-                        message: Some(crate::state::parameter_writer_group_not_found_message(
-                            &requested_name,
-                        )),
+                        message: Some(
+                            crate::service::cache_parameter_group_not_found::spaced_message(
+                                &requested_name,
+                            ),
+                        ),
                     },
                 )
                 .into(),
@@ -265,7 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::unknown_parameter_message(&parameter_name),
                 ));
             };
-            if let Err(message) = crate::state::check_parameter_value(parameter, &value) {
+            if let Some(message) = parameter_value_refusal(parameter, &value) {
                 return Err(invalid_parameter_value(message));
             }
             // A parameter whose value is already the one asked for is not

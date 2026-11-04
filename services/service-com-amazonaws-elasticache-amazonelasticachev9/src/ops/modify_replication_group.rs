@@ -253,6 +253,20 @@ impl From<ModifyReplicationGroupErrorModeled> for ModifyReplicationGroupError {
     }
 }
 
+/// How THIS operation words a replication group this account does not hold:
+/// `Replication group '<id>' not found` — the id single-quoted, and no trailing
+/// stop.
+///
+/// The wording is this operation's own. The describe that resolves the same
+/// member answers the other template the service has for that fault
+/// (`crate::state::replication_group_not_found_message`, `ReplicationGroup <id>
+/// not found.`), and the two are observable apart on the live service, so one
+/// template cannot serve both. The id is the one variable part and comes from the
+/// request, as the request spelled it.
+fn replication_group_not_found_message(replication_group_id: &str) -> String {
+    format!("Replication group '{replication_group_id}' not found")
+}
+
 /// The `ModifyReplicationGroup` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -483,7 +497,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ModifyReplicationGroupErrorModeled::CacheParameterGroupNotFoundFault(
                             CacheParameterGroupNotFoundFault {
                                 message: Some(
-                                    crate::state::cache_parameter_group_not_found_message(name),
+                                    crate::service::cache_parameter_group_not_found::spaced_message(
+                                        name,
+                                    ),
                                 ),
                             },
                         )
@@ -498,7 +514,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ModifyReplicationGroupErrorModeled::ReplicationGroupNotFoundFault(
                     ReplicationGroupNotFoundFault {
-                        message: Some(crate::state::replication_group_not_found_message(
+                        message: Some(replication_group_not_found_message(
                             &input.replication_group_id,
                         )),
                     },

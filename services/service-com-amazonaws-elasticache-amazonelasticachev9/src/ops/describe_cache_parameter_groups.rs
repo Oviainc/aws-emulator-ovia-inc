@@ -200,15 +200,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If a cache parameter group name is specified, the list contains only
         // the descriptions for that group" — or the modelled not-found when the
-        // account holds no such group. Pagination does not apply to a
-        // single-resource lookup.
+        // account holds no such group, worded with the second of the service's
+        // two templates for it
+        // (`crate::service::cache_parameter_group_not_found`). Pagination does
+        // not apply to a single-resource lookup.
         if let Some(name) = input.cache_parameter_group_name.as_deref() {
             let Some(group) = store.parameter_group(name) else {
                 return Err(
                     DescribeCacheParameterGroupsErrorModeled::CacheParameterGroupNotFoundFault(
                         CacheParameterGroupNotFoundFault {
                             message: Some(
-                                crate::state::cache_parameter_group_not_found_message(name),
+                                crate::service::cache_parameter_group_not_found::spaced_message(
+                                    name,
+                                ),
                             ),
                         },
                     )

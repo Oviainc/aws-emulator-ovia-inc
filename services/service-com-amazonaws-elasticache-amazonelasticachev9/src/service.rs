@@ -49,7 +49,22 @@
 //! adds it to a routing failure, a transport failure and a pre-dispatch refusal.
 //! Everything else about those paths — status, `<Type>`, `<Code>`, `<Message>` — stays
 //! with the framework.
+//!
+//! # How this service words two of its refusals
+//!
+//! Two refusals are worded by more than one handler, and the words are the whole
+//! difference a client sees, so each is stated once beside this file rather than in the
+//! handlers that answer it:
+//!
+//! * [`cache_parameter_group_not_found`] — the first of the two sibling templates the
+//!   service answers a `CacheParameterGroupNotFoundFault` with, for the operations that
+//!   address a named group's own parameters.
+//! * [`access_string_categories`] — which of its two refusals an `AccessString` gets: a
+//!   rule list naming a command category the engine does not publish is diagnosed as that,
+//!   and only an input that is not rule-list syntax keeps the generic sentence.
 
+pub mod access_string_categories;
+pub mod cache_parameter_group_not_found;
 pub mod query_error_envelope;
 
 use query_error_envelope::{ElastiCacheDefinition, RequestIdEnvelopeOperation};
