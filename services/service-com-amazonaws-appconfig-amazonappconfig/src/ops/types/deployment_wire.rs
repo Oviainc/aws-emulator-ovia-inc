@@ -90,6 +90,9 @@ macro_rules! ac_shape_type {
     (struct_of) => {
         ::aws_smithy_schema::ShapeType::Structure
     };
+    (union_of) => {
+        ::aws_smithy_schema::ShapeType::Union
+    };
     (map_of_string) => {
         ::aws_smithy_schema::ShapeType::Map
     };
@@ -99,7 +102,8 @@ macro_rules! ac_shape_type {
 /// `@timestampFormat("date-time")` chain call it cannot.
 ///
 /// `$kind` is the member's shape kind — `string` (a `string` or an `enum` shape, both
-/// string-encoded), `integer`, `float`, `date_time`, `list_of(T)` or `struct_of(T)`.
+/// string-encoded), `integer`, `float`, `date_time`, `list_of(T)`, `struct_of(T)` or
+/// `union_of(T)`.
 macro_rules! ac_member_schema {
     ($ns:literal, $local:literal, $wire:literal, $idx:literal, date_time) => {
         ::aws_smithy_schema::Schema::new_member(
@@ -161,6 +165,13 @@ macro_rules! ac_write_member {
     // codec reads the wire name from; the value's own member schemas write what is inside
     // it. The vendored codegen's `emit_write` does exactly this for `ShapeKind::Structure`.
     ($s:ident, $m:expr, $v:expr, struct_of($inner:ty)) => {
+        $s.write_struct($m, $v)?;
+    };
+    // A union-typed member is written exactly as a structure-typed one is — the vendored
+    // codegen's `emit_write` treats `ShapeKind::Union` and `ShapeKind::Structure` alike,
+    // because a union serializes the one member it carries into the object the member
+    // schema names.
+    ($s:ident, $m:expr, $v:expr, union_of($inner:ty)) => {
         $s.write_struct($m, $v)?;
     };
 }

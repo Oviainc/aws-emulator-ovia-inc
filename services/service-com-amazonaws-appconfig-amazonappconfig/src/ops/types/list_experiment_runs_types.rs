@@ -21,14 +21,36 @@ pub struct ListExperimentRunsInput {
     pub status: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appconfig#ExperimentRuns")]
+/// Carries a list of [`ExperimentRunSummary`], whose instants need the hand-written
+/// serializer below, so this shape's schema and serializer come from `ac_schema_and_codec!`
+/// too — a list element is written against the element shape's own `SCHEMA`, and only a
+/// hand-written parent reaches the hand-written element.
+///
+/// Member set and order from `smithy_query(query="shape", shape="ExperimentRuns")`.
 #[derive(Debug, Clone, Default)]
 pub struct ListExperimentRunsOutput {
     pub items: Option<Vec<ExperimentRunSummary>>,
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appconfig#ExperimentRunSummary")]
+ac_schema_and_codec!(
+    ListExperimentRunsOutput,
+    LIST_EXPERIMENT_RUNS_OUTPUT_SCHEMA,
+    "com.amazonaws.appconfig#ExperimentRuns",
+    "com.amazonaws.appconfig",
+    "ExperimentRuns",
+    (M_ITEMS, items, "Items", 0, opt, list_of(ExperimentRunSummary)),
+    (M_NEXT_TOKEN, next_token, "NextToken", 1, opt, string),
+);
+
+/// `StartedAt`, `UpdatedAt` and `EndedAt` target `Iso8601DateTime`
+/// (`@timestampFormat("date-time")`), so this shape's schema and serializer come from
+/// `ac_schema_and_codec!` rather than from `#[smithy_macros::smithy(shape = ...)]` — see
+/// `types/deployment_wire.rs`. A summary reports the run's own instants, so it reports them
+/// in the same wire form `GetExperimentRun` does.
+///
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="ExperimentRunSummary")`.
 #[derive(Debug, Clone, Default)]
 pub struct ExperimentRunSummary {
     pub experiment_definition_id: Option<String>,
@@ -39,4 +61,26 @@ pub struct ExperimentRunSummary {
     pub updated_at: Option<::aws_smithy_types::DateTime>,
     pub ended_at: Option<::aws_smithy_types::DateTime>,
 }
+
+ac_schema_and_codec!(
+    ExperimentRunSummary,
+    EXPERIMENT_RUN_SUMMARY_SCHEMA,
+    "com.amazonaws.appconfig#ExperimentRunSummary",
+    "com.amazonaws.appconfig",
+    "ExperimentRunSummary",
+    (
+        M_EXPERIMENT_DEFINITION_ID,
+        experiment_definition_id,
+        "ExperimentDefinitionId",
+        0,
+        opt,
+        string
+    ),
+    (M_RUN, run, "Run", 1, def, integer),
+    (M_DESCRIPTION, description, "Description", 2, opt, string),
+    (M_STATUS, status, "Status", 3, opt, string),
+    (M_STARTED_AT, started_at, "StartedAt", 4, opt, date_time),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 5, opt, date_time),
+    (M_ENDED_AT, ended_at, "EndedAt", 6, opt, date_time),
+);
 

@@ -551,8 +551,9 @@ async fn a_started_run_reports_the_members_the_request_carried() {
         let started = assert_running(case, &created, 1, &definition);
 
         // Each member the request carried is reported as written; one it did not carry is
-        // not invented.
-        for member in ["Description", "ExposurePercentage", "TreatmentOverrides"] {
+        // not invented — except the audience exposure, which a run always delivers to, so a
+        // start that named none reports the zero exposure it is running at.
+        for member in ["Description", "TreatmentOverrides"] {
             assert_eq!(
                 started.get(member),
                 body.get(member),
@@ -561,6 +562,16 @@ async fn a_started_run_reports_the_members_the_request_carried() {
                 started.get(member)
             );
         }
+        let expected_exposure = body
+            .get("ExposurePercentage")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let reported_exposure = started.get("ExposurePercentage").and_then(Value::as_f64);
+        assert!(
+            reported_exposure.is_some_and(|got| (got - expected_exposure).abs() < 1e-6),
+            "case {case:?}: expected ExposurePercentage {expected_exposure}, got {:?}",
+            started.get("ExposurePercentage")
+        );
         assert_reads_back(&router, case, &scope.application, &definition_id, &started).await;
     }
 }

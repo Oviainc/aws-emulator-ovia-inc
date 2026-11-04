@@ -27,6 +27,12 @@ pub mod deployment_wire;
 #[macro_use]
 pub mod experiment_definition_wire;
 
+// The `ExperimentRun` shape's member list, stated once against the same macros for the four
+// operations that answer that shape. Hand-added, not generated; `#[macro_use]` and declared
+// before the `*_types` modules that carry those structs, for the same reason.
+#[macro_use]
+pub mod experiment_run_wire;
+
 pub mod create_application_types;
 pub mod create_configuration_profile_types;
 pub mod create_deployment_strategy_types;

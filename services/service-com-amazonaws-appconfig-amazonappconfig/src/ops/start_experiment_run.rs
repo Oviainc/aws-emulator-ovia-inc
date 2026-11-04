@@ -319,7 +319,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             // The run is delivering treatments from the moment this call answers.
             status: crate::state::EXPERIMENT_RUN_RUNNING.to_string(),
-            exposure_percentage: input.exposure_percentage,
+            // A start that names no exposure runs at no exposure: the share of the
+            // audience a run delivers to is materialized here, so every reader of the run
+            // reports which share that is rather than leaving the member out.
+            exposure_percentage: input
+                .exposure_percentage
+                .unwrap_or(crate::state::UNEXPOSED_AUDIENCE),
             treatment_overrides: input.treatment_overrides,
             // The result is the experiment's conclusion, which only the end of the run
             // supplies; a run that has just started has none and none is invented.
@@ -358,7 +363,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             run: stored.run,
             description: stored.description.clone(),
             status: Some(stored.status.clone()),
-            exposure_percentage: stored.exposure_percentage,
+            exposure_percentage: Some(stored.exposure_percentage),
             treatment_overrides: stored.treatment_overrides.clone(),
             result: stored.result.clone(),
             started_at: Some(crate::state::to_date_time(stored.started_at)),

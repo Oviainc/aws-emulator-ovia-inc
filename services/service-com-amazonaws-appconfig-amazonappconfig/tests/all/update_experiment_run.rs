@@ -201,7 +201,9 @@ async fn an_update_patches_only_the_members_the_request_carries() {
             start: json!({}),
             patch: json!({ "Description": "named after the fact" }),
             description: Some(json!("named after the fact")),
-            exposure: None,
+            // A run started without an exposure delivers to nobody, and reports that zero
+            // share, so a patch that does not touch it keeps it.
+            exposure: Some(json!(0.0)),
             overrides: None,
         },
         Patch {
@@ -341,7 +343,7 @@ async fn an_update_cannot_lower_the_audience_a_run_already_exposes() {
 
     // Rows differ along the stored exposure, how far the request moves it and in which
     // direction, including both published bounds of `NullablePercentage` (range 0..100)
-    // and a run that holds no exposure at all.
+    // and a run started with no exposure at all, which delivers to nobody.
     let rows: Vec<(&str, Value, f64, bool)> = vec![
         (
             "a fraction below the stored exposure",
@@ -386,7 +388,7 @@ async fn an_update_cannot_lower_the_audience_a_run_already_exposes() {
             true,
         ),
         (
-            "any exposure on a run that holds none to decrease",
+            "any exposure on a run started without one, which exposes nobody",
             json!({ "Description": "no exposure yet" }),
             0.0,
             true,

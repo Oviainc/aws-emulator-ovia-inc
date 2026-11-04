@@ -5,8 +5,9 @@
 //! this call, records the conclusion the call states and the stop on the run's timeline,
 //! and leaves the definition with no experiment in flight.
 //!
-//! A run the experiment has already finished with takes no second stop: that is a
-//! conflict with the state of the run, not a bad request, and it writes nothing.
+//! A run the experiment has already finished with takes no second stop: an experiment run
+//! never returns to running, so the stop is an input this service will not satisfy — a bad
+//! request rather than a conflict with a state that can clear — and it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -251,18 +252,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // This operation "stops a running experiment" (its own documentation), and a run
-        // the experiment has already finished with is exposing no audience left to end —
-        // so a stop of it conflicts with the current state of the resource and writes
-        // nothing, leaving the instant it DID end, and the conclusion it ended with, as
-        // the stop that ended it wrote them.
+        // the experiment has already finished with is exposing no audience left to end. An
+        // experiment run is a forward-only state machine — once it has reached the terminal
+        // status it ends in, nothing moves it back, so no later request can make this one
+        // acceptable — which makes it an input this service will not satisfy rather than a
+        // conflict with a state that can clear: it is refused as a bad request and writes
+        // nothing, leaving the instant it DID end, and the conclusion it ended with, as the
+        // stop that ended it wrote them.
         if !run.is_active() {
-            return Err(StopExperimentRunErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(crate::state::experiment_run_not_stoppable(
-                        &run.experiment_definition_id,
-                        run.run,
-                        &run.status,
+            return Err(StopExperimentRunErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::experiment_run_not_running(
+                        input.run,
+                        &input.experiment_definition_identifier,
                     )),
+                    reason: None,
+                    details: None,
                 },
             )
             .into());
@@ -287,7 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             run: run.run,
             description: run.description.clone(),
             status: Some(run.status.clone()),
-            exposure_percentage: run.exposure_percentage,
+            exposure_percentage: Some(run.exposure_percentage),
             treatment_overrides: run.treatment_overrides.clone(),
             result: run.result.clone(),
             started_at: Some(crate::state::to_date_time(run.started_at)),

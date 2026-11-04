@@ -220,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             run: run.run,
             description: run.description.clone(),
             status: Some(run.status.clone()),
-            exposure_percentage: run.exposure_percentage,
+            exposure_percentage: Some(run.exposure_percentage),
             treatment_overrides: run.treatment_overrides.clone(),
             result: run.result.clone(),
             started_at: Some(crate::state::to_date_time(run.started_at)),

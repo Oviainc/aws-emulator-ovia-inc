@@ -307,12 +307,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Audience exposure can only be increased, not decreased" (this operation's own
         // documentation), so an exposure below the one the run is already delivering is an
-        // input this service will not satisfy, and nothing is written for it. A run holding
-        // no exposure has none to decrease, and an exposure equal to the stored one lowers
-        // nothing.
-        if let (Some(requested), Some(current)) =
-            (input.exposure_percentage, run.exposure_percentage)
-        {
+        // input this service will not satisfy, and nothing is written for it. An exposure
+        // equal to the stored one lowers nothing.
+        if let Some(requested) = input.exposure_percentage {
+            let current = run.exposure_percentage;
             if requested < current {
                 return Err(UpdateExperimentRunErrorModeled::BadRequestException(
                     BadRequestException {
@@ -356,7 +354,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             run: run.run,
             description: run.description.clone(),
             status: Some(run.status.clone()),
-            exposure_percentage: run.exposure_percentage,
+            exposure_percentage: Some(run.exposure_percentage),
             treatment_overrides: run.treatment_overrides.clone(),
             result: run.result.clone(),
             started_at: Some(crate::state::to_date_time(run.started_at)),

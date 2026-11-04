@@ -17,8 +17,9 @@
 //!   most-recent-first feed, ahead of the one the start wrote — and the definition leaves
 //!   the status it holds while an experiment is in flight
 //!   — so a new run of it may be started again;
-//! * a run the experiment has already finished with takes no second stop: that is HTTP 409
-//!   `ConflictException` and it writes nothing;
+//! * a run the experiment has already finished with takes no second stop: an experiment
+//!   run never returns to running, so it is HTTP 400 `BadRequestException` naming the run
+//!   and the definition it was addressed under, and it writes nothing;
 //! * a stop ends the ONE run its path addresses: the runs the definition already finished
 //!   with keep the documents they finished with, and a run of another definition keeps
 //!   running;
@@ -347,11 +348,11 @@ async fn a_stop_ends_the_run_and_frees_the_definition() {
     }
 }
 
-/// A run the experiment has already finished with takes no second stop: HTTP 409
-/// `ConflictException`, naming the run and the status that refused it, and nothing is
-/// written — the instant it DID end and the conclusion it ended with stand.
+/// A run the experiment has already finished with takes no second stop: HTTP 400
+/// `BadRequestException`, naming the run and the definition the request addressed it under,
+/// and nothing is written — the instant it DID end and the conclusion it ended with stand.
 #[tokio::test]
-async fn a_second_stop_of_a_finished_run_conflicts_and_changes_nothing() {
+async fn a_second_stop_of_a_finished_run_is_refused_and_changes_nothing() {
     const LABEL: &str = "twice";
     let router = router();
     let scope = scope(&router, LABEL).await;
@@ -381,11 +382,6 @@ async fn a_second_stop_of_a_finished_run_conflicts_and_changes_nothing() {
         String::from_utf8_lossy(&first.body)
     );
     let ended = first.json();
-    let expected_message = format!(
-        "Run 1 of experiment definition {definition_id} is {}, so it cannot be stopped: only \
-         a running experiment can be stopped.",
-        state::EXPERIMENT_RUN_DONE
-    );
 
     // Rows differ along how the second stop addresses the run and what it would write:
     // another conclusion, no conclusion, and deployment parameters. None of them lands.
@@ -408,7 +404,11 @@ async fn a_second_stop_of_a_finished_run_conflicts_and_changes_nothing() {
             (scope.application.clone(), definition_id.clone())
         };
         let refused = stop_run(&router, &application, &addressed, 1, &body).await;
-        assert_refused(case, &refused, 409, "ConflictException");
+        assert_refused(case, &refused, 400, "BadRequestException");
+        // The sentence names the run and the definition exactly as the request addressed
+        // them, so a row that addressed the definition by name reads back that name.
+        let expected_message =
+            format!("Experiment run 1 for experiment definition {addressed} is not running.");
         assert_eq!(
             refused.string("Message").as_deref(),
             Some(expected_message.as_str()),
@@ -491,12 +491,12 @@ async fn a_stop_ends_only_the_run_it_addresses() {
             started.json()
         );
 
-        // A stop aimed at a run this definition has already finished with conflicts, and
+        // A stop aimed at a run this definition has already finished with is refused, and
         // the run that IS in flight is not the one it ends.
         for (earlier, _) in &finished {
             let refused =
                 stop_run(&router, &scope.application, &definition_id, *earlier, &json!({})).await;
-            assert_refused(&case, &refused, 409, "ConflictException");
+            assert_refused(&case, &refused, 400, "BadRequestException");
             let in_flight = get_run(&router, &scope.application, &definition_id, run).await;
             assert_eq!(
                 in_flight.json().get("Status").and_then(Value::as_str),

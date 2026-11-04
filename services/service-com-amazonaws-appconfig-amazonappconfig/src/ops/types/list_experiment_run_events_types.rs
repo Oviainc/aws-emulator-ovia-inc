@@ -21,14 +21,35 @@ pub struct ListExperimentRunEventsInput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appconfig#ExperimentRunEvents")]
+/// Carries a list of [`ExperimentRunEvent`], whose instants need the hand-written
+/// serializer below, so this shape's schema and serializer come from `ac_schema_and_codec!`
+/// too — a list element is written against the element shape's own `SCHEMA`, and only a
+/// hand-written parent reaches the hand-written element.
+///
+/// Member set and order from `smithy_query(query="shape", shape="ExperimentRunEvents")`.
 #[derive(Debug, Clone, Default)]
 pub struct ListExperimentRunEventsOutput {
     pub items: Option<Vec<ExperimentRunEvent>>,
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appconfig#ExperimentRunEvent")]
+ac_schema_and_codec!(
+    ListExperimentRunEventsOutput,
+    LIST_EXPERIMENT_RUN_EVENTS_OUTPUT_SCHEMA,
+    "com.amazonaws.appconfig#ExperimentRunEvents",
+    "com.amazonaws.appconfig",
+    "ExperimentRunEvents",
+    (M_ITEMS, items, "Items", 0, opt, list_of(ExperimentRunEvent)),
+    (M_NEXT_TOKEN, next_token, "NextToken", 1, opt, string),
+);
+
+/// `OccurredAt` targets `Iso8601DateTime` (`@timestampFormat("date-time")`), so this
+/// shape's schema and serializer come from `ac_schema_and_codec!` rather than from
+/// `#[smithy_macros::smithy(shape = ...)]` — see `types/deployment_wire.rs`.
+///
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="ExperimentRunEvent")`: `TreatmentOverrides` is a
+/// union and `ExposurePercentage` the `NullablePercentage` float.
 #[derive(Debug, Clone, Default)]
 pub struct ExperimentRunEvent {
     pub description: Option<String>,
@@ -39,4 +60,40 @@ pub struct ExperimentRunEvent {
     pub exposure_percentage: Option<f32>,
     pub treatment_overrides: Option<TreatmentOverrides>,
 }
+
+ac_schema_and_codec!(
+    ExperimentRunEvent,
+    EXPERIMENT_RUN_EVENT_SCHEMA,
+    "com.amazonaws.appconfig#ExperimentRunEvent",
+    "com.amazonaws.appconfig",
+    "ExperimentRunEvent",
+    (M_DESCRIPTION, description, "Description", 0, opt, string),
+    (
+        M_ASSOCIATED_DEPLOYMENT,
+        associated_deployment,
+        "AssociatedDeployment",
+        1,
+        opt,
+        string
+    ),
+    (M_EVENT_TYPE, event_type, "EventType", 2, opt, string),
+    (M_OCCURRED_AT, occurred_at, "OccurredAt", 3, opt, date_time),
+    (M_TRIGGERED_BY, triggered_by, "TriggeredBy", 4, opt, string),
+    (
+        M_EXPOSURE_PERCENTAGE,
+        exposure_percentage,
+        "ExposurePercentage",
+        5,
+        opt,
+        float
+    ),
+    (
+        M_TREATMENT_OVERRIDES,
+        treatment_overrides,
+        "TreatmentOverrides",
+        6,
+        opt,
+        union_of(TreatmentOverrides)
+    ),
+);
 

@@ -23,7 +23,10 @@ pub struct UpdateExperimentRunInput {
     pub deployment_parameters: Option<DeploymentParameters>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appconfig#ExperimentRun")]
+/// `StartedAt`, `UpdatedAt` and `EndedAt` target `Iso8601DateTime`
+/// (`@timestampFormat("date-time")`), so this shape's schema and serializer come from
+/// `ac_experiment_run_shape!` rather than from `#[smithy_macros::smithy(shape = ...)]` —
+/// see `types/experiment_run_wire.rs`.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateExperimentRunOutput {
     pub application_id: Option<String>,
@@ -39,4 +42,6 @@ pub struct UpdateExperimentRunOutput {
     pub ended_at: Option<::aws_smithy_types::DateTime>,
     pub experiment_definition_snapshot: Option<ExperimentDefinitionSnapshot>,
 }
+
+ac_experiment_run_shape!(UpdateExperimentRunOutput, UPDATE_EXPERIMENT_RUN_OUTPUT_SCHEMA);
 

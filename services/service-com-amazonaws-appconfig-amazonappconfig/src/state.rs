@@ -1408,6 +1408,14 @@ fn resolve_by_name<'store, T: 'store>(
 /// The key the control treatment carries. See [`treatment_key`].
 pub const CONTROL_TREATMENT_KEY: &str = "c";
 
+/// The share of the audience a run exposes to treatments when the start of it named none.
+///
+/// `StartExperimentRun$ExposurePercentage` documents the zero as the setting that
+/// "validates the experiment before exposing production users", and the member is the one
+/// a start may leave out, so a run started without it is the run that exposes nobody —
+/// which is a share of the audience, reported as one, rather than an unknown exposure.
+pub const UNEXPOSED_AUDIENCE: f32 = 0.0;
+
 /// The key this service gives the `index`-th treatment of a definition, counting from
 /// `0`.
 ///
@@ -1557,10 +1565,15 @@ pub struct ExperimentRun {
     pub description: Option<String>,
     /// [`EXPERIMENT_RUN_RUNNING`] or [`EXPERIMENT_RUN_DONE`].
     pub status: String,
-    /// The share of the audience this run exposes to treatments, exactly as the request
-    /// that started the run wrote it: the model gives the member no default, so a start
-    /// that named none leaves none to report.
-    pub exposure_percentage: Option<f32>,
+    /// The share of the audience this run exposes to treatments.
+    ///
+    /// A start that named no exposure exposes nobody, which this service materializes as
+    /// [`UNEXPOSED_AUDIENCE`] rather than leaving the member out: the model's
+    /// `NullablePercentage` is `range 0..100` and AppConfig documents the zero as a run
+    /// that "validates the experiment before exposing production users"
+    /// (`StartExperimentRun$ExposurePercentage`), so a run always delivers to a known share
+    /// of the audience and every operation that reports the run reports which.
+    pub exposure_percentage: f32,
     pub treatment_overrides: Option<TreatmentOverrides>,
     /// The experiment's conclusions, which only the end of the run supplies.
     pub result: Option<ExperimentRunResult>,
@@ -1638,15 +1651,13 @@ impl ExperimentRun {
         }
         // Read BEFORE the write: what moved is the difference between the value stored and
         // the value the request asked for.
-        let exposure_moved = exposure_percentage.is_some_and(|requested| {
-            self.exposure_percentage
-                .is_none_or(|stored| stored != requested)
-        });
+        let exposure_moved =
+            exposure_percentage.is_some_and(|requested| requested != self.exposure_percentage);
         let overrides_moved = treatment_overrides.as_ref().is_some_and(|requested| {
             !treatment_overrides_match(self.treatment_overrides.as_ref(), requested)
         });
         if let Some(exposure_percentage) = exposure_percentage {
-            self.exposure_percentage = Some(exposure_percentage);
+            self.exposure_percentage = exposure_percentage;
         }
         if let Some(treatment_overrides) = treatment_overrides {
             self.treatment_overrides = Some(treatment_overrides);
@@ -1744,7 +1755,7 @@ fn experiment_run_event(
     triggered_by: &str,
     description: String,
     occurred_at: SystemTime,
-    exposure_percentage: Option<f32>,
+    exposure_percentage: f32,
     treatment_overrides: Option<TreatmentOverrides>,
 ) -> ExperimentRunEvent {
     ExperimentRunEvent {
@@ -1753,7 +1764,7 @@ fn experiment_run_event(
         event_type: Some(event_type.to_string()),
         occurred_at: Some(to_date_time(occurred_at)),
         triggered_by: Some(triggered_by.to_string()),
-        exposure_percentage,
+        exposure_percentage: Some(exposure_percentage),
         treatment_overrides,
     }
 }
@@ -3086,18 +3097,18 @@ pub fn experiment_run_already_terminal(
     )
 }
 
-/// `Message` for a stop refused because the run it addressed is no longer running.
+/// `Message` for a call refused because the experiment run it addressed is not running.
 ///
-/// Derived from the state that refused it — the run addressed and the status it holds —
-/// so the caller can see that the experiment it asked to stop has already ended.
-pub fn experiment_run_not_stoppable(
-    experiment_definition_id: &str,
-    run: i32,
-    status: &str,
-) -> String {
+/// AWS's template for this refusal, rendered from the request: the run number it addressed
+/// and the experiment definition it addressed that run under — an `Identifier`, documented
+/// as the definition's "ID or name", so the sentence names the definition exactly as the
+/// request did — around the fixed text stating that the run is not running. The status the
+/// run DOES hold is not disclosed: the caller learns that the experiment it asked to act on
+/// is not delivering treatments, which is what refused the call.
+pub fn experiment_run_not_running(run: i32, experiment_definition_identifier: &str) -> String {
     format!(
-        "Run {run} of experiment definition {experiment_definition_id} is {status}, so it \
-         cannot be stopped: only a running experiment can be stopped."
+        "Experiment run {run} for experiment definition {experiment_definition_identifier} is \
+         not running."
     )
 }
 

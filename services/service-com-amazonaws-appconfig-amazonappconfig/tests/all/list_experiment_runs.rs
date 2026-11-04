@@ -85,8 +85,9 @@ fn engine_and_router() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
 
 /// `GET /applications/{ApplicationIdentifier}/experimentdefinitions/{ExperimentDefinitionIdentifier}/experimentruns`
 /// with `query` as the request's `httpQuery` members (`max_results`, `next_token`,
-/// `status`).
-async fn list(
+/// `status`). `pub(crate)` because more than one suite in this target reads a definition's
+/// run history.
+pub(crate) async fn list(
     router: &MultiServiceRouter,
     application: &str,
     definition: &str,
@@ -184,7 +185,7 @@ fn seed_finished_runs(
             experiment_definition_id: definition_id.clone(),
             description: description.clone(),
             status: state::EXPERIMENT_RUN_DONE.to_string(),
-            exposure_percentage: None,
+            exposure_percentage: state::UNEXPOSED_AUDIENCE,
             treatment_overrides: None,
             result: None,
             started_at,
