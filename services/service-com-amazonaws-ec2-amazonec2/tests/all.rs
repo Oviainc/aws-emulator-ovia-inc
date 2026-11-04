@@ -57,6 +57,12 @@ mod get_managed_prefix_list_entries;
 // lines, so these two sit one block further down with context between them.
 #[path = "all/describe_ipam_pools.rs"]
 mod describe_ipam_pools;
+// What `DescribeIpamResourceDiscoveries` reports out of the store: the default resource
+// discovery every `CreateIpam` comes up with, narrowed by the ids and filters the request
+// carries, paged in id order, and the `create-complete` move the clock owes one it is read
+// through.
+#[path = "all/describe_ipam_resource_discoveries.rs"]
+mod describe_ipam_resource_discoveries;
 // The entries (rules) of a network ACL: what `CreateNetworkAclEntry` stores on a stored ACL
 // and in which order, what `DeleteNetworkAclEntry` takes off it, and the not-found answer
 // every read of a `DeleteNetworkAcl`-ed ACL gets. Declared beside `prefix_lists` for the
