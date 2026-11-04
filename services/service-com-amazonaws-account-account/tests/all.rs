@@ -65,6 +65,8 @@ mod region_opt_in;
 mod region_opt_in_listing;
 #[path = "all/region_opt_target_rule.rs"]
 mod region_opt_target_rule;
+#[path = "all/schema_finding_refusal_wording.rs"]
+mod schema_finding_refusal_wording;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/unknown_account_refusal.rs"]

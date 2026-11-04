@@ -82,9 +82,74 @@ fn pattern_clause(violation: &Violation) -> Option<String> {
     // A pattern violation always carries the value it tested; a violation without
     // one (an absent member) is not a pattern violation at all.
     let value = violation.value.as_deref()?;
-    Some(format!(
-        "ECMA 262 regex \"{regex}\" does not match input string \"{value}\""
+    Some(service_common::validation_message::pattern_mismatch(
+        regex, value,
     ))
+}
+
+/// One ABSENT `@required` member as Account states it: that the object did not carry
+/// every property its schema requires, and which property it left out — again in the
+/// JSON-Schema voice, naming no member path and no count.
+///
+/// The property is named the way the request would have had to spell it, which is the
+/// name the model DECLARES for that member: every member of this service's model is
+/// declared in Pascal case and carries no `jsonName`
+/// (`smithy_query(query="operation", operation="…")` over this service's operations
+/// and `smithy_query(query="shape", shape="ContactInformation")` for the nested ones),
+/// while the framework reports a member at a dotted lowerCamel PATH
+/// (`aws_smithy_schema_server::constraints::path` lowercases the first character of
+/// each member name). The declared name is therefore the LAST segment of that path
+/// with its first character restored to upper case — the one segment that names the
+/// absent property itself rather than the objects it sits in.
+///
+/// `None` for anything that is not an absent required member, which lets
+/// [`refusal_clause`] try the other clauses this service words.
+///
+/// The finding states a LIST of properties because that is the form it has, but the
+/// list holds one name: absence is found while READING the request, and that read
+/// stops at the first property it misses, so one refusal carries one absent member
+/// however many the body left out.
+fn missing_property_clause(violation: &Violation) -> Option<String> {
+    if !matches!(violation.kind, ViolationKind::MissingRequiredMember) {
+        return None;
+    }
+    let declared = declared_property_name(violation.path.as_str())?;
+    Some(service_common::validation_message::missing_required_properties(&[declared]))
+}
+
+/// The name the model declares for the member a violation path ends at: its last
+/// segment with the first character upper-cased again. `None` for a path with no
+/// segment to name (an empty path), since there is then no property to report.
+fn declared_property_name(path: &str) -> Option<String> {
+    let segment = path.split('.').next_back()?;
+    let mut characters = segment.chars();
+    let first = characters.next()?;
+    Some(first.to_uppercase().chain(characters).collect())
+}
+
+/// One `@range` violation as Account states it: that the number is outside the bound
+/// its schema declares, which bound that is, and the number the request carried.
+///
+/// Two templates, because being above the maximum and being below the minimum are two
+/// findings: the maximum is reported as `numeric instance is greater than the required
+/// maximum (…)` and the minimum as `numeric instance is lower than the required
+/// minimum (…)`. The bound is the one the model declares and the found number is the
+/// one the request sent, so the whole clause is derived from the model and the request.
+///
+/// `None` for anything that is not a `@range` violation, and for one whose value the
+/// refusal does not carry: the number found is half of the finding, so there is no
+/// stating it without the value.
+fn range_clause(violation: &Violation) -> Option<String> {
+    let found = violation.value.as_deref()?;
+    match &violation.kind {
+        ViolationKind::MaxValue(max) => Some(
+            service_common::validation_message::numeric_above_maximum(found, max),
+        ),
+        ViolationKind::MinValue(min) => Some(
+            service_common::validation_message::numeric_below_minimum(found, min),
+        ),
+        _ => None,
+    }
 }
 
 /// The whole `ValidationException` message for the violations a HANDLER's own
@@ -137,19 +202,22 @@ fn length_clause(violation: &Violation) -> Option<String> {
         return None;
     }
     let length = value.chars().count();
-    Some(format!(
-        "string \"{value}\" is too long (length: {length}, maximum allowed: {max})"
+    Some(service_common::validation_message::string_too_long(
+        value, length, *max,
     ))
 }
 
 /// The reason Account states for ONE violation, or `None` for a violation class
 /// this service has no wording for.
 fn refusal_clause(violation: &Violation) -> Option<String> {
-    pattern_clause(violation).or_else(|| length_clause(violation))
+    pattern_clause(violation)
+        .or_else(|| length_clause(violation))
+        .or_else(|| missing_property_clause(violation))
+        .or_else(|| range_clause(violation))
 }
 
 /// The `ValidationException` message for a refusal every one of whose violations
-/// Account words itself: the bracketed list of the reasons, one per violated
+/// Account words itself: the bracketed list of the findings, one per violated
 /// member, in the order the validating walk found them.
 ///
 /// The brackets are the list itself — a single violation reads
@@ -168,7 +236,9 @@ fn refusal_message(violations: &[Violation]) -> Option<String> {
         .iter()
         .map(refusal_clause)
         .collect::<Option<Vec<_>>>()?;
-    Some(format!("[{}]", clauses.join(", ")))
+    Some(service_common::validation_message::bracketed_findings(
+        &clauses,
+    ))
 }
 
 /// The `com-amazonaws-account-account` emulated service: the generated [`ServiceDefinition`] plus
@@ -379,14 +449,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // - a `@pattern` violation as the violated ECMA-262 expression and the
         //   input string that failed it;
         // - a `@length` MAXIMUM violation as the subject, its own length and the
-        //   maximum admitted.
+        //   maximum admitted;
+        // - an ABSENT `@required` member as the object missing a property its
+        //   schema requires, naming that property as the model declares it;
+        // - a `@range` violation as the bound the number is outside of and the
+        //   number the request carried, one template per bound.
         //
         // The code stays the modeled `ValidationException` (HTTP 400), which is
         // what the framework would have answered; only the wording changes.
         //
-        // Every other refusal — an absent required member, a `@length` minimum, a
-        // `@range` bound, an enum value, an authentication failure — keeps the
-        // framework's wording: nothing records how this service phrases those.
+        // Every other refusal — a `@length` minimum, an enum value, an
+        // authentication failure — keeps the framework's wording: nothing records
+        // how this service phrases those.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),

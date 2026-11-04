@@ -409,18 +409,15 @@ async fn two_pattern_violations_are_listed_in_one_message() {
 }
 
 /// A refusal that is NOT one of the violations this service words itself keeps
-/// the framework's wording: Account has no recorded phrasing for an absent
-/// member, a `@length` MINIMUM, or a value outside an enum, and a value whose
-/// echo the framework already elided carries neither the input string nor its
-/// length — so none of them is dressed in the bracketed JSON-Schema form.
+/// the framework's wording: Account has no recorded phrasing for a `@length`
+/// MINIMUM or a value outside an enum, and a value whose echo the framework
+/// already elided carries neither the input string nor its length — so none of
+/// them is dressed in the bracketed JSON-Schema form. The classes that ARE worded
+/// that way are pinned above and in
+/// `tests/all/schema_finding_refusal_wording.rs`.
 #[tokio::test]
 async fn other_refusals_are_not_worded_as_pattern_violations() {
     let cases: Vec<(&str, &str, Value)> = vec![
-        (
-            "an absent required member",
-            "/putAccountName",
-            json!({}),
-        ),
         (
             "a value below a length bound",
             "/putAccountName",

@@ -37,8 +37,9 @@
 //! about a member's length. [`property_count_refusal`] states that one, for a service
 //! whose recordings show it, and is asked before the envelope.
 //!
-//! [`too_many_properties`], [`pattern_mismatch`], [`string_too_long`],
-//! [`string_too_short`] and [`enum_value_not_found`] are the SENTENCES that layer states
+//! [`too_many_properties`], [`missing_required_properties`], [`pattern_mismatch`],
+//! [`string_too_long`], [`string_too_short`], [`numeric_above_maximum`],
+//! [`numeric_below_minimum`] and [`enum_value_not_found`] are the SENTENCES that layer states
 //! for the constraint classes it reports on a member it read from the request BODY. A service whose front door words
 //! those findings itself — because it has to tell a body member from one bound to the URI,
 //! which the refusal seam cannot — builds them from here, so the sentences do not drift
@@ -343,6 +344,46 @@ pub fn string_too_long(value: &str, length: usize, max: i64) -> String {
 #[must_use]
 pub fn string_too_short(value: &str, length: usize, min: i64) -> String {
     format!("string \"{value}\" is too short (length: {length}, required minimum: {min})")
+}
+
+/// The finding that layer states for an OBJECT that does not carry every property its
+/// schema requires: the properties the request left out, each double-quoted and separated
+/// by a bare comma inside one pair of brackets.
+///
+/// Each property is named as the SCHEMA declares it — the name the property has on the
+/// wire, not the member path a per-member clause states — so the caller reads back the
+/// spelling it would have had to send. The caller hands the names over in the order the
+/// finding is to list them.
+#[must_use]
+pub fn missing_required_properties<S: AsRef<str>>(properties: &[S]) -> String {
+    let quoted: Vec<String> = properties
+        .iter()
+        .map(|property| format!("\"{}\"", property.as_ref()))
+        .collect();
+    format!(
+        "object has missing required properties ([{}])",
+        quoted.join(",")
+    )
+}
+
+/// The finding that layer states for a number above the maximum its schema admits: that
+/// maximum, then the number the caller submitted.
+///
+/// Both are passed as the TEXT they are stated with — the bound as the schema writes it and
+/// the value as the request carried it — so neither is re-rendered here and an integral
+/// bound never grows a fractional part it was not declared with.
+#[must_use]
+pub fn numeric_above_maximum(value: &str, max: &str) -> String {
+    format!(
+        "numeric instance is greater than the required maximum (maximum: {max}, found: {value})"
+    )
+}
+
+/// The finding that layer states for a number below the minimum its schema admits: the
+/// mirror of [`numeric_above_maximum`], down to where its two numbers come from.
+#[must_use]
+pub fn numeric_below_minimum(value: &str, min: &str) -> String {
+    format!("numeric instance is lower than the required minimum (minimum: {min}, found: {value})")
 }
 
 /// The finding that layer states for a value outside the set its schema enumerates: the
