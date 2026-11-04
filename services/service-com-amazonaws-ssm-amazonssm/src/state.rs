@@ -40,7 +40,12 @@
 //! one — derived from the catalogue's body by the same content reader, so a published
 //! document reports nothing a created one would not.
 //!
-//! The third is the **managed nodes** the node describes report
+//! The third is **Run Command** ([`commands`]): `SendCommand` resolves the document and
+//! the managed nodes a send names or describes, persists the command and one invocation
+//! per resolved node, and `GetCommandInvocation` reports one of those invocations — so
+//! what a send persisted is what a later read reports, per Region.
+//!
+//! The fourth is the **managed nodes** the node describes report
 //! ([`ManagedNodeRecord`]), keyed by `(region, node id)`: `DescribeInstanceProperties`
 //! projects a node's `properties` and `DescribeInstanceInformation` projects the same
 //! record through [`ManagedNodeRecord::to_instance_information`], so both report the one
@@ -63,6 +68,10 @@ use std::time::{Duration, SystemTime};
 /// Whether a read may have a `SecureString`'s value decrypted for its caller, which is a
 /// decision the KMS key the value is sealed under makes rather than this service.
 pub mod secure_string;
+
+/// A command a caller sent to the managed nodes of one Region, and the invocation each of
+/// those nodes holds of it.
+pub mod commands;
 
 use crate::ops::types::{
     Activation, AttachmentInformation, DocumentDescription, DocumentParameter, DocumentRequires,
@@ -924,6 +933,10 @@ pub struct ParsedDocumentContent {
     /// The platforms the content's step preconditions restrict the document to, or
     /// every modelled platform when it restricts it to none.
     pub platform_types: Vec<String>,
+    /// The names of the steps the content declares, in the content's own order: the
+    /// steps a command's invocation runs, which `GetCommandInvocation`'s `PluginName`
+    /// names one of ([`declared_step_names`]).
+    pub step_names: Vec<String>,
 }
 
 /// The documented size bound, applied to content of EVERY format: "The content of the
@@ -1697,6 +1710,31 @@ fn declared_platform_types(map: &::yaml_rust2::yaml::Hash) -> Vec<String> {
         .collect()
 }
 
+/// The names of the steps `content` declares, in its own order.
+///
+/// A schema 2.x document declares its steps as `mainSteps`, each with its own `name`
+/// ("The name of the step"), and a schema 1.2 document declares them as the `runtimeConfig`
+/// plugin entries, whose keys are the plugin names. A `GetCommandInvocation` asks for one
+/// step's detailed results by that name, so both spellings are read.
+fn declared_step_names(map: &::yaml_rust2::yaml::Hash) -> Vec<String> {
+    if let Some(steps) = mapping_get(map, "mainSteps").and_then(::yaml_rust2::Yaml::as_vec) {
+        return steps
+            .iter()
+            .filter_map(|step| mapping_get(step.as_hash()?, "name").and_then(scalar_string))
+            .collect();
+    }
+    mapping_get(map, "runtimeConfig")
+        .and_then(::yaml_rust2::Yaml::as_hash)
+        .map(|plugins| {
+            plugins
+                .keys()
+                .filter_map(::yaml_rust2::Yaml::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// What `content` declares, or why it is not a document this service accepts.
 ///
 /// "The content for the new SSM document in JSON or YAML format"
@@ -1768,6 +1806,7 @@ pub fn parse_document_content(
         description: mapping_get(map, "description").and_then(scalar_string),
         parameters: declared_parameters(map)?,
         platform_types: declared_platform_types(map),
+        step_names: declared_step_names(map),
     })
 }
 
@@ -2424,6 +2463,15 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// `BTreeMap` so a listing walks a stable, total order.
     pub documents: BTreeMap<(String, String), DocumentRecord>,
 
+    /// Every command a caller sent, keyed by `(region, command id)`: a command is sent
+    /// to the Systems Manager endpoint of one Region and identified there by the id this
+    /// service minted for it. A `BTreeMap` so a listing walks a stable, total order.
+    pub commands: BTreeMap<(String, String), commands::CommandRecord>,
+
+    /// How many command ids this store has minted, which is the entropy behind the next
+    /// one ([`ComAmazonawsSsmAmazonssmState::mint_command_id`]).
+    pub minted_command_ids: u64,
+
     /// Every managed node, keyed by `(region, node id)`: a node is registered with the
     /// Systems Manager endpoint of one Region and is identified there by its node id. A
     /// `BTreeMap` so a describe walks a stable, total order — ascending by node id
@@ -2457,6 +2505,8 @@ impl Default for ComAmazonawsSsmAmazonssmState {
         Self {
             parameters: BTreeMap::new(),
             documents: BTreeMap::new(),
+            commands: BTreeMap::new(),
+            minted_command_ids: 0,
             managed_nodes: BTreeMap::new(),
             activations: BTreeMap::new(),
             created_at: SystemTime::now(),
@@ -2471,6 +2521,61 @@ impl ComAmazonawsSsmAmazonssmState {
         for document in self.documents.values_mut() {
             document.materialize_due(now);
         }
+        // A command is reported for as long as Run Command keeps its history
+        // (`commands::COMMAND_HISTORY_RETENTION`); one older than that was already gone
+        // at `now`, whether or not anybody called.
+        self.commands
+            .retain(|_, command| now < command.retained_until());
+    }
+
+    /// The command `command_id` names in `region`, or `None` when that Region holds none.
+    pub fn command(&self, region: &str, command_id: &str) -> Option<&commands::CommandRecord> {
+        self.commands
+            .get(&(region.to_string(), command_id.to_string()))
+    }
+
+    /// Store `record` as `region`'s command of that id.
+    ///
+    /// Past [`commands::MAX_COMMANDS_RETAINED`] the oldest command's history is dropped
+    /// early, so this store holds a bounded number of records however many sends arrive.
+    pub fn insert_command(&mut self, record: commands::CommandRecord) {
+        let key = (record.region.clone(), record.command_id.clone());
+        self.commands.insert(key, record);
+        while self.commands.len() > commands::MAX_COMMANDS_RETAINED {
+            let Some(oldest) = self
+                .commands
+                .iter()
+                .min_by_key(|(_, command)| command.requested_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.commands.remove(&oldest);
+        }
+    }
+
+    /// Mint the `CommandId` of a command being sent.
+    ///
+    /// "A unique identifier for this command" (`Command$CommandId`), modelled exactly 36
+    /// characters long — the hyphenated UUID form. The 16 bytes behind it are the Sha256
+    /// of this store's own creation instant and its mint counter, so no two commands of
+    /// one run collide and the value is not a count a caller can read off the wire; the
+    /// UUID LAYOUT — the group boundaries and the version and variant bits — is
+    /// `service_common`'s one rendering of 16 opaque bytes, so it is not restated here.
+    pub fn mint_command_id(&mut self) -> String {
+        use ::sha2::Digest;
+
+        self.minted_command_ids += 1;
+        let since_epoch = self
+            .created_at
+            .duration_since(::std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let mut digest = ::sha2::Sha256::new();
+        digest.update(since_epoch.as_nanos().to_be_bytes());
+        digest.update(self.minted_command_ids.to_be_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest.finalize()[..16]);
+        ::service_common::uuid_from_random_bytes(bytes)
     }
 
     /// The document `name` names in `region`, or `None` when that Region holds none.
@@ -2597,6 +2702,14 @@ impl ComAmazonawsSsmAmazonssmState {
             .iter()
             .filter(move |((held, _), _)| held == region)
             .map(|((_, name), record)| (name.as_str(), record))
+    }
+
+    /// The managed node `id` names in `region`, or `None` when that Region has no node
+    /// registered under it. The one lookup of a single node, so an operation that
+    /// RESOLVES a node id does not reach into the store's key shape itself.
+    pub fn managed_node(&self, region: &str, id: &str) -> Option<&ManagedNodeRecord> {
+        self.managed_nodes
+            .get(&(region.to_string(), id.to_string()))
     }
 
     /// Every managed node `region` holds, in ascending node-id order, as

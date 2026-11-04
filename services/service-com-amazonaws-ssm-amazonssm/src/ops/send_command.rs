@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendCommand
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendCommand`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Run a document on managed nodes — the write half of this service's Run Command slice.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendCommand::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it persists is read back by `GetCommandInvocation`; both reach the one store in
+//! [`crate::state::commands`]. The send resolves three things from state and refuses what
+//! it cannot resolve:
+//!
+//! * the DOCUMENT, by name or by its ARN, among the documents the Region holds and the
+//!   ones Systems Manager publishes (`InvalidDocument`), at the version the request named
+//!   (`InvalidDocumentVersion`), with the parameter values that document declares
+//!   (`InvalidParameters`);
+//! * the nodes the request NAMES in `InstanceIds`, which must each be a node registered in
+//!   that Region and in a state that can take a command (`InvalidInstanceId`), named once
+//!   (`DuplicateInstanceId`), and running a platform the document supports
+//!   (`UnsupportedPlatformType`);
+//! * the nodes the request DESCRIBES in `Targets`, which are search criteria rather than
+//!   identities ([`crate::state::commands::nodes_matching_target`]): criteria that
+//!   describe no registered node select none, and the command is sent with no invocation
+//!   rather than refused.
+//!
+//! The command is minted `Pending` with one `Pending` invocation per resolved node —
+//! "the command hasn't been sent to any managed nodes" — and the counts the response
+//! reports are counted from those invocations. Delivering a command is the SSM Agent's
+//! own poll from the node, and this emulator runs no agent on any node, so nothing moves
+//! an invocation on and nothing reports output, an exit code or an execution window for a
+//! step that never ran.
+//!
+//! Two members are persisted and reported but not RESOLVED here. `OutputS3BucketName` is
+//! a bucket of another service, which this crate holds no state of, so a send is not
+//! refused `InvalidOutputFolder` for one the account may not hold; and `OutputS3Region` is
+//! the member whose own documentation says "the system ignores it", so nothing is stored
+//! for it at all.
 //!
 //! ## Shape of an operation
 //!
@@ -240,18 +263,325 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendCommand` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendCommandErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendCommand"))
+        // `DocumentName`'s and `DocumentVersion`'s patterns, the `InstanceIds` and
+        // `Targets` list lengths, `MaxConcurrency`'s and `MaxErrors`'s patterns and
+        // `TimeoutSeconds`'s range are MODELLED constraints, so the centralized walk has
+        // already refused anything outside them. What is checked here is what the model
+        // cannot say: which document, which version, which parameters and which nodes
+        // the request actually resolves to.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SendCommandErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the command store is unavailable".to_string()),
+            })
+        })?;
+
+        // "The ARN of the Identity and Access Management (IAM) service role to use to
+        // publish … notifications" (`ServiceRoleArn`): a value that is not an IAM role
+        // ARN names no role to publish them with.
+        if let Some(role) = non_empty(input.service_role_arn.as_deref()) {
+            if !::service_common::arn::IAM_ROLE.admits(role) {
+                return Err(SendCommandErrorModeled::InvalidRole(InvalidRole {
+                    message: Some(format!(
+                        "ServiceRoleArn '{role}' {}",
+                        ::service_common::arn::IAM_ROLE.phrase()
+                    )),
+                })
+                .into());
+            }
+        }
+        // "An Amazon Resource Name (ARN) for an Amazon Simple Notification Service
+        // (Amazon SNS) topic" (`NotificationConfig$NotificationArn`): the modelled
+        // `NotificationEvents` and `NotificationType` are enums the walk already refused
+        // a bad value for, so the ARN is what is left to read.
+        if let Some(arn) = input
+            .notification_config
+            .as_ref()
+            .and_then(|config| non_empty(config.notification_arn.as_deref()))
+        {
+            if !SNS_TOPIC.admits(arn) {
+                return Err(SendCommandErrorModeled::InvalidNotificationConfig(
+                    InvalidNotificationConfig {
+                        message: Some(format!("NotificationArn '{arn}' {}", SNS_TOPIC.phrase())),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let invalid_document = || {
+            SendCommandErrorModeled::InvalidDocument(InvalidDocument {
+                message: Some(format!("Document {} doesn't exist", input.document_name)),
+            })
+        };
+        // "This can be a public document or a custom document. To run a shared document
+        // belonging to another account, specify the document Amazon Resource Name (ARN)"
+        // (`DocumentName`), so either spelling names the same document; a value this
+        // service could never have stored names no document, so it is a miss rather than
+        // a refusal.
+        let Some(query) = crate::state::parse_document_query(&input.document_name) else {
+            return Err(invalid_document().into());
+        };
+        // A document is resolved through the endpoint the request was signed for: an ARN
+        // naming another account or another Region names nothing reachable here. The
+        // Region therefore never comes from the request body.
+        let region = crate::state::request_region(ctx.parts());
+        if query
+            .account
+            .is_some_and(|account| !account.is_empty() && account != ::engine::emulator_account_id())
+            || query
+                .region
+                .is_some_and(|named| !named.is_empty() && named != region)
+        {
+            return Err(invalid_document().into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A read of this store reports what the clock already owes, so a document's move
+        // to `Active` and a command whose history is no longer retained are both
+        // materialised before anything here resolves against the store.
+        store.materialize_due(now);
+
+        // The account holds the documents a caller created here AND the ones Systems
+        // Manager publishes, so a name the catalogue carries resolves without any create.
+        let Some(document) = store.resolve_document(&region, query.name) else {
+            return Err(invalid_document().into());
+        };
+        // "You can specify $DEFAULT, $LATEST, or a specific version number"
+        // (`DocumentVersion`): both aliases name the one version a document holds here,
+        // and any other number names a version it does not carry. A request that names
+        // none runs the document's default version.
+        let document_version = match non_empty(input.document_version.as_deref()) {
+            None => crate::state::DOCUMENT_VERSION_DEFAULT.to_string(),
+            Some(requested) => {
+                let names_the_stored_version = requested == crate::state::DOCUMENT_VERSION_LATEST
+                    || requested == crate::state::DOCUMENT_VERSION_DEFAULT
+                    || requested == crate::state::FIRST_DOCUMENT_VERSION;
+                if !names_the_stored_version {
+                    return Err(SendCommandErrorModeled::InvalidDocumentVersion(
+                        InvalidDocumentVersion {
+                            message: Some(format!(
+                                "Document {} has no version '{requested}'",
+                                document.name
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                requested.to_string()
+            }
+        };
+
+        // "The Sha256 or Sha1 hash created by the system when the document was created"
+        // (`DocumentHash`): a send that carries one is asking to run the document whose
+        // content hashes to it, so a hash the resolved document's content does not produce
+        // names a different document than the one that was resolved. This service holds
+        // the Sha256 of a document's content (`crate::state::DOCUMENT_HASH_TYPE`) and no
+        // Sha1 — "Sha1 hashes have been deprecated", and a document's `Sha1` is reported
+        // unset — so a Sha1 hash is matched against nothing and left unchecked.
+        if let Some(hash) = non_empty(input.document_hash.as_deref()) {
+            let hash_type = input
+                .document_hash_type
+                .as_deref()
+                .filter(|named| !named.is_empty())
+                .unwrap_or(crate::state::DOCUMENT_HASH_TYPE);
+            if hash_type == crate::state::DOCUMENT_HASH_TYPE && hash != document.hash {
+                return Err(SendCommandErrorModeled::InvalidDocument(InvalidDocument {
+                    message: Some(format!(
+                        "Document {} doesn't have {hash_type} hash '{hash}'",
+                        document.name
+                    )),
+                })
+                .into());
+            }
+        }
+
+        // The nodes the request NAMES, each resolved against the node inventory: "the IDs
+        // of the managed nodes where the command should run" is an identity, so one that
+        // names no node this Region holds, or a node that cannot take a command, is
+        // refused rather than skipped.
+        let named: Vec<String> = input.instance_ids.clone().unwrap_or_default();
+        for (position, id) in named.iter().enumerate() {
+            if named[..position].contains(id) {
+                // The modelled `DuplicateInstanceId` carries no message member, so the
+                // refusal is the error code alone.
+                return Err(
+                    SendCommandErrorModeled::DuplicateInstanceId(DuplicateInstanceId {}).into(),
+                );
+            }
+        }
+        // A node takes a command through its agent's poll, so a node whose agent is not
+        // reporting is one of the states `InvalidInstanceId` is documented for ("SSM Agent
+        // isn't running… The managed node isn't in a valid state").
+        let usable = |id: &str| {
+            store
+                .managed_node(&region, id)
+                .filter(|node| {
+                    node.properties.ping_status.as_deref() == Some(crate::state::PING_STATUS_ONLINE)
+                })
+                .is_some()
+        };
+        if !named.iter().all(|id| usable(id)) {
+            return Err(SendCommandErrorModeled::InvalidInstanceId(InvalidInstanceId {
+                message: Some(crate::state::commands::NODES_NOT_IN_A_VALID_STATE.to_string()),
+            })
+            .into());
+        }
+        // "The document doesn't support the platform type of the given managed node IDs":
+        // a refusal about the nodes the request NAMED, which is why it is not applied to
+        // the nodes criteria selected.
+        for id in &named {
+            let Some(node) = store.managed_node(&region, id) else {
+                continue;
+            };
+            if let Some(why) = crate::state::commands::unsupported_platform(
+                &document.name,
+                &document.parsed.platform_types,
+                node,
+            ) {
+                return Err(SendCommandErrorModeled::UnsupportedPlatformType(
+                    UnsupportedPlatformType { message: Some(why) },
+                )
+                .into());
+            }
+        }
+
+        // The nodes the request DESCRIBES. Several targets narrow one another — each is a
+        // criterion the node has to meet — and a criterion met by no registered node
+        // leaves the command with no invocation at all.
+        let targets: Vec<Target> = input.targets.clone().unwrap_or_default();
+        let mut described: Option<Vec<String>> = None;
+        for target in &targets {
+            let selected = crate::state::commands::nodes_matching_target(&store, &region, target)
+                .map_err(|key| {
+                    crate::scaffolded::Scaffolded::validation(format!(
+                        "Target key '{key}' isn't one of the target keys a command selects \
+                         managed nodes by: {}",
+                        crate::state::commands::supported_target_keys().join(", ")
+                    ))
+                })?;
+            let selected: Vec<String> = selected.into_iter().map(str::to_string).collect();
+            described = Some(match described {
+                None => selected,
+                Some(held) => held
+                    .into_iter()
+                    .filter(|id| selected.iter().any(|also| also == id))
+                    .collect(),
+            });
+        }
+        // "Targets is required if you don't provide one or more managed node IDs in the
+        // call" (`Command$Targets`), so a send that names and describes nothing names no
+        // node to run on at all.
+        if named.is_empty() && targets.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Either InstanceIds or Targets must be specified",
+            ));
+        }
+
+        let supplied: ::std::collections::BTreeMap<String, Vec<String>> = input
+            .parameters
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if let Some(why) = crate::state::commands::parameter_rejection(
+            &document.name,
+            &document.parsed.parameters,
+            &supplied,
+        ) {
+            return Err(
+                SendCommandErrorModeled::InvalidParameters(InvalidParameters {
+                    message: Some(why),
+                })
+                .into(),
+            );
+        }
+
+        // One invocation per resolved node, in node-id order: "if a user runs SendCommand
+        // against three managed nodes, then a command invocation is created for each
+        // requested managed node ID".
+        let mut resolved: Vec<String> = named.clone();
+        for id in described.unwrap_or_default() {
+            if !resolved.iter().any(|held| held == &id) {
+                resolved.push(id);
+            }
+        }
+        let invocations = resolved
+            .iter()
+            .map(|id| {
+                let instance_name = store.managed_node(&region, id).and_then(|node| {
+                    node.properties
+                        .computer_name
+                        .clone()
+                        .or_else(|| node.properties.name.clone())
+                });
+                (
+                    id.clone(),
+                    crate::state::commands::CommandInvocationRecord::pending(
+                        id.clone(),
+                        instance_name,
+                    ),
+                )
+            })
+            .collect();
+
+        let command_id = store.mint_command_id();
+        let record = crate::state::commands::CommandRecord {
+            command_id,
+            region: region.clone(),
+            // `Command$DocumentName` is a document NAME, so the name the document is held
+            // under is reported whichever spelling the request named it by.
+            document_name: document.name.clone(),
+            document_version,
+            step_names: document.parsed.step_names.clone(),
+            comment: input.comment.clone(),
+            parameters: supplied,
+            instance_ids: named,
+            targets,
+            output_s3_bucket_name: input.output_s3_bucket_name.clone(),
+            output_s3_key_prefix: input.output_s3_key_prefix.clone(),
+            max_concurrency: input
+                .max_concurrency
+                .clone()
+                .unwrap_or_else(|| crate::state::commands::DEFAULT_MAX_CONCURRENCY.to_string()),
+            max_errors: input
+                .max_errors
+                .clone()
+                .unwrap_or_else(|| crate::state::commands::DEFAULT_MAX_ERRORS.to_string()),
+            timeout_seconds: input
+                .timeout_seconds
+                .unwrap_or(crate::state::commands::DEFAULT_TIMEOUT_SECONDS),
+            service_role: input.service_role_arn.clone(),
+            notification_config: input.notification_config.clone(),
+            cloud_watch_output_config: input.cloud_watch_output_config.clone(),
+            alarm_configuration: input.alarm_configuration.clone(),
+            requested_at: now,
+            status: crate::state::commands::COMMAND_STATUS_PENDING.to_string(),
+            status_details: crate::state::commands::COMMAND_STATUS_PENDING.to_string(),
+            invocations,
+        };
+        let command = record.to_command();
+        store.insert_command(record);
+
+        Ok(SendCommandOutput {
+            command: Some(command),
+        })
     }
+}
+
+/// What `NotificationConfig$NotificationArn` has to name: a topic of Amazon Simple
+/// Notification Service. Only the vendor is fixed — an SNS topic ARN's resource field is
+/// the topic name itself (`arn:aws:sns:<region>:<account>:<topic>`), so there is no fixed
+/// resource type to require.
+const SNS_TOPIC: ::service_common::arn::Requirement = ::service_common::arn::Requirement {
+    vendor: "sns",
+    resource_type: None,
+    label: "an Amazon Simple Notification Service topic",
+};
+
+/// `value` when the request set it to something, and `None` when it set it to nothing: an
+/// optional member sent EMPTY names no role, no topic and no document version, the same
+/// way an omitted one does.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty())
 }

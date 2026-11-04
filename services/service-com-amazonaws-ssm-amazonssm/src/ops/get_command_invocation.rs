@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCommandInvocation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCommandInvocation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report one managed node's invocation of a command — the read half of this service's
+//! Run Command slice. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCommandInvocation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What `SendCommand` persisted is what this reports: both reach the one store in
+//! [`crate::state::commands`], so the command id a send minted resolves here, in the
+//! Region it was sent to, and the nodes it created an invocation for are the nodes this
+//! answers for. A command id the Region holds none of is `InvalidCommandId`; a node the
+//! Region has no registration of is `InvalidInstanceId`; a registered node the command
+//! created no invocation for is `InvocationDoesNotExist`.
+//!
+//! Nothing in this emulator delivers a command to a node (see
+//! [`crate::state::commands`]), so an invocation reports the status it was minted with
+//! and no step of it has produced an exit code, output or an execution window: the
+//! response code is the documented "-1 … the command hasn't started running on the
+//! managed node" and each member the model documents as empty until a step runs is
+//! reported empty.
 //!
 //! ## Shape of an operation
 //!
@@ -228,18 +235,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCommandInvocation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCommandInvocationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCommandInvocation"))
+        // `CommandId`'s length and `InstanceId`'s and `PluginName`'s patterns and lengths
+        // are MODELLED constraints, so the centralized walk has already refused anything
+        // outside them: what is resolved here is which command, which node and which step
+        // the request names.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCommandInvocationErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the command store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The one write a report makes: the drop the clock already owed of a command
+        // whose history is no longer retained.
+        store.materialize_due(::std::time::SystemTime::now());
+
+        // A node is registered with the Systems Manager endpoint of one Region, so an id
+        // this Region has no registration under names no managed node reachable here.
+        let registered = store
+            .managed_node(&region, &input.instance_id)
+            .is_some();
+        // A command is reached through the endpoint it was sent to, so an id another
+        // Region holds names no command here.
+        let Some(command) = store.command(&region, &input.command_id) else {
+            // The modelled `InvalidCommandId` carries no message member, so the refusal
+            // is the error code alone.
+            return Err(
+                GetCommandInvocationErrorModeled::InvalidCommandId(InvalidCommandId {}).into(),
+            );
+        };
+        let Some(invocation) = command.invocation(&input.instance_id) else {
+            // "The command ID and managed node ID you specified didn't match any
+            // invocations" is what a command holding no invocation for a REGISTERED node
+            // means; an id no node is registered under names no managed node at all,
+            // which is the other refusal.
+            if registered {
+                return Err(GetCommandInvocationErrorModeled::InvocationDoesNotExist(
+                    InvocationDoesNotExist {},
+                )
+                .into());
+            }
+            return Err(GetCommandInvocationErrorModeled::InvalidInstanceId(
+                InvalidInstanceId {
+                    message: Some(
+                        crate::state::commands::NODES_NOT_IN_A_VALID_STATE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "The name of the step for which you want detailed results … To find the
+        // PluginName, check the document content and find the name of the step you want
+        // details for", so a name the document the command runs declares no step of names
+        // no step to report. A request that names NONE is answered with the invocation's
+        // own status: no step has started, so there are no per-step details to choose
+        // between.
+        if let Some(step) = input.plugin_name.as_deref().filter(|step| !step.is_empty()) {
+            if !command.step_names.iter().any(|held| held == step) {
+                return Err(
+                    GetCommandInvocationErrorModeled::InvalidPluginName(InvalidPluginName {})
+                        .into(),
+                );
+            }
+        }
+
+        Ok(GetCommandInvocationOutput {
+            command_id: Some(command.command_id.clone()),
+            instance_id: Some(invocation.instance_id.clone()),
+            comment: command.comment.clone(),
+            document_name: Some(command.document_name.clone()),
+            document_version: Some(command.document_version.clone()),
+            plugin_name: input.plugin_name.clone(),
+            // "If the response code is -1, then the command hasn't started running on the
+            // managed node, or it wasn't received by the node"
+            // (`GetCommandInvocationResult$ResponseCode`) — which is this invocation.
+            response_code: crate::state::commands::NO_RESPONSE_CODE,
+            // "If the plugin hasn't started to run, the string is empty"
+            // (`ExecutionStartDateTime`, `ExecutionEndDateTime`), and the elapsed time is
+            // measured since a start there has not been.
+            execution_start_date_time: Some(String::new()),
+            execution_elapsed_time: Some(String::new()),
+            execution_end_date_time: Some(String::new()),
+            status: Some(invocation.status.clone()),
+            status_details: Some(invocation.status_details.clone()),
+            // "If the command hasn't finished running, then this string is empty"
+            // (`StandardOutputContent`, `StandardErrorContent`); the URLs name the files
+            // a plugin wrote to Amazon S3, of which there are none.
+            standard_output_content: Some(String::new()),
+            standard_output_url: Some(String::new()),
+            standard_error_content: Some(String::new()),
+            standard_error_url: Some(String::new()),
+            cloud_watch_output_config: command.cloud_watch_output_config.clone(),
+        })
     }
 }

@@ -41,6 +41,8 @@ mod parameters_batch;
 mod parameters_by_path;
 #[path = "all/published_documents.rs"]
 mod published_documents;
+#[path = "all/run_command.rs"]
+mod run_command;
 #[path = "all/secure_string_decryption.rs"]
 mod secure_string_decryption;
 #[path = "all/secure_string_encryption_at_rest.rs"]
