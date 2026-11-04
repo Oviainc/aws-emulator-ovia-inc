@@ -5,7 +5,8 @@
 //! Reports the latest version of a stored configuration bundle, on the branch
 //! the request names or on `mainline` when it names none. Everything it reports
 //! is the record `CreateConfigurationBundle` persisted in [`crate::state`]; a
-//! read writes nothing.
+//! read writes nothing, and a bundle whose deletion was accepted is no longer
+//! there to report.
 //!
 //! ## Shape of an operation
 //!
@@ -187,23 +188,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.bundle_id)
             .ok_or_else(|| {
                 GetConfigurationBundleErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(
-                        crate::state::RESOURCE_CONFIGURATION_BUNDLE,
-                    ),
+                    crate::state::configuration_bundle_not_found(),
                 )
             })?;
 
         // "Gets the latest version of a configuration bundle. By default,
         // returns the latest version on the mainline branch." A branch this
-        // bundle holds no commit on has no version to report, which is the
-        // modelled 404 for that version rather than for the bundle.
+        // bundle holds no commit on has no version to report, so there is no
+        // bundle to get on that branch: the same modelled 404, in the same words
+        // — the family's sentence names the bundle however the lookup failed.
         let version = record
             .latest_on_branch(input.branch_name.as_deref())
             .ok_or_else(|| {
                 GetConfigurationBundleErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(
-                        crate::state::RESOURCE_CONFIGURATION_BUNDLE_VERSION,
-                    ),
+                    crate::state::configuration_bundle_not_found(),
                 )
             })?;
 

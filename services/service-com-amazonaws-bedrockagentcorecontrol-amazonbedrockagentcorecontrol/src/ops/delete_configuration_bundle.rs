@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConfigurationBundle
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConfigurationBundle`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConfigurationBundle::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Deletes a configuration bundle and all of its versions." The deletion is
+//! accepted (HTTP 202) and reported `DELETING`, and the bundle stops existing
+//! with it: the record, the version lineage it holds, the account-wide
+//! reservation of its name and the idempotency records naming it all go
+//! ([`crate::state::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::remove_configuration_bundle`]),
+//! so every later read of that `bundleId` takes the family's not-found path and
+//! the name is free for a new bundle.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +159,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConfigurationBundle` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConfigurationBundleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteConfigurationBundleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the configuration bundle store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // The store is keyed by the `bundleId` the create minted, and the delete
+        // removes that entry with everything held for it, so what the deletion
+        // reports is read off the record it just took out.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConfigurationBundle"))
+        // No read of this family carries a bundle's status, so an accepted
+        // deletion has no half-deleted state for a later call to observe: the
+        // only thing a caller can see of it is that the bundle is gone. An id
+        // naming no stored bundle is therefore the modelled 404 — which is also
+        // what a second delete of the same bundle answers, the deletion of the
+        // first having already taken it out.
+        let record = store
+            .remove_configuration_bundle(&input.bundle_id)
+            .ok_or_else(|| {
+                DeleteConfigurationBundleErrorModeled::ResourceNotFoundException(
+                    crate::state::configuration_bundle_not_found(),
+                )
+            })?;
+
+        Ok(record.delete_output())
     }
 }
