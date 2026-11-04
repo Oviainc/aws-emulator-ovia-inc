@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpcEncryptionControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVpcEncryptionControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVpcEncryptionControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +63,20 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The account's per-VPC VPC Encryption Control configurations: the store this operation
+/// mints into, and the one projection of one that `DescribeVpcEncryptionControls`,
+/// `ModifyVpcEncryptionControl` and `DeleteVpcEncryptionControl` all report from.
+///
+/// A child module of this operation — the one that MINTS a configuration — rather than
+/// another field of [`crate::state`], for the reason its own header gives.
+///
+/// The `#[path]` is explicit because this file is itself declared with one (`ops/mod.rs` is
+/// generated into `$OUT_DIR` and declares every operation by absolute path), so a bare `mod`
+/// item here would resolve against `src/ops/` — where a `.rs` file is read as an operation of
+/// this service.
+#[path = "create_vpc_encryption_control/vpc_encryption_controls.rs"]
+pub mod vpc_encryption_controls;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -140,18 +145,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVpcEncryptionControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVpcEncryptionControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+        use std::time::Instant;
+        use vpc_encryption_controls::{
+            VPC_ENCRYPTION_CONTROL_ID_PREFIX, VPC_ENCRYPTION_CONTROL_TAGGABLE_RESOURCE,
+            require_vpc_encryption_controls, vpc_already_has_a_configuration,
+            vpc_encryption_control_limit_exceeded,
+        };
+
+        // The configuration this mints is a fact of the VPC the request names (the modelled
+        // `VpcEncryptionControl` carries no Region or ARN member), so this operation reads
+        // nothing off the request's metadata. The stores are reached through the engine held
+        // on `self`.
+        let _ = ctx;
+
+        // "The tags to apply to the VPC Encryption Control resource"
+        // (`CreateVpcEncryptionControlRequest$TagSpecifications`): the shared reader refuses
+        // a specification naming any other resource type and holds the payload to the
+        // documented bounds, which is what bounds the caller-chosen bytes one stored
+        // configuration retains.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            VPC_ENCRYPTION_CONTROL_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+
+        // The VPC the configuration is for, and the id it will be minted under, both out of
+        // the service's main store, which this finishes with BEFORE the configuration store
+        // is taken: the two are never held at once, so they have no lock order to invert.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVpcEncryptionControl"))
+        // "The ID of the VPC for which to create the encryption control configuration"
+        // (`CreateVpcEncryptionControlRequest$VpcId`, required): a VPC the account does not
+        // have is an error, not a configuration of nothing, which is the refusal every
+        // operation of this crate that resolves a `VpcId` answers.
+        let vpc_encryption_control_id = {
+            let state_handle = state::require_service_state(&*self.engine)?;
+            let mut store = state_handle.lock();
+            if !store.vpcs.contains_key(&input.vpc_id) {
+                return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+            }
+            // Minted here because the mint is the main store's monotonic counter. A create
+            // the configuration store then refuses simply leaves this value unused: EC2
+            // resource ids are unique, not contiguous, so a gap in them is not observable.
+            store.next_id(VPC_ENCRYPTION_CONTROL_ID_PREFIX)
+        };
+
+        let configurations = require_vpc_encryption_controls(&*self.engine)?;
+        let mut configurations = configurations.lock();
+
+        // "Creates a VPC Encryption Control configuration for a specified VPC": one
+        // configuration per VPC, so a VPC that already has one is told the rule rather than
+        // given a second configuration of itself.
+        if configurations.governing(&input.vpc_id).is_some() {
+            return Err(vpc_already_has_a_configuration());
+        }
+        // The store's record ceiling, asked HERE so the refusal names what is full and so a
+        // dry run of a create the store has no room for is refused with that reason.
+        if !configurations.has_capacity() {
+            return Err(vpc_encryption_control_limit_exceeded(format!(
+                "This emulator holds {max} VPC Encryption Control configurations, which is as \
+                 many as it stores",
+                max = state::MAX_STORED_RECORDS_PER_STORE,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "if you have
+        // the required permissions, the error response is DryRunOperation"
+        // (`CreateVpcEncryptionControlRequest$DryRun`). Nothing has been written yet, and
+        // nothing is. This emulator models no principal permissions (the framework verifies
+        // a request's signature and no operation of this crate evaluates IAM), so
+        // `UnauthorizedOperation`, the other outcome the member documents, cannot arise.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The write, and the configuration as it stands the instant it was made: the move the
+        // create starts is still owed, so what it answers carries the `creating` state a
+        // caller reading straight afterwards also sees.
+        let view = configurations.insert(
+            vpc_encryption_control_id,
+            input.vpc_id.clone(),
+            tags,
+            Instant::now(),
+        );
+        Ok(CreateVpcEncryptionControlOutput {
+            vpc_encryption_control: Some(view),
+        })
     }
 }

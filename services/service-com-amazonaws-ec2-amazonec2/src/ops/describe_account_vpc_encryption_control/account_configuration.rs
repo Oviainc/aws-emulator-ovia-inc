@@ -97,6 +97,11 @@ pub const EXCLUSION_DISABLED: &str = "disabled";
 /// also — member for member — what `ModifyAccountVpcEncryptionControl` takes, so one value
 /// here names both the request member a modify reads and the result member a report
 /// writes.
+///
+/// `VpcEncryptionControlExclusions` — what a PER-VPC configuration reports — declares the
+/// same eight resource types (`smithy_query(query="shape",shape="VpcEncryptionControlExclusions")`),
+/// so the per-VPC surface reads this one catalog too and only spells the REQUEST member
+/// differently ([`crate::ops::create_vpc_encryption_control::vpc_encryption_controls`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExcludableResource {
     /// `AccountVpcEncryptionControlExclusions$InternetGateway`.
@@ -163,21 +168,58 @@ impl ExcludableResource {
     }
 }
 
-/// What the store holds about ONE resource type: whether it is excluded, and when the move
+/// What a store holds about ONE resource type: whether it is excluded, and when the move
 /// to that choice settles.
+///
+/// Shared with the PER-VPC configurations
+/// ([`crate::ops::create_vpc_encryption_control::vpc_encryption_controls`]) rather than
+/// copied there: a resource type's exclusion is reported through the same modelled enum at
+/// both levels (`VpcEncryptionControlExclusion$State`, whose catalog is
+/// `smithy_query(query="shape",shape="VpcEncryptionControlExclusionState")`), so one state
+/// machine answers both and the two cannot word one move differently.
 #[derive(Debug, Clone, Copy, Default)]
-struct Exclusion {
-    /// Whether this resource type is excluded from account-level encryption enforcement.
-    /// `false` — inside enforcement — is where an unmodified account's every resource type
-    /// sits.
+pub struct Exclusion {
+    /// Whether this resource type is excluded from encryption enforcement. `false` — inside
+    /// enforcement — is where an unmodified account's every resource type sits, and where a
+    /// freshly created per-VPC configuration's every resource type sits.
     excluded: bool,
-    /// When the move to [`Self::excluded`] falls due, and `None` for a choice no modify
-    /// has moved at all.
+    /// When the move to [`Self::excluded`] falls due, and `None` for a choice nothing has
+    /// moved at all.
     ///
     /// The due instant is KEPT once it has passed rather than cleared: whether the move has
     /// settled is derived by comparing it with the instant a report is made
-    /// ([`AccountConfiguration::exclusion_at`]), which is what lets a report write nothing.
+    /// ([`Self::state_at`]), which is what lets a report write nothing.
     settles_at: Option<Instant>,
+}
+
+impl Exclusion {
+    /// Whether this resource type is excluded, whatever the move to that choice has reached.
+    pub const fn is_excluded(self) -> bool {
+        self.excluded
+    }
+
+    /// The exclusion as a move to `excluded` that settles at `settles_at` — what a modify
+    /// that CHANGED the choice leaves behind, the instant being stored rather than slept
+    /// for.
+    pub const fn moving_to(excluded: bool, settles_at: Instant) -> Self {
+        Self {
+            excluded,
+            settles_at: Some(settles_at),
+        }
+    }
+
+    /// The `VpcEncryptionControlExclusionState` of this resource type as of `now`: the
+    /// settled word once the move to the stored choice has fallen due, and the transitional
+    /// one until then.
+    pub fn state_at(self, now: Instant) -> &'static str {
+        let settled = self.settles_at.is_none_or(|due| now >= due);
+        match (self.excluded, settled) {
+            (true, true) => EXCLUSION_ENABLED,
+            (true, false) => EXCLUSION_ENABLING,
+            (false, true) => EXCLUSION_DISABLED,
+            (false, false) => EXCLUSION_DISABLING,
+        }
+    }
 }
 
 /// The account's VPC Encryption Control configuration.
@@ -296,18 +338,11 @@ impl AccountConfiguration {
         }
     }
 
-    /// The `VpcEncryptionControlExclusionState` of `resource` as of `now`: the settled word
-    /// once the move to the stored choice has fallen due, and the transitional one until
-    /// then.
+    /// The `VpcEncryptionControlExclusionState` of `resource` as of `now`, through the one
+    /// reading of that enum every level of this surface shares
+    /// ([`Exclusion::state_at`]).
     fn exclusion_at(&self, resource: ExcludableResource, now: Instant) -> &'static str {
-        let exclusion = self.exclusions[resource.index()];
-        let settled = exclusion.settles_at.is_none_or(|due| now >= due);
-        match (exclusion.excluded, settled) {
-            (true, true) => EXCLUSION_ENABLED,
-            (true, false) => EXCLUSION_ENABLING,
-            (false, true) => EXCLUSION_DISABLED,
-            (false, false) => EXCLUSION_DISABLING,
-        }
+        self.exclusions[resource.index()].state_at(now)
     }
 
     /// Apply `patch` and answer the configuration as it then stands as of `now`.
@@ -341,11 +376,8 @@ impl AccountConfiguration {
                 continue;
             };
             let exclusion = &mut self.exclusions[resource.index()];
-            if exclusion.excluded != excluded {
-                *exclusion = Exclusion {
-                    excluded,
-                    settles_at: Some(now + TRANSITION_DELAY),
-                };
+            if exclusion.is_excluded() != excluded {
+                *exclusion = Exclusion::moving_to(excluded, now + TRANSITION_DELAY);
                 changed = true;
             }
         }

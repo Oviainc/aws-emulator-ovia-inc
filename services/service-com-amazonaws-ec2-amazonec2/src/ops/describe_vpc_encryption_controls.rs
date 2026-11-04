@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVpcEncryptionControls
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVpcEncryptionControls`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVpcEncryptionControls::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +140,310 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVpcEncryptionControls` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVpcEncryptionControlsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::ops::create_vpc_encryption_control::vpc_encryption_controls::{
+            require_vpc_encryption_controls, require_well_formed_configuration_id,
+            vpc_encryption_control_ids_not_found,
+        };
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_RESOURCE_IDS, MatchBudget,
+        };
+        use std::collections::HashSet;
+        use std::time::Instant;
+
+        // A configuration is a fact of its VPC (the modelled `VpcEncryptionControl` carries
+        // no Region or ARN member), so this operation reads nothing off the request's
+        // metadata.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation"
+        // (`DescribeVpcEncryptionControlsRequest$DryRun`). Every caller of this emulator is
+        // permitted, so a dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        // "The token returned from a previous paginated request"
+        // (`DescribeVpcEncryptionControlsRequest$NextToken`): anything else is refused rather
+        // than read as an id, and it is refused before any other member is looked at, so
+        // whether a bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // Matching cost is filters x values x value length x stored configurations, and the
+        // model bounds none of them (`FilterList` and `Filter$Values` carry no `@length`), so
+        // every request-controlled factor is capped HERE, before any work proportional to it
+        // is done and before a store is locked: the same ceilings the sibling describes
+        // enforce, from `crate::state`.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not answer for is refused whether or not any
+        // configuration would have matched it, so an unsupported filter can never read as "no
+        // results". Each value is compiled into its pattern ONCE here, rather than recompiled
+        // for every candidate configuration.
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !filter_name_is_answered(name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so a value's size is bounded
+            // here too.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            compiled.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The IDs of the VPC Encryption Control configurations to describe" and "the IDs of
+        // the VPCs to describe encryption control configurations for": both lists are
+        // caller-sized and each entry is resolved against a store, so both are capped the way
+        // every other EC2 describe of this crate caps a resource-id list.
+        let requested: &[String] = input.vpc_encryption_control_ids.as_deref().unwrap_or_default();
+        if requested.len() > MAX_RESOURCE_IDS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "VpcEncryptionControlIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested.len()
+            )));
+        }
+        let requested_vpcs: &[String] = input.vpc_ids.as_deref().unwrap_or_default();
+        if requested_vpcs.len() > MAX_RESOURCE_IDS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "VpcIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_vpcs.len()
+            )));
+        }
+
+        // A VPC id names a resource of the service's MAIN store, which this finishes with
+        // before the configuration store is taken: the two are never held at once, so they
+        // have no lock order to invert. An id that names no VPC of the account is an error,
+        // not an absent row.
+        if !requested_vpcs.is_empty() {
+            let state_handle = crate::state::require_service_state(&*self.engine)?;
+            let store = state_handle.lock();
+            if let Some(unknown) = requested_vpcs
+                .iter()
+                .find(|vpc_id| !store.vpcs.contains_key(vpc_id.as_str()))
+            {
+                return Err(crate::state::invalid_vpc_id_not_found(unknown));
+            }
+        }
+
+        let configurations = require_vpc_encryption_controls(&*self.engine)?;
+        let configurations = configurations.lock();
+
+        // An id that names no configuration of the account is an error too, asked after the
+        // "is it an id of this kind at all" question so a caller can tell the two apart. The
+        // refusal speaks about the LIST rather than about one entry, which is how EC2 words an
+        // unresolvable entry of an id list.
+        for id in requested {
+            require_well_formed_configuration_id(id)?;
+        }
+        if requested
+            .iter()
+            .any(|id| configurations.get(id).is_none())
+        {
+            return Err(vpc_encryption_control_ids_not_found());
+        }
+        // Sets, so narrowing below costs one lookup per configuration rather than a scan of
+        // each asked-for list.
+        let wanted: HashSet<&str> = requested.iter().map(String::as_str).collect();
+        let wanted_vpcs: HashSet<&str> = requested_vpcs.iter().map(String::as_str).collect();
+
+        // REPORTING ONLY: each configuration as of this ONE instant, derived rather than
+        // written, so two reports at one instant answer the same words and the transient
+        // states a create, a modify or a delete started are reported without being settled
+        // here.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVpcEncryptionControls"))
+        // Every comparison is charged to ONE budget, so the product of stored
+        // configurations, filters, values and value length is bounded however the caller
+        // combines them, which is also what bounds how long this holds the store's lock.
+        let now = Instant::now();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<VpcEncryptionControl> = Vec::new();
+        for record in configurations.ordered() {
+            if budget.exhausted() {
+                break;
+            }
+            if !wanted.is_empty() && !wanted.contains(record.id()) {
+                continue;
+            }
+            if !wanted_vpcs.is_empty() && !wanted_vpcs.contains(record.vpc_id()) {
+                continue;
+            }
+            let view = record.view_at(now);
+            // "If you specify multiple filters, the filters are joined with an AND"
+            // (`Filter`), evaluated by the one matcher every filtered describe of this crate
+            // shares.
+            if crate::state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(&view, name)
+            }) {
+                selected.push(view);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `VpcEncryptionControlId` order, which the cursor below names a position in.
+        // The store is an ordered map, so its iteration order already satisfies this sort;
+        // doing it here establishes the invariant the cursor depends on at the point of use.
+        selected.sort_by(|left, right| {
+            left.vpc_encryption_control_id
+                .cmp(&right.vpc_encryption_control_id)
+        });
+
+        // "The maximum number of items to return for this request"
+        // (`DescribeVpcEncryptionControlsRequest$MaxResults`). A request that names none gets
+        // the largest page the model publishes, so the `NextToken` path below behaves the
+        // same whether or not a page size was asked for. The model's `range 5..1000` has
+        // already refused anything outside it; the ceiling is held here as well, so this
+        // handler cannot serve a larger page even if nothing refused the size first.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_VPC_ENCRYPTION_CONTROLS_PAGE_SIZE)
+            .clamp(1, MAX_VPC_ENCRYPTION_CONTROLS_PAGE_SIZE);
+
+        // The page and the token that follows it, through the one definition of EC2 paging
+        // ([`crate::state::page_from_cursor`]): the cursor names the configuration this page
+        // ends at, and a token is answered only while a further one follows the page.
+        let (page, next_token) = crate::state::page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            crate::state::PageTokenRule::WhenAnotherItemFollows,
+            |configuration| {
+                configuration
+                    .vpc_encryption_control_id
+                    .as_deref()
+                    .unwrap_or_default()
+            },
+        );
+
+        Ok(DescribeVpcEncryptionControlsOutput {
+            vpc_encryption_controls: Some(page.to_vec()),
+            next_token,
+        })
+    }
+}
+
+/// The largest page this operation serves, and the page it serves when the request names no
+/// size.
+///
+/// The top of the modelled `MaxResults` range, `DescribeVpcEncryptionControlsMaxResults`'s
+/// `range 5..1000`
+/// (`smithy_query(query="operation",operation="DescribeVpcEncryptionControls")`), so a request
+/// that names no page size is answered with the largest page the operation can be ASKED for
+/// and the `NextToken` path behaves the same either way.
+const MAX_VPC_ENCRYPTION_CONTROLS_PAGE_SIZE: usize = 1_000;
+
+/// The filter names this operation answers for.
+///
+/// "The filters to apply to the request"
+/// (`smithy_query(query="doc",shape="DescribeVpcEncryptionControlsRequest",member="Filters")`)
+/// names none, so the set is the reported resource's OWN members, spelled the way EC2 spells
+/// a filter on a member: the configuration's id and its VPC's id, its `Mode` and its `State`
+/// (`smithy_query(query="shape",shape="VpcEncryptionControl")`). `tag:<key>` and `tag-key` are
+/// the two names every taggable EC2 resource is filtered by, which this resource is
+/// (`VpcEncryptionControl$Tags`); `tag:<key>` is the one name with a variable part, so it is
+/// matched by prefix rather than listed here. Every entry must be answered by
+/// [`filter_values`].
+const VPC_ENCRYPTION_CONTROL_FILTERS: [&str; 4] = [
+    "mode",
+    "state",
+    "tag-key",
+    "vpc-encryption-control-id",
+];
+
+/// Whether this operation answers for the filter the request named.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact, and the
+/// tag filter's key must not be empty: a `tag:` with no key names no tag.
+fn filter_name_is_answered(name: &str) -> bool {
+    name.strip_prefix(crate::state::TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+        || name == VPC_ID_FILTER
+        || VPC_ENCRYPTION_CONTROL_FILTERS.contains(&name)
+}
+
+/// The filter that narrows to the configurations of one VPC, named separately because the
+/// `VpcIds` member narrows by exactly the same fact.
+const VPC_ID_FILTER: &str = "vpc-id";
+
+/// The values the EC2 filter `name` compares against this configuration.
+///
+/// A filter naming an attribute the configuration carries nothing for compares against NO
+/// values, so it selects nothing. `name` is a name the handler has already found answerable.
+///
+/// The AND/OR evaluation of these values, and the budget that bounds it, live in
+/// [`crate::state::matches_every_filter`], which every filtered describe of this crate shares:
+/// within one filter "if you specify multiple values for a filter, the values are joined with
+/// an OR" (`Filter$Values`), so a filter carrying NO value matches nothing.
+fn filter_values<'a>(
+    configuration: &'a VpcEncryptionControl,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let tags = || configuration.tags.iter().flatten();
+    if let Some(key) = name.strip_prefix(crate::state::TAG_FILTER_PREFIX) {
+        return tags()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "mode" => text(configuration.mode.as_deref()),
+        "state" => text(configuration.state.as_deref()),
+        "tag-key" => tags()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "vpc-encryption-control-id" => text(configuration.vpc_encryption_control_id.as_deref()),
+        VPC_ID_FILTER => text(configuration.vpc_id.as_deref()),
+        // Unreachable: the handler has already refused every other name. An unanswered name
+        // compares against nothing, so it could never widen a result even if that check were
+        // bypassed.
+        _ => Vec::new(),
     }
 }

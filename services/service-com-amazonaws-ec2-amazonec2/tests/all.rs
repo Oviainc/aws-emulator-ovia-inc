@@ -15,6 +15,15 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The per-VPC VPC Encryption Control slice: what `CreateVpcEncryptionControl` records for one
+// VPC, what `ModifyVpcEncryptionControl` writes on it, what `DeleteVpcEncryptionControl`
+// retires, and what `DescribeVpcEncryptionControls` reports back out of that one store — with
+// the clock-owed moves each starts, the narrowing and paging of the report, and the refusals
+// each answers. Declared beside `prefix_lists` for the reason the note above gives: the
+// sorted neighbourhood and the tail of this file are where every new ec2 suite inserts its
+// lines.
+#[path = "all/vpc_encryption_controls.rs"]
+mod vpc_encryption_controls;
 // The route path out of a VPC: an internet gateway attached to exactly one VPC, a route
 // table created for one VPC with the local route it comes with, one route per destination
 // against a target of that VPC, and a subnet associated with one table of its own VPC — each

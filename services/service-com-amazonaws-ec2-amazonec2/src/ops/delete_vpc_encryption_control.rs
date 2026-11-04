@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVpcEncryptionControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVpcEncryptionControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVpcEncryptionControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +128,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVpcEncryptionControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVpcEncryptionControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVpcEncryptionControl"))
+        use crate::ops::create_vpc_encryption_control::vpc_encryption_controls::{
+            require_vpc_encryption_controls, require_well_formed_configuration_id,
+        };
+        use std::time::Instant;
+
+        // A configuration is a fact of its VPC (the modelled `VpcEncryptionControl` carries
+        // no Region or ARN member), so this operation reads nothing off the request's
+        // metadata.
+        let _ = ctx;
+
+        // "The ID of the VPC Encryption Control resource to delete"
+        // (`DeleteVpcEncryptionControlRequest$VpcEncryptionControlId`, required): asked for
+        // its form before anything else, so "not an id of this kind" is never reported as "no
+        // such configuration".
+        require_well_formed_configuration_id(&input.vpc_encryption_control_id)?;
+
+        let configurations = require_vpc_encryption_controls(&*self.engine)?;
+        let mut configurations = configurations.lock();
+        let now = Instant::now();
+
+        // The configuration is resolved BEFORE the dry run is answered, so a dry run of a
+        // delete that could not have succeeded is refused with the reason it would have
+        // failed: "if you have the required permissions, the error response is
+        // DryRunOperation" (`DeleteVpcEncryptionControlRequest$DryRun`), and nothing is
+        // deleted. This emulator models no principal permissions, so
+        // `UnauthorizedOperation`, the other outcome the member documents, cannot arise.
+        if input.dry_run.unwrap_or(false) {
+            configurations.require::<DeleteVpcEncryptionControlErrorModeled>(
+                &input.vpc_encryption_control_id,
+            )?;
+            return Err(crate::state::dry_run_operation());
+        }
+
+        // "Information about the deleted VPC Encryption Control configuration"
+        // (`DeleteVpcEncryptionControlResult$VpcEncryptionControl`): the configuration as it
+        // stood the instant the delete took it out of the store, which is `deleting`. Its id
+        // names no configuration from this instant on, and its VPC may be given a new one.
+        let view = configurations.delete(&input.vpc_encryption_control_id, now)?;
+        Ok(DeleteVpcEncryptionControlOutput {
+            vpc_encryption_control: Some(view),
+        })
     }
 }

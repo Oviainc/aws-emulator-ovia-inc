@@ -624,6 +624,11 @@ impl ErasedOperation for FinishedEnvelope {
 /// with the sentence it words for that parameter type
 /// ([`crate::state::instance_family_refusal_message`]), keyed on that catalog the same way.
 ///
+/// A `Mode` outside the per-VPC `VpcEncryptionControlMode` catalog is the third: EC2 answers
+/// its own `InvalidParameterValue` with the sentence
+/// [`crate::ops::create_vpc_encryption_control::vpc_encryption_controls::vpc_encryption_control_mode_refusal_message`]
+/// words, which is also what that operation's own backstop answers with.
+///
 /// A `MaxResults` below the smallest page the operation publishes is the other refusal this
 /// service states: EC2 answers its own code and sentence for it, naming the value and the
 /// bound ([`crate::state::max_results_refusal`]). It is keyed on the member the constraint
@@ -660,6 +665,22 @@ fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<
                 message: crate::state::instance_family_refusal_message(
                     violation.value.as_deref().unwrap_or_default(),
                 ),
+            })
+        }
+        ViolationKind::EnumValue(allowed)
+            if crate::ops::create_vpc_encryption_control::vpc_encryption_controls::
+                is_vpc_encryption_control_mode_catalog(allowed) =>
+        {
+            // A `Mode` outside the per-VPC `VpcEncryptionControlMode` catalog is EC2's own
+            // `InvalidParameterValue` rather than a validation clause, in the sentence EC2
+            // words for that parameter (the one `ModifyVpcEncryptionControl`'s own backstop
+            // answers with, so the two cannot disagree). That sentence states the catalog and
+            // echoes no part of the request at all.
+            Some(Refused {
+                code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
+                message:
+                    crate::ops::create_vpc_encryption_control::vpc_encryption_controls::
+                        vpc_encryption_control_mode_refusal_message(),
             })
         }
         ViolationKind::MinValue(minimum)
