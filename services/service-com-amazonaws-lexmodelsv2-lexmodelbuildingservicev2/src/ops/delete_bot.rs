@@ -228,6 +228,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Nor can a version of the bot, so a later `DescribeBotVersion` cannot find one
         // of a bot the store no longer holds.
         store.remove_bot_versions_of_bot(&input.bot_id);
+        // Nor can an alias of the bot, so a later `ListBotAliases` cannot report one of a
+        // bot the store no longer holds.
+        store.remove_bot_aliases_of_bot(&input.bot_id);
         // The record is gone, so a later `DescribeBot` cannot find it and `ListBots`
         // cannot list it; the status reported is the one the delete call itself puts the
         // bot into.

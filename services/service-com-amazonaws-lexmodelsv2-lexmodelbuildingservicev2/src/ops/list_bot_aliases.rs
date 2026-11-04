@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBotAliases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBotAliases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBotAliases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Builds `botAliasSummaries` from the aliases the bot the URI names holds in
+//! [`crate::state`], and pages the result with `maxResults` / `nextToken`. The model
+//! declares no sort or filter member for this listing, so the entries are returned in an
+//! order of this operation's own — by `botAliasName`, with the `botAliasId` as the
+//! tiebreak — which keeps that order total and `nextToken` paging stable across calls.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +156,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBotAliases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBotAliasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBotAliases"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListBotAliasesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        // `maxResults` carries the modelled range 1..1000. A value outside it is refused,
+        // not reinterpreted, so a caller that asked for an illegal page size never gets a
+        // plausible success. A request that asks for no page size is served the modelled
+        // maximum, which keeps every response bounded — the same way `ListBots` does.
+        let page_size = match input.max_results {
+            Some(max_results) => {
+                let requested = usize::try_from(max_results)
+                    .ok()
+                    .filter(|size| (1..=crate::state::MAX_LIST_PAGE).contains(size));
+                let Some(page_size) = requested else {
+                    return Err(invalid(format!(
+                        "maxResults must be between 1 and {}; received {max_results}",
+                        crate::state::MAX_LIST_PAGE
+                    )));
+                };
+                page_size
+            }
+            None => crate::state::MAX_LIST_PAGE,
+        };
+
+        let store = state.lock();
+
+        // The listing is scoped to the one bot the URI names, so an alias of any other
+        // bot is not in it. This operation models no error for a bot the store does not
+        // hold (`smithy_query(query="operation",operation="ListBotAliases")` declares no
+        // not-found error), so such a request is answered with the aliases that bot has:
+        // none.
+        let mut page: Vec<BotAliasSummary> = store
+            .bot_aliases_of_bot(&input.bot_id)
+            .map(crate::state::BotAlias::summary)
+            .collect();
+
+        page.sort_by(|left, right| {
+            (entry_name(left), entry_id(left)).cmp(&(entry_name(right), entry_id(right)))
+        });
+
+        // The cursor `nextToken` carries is the sort key of the first entry of the page it
+        // opens, so the remainder is resolved against the same total order and an alias
+        // deleted between pages does not strand the listing: paging resumes at the first
+        // entry at or after the cursor.
+        if let Some(token) = input.next_token.as_deref() {
+            let Some(cursor) = parse_cursor(token) else {
+                return Err(invalid(format!(
+                    "nextToken {token} is not a token this operation issued; restart the listing"
+                )));
+            };
+            let resume_at = page
+                .iter()
+                .position(|entry| at_or_after(entry, &cursor))
+                .unwrap_or(page.len());
+            page.drain(..resume_at);
+        }
+
+        // Whatever is left over is handed back as an opaque token, so the page itself is
+        // always within `page_size`.
+        let next_token = if page.len() > page_size {
+            let remainder = page.split_off(page_size);
+            remainder.first().map(render_cursor)
+        } else {
+            None
+        };
+
+        Ok(ListBotAliasesOutput {
+            bot_id: Some(input.bot_id),
+            bot_alias_summaries: Some(page),
+            next_token,
+        })
     }
+}
+
+/// An entry's `botAliasName`, the first half of the order this listing returns. Every
+/// summary this handler builds carries one.
+fn entry_name(entry: &BotAliasSummary) -> &str {
+    entry.bot_alias_name.as_deref().unwrap_or_default()
+}
+
+/// An entry's `botAliasId`, the tiebreak that makes that order total.
+fn entry_id(entry: &BotAliasSummary) -> &str {
+    entry.bot_alias_id.as_deref().unwrap_or_default()
+}
+
+/// The opaque `nextToken` that resumes a listing at `entry`.
+///
+/// The cursor inside it is the entry's sort key; neither a `botAliasName` nor a
+/// `botAliasId` can contain `/` (their modelled patterns allow only alphanumerics plus
+/// `_` and `-`), so the pair is unambiguous, and [`crate::state::encode_page_token`]
+/// renders it opaque.
+fn render_cursor(entry: &BotAliasSummary) -> String {
+    crate::state::encode_page_token(&format!("{}/{}", entry_name(entry), entry_id(entry)))
+}
+
+/// The sort key a `nextToken` carries, or `None` when it is not a token this operation
+/// issued.
+fn parse_cursor(token: &str) -> Option<(String, String)> {
+    let cursor = crate::state::decode_page_token(token)?;
+    let (name, id) = cursor.split_once('/')?;
+    (!id.is_empty()).then(|| (name.to_string(), id.to_string()))
+}
+
+/// Does this entry sort at or after `cursor` in the order being returned?
+fn at_or_after(entry: &BotAliasSummary, cursor: &(String, String)) -> bool {
+    (entry_name(entry), entry_id(entry)) >= (cursor.0.as_str(), cursor.1.as_str())
+}
+
+/// Refuse the request with the modelled `ValidationException` (HTTP 400).
+fn invalid(message: String) -> ListBotAliasesError {
+    ListBotAliasesErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }

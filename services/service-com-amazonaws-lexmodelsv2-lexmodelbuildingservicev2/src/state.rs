@@ -31,12 +31,16 @@
 //! types and slots — into the new version under the ids they already have. That is why a
 //! resource of a bot version is keyed by its bot version as well as by its own id: one id
 //! names the same resource in every version that snapshotted it.
+//!
+//! The alias slice (`ListBotAliases`) is served out of `bot_aliases`, keyed by the bot
+//! and the alias id: a bot is created with the alias Amazon Lex keeps for testing it, so
+//! a bot the store holds always has at least that one alias to report.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    AudioFillerSettings, BotMember, BotSummary, BotVersionLocaleDetails,
+    AudioFillerSettings, BotAliasSummary, BotMember, BotSummary, BotVersionLocaleDetails,
     CompositeSlotTypeSetting, DataPrivacy,
     DialogCodeHookSettings, ErrorLogSettings, ExternalSourceSetting, FulfillmentCodeHookSettings,
     GenerativeAISettings, InitialResponseSetting, InputContext, IntentClosingSetting,
@@ -395,6 +399,93 @@ impl Bot {
     /// The stored `testBotAliasTags`, absent rather than empty when there are none.
     pub fn wire_test_bot_alias_tags(&self) -> Option<HashMap<String, String>> {
         (!self.test_bot_alias_tags.is_empty()).then(|| self.test_bot_alias_tags.clone())
+    }
+}
+
+/// `BotAliasStatus` members this crate names. The full modelled set is
+/// `smithy_query(query="shape",shape="BotAliasStatus")`:
+/// Creating | Available | Deleting | Failed. AWS documents this one as the status in
+/// which "the alias is ready for use".
+pub const BOT_ALIAS_STATUS_AVAILABLE: &str = "Available";
+
+/// The working copy of a bot, which is the version an alias points at until it is
+/// pointed at a numbered one: the modelled `BotVersion` admits it beside a number
+/// (`smithy_query(query="shape",shape="BotVersion")`, pattern `^(DRAFT|[0-9]+)$`).
+pub const DRAFT_BOT_VERSION: &str = "DRAFT";
+
+/// The `botAliasId` of the alias Amazon Lex V2 keeps for testing a bot: the modelled
+/// `BotAliasId` singles this id out in its own pattern
+/// (`smithy_query(query="shape",shape="BotAliasId")`,
+/// `^(\bTSTALIASID\b|[0-9a-zA-Z]+)$`), rather than leaving it to the minted
+/// `[0-9a-zA-Z]{10}` space every other alias id is drawn from.
+pub const TEST_BOT_ALIAS_ID: &str = "TSTALIASID";
+
+/// The `botAliasName` of that alias, as Amazon Lex V2 publishes it.
+pub const TEST_BOT_ALIAS_NAME: &str = "TestBotAlias";
+
+/// How a bot alias is keyed: the bot it belongs to and its own id, which is the pair
+/// every alias operation's URI carries.
+pub type BotAliasKey = (String, String);
+
+/// The [`BotAliasKey`] for one alias of one bot.
+pub fn bot_alias_key(bot_id: &str, bot_alias_id: &str) -> BotAliasKey {
+    (bot_id.to_string(), bot_alias_id.to_string())
+}
+
+/// An alias of a bot, as `ListBotAliases` reads it back.
+///
+/// Every bot has at least the alias Amazon Lex V2 keeps for testing it
+/// ([`TEST_BOT_ALIAS_ID`]), which exists from the moment the bot does: `CreateBot`
+/// documents its `testBotAliasTags` as "a list of tags to add to the test alias for a
+/// bot" that "you can only add when you create a bot", so the alias is there to be
+/// tagged as the bot is created. That is why a listing of a freshly created bot is not
+/// empty, and why nothing else has to be created for an alias of a bot to exist.
+#[derive(Debug, Clone)]
+pub struct BotAlias {
+    pub bot_id: String,
+    pub bot_alias_id: String,
+    pub bot_alias_name: String,
+    pub description: Option<String>,
+    /// The version of the bot this alias points at: a number, or
+    /// [`DRAFT_BOT_VERSION`] for the working copy.
+    pub bot_version: String,
+    pub bot_alias_status: String,
+    pub creation_date_time: SystemTime,
+    pub last_updated_date_time: SystemTime,
+}
+
+impl BotAlias {
+    /// The alias Amazon Lex V2 keeps for testing `bot_id`, as created with the bot.
+    ///
+    /// It points at the bot's working copy ([`DRAFT_BOT_VERSION`]) — the version the
+    /// test alias is there to exercise — and is ready for use straight away: nothing
+    /// Amazon Lex answers reports this alias in a status it still has to leave, so
+    /// there is no transition owed on it, unlike the bot itself, whose own `Creating`
+    /// status `CreateBot` reports and [`CREATION_SETTLES_AFTER`] settles.
+    pub fn test_alias(bot_id: &str, now: SystemTime) -> Self {
+        Self {
+            bot_id: bot_id.to_string(),
+            bot_alias_id: TEST_BOT_ALIAS_ID.to_string(),
+            bot_alias_name: TEST_BOT_ALIAS_NAME.to_string(),
+            description: None,
+            bot_version: DRAFT_BOT_VERSION.to_string(),
+            bot_alias_status: BOT_ALIAS_STATUS_AVAILABLE.to_string(),
+            creation_date_time: now,
+            last_updated_date_time: now,
+        }
+    }
+
+    /// This alias as a `ListBotAliases` summary entry.
+    pub fn summary(&self) -> BotAliasSummary {
+        BotAliasSummary {
+            bot_alias_id: Some(self.bot_alias_id.clone()),
+            bot_alias_name: Some(self.bot_alias_name.clone()),
+            description: self.description.clone(),
+            bot_version: Some(self.bot_version.clone()),
+            bot_alias_status: Some(self.bot_alias_status.clone()),
+            creation_date_time: Some(to_date_time(self.creation_date_time)),
+            last_updated_date_time: Some(to_date_time(self.last_updated_date_time)),
+        }
     }
 }
 
@@ -910,6 +1001,12 @@ pub struct ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
     /// ([`BOTS_PER_ACCOUNT_QUOTA`]) times [`VERSIONS_PER_BOT_QUOTA`]: a caller cannot
     /// grow it past that.
     pub bot_versions: HashMap<BotVersionKey, BotVersion>,
+    /// Every bot alias this emulator holds, keyed by [`bot_alias_key`]. An alias belongs
+    /// to one bot, and the alias Amazon Lex keeps for testing a bot
+    /// ([`BotAlias::test_alias`]) is created with the bot, so this map holds one record
+    /// per stored bot and is bounded by [`BOTS_PER_ACCOUNT_QUOTA`]: a caller cannot grow
+    /// it past that.
+    pub bot_aliases: HashMap<BotAliasKey, BotAlias>,
     /// The monotonic source the minted ids are derived from.
     id_seq: u64,
 }
@@ -1038,6 +1135,32 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
         let before = self.bot_versions.len();
         self.bot_versions.retain(|(bot, _), _| bot != bot_id);
         before - self.bot_versions.len()
+    }
+
+    /// Store the alias Amazon Lex keeps for testing a bot, as creating the bot does, and
+    /// answer the id it carries ([`TEST_BOT_ALIAS_ID`]).
+    pub fn add_test_bot_alias(&mut self, bot_id: &str, now: SystemTime) -> String {
+        let alias = BotAlias::test_alias(bot_id, now);
+        let bot_alias_id = alias.bot_alias_id.clone();
+        self.bot_aliases
+            .insert(bot_alias_key(bot_id, &bot_alias_id), alias);
+        bot_alias_id
+    }
+
+    /// Every alias of one bot, which is what a listing of that bot's aliases is built
+    /// from. An alias of any other bot is not in it.
+    pub fn bot_aliases_of_bot<'a>(&'a self, bot_id: &'a str) -> impl Iterator<Item = &'a BotAlias> + 'a {
+        self.bot_aliases
+            .values()
+            .filter(move |alias| alias.bot_id == bot_id)
+    }
+
+    /// Drop every alias of `bot_id` and answer how many went: an alias cannot outlive
+    /// the bot it is an alias of.
+    pub fn remove_bot_aliases_of_bot(&mut self, bot_id: &str) -> usize {
+        let before = self.bot_aliases.len();
+        self.bot_aliases.retain(|(bot, _), _| bot != bot_id);
+        before - self.bot_aliases.len()
     }
 
     /// Copy one locale of one version of a bot into another version of the same bot, the

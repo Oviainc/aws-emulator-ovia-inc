@@ -271,8 +271,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The response is read back off the record that was just stored, so a `botId`
         // this operation hands out always has a backing bot.
-        let stored = store.bots.entry(bot_id).or_insert(bot);
-        Ok(CreateBotOutput {
+        let stored = store.bots.entry(bot_id.clone()).or_insert(bot);
+        let output = CreateBotOutput {
             bot_id: Some(stored.bot_id.clone()),
             bot_name: Some(stored.bot_name.clone()),
             description: stored.description.clone(),
@@ -286,6 +286,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             bot_type: stored.bot_type.clone(),
             bot_members: stored.wire_bot_members(),
             error_log_settings: stored.error_log_settings.clone(),
-        })
+        };
+
+        // Creating a bot also creates the alias Amazon Lex keeps for testing it: the
+        // `testBotAliasTags` this request accepts are documented as "tags to add to the
+        // test alias for a bot" that "you can only add when you create a bot", so that
+        // alias exists from here on and `ListBotAliases` reports it.
+        store.add_test_bot_alias(&bot_id, now);
+
+        Ok(output)
     }
 }
