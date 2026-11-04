@@ -164,37 +164,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         };
 
-        // "Name is the full Amazon Resource Name (ARN) of the document" for a shared
-        // document, so either spelling names the same document; a name this service
-        // could never have stored (an ARN of another service, say) names no document,
-        // so it is a miss rather than a refusal.
-        let Some(query) = crate::state::parse_document_query(&input.name) else {
-            return Err(missing().into());
-        };
-        // A document is resolved through the endpoint it is asked for: an ARN naming
-        // another account or another Region than this request was signed for names
-        // nothing reachable here. The Region therefore never comes from the request
-        // body — only from the signed credential scope. An ARN field left EMPTY names
-        // no account at all, the way the ARN of a document Systems Manager publishes
-        // carries none, so it resolves through this endpoint rather than being a miss.
+        // The document the request names, resolved through the endpoint it was signed for
+        // by the one lookup every document read uses; it also materialises the status move
+        // the clock already owed. The account holds the documents a caller created here
+        // AND the ones Systems Manager publishes, so a name the catalogue carries resolves
+        // without any create; only a name neither holds is a miss.
         let region = crate::state::request_region(ctx.parts());
-        if query
-            .account
-            .is_some_and(|account| !account.is_empty() && account != ::engine::emulator_account_id())
-            || query
-                .region
-                .is_some_and(|named| !named.is_empty() && named != region)
-        {
-            return Err(missing().into());
-        }
-
-        let mut store = state.lock();
-        // The one write a report makes: the move to `Active` the clock already owed.
-        store.materialize_due(::std::time::SystemTime::now());
-        // The account holds the documents a caller created here AND the ones Systems
-        // Manager publishes, so a name the catalogue carries resolves without any
-        // create; only a name neither holds is a miss.
-        let Some(record) = store.resolve_document(&region, query.name) else {
+        let now = ::std::time::SystemTime::now();
+        let Some(record) = state
+            .lock()
+            .resolve_document_for_request(&input.name, &region, now)
+        else {
             return Err(missing().into());
         };
 
@@ -207,10 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .filter(|version| !version.is_empty())
         {
-            let names_the_stored_version = requested == crate::state::DOCUMENT_VERSION_LATEST
-                || requested == crate::state::DOCUMENT_VERSION_DEFAULT
-                || requested == crate::state::FIRST_DOCUMENT_VERSION;
-            if !names_the_stored_version {
+            if !record.holds_version(requested) {
                 return Err(DescribeDocumentErrorModeled::InvalidDocumentVersion(
                     InvalidDocumentVersion {
                         message: Some(format!(
@@ -229,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .filter(|version_name| !version_name.is_empty())
         {
-            if record.version_name.as_deref() != Some(requested) {
+            if !record.holds_version_name(requested) {
                 return Err(DescribeDocumentErrorModeled::InvalidDocumentVersion(
                     InvalidDocumentVersion {
                         message: Some(format!(

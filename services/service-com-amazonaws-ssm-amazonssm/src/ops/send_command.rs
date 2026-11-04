@@ -315,36 +315,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // "This can be a public document or a custom document. To run a shared document
         // belonging to another account, specify the document Amazon Resource Name (ARN)"
-        // (`DocumentName`), so either spelling names the same document; a value this
-        // service could never have stored names no document, so it is a miss rather than
-        // a refusal.
-        let Some(query) = crate::state::parse_document_query(&input.document_name) else {
-            return Err(invalid_document().into());
-        };
-        // A document is resolved through the endpoint the request was signed for: an ARN
-        // naming another account or another Region names nothing reachable here. The
-        // Region therefore never comes from the request body.
+        // (`DocumentName`), so either spelling names the same document. The document is
+        // resolved through the endpoint the request was signed for by the one lookup every
+        // document read uses, which also materialises what the clock already owes — a
+        // document's move to `Active` and a command whose history is no longer retained —
+        // before anything here resolves against the store. The account holds the documents
+        // a caller created here AND the ones Systems Manager publishes, so a name the
+        // catalogue carries resolves without any create.
         let region = crate::state::request_region(ctx.parts());
-        if query
-            .account
-            .is_some_and(|account| !account.is_empty() && account != ::engine::emulator_account_id())
-            || query
-                .region
-                .is_some_and(|named| !named.is_empty() && named != region)
-        {
-            return Err(invalid_document().into());
-        }
-
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // A read of this store reports what the clock already owes, so a document's move
-        // to `Active` and a command whose history is no longer retained are both
-        // materialised before anything here resolves against the store.
-        store.materialize_due(now);
-
-        // The account holds the documents a caller created here AND the ones Systems
-        // Manager publishes, so a name the catalogue carries resolves without any create.
-        let Some(document) = store.resolve_document(&region, query.name) else {
+        let Some(document) = store.resolve_document_for_request(&input.document_name, &region, now)
+        else {
             return Err(invalid_document().into());
         };
         // "You can specify $DEFAULT, $LATEST, or a specific version number"
@@ -354,10 +336,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let document_version = match non_empty(input.document_version.as_deref()) {
             None => crate::state::DOCUMENT_VERSION_DEFAULT.to_string(),
             Some(requested) => {
-                let names_the_stored_version = requested == crate::state::DOCUMENT_VERSION_LATEST
-                    || requested == crate::state::DOCUMENT_VERSION_DEFAULT
-                    || requested == crate::state::FIRST_DOCUMENT_VERSION;
-                if !names_the_stored_version {
+                if !document.holds_version(requested) {
                     return Err(SendCommandErrorModeled::InvalidDocumentVersion(
                         InvalidDocumentVersion {
                             message: Some(format!(

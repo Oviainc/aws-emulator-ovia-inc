@@ -26,11 +26,14 @@
 //! parameter at a time. `DeleteParameter` and `DeleteParameters` remove a parameter
 //! whole, labels and every retained version with it.
 //!
-//! The second is **SSM documents**: `CreateDocument` registers a document and
-//! `DescribeDocument` reports it. A document is keyed by `(region, name)` the same way,
-//! and everything a read reports beyond the request's own members — the schema version,
-//! the description, the parameters, the platform types, the hash — is derived from the
-//! content that was persisted (see [`parse_document_content`]).
+//! The second is **SSM documents**: `CreateDocument` registers a document,
+//! `DescribeDocument` reports it and `GetDocument` reports its content. A document is
+//! keyed by `(region, name)` the same way, and everything a read reports beyond the
+//! request's own members — the schema version, the description, the parameters, the
+//! platform types, the hash — is derived from the content that was persisted (see
+//! [`parse_document_content`]). The content itself is held exactly as the create supplied
+//! it, and a read that asks for another `DocumentFormat` is served the same content
+//! re-rendered in it ([`document_format::rendered_content`]).
 //!
 //! A document a caller created is not the only one an account holds: Systems Manager
 //! also PUBLISHES a catalogue of its own documents ([`PUBLISHED_DOCUMENTS`]) in every
@@ -80,6 +83,9 @@ use std::time::{Duration, SystemTime};
 /// The cloud connectors this service holds, and how a create, an update and a read of
 /// one reach the single store below.
 pub mod cloud_connectors;
+
+/// Rendering a persisted document's content in the `DocumentFormat` a read asks for.
+pub mod document_format;
 
 /// Whether a read may have a `SecureString`'s value decrypted for its caller, which is a
 /// decision the KMS key the value is sealed under makes rather than this service.
@@ -805,6 +811,10 @@ pub const DEFAULT_DOCUMENT_FORMAT: &str = "JSON";
 /// The `DocumentFormat` whose content is free text rather than a document tree — a
 /// Change Calendar entry, say — so nothing is derived from it.
 pub const DOCUMENT_FORMAT_TEXT: &str = "TEXT";
+
+/// The other `DocumentFormat` a document tree is written in: "The document format can be
+/// either JSON or YAML" (`DocumentFormat`, `crate::ops::types::DOCUMENT_FORMAT_VALUES`).
+pub const DOCUMENT_FORMAT_YAML: &str = "YAML";
 
 /// The document type a create that names none produces: `Command`, Systems Manager's
 /// default document type (`DocumentType` is optional on `CreateDocument` and a
@@ -1755,6 +1765,25 @@ fn declared_step_names(map: &::yaml_rust2::yaml::Hash) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The ONE document tree `content` holds, or why it is not one document tree this
+/// service accepts.
+///
+/// This is what "one document tree" means for this crate: the create that derives a
+/// document's report from its content and the read that re-renders that content in
+/// another format ([`document_format`]) both read it through here.
+pub fn load_single_document(content: &str) -> Result<::yaml_rust2::Yaml, ContentRejection> {
+    let mut documents = ::yaml_rust2::YamlLoader::load_from_str(content).map_err(|why| {
+        ContentRejection::Content(format!("Content could not be parsed as a document: {why}"))
+    })?;
+    if documents.len() != 1 {
+        return Err(ContentRejection::Content(format!(
+            "Content must be exactly one document; found {}",
+            documents.len()
+        )));
+    }
+    Ok(documents.remove(0))
+}
+
 /// What `content` declares, or why it is not a document this service accepts.
 ///
 /// "The content for the new SSM document in JSON or YAML format"
@@ -1783,16 +1812,7 @@ pub fn parse_document_content(
         ));
     }
     reject_document_aliases(content)?;
-    let mut documents = ::yaml_rust2::YamlLoader::load_from_str(content).map_err(|why| {
-        ContentRejection::Content(format!("Content could not be parsed as a document: {why}"))
-    })?;
-    if documents.len() != 1 {
-        return Err(ContentRejection::Content(format!(
-            "Content must be exactly one document; found {}",
-            documents.len()
-        )));
-    }
-    let document = documents.remove(0);
+    let document = load_single_document(content)?;
     let Some(map) = document.as_hash() else {
         return Err(ContentRejection::Content(
             "Content must be a mapping of document keys to values".to_string(),
@@ -2360,6 +2380,36 @@ impl DocumentRecord {
         }
     }
 
+    /// Whether `requested` names the version of this document a read resolves to.
+    ///
+    /// "The document version for which you want information. Can be a specific version
+    /// or the default version": a document holds exactly one version here
+    /// ([`FIRST_DOCUMENT_VERSION`]), so the latest and the default selector both name
+    /// that version and any other number names a version the document does not carry.
+    pub fn holds_version(&self, requested: &str) -> bool {
+        requested == DOCUMENT_VERSION_LATEST
+            || requested == DOCUMENT_VERSION_DEFAULT
+            || requested == FIRST_DOCUMENT_VERSION
+    }
+
+    /// Whether `requested` names this document's version name: "This value is unique
+    /// across all versions of a document" (`DocumentDescription$VersionName`), so a name
+    /// the document does not carry names no version of it.
+    pub fn holds_version_name(&self, requested: &str) -> bool {
+        self.version_name.as_deref() == Some(requested)
+    }
+
+    /// "The current review status of a new custom Systems Manager document"
+    /// (`DocumentDescription$ReviewStatus`).
+    ///
+    /// A review is the change-template approval workflow, and `UpdateDocumentMetadata` —
+    /// the operation that records one — is still a scaffold, so a change template created
+    /// here has not been reviewed and no other document type carries a review at all.
+    pub fn review_status(&self) -> Option<String> {
+        (self.document_type == CHANGE_TEMPLATE_DOCUMENT_TYPE)
+            .then(|| DOCUMENT_REVIEW_STATUS_NOT_REVIEWED.to_string())
+    }
+
     /// The modelled `DocumentDescription` for this document.
     pub fn to_description(&self) -> DocumentDescription {
         DocumentDescription {
@@ -2417,8 +2467,7 @@ impl DocumentRecord {
             review_information: None,
             approved_version: None,
             pending_review_version: None,
-            review_status: (self.document_type == CHANGE_TEMPLATE_DOCUMENT_TYPE)
-                .then(|| DOCUMENT_REVIEW_STATUS_NOT_REVIEWED.to_string()),
+            review_status: self.review_status(),
             // "The classification of a document to help you identify and categorize
             // its use", which Systems Manager assigns to the documents it publishes;
             // nothing classifies a document created through this API.
@@ -2663,6 +2712,44 @@ impl ComAmazonawsSsmAmazonssmState {
             return Some(stored.clone());
         }
         self.published_document_record(region, name)
+    }
+
+    /// The document a request names, resolved the way EVERY document read resolves one,
+    /// or `None` when no document of that name is reachable through this endpoint — which
+    /// is what each read's own not-found error reports.
+    ///
+    /// A `DocumentARN` value is "the name of the … document. The name can be an Amazon
+    /// Resource Name (ARN)", so either spelling names the same document
+    /// ([`parse_document_query`]); a value this service could never have stored (an ARN of
+    /// another service, say) names no document, so it is a miss rather than a refusal. A
+    /// document is reached through the endpoint it is asked for, so an ARN naming another
+    /// account or another Region than the request was signed for names nothing reachable
+    /// here: `region` comes from the signed credential scope ([`request_region`]) and
+    /// never from the request body. An ARN field left EMPTY names no account at all, the
+    /// way the ARN of a document Systems Manager publishes carries none, so it resolves
+    /// through this endpoint rather than being a miss.
+    ///
+    /// The one write a report makes happens here: the status move the clock already owed
+    /// at `now` is materialised before anything resolves against the store, so a read
+    /// reports what was due whether or not anybody called.
+    pub fn resolve_document_for_request(
+        &mut self,
+        name: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<DocumentRecord> {
+        let query = parse_document_query(name)?;
+        if query
+            .account
+            .is_some_and(|account| !account.is_empty() && account != ::engine::emulator_account_id())
+            || query
+                .region
+                .is_some_and(|named| !named.is_empty() && named != region)
+        {
+            return None;
+        }
+        self.materialize_due(now);
+        self.resolve_document(region, query.name)
     }
 
     /// Store `record` as `region`'s document of that name.

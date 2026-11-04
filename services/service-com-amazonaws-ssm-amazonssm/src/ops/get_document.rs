@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDocument
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDocument`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDocument::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the content of the SSM document a request names, in the `DocumentFormat` it
+//! asks for.
+//!
+//! The document is the one `region`'s endpoint holds under that name — the one a caller
+//! created there or the one Systems Manager publishes — resolved by the same lookup every
+//! other document read goes through ([`crate::state::ComAmazonawsSsmAmazonssmState::resolve_document`]),
+//! so a name neither holds is reported as no document rather than served. The content is
+//! the content that was persisted, re-rendered in the requested format
+//! ([`crate::state::document_format::rendered_content`]); nothing here holds a second
+//! copy of a document and nothing is synthesized for a document nobody created.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +185,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDocument` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDocumentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDocument"))
+        // `Name`'s and `DocumentVersion`'s patterns and the `DocumentFormat` value set
+        // are MODELLED constraints, so the centralized walk has already refused anything
+        // outside them: reaching here means `DocumentVersion` is `$LATEST`, `$DEFAULT` or
+        // a positive integer.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetDocumentErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the document store is unavailable".to_string()),
+            })
+        })?;
+
+        let missing = || {
+            GetDocumentErrorModeled::InvalidDocument(InvalidDocument {
+                message: Some(format!("Document with name {} does not exist.", input.name)),
+            })
+        };
+
+        // "Returns the document in the specified format … JSON is the default format",
+        // so a request that names no format asks for the default one. `DocumentFormat` is
+        // a modelled enum and the walk has already refused a value outside its value set;
+        // it is re-checked here because the format decides how the content is rendered,
+        // and a value the model does not declare — the EMPTY string a request may send in
+        // place of omitting the member — must not be served as if it were the default.
+        let requested_format = match input.document_format.as_deref() {
+            None => crate::state::DEFAULT_DOCUMENT_FORMAT,
+            Some(format) if DOCUMENT_FORMAT_VALUES.contains(&format) => format,
+            Some(format) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "DocumentFormat '{format}' isn't one of the document formats {}",
+                    DOCUMENT_FORMAT_VALUES.join(", ")
+                )));
+            }
+        };
+
+        // The document the request names, resolved through the endpoint it was signed for
+        // by the one lookup every document read uses; it also materialises the status move
+        // the clock already owed. The account holds the documents a caller created here
+        // AND the ones Systems Manager publishes, so a name the catalogue carries resolves
+        // without any create; only a name neither holds is a miss.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let Some(record) = state
+            .lock()
+            .resolve_document_for_request(&input.name, &region, now)
+        else {
+            return Err(missing().into());
+        };
+
+        // A version the document does not carry names nothing to report, whether the
+        // request named it by selector — a number or one of the two role selectors — or
+        // by version name, "unique across all versions of a document". Each refusal names
+        // what it was asked for, read from the request, beside the version the document
+        // actually holds, read from the store.
+        if let Some(requested) = input
+            .document_version
+            .as_deref()
+            .filter(|version| !version.is_empty() && !record.holds_version(version))
+        {
+            return Err(GetDocumentErrorModeled::InvalidDocumentVersion(
+                InvalidDocumentVersion {
+                    message: Some(format!(
+                        "Document version: {requested} is invalid, latest version is {}",
+                        crate::state::FIRST_DOCUMENT_VERSION
+                    )),
+                },
+            )
+            .into());
+        }
+        // A version NAME is the other way of naming a version, so a name no version of
+        // the document carries names no version to report either.
+        if let Some(requested) = input
+            .version_name
+            .as_deref()
+            .filter(|name| !name.is_empty() && !record.holds_version_name(name))
+        {
+            return Err(GetDocumentErrorModeled::InvalidDocumentVersion(
+                InvalidDocumentVersion {
+                    message: Some(format!("Document version name: {requested} is invalid")),
+                },
+            )
+            .into());
+        }
+
+        let (content, document_format) = crate::state::document_format::rendered_content(
+            &record.content,
+            &record.document_format,
+            requested_format,
+        );
+
+        Ok(GetDocumentOutput {
+            name: Some(record.name.clone()),
+            created_date: Some(::aws_smithy_types::DateTime::from(record.created_date)),
+            display_name: record.display_name.clone(),
+            version_name: record.version_name.clone(),
+            document_version: Some(crate::state::FIRST_DOCUMENT_VERSION.to_string()),
+            status: Some(record.status.clone()),
+            // "A message returned by Amazon Web Services Systems Manager that explains
+            // the Status value", which it sets for a failure; nothing here failed.
+            status_information: None,
+            content: Some(content),
+            document_type: Some(record.document_type.clone()),
+            document_format: Some(document_format),
+            requires: record.requires.clone(),
+            // "A description of the document attachments, including names, locations,
+            // sizes": an attachment's content lives in the S3 object the create's
+            // `AttachmentsSource` pointed at, which this emulator never fetched, so there
+            // is no attachment content to describe — the names the create supplied are
+            // what `DescribeDocument` reports as `AttachmentsInformation`.
+            attachments_content: None,
+            review_status: record.review_status(),
+        })
     }
 }
