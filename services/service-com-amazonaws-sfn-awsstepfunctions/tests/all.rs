@@ -31,6 +31,8 @@ mod activity_worker_hand_off;
 mod alias_order_and_redrive_context;
 #[path = "all/arn_validation.rs"]
 mod arn_validation;
+#[path = "all/callback_service_integration.rs"]
+mod callback_service_integration;
 #[path = "all/client_error_wrappers.rs"]
 mod client_error_wrappers;
 #[path = "all/client_refusal_status.rs"]

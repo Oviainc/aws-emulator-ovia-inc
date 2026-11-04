@@ -56,8 +56,6 @@
 //!   simply are not listed here yet;
 //! * an operation of a REST service whose own bindings are not carried, since where
 //!   each of its members goes on the wire is that operation's own fact;
-//! * the `.waitForTaskToken` integration pattern, which needs a later
-//!   `SendTaskSuccess` from outside the execution;
 //! * a run-a-job (`.sync`) pattern over an integration that is not in the
 //!   [`RUN_A_JOB`] catalogue below, because the job it starts is reported and
 //!   stopped through calls only that integration names;
@@ -94,6 +92,18 @@
 //! then polled through its own reporting call until it reaches a terminal status,
 //! which is what resolves the task ([`super::run_a_job`]). Nothing is synthesised:
 //! the identifier, the status and the failure are the invoked service's own answers.
+//!
+//! ## The callback (`.waitForTaskToken`) pattern
+//!
+//! A `Resource` ending in `.waitForTaskToken` asks for the callback pattern: the
+//! integration's own call is made exactly as a request-response one is, and what it
+//! carries includes a `taskToken` the state's parameters read out of the context
+//! object — so the task is finished not by that call's answer but by a later
+//! `SendTaskSuccess` or `SendTaskFailure` quoting that token. [`Call::callback`] is
+//! what marks such a call, and the walk records what the call answered as the task's
+//! submission and SUSPENDS at it ([`super::asl::ScheduledActivity`]), which is the
+//! execution waiting for an answer exactly as it waits for an activity worker's. The
+//! token itself is minted before the call, because the call is what delivers it.
 //!
 //! An ACTIVITY `Resource` is not one of these: its work belongs to a worker that
 //! polls this emulator, so the walk schedules a task and suspends at it rather than
@@ -623,6 +633,11 @@ pub struct Call {
     /// so the walk parks at it instead of placing the response as the result.
     /// `None` for a request-response integration, whose call IS the whole task.
     pub job: Option<&'static RunAJob>,
+    /// Whether the `Resource` asked for the callback (`.waitForTaskToken`) pattern:
+    /// the call is made, and the task is then finished by a `SendTaskSuccess` or
+    /// `SendTaskFailure` quoting the `taskToken` that call carried, so the walk
+    /// suspends at it instead of placing the response as the result.
+    pub callback: bool,
     /// Whether the `Resource` asked for the pattern's SECOND revision (`.sync:2`),
     /// which differs in one thing: a document the job carries as JSON TEXT is
     /// reported as the parsed document rather than as that text
@@ -1075,9 +1090,20 @@ const EPOCH_MILLIS_MEMBERS: &[(&str, &[&str])] = &[
 const RUN_A_JOB_PATTERN: &str = "sync";
 const RUN_A_JOB_PATTERN_2: &str = "sync:2";
 
-/// The `.waitForTaskToken` pattern, whose outcome is a `SendTaskSuccess` from
-/// outside the execution rather than a job this emulator can poll.
+/// The `.waitForTaskToken` pattern, whose outcome is a `SendTaskSuccess` or
+/// `SendTaskFailure` from outside the execution rather than a job this emulator
+/// polls.
 const CALLBACK_PATTERN: &str = "waitForTaskToken";
+
+/// Whether `resource` asks for the callback (`.waitForTaskToken`) pattern.
+///
+/// Read from the `Resource` alone, so it can be asked BEFORE the call it names is
+/// read: a callback task carries the heartbeat members an answer from outside the
+/// execution can be bounded by, which a request-response task cannot owe
+/// ([`super::asl`] decides a state's members from this).
+pub fn asks_for_callback(resource: &str) -> bool {
+    read(resource).is_ok_and(|call| call.callback)
+}
 
 /// One run-a-job (`.sync`) service integration: the three calls the pattern is made
 /// of, and where the job's identifier, status and failure sit in their documents.
@@ -1474,8 +1500,8 @@ pub fn read(resource: &str) -> Result<Call, String> {
     // The run-a-job pattern is performed for the integrations [`RUN_A_JOB`] names
     // the reporting and stopping calls of; the callback pattern waits for a
     // `SendTaskSuccess` nothing inside the execution makes.
-    let (job, parsed_output) = match pattern {
-        None => (None, false),
+    let (job, parsed_output, callback) = match pattern {
+        None => (None, false, false),
         Some(pattern @ (RUN_A_JOB_PATTERN | RUN_A_JOB_PATTERN_2)) => {
             let starts = format!("{service}:{action}");
             let job = RUN_A_JOB
@@ -1489,15 +1515,11 @@ pub fn read(resource: &str) -> Result<Call, String> {
                         super::asl::echoed(pattern)
                     )
                 })?;
-            (Some(job), pattern == RUN_A_JOB_PATTERN_2)
+            (Some(job), pattern == RUN_A_JOB_PATTERN_2, false)
         }
-        Some(pattern) if pattern == CALLBACK_PATTERN => {
-            return Err(format!(
-                "'{shown}' asks for the '{}' integration pattern, whose outcome is a later \
-                 'SendTaskSuccess' from outside the execution, so nothing was run for it",
-                super::asl::echoed(pattern)
-            ))
-        }
+        // The callback pattern's call is the same call the request-response form
+        // makes; what differs is that its answer does not finish the task.
+        Some(pattern) if pattern == CALLBACK_PATTERN => (None, false, true),
         Some(pattern) => {
             return Err(format!(
                 "'{shown}' names '{}', which is not one of this service's integration patterns, \
@@ -1540,6 +1562,7 @@ pub fn read(resource: &str) -> Result<Call, String> {
         operation,
         rest,
         job,
+        callback,
         parsed_output,
         json_text,
         // The OPTIMIZED family's result is the literal SDK response; the AWS SDK
@@ -1587,8 +1610,10 @@ fn direct_invocation(function: &str, shown: &str) -> Result<Call, String> {
         operation: LAMBDA_INVOKE_OPERATION.to_string(),
         rest: Some(rest),
         // A function ARN asks for no integration pattern: the invocation IS the task's
-        // whole work, so there is no job to park at and no member to convert.
+        // whole work, so there is no job to park at, no callback to wait for and no
+        // member to convert.
         job: None,
+        callback: false,
         parsed_output: false,
         json_text: &[],
         // The result of this form is the function's own payload, not the SDK response
@@ -1681,6 +1706,7 @@ fn pattern_call(api: &'static Api, operation: &str) -> Call {
         // ([`RUN_A_JOB`]), so neither of its own calls carries a REST binding.
         rest: None,
         job: None,
+        callback: false,
         parsed_output: false,
         json_text: &[],
         sdk_envelope: false,
@@ -1803,6 +1829,25 @@ fn unavailable(operation: &str) -> Failed {
     }
 }
 
+/// What a task fails with when the operation running the execution is STILL inside
+/// the previous call of this walk, so there is nothing to hand this one to.
+///
+/// One call is in flight at a time, and the walk waits for each answer before it
+/// transitions — so this is reachable only after a call TIMED OUT server-side while
+/// its target went on holding it. The walk is not held with it: the task fails with
+/// ASL's own timeout error, which the state's `Retry` and `Catch` may match, and no
+/// call is made for it.
+fn still_calling(call: &Call) -> Failed {
+    Failed {
+        error: super::asl::TIMEOUT_ERROR.to_string(),
+        cause: format!(
+            "the '{}' call of {} could not be made while the call this execution made before it \
+             has still not answered, so nothing was run for it",
+            call.operation, call.api.sdk_id
+        ),
+    }
+}
+
 /// What a task fails with when the chain of in-process calls it sits in is already
 /// as deep as this emulator carries one ([`MAX_CALL_CHAIN_DEPTH`]): the call is NOT
 /// made, so the thread this walk holds is the last one the chain pins.
@@ -1852,12 +1897,24 @@ impl Tasks for Dispatcher {
             answer,
         };
         // The walk runs on a blocking thread (`spawn_blocking`), never on an async
-        // worker, so it may block here. The handover itself cannot wait on a full
-        // channel: the walk has at most one call outstanding, and a channel whose
-        // serving half is gone refuses the send rather than blocking.
-        self.calls
-            .blocking_send(handover)
-            .map_err(|_| unavailable(&call.operation))?;
+        // worker, so it may block here — but the handover must not be able to block
+        // WITHOUT a bound. The walk has at most one call outstanding, so the single
+        // buffered slot is normally free; it is NOT free when a previous call of this
+        // walk timed out server-side and its target has still not answered, because
+        // the serving half is then still inside that call. A send that waited there
+        // would hold this blocking thread for the stuck target's own hold time rather
+        // than for any ceiling this module states, so the handover is attempted
+        // WITHOUT waiting and a slot that is not free fails the task instead:
+        // nothing was handed over for it, and nothing is faked.
+        match self.calls.try_send(handover) {
+            Ok(()) => {}
+            Err(::tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(unavailable(&call.operation))
+            }
+            Err(::tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                return Err(still_calling(call))
+            }
+        }
         // The wait is CLAMPED server-side: whatever the call is doing, this thread
         // is released at that bound.
         match answered.recv_timeout(waited) {
@@ -1935,7 +1992,22 @@ where
     });
     let serve = async {
         while let Some(handover) = handovers.recv().await {
-            let answer = call_api(callback, region, &handover.call, &handover.request).await;
+            // The SERVING half is bounded by the same ceiling the waiting half is:
+            // a call that has not answered inside it is abandoned here too, so this
+            // loop returns to `handovers.recv()` and the walk's next call is handed
+            // over rather than waiting for a target that is still holding the
+            // previous one (`GetActivityTask` is a long poll). Nothing is faked for
+            // an abandoned call: the walk reported the timeout itself.
+            let answer =
+                match ::tokio::time::timeout(
+                    MAX_CALL_DURATION,
+                    call_api(callback, region, &handover.call, &handover.request),
+                )
+                .await
+                {
+                    Ok(answer) => answer,
+                    Err(_elapsed) => Err(timed_out(&handover.call, MAX_CALL_DURATION)),
+                };
             // A walk that has stopped waiting — it timed out, or it is gone — cannot
             // be told; it reported the timeout itself.
             let _ = handover.answer.send(answer);
@@ -2771,7 +2843,7 @@ mod tests {
     #[test]
     fn a_resource_names_the_call_its_action_does() {
         // (case, the Resource, the signing name and operation it names, parks at a job)
-        let rows: [ResourceRow; 28] = [
+        let rows: [ResourceRow; 29] = [
             (
                 "the optimized DynamoDB integration",
                 "arn:aws:states:::dynamodb:putItem",
@@ -2897,10 +2969,18 @@ mod tests {
                 None,
                 false,
             ),
+            // The callback pattern: the ACTION is what is called, and the task is
+            // suspended at the token that call carried rather than parked at a job.
             (
-                "the .waitForTaskToken pattern",
+                "the callback pattern over an SQS message",
                 "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
-                None,
+                Some(("sqs", "SendMessage")),
+                false,
+            ),
+            (
+                "the callback pattern over a Lambda invocation",
+                "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                Some(("lambda", "Invoke")),
                 false,
             ),
             (

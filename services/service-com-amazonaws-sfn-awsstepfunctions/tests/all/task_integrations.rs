@@ -137,6 +137,17 @@ impl Chain {
         parsed
     }
 
+    /// Call one Step Functions operation, requiring a FAILURE, and report its status
+    /// and the error code it answered.
+    pub(crate) async fn sfn_err(&self, operation: &str, body: &Value) -> (u16, String) {
+        let (status, parsed) = self.call(&SFN, operation, body).await;
+        assert_ne!(
+            status, 200,
+            "case {operation}: expected a failure, got 200 with body {parsed:?}"
+        );
+        (status, error_code(&parsed))
+    }
+
     /// Call one DynamoDB operation, requiring a 200.
     async fn ddb(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(&DYNAMODB, operation, body).await;
@@ -164,7 +175,10 @@ impl Chain {
     }
 
     /// The item stored under `pk`, or `None` when the table holds none.
-    async fn item(&self, table: &str, pk: &str) -> Option<Value> {
+    ///
+    /// `pub(crate)`, not private: a sibling suite that asserts what the far end of a
+    /// task's call really received reads it back through this one.
+    pub(crate) async fn item(&self, table: &str, pk: &str) -> Option<Value> {
         let read = self
             .ddb(
                 "GetItem",
@@ -178,6 +192,48 @@ impl Chain {
     /// execution ended as once the clock has made the outcome due.
     pub(crate) async fn run(&self, name: &str, definition: &Value, input: &Value) -> Value {
         self.run_after(name, definition, input, Duration::ZERO).await
+    }
+
+    /// Create a state machine of `name` and report its ARN.
+    ///
+    /// `pub(crate)`, not private: a sibling suite that has to act WHILE an execution
+    /// is still running creates and starts in two steps rather than through `run`.
+    pub(crate) async fn create(&self, name: &str, definition: &Value) -> String {
+        let created = self
+            .sfn(
+                "CreateStateMachine",
+                &json!({
+                    "name": name,
+                    "definition": definition.to_string(),
+                    "roleArn": ROLE_ARN
+                }),
+            )
+            .await;
+        string(&created, "stateMachineArn")
+    }
+
+    /// Start one execution of `machine` and report its ARN.
+    pub(crate) async fn start(&self, machine: &str, name: &str, input: &Value) -> String {
+        let started = self
+            .sfn(
+                "StartExecution",
+                &json!({
+                    "stateMachineArn": machine,
+                    "name": name,
+                    "input": input.to_string()
+                }),
+            )
+            .await;
+        string(&started, "executionArn")
+    }
+
+    /// `DescribeExecution`, as the API answers it.
+    pub(crate) async fn describe(&self, execution_arn: &str) -> Value {
+        self.sfn(
+            "DescribeExecution",
+            &json!({ "executionArn": execution_arn }),
+        )
+        .await
     }
 
     /// The same, waiting a further `owed` for a definition whose own `Wait` or
@@ -602,13 +658,15 @@ async fn a_refused_call_fails_the_task_with_the_services_own_error() {
 /// nothing was written anywhere.
 ///
 /// The rows span the classes [`state::integration::read`] declines: a service whose
-/// request is not one JSON document, the callback pattern whose outcome arrives from
-/// outside the execution, a run-a-job pattern over an integration whose job this
-/// emulator cannot report or stop, a bare resource ARN, and a `Resource` that is no
+/// request is not one JSON document, a run-a-job pattern over an integration whose
+/// job this emulator cannot report or stop, an integration pattern this service does
+/// not name, a bare resource ARN, and a `Resource` that is no
 /// ARN at all. An ACTIVITY `Resource` is not among them — its work is a worker's, so
 /// the walk schedules a task and the execution waits at that state (its own suites
 /// cover that) — and neither is a run-a-job pattern this emulator DOES perform, whose
-/// job is started, polled and resolved (`sync_service_integration.rs`).
+/// job is started, polled and resolved (`sync_service_integration.rs`), nor the
+/// callback pattern, whose call is made and whose token is then waited for
+/// (`callback_service_integration.rs`).
 #[tokio::test]
 async fn a_resource_no_call_is_made_for_fails_rather_than_being_faked() {
     let cases: [(&str, &str); 5] = [
@@ -621,8 +679,8 @@ async fn a_resource_no_call_is_made_for_fails_rather_than_being_faked() {
             "arn:aws:states:::dynamodb:putItem.sync",
         ),
         (
-            "the .waitForTaskToken pattern, which waits for a later SendTaskSuccess",
-            "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+            "an integration pattern this service does not name",
+            "arn:aws:states:::dynamodb:putItem.whenever",
         ),
         (
             // A bare resource ARN of a service whose resources are not work in

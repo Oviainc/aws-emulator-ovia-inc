@@ -14,6 +14,13 @@
 //! outcome is owed to the clock exactly as the outcome a successful reply continues to
 //! is, and one token answers one task, so no later reply resolves it.
 //!
+//! The same call answers a CALLBACK (`.waitForTaskToken`) task, whose token was
+//! carried by the `Task` state's own integration call. There the reported failure is
+//! that state's own outcome, so the execution is CONTINUED from it
+//! ([`crate::state::plan_callback_reply`]): the state's `Retry` makes the call again
+//! for its next attempt, its `Catch` hands the failure to the catcher it names, and
+//! with neither the execution fails with the `error` and `cause` reported here.
+//!
 //! An execution of a state machine on a customer managed KMS key has the `error` and
 //! `cause` this reply carries SEALED under that key, so a reply that carries either is
 //! refused with `KmsAccessDeniedException` unless KMS lets this caller have the key
@@ -212,85 +219,302 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = crate::state::now();
-        let mut store = state.lock();
-        // Settle first: a task whose own bound the clock already made due is closed —
-        // and the execution waiting at it failed — before this call decides whether
-        // the token still answers anything.
-        store.settle(now);
+        // Phase 1, under the lock: resolve the task and refuse what cannot be
+        // answered. An ACTIVITY's task is CLOSED here, because what its state does
+        // with the reported failure needs no walk; a CALLBACK task's state is
+        // CONTINUED from that failure, so its facts are read out and the lock
+        // released before the continuation is interpreted.
+        let (
+            definition,
+            execution_input,
+            previous_event_id,
+            execution_arn,
+            start_date,
+            machine_arn,
+            machine_name,
+            context,
+            reply,
+        ) = {
+            let mut store = state.lock();
+            // Settle first: a task whose own bound the clock already made due is
+            // closed — and the execution waiting at it failed — before this call
+            // decides whether the token still answers anything.
+            store.settle(now);
 
-        let Some(task) = store.activity_tasks.get(&input.task_token) else {
-            return Err(SendTaskFailureErrorModeled::TaskTimedOut(TaskTimedOut {
-                message: Some(crate::state::task_timed_out_message(&token_activity)),
-            })
-            .into());
-        };
-        let activity_arn = task.activity_arn.clone();
-        let execution_arn = task.execution_arn.clone();
-        let state_name = task.state_name.clone();
-        // The activity this task is queued under can be DELETED while the task is
-        // outstanding, which leaves the task with no activity to be answered for: the
-        // modelled `TaskDoesNotExist`, whose own documentation is "the activity does
-        // not exist".
-        if !store.activities.contains_key(&activity_arn) {
-            return Err(
-                SendTaskFailureErrorModeled::TaskDoesNotExist(TaskDoesNotExist {
-                    message: Some(crate::state::resource_error_message(
-                        crate::state::ACTIVITY_DOES_NOT_EXIST,
-                        &activity_arn,
-                    )),
+            let Some(task) = store.activity_tasks.get(&input.task_token) else {
+                return Err(SendTaskFailureErrorModeled::TaskTimedOut(TaskTimedOut {
+                    message: Some(crate::state::task_timed_out_message(&token_activity)),
                 })
-                .into(),
-            );
-        }
-        // A task whose execution is no longer running is answered by nobody: it was
-        // stopped, or the clock closed an earlier bound of it, so the token names a
-        // task that has already been closed.
-        let Some(execution) = store
-            .executions
-            .get(&execution_arn)
-            .filter(|execution| !execution.is_terminal())
-        else {
-            return Err(SendTaskFailureErrorModeled::TaskTimedOut(TaskTimedOut {
-                message: Some(crate::state::task_timed_out_message(&token_activity)),
-            })
-            .into());
+                .into());
+            };
+            let activity_arn = task.activity_arn.clone();
+            let execution_arn = task.execution_arn.clone();
+            let state_name = task.state_name.clone();
+            // The state's RAW input, which its `ResultPath` or its `Catch` is applied
+            // against: the task carries it, so the failure is placed against the
+            // document the state was really entered with.
+            let state_input = task.state_input.clone();
+            // What this state's retriers have already spent on the task, so the
+            // continuation takes that budget up rather than restarting it.
+            let retries_taken = task.retries_taken.clone();
+            // The activity this task is queued under can be DELETED while the task is
+            // outstanding, which leaves the task with no activity to be answered for:
+            // the modelled `TaskDoesNotExist`, whose own documentation is "the
+            // activity does not exist". A CALLBACK task belongs to no activity, so
+            // nothing of the kind can have gone missing for one.
+            let missing_activity = activity_arn
+                .as_ref()
+                .filter(|activity_arn| !store.activities.contains_key(*activity_arn));
+            if let Some(activity_arn) = missing_activity {
+                return Err(
+                    SendTaskFailureErrorModeled::TaskDoesNotExist(TaskDoesNotExist {
+                        message: Some(crate::state::resource_error_message(
+                            crate::state::ACTIVITY_DOES_NOT_EXIST,
+                            activity_arn,
+                        )),
+                    })
+                    .into(),
+                );
+            }
+            // A task whose execution is no longer running is answered by nobody: it was
+            // stopped, or the clock closed an earlier bound of it, so the token names a
+            // task that has already been closed.
+            let Some(execution) = store
+                .executions
+                .get(&execution_arn)
+                .filter(|execution| !execution.is_terminal())
+            else {
+                return Err(SendTaskFailureErrorModeled::TaskTimedOut(TaskTimedOut {
+                    message: Some(crate::state::task_timed_out_message(&token_activity)),
+                })
+                .into());
+            };
+
+            let last_event_id = execution.last_event_id();
+            let execution_input = execution.input.clone();
+            let execution_name = execution.name.clone();
+            let start_date = execution.start_date;
+            let state_machine_arn = execution.state_machine_arn.clone();
+            let redrive_count = execution.redrive_count;
+            let version_arn = execution.state_machine_version_arn.clone();
+
+            if activity_arn.is_some() {
+                // The state that scheduled the task answers for the error first: a
+                // `Retry` whose retrier names it, with attempts left, closes THIS
+                // attempt and queues the next one, so the execution is still running
+                // and this reply resolved the token it carried. A worker that reported
+                // no `error` names none, which only a retrier on the `States.ALL`
+                // wildcard answers for.
+                let reported = input.error.clone().unwrap_or_default();
+                if store.retry_failed_activity_task(&input.task_token, &reported, now) {
+                    return Ok(SendTaskFailureOutput {});
+                }
+
+                // Nothing is interpreted: no retrier of the scheduling state answers
+                // for the error, and the state declares no `Catch` this emulator
+                // interprets, so the failure the worker reported is the execution's —
+                // what is recorded is the two events that failure writes and the
+                // outcome the clock then owes.
+                let planned = crate::state::plan_task_failure(
+                    &state_name,
+                    now,
+                    input.error,
+                    input.cause,
+                    last_event_id,
+                );
+                return match store.fail_activity_task(
+                    &input.task_token,
+                    planned.opening,
+                    planned.pending,
+                ) {
+                    Ok(()) => Ok(SendTaskFailureOutput {}),
+                    Err(crate::state::TaskReplyRejection::Gone) => {
+                        Err(SendTaskFailureErrorModeled::TaskTimedOut(TaskTimedOut {
+                            message: Some(crate::state::task_timed_out_message(&token_activity)),
+                        })
+                        .into())
+                    }
+                    // The failure's own events and outcome are what the execution
+                    // would grow by, so a reply the store has no room for is refused
+                    // rather than retained past its ceiling. This operation models no
+                    // limit error, so the refusal is the standard 400 validation
+                    // envelope.
+                    Err(crate::state::TaskReplyRejection::NoRoom) => {
+                        Err(crate::scaffolded::Scaffolded::validation(format!(
+                            "failing execution {execution_arn} would take the store past the {} \
+                             bytes this emulator retains",
+                            crate::state::MAX_STORE_BYTES
+                        )))
+                    }
+                };
+            }
+
+            let Some(machine) = store.state_machines.get(&state_machine_arn) else {
+                return Err(SendTaskFailureErrorModeled::TaskTimedOut(TaskTimedOut {
+                    message: Some(crate::state::task_timed_out_message(&token_activity)),
+                })
+                .into());
+            };
+            // The context object (`$$`) the continuation reads is the SAME execution's
+            // identity: an answer continues this execution rather than starting one,
+            // so `$$.Execution.Id` and `$$.Execution.Name` do not change.
+            let context = crate::state::asl::Context {
+                execution_arn: execution_arn.clone(),
+                execution_name,
+                state_machine_arn: machine.arn.clone(),
+                state_machine_name: machine.name.clone(),
+                role_arn: machine.role_arn.clone(),
+                // The answer CONTINUES the attempt the task was handed over on rather
+                // than beginning another, so the states it runs on read the count the
+                // record already carries — not one more.
+                redrive_count,
+                express: machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS,
+            };
+            // The execution runs the definition it was STARTED on, which for one
+            // started through a version ARN — or through an alias that routed to a
+            // version — is that version's immutable snapshot and not what the state
+            // machine has been updated to since.
+            let definition = version_arn
+                .as_deref()
+                .and_then(|version_arn| store.state_machine_versions.get(version_arn))
+                .map_or_else(
+                    || machine.definition.clone(),
+                    |version| version.definition.clone(),
+                );
+            (
+                definition,
+                execution_input,
+                last_event_id,
+                execution_arn,
+                start_date,
+                machine.arn.clone(),
+                machine.name.clone(),
+                context,
+                crate::state::asl::CallbackReply {
+                    state_name,
+                    state_input,
+                    // "The error code of the failure" and "a more detailed explanation
+                    // of the cause of the failure": what the answer reported IS the
+                    // task's failure, which the state's `Retry` is matched against and
+                    // its `Catch` hands on.
+                    outcome: Err(crate::state::asl::Failure {
+                        error: input.error.clone(),
+                        cause: input.cause.clone(),
+                    }),
+                    retries_taken,
+                },
+            )
         };
 
-        let last_event_id = execution.last_event_id();
+        // Phase 2, OUTSIDE the lock: the continuation is INTERPRETED here, from the
+        // state whose integration call carried the token. Its `Retry` makes that call
+        // again for the next attempt and its `Catch` transitions to the catcher it
+        // names, so those states call from this request's own task exactly as a
+        // start's do (`state::integration::interpret`), in the state machine's own
+        // Region.
+        let interpreted = {
+            let definition = definition.clone();
+            let execution_input = execution_input.clone();
+            let region = crate::state::arn_region(&machine_arn);
+            // The states after the answer call as the SAME execution role the states
+            // before it did.
+            let role = crate::state::task_authorization::role_gate(
+                &self.engine,
+                &region,
+                &context.role_arn,
+            );
+            crate::state::integration::interpret(ctx, &region, role, move |tasks| {
+                crate::state::plan_callback_reply(
+                    &definition,
+                    &execution_input,
+                    start_date,
+                    now,
+                    &context,
+                    &reply,
+                    previous_event_id,
+                    tasks,
+                )
+            })
+            .await
+        };
+        let Ok(planned) = interpreted else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::INTERPRETER_UNAVAILABLE,
+            ));
+        };
+        // The definition no longer declares the state that was waiting, so there is
+        // nothing to continue the execution with: the answer is refused and the
+        // execution is left exactly as it was.
+        let Some(planned) = planned else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::TASK_STATE_NOT_REACHED,
+            ));
+        };
+        // A job the continuation STARTED and then abandoned is stopped through its own
+        // integration, as a start's own is. Done with no store of this service locked.
+        crate::state::integration::stop_abandoned(
+            ctx.callback(),
+            &crate::state::arn_region(&machine_arn),
+            &planned.abandoned,
+        )
+        .await;
 
-        // The state that scheduled the task answers for the error first: a `Retry`
-        // whose retrier names it, with attempts left, closes THIS attempt and queues
-        // the next one, so the execution is still running and this reply resolved the
-        // token it carried. A worker that reported no `error` names none, which only a
-        // retrier on the `States.ALL` wildcard answers for.
-        let reported = input.error.clone().unwrap_or_default();
-        if store.retry_failed_activity_task(&input.task_token, &reported, now) {
-            return Ok(SendTaskFailureOutput {});
-        }
-
-        // Nothing is interpreted: no retrier of the scheduling state answers for the
-        // error, and the state declares no `Catch` this emulator interprets, so the
-        // failure the worker reported is the execution's — what is recorded is the two
-        // events that failure writes and the outcome the clock then owes.
-        let planned = crate::state::plan_task_failure(
-            &state_name,
-            now,
-            input.error,
-            input.cause,
-            last_event_id,
-        );
-        match store.fail_activity_task(&input.task_token, planned.opening, planned.pending) {
-            Ok(()) => Ok(SendTaskFailureOutput {}),
+        // Phase 3, under the lock again: record it. Every check is re-made, because
+        // the task could have been answered or closed while the walk ran.
+        let mut store = state.lock();
+        store.settle(now);
+        let waiting = planned.waiting;
+        let parked = planned.parked;
+        let task_bytes = waiting
+            .as_ref()
+            .map_or(0, crate::state::PlannedActivityTask::measure)
+            + parked.as_ref().map_or(0, crate::state::PlannedJob::measure);
+        let map_runs = planned.map_runs;
+        let map_run_bytes = crate::state::planned_map_run_bytes(&map_runs);
+        match store.answer_activity_task(
+            &input.task_token,
+            planned.opening,
+            planned.pending,
+            task_bytes + map_run_bytes,
+            planned.stopped_at,
+        ) {
+            Ok(()) => {
+                // The continuation is waiting again: the state's `Retry` made its
+                // integration call for the next attempt, which handed out a token of
+                // its own, or a state after a `Catch` scheduled an activity task.
+                if let Some(waiting) = waiting {
+                    store.schedule_activity_task(&execution_arn, waiting);
+                }
+                store.append_map_runs(
+                    &execution_arn,
+                    &machine_arn,
+                    &machine_name,
+                    &crate::state::arn_region(&machine_arn),
+                    map_runs,
+                );
+                if let Some(parked) = parked {
+                    let region = crate::state::arn_region(&machine_arn);
+                    store.park_job(&execution_arn, parked, &region);
+                    drop(store);
+                    crate::state::run_a_job::watch(
+                        std::sync::Arc::clone(&self.engine),
+                        ctx.callback().clone(),
+                        crate::state::integration::chain_depth(ctx),
+                        execution_arn.clone(),
+                    );
+                }
+                Ok(SendTaskFailureOutput {})
+            }
             Err(crate::state::TaskReplyRejection::Gone) => {
                 Err(SendTaskFailureErrorModeled::TaskTimedOut(TaskTimedOut {
                     message: Some(crate::state::task_timed_out_message(&token_activity)),
                 })
                 .into())
             }
-            // The failure's own events and outcome are what the execution would grow
-            // by, so a reply the store has no room for is refused rather than retained
-            // past its ceiling. This operation models no limit error, so the refusal is
-            // the standard 400 validation envelope.
+            // The continuation's own events and outcome are what the execution would
+            // grow by, so an answer the store has no room for is refused rather than
+            // retained past its ceiling. This operation models no limit error, so the
+            // refusal is the standard 400 validation envelope.
             Err(crate::state::TaskReplyRejection::NoRoom) => {
                 Err(crate::scaffolded::Scaffolded::validation(format!(
                     "failing execution {execution_arn} would take the store past the {} bytes \

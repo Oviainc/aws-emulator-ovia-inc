@@ -15,6 +15,11 @@
 //! regardless of the number of SendTaskHeartbeat requests received" — so heartbeats
 //! keep a task alive only up to that whole-task bound.
 //!
+//! The same call reports a CALLBACK (`.waitForTaskToken`) task still making progress:
+//! whoever holds the token the `Task` state's own integration call carried heartbeats
+//! that task exactly as a worker heartbeats an activity's, and the window the state's
+//! `HeartbeatSeconds` opens runs again from this instant.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -196,13 +201,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The activity this task is queued under can be DELETED while the task is
         // outstanding, which leaves the task with no activity to report progress for:
         // the modelled `TaskDoesNotExist`, whose own documentation is "the activity
-        // does not exist".
-        if !store.activities.contains_key(&activity_arn) {
+        // does not exist". A CALLBACK task belongs to no activity, so nothing of the
+        // kind can have gone missing for one.
+        let missing_activity = activity_arn
+            .as_ref()
+            .filter(|activity_arn| !store.activities.contains_key(*activity_arn));
+        if let Some(activity_arn) = missing_activity {
             return Err(SendTaskHeartbeatErrorModeled::TaskDoesNotExist(
                 TaskDoesNotExist {
                     message: Some(crate::state::resource_error_message(
                         crate::state::ACTIVITY_DOES_NOT_EXIST,
-                        &activity_arn,
+                        activity_arn,
                     )),
                 },
             )

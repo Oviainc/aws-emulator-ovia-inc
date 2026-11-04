@@ -150,7 +150,7 @@ pub(crate) fn held_tasks(emulator: &Emulator, activity_arn: &str) -> usize {
     store
         .activity_tasks
         .values()
-        .filter(|task| task.activity_arn == activity_arn)
+        .filter(|task| task.activity_arn.as_deref() == Some(activity_arn))
         .count()
 }
 

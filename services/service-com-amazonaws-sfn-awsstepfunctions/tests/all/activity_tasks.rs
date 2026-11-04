@@ -145,7 +145,7 @@ pub(crate) fn queued_tasks(emulator: &Emulator, activity_arn: &str) -> (usize, u
     let mine = store
         .activity_tasks
         .values()
-        .filter(|task| task.activity_arn == activity_arn);
+        .filter(|task| task.activity_arn.as_deref() == Some(activity_arn));
     let mut held = 0;
     let mut claimable = 0;
     for task in mine {

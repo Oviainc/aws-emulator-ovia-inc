@@ -5,7 +5,10 @@
 //! States Language definition through [`crate::state::asl`], parking the terminal
 //! outcome the walk computed until the clock makes it due — or, where the walk
 //! reached an activity task, queueing that task for a worker to claim with
-//! `GetActivityTask` and leaving the execution waiting at that state. The
+//! `GetActivityTask` and leaving the execution waiting at that state, or where it
+//! reached a callback (`.waitForTaskToken`) task, recording the token that task's own
+//! integration call carried and leaving the execution waiting for a `SendTask*` that
+//! quotes it. The
 //! `stateMachineArn` may be unqualified, a version ARN or an alias ARN; the last two
 //! are resolved through
 //! [`crate::state::ComAmazonawsSfnAwsstepfunctionsState::read_run_target`] and

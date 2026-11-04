@@ -12,6 +12,11 @@
 //! the state's `Next`, exactly as [`crate::state::plan_reply`] computes it. The task is
 //! then closed, so one token answers one task and no later reply resolves it.
 //!
+//! The same call answers a CALLBACK (`.waitForTaskToken`) task: there the token was
+//! carried by the `Task` state's own integration call, and whoever received it reports
+//! the task's result here, so the execution continues from that state in the same way
+//! ([`crate::state::plan_callback_reply`]).
+//!
 //! An execution of a state machine on a customer managed KMS key has the `output` this
 //! reply carries SEALED under that key, so the reply is refused with
 //! `KmsAccessDeniedException` unless KMS lets this caller have the key used for it
@@ -134,6 +139,19 @@ pub struct SendTaskSuccess<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Which kind of outstanding task this reply answers, with the continuation each one
+/// begins.
+///
+/// One token answers one task, and the two kinds of task an execution waits at are
+/// continued from the same state in different ways: an ACTIVITY's task was scheduled
+/// for a worker, so the reply is that state's result, while a CALLBACK task's state
+/// MADE a call that carried the token, so the reply is that state's outcome and its
+/// `Retry` may make the call again.
+enum Answered {
+    Activity(crate::state::asl::ActivityReply),
+    Callback(crate::state::asl::CallbackReply),
+}
+
 impl<Eng> SendTaskSuccess<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -244,16 +262,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the task carries it, so the reply is placed against the document the
             // state was really entered with.
             let state_input = task.state_input.clone();
+            // What this state's retriers have already spent on the task, so the
+            // continuation takes that budget up rather than restarting it.
+            let retries_taken = task.retries_taken.clone();
             // The activity this task is queued under can be DELETED while the task is
             // outstanding, which leaves the task with no activity to be answered for:
             // the modelled `TaskDoesNotExist`, whose own documentation is "the
-            // activity does not exist".
-            if !store.activities.contains_key(&activity_arn) {
+            // activity does not exist". A CALLBACK task belongs to no activity, so
+            // nothing of the kind can have gone missing for one.
+            let missing_activity = activity_arn
+                .as_ref()
+                .filter(|activity_arn| !store.activities.contains_key(*activity_arn));
+            if let Some(activity_arn) = missing_activity {
                 return Err(SendTaskSuccessErrorModeled::TaskDoesNotExist(
                     TaskDoesNotExist {
                         message: Some(crate::state::resource_error_message(
                             crate::state::ACTIVITY_DOES_NOT_EXIST,
-                            &activity_arn,
+                            activity_arn,
                         )),
                     },
                 )
@@ -317,10 +342,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 machine.arn.clone(),
                 machine.name.clone(),
                 context,
-                crate::state::asl::ActivityReply {
-                    state_name,
-                    state_input,
-                    result,
+                // Which kind of task the token named decides which continuation the
+                // reply begins: an activity's task is answered at the state that
+                // SCHEDULED it, a callback task at the state whose integration call
+                // CARRIED the token — whose `Retry` may make that call again.
+                match activity_arn {
+                    Some(_) => Answered::Activity(crate::state::asl::ActivityReply {
+                        state_name,
+                        state_input,
+                        result,
+                    }),
+                    None => Answered::Callback(crate::state::asl::CallbackReply {
+                        state_name,
+                        state_input,
+                        outcome: Ok(result),
+                        retries_taken,
+                    }),
                 },
             )
         };
@@ -344,17 +381,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &region,
                 &context.role_arn,
             );
-            crate::state::integration::interpret(ctx, &region, role, move |tasks| {
-                crate::state::plan_reply(
+            crate::state::integration::interpret(ctx, &region, role, move |tasks| match &reply {
+                Answered::Activity(reply) => crate::state::plan_reply(
                     &definition,
                     &execution_input,
                     start_date,
                     now,
                     &context,
-                    &reply,
+                    reply,
                     previous_event_id,
                     tasks,
-                )
+                ),
+                Answered::Callback(reply) => crate::state::plan_callback_reply(
+                    &definition,
+                    &execution_input,
+                    start_date,
+                    now,
+                    &context,
+                    reply,
+                    previous_event_id,
+                    tasks,
+                ),
             })
             .await
         };
