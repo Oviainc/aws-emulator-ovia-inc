@@ -85,6 +85,8 @@ mod get_configuration;
 mod json_schema_validator_gate;
 #[path = "all/list_applications.rs"]
 mod list_applications;
+#[path = "all/list_applications_order.rs"]
+mod list_applications_order;
 #[path = "all/list_configuration_profiles.rs"]
 mod list_configuration_profiles;
 #[path = "all/list_deployment_strategies.rs"]

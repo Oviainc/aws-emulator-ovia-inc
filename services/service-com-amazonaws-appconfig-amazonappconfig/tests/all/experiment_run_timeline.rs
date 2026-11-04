@@ -188,7 +188,7 @@ async fn an_update_records_one_entry_for_each_state_it_moved() {
             vec!["EXPOSURE_UPDATED"],
         ),
         (
-            "an exposure a run that held none is given",
+            "an exposure a run started without one is given",
             json!({}),
             json!({ "ExposurePercentage": 12.5 }),
             vec!["EXPOSURE_UPDATED"],

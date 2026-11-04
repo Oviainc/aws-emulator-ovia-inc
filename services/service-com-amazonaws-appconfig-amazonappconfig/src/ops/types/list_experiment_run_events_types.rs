@@ -43,7 +43,8 @@ ac_schema_and_codec!(
     (M_NEXT_TOKEN, next_token, "NextToken", 1, opt, string),
 );
 
-/// `OccurredAt` targets `Iso8601DateTime` (`@timestampFormat("date-time")`), so this
+/// `OccurredAt` targets `Iso8601DateTime` (`@timestampFormat("date-time")`) and is
+/// documented as "The date and time the event occurred, in ISO 8601 format", so this
 /// shape's schema and serializer come from `ac_schema_and_codec!` rather than from
 /// `#[smithy_macros::smithy(shape = ...)]` — see `types/deployment_wire.rs`.
 ///

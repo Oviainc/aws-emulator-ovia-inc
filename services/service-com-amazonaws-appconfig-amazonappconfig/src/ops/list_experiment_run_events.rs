@@ -12,7 +12,8 @@
 //! recent events are displayed first"), so the head of the first page is the newest entry
 //! whatever page size a caller asks for. The log is append-only, so an entry's position in
 //! it is a stable total order; complementing that position is what turns it into the
-//! descending key [`crate::state::paginate`] keys its cursor on.
+//! descending key [`crate::state::paginate`] keys its cursor on
+//! ([`crate::state::descending_count_key`]).
 //!
 //! ## Shape of an operation
 //!
@@ -204,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let ordered: Vec<(String, ExperimentRunEvent)> = run
             .timeline_newest_first()
             .into_iter()
-            .map(|(place, event)| (timeline_key(place), event))
+            .map(|(place, event)| (crate::state::descending_count_key(place), event))
             .collect();
 
         // A `NextToken` this listing did not mint is a bad request rather than "start from
@@ -237,19 +238,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token: page.next_token,
         })
     }
-}
-
-/// The sort key of the entry at `place` on a run's timeline, built so that ASCENDING key
-/// order is MOST RECENT FIRST: [`crate::state::paginate`] walks its input in ascending key
-/// order, and an entry's place rises with the order it was appended in, so the key has to
-/// descend as the place rises.
-///
-/// The complement is taken against the largest place there can be, so none underflows it,
-/// and both are rendered at that value's fixed width, which makes the string comparison
-/// agree with the numeric one (`"10"` must not sort before `"9"`).
-fn timeline_key(place: u64) -> String {
-    const WIDTH: usize = u64::MAX.ilog10() as usize + 1;
-    format!("{:0WIDTH$}", u64::MAX - place)
 }
 
 /// The 404 this operation answers for a level of the path that addresses nothing.

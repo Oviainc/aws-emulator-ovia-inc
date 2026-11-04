@@ -1162,6 +1162,14 @@ pub struct Application {
     /// [`MAX_RETAINED_DEPLOYMENTS_WITHOUT_ENVIRONMENT`], and read back through
     /// [`Application::deployment_without_environment_mut`].
     pub deployments_without_environment: HashMap<(String, i32), Deployment>,
+    /// Where this application falls in the order the account created its applications: 1
+    /// for the first stored, counting up, and never reissued.
+    ///
+    /// Assigned by [`ComAmazonawsAppconfigAmazonappconfigState::try_insert_application`],
+    /// the one place an application is stored, so a record outside the store carries 0
+    /// until it is stored. A listing orders on it, which is why it is a COUNT rather than
+    /// an instant: two applications created inside one clock tick still have an order.
+    pub creation_order: u64,
 }
 
 impl Application {
@@ -1181,6 +1189,8 @@ impl Application {
             experiment_definitions: HashMap::new(),
             // Nothing has been deleted out from under a deployment yet.
             deployments_without_environment: HashMap::new(),
+            // Assigned when the record is stored; see the field.
+            creation_order: 0,
         }
     }
 
@@ -3639,6 +3649,9 @@ pub struct ComAmazonawsAppconfigAmazonappconfigState {
     /// [`Self::remove_application`] are how a handler reads, mutates, lists and forgets
     /// one.
     applications: HashMap<String, Application>,
+    /// How many applications this account has stored, counting the ones since deleted:
+    /// the counter behind [`Application::creation_order`]. Never answered to a caller.
+    applications_created: u64,
     /// This account's AppConfig settings, as `UpdateAccountSettings` last wrote them —
     /// [`AccountSettingsRecord::default`] (AppConfig's documented defaults) until it
     /// does. Account-scoped rather than per-application: the settings surface is
@@ -3717,6 +3730,13 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
         if self.applications.len() >= MAX_APPLICATIONS {
             return None;
         }
+        let mut application = application;
+        // The order this application was created in, which `ListApplications` reports the
+        // account's applications by. Counted on the store rather than taken from the map's
+        // size, so a create after a delete never reuses the place a deleted application
+        // held.
+        self.applications_created = self.applications_created.saturating_add(1);
+        application.creation_order = self.applications_created;
         match self.applications.entry(application.id.clone()) {
             std::collections::hash_map::Entry::Vacant(slot) => Some(slot.insert(application)),
             std::collections::hash_map::Entry::Occupied(_) => None,
@@ -4582,6 +4602,20 @@ pub const LISTING_EXPERIMENT_RUNS: &str = "ListExperimentRuns";
 /// The `kind` a `ListExperimentDefinitions` cursor is stamped with, so a token minted by
 /// another listing cannot resume this one. See [`paginate`].
 pub const LISTING_EXPERIMENT_DEFINITIONS: &str = "ListExperimentDefinitions";
+
+/// The sort key of a resource placed in the order its parent recorded it, built so that
+/// ASCENDING key order is DESCENDING place order — the newest-first order this service
+/// lists an append-only sequence in, and [`paginate`] walks its input in ascending key
+/// order.
+///
+/// The complement is taken against the largest place there can be, so none underflows it,
+/// and both are rendered at that value's fixed width, which makes the string comparison
+/// agree with the numeric one (`"10"` must not sort before `"9"`). Shared by every listing
+/// ordered that way, so one walk's cursor cannot disagree with another's.
+pub fn descending_count_key(place: u64) -> String {
+    const WIDTH: usize = u64::MAX.ilog10() as usize + 1;
+    format!("{:0WIDTH$}", u64::MAX - place)
+}
 
 /// The sort key of a resource numbered within its parent, built so that ASCENDING key
 /// order is DESCENDING number order: this service lists a parent's numbered children

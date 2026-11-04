@@ -228,8 +228,8 @@ fn assert_run_started_entry(case: &str, entry: &Value, started: &Value) {
     );
     // "The exposure percentage at the time of the event" and "The treatment overrides at
     // the time of the event" (`smithy_query(query="shape", shape="ExperimentRunEvent")`),
-    // which for the start of the run is what the start stored — and neither is invented
-    // for a start that carried none.
+    // which for the start of the run is what the start stored — the share of the audience
+    // the run began delivering to, and the assignments it began with where it carried any.
     for member in ["ExposurePercentage", "TreatmentOverrides"] {
         assert_eq!(
             entry.get(member),

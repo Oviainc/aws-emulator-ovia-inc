@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplications
+//! IMPLEMENTED: reports the applications this account holds, most recently created first,
+//! one page at a time. Reporting only — nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -151,14 +153,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An application is owned by the ACCOUNT, not by any other resource, so the
         // listing is every application this service holds — read out of the same map
         // `CreateApplication` wrote them into and `GetApplication` reads them back from.
+        //
+        // MOST RECENTLY CREATED FIRST, the order the recorded service pages an account's
+        // applications in, and the order this service serves every other sequence it lists
+        // (a definition's runs, a run's timeline, an environment's deployments, a profile's
+        // hosted versions): the head of the first page is the newest application whatever
+        // page size a caller asks for. The place an application was created in is assigned
+        // once and never reissued, so complementing it is a TOTAL order — which is what a
+        // pagination cursor needs to resume exactly once.
         let mut ordered: Vec<(String, CreateApplicationOutput)> = store
             .all_applications()
-            .map(|application| (application.id.clone(), reported(application)))
+            .map(|application| {
+                (
+                    crate::state::descending_count_key(application.creation_order),
+                    reported(application),
+                )
+            })
             .collect();
-        // An application id is unique across this service, so ordering by id is a TOTAL
-        // order — which is what a pagination cursor needs to resume exactly once, and the
-        // id is the one member of the record that is guaranteed to differ between two
-        // entries.
         ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         let page = match crate::state::paginate(

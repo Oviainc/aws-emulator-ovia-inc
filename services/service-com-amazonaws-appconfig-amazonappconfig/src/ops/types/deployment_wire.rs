@@ -67,7 +67,8 @@
 //!
 //! [`ac_schema_and_codec`] is not the `Deployment` shape's: every shape of this service
 //! with a `date-time` member needs it, so `types/experiment_definition_wire.rs` states the
-//! `ExperimentDefinition` shape's member list against the same macros.
+//! `ExperimentDefinition` shape's member list against the same macros, and
+//! `types/experiment_run_wire.rs` the `ExperimentRun` shape's.
 
 /// The `ShapeType` one member kind names. Mirrors the vendored codegen's
 /// `codegen::shape_type_ident`.

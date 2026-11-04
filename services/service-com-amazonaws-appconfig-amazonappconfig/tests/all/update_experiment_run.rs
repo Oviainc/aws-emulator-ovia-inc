@@ -223,7 +223,7 @@ async fn an_update_patches_only_the_members_the_request_carries() {
             overrides: Some(json!({ "Inline": { "entity-1": "T1", "entity-2": "C" } })),
         },
         Patch {
-            case: "an exposure on a run that holds none, at the lower range bound",
+            case: "an exposure at the lower range bound on a run started without one",
             start: json!({}),
             patch: json!({ "ExposurePercentage": 0.0 }),
             description: None,
