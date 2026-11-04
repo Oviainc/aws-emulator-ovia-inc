@@ -2369,6 +2369,23 @@ pub fn alias_update_not_found_message(alias_arn: &str) -> String {
     format!("Alias not found: {alias_arn}")
 }
 
+/// The message a delete of a published version that one or more aliases still reference
+/// is refused with: `ResourceConflictException`'s own subject — the version is still in
+/// use — naming every alias that has to be repointed or deleted first.
+///
+/// "You can't delete a version that an alias references"
+/// (`DeleteFunction$Qualifier`), so the sentence states which aliases do: the names are
+/// listed inside one bracketed group, comma-separated, in the order the function keeps
+/// its aliases ([`FunctionRecord::aliases_referencing`]), so the caller reads the whole
+/// set it has to deal with from one refusal rather than one name per retry.
+#[must_use]
+pub fn version_referenced_by_aliases_message(aliases: &[String]) -> String {
+    format!(
+        "Unable to delete version because the following aliases reference it: [{}]",
+        aliases.join(", ")
+    )
+}
+
 /// One alias of a function: "a function identifier that you can update to invoke a
 /// different version", as `CreateAlias` documents it.
 ///

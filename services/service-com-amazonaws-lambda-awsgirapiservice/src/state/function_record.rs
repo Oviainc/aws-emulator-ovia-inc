@@ -505,6 +505,28 @@ impl FunctionRecord {
             .map(|alias| alias.function_version.clone())
     }
 
+    /// The names of this function's aliases that reference the version label `version`,
+    /// in the order the store keeps them (by alias name).
+    ///
+    /// An alias references a version two ways, and both count: the version it invokes
+    /// ([`AliasRecord::function_version`]) and the second version its routing
+    /// configuration shifts part of its traffic to
+    /// ([`AliasRecord::additional_version_weights`], the model's
+    /// `AliasRoutingConfiguration$AdditionalVersionWeights`). Either reference makes an
+    /// invocation of the alias reach that version, so either one is a live reference to
+    /// it.
+    #[must_use]
+    pub fn aliases_referencing(&self, version: &str) -> Vec<String> {
+        self.aliases
+            .values()
+            .filter(|alias| {
+                alias.function_version == version
+                    || alias.additional_version_weights.contains_key(version)
+            })
+            .map(|alias| alias.name.clone())
+            .collect()
+    }
+
     /// The qualifier label a `PublishedFunctionQualifier` names on this function, or
     /// `None` when the function has no such qualifier.
     ///

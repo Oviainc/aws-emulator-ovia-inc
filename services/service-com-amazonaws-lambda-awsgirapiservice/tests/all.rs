@@ -233,5 +233,7 @@ mod tag_resource_arn_constraint;
 mod untrusted_name_parsing;
 #[path = "all/update_function_configuration.rs"]
 mod update_function_configuration;
+#[path = "all/version_delete_alias_reference.rs"]
+mod version_delete_alias_reference;
 #[path = "all/version_publishing.rs"]
 mod version_publishing;

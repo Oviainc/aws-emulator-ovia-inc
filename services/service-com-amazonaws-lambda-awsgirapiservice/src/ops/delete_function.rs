@@ -224,6 +224,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
+            // "You can't delete a version that an alias references" (`Qualifier`): an
+            // alias is the identifier clients invoke, so a version it still points at
+            // stays, and the delete is REFUSED before any state is removed rather than
+            // leaving the alias naming a version that is gone.
+            let referencing = record.aliases_referencing(&version);
+            if !referencing.is_empty() {
+                return Err(DeleteFunctionErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        r#type: None,
+                        message: Some(crate::state::version_referenced_by_aliases_message(
+                            &referencing,
+                        )),
+                    },
+                )
+                .into());
+            }
             record.versions.remove(&number);
         } else {
             // "Otherwise, all versions and aliases are deleted" — the whole record goes.
