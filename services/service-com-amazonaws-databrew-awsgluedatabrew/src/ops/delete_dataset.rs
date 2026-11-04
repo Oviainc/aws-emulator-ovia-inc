@@ -161,22 +161,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exists, so deleting that dataset would leave the project addressing nothing:
         // the delete is refused with the modelled `ConflictException` (model: "Updating
         // or deleting a resource can cause an inconsistent state") until every project
-        // that pins it is gone — which is why the message names them all. A JOB that
+        // that pins it is gone. DataBrew's sentence for this refusal names ONE project
+        // (and the remediation step), so the refusal reports the first pinning project
+        // in name order — the store is keyed by name — and a dataset several projects
+        // act upon is refused again, naming the next, until none is left. A JOB that
         // names the dataset does not pin it: a job reads the dataset when it RUNS, so
         // the reference is resolved per run.
-        let pinning: Vec<&str> = store
+        let pinning = store
             .projects
             .values()
-            .filter(|project| project.dataset_name == input.name)
-            .map(|project| project.name.as_str())
-            .collect();
-        if !pinning.is_empty() {
+            .find(|project| project.dataset_name == input.name)
+            .map(|project| project.name.clone());
+        if let Some(project_name) = pinning {
             return Err(DeleteDatasetErrorModeled::ConflictException(ConflictException {
-                message: Some(crate::state::in_use_message(
-                    "Dataset",
+                message: Some(crate::state::dataset_in_use_by_project_message(
                     &input.name,
-                    "projects",
-                    &pinning,
+                    &project_name,
                 )),
             })
             .into());

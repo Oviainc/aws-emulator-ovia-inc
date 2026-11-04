@@ -646,7 +646,8 @@ async fn a_dataset_a_project_acts_upon_cannot_be_deleted() {
     assert_eq!(
         error_message(&refused),
         format!(
-            "Dataset {pinned} is currently in use by the following projects: pinning-project."
+            "The dataset {pinned} is used in project pinning-project. To delete this \
+             dataset, first delete the associated project."
         ),
         "case \"a dataset a project acts upon\": unexpected message, got {:?}",
         refused.body
@@ -661,7 +662,8 @@ async fn a_dataset_a_project_acts_upon_cannot_be_deleted() {
     );
 
     // Several projects can act upon one dataset, and every one of them has to go before
-    // the dataset can: the refusal names them all, in name order.
+    // the dataset can: the refusal names one of them — the first in name order — and is
+    // answered again for the next until none is left.
     let (_, second_recipe) = seed_dataset_and_recipe(&emulator, "second-pinning").await;
     assert_eq!(
         create_project(
@@ -689,10 +691,11 @@ async fn a_dataset_a_project_acts_upon_cannot_be_deleted() {
     assert_eq!(
         error_message(&refused_again),
         format!(
-            "Dataset {pinned} is currently in use by the following projects: \
-             another-pinning-project, pinning-project."
+            "The dataset {pinned} is used in project another-pinning-project. To delete \
+             this dataset, first delete the associated project."
         ),
-        "case \"two projects acting upon one dataset\": the refusal must name both, got {:?}",
+        "case \"two projects acting upon one dataset\": the refusal must name a pinning \
+         project, got {:?}",
         refused_again.body
     );
 

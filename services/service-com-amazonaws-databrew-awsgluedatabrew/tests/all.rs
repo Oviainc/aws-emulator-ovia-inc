@@ -15,6 +15,8 @@
 mod databrew_core_loop;
 #[path = "all/databrew_harness.rs"]
 mod databrew_harness;
+#[path = "all/dataset_in_use_refusal.rs"]
+mod dataset_in_use_refusal;
 #[path = "all/dataset_update_lifecycle.rs"]
 mod dataset_update_lifecycle;
 #[path = "all/project_lifecycle.rs"]

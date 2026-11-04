@@ -65,23 +65,45 @@ pub fn already_exists_message(kind: &str, name: &str) -> String {
     format!("{kind} {name} already exists.")
 }
 
-/// The message DataBrew answers a `ConflictException` with when a delete is refused
-/// because other resources still depend on the one addressed: the kind and name of the
-/// resource the request addressed, and EVERY resource that still references it, so a
-/// client can tell exactly what to remove first.
+/// The message DataBrew answers a `ConflictException` with when a write is refused
+/// because another resource already holds the one the request names: the kind and name
+/// of the resource the request addressed, and every resource that references it, so a
+/// client can tell exactly what to release first.
 ///
 /// The sentence the model documents on the error SHAPE ("Updating or deleting a
 /// resource can cause an inconsistent state.") describes the error class; the message
-/// a particular refusal answers with names the dependencies that would be left
-/// dangling — all of them, since removing only the one named would run into the same
-/// refusal again. `kind` is the addressed resource's kind as DataBrew opens a sentence
-/// with it, capitalised (`Dataset`, `Project`, `Job`, `Recipe`); `by_kind_plural` is the
+/// a particular refusal answers with names the references that would be left dangling.
+/// `kind` is the addressed resource's kind as DataBrew opens a sentence with it,
+/// capitalised (`Dataset`, `Project`, `Job`, `Recipe`); `by_kind_plural` is the
 /// referencing resources' kind in prose mid-sentence, so lower case and plural
 /// (`projects`, `jobs`, `recipes`).
+///
+/// A refusal DataBrew words with its own per-resource sentence does NOT come from here:
+/// see [`dataset_in_use_by_project_message`].
 pub fn in_use_message(kind: &str, name: &str, by_kind_plural: &str, by_names: &[&str]) -> String {
     format!(
         "{kind} {name} is currently in use by the following {by_kind_plural}: {}.",
         by_names.join(", ")
+    )
+}
+
+/// The message `DeleteDataset` answers its `ConflictException` with when a project was
+/// created against the dataset the request addresses: DataBrew's own per-resource
+/// sentence, which names the dataset, the ONE project that acts upon it, and the step
+/// that clears the refusal.
+///
+/// The sentence the model documents on the error SHAPE ("Updating or deleting a
+/// resource can cause an inconsistent state.") describes the error class, and the
+/// message is the only detail this error carries about which resource pinned which —
+/// there is no per-resource member on the error shape — so a client that tells this 409
+/// from any other 409 reads the message. The project is named in the SINGULAR because
+/// DataBrew's sentence is: a dataset several projects act upon reports the first of
+/// them in name order, and the delete runs into the same refusal for the next one until
+/// every project naming the dataset is gone.
+pub fn dataset_in_use_by_project_message(dataset_name: &str, project_name: &str) -> String {
+    format!(
+        "The dataset {dataset_name} is used in project {project_name}. To delete this \
+         dataset, first delete the associated project."
     )
 }
 
