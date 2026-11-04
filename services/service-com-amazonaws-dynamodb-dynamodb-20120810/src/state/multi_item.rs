@@ -62,6 +62,45 @@ pub fn exactly_one_operation(member: &str, choices: &str) -> RequestError {
 pub const DUPLICATE_TRANSACT_ITEM_MESSAGE: &str =
     "Transaction request cannot include multiple operations on one item";
 
+impl Substitutions<'_> {
+    /// Hold ONE ELEMENT's expressions and its substitution tables to each other — every
+    /// token its expressions dereference defined, every entry it defines referenced — and
+    /// state what is wrong with them as a refusal about an element is stated.
+    ///
+    /// The CHECK is the request-level one ([`Substitutions::check_all_referenced`]), because
+    /// the rule is the same wherever the members sit and stating it twice would let the two
+    /// drift. What differs is the ENVELOPE: `<N> validation error(s) detected: ` reports
+    /// violations of the REQUEST's own members, which is what the request validator is handed,
+    /// and the expression members of one `TransactItems` action or one `RequestItems` entry
+    /// are members of that element — so the sentence an element earns is stated on its own,
+    /// like every other refusal this service raises about an element
+    /// ([`DUPLICATE_TRANSACT_ITEM_MESSAGE`], [`too_many_batch_items`]).
+    pub fn check_all_referenced_in_element(
+        &self,
+        expressions: &[(&str, Option<&str>)],
+    ) -> Result<(), RequestError> {
+        self.check_all_referenced(expressions)
+            .map_err(stated_outside_the_envelope)
+    }
+}
+
+/// One refusal, stated outside the `<N> validation error(s) detected: ` envelope.
+///
+/// The envelope over an EMPTY clause is exactly the text it puts in front of a clause, so
+/// the prefix comes from the one function that writes it ([`validation_message`]) rather than
+/// being spelled a second time here. A refusal that carries no envelope is already stated on
+/// its own and is left exactly as it came.
+fn stated_outside_the_envelope(error: RequestError) -> RequestError {
+    match error {
+        RequestError::Validation(message) => {
+            let envelope = validation_message([String::new()]).unwrap_or_default();
+            let clause = message.strip_prefix(&envelope).map(str::to_string);
+            RequestError::Validation(clause.unwrap_or(message))
+        }
+        other => other,
+    }
+}
+
 /// How a transaction that no item of could be applied is reported: the
 /// `TransactionCanceledException` message, which lists the per-action reason codes the
 /// `CancellationReasons` member carries in the same order ("Cancellation reason codes

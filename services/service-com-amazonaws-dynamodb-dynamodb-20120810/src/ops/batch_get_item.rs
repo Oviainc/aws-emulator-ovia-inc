@@ -255,9 +255,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(lift(crate::state::too_many_batch_items("BatchGetItem")));
         }
         for keys in input.request_items.values() {
-            // Every token one table's entry DEFINES must be one its projection uses.
+            // Every token one table's entry DEFINES must be one its projection uses, and
+            // the refusal is that ENTRY's, so it is stated on its own.
             crate::state::Substitutions::new(keys.expression_attribute_names.as_ref(), None)
-                .check_all_referenced(&[(
+                .check_all_referenced_in_element(&[(
                     "ProjectionExpression",
                     keys.projection_expression.as_deref(),
                 )])

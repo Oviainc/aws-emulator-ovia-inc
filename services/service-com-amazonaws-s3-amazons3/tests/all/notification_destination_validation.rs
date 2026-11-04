@@ -30,8 +30,9 @@
 //! Lambda function), WHY S3 cannot publish to it (its service does not hold it, it cannot
 //! take the publication, its policy grants S3 nothing), WHICH grant its resource policy
 //! carries (none, one for this bucket, one for every source, one for another bucket,
-//! another principal, another action), HOW MANY destinations one container names (one, two
-//! of one kind, two kinds) and which of them is refused, and whether validation is skipped.
+//! another principal, another action, another source account), HOW MANY destinations one
+//! container names (one, two of one kind, two kinds) and which of them is refused, and
+//! whether validation is skipped.
 //!
 //! Every assertion drives real HTTP requests through a router carrying S3 beside the
 //! services that own the destinations, so what is pinned is the wire behaviour a client
@@ -121,11 +122,21 @@ enum Grant {
     OtherPrincipal,
     /// Another action to `s3.amazonaws.com`.
     OtherAction,
+    /// The action S3 needs, to `s3.amazonaws.com`, narrowed to THIS bucket's ARN and to
+    /// ANOTHER account as the owner of the publishing bucket. Every part of the grant fits
+    /// except the account the notification really comes from, so it grants this bucket
+    /// nothing.
+    OtherAccount,
 }
 
 /// The bucket a [`Grant::OtherBucket`] statement names, which is never the bucket the row
 /// configures.
 const ANOTHER_BUCKET: &str = "some-other-bucket";
+
+/// The account a [`Grant::OtherAccount`] statement names as the source account: AWS's own
+/// documented example account id, which is never the account this emulator serves (every
+/// emulator ARN carries `engine::emulator_account_id`).
+const ANOTHER_ACCOUNT: &str = "111122223333";
 
 /// One destination a row's container names: its kind, the resource's name, how that
 /// resource exists in the owning service before the put is made, the grant its resource
@@ -332,6 +343,30 @@ fn rows() -> Vec<Row> {
                 existing: Existing::Yes,
                 grant: Grant::OtherAction,
                 rejected: Some(FUNCTION_UNPERMITTED),
+            }],
+            skip_validation: false,
+            expected_status: INVALID_ARGUMENT_STATUS,
+        },
+        Row {
+            case: "one function whose invoke grant names another source account",
+            destinations: &[Named {
+                kind: Kind::Function,
+                name: "other-account-function",
+                existing: Existing::Yes,
+                grant: Grant::OtherAccount,
+                rejected: Some(FUNCTION_UNPERMITTED),
+            }],
+            skip_validation: false,
+            expected_status: INVALID_ARGUMENT_STATUS,
+        },
+        Row {
+            case: "one queue whose policy names another source account",
+            destinations: &[Named {
+                kind: Kind::Queue,
+                name: "other-account-queue",
+                existing: Existing::Yes,
+                grant: Grant::OtherAccount,
+                rejected: Some(QUEUE_UNPERMITTED),
             }],
             skip_validation: false,
             expected_status: INVALID_ARGUMENT_STATUS,
@@ -604,6 +639,17 @@ fn queue_policy(grant: Grant, queue_arn: &str, bucket: &str) -> Option<String> {
             "Principal": {"Service": "s3.amazonaws.com"},
             "Action": "sqs:ReceiveMessage",
         }),
+        // `aws:SourceAccount` is the condition key AWS documents beside `aws:SourceArn` for
+        // the account that owns the publishing bucket, so a grant naming another account
+        // applies to no notification of this bucket.
+        Grant::OtherAccount => json!({
+            "Sid": "s3-publish-other-account",
+            "Effect": "Allow",
+            "Principal": {"Service": "s3.amazonaws.com"},
+            "Action": "sqs:SendMessage",
+            "Condition": {"ArnLike": {"aws:SourceArn": bucket_arn(bucket)},
+                          "StringEquals": {"aws:SourceAccount": ANOTHER_ACCOUNT}},
+        }),
     };
     statement["Resource"] = json!(queue_arn);
     Some(json!({ "Version": "2012-10-17", "Statement": [statement] }).to_string())
@@ -678,6 +724,17 @@ async fn add_permission(emulator: &Emulator, name: &str, bucket: &str, grant: Gr
             "Action": "lambda:GetFunction",
             "Principal": "s3.amazonaws.com",
             "SourceArn": bucket_arn(bucket),
+        }),
+        // `SourceAccount` is "for Amazon Web Services service principals, the ID of the
+        // Amazon Web Services account that owns the resource" (`AddPermission$SourceAccount`):
+        // the account that owns the publishing bucket. A grant naming another one fits every
+        // part of this notification except where it comes from.
+        Grant::OtherAccount => json!({
+            "StatementId": "s3-invoke-other-account",
+            "Action": "lambda:InvokeFunction",
+            "Principal": "s3.amazonaws.com",
+            "SourceArn": bucket_arn(bucket),
+            "SourceAccount": ANOTHER_ACCOUNT,
         }),
     };
     statement["FunctionName"] = json!(name);

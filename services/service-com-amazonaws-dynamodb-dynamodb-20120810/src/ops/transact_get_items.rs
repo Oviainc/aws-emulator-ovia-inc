@@ -207,9 +207,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
 
         for item in &input.transact_items {
-            // Every token this element DEFINES must be one its projection uses.
+            // Every token this element DEFINES must be one its projection uses, and the
+            // refusal is the ELEMENT's, so it is stated on its own.
             crate::state::Substitutions::new(item.get.expression_attribute_names.as_ref(), None)
-                .check_all_referenced(&[(
+                .check_all_referenced_in_element(&[(
                     "ProjectionExpression",
                     item.get.projection_expression.as_deref(),
                 )])

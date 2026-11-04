@@ -17,9 +17,10 @@
 //! the token stood in (`ConditionExpression` and `UpdateExpression`), the token kind
 //! (`#name` and `:value`), the position of the faulty element among its siblings, whether
 //! a surplus entry is present beside the undefined token, and which substitution table the
-//! surplus entry belongs to. The envelope follows the member, as everywhere else in this
-//! service: the two members a WRITE states its intent through carry the
-//! `<N> validation error(s) detected: ` envelope.
+//! surplus entry belongs to. Both diagnoses are stated ON THEIR OWN here, whichever member
+//! the element carried: the `<N> validation error(s) detected: ` envelope reports violations
+//! of the REQUEST's own members, and these are members of one element of it
+//! (`element_expression_envelopes` is the suite that spans that rule).
 
 use serde_json::{json, Value};
 
@@ -28,7 +29,8 @@ use crate::table_items::create_active_table;
 // The sentences both diagnoses carry are stated ONCE for this crate, by the suite that
 // drives the same rule through the single-item and read operations.
 use crate::undefined_expression_tokens::{
-    expression_refusal, undefined_name_clause, undefined_value_clause, unused_entries,
+    expression_refusal_in_element, undefined_name_clause, undefined_value_clause,
+    unused_entries_in_element,
 };
 
 /// The table every row below drives.
@@ -182,7 +184,7 @@ async fn a_token_no_entry_defines_is_diagnosed_before_a_surplus_entry() {
     ];
 
     for (case, transact_items, member, clause) in rows {
-        let expected = expression_refusal(member, &clause);
+        let expected = expression_refusal_in_element(member, &clause);
         let (status, body) = call(
             &router,
             "TransactWriteItems",
@@ -212,9 +214,10 @@ async fn a_token_no_entry_defines_is_diagnosed_before_a_surplus_entry() {
 async fn a_surplus_entry_is_diagnosed_once_every_referenced_token_is_defined() {
     let router = seeded().await;
 
-    // (case, TransactItems, the expression member the keys were offered to, the table
-    // the surplus entry belongs to, its keys)
-    let rows: Vec<(&str, Value, &str, &str, Vec<&str>)> = vec![
+    // (case, TransactItems, the table the surplus entry belongs to, its keys). The
+    // sentence an element earns names the substitution table and not the expression member
+    // the keys were offered to, so the member is not a column here.
+    let rows: Vec<(&str, Value, &str, Vec<&str>)> = vec![
         (
             "a surplus name entry beside a put whose condition names no token",
             json!([{"Put": {
@@ -222,7 +225,6 @@ async fn a_surplus_entry_is_diagnosed_once_every_referenced_token_is_defined() {
                 "Item": {"pk": {"S": "item-3"}, "status": {"S": "paused"}},
                 "ConditionExpression": "attribute_not_exists(pk)",
                 "ExpressionAttributeNames": {"#other": "status"}}}]),
-            "ConditionExpression",
             "ExpressionAttributeNames",
             vec!["#other"],
         ),
@@ -235,7 +237,6 @@ async fn a_surplus_entry_is_diagnosed_once_every_referenced_token_is_defined() {
                 "ExpressionAttributeNames": {"#s": "status"},
                 "ExpressionAttributeValues": {":v": {"S": "paused"},
                                               ":other": {"S": "active"}}}}]),
-            "UpdateExpression",
             "ExpressionAttributeValues",
             vec![":other"],
         ),
@@ -248,7 +249,6 @@ async fn a_surplus_entry_is_diagnosed_once_every_referenced_token_is_defined() {
                 "ExpressionAttributeNames": {"#s": "status", "#b": "status",
                                              "#a": "status"},
                 "ExpressionAttributeValues": {":v": {"S": "active"}}}}]),
-            "ConditionExpression",
             "ExpressionAttributeNames",
             vec!["#a", "#b"],
         ),
@@ -262,14 +262,13 @@ async fn a_surplus_entry_is_diagnosed_once_every_referenced_token_is_defined() {
                     "ConditionExpression": "#s = :v",
                     "ExpressionAttributeNames": {"#s": "status", "#other": "status"},
                     "ExpressionAttributeValues": {":v": {"S": "active"}}}}]),
-            "ConditionExpression",
             "ExpressionAttributeNames",
             vec!["#other"],
         ),
     ];
 
-    for (case, transact_items, expression_member, member, keys) in rows {
-        let expected = unused_entries(expression_member, member, &keys);
+    for (case, transact_items, member, keys) in rows {
+        let expected = unused_entries_in_element(member, &keys);
         let (status, body) = call(
             &router,
             "TransactWriteItems",

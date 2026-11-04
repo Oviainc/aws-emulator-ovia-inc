@@ -371,9 +371,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             // Every token this element DEFINES must be one of its own expressions
             // uses: an unused entry of either substitution table makes the whole
-            // request invalid.
+            // request invalid. It is the ELEMENT's tables that are checked, so the
+            // refusal is stated on its own
+            // ([`crate::state::Substitutions::check_all_referenced_in_element`]).
             substitutions
-                .check_all_referenced(&[
+                .check_all_referenced_in_element(&[
                     ("ConditionExpression", action.condition_expression()),
                     ("UpdateExpression", action.update_expression()),
                 ])

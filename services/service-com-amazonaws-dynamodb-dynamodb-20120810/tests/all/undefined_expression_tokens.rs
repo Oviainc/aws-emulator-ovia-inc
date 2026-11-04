@@ -57,25 +57,43 @@ pub(crate) fn envelopes(expression_member: &str) -> bool {
 /// The whole sentence for a clause the expression language raises, stated behind the
 /// member that carried it, in or out of the envelope that member earns.
 pub(crate) fn expression_refusal(member: &str, clause: &str) -> String {
-    let stated = format!("Invalid {member}: {clause}");
+    let stated = expression_refusal_in_element(member, clause);
     if envelopes(member) {
         return format!("1 validation error detected: {stated}");
     }
     stated
 }
 
+/// The same sentence as an ELEMENT of a multi-item request earns it: the clause behind the
+/// member that carried it, on its own.
+///
+/// The `<N> validation error(s) detected: ` envelope states violations of the REQUEST's own
+/// members, and the expression members of one `TransactItems` action or one `RequestItems`
+/// entry are members of that element — so an element's refusal carries no envelope whichever
+/// member it names.
+pub(crate) fn expression_refusal_in_element(member: &str, clause: &str) -> String {
+    format!("Invalid {member}: {clause}")
+}
+
 /// The sentence AWS states for entries of `table` that no expression referenced, as the
 /// request that offered them to `expression_member` earns it: the service's own rule, so
 /// the sentence stands on its own except where that member's refusals carry the envelope.
 pub(crate) fn unused_entries(expression_member: &str, table: &str, keys: &[&str]) -> String {
-    let stated = format!(
-        "Value provided in {table} unused in expressions: keys: {{{}}}",
-        keys.join(", ")
-    );
+    let stated = unused_entries_in_element(table, keys);
     if envelopes(expression_member) {
         return format!("1 validation error detected: {stated}");
     }
     stated
+}
+
+/// The same sentence as an ELEMENT of a multi-item request earns it: stated on its own, for
+/// the reason [`expression_refusal_in_element`] gives, so it names no expression member at
+/// all.
+pub(crate) fn unused_entries_in_element(table: &str, keys: &[&str]) -> String {
+    format!(
+        "Value provided in {table} unused in expressions: keys: {{{}}}",
+        keys.join(", ")
+    )
 }
 
 /// Seed the table and the item every condition below is evaluated against.
