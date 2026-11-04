@@ -633,33 +633,31 @@ fn cloud_hsm_backing<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
 
     // The cluster a key store names is one the CLOUDHSM service holds, so the three
     // refusals about it are decided there, once, for every operation that takes a
-    // `CloudHsmClusterId`. Each carries the error code alone, as the recorded refusal
-    // of a cluster this account does not hold does.
+    // `CloudHsmClusterId`, and each is worded here on THIS operation's error channel
+    // with the message its own class carries: the fixed sentence for the cluster that
+    // is not serving yet, and the error code alone for the other two.
     match crate::state::cloud_hsm::usable_cluster(engine, &cloud_hsm_cluster_id) {
         Ok(()) => {}
-        Err(crate::state::cloud_hsm::ClusterRefusal::NotFound) => {
-            return Err(
-                CreateCustomKeyStoreErrorModeled::CloudHsmClusterNotFoundException(
-                    CloudHsmClusterNotFoundException { message: None },
-                )
-                .into(),
-            );
-        }
-        Err(crate::state::cloud_hsm::ClusterRefusal::NotActive) => {
-            return Err(
-                CreateCustomKeyStoreErrorModeled::CloudHsmClusterNotActiveException(
-                    CloudHsmClusterNotActiveException { message: None },
-                )
-                .into(),
-            );
-        }
-        Err(crate::state::cloud_hsm::ClusterRefusal::InvalidConfiguration) => {
-            return Err(
-                CreateCustomKeyStoreErrorModeled::CloudHsmClusterInvalidConfigurationException(
-                    CloudHsmClusterInvalidConfigurationException { message: None },
-                )
-                .into(),
-            );
+        Err(refusal) => {
+            let message = refusal.message().map(ToString::to_string);
+            return Err(match refusal {
+                crate::state::cloud_hsm::ClusterRefusal::NotFound => {
+                    CreateCustomKeyStoreErrorModeled::CloudHsmClusterNotFoundException(
+                        CloudHsmClusterNotFoundException { message },
+                    )
+                }
+                crate::state::cloud_hsm::ClusterRefusal::NotActive => {
+                    CreateCustomKeyStoreErrorModeled::CloudHsmClusterNotActiveException(
+                        CloudHsmClusterNotActiveException { message },
+                    )
+                }
+                crate::state::cloud_hsm::ClusterRefusal::InvalidConfiguration => {
+                    CreateCustomKeyStoreErrorModeled::CloudHsmClusterInvalidConfigurationException(
+                        CloudHsmClusterInvalidConfigurationException { message },
+                    )
+                }
+            }
+            .into());
         }
     }
 

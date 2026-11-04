@@ -62,6 +62,26 @@ const MAX_NAME_LEN: usize = 256;
 /// model_path="services/service-com-amazonaws-cloudhsmv2-baldrapiservice/smithy-model/com-amazonaws-cloudhsmv2-baldrapiservice.json")`.
 const CLUSTER_STATE_ACTIVE: &str = "ACTIVE";
 
+/// Every `ClusterState` other than [`CLUSTER_STATE_ACTIVE`] that a cluster of the
+/// account can be in while still being a cluster an operation acts on, from the same
+/// enum as [`CLUSTER_STATE_ACTIVE`]. `DELETE_IN_PROGRESS` and `DELETED` are left out:
+/// a cluster being deleted or deleted is gone, so its id names no cluster at all.
+const INACTIVE_CLUSTER_STATES: [&str; 8] = [
+    "CREATE_IN_PROGRESS",
+    "UNINITIALIZED",
+    "INITIALIZE_IN_PROGRESS",
+    "INITIALIZED",
+    "UPDATE_IN_PROGRESS",
+    "MODIFY_IN_PROGRESS",
+    "ROLLBACK_IN_PROGRESS",
+    "DEGRADED",
+];
+
+/// The whole `message` KMS answers with `CloudHsmClusterNotActiveException`: fixed
+/// text for the class, into which no cluster id, key store name or limit is
+/// interpolated, so it is the same string for every cluster that is not serving.
+const CLUSTER_NOT_ACTIVE_MESSAGE: &str = "Cluster is not active.";
+
 /// A trust anchor certificate, as a caller sends the content of its `customerCA.crt`
 /// file. `TrustAnchorCertificateType` is modelled `@length(1..5000)` with no pattern.
 const TRUST_ANCHOR: &str = "-----BEGIN CERTIFICATE-----\nY3JlYXRl\n-----END CERTIFICATE-----";
@@ -132,10 +152,14 @@ async fn cloud_hsm_cluster(router: &MultiServiceRouter, case: &str, subnets: usi
         .to_string()
 }
 
-/// Take the cluster `cluster_id` to [`CLUSTER_STATE_ACTIVE`] in the CloudHSM store —
-/// what `InitializeCluster`, still a scaffold stub with its own issue, would do — so
-/// the cluster is one that can back a CloudHSM key store.
-fn activate(engine: &Arc<engine::InMemoryEngine>, case: &str, cluster_id: &str) {
+/// Put the cluster `cluster_id` into `cluster_state` in the CloudHSM store, settled,
+/// so the cluster is one a key store request is judged against in that state.
+fn put_cluster_state(
+    engine: &Arc<engine::InMemoryEngine>,
+    case: &str,
+    cluster_id: &str,
+    cluster_state: &str,
+) {
     let state = service_com_amazonaws_cloudhsmv2_baldrapiservice::state::service_state(&**engine)
         .expect("the CloudHSM state store is reachable");
     let mut state = state.lock();
@@ -143,9 +167,16 @@ fn activate(engine: &Arc<engine::InMemoryEngine>, case: &str, cluster_id: &str) 
         .clusters
         .get_mut(cluster_id)
         .unwrap_or_else(|| panic!("case {case}: the CloudHSM store holds {cluster_id}"));
-    cluster.state = CLUSTER_STATE_ACTIVE.to_string();
+    cluster.state = cluster_state.to_string();
     cluster.state_message = None;
     cluster.pending = None;
+}
+
+/// Take the cluster `cluster_id` to [`CLUSTER_STATE_ACTIVE`] in the CloudHSM store —
+/// what `InitializeCluster`, still a scaffold stub with its own issue, would do — so
+/// the cluster is one that can back a CloudHSM key store.
+fn activate(engine: &Arc<engine::InMemoryEngine>, case: &str, cluster_id: &str) {
+    put_cluster_state(engine, case, cluster_id, CLUSTER_STATE_ACTIVE);
 }
 
 /// A CloudHSM cluster of the account that is active and spans two Availability
@@ -816,9 +847,20 @@ async fn create_custom_key_store_refuses_a_request_that_cannot_produce_a_key_sto
             before,
             "case {case}: a refused create must persist nothing"
         );
-        // A refusal about the CloudHSM cluster carries the error code alone, as the
-        // recorded refusal of a cluster this account does not hold does.
-        if expected.starts_with("CloudHsmCluster") && expected != "CloudHsmClusterInUseException" {
+        // Each refusal about the CloudHSM cluster carries the message its OWN class
+        // carries: the not-active class is worded with its fixed sentence, and the
+        // cluster-not-found and invalid-configuration classes carry the error code
+        // alone, as the recorded refusal of a cluster this account does not hold does.
+        if expected == "CloudHsmClusterNotActiveException" {
+            assert_eq!(
+                error_message(&payload),
+                CLUSTER_NOT_ACTIVE_MESSAGE,
+                "case {case}: expected the not-active refusal worded \
+                 {CLUSTER_NOT_ACTIVE_MESSAGE:?}, got {payload}"
+            );
+        } else if expected.starts_with("CloudHsmCluster")
+            && expected != "CloudHsmClusterInUseException"
+        {
             assert!(
                 error_message(&payload).is_empty(),
                 "case {case}: the refusal carries no message text, got {payload}"
@@ -847,4 +889,114 @@ async fn create_custom_key_store_refuses_a_request_that_cannot_produce_a_key_sto
             }
         }
     }
+}
+
+/// The refusal of a cluster that exists but is not serving is worded with the fixed
+/// sentence of its class, whatever left the cluster out of service, while the sibling
+/// refusals of the family send the error code alone — so a client can tell the
+/// not-active refusal from the message-less ones.
+///
+/// The table's rows differ in the `ClusterState` the cluster is in, in how many
+/// Availability Zones its private subnets span (the next requirement an active cluster
+/// is judged by, which this refusal comes before), in the friendly name the request
+/// asks for — the shortest and the longest the model admits — and in the Region whose
+/// endpoint is called.
+#[tokio::test]
+async fn create_custom_key_store_words_the_not_active_refusal_for_every_inactive_cluster() {
+    let (router, engine) = emulator();
+    let before = held(&engine);
+
+    for (index, cluster_state) in INACTIVE_CLUSTER_STATES.iter().enumerate() {
+        let subnets = if index % 2 == 0 { 2 } else { 1 };
+        let name = "n".repeat(if index % 2 == 0 { MIN_NAME_LEN } else { MAX_NAME_LEN });
+        let region = if index % 3 == 0 { OTHER_REGION } else { REGION };
+        let case = format!("a cluster in {cluster_state} over {subnets} subnet(s) in {region}");
+        let cluster_id = cloud_hsm_cluster(&router, &case, subnets).await;
+        put_cluster_state(&engine, &case, &cluster_id, cluster_state);
+
+        let (status, payload) = call(
+            &router,
+            region,
+            "CreateCustomKeyStore",
+            &cloud_hsm_request(&name, &cluster_id),
+        )
+        .await;
+        assert_eq!(
+            (
+                status,
+                error_code(&payload).as_str(),
+                error_message(&payload).as_str()
+            ),
+            (
+                400,
+                "CloudHsmClusterNotActiveException",
+                CLUSTER_NOT_ACTIVE_MESSAGE
+            ),
+            "case {case}: expected HTTP 400 CloudHsmClusterNotActiveException worded \
+             {CLUSTER_NOT_ACTIVE_MESSAGE:?}, got {status} with {payload}"
+        );
+        assert_eq!(
+            held(&engine),
+            before,
+            "case {case}: a refused create must persist nothing"
+        );
+
+        // The rejected create left no key store behind, and the reader's own refusal
+        // for the name it asked for carries NO message: the wording above is what
+        // distinguishes the not-active class from the message-less ones.
+        let (status, payload) = call(
+            &router,
+            region,
+            "DescribeCustomKeyStores",
+            &json!({"CustomKeyStoreName": name}),
+        )
+        .await;
+        assert_eq!(
+            (
+                status,
+                error_code(&payload).as_str(),
+                error_message(&payload).as_str()
+            ),
+            (400, "CustomKeyStoreNotFoundException", ""),
+            "case {case}: expected an unworded HTTP 400 CustomKeyStoreNotFoundException, got \
+             {status} with {payload}"
+        );
+
+        // The sibling refusal of the SAME operation: a cluster id of the modelled shape
+        // that no cluster of the account has is refused with a different code and no
+        // message at all.
+        // Of the modelled shape — `^cluster-[2-7a-zA-Z]{11,16}$`
+        // (`smithy_query(query="shape",shape="CloudHsmClusterIdType")`) — and held by no
+        // cluster, one id per row.
+        let absent = format!("cluster-absentcluster{}", (b'a' + index as u8) as char);
+        let (status, payload) = call(
+            &router,
+            region,
+            "CreateCustomKeyStore",
+            &cloud_hsm_request(&name, &absent),
+        )
+        .await;
+        assert_eq!(
+            (
+                status,
+                error_code(&payload).as_str(),
+                error_message(&payload).as_str()
+            ),
+            (400, "CloudHsmClusterNotFoundException", ""),
+            "case {case}: expected an unworded HTTP 400 CloudHsmClusterNotFoundException for \
+             {absent}, got {status} with {payload}"
+        );
+    }
+
+    // The same cluster, once it is serving over subnets in two Availability Zones, is
+    // not refused at all: the wording belongs to the refusal, not to every create.
+    let case = "an activated cluster";
+    let cluster_id = active_cluster(&router, &engine, case).await;
+    let id = created(&router, case, &cloud_hsm_request("hsm-now-active", &cluster_id)).await;
+    let entry = entry(&router, case, &id).await;
+    assert_eq!(
+        entry["CloudHsmClusterId"].as_str().unwrap_or_default(),
+        cluster_id,
+        "case {case}: expected the created key store to report {cluster_id}, got {entry}"
+    );
 }

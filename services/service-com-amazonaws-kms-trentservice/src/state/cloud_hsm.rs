@@ -22,6 +22,11 @@
 //! customer creates when initializing the cluster — is not a fact the CloudHSM store
 //! records, so there is nothing here to judge the request's `TrustAnchorCertificate`
 //! against, and a request is not refused on evidence this emulator does not hold.
+//!
+//! This module owns the WORDING of each refusal as well as the decision: a class whose
+//! message is fixed text carries it here ([`ClusterRefusal::message`]), so every
+//! operation that takes a `CloudHsmClusterId` words the same refusal the same way and
+//! no `src/ops/` module keeps a second copy of the text.
 
 use ::service_com_amazonaws_cloudhsmv2_baldrapiservice::state as cloud_hsm_store;
 
@@ -31,6 +36,12 @@ use ::service_com_amazonaws_cloudhsmv2_baldrapiservice::state as cloud_hsm_store
 /// "initialize and activate the cluster and try the command again"
 /// (`CloudHsmClusterNotActiveException`) asks the caller to finish.
 const CLUSTER_STATE_ACTIVE: &str = "ACTIVE";
+
+/// The whole `message` KMS answers when the cluster a request names exists but is not
+/// serving yet. The sentence is the complete text of this refusal class: no cluster id,
+/// key store name or limit is interpolated into it, so every such refusal carries
+/// exactly this string.
+const CLUSTER_NOT_ACTIVE_MESSAGE: &str = "Cluster is not active.";
 
 /// The fewest Availability Zones a cluster's private subnets have to span before it can
 /// back a CloudHSM key store: "the CloudHSM cluster must be configured with private
@@ -56,6 +67,22 @@ pub enum ClusterRefusal {
     /// requirements for a key store:
     /// `CloudHsmClusterInvalidConfigurationException`.
     InvalidConfiguration,
+}
+
+impl ClusterRefusal {
+    /// The `message` member a handler fills when it words this refusal on its own error
+    /// channel, or `None` for a class that carries the error code alone.
+    ///
+    /// Only the not-active class has a message that is fixed text, which is why it can
+    /// be stated once here for every operation that takes a `CloudHsmClusterId`; the
+    /// other two classes send no message, as the recorded refusal of a cluster this
+    /// account does not hold does.
+    pub const fn message(self) -> Option<&'static str> {
+        match self {
+            Self::NotActive => Some(CLUSTER_NOT_ACTIVE_MESSAGE),
+            Self::NotFound | Self::InvalidConfiguration => None,
+        }
+    }
 }
 
 /// Whether the cluster `cloud_hsm_cluster_id` names can back a CloudHSM key store, and
