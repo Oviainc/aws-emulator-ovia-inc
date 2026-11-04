@@ -335,6 +335,32 @@ pub(crate) fn is_wire_timestamp(value: &str) -> bool {
     value.contains('T') && value.ends_with('Z') && value.len() >= "2026-01-01T00:00:00Z".len()
 }
 
+/// The instant the wire form `value` names, as the `(seconds, nanoseconds)` pair since the
+/// epoch — the pair two instants are ORDERED by.
+///
+/// A restXml `timestamp` travels as RFC-3339 at UTC carrying only the SIGNIFICANT digits of
+/// its subsecond fraction (`2027-01-15T08:00:00.5Z`, and, for a zero fraction,
+/// `2027-01-15T08:00:00Z` with no fractional part at all), so comparing two of them as TEXT
+/// does not order the instants they name: `…:00Z` sorts after `…:00.5Z` while naming the
+/// earlier instant, and `…:00.39091Z` sorts before `…:00.390903Z` while naming the later
+/// one. Every ordering assertion on an instant this service reports therefore parses it
+/// here first; an equality assertion needs no parse, since one instant has one rendering.
+///
+/// `pub(crate)` and written once, beside the predicate for the same wire form, so no suite
+/// grows its own reading of it. PANICS when `value` is no wire instant at all, naming
+/// `case`, so a malformed member fails the suite that read it rather than comparing as
+/// something.
+pub(crate) fn wire_instant(value: &str, case: &str) -> (i64, u32) {
+    let parsed = ::aws_smithy_types::DateTime::from_str(
+        value,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .unwrap_or_else(|error| {
+        panic!("case {case}: expected an ISO-8601 instant, got {value:?}: {error}")
+    });
+    (parsed.secs(), parsed.subsec_nanos())
+}
+
 /// Create every row of `rows` through the API and report `(row, id, created_time)` in
 /// creation order.
 async fn create_all(router: &MultiServiceRouter, rows: &[Key]) -> Vec<(Key, String, String)> {

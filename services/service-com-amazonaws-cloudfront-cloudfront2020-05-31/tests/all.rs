@@ -285,3 +285,5 @@ mod untag_resource;
 mod verify_dns_configuration;
 #[path = "all/web_acl_association.rs"]
 mod web_acl_association;
+#[path = "all/wire_instant_ordering.rs"]
+mod wire_instant_ordering;

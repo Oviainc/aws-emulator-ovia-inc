@@ -46,7 +46,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{call, emulator, is_version_token, Answer, API_VERSION};
 use crate::key_group_lifecycle::{create_group, get_group, mint_public_keys, table, Group};
-use crate::public_key_lifecycle::is_wire_timestamp;
+use crate::public_key_lifecycle::{is_wire_timestamp, wire_instant};
 
 // ---------------------------------------------------------------------------
 // Calling the surface under test
@@ -383,10 +383,18 @@ async fn an_update_replaces_the_whole_configuration() {
              {written_last_modified:?} in {}",
             updated.raw
         );
+        // The ordering is decided on the INSTANT each text names, never on the two texts:
+        // the wire form carries only the significant digits of its subsecond fraction, so
+        // the strings do not sort the way the instants they name do.
+        let (written_at, created_at) = (
+            wire_instant(&written_last_modified, &case),
+            wire_instant(&created_last_modified, &case),
+        );
         assert!(
-            written_last_modified >= created_last_modified,
+            written_at >= created_at,
             "case {case}: expected the last-modified instant not to move backwards from \
-             {created_last_modified}, got {written_last_modified}"
+             {created_last_modified} ({created_at:?}), got {written_last_modified} \
+             ({written_at:?})"
         );
 
         // A later read answers from the stored record, at the version the update minted and
