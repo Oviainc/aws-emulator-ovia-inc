@@ -9,8 +9,9 @@
 //! constant.
 //!
 //! Each suite below is a table whose rows vary what the rule generalises over — how many
-//! resources (and of which types) hold the one being deleted, and the shape of the ARN
-//! that resolves to nothing — so the recorded case is one row among several.
+//! resources (and of which types) hold the one being deleted, the KIND of resource an ARN
+//! addresses and the operation that resolves it, and the shape of the ARN that resolves to
+//! nothing — so the recorded case is one row among several.
 
 use crate::dataset_group_lifecycle::{
     assert_deleted, avro_schema, create_active_group, create_dataset, create_schema, error_code,
@@ -31,10 +32,14 @@ pub(crate) const SCHEMA_IN_USE_MESSAGE: &str =
 pub(crate) const DATASET_GROUP_IN_USE_MESSAGE: &str =
     "The provided dataset-group is being referenced by one or more datasets";
 
-/// What a schema lookup that resolves to nothing answers. The ARN the caller asked about
-/// is the sentence's one variable part.
-fn schema_not_found_message(schema_arn: &str) -> String {
-    format!("Resource Arn {schema_arn} does not exist.")
+/// What a lookup that resolves to nothing answers, whichever resource the ARN addresses.
+/// The ARN the caller asked about is the sentence's one variable part — the sentence names
+/// no resource KIND, so one wording serves schemas, dataset groups and datasets alike.
+///
+/// Written out here rather than read from `crate::state` for the reason above: a test that
+/// asserted the handler's own helper would pass whatever that helper said.
+fn resource_not_found_message(arn: &str) -> String {
+    format!("Resource Arn {arn} does not exist.")
 }
 
 /// A row of the in-use table: the dataset types created against one schema in one group
@@ -205,7 +210,7 @@ async fn a_schema_lookup_that_resolves_to_nothing_names_the_arn_it_was_asked_abo
     ];
 
     for (index, (case, arn)) in absent.iter().enumerate() {
-        let expected = schema_not_found_message(arn);
+        let expected = resource_not_found_message(arn);
         for operation in ["DescribeSchema", "DeleteSchema"] {
             assert_refused(
                 &emulator,
@@ -272,9 +277,213 @@ async fn a_schema_lookup_that_resolves_to_nothing_names_the_arn_it_was_asked_abo
         (
             400,
             "ResourceNotFoundException",
-            &schema_not_found_message(&schema_arn),
+            &resource_not_found_message(&schema_arn),
         ),
         case,
     )
     .await;
+}
+
+/// One row of the not-found table: a well-formed ARN that addresses nothing, and every
+/// operation that has to resolve it.
+struct AbsentRow {
+    case: &'static str,
+    arn: String,
+    /// `(operation, the input member naming the ARN)` for each operation that resolves it.
+    lookups: &'static [(&'static str, &'static str)],
+}
+
+/// The operations that resolve a `schemaArn`, and so can answer the not-found class for
+/// one. Source: this crate's `OPERATIONS.md` (`DescribeSchema`, `DeleteSchema`;
+/// `CreateDataset` resolves one too and is exercised separately below, because it names
+/// two ARNs at once).
+const SCHEMA_LOOKUPS: &[(&str, &str)] = &[
+    ("DescribeSchema", "schemaArn"),
+    ("DeleteSchema", "schemaArn"),
+];
+
+/// The same for a `datasetGroupArn`.
+const DATASET_GROUP_LOOKUPS: &[(&str, &str)] = &[
+    ("DescribeDatasetGroup", "datasetGroupArn"),
+    ("DeleteDatasetGroup", "datasetGroupArn"),
+];
+
+/// The same for a `datasetArn`.
+const DATASET_LOOKUPS: &[(&str, &str)] = &[
+    ("DescribeDataset", "datasetArn"),
+    ("DeleteDataset", "datasetArn"),
+];
+
+#[tokio::test]
+async fn a_lookup_that_resolves_to_nothing_reads_the_same_for_every_resource_kind() {
+    let emulator = Emulator::new();
+
+    // The rows vary what the rule generalises over: the KIND of resource the ARN addresses
+    // (schema, dataset group, dataset), the operation that resolves it (a read and a
+    // delete for each), and the shape of the ARN itself (a plain name, every permitted
+    // character class, a long name, a dataset's two-segment resource part, another region
+    // and account). The sentence names no kind, so every row expects the same text with
+    // its own ARN.
+    let rows: Vec<AbsentRow> = vec![
+        AbsentRow {
+            case: "a schema under a plain name",
+            arn: format!("arn:aws:personalize:{REGION}:{ACCOUNT}:schema/absent-kind"),
+            lookups: SCHEMA_LOOKUPS,
+        },
+        AbsentRow {
+            case: "a dataset group under a plain name",
+            arn: format!("arn:aws:personalize:{REGION}:{ACCOUNT}:dataset-group/absent-kind"),
+            lookups: DATASET_GROUP_LOOKUPS,
+        },
+        AbsentRow {
+            case: "a dataset group with dashes, digits and underscores",
+            arn: format!("arn:aws:personalize:{REGION}:{ACCOUNT}:dataset-group/Absent-9_dsg"),
+            lookups: DATASET_GROUP_LOOKUPS,
+        },
+        AbsentRow {
+            case: "a dataset group under a long name",
+            arn: format!(
+                "arn:aws:personalize:{REGION}:{ACCOUNT}:dataset-group/{}",
+                "g".repeat(63)
+            ),
+            lookups: DATASET_GROUP_LOOKUPS,
+        },
+        AbsentRow {
+            case: "a dataset group in another region and account",
+            arn: "arn:aws:personalize:eu-west-1:210987654321:dataset-group/elsewhere".to_string(),
+            lookups: DATASET_GROUP_LOOKUPS,
+        },
+        AbsentRow {
+            case: "a dataset addressed by group and type",
+            arn: format!(
+                "arn:aws:personalize:{REGION}:{ACCOUNT}:dataset/absent-kind/INTERACTIONS"
+            ),
+            lookups: DATASET_LOOKUPS,
+        },
+        AbsentRow {
+            case: "a dataset of another type in a group that exists",
+            arn: format!("arn:aws:personalize:{REGION}:{ACCOUNT}:dataset/present-kind/ACTIONS"),
+            lookups: DATASET_LOOKUPS,
+        },
+        AbsentRow {
+            case: "a dataset in another region and account",
+            arn: "arn:aws:personalize:eu-west-1:210987654321:dataset/elsewhere/USERS".to_string(),
+            lookups: DATASET_LOOKUPS,
+        },
+    ];
+
+    // A group and a schema that DO exist, so a row addressing a dataset inside a live
+    // group is refused for the dataset and not for its container.
+    let setup = "not-found wording setup";
+    let present_group = create_active_group(&emulator, "present-kind", setup).await;
+    let present_schema =
+        create_schema(&emulator, "present-kind", &avro_schema("Interactions"), setup).await;
+
+    for row in &rows {
+        let expected = resource_not_found_message(&row.arn);
+        for (operation, member) in row.lookups {
+            assert_refused(
+                &emulator,
+                operation,
+                member,
+                &row.arn,
+                (400, "ResourceNotFoundException", &expected),
+                row.case,
+            )
+            .await;
+        }
+    }
+
+    // `CreateDataset` resolves two ARNs, and words whichever of them resolves to nothing
+    // the same way a read of that resource would.
+    for (case, group_arn, schema_arn, absent) in [
+        (
+            "CreateDataset naming a group that does not exist",
+            format!("arn:aws:personalize:{REGION}:{ACCOUNT}:dataset-group/absent-kind"),
+            present_schema.clone(),
+            format!("arn:aws:personalize:{REGION}:{ACCOUNT}:dataset-group/absent-kind"),
+        ),
+        (
+            "CreateDataset naming a schema that does not exist",
+            present_group.clone(),
+            format!("arn:aws:personalize:{REGION}:{ACCOUNT}:schema/absent-kind"),
+            format!("arn:aws:personalize:{REGION}:{ACCOUNT}:schema/absent-kind"),
+        ),
+    ] {
+        let expected = resource_not_found_message(&absent);
+        let (status, body) = emulator
+            .call(
+                "CreateDataset",
+                serde_json::json!({
+                    "name": "needs-both",
+                    "schemaArn": schema_arn,
+                    "datasetGroupArn": group_arn,
+                    "datasetType": "Items",
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected CreateDataset to answer HTTP 400, got {status} {body:?}"
+        );
+        assert!(
+            error_code(&body).contains("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+        let message = error_message(&body);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+    }
+
+    // A dataset and a group that EXIST are read, and once deleted their own ARNs answer
+    // the very same sentence — so the wording belongs to the lookup that found nothing
+    // rather than to every call.
+    let case = "a group and a dataset that exist, then do not";
+    let dataset_arn = create_dataset(
+        &emulator,
+        &present_group,
+        &present_schema,
+        "Interactions",
+        case,
+    )
+    .await;
+    for (operation, member, arn) in [
+        ("DescribeDataset", "datasetArn", &dataset_arn),
+        ("DescribeDatasetGroup", "datasetGroupArn", &present_group),
+    ] {
+        let (status, body) = emulator.call_with_arn(operation, member, arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected {operation} to answer 200, got {status} {body:?}"
+        );
+    }
+
+    assert_deleted(&emulator, "DeleteDataset", "datasetArn", &dataset_arn, case).await;
+    assert_deleted(
+        &emulator,
+        "DeleteDatasetGroup",
+        "datasetGroupArn",
+        &present_group,
+        case,
+    )
+    .await;
+    for (lookups, arn) in [
+        (DATASET_LOOKUPS, &dataset_arn),
+        (DATASET_GROUP_LOOKUPS, &present_group),
+    ] {
+        let expected = resource_not_found_message(arn);
+        for (operation, member) in lookups {
+            assert_refused(
+                &emulator,
+                operation,
+                member,
+                arn,
+                (400, "ResourceNotFoundException", &expected),
+                case,
+            )
+            .await;
+        }
+    }
 }

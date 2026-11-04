@@ -144,11 +144,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is written and two callers reading at one instant agree.
         let state = state.lock();
         let Some(record) = state.dataset_groups.get(&input.dataset_group_arn) else {
+            // The not-found class carries this service's own wording, with the ARN the
+            // caller asked about as its one variable part
+            // ([`crate::state::resource_not_found_message`]).
             return Err(DescribeDatasetGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Resource not found: {arn}",
-                        arn = input.dataset_group_arn
+                    message: Some(crate::state::resource_not_found_message(
+                        &input.dataset_group_arn,
                     )),
                 },
             )

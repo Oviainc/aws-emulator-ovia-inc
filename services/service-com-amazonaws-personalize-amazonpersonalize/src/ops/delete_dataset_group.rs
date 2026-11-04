@@ -157,11 +157,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = state.lock();
         if !state.dataset_groups.contains_key(&input.dataset_group_arn) {
+            // The not-found class carries this service's own wording, with the ARN the
+            // caller asked about as its one variable part
+            // ([`crate::state::resource_not_found_message`]).
             return Err(DeleteDatasetGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Resource not found: {arn}",
-                        arn = input.dataset_group_arn
+                    message: Some(crate::state::resource_not_found_message(
+                        &input.dataset_group_arn,
                     )),
                 },
             )

@@ -213,10 +213,14 @@ pub fn dataset_arn(region: &str, dataset_group_name: &str, dataset_type: &str) -
 // whichever operation raised it, so the text lives here instead of being composed at the
 // rejection site. Only the parts the service itself varies are arguments.
 
-/// What a schema lookup that resolves to nothing answers, for the ARN the caller asked
-/// about: the one variable part of the sentence.
-pub fn schema_not_found_message(schema_arn: &str) -> String {
-    format!("Resource Arn {schema_arn} does not exist.")
+/// What a lookup that resolves to nothing answers, for the ARN the caller asked about:
+/// the one variable part of the sentence.
+///
+/// The sentence names the ARN and NOT the kind of resource it addresses, so one wording
+/// serves every resource this service holds — a schema, a dataset group, a dataset — and
+/// every operation that resolves an ARN, whether it reads, deletes or references it.
+pub fn resource_not_found_message(arn: &str) -> String {
+    format!("Resource Arn {arn} does not exist.")
 }
 
 /// What a schema delete still referenced by a dataset answers. The whole sentence is

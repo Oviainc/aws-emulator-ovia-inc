@@ -146,7 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // shape's modeled `@httpError` — see `crate::scaffolded::wire_status`.
             return Err(DescribeSchemaErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::schema_not_found_message(&input.schema_arn)),
+                    message: Some(crate::state::resource_not_found_message(&input.schema_arn)),
                 },
             )
             .into());

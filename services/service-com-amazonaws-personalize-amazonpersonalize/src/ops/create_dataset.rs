@@ -209,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = dataset_arn(&group.region, &group.name, dataset_type);
 
         if !state.schemas.contains_key(&input.schema_arn) {
-            return Err(schema_not_found(&input.schema_arn));
+            return Err(not_found(&input.schema_arn));
         }
 
         // A dataset's identity inside its group is its TYPE — "a dataset group can
@@ -338,20 +338,14 @@ fn invalid_input(message: impl Into<String>) -> CreateDatasetError {
 }
 
 /// This operation's modelled `ResourceNotFoundException` for an ARN this service holds no
-/// resource for.
+/// resource for — a `datasetGroupArn` or a `schemaArn` alike.
+///
+/// Worded the way every lookup in this service words the class
+/// (see [`crate::state::resource_not_found_message`]), so the reply reads the same here as
+/// it does from the operation that owns the resource.
 fn not_found(arn: &str) -> CreateDatasetError {
     CreateDatasetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Resource not found: {arn}")),
-    })
-    .into()
-}
-
-/// The same error for a `schemaArn` no schema stands behind, worded the way every schema
-/// lookup in this service words it (see [`crate::state::schema_not_found_message`]), so
-/// the reply reads the same here as it does from a schema operation.
-fn schema_not_found(schema_arn: &str) -> CreateDatasetError {
-    CreateDatasetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::schema_not_found_message(schema_arn)),
+        message: Some(crate::state::resource_not_found_message(arn)),
     })
     .into()
 }
