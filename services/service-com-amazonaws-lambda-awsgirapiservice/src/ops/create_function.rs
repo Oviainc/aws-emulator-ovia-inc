@@ -442,9 +442,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "To create a function, you need a deployment package and an execution role."
         // The function RUNS AS the role the request names, so that role is resolved
-        // before anything is written: a role this emulator's own IAM does not hold, or
-        // one whose trust policy does not let this service assume it, is the modelled 400
-        // and no function is stored.
+        // before anything is written: a role this emulator's own IAM HOLDS whose trust
+        // policy does not let this service assume it is the modelled 400 and no function
+        // is stored. A role no record is held for is SERVED — an execution role is
+        // normally provisioned outside the client that creates the function, so an absent
+        // record is no evidence about the role (see
+        // [`crate::state::execution_role_is_unassumable`]).
         //
         // The question is put to the emulator's OWN IAM, over the emulator's OWN
         // in-process transport: `crate::state::execution_role_is_unassumable` asks through

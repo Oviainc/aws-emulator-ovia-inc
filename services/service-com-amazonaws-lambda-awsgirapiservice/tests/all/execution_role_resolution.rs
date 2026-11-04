@@ -3,12 +3,13 @@
 //! What the execution-role check does when there is no IAM to ask.
 //!
 //! RULE: an operation that STORES the execution role a function runs as refuses the write
-//! only on what this account's IAM ANSWERED about that role. Nothing is KNOWN about a role
-//! this emulator cannot ask about — an ARN naming another account's IAM, or an emulator
-//! with no IAM service mounted at all — so the write goes ahead and the role is stored as
-//! supplied. The refusal grounded in an IAM answer is asserted where both services can be
-//! mounted on one engine (`core/router/tests/all/lambda_execution_role_trust.rs`); this
-//! suite pins the complement, which is the behaviour of this crate ON ITS OWN.
+//! only on a TRUST DOCUMENT this account's IAM answered with. Nothing is KNOWN about a role
+//! this emulator cannot ask about — an ARN naming another account's IAM, or an emulator with
+//! no IAM service mounted at all — nor about a name this account's IAM holds no role under,
+//! so the write goes ahead and the role is stored as supplied. The refusal grounded in a
+//! stored trust document is asserted where both services can be mounted on one engine
+//! (`core/router/tests/all/lambda_execution_role_trust.rs`); this suite pins the complement,
+//! which is the behaviour of this crate ON ITS OWN.
 //!
 //! The rows differ along the form of the role ARN: the path the role lives under, how many
 //! path segments it has, which characters the role name holds, which account the ARN names

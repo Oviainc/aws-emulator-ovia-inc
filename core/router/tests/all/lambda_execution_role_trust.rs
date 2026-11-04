@@ -4,9 +4,12 @@
 //!
 //! RULE: an operation that STORES the execution role a function runs as resolves that role
 //! against this account's IAM records first and refuses the write with
-//! `InvalidParameterValueException` (HTTP 400) — persisting nothing — unless IAM reports a
-//! role whose trust policy lets `lambda.amazonaws.com` perform `sts:AssumeRole` on it.
-//! Both write paths ask: `CreateFunction` for the role a new function is created with, and
+//! `InvalidParameterValueException` (HTTP 400) — persisting nothing — when IAM reports a role
+//! whose trust policy does not let `lambda.amazonaws.com` perform `sts:AssumeRole` on it.
+//! Only a role this account's IAM HOLDS can be refused for its trust: a name it holds nothing
+//! under is no evidence about the role the caller named, since an execution role is normally
+//! provisioned outside the client that creates the function. Both write paths ask:
+//! `CreateFunction` for the role a new function is created with, and
 //! `UpdateFunctionConfiguration` for a role that replaces it.
 //!
 //! The role is resolved against the ACCOUNT's IAM records, which is why this suite lives
@@ -17,7 +20,9 @@
 //! whether it names several, which statement carries the grant, whether the grant is an
 //! `Allow`, whether an explicit `Deny` stands beside it, which action the statement names,
 //! which wildcard stands in the action's place, and which KIND of principal it names — and,
-//! in the second table, along whether this account's IAM holds the named role at all.
+//! in the later tables, along whether this account's IAM holds the named role at all, which
+//! path it lives under, which characters its name holds, and which account and partition the
+//! ARN names.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -544,27 +549,35 @@ async fn update_function_configuration_refuses_a_role_whose_trust_policy_withhol
     }
 }
 
-/// RULE (the complement): the refusal is grounded in what IAM ANSWERED. A role name this
-/// account's IAM holds nothing under is an answer — there is no such role to assume — while
-/// an ARN naming ANOTHER account's role is not this emulator's IAM to ask about, so the
-/// write goes ahead.
-#[tokio::test]
-async fn create_function_refuses_only_a_role_this_accounts_iam_answered_about() {
-    let (router, _engine) = emulator();
-
-    // The rows differ along which IAM the ARN names: this account's (held and unheld, at
-    // the default path and under a path) and another account's, in this partition and in
-    // another.
-    let rows: [(&str, String, bool); 5] = [
+/// RULE (the complement): the refusal is grounded in a TRUST DOCUMENT IAM answered with, so
+/// only a role this account's IAM HOLDS can be refused for one. A role name this account's
+/// IAM holds nothing under is no evidence about the role the caller named — an execution role
+/// is normally provisioned outside the client that creates the function, so this emulator's
+/// IAM holds a record of it only when that client created it here — and neither is an ARN
+/// naming ANOTHER account's role, which is not this emulator's IAM to ask about. Both write
+/// paths serve those, and store the role as supplied.
+///
+/// The rows differ along which IAM the ARN names and what it holds: this account's, held
+/// (admitting and withholding) and unheld (at the default path, under a path, and with the
+/// punctuation a role name admits), and another account's, in this partition and in another.
+fn unheld_rows() -> Vec<(&'static str, String, bool)> {
+    vec![
         (
             "a role this account's IAM does not hold",
             "arn:aws:iam::000000000000:role/never-created".to_string(),
-            false,
+            true,
         ),
         (
             "a role under a path this account's IAM does not hold",
             "arn:aws:iam::000000000000:role/service-role/never-created".to_string(),
-            false,
+            true,
+        ),
+        (
+            // The characters IAM admits in a role name, per the model's `RoleArn` pattern
+            // (`smithy_query(query="shape", shape="RoleArn")`).
+            "an unheld role name holding every admitted character class",
+            "arn:aws:iam::000000000000:role/a_b-1+2=3,4.5@6".to_string(),
+            true,
         ),
         (
             "another account's role",
@@ -581,7 +594,46 @@ async fn create_function_refuses_only_a_role_this_accounts_iam_answered_about() 
             "arn:aws-us-gov:iam::123456789012:role/remote-exec".to_string(),
             true,
         ),
-    ];
+    ]
+}
+
+#[tokio::test]
+async fn create_function_refuses_only_a_role_this_accounts_iam_holds() {
+    let (router, _engine) = emulator();
+
+    // The held rows are created through the real `CreateRole` on the same engine, so the
+    // negative row is refused on the document IAM persisted for it and not on a copy.
+    let mut rows = unheld_rows();
+    rows.push((
+        "a role this account's IAM holds, whose trust policy admits this service",
+        create_role(
+            &router,
+            "a role this account's IAM holds, whose trust policy admits this service",
+            "lambda-held-admitting",
+            &trust(
+                "Allow",
+                json!("sts:AssumeRole"),
+                json!({ "Service": LAMBDA_PRINCIPAL }),
+            ),
+        )
+        .await,
+        true,
+    ));
+    rows.push((
+        "a role this account's IAM holds, whose trust policy withholds this service",
+        create_role(
+            &router,
+            "a role this account's IAM holds, whose trust policy withholds this service",
+            "lambda-held-withholding",
+            &trust(
+                "Allow",
+                json!("sts:AssumeRole"),
+                json!({ "Service": "ec2.amazonaws.com" }),
+            ),
+        )
+        .await,
+        false,
+    ));
 
     for (index, (case, role_arn, accepted)) in rows.iter().enumerate() {
         let name = format!("unheld-probe-{index}");
@@ -596,8 +648,8 @@ async fn create_function_refuses_only_a_role_this_accounts_iam_answered_about() 
             assert_eq!(
                 (status, code.as_str()),
                 (201, ""),
-                "case {case:?}: a role no answer of this account's IAM covers must be \
-                 accepted, got {status} {code:?}: {created}"
+                "case {case:?}: a role no trust document of this account's IAM withholds \
+                 must be accepted, got {status} {code:?}: {created}"
             );
             assert_eq!(
                 created["Role"].as_str(),
@@ -608,8 +660,8 @@ async fn create_function_refuses_only_a_role_this_accounts_iam_answered_about() 
             assert_eq!(
                 (status, code.as_str()),
                 (400, "InvalidParameterValueException"),
-                "case {case:?}: a role this account's IAM reports nothing under must be \
-                 refused, got {status} {code:?}: {created}"
+                "case {case:?}: a role whose stored trust policy withholds this service must \
+                 be refused, got {status} {code:?}: {created}"
             );
             assert_eq!(
                 created["message"].as_str(),
@@ -617,5 +669,107 @@ async fn create_function_refuses_only_a_role_this_accounts_iam_answered_about() 
                 "case {case:?}: expected the modelled refusal message, got {created}"
             );
         }
+
+        // The answer and the store agree: a refused create persists nothing.
+        let (status, code, fetched) = lambda(
+            &router,
+            "GET",
+            &format!("/2015-03-31/functions/{name}/configuration"),
+            None,
+        )
+        .await;
+        let expected = if *accepted {
+            (200, "")
+        } else {
+            (404, "ResourceNotFoundException")
+        };
+        assert_eq!(
+            (status, code.as_str()),
+            expected,
+            "case {case:?}: expected HTTP {} {:?} reading the function back, got {status} \
+             {code:?}: {fetched}",
+            expected.0,
+            expected.1
+        );
+        if *accepted {
+            assert_eq!(
+                fetched["Role"].as_str(),
+                Some(role_arn.as_str()),
+                "case {case:?}: expected the stored role to be {role_arn}, got {fetched}"
+            );
+        }
+    }
+}
+
+/// RULE (the same, on the OTHER write path): `UpdateFunctionConfiguration` stores a role no
+/// trust document of this account's IAM withholds, and the replacement is what a later read
+/// reports.
+#[tokio::test]
+async fn update_function_configuration_stores_a_role_this_accounts_iam_holds_nothing_under() {
+    let (router, engine) = emulator();
+
+    let admitting = create_role(
+        &router,
+        "the function's first role",
+        "lambda-unheld-update-base",
+        &trust(
+            "Allow",
+            json!("sts:AssumeRole"),
+            json!({ "Service": LAMBDA_PRINCIPAL }),
+        ),
+    )
+    .await;
+    let name = "unheld-update-probe";
+    let (status, code, created) = lambda(
+        &router,
+        "POST",
+        "/2015-03-31/functions",
+        Some(create_body(name, &admitting)),
+    )
+    .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (201, ""),
+        "case \"the function's first role\": expected the function to be created, \
+         got {status} {code:?}: {created}"
+    );
+
+    for (case, role_arn, _) in unheld_rows() {
+        // "During this time, you can't invoke or modify the function": bring the clock-owed
+        // transitions forward so each row's update is judged on its role.
+        make_activation_due(&engine);
+        let (status, code, updated) = lambda(
+            &router,
+            "PUT",
+            &format!("/2015-03-31/functions/{name}/configuration"),
+            Some(json!({ "Role": role_arn })),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (200, ""),
+            "case {case:?}: a role no trust document of this account's IAM withholds must be \
+             stored, got {status} {code:?}: {updated}"
+        );
+
+        make_activation_due(&engine);
+        let (status, code, fetched) = lambda(
+            &router,
+            "GET",
+            &format!("/2015-03-31/functions/{name}/configuration"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (200, ""),
+            "case {case:?}: expected the configuration to read back, got {status} {code:?}: \
+             {fetched}"
+        );
+        assert_eq!(
+            fetched["Role"].as_str(),
+            Some(role_arn.as_str()),
+            "case {case:?}: expected the stored role to be {role_arn}, got {fetched}"
+        );
     }
 }

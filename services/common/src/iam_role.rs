@@ -179,15 +179,59 @@ pub async fn role_is_unassumable(
         // IAM reported the role: it is assumable only if the trust policy it carries
         // admits the principal. A role with no readable grant is refused — that IS what
         // IAM answered about it.
-        RoleAnswer::Held(document) => !document.is_some_and(|document| {
-            crate::iam_trust_policy::admits_service_principal(&document, service_principal)
-                .unwrap_or(false)
-        }),
+        RoleAnswer::Held(document) => trust_withholds(document.as_deref(), service_principal),
         // IAM says this account holds no such role: the refusal is grounded.
         RoleAnswer::Absent => true,
         // Nothing was learned, so nothing is refused.
         RoleAnswer::Unknown => false,
     }
+}
+
+/// Whether IAM ANSWERED that `role_arn` is a role it HOLDS and `service_principal` cannot
+/// assume: this account holds a role under the name the ARN carries, and the trust policy
+/// that stored role carries does not admit that principal.
+///
+/// The same question [`role_is_unassumable`] answers, for a service whose recorded behaviour
+/// SERVES a request naming a role this account's IAM holds nothing under. The two readings
+/// differ in that one case only, and the caller picks between them by what its service is
+/// recorded doing: a role record is created in this emulator's IAM only by a client that
+/// created it HERE, while an execution role is routinely provisioned out of band, so "IAM
+/// holds no such role" is evidence about this emulator's store and not about the role the
+/// caller named. A service that answers a request for such a role with a refusal makes its
+/// whole create surface unreachable for that client, so it reads the question here and
+/// refuses only what the stored trust document itself withholds.
+///
+/// `false` — do not refuse — for every other case, for the reason [`role_is_unassumable`]
+/// gives: a value that names no role of this account, an answer this emulator could not read,
+/// an emulator with no IAM mounted at all, and now a role this account's IAM holds nothing
+/// under.
+pub async fn held_role_is_unassumable(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+    service_principal: &str,
+) -> bool {
+    let Some(role_name) = role_name(role_arn) else {
+        return false;
+    };
+    match role_answer(ctx, region, role_name).await {
+        RoleAnswer::Held(document) => trust_withholds(document.as_deref(), service_principal),
+        RoleAnswer::Absent | RoleAnswer::Unknown => false,
+    }
+}
+
+/// Whether the trust document IAM reported for a role it HOLDS withholds `service_principal`:
+/// the ONE reading of a stored trust document both readings above take, so a role IAM
+/// answered about is judged the same way whichever of them asked.
+///
+/// A document IAM carried none of, and one this emulator cannot read as a policy, carry no
+/// grant that can be acted on, so they withhold it: that document IS what IAM answered about
+/// the role.
+fn trust_withholds(document: Option<&str>, service_principal: &str) -> bool {
+    !document.is_some_and(|document| {
+        crate::iam_trust_policy::admits_service_principal(document, service_principal)
+            .unwrap_or(false)
+    })
 }
 
 /// Whether IAM ANSWERED that `role_arn` is a role this account cannot hand to
