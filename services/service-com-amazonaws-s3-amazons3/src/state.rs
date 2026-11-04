@@ -6345,6 +6345,24 @@ impl Bucket {
         self.encryption = Some(rules);
     }
 
+    /// Take the bucket's own default encryption configuration away, reporting whether it
+    /// carried one.
+    ///
+    /// What `DeleteBucketEncryption` does: it "resets the default encryption for the bucket
+    /// as server-side encryption with Amazon S3 managed keys (SSE-S3)" (that operation's own
+    /// documentation) — which is exactly the state a bucket that was never configured is in,
+    /// so dropping the stored rules is what resets it: [`Self::effective_encryption_rules`]
+    /// then computes [`default_encryption_rule`] again for every reader, and a write that
+    /// names no encryption of its own inherits that default
+    /// ([`Self::default_object_encryption`]).
+    ///
+    /// Scoped to this one subresource, the way [`Self::clear_replication`] is scoped to the
+    /// replication one: every other configuration the bucket holds, and its objects, are
+    /// left exactly as they were.
+    pub fn clear_encryption(&mut self) -> bool {
+        self.encryption.take().is_some()
+    }
+
     /// The bucket's replication configuration, or `None` while no configuration is
     /// associated with it.
     pub fn replication(&self) -> Option<&crate::ops::types::ReplicationConfiguration> {

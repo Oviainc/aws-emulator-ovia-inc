@@ -35,6 +35,8 @@ mod bucket_cors_delete;
 mod bucket_deletion_emptiness;
 #[path = "all/bucket_encryption.rs"]
 mod bucket_encryption;
+#[path = "all/bucket_encryption_delete.rs"]
+mod bucket_encryption_delete;
 #[path = "all/bucket_error_envelope.rs"]
 mod bucket_error_envelope;
 #[path = "all/bucket_intelligent_tiering.rs"]

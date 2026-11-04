@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBucketEncryption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBucketEncryption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBucketEncryption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Withdraws the named bucket's OWN default encryption configuration, which resets the
+//! bucket to server-side encryption with Amazon S3 managed keys (SSE-S3), and answers the
+//! modelled 204 with an empty body. `GetBucketEncryption` reports that default again
+//! afterwards, and an object written without naming any encryption of its own inherits it.
 //!
 //! ## Shape of an operation
 //!
@@ -123,14 +119,22 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteBucketEncryptionOu
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `DeleteBucketEncryptionError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#DeleteBucketEncryption")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="DeleteBucketEncryption")` reports
+// `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that does
+// not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`) — the same 404 `GetBucketEncryption` and
+// `PutBucketEncryption` answer for a bucket this emulator does not hold, and the same one
+// `DeleteBucketReplication` answers for the subresource it removes.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#DeleteBucketEncryption",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum DeleteBucketEncryptionErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -184,18 +188,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBucketEncryption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBucketEncryptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBucketEncryption"))
+        // Everything this delete needs is in its deserialized input: the bucket travels as
+        // an @httpLabel and the expected owner as a bound header.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`DeleteBucketEncryptionRequest$ExpectedBucketOwner`), judged the way the put and
+        // the read of this same subresource judge it: this emulator serves one account, so
+        // that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine that
+            // is not the shared `InMemoryEngine`; no configuration can then be reset, and
+            // the one widened-in error would be a false statement about the bucket, so the
+            // scaffold's 501 says what is true.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteBucketEncryption",
+            ));
+        };
+
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(DeleteBucketEncryptionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        // "This implementation of the DELETE action resets the default encryption for the
+        // bucket as server-side encryption with Amazon S3 managed keys (SSE-S3)" (this
+        // operation's own documentation): the bucket's OWN configuration goes in full,
+        // whatever it named, which leaves the bucket in the state it was created in — so a
+        // reader computes the documented SSE-S3 default again. Idempotent: a bucket carrying
+        // no configuration of its own is already in the asked-for state, so the call still
+        // succeeds.
+        bucket.clear_encryption();
+
+        // `Unit` output: success is the modelled 204 and an empty body.
+        Ok(DeleteBucketEncryptionOutput)
     }
 }
+
+/// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
+/// status code 403 Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;

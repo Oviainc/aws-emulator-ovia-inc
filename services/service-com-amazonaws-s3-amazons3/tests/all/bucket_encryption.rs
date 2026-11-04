@@ -42,17 +42,22 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::bucket_lifecycle::{create_bucket, router, send, Answer};
 
 /// The XML namespace botocore puts on an S3 request payload.
-const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+///
+/// `pub(crate)` with the two value lists below it: the delete suite beside this one
+/// ([`super::bucket_encryption_delete`]) spells its payloads and spans the published
+/// catalogs through these rather than keeping a second copy that could drift from the
+/// model's own order.
+pub(crate) const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// Every value the `ServerSideEncryption` enum publishes, in the model's own order
 /// (`smithy_query(query="shape",shape="ServerSideEncryption")` reports
 /// `values: [AES256, aws:fsx, aws:backup, aws:kms, aws:kms:dsse]`).
-const SERVER_SIDE_ENCRYPTION_VALUES: [&str; 5] =
+pub(crate) const SERVER_SIDE_ENCRYPTION_VALUES: [&str; 5] =
     ["AES256", "aws:fsx", "aws:backup", "aws:kms", "aws:kms:dsse"];
 
 /// Every value the `EncryptionType` enum publishes
 /// (`smithy_query(query="shape",shape="EncryptionType")` reports `values: [NONE, SSE-C]`).
-const ENCRYPTION_TYPE_VALUES: [&str; 2] = ["NONE", "SSE-C"];
+pub(crate) const ENCRYPTION_TYPE_VALUES: [&str; 2] = ["NONE", "SSE-C"];
 
 /// One `ServerSideEncryptionRule`, as a request carries it and as a report brings it back.
 ///
