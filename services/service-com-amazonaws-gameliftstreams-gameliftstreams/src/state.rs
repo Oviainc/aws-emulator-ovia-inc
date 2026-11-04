@@ -744,29 +744,44 @@ impl LocationSlot {
         }
     }
 
+    /// Start releasing this location: "REMOVING: Amazon GameLift Streams is working
+    /// to remove this location. This will release all provisioned capacity for this
+    /// location" (`LocationState::Status` documentation). The clock owes the release
+    /// one [`TRANSITION`] later, at which point the group no longer holds the
+    /// location at all.
+    pub fn start_removal(&mut self, now: SystemTime) {
+        self.status = LOCATION_REMOVING.to_string();
+        self.status_due_at = Some(now + TRANSITION);
+    }
+
     /// Is this location still working towards a status of its own?
     ///
     /// `REMOVING` counts as well as `ACTIVATING` — "REMOVING: Amazon GameLift
     /// Streams is working to remove this location" — so a location on its way out
-    /// keeps the group in `UPDATING_LOCATIONS` too. Nothing stores `REMOVING` yet:
-    /// `RemoveStreamGroupLocations` is still a scaffold stub, and whoever
-    /// implements it owns that slot status and the transition that ends it.
+    /// keeps the group in `UPDATING_LOCATIONS` too.
     fn is_settling(&self) -> bool {
         matches!(self.status.as_str(), LOCATION_ACTIVATING | LOCATION_REMOVING)
     }
 
-    /// Advance the transition the clock owed this location at `now`.
-    fn advance(&mut self, now: SystemTime) {
+    /// Advance the transition the clock owed this location at `now`. Answers `true`
+    /// when the location is due to be gone: a `REMOVING` location whose provisioned
+    /// capacity the service has released by now leaves the group's set.
+    fn advance(&mut self, now: SystemTime) -> bool {
         let Some(due) = self.status_due_at else {
-            return;
+            return false;
         };
         if now < due {
-            return;
+            return false;
         }
         self.status_due_at = None;
-        // "ACTIVE: The location is provisioned with initial capacity."
-        if self.status == LOCATION_ACTIVATING {
-            self.status = LOCATION_ACTIVE.to_string();
+        match self.status.as_str() {
+            // "ACTIVE: The location is provisioned with initial capacity."
+            LOCATION_ACTIVATING => {
+                self.status = LOCATION_ACTIVE.to_string();
+                false
+            }
+            LOCATION_REMOVING => true,
+            _ => false,
         }
     }
 }
@@ -832,6 +847,17 @@ impl StreamGroup {
     /// Does this group hold `location`?
     pub fn has_location(&self, location: &str) -> bool {
         self.locations.iter().any(|slot| slot.name == location)
+    }
+
+    /// This group's primary location: "the Amazon Web Services Region location where
+    /// you initially created this stream group, known as the primary location"
+    /// (`RemoveStreamGroupLocations` documentation).
+    ///
+    /// That Region is the one the create was answered in, which is the region segment
+    /// of the ARN minted with the record — so the primary location is read off the
+    /// stored resource rather than held as a second copy of it.
+    pub fn primary_location(&self) -> &str {
+        arn_region(&self.arn)
     }
 
     /// Can this group host a stream session right now?
@@ -1011,9 +1037,9 @@ impl StreamGroup {
         // rather than by every `StartStreamSession` ever served.
         self.sessions
             .retain(|_, session| !session.retention_elapsed(now));
-        for slot in &mut self.locations {
-            slot.advance(now);
-        }
+        // A location whose release the clock has completed is not part of the group
+        // any more, so it stops being reported and stops taking up room in the set.
+        self.locations.retain_mut(|slot| !slot.advance(now));
         // "streamGroupDeleted: The stream group was deleted, which revoked the
         // stream URL" (`StreamUrlStatusReason`). The deletion is already under way,
         // so the revocation it causes is owed at the same instant — whether or not
@@ -1677,6 +1703,12 @@ pub fn identifier_id(identifier: &str, resource_type: &str) -> Option<String> {
         .strip_prefix(resource_type)?
         .strip_prefix('/')?;
     path.split('/').next_back().map(str::to_string)
+}
+
+/// The region segment of an ARN this service minted, which for every resource it
+/// holds is the region the request that created the resource was answered in.
+fn arn_region(arn: &str) -> &str {
+    arn.split(':').nth(3).unwrap_or_default()
 }
 
 /// One resource's ARN: `arn:aws:gameliftstreams:<region>:<account>:<type>/<path>`.

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveStreamGroupLocations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveStreamGroupLocations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveStreamGroupLocations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Releases locations a stored stream group holds and PERSISTS the release: each
+//! location this call names that the group holds moves to `REMOVING`, the group
+//! reports `UPDATING_LOCATIONS` while the service releases the capacity, and once
+//! the clock has released it the location is gone from the group's set. The
+//! group's primary location is never released, and a location the group does not
+//! hold leaves the set exactly as it stands.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +182,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveStreamGroupLocations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveStreamGroupLocationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveStreamGroupLocations"))
+        // The `Identifier` has to resolve to the ARN of the resource this operation
+        // addresses, which is checked BEFORE the store is read: a value that
+        // resolves to no stream group ARN is a bad value for the member, not a
+        // stream group that is missing.
+        if let Some(refusal) = crate::state::invalid_resource_arn(
+            crate::state::IDENTIFIER_MEMBER,
+            &input.identifier,
+            crate::state::STREAM_GROUP_RESOURCE,
+        ) {
+            return Err(RemoveStreamGroupLocationsErrorModeled::ValidationException(refusal).into());
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RemoveStreamGroupLocationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::region_of(ctx.parts());
+        let mut state = state.lock();
+        state.materialize(now);
+
+        let Some(group) = state.stream_group_mut(&input.identifier) else {
+            // The message names the ARN the request's `Identifier` resolves to.
+            return Err(RemoveStreamGroupLocationsErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&crate::state::resolved_arn(
+                    &region,
+                    &input.identifier,
+                    crate::state::STREAM_GROUP_RESOURCE,
+                )),
+            )
+            .into());
+        };
+
+        // "To remove a location, the stream group must be in ACTIVE status." A group
+        // that is still activating, already updating its locations, being deleted or
+        // expired cannot release one; this operation models no `ConflictException`,
+        // so the refusal is the modelled `ValidationException`.
+        if group.status != crate::state::STREAM_GROUP_ACTIVE {
+            return Err(RemoveStreamGroupLocationsErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::with_internal_id(format!(
+                        "stream group {} is in {} status; a location can only be removed \
+                         from a stream group in ACTIVE status",
+                        group.id, group.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "You cannot remove the Amazon Web Services Region location where you
+        // initially created this stream group, known as the primary location.
+        // However, you can set the stream capacity to zero to avoid incurring costs
+        // for allocated compute resources in that location." The whole call is
+        // refused before anything is written, so a request that names the primary
+        // location beside others releases none of them.
+        let primary = group.primary_location().to_string();
+        if input.locations.contains(&primary) {
+            return Err(RemoveStreamGroupLocationsErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::with_internal_id(format!(
+                        "The primary service location '{primary}' cannot be removed from \
+                         stream group '{}', set capacity to zero instead",
+                        group.arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Only a location the group actually holds has capacity to release. Naming
+        // one it does not hold is NOT a refusal: the operation is `@idempotent`, so
+        // a retry of the call that already released a location — or a reconcile that
+        // replays a whole set — is served, and leaves the set as it stands. The same
+        // location named twice in one request releases it once.
+        let mut removing: Vec<String> = Vec::new();
+        for location in &input.locations {
+            if group.has_location(location) && !removing.contains(location) {
+                removing.push(location.clone());
+            }
+        }
+
+        for slot in &mut group.locations {
+            if removing.contains(&slot.name) {
+                slot.start_removal(now);
+            }
+        }
+        // "When you remove a location, Amazon GameLift Streams releases allocated
+        // compute resources in that location", so a stream session still running on
+        // that capacity ends with it, by the same rule `DeleteStreamGroup` applies to
+        // the capacity of a whole group. The clock owes each session its
+        // `TERMINATED`, as it does a session stopped through
+        // `TerminateStreamSession`.
+        for session in group.sessions.values_mut() {
+            if removing.contains(&session.location) && !session.is_terminal() {
+                session.status = crate::state::SESSION_TERMINATING.to_string();
+                session.status_reason =
+                    Some(crate::state::SESSION_REASON_API_TERMINATED.to_string());
+                session.last_updated_at = now;
+                session.status_due_at = Some(now + crate::state::TRANSITION);
+            }
+        }
+        if !removing.is_empty() {
+            // "REMOVING: Amazon GameLift Streams is working to remove this location",
+            // so the group itself is "UPDATING_LOCATIONS: One or more locations in the
+            // stream group are in the process of updating" until the clock has
+            // released that capacity. A call that releases nothing moves neither the
+            // group's status nor its `LastUpdatedAt`.
+            group.status = crate::state::STREAM_GROUP_UPDATING_LOCATIONS.to_string();
+            group.status_due_at = Some(now + crate::state::TRANSITION);
+            group.last_updated_at = now;
+        }
+        let arn = group.arn.clone();
+        let associated_applications = group.associated_applications.clone();
+
+        // "Amazon GameLift Streams also deletes the content files of all associated
+        // applications that were in Amazon GameLift Streams's internal Amazon S3
+        // bucket at this location", which is what the applications report as their
+        // `ReplicationStatuses`. Only the rows THIS group asked for at a released
+        // location go: another group's content at the same location stays.
+        for application_arn in &associated_applications {
+            let Some(application) = state.application_mut(application_arn) else {
+                continue;
+            };
+            let before = application.replications.len();
+            application.replications.retain(|replication| {
+                replication.stream_group_arn != arn || !removing.contains(&replication.location)
+            });
+            if application.replications.len() != before {
+                application.last_updated_at = now;
+            }
+        }
+
+        Ok(RemoveStreamGroupLocationsOutput)
     }
 }

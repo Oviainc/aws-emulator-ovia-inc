@@ -17,6 +17,8 @@ mod control_plane_fidelity;
 mod not_found_messages;
 #[path = "all/refusal_envelope.rs"]
 mod refusal_envelope;
+#[path = "all/remove_stream_group_locations.rs"]
+mod remove_stream_group_locations;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
