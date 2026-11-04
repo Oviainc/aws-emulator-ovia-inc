@@ -247,7 +247,7 @@ async fn a_filed_request_is_what_the_read_reports() {
                 notification_channel:
                     "arn:aws-cn:sns:cn-north-1:210987654321:delegation_updates.1".to_string(),
                 policy_template_arn: Some(
-                    "arn:aws-cn:iam::210987654321:policy-template/PartnerDrop".to_string(),
+                    "arn:aws-cn:iam::aws:policy-template/PartnerDrop".to_string(),
                 ),
                 ..filing("workflow-other-partition")
             },
@@ -592,6 +592,125 @@ async fn a_permission_that_names_no_policy_template_arn_is_refused() {
     assert!(
         held(&engine).is_empty(),
         "a refused filing stores nothing, got {:?}",
+        held(&engine)
+    );
+}
+
+/// RULE: a policy template is pre-registered content published by a SERVICE rather than a
+/// resource an account owns, so the ARN naming one carries no account number — a
+/// `PolicyTemplateArn` whose account field spells one is refused HTTP 400 `ValidationError`
+/// in AWS's fixed sentence and nothing is filed, while the forms a published template's ARN
+/// does take (the publisher, or no account at all) are accepted.
+#[tokio::test]
+async fn a_policy_template_arn_carrying_an_account_number_is_refused() {
+    let (router, engine) = router_with_engine();
+
+    // The whole sentence AWS refuses such an ARN with: fixed text, quoting neither the
+    // member nor the value. Spelled out here rather than read from a helper, so this suite
+    // notices the wording drifting.
+    const ACCOUNT_NUMBERS_REFUSED: &str =
+        "Invalid ARN: account numbers are not acceptable for template ARNs!";
+
+    // Rows: the ways an ARN can carry an account NUMBER — this account's own id, another
+    // account's, in another partition, in another Region, and under another IAM resource
+    // type — so the rule is read over the account field rather than over one ARN.
+    let refused = [
+        (
+            "this account's own id",
+            format!(
+                "arn:aws:iam::{}:policy-template/PartnerDropReadWrite",
+                account_id()
+            ),
+        ),
+        (
+            "another account's id",
+            "arn:aws:iam::210987654321:policy-template/PartnerDrop".to_string(),
+        ),
+        (
+            "an account number in another partition",
+            "arn:aws-cn:iam::210987654321:policy-template/PartnerDrop".to_string(),
+        ),
+        (
+            "an account number beside a Region",
+            "arn:aws:iam:us-east-1:210987654321:policy-template/PartnerDrop".to_string(),
+        ),
+        (
+            "an account number under another IAM resource type",
+            "arn:aws:iam::210987654321:role-template/PartnerDeployment".to_string(),
+        ),
+    ];
+
+    for (row, (case, template)) in refused.iter().enumerate() {
+        let (status, body) = create(
+            &router,
+            None,
+            &Filing {
+                policy_template_arn: Some(template.clone()),
+                ..filing(&format!("workflow-account-number-{row}"))
+            },
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationError",
+            "case {case:?}: expected ValidationError, got {:?}: {body}",
+            error_code(&body)
+        );
+        assert_eq!(
+            element(&body, "Message"),
+            ACCOUNT_NUMBERS_REFUSED,
+            "case {case:?}: unexpected refusal wording: {body}"
+        );
+    }
+
+    assert!(
+        held(&engine).is_empty(),
+        "a refused filing stores nothing, got {:?}",
+        held(&engine)
+    );
+
+    // The control: the account field a published template's ARN DOES carry — the publisher
+    // AWS writes there, and no account at all — names a template, so those filings are
+    // served.
+    let accepted = [
+        (
+            "the publisher in the account field",
+            "arn:aws:iam::aws:policy-template/PartnerDropReadWrite",
+        ),
+        (
+            "no account at all",
+            "arn:aws:iam:::policy-template/PartnerDropReadWrite",
+        ),
+        (
+            // A field that is not empty and is not a number names a publisher too.
+            "a publisher in another partition",
+            "arn:aws-cn:iam::aws:policy-template/PartnerDrop",
+        ),
+    ];
+    for (row, (case, template)) in accepted.iter().enumerate() {
+        let (status, body) = create(
+            &router,
+            None,
+            &Filing {
+                policy_template_arn: Some((*template).to_string()),
+                ..filing(&format!("workflow-published-template-{row}"))
+            },
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected a published template's ARN to be accepted, got \
+             {status}: {body}"
+        );
+    }
+    assert_eq!(
+        held(&engine).len(),
+        accepted.len(),
+        "only the accepted filings may be held: {:?}",
         held(&engine)
     );
 }

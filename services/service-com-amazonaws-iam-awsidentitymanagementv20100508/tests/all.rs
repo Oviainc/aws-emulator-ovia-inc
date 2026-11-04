@@ -29,6 +29,8 @@ mod access_keys;
 mod account_aliases;
 #[path = "all/account_authorization_details.rs"]
 mod account_authorization_details;
+#[path = "all/account_password_policy.rs"]
+mod account_password_policy;
 #[path = "all/account_properties.rs"]
 mod account_properties;
 #[path = "all/account_singleton_authorization.rs"]

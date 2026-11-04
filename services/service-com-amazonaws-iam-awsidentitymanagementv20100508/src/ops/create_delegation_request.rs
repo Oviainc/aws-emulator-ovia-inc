@@ -224,13 +224,22 @@ fn notification_channel_refusal(value: &str) -> Option<&'static str> {
 /// A permission that supplies NO template ARN at all supplies no ARN to read, so it is
 /// refused exactly as a value that cannot be read as one: either way the permission names
 /// no pre-registered policy content, which is what it has to name to delegate anything.
+///
+/// A template is published by a SERVICE rather than owned by an account, so the last thing
+/// read is the ARN's ACCOUNT field: a template ARN carrying an account number names no
+/// template IAM publishes, and is refused in the sentence this crate states that rule with
+/// (`crate::state::TEMPLATE_ARN_WITH_ACCOUNT_NUMBER`). The three readings are taken in the
+/// order they narrow the value down — it has to be an ARN, then an ARN of IAM, then one
+/// whose account field is not a number — so one value cannot answer two sentences.
 fn policy_template_refusal(value: Option<&str>) -> Option<&'static str> {
     let Some(value) = value.filter(|value| ::service_common::arn::parse(value).is_some()) else {
         return Some(crate::state::ARN_UNPARSEABLE);
     };
-    ::service_common::arn::parse_of(value, IAM_VENDOR)
-        .is_none()
-        .then_some(crate::state::ARN_WRONG_RESOURCE_TYPE)
+    if ::service_common::arn::parse_of(value, IAM_VENDOR).is_none() {
+        return Some(crate::state::ARN_WRONG_RESOURCE_TYPE);
+    }
+    crate::state::template_arn_carries_account_number(value)
+        .then_some(crate::state::TEMPLATE_ARN_WITH_ACCOUNT_NUMBER)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative

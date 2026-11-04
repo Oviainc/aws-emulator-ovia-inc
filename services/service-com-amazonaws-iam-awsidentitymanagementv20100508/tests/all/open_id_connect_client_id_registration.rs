@@ -25,14 +25,17 @@
 //! request is the specification.
 //!
 //! The DELETE half is the second rule: it FORGETS the named provider with everything held
-//! on it, is idempotent ("it does not fail or return an error if you call the operation for
-//! a provider that does not exist"), and updates nothing that references the provider — so
-//! a later read of that ARN is a 404, the URL it was registered under is free again, and
-//! every other provider is untouched.
+//! on it, refuses an ARN the account holds no provider under with `404` `NoSuchEntity`
+//! (against its doc's claim of idempotency — the measured answer to the second delete is
+//! that refusal), and updates nothing that references the provider — so a later read of that
+//! ARN is a 404, the URL it was registered under is free again, and every other provider is
+//! untouched.
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::open_id_connect_providers::{absence_message, client_ids, list_members};
+use crate::open_id_connect_providers::{
+    absence_message, client_ids, list_members, tagging_absence_message,
+};
 use crate::role_lifecycle::{borrowed, param, reported_tags};
 use crate::user_lifecycle::{account_id, call, element, error_code, router};
 
@@ -587,11 +590,11 @@ async fn adding_to_a_provider_the_account_does_not_hold_is_refused() {
 // ---------------------------------------------------------------------------
 
 /// A delete forgets the named provider and nothing else: its ARN stops resolving, every
-/// other provider the account holds is untouched, repeating the delete still succeeds, and
-/// the URL it was registered under is free again — while a value that is not an ARN is
-/// refused `InvalidInput`.
+/// other provider the account holds is untouched, repeating the delete is refused as the
+/// missing entity the provider now is, and the URL it was registered under is free again —
+/// while a value that is not an ARN is refused `InvalidInput`.
 #[tokio::test]
-async fn deleting_a_provider_forgets_only_that_provider_and_is_idempotent() {
+async fn deleting_a_provider_forgets_only_that_provider() {
     let router = router();
     // Rows: providers whose records differ in what is held on them, so the delete is
     // exercised on more than one shape of record.
@@ -610,11 +613,22 @@ async fn deleting_a_provider_forgets_only_that_provider_and_is_idempotent() {
         let arn = &arns[index];
         for attempt in 1..=3 {
             let (status, body) = delete(&router, arn).await;
+            // The FIRST delete forgets the provider; every later one addresses an ARN the
+            // account now holds nothing under, which is the missing entity every other call
+            // on that ARN reports.
+            let expected = if attempt == 1 { 200 } else { 404 };
             assert_eq!(
-                status, 200,
-                "case {name:?}: attempt {attempt}: expected HTTP 200, got {status} with body \
-                 {body}"
+                status, expected,
+                "case {name:?}: attempt {attempt}: expected HTTP {expected}, got {status} with \
+                 body {body}"
             );
+            if attempt > 1 {
+                assert_eq!(
+                    error_code(&body),
+                    "NoSuchEntity",
+                    "case {name:?}: attempt {attempt}: expected NoSuchEntity, got {body}"
+                );
+            }
             let (status, after) = read(&router, arn).await;
             assert_eq!(
                 status, 404,
@@ -681,18 +695,24 @@ async fn deleting_a_provider_forgets_only_that_provider_and_is_idempotent() {
         );
     }
 
-    // "This operation is idempotent; it does not fail or return an error if you call the
-    // operation for a provider that does not exist": a well-formed ARN naming no provider is
-    // answered as the deletion it already is.
+    // A well-formed ARN naming no provider is refused as the missing entity it is, in the
+    // sentence this family words that absence with — not answered as the deletion it already
+    // is, which is what this operation's own doc claims.
     for arn in [
         format!("arn:aws:iam::{}:oidc-provider/never.example.net", account_id()),
         "arn:aws:iam::111122223333:oidc-provider/kept-three.example.net".to_string(),
     ] {
         let (status, body) = delete(&router, &arn).await;
         assert_eq!(
-            status, 200,
-            "case {arn:?}: deleting a provider the account does not hold expected HTTP 200, got \
-             {status} with body {body}"
+            (status, error_code(&body).as_str()),
+            (404, "NoSuchEntity"),
+            "case {arn:?}: deleting a provider the account does not hold expected (404, \
+             NoSuchEntity), got ({status}, {body})"
+        );
+        assert_eq!(
+            element(&body, "Message"),
+            tagging_absence_message(&arn),
+            "case {arn:?}: expected the family's absence wording, got {body}"
         );
     }
 }

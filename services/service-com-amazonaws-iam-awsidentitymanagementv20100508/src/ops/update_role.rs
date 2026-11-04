@@ -7,6 +7,11 @@
 //! what this call stored. A member the request leaves out is not changed: the two settings
 //! this call takes are updated independently of one another.
 //!
+//! The maximum session duration of a role a service links to ITSELF is not the account's to
+//! move, so a request asking to change it on such a role is refused
+//! `UnmodifiableEntityException`; its description is, so a request carrying only that is
+//! served.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -174,13 +179,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so the role keeps what it held — the description `CreateRole` or
         // `UpdateRoleDescription` wrote, and the duration `CreateRole` stored. No other
         // member of the record is touched.
-        //
-        // Both settings belong to the account's own record of the role rather than to
-        // its permissions or its trust relationship, so a role a service links itself
-        // to is updated here like any other: the protected-entity refusal this operation
-        // also models guards the calls that change such a role's trust policy, its
-        // attached or inline permissions, or its existence (`UpdateAssumeRolePolicy`,
-        // `AttachRolePolicy`, `PutRolePolicy`, `DeleteRole`), not these two settings.
         let key = crate::state::name_key(&input.role_name);
 
         // IAM authorizes its own API: the signing principal's identity-based policies are
@@ -212,6 +210,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // "Service-linked roles are protected Amazon Web Services resources. Only the
+        // service that depends on the service-linked role can modify or delete the role on
+        // your behalf" (`UnmodifiableEntityException`), and the role's MAXIMUM SESSION
+        // DURATION is one of the settings that protection covers: the service the role is
+        // linked to is what assumes it, so how long a session of it may last is the owning
+        // service's to set. A request asking to move it on such a role is refused with the
+        // modelled `UnmodifiableEntityException`, in the sentence this service states that
+        // refusal with (`crate::state::service_linked_role_session_duration_message`), and
+        // it changes NOTHING — not the duration and not the description the same request
+        // may carry, because the refusal is decided before either is written. The role's
+        // PATH is what says it is service-linked, read through the one reading every
+        // protection in this crate shares.
+        //
+        // The DESCRIPTION is not covered: it belongs to the account's own descriptive
+        // record of the role rather than to its permissions, its trust relationship or its
+        // existence, so a request carrying only a description is served for a
+        // service-linked role exactly as for any other.
+        if input.max_session_duration.is_some()
+            && crate::state::is_service_linked_role_path(&role.path)
+        {
+            return Err(UpdateRoleErrorModeled::UnmodifiableEntityException(
+                UnmodifiableEntityException {
+                    message: Some(crate::state::service_linked_role_session_duration_message(
+                        &input.role_name,
+                    )),
+                },
+            )
+            .into());
+        }
         if let Some(description) = input.description {
             role.description = Some(description);
         }

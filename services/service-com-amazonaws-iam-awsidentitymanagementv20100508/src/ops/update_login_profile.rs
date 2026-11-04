@@ -277,17 +277,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`LoginProfile` carries only the user name, the create date and the reset
         // flag) and the model marks the member sensitive.
         //
-        // `PasswordPolicyViolationException` is DECLINED for the reason it cannot
-        // arise: it refuses a password that "did not meet the requirements imposed
-        // by the account password policy", and no account password policy can exist
-        // while `UpdateAccountPasswordPolicy` is unimplemented; `passwordType`'s
-        // own length and alphabet constraints are enforced before this handler
-        // runs. `LimitExceededException` is declined too: an update creates no
+        // `PasswordPolicyViolationException` refuses a password that "did not meet the
+        // requirements imposed by the account password policy", so the policy in force is
+        // evaluated before anything is written — through the one place this service decides
+        // that question (`crate::state::password_policy_violation`), which also answers it
+        // for `CreateLoginProfile` and `ChangePassword` — and the refusal names the rule
+        // that was broken. A refused update changes nothing at all: the user keeps the
+        // password and the reset flag it already had, because the decision precedes the
+        // write.
+        //
+        // `LimitExceededException` is declined: an update creates no
         // entity, so it reaches no quota. So is
         // `EntityTemporarilyUnmodifiableException`, which reports "a user name that
         // was deleted and then recreated": every delete and create in this
         // emulator takes effect at once, so no entity is ever temporarily
         // unmodifiable.
+        if let Some(violation) = input
+            .password
+            .as_deref()
+            .and_then(|password| store.password_policy_violation(password))
+        {
+            ::tracing::info!(
+                audit = true,
+                operation = "UpdateLoginProfile",
+                outcome = "refused_password_policy_violation",
+                caller_akid = %caller_akid,
+                user_key = %user_key,
+                "no login profile was updated"
+            );
+            return Err(
+                UpdateLoginProfileErrorModeled::PasswordPolicyViolationException(
+                    PasswordPolicyViolationException {
+                        message: Some(violation),
+                    },
+                )
+                .into(),
+            );
+        }
         let held_password = input
             .password
             .map(|password| store.hold_password(&password));

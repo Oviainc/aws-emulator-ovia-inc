@@ -351,19 +351,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the administrative update do: nothing reports a password back, the model
         // marks both members sensitive, and neither password is logged or echoed.
         //
-        // `PasswordPolicyViolationException` is DECLINED for the reason it cannot
-        // arise: it refuses a password that "did not meet the requirements imposed by
-        // the account password policy", and no account password policy can exist while
-        // `UpdateAccountPasswordPolicy` is unimplemented; `passwordType`'s own length
-        // and alphabet constraints are enforced before this handler runs. Once a policy
-        // CAN be in force, a `NewPassword` it does not admit is refused here with
-        // [`PASSWORD_CHANGE_REFUSED`] — the one sentence that covers both that
-        // condition and a stale `OldPassword` without disclosing which failed.
-        // `LimitExceededException` is declined too — a change creates no entity, so it
+        // Before that, the new password has to be one the ACCOUNT admits: a password that
+        // "did not meet the requirements imposed by the account password policy" is what
+        // `PasswordPolicyViolationException` refuses, so the policy in force is evaluated
+        // here through the one place this service decides that question
+        // (`crate::state::password_policy_violation`), which also answers it for
+        // `CreateLoginProfile` and `UpdateLoginProfile`. THIS operation answers the refusal
+        // on the authorization channel instead of through the modelled shape, because the
+        // sentence measured for it is the one that covers BOTH this condition and a stale
+        // `OldPassword` without disclosing which failed ([`PASSWORD_CHANGE_REFUSED`]) — the
+        // caller here is the user itself, so telling it which of the two failed would tell
+        // an unauthenticated caller whether it guessed the current password. A refused
+        // change leaves the password in force exactly as it was.
+        //
+        // `LimitExceededException` is declined — a change creates no entity, so it
         // reaches no quota — and so is `EntityTemporarilyUnmodifiableException`, which
         // reports "a user name that was deleted and then recreated": every delete and
         // create in this emulator takes effect at once, so no entity is ever
         // temporarily unmodifiable.
+        if store
+            .password_policy_violation(&input.new_password)
+            .is_some()
+        {
+            ::tracing::info!(
+                audit = true,
+                operation = "ChangePassword",
+                outcome = "refused_password_policy_violation",
+                caller_akid = %caller_akid,
+                user_key = %user_key,
+                "no password was changed"
+            );
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                PASSWORD_CHANGE_REFUSED,
+            ));
+        }
         let held_password = store.hold_password(&input.new_password);
         let Some(held) = store.login_profiles.get_mut(&user_key) else {
             return Err(ChangePasswordErrorModeled::ServiceFailureException(

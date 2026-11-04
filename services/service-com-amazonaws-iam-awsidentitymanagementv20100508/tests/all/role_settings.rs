@@ -486,10 +486,11 @@ async fn updating_a_role_the_account_does_not_hold_is_not_found() {
     );
 }
 
-/// RULE: a role's description and maximum session duration are settings of the account's
-/// own record of it, not the permissions or trust relationship a service-linked role
-/// protects — so this update is served for such a role exactly as for any other, and a
-/// later `GetRole` reports what it wrote.
+/// RULE: a role's DESCRIPTION is a setting of the account's own record of it, not one of
+/// the properties a service-linked role protects — so an update carrying only a description
+/// is served for such a role exactly as for any other, and a later `GetRole` reports what
+/// it wrote. Its MAXIMUM SESSION DURATION is the owning service's, so an update carrying
+/// one is refused `UnmodifiableEntity` and writes neither setting.
 #[tokio::test]
 async fn updating_a_service_linked_roles_settings_is_served() {
     let router = router();
@@ -512,7 +513,9 @@ async fn updating_a_service_linked_roles_settings_is_served() {
             "case {principal:?}: CreateServiceLinkedRole must succeed, got {status}: {created}"
         );
         let role_name = element(&created, "RoleName");
-        let (mut held_description, mut held_duration) = read_settings(&router, &role_name).await;
+        // The settings the owning service's create left on the role: the duration no row
+        // below may move, and the description the served rows replace.
+        let (mut held_description, created_duration) = read_settings(&router, &role_name).await;
 
         for update_case in update_cases() {
             let case = format!("{principal} / {}", update_case.case);
@@ -523,25 +526,49 @@ async fn updating_a_service_linked_roles_settings_is_served() {
                 update_case.max_session_duration,
             )
             .await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: expected 200 for a service-linked role, got {status}: {body}"
-            );
-            assert!(
-                elements(&body, "Code").is_empty(),
-                "case {case:?}: a successful update must carry no error code: {body}"
-            );
-
-            if let Some(description) = &update_case.description {
-                held_description = description.clone();
+            // The duration belongs to the service the role is linked to: a request asking
+            // to move it is refused whatever else it carries, and a request that asks only
+            // about the description is served.
+            if update_case.max_session_duration.is_some() {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected a duration change on a service-linked role to \
+                     be refused, got {status}: {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "UnmodifiableEntity",
+                    "case {case:?}: expected the modelled awsQuery code, got {body}"
+                );
+                let message = element(&body, "Message");
+                assert_eq!(
+                    message,
+                    format!(
+                        "{role_name} is an AWS service linked role, max session duration \
+                         cannot be changed."
+                    ),
+                    "case {case:?}: expected AWS's UnmodifiableEntity wording, got {message:?}"
+                );
+            } else {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected 200 for a service-linked role, got {status}: \
+                     {body}"
+                );
+                assert!(
+                    elements(&body, "Code").is_empty(),
+                    "case {case:?}: a successful update must carry no error code: {body}"
+                );
+                if let Some(description) = &update_case.description {
+                    held_description = description.clone();
+                }
             }
-            if let Some(duration) = update_case.max_session_duration {
-                held_duration = duration.to_string();
-            }
+            // A refused update writes NEITHER setting, so the expected pair is the one the
+            // served rows left behind — with the duration still the one the create set.
             let read = read_settings(&router, &role_name).await;
             assert_eq!(
                 read,
-                (held_description.clone(), held_duration.clone()),
+                (held_description.clone(), created_duration.clone()),
                 "case {case:?}: expected GetRole to report the settings the update wrote, \
                  got {read:?}"
             );

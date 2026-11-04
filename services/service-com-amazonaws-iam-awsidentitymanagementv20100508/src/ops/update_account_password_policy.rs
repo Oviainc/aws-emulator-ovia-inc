@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccountPasswordPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccountPasswordPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccountPasswordPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -211,18 +202,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccountPasswordPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAccountPasswordPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateAccountPasswordPolicyErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // A mutation: the operation "updates the password policy settings for the
+        // Amazon Web Services account", so the lock is held for write.
+        let mut store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the policy is written. This request addresses the account's own
+        // configuration rather than one entity in it, so the decision is made on the
+        // account-wide resource, exactly as `PutAccountProperties` and
+        // `CreateAccountAlias` decide — and a refused call leaves the policy the account
+        // already holds in force, because the decision precedes the write.
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::UPDATE_ACCOUNT_PASSWORD_POLICY,
+            crate::state::authorization::ACCOUNT_WIDE_RESOURCE,
+        )?;
+
+        // "This operation does not support partial updates. No parameters are required,
+        // but if you do not specify a parameter, that parameter's value reverts to its
+        // default value": the write REPLACES the whole record, so the policy is built from
+        // this request alone and a member it omits takes the default the model documents
+        // for it rather than the value the account held
+        // (`crate::state::AccountPasswordPolicy::from_request`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccountPasswordPolicy"))
+        // Every modelled range — the minimum length's 6..128, the maximum age's 1..1095,
+        // the reuse window's 1..24 — is enforced before this handler runs, so what arrives
+        // here is already a policy IAM can hold.
+        //
+        // `MalformedPolicyDocumentException` is DECLINED: this request carries no policy
+        // DOCUMENT at all, only the account's password settings, so there is nothing that
+        // can be malformed. `LimitExceededException` is declined too — an account holds
+        // exactly one password policy, which this call replaces rather than adds to, so no
+        // quota is reached — and so is `NoSuchEntityException`: the resource the call
+        // addresses is the account itself, which exists for as long as anything is served.
+        let policy = crate::state::AccountPasswordPolicy::from_request(&input);
+
+        // Audit record for a change to the account's own security configuration: who asked
+        // and what the account now requires of a password. Only the settings themselves —
+        // no password is involved in this call at all.
+        ::tracing::info!(
+            audit = true,
+            operation = "UpdateAccountPasswordPolicy",
+            outcome = "updated",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            minimum_password_length = policy.minimum_password_length,
+            "the account password policy was replaced"
+        );
+
+        store.account_password_policy = Some(policy);
+
+        // `UpdateAccountPasswordPolicy` answers no members, so the policy just written is
+        // reported by the readers of it and enforced by the operations that set a
+        // password, not by this response.
+        Ok(UpdateAccountPasswordPolicyOutput)
     }
 }

@@ -2,8 +2,10 @@
 
 //! @op DeleteOpenIDConnectProvider
 //! Forgets a held IAM OpenID Connect provider, with the client IDs, thumbprints and tags
-//! held on it, and is idempotent: "it does not fail or return an error if you call the
-//! operation for a provider that does not exist" (this operation's own doc).
+//! held on it, and refuses an `OpenIDConnectProviderArn` the account holds no provider
+//! under with `404` `NoSuchEntity` — the answer measured for that request, against this
+//! operation's own doc claim that it "is idempotent; it does not fail or return an error if
+//! you call the operation for a provider that does not exist".
 //!
 //! Nothing that NAMES the provider is touched — "deleting an IAM OIDC provider resource
 //! does not update any roles that reference the provider as a principal in their trust
@@ -194,12 +196,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Deleting an IAM OIDC provider resource does not update any roles that reference
         // the provider as a principal in their trust policies. Any attempt to assume a role
-        // that references a deleted provider fails. This operation is idempotent; it does
-        // not fail or return an error if you call the operation for a provider that does
-        // not exist" (this operation's own doc): the record and everything held on it (its
-        // client IDs, thumbprints and tags) are forgotten, nothing that NAMES the provider
-        // is touched, and an ARN the account holds no provider for is answered as the
-        // deletion it already is.
+        // that references a deleted provider fails" (this operation's own doc): the record
+        // and everything held on it (its client IDs, thumbprints and tags) are forgotten,
+        // and nothing that NAMES the provider is touched.
+        //
+        // The doc's further claim — that the operation "is idempotent; it does not fail or
+        // return an error if you call the operation for a provider that does not exist" —
+        // is NOT what the service answers: a measured delete of an ARN the account holds no
+        // provider under is refused `404` `NoSuchEntity`, which is also the one client error
+        // besides `InvalidInput` this operation models. A delete addressed by a resource
+        // identifier therefore reports the same absence every other call on that identifier
+        // reports, so a client can tell a delete it performed from a delete it raced, and
+        // the wording is the family's own
+        // (`crate::state::open_id_connect_provider_cannot_be_found`) rather than one this
+        // handler words for itself.
         let mut store = state.lock();
 
         // IAM authorizes its own API: the signing principal's identity-based policies are
@@ -214,9 +224,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.open_id_connect_provider_arn,
             &format!("oidc-provider {}", input.open_id_connect_provider_arn),
         )?;
-        store
+        if store
             .open_id_connect_providers
-            .remove(&input.open_id_connect_provider_arn);
+            .remove(&input.open_id_connect_provider_arn)
+            .is_none()
+        {
+            return Err(
+                DeleteOpenIDConnectProviderErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(
+                            crate::state::open_id_connect_provider_cannot_be_found(
+                                &input.open_id_connect_provider_arn,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
 
         Ok(DeleteOpenIDConnectProviderOutput)
     }

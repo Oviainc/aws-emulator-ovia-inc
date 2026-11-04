@@ -21,10 +21,11 @@
 //! what the sentence is cannot notice the helper changing, so the texts themselves are
 //! pinned here.
 //!
-//! `DeleteOpenIDConnectProvider` is not here: "this operation is idempotent; it does not
-//! fail or return an error if you call the operation for a provider that does not exist"
-//! (its own doc), so it has no absence sentence to word — the control pass below asserts it
-//! answers `200` for an ARN nothing is held under.
+//! `DeleteOpenIDConnectProvider` is here too, wording the absence the tag-mutation way,
+//! against its own doc's claim that "this operation is idempotent; it does not fail or
+//! return an error if you call the operation for a provider that does not exist": the
+//! measured answer to a delete of an ARN nothing is held under is that refusal, so the
+//! delete has an absence sentence like every other call addressed by this member.
 //!
 //! Every assertion drives a `MultiServiceRouter` holding this service over one shared
 //! `InMemoryEngine`, exactly as the production router does, so what is under test is the
@@ -149,6 +150,11 @@ const PROVIDER_ARN_CALLS: &[ProviderArnCall] = &[
         action: "UntagOpenIDConnectProvider",
         wording: AbsenceWording::TagMutation,
         extra: &[("TagKeys.member.1", HELD_TAG_KEY)],
+    },
+    ProviderArnCall {
+        action: "DeleteOpenIDConnectProvider",
+        wording: AbsenceWording::TagMutation,
+        extra: &[],
     },
 ];
 
@@ -290,21 +296,6 @@ async fn an_unresolvable_provider_arn_is_refused_with_aws_wording() {
                 "case {case:?}: expected AWS's NoSuchEntity wording, got {message:?}"
             );
         }
-
-        // "This operation is idempotent; it does not fail or return an error if you call the
-        // operation for a provider that does not exist" (`DeleteOpenIDConnectProvider`): the
-        // one operation on this member with no absence sentence answers the deletion it
-        // already is.
-        let (status, body) = call(
-            &router,
-            "DeleteOpenIDConnectProvider",
-            &[("OpenIDConnectProviderArn", arn)],
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {what:?}: DeleteOpenIDConnectProvider is idempotent, got {status}: {body}"
-        );
     }
 
     // None of the refused calls above wrote anything: the ARNs that resolved to nothing
@@ -369,7 +360,12 @@ async fn an_unresolvable_provider_arn_is_refused_with_aws_wording() {
 async fn the_held_provider_arn_is_served_by_every_operation() {
     let (router, held) = fixture().await;
 
-    for call_under_test in PROVIDER_ARN_CALLS {
+    for call_under_test in PROVIDER_ARN_CALLS
+        .iter()
+        // The delete is driven last, below: it FORGETS the provider, so running it among
+        // the rest would leave the read-back nothing to report.
+        .filter(|candidate| candidate.action != "DeleteOpenIDConnectProvider")
+    {
         let action = call_under_test.action;
         let (status, body) = provider_arn_call(&router, call_under_test, &held).await;
         assert_eq!(
@@ -419,5 +415,35 @@ async fn the_held_provider_arn_is_served_by_every_operation() {
         vec![ADDED_TAG_VALUE.to_string()],
         "case held provider: the tag row's value must be reported with its key, got \
          {values:?}"
+    );
+
+    // The last row: the delete is served for the ARN the account DOES hold, and the ARN it
+    // forgets then answers the refusal every row of the table above asserts.
+    let (status, body) = call(
+        &router,
+        "DeleteOpenIDConnectProvider",
+        &[("OpenIDConnectProviderArn", &held)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case held provider: the delete must be served, got {status}: {body}"
+    );
+    let (status, body) = call(
+        &router,
+        "DeleteOpenIDConnectProvider",
+        &[("OpenIDConnectProviderArn", &held)],
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "case held provider: a second delete addresses an ARN nothing is held under, got \
+         {status}: {body}"
+    );
+    let message = element(&body, "Message");
+    assert_eq!(
+        message,
+        expected_absence_message(AbsenceWording::TagMutation, &held),
+        "case held provider: expected AWS's NoSuchEntity wording, got {message:?}"
     );
 }

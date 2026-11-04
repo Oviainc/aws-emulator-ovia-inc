@@ -299,14 +299,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports one back (`LoginProfile` carries only the user name, the create date
         // and the reset flag) and the model marks the member sensitive.
         //
-        // `PasswordPolicyViolationException` is DECLINED for the reason it cannot
-        // arise: it refuses a password that "did not meet the requirements imposed
-        // by the account password policy", and no account password policy can exist
-        // while `UpdateAccountPasswordPolicy` is unimplemented; `passwordType`'s own
-        // length and alphabet constraints are enforced before this handler runs.
-        // `LimitExceededException` is declined too: a login profile is bounded by
-        // its user (at most one each), so the account's user quota — enforced by
-        // `CreateUser` — is the only limit there is.
+        // Before any of that, the password has to be one the ACCOUNT admits: a password
+        // that "did not meet the requirements imposed by the account password policy" is
+        // what `PasswordPolicyViolationException` refuses, so the policy in force is
+        // evaluated here — through the one place this service decides that question
+        // (`crate::state::password_policy_violation`), which also answers it for
+        // `UpdateLoginProfile` and `ChangePassword` — and the refusal names the rule that
+        // was broken. Nothing is created for a password the account will not take: the
+        // decision precedes the write, so the user is left with no login profile rather
+        // than with one carrying a password the policy forbids.
+        //
+        // `LimitExceededException` is declined: a login profile is bounded by its user (at
+        // most one each), so the account's user quota — enforced by `CreateUser` — is the
+        // only limit there is.
+        if let Some(violation) = store.password_policy_violation(&password) {
+            ::tracing::info!(
+                audit = true,
+                operation = "CreateLoginProfile",
+                outcome = "refused_password_policy_violation",
+                caller_akid = %caller_akid,
+                user_key = %user_key,
+                "no login profile was created"
+            );
+            return Err(
+                CreateLoginProfileErrorModeled::PasswordPolicyViolationException(
+                    PasswordPolicyViolationException {
+                        message: Some(violation),
+                    },
+                )
+                .into(),
+            );
+        }
         let held_password = store.hold_password(&password);
         drop(password);
 

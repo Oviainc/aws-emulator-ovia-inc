@@ -1,0 +1,599 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The account password policy and the operations that SET a console password, end to end
+//! over the awsQuery wire.
+//!
+//! RULE: `UpdateAccountPasswordPolicy` replaces the account's password policy wholesale,
+//! and every operation that sets an IAM user's console password evaluates the password it
+//! carries against the policy in force — a password that breaks one of the policy's content
+//! rules (its minimum length, or a character class it requires) is REFUSED and nothing is
+//! written, so the user is left with the password it already had, or with none at all.
+//!
+//! The refusal differs by operation only in its channel, because that is what the two
+//! families were measured answering: the administrative writes (`CreateLoginProfile`,
+//! `UpdateLoginProfile`) answer the modelled `PasswordPolicyViolationException` — HTTP 400,
+//! awsQuery code `PasswordPolicyViolation` — whose message NAMES the rule that was broken,
+//! while `ChangePassword`, which a user makes about its own password, answers HTTP 403
+//! `AccessDenied` with the one fixed sentence that covers a policy violation and a stale
+//! old password alike, so a caller cannot read out of it which of the two failed.
+//!
+//! Each test is a TABLE whose rows differ along what the rule generalises over: which rule
+//! of the policy a password breaks, the minimum length the policy sets (both published
+//! bounds of `minimumPasswordLengthType` among them), which character class it demands, the
+//! symbol a password satisfies the symbol rule with, and which of the three password-setting
+//! operations carries the password. No single request is the specification.
+//!
+//! The awsQuery harness (`router`, `call`, `call_signed_by`, `element`, `error_code`) is the
+//! one `tests/all/user_lifecycle.rs` owns and every suite in this crate shares.
+
+use smithy_server_runtime::MultiServiceRouter;
+
+use crate::user_lifecycle::{call, call_signed_by, element, error_code, router};
+
+/// The awsQuery error code the administrative writes answer a password the policy does not
+/// admit with: `PasswordPolicyViolationException`'s own `awsQueryError` code
+/// (`smithy_query(query="operation", operation="CreateLoginProfile")`), carried with HTTP
+/// 400.
+const VIOLATION_CODE: &str = "PasswordPolicyViolation";
+
+/// The code `ChangePassword` answers the same condition with. See this module's header.
+const CHANGE_REFUSED_CODE: &str = "AccessDenied";
+
+/// The WHOLE sentence a refused `ChangePassword` carries, spelled out here rather than read
+/// from the handler so a change of the wording fails this suite instead of following it. It
+/// interpolates nothing at all: one sentence covers both the policy violation and a stale
+/// `OldPassword`.
+const CHANGE_REFUSED_MESSAGE: &str = "Either the new password does not conform to the \
+     account password policy or the old password was incorrect.";
+
+/// The published floor of `minimumPasswordLengthType`'s range, 6..128
+/// (`smithy_query(query="shape", shape="minimumPasswordLengthType")`), which is also the
+/// minimum an account that never named one holds: "if you do not specify a value for this
+/// parameter, then the operation uses the default value of `6`".
+const MIN_MINIMUM_PASSWORD_LENGTH: usize = 6;
+
+/// The published ceiling of that range. See [`MIN_MINIMUM_PASSWORD_LENGTH`].
+const MAX_MINIMUM_PASSWORD_LENGTH: usize = 128;
+
+/// Every symbol `PasswordPolicy$RequireSymbols` lists as satisfying that rule: "! @ # $ % ^
+/// & * ( ) _ + - = [ ] { } | '". Written out here as the catalog this suite reads the rule
+/// over, so each one is exercised rather than only the first.
+const POLICY_SYMBOLS: &[char] = &[
+    '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '-', '=', '[', ']', '{', '}', '|',
+    '\'',
+];
+
+/// The sentence AWS names the symbol rule with, in the spelling
+/// `PasswordPolicy$RequireSymbols` writes the set out in.
+const SYMBOL_RULE_MESSAGE: &str =
+    "Password should have at least one of the following symbols: ! @ # $ % ^ & * ( ) _ + - = \
+     [ ] { } | '";
+
+/// One rule of the policy, as a row states it: the policy to put in force, a password that
+/// breaks exactly that rule, the sentence naming it, and a password the same policy admits.
+struct Rule {
+    case: &'static str,
+    /// The `UpdateAccountPasswordPolicy` parameters this row sets.
+    policy: Vec<(&'static str, String)>,
+    /// A password the policy above refuses.
+    refused: String,
+    /// The whole message that refusal carries.
+    message: String,
+    /// A password the policy above admits, so the row shows the policy discriminating
+    /// rather than refusing everything.
+    admitted: String,
+}
+
+/// A password long enough for any row's minimum, carrying one of every character class, so
+/// a row that is about ONE rule can state the admitted password from it.
+fn conforming_password(length: usize) -> String {
+    let base = "Aa1!";
+    let mut password = String::from(base);
+    while password.chars().count() < length {
+        password.push('x');
+    }
+    password
+}
+
+/// The rows: one per content rule the policy can state, plus the two published bounds of
+/// the minimum length and a policy stating every rule at once.
+fn rules() -> Vec<Rule> {
+    let shortest = MIN_MINIMUM_PASSWORD_LENGTH;
+    let longest = MAX_MINIMUM_PASSWORD_LENGTH;
+    vec![
+        Rule {
+            case: "the minimum length at the floor of the published range",
+            policy: vec![("MinimumPasswordLength", shortest.to_string())],
+            refused: "a".repeat(shortest - 1),
+            message: format!("Password should have a minimum length of {shortest}"),
+            admitted: "a".repeat(shortest),
+        },
+        Rule {
+            case: "a minimum length inside the published range",
+            policy: vec![("MinimumPasswordLength", "24".to_string())],
+            refused: "a".repeat(23),
+            message: "Password should have a minimum length of 24".to_string(),
+            admitted: "a".repeat(24),
+        },
+        Rule {
+            case: "the minimum length at the ceiling of the published range",
+            policy: vec![("MinimumPasswordLength", longest.to_string())],
+            refused: "a".repeat(longest - 1),
+            message: format!("Password should have a minimum length of {longest}"),
+            // `passwordType` is modelled len 1..128, so the ceiling of the minimum is the
+            // only length that both satisfies this policy and is a legal password.
+            admitted: "a".repeat(longest),
+        },
+        Rule {
+            case: "a required symbol",
+            policy: vec![("RequireSymbols", "true".to_string())],
+            refused: "noSymbols1".to_string(),
+            message: SYMBOL_RULE_MESSAGE.to_string(),
+            admitted: "withSymbol1!".to_string(),
+        },
+        Rule {
+            case: "a required numeric character",
+            policy: vec![("RequireNumbers", "true".to_string())],
+            refused: "noDigitsHere!".to_string(),
+            message: "Password should have at least one numeric character (0 to 9)".to_string(),
+            admitted: "oneDigit7!".to_string(),
+        },
+        Rule {
+            case: "a required uppercase character",
+            policy: vec![("RequireUppercaseCharacters", "true".to_string())],
+            refused: "no uppercase 1!".to_string(),
+            message: "Password should have at least one uppercase character (A to Z)".to_string(),
+            admitted: "One Uppercase 1!".to_string(),
+        },
+        Rule {
+            case: "a required lowercase character",
+            policy: vec![("RequireLowercaseCharacters", "true".to_string())],
+            refused: "NO LOWERCASE 1!".to_string(),
+            message: "Password should have at least one lowercase character (a to z)".to_string(),
+            admitted: "ONE lOWERCASE 1!".to_string(),
+        },
+        Rule {
+            case: "every rule at once, refused by the first the password breaks",
+            policy: vec![
+                ("MinimumPasswordLength", "12".to_string()),
+                ("RequireSymbols", "true".to_string()),
+                ("RequireNumbers", "true".to_string()),
+                ("RequireUppercaseCharacters", "true".to_string()),
+                ("RequireLowercaseCharacters", "true".to_string()),
+            ],
+            // Short AND missing every class: the rules are taken in the order
+            // `PasswordPolicy` declares them, so the length is the one reported.
+            refused: "short".to_string(),
+            message: "Password should have a minimum length of 12".to_string(),
+            admitted: conforming_password(12),
+        },
+    ]
+}
+
+/// Put `policy` in force as the account's password policy.
+async fn set_policy(router: &MultiServiceRouter, case: &str, policy: &[(&str, String)]) {
+    let params: Vec<(&str, &str)> = policy
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+    let (status, body) = call(router, "UpdateAccountPasswordPolicy", &params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: UpdateAccountPasswordPolicy must be served, got {status}: {body}"
+    );
+}
+
+/// Create `user`, with no console password.
+async fn create_user(router: &MultiServiceRouter, case: &str, user: &str) {
+    let (status, body) = call(router, "CreateUser", &[("UserName", user)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the fixture CreateUser must succeed, got {status}: {body}"
+    );
+}
+
+/// One `CreateLoginProfile`.
+async fn create_login_profile(
+    router: &MultiServiceRouter,
+    user: &str,
+    password: &str,
+) -> (u16, String) {
+    call(
+        router,
+        "CreateLoginProfile",
+        &[("UserName", user), ("Password", password)],
+    )
+    .await
+}
+
+/// One `UpdateLoginProfile` carrying a password.
+async fn update_login_profile(
+    router: &MultiServiceRouter,
+    user: &str,
+    password: &str,
+) -> (u16, String) {
+    call(
+        router,
+        "UpdateLoginProfile",
+        &[("UserName", user), ("Password", password)],
+    )
+    .await
+}
+
+/// `GetLoginProfile` for `user`.
+async fn read_profile(router: &MultiServiceRouter, user: &str) -> (u16, String) {
+    call(router, "GetLoginProfile", &[("UserName", user)]).await
+}
+
+/// Mint an access key for `user`, with the one grant a signed `ChangePassword` needs, and
+/// answer that key's id — which is what `ChangePassword` resolves the calling user from.
+async fn signing_key(router: &MultiServiceRouter, case: &str, user: &str) -> String {
+    crate::identity_policy_enforcement::grant_action(router, case, user, "iam:ChangePassword")
+        .await;
+    let (status, minted) = call(router, "CreateAccessKey", &[("UserName", user)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the fixture CreateAccessKey must succeed, got {status}: {minted}"
+    );
+    element(&minted, "AccessKeyId")
+}
+
+/// One `ChangePassword` presented as signed by `akid`.
+async fn change_password(
+    router: &MultiServiceRouter,
+    akid: &str,
+    old_password: &str,
+    new_password: &str,
+) -> (u16, String) {
+    call_signed_by(
+        router,
+        Some(akid),
+        "ChangePassword",
+        &[
+            ("OldPassword", old_password),
+            ("NewPassword", new_password),
+        ],
+    )
+    .await
+}
+
+/// RULE: `CreateLoginProfile` refuses a password the account's policy does not admit with
+/// HTTP 400 `PasswordPolicyViolation`, naming the rule that was broken, and creates no login
+/// profile — so the user still has none, and a later create carrying a password the policy
+/// DOES admit is served.
+#[tokio::test]
+async fn a_create_is_refused_by_the_rule_the_password_breaks() {
+    for (row, rule) in rules().into_iter().enumerate() {
+        // One router per row, so each row's policy is the only one in force.
+        let router = router();
+        set_policy(&router, rule.case, &rule.policy).await;
+        let user = format!("creator{row}");
+        create_user(&router, rule.case, &user).await;
+
+        let (status, body) = create_login_profile(&router, &user, &rule.refused).await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: expected the create to be refused, got {status}: {body}",
+            rule.case
+        );
+        assert_eq!(
+            error_code(&body),
+            VIOLATION_CODE,
+            "case {:?}: expected {VIOLATION_CODE}, got {body}",
+            rule.case
+        );
+        let message = element(&body, "Message");
+        assert_eq!(
+            message, rule.message,
+            "case {:?}: expected the refusal to name the rule broken, got {message:?}",
+            rule.case
+        );
+        assert!(
+            !body.contains(&rule.refused),
+            "case {:?}: the refusal must not echo the password: {body}",
+            rule.case
+        );
+
+        // The cascade the refusal has to leave behind: the user has NO login profile, so
+        // the read reports the absence the family words that way.
+        let (status, body) = read_profile(&router, &user).await;
+        assert_eq!(
+            status, 404,
+            "case {:?}: a refused create must create no login profile, got {status}: {body}",
+            rule.case
+        );
+        assert_eq!(
+            error_code(&body),
+            "NoSuchEntity",
+            "case {:?}: expected NoSuchEntity, got {body}",
+            rule.case
+        );
+        let message = element(&body, "Message");
+        assert_eq!(
+            message,
+            format!("Login Profile for User {user} cannot be found."),
+            "case {:?}: expected the family's absence wording, got {message:?}",
+            rule.case
+        );
+
+        // And the create the policy admits is served, on the very user the refused one
+        // named — not refused as a profile that already exists.
+        let (status, body) = create_login_profile(&router, &user, &rule.admitted).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected a conforming create to be served, got {status}: {body}",
+            rule.case
+        );
+        let reported = element(&body, "UserName");
+        assert_eq!(
+            reported, user,
+            "case {:?}: the created profile must report its user, got {reported:?}",
+            rule.case
+        );
+        let (status, body) = read_profile(&router, &user).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the created profile must read back, got {status}: {body}",
+            rule.case
+        );
+    }
+}
+
+/// RULE: `UpdateLoginProfile` evaluates the same policy, answers the same refusal, and
+/// leaves the password in force untouched — so the password the create set still verifies
+/// afterwards.
+#[tokio::test]
+async fn an_update_is_refused_by_the_rule_the_password_breaks() {
+    for (row, rule) in rules().into_iter().enumerate() {
+        let router = router();
+        let user = format!("updater{row}");
+        create_user(&router, rule.case, &user).await;
+        // The password in force is set BEFORE the policy, so the row is about the update
+        // the policy refuses rather than about the create.
+        let in_force = conforming_password(MAX_MINIMUM_PASSWORD_LENGTH);
+        let (status, body) = create_login_profile(&router, &user, &in_force).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the fixture create must succeed, got {status}: {body}",
+            rule.case
+        );
+        let akid = signing_key(&router, rule.case, &user).await;
+        set_policy(&router, rule.case, &rule.policy).await;
+
+        let (status, body) = update_login_profile(&router, &user, &rule.refused).await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: expected the update to be refused, got {status}: {body}",
+            rule.case
+        );
+        assert_eq!(
+            error_code(&body),
+            VIOLATION_CODE,
+            "case {:?}: expected {VIOLATION_CODE}, got {body}",
+            rule.case
+        );
+        let message = element(&body, "Message");
+        assert_eq!(
+            message, rule.message,
+            "case {:?}: expected the refusal to name the rule broken, got {message:?}",
+            rule.case
+        );
+
+        // The refused update wrote nothing: the password the create set is still the one in
+        // force, which is what a change presenting it as the current password proves.
+        let (status, body) = change_password(&router, &akid, &in_force, &rule.admitted).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the password in force must be the one the create set, got {status}: \
+             {body}",
+            rule.case
+        );
+
+        // And an update carrying a password the policy admits is served.
+        let (status, body) = update_login_profile(&router, &user, &rule.admitted).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected a conforming update to be served, got {status}: {body}",
+            rule.case
+        );
+    }
+}
+
+/// RULE: `ChangePassword` evaluates the same policy and refuses a `NewPassword` it does not
+/// admit with HTTP 403 `AccessDenied` and the one fixed sentence — which names no rule, so a
+/// caller cannot tell it from a stale `OldPassword` — leaving the password in force, which a
+/// change to a conforming password then replaces.
+#[tokio::test]
+async fn a_change_is_refused_without_naming_the_rule() {
+    for (row, rule) in rules().into_iter().enumerate() {
+        let router = router();
+        let user = format!("changer{row}");
+        create_user(&router, rule.case, &user).await;
+        let in_force = conforming_password(MAX_MINIMUM_PASSWORD_LENGTH);
+        let (status, body) = create_login_profile(&router, &user, &in_force).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the fixture create must succeed, got {status}: {body}",
+            rule.case
+        );
+        let akid = signing_key(&router, rule.case, &user).await;
+        set_policy(&router, rule.case, &rule.policy).await;
+
+        let (status, body) = change_password(&router, &akid, &in_force, &rule.refused).await;
+        assert_eq!(
+            status, 403,
+            "case {:?}: expected the change to be refused, got {status}: {body}",
+            rule.case
+        );
+        assert_eq!(
+            error_code(&body),
+            CHANGE_REFUSED_CODE,
+            "case {:?}: expected {CHANGE_REFUSED_CODE}, got {body}",
+            rule.case
+        );
+        let message = element(&body, "Message");
+        assert_eq!(
+            message, CHANGE_REFUSED_MESSAGE,
+            "case {:?}: expected the one fixed sentence, got {message:?}",
+            rule.case
+        );
+        assert!(
+            !message.contains(&user) && !body.contains(&rule.refused),
+            "case {:?}: the refusal must disclose neither the user nor the password: {body}",
+            rule.case
+        );
+
+        // The refused change left the password in force, so a change that presents it and
+        // chooses a conforming new password is served.
+        let (status, body) = change_password(&router, &akid, &in_force, &rule.admitted).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected a conforming change to be served, got {status}: {body}",
+            rule.case
+        );
+    }
+}
+
+/// RULE (the control): an account that has never set a password policy enforces none, so
+/// every password `passwordType` admits is accepted — including one at the published
+/// minimum length of 1.
+#[tokio::test]
+async fn an_account_with_no_policy_admits_every_modelled_password() {
+    let router = router();
+
+    // Rows spanning the class `passwordType` admits: its published minimum length, a value
+    // far below any policy minimum, and its published maximum.
+    let passwords = [
+        ("the published minimum length", "~".to_string()),
+        ("one character of each class", "Aa1!".to_string()),
+        ("the published maximum length", "p".repeat(128)),
+    ];
+    for (row, (case, password)) in passwords.iter().enumerate() {
+        let user = format!("unpoliced{row}");
+        create_user(&router, case, &user).await;
+        let (status, body) = create_login_profile(&router, &user, password).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: with no policy in force the create must be served, got {status}: \
+             {body}"
+        );
+    }
+}
+
+/// RULE: `UpdateAccountPasswordPolicy` "does not support partial updates … if you do not
+/// specify a parameter, that parameter's value reverts to its default value" — so a second
+/// write REPLACES the policy rather than merging into it, and a rule the second write does
+/// not state stops being enforced.
+#[tokio::test]
+async fn a_second_write_replaces_the_whole_policy() {
+    let router = router();
+
+    // In force first: a long minimum plus every character class.
+    set_policy(
+        &router,
+        "the first policy",
+        &[
+            ("MinimumPasswordLength", "24".to_string()),
+            ("RequireSymbols", "true".to_string()),
+            ("RequireNumbers", "true".to_string()),
+            ("RequireUppercaseCharacters", "true".to_string()),
+            ("RequireLowercaseCharacters", "true".to_string()),
+        ],
+    )
+    .await;
+    create_user(&router, "the first policy", "replaced").await;
+    let (status, body) = create_login_profile(&router, "replaced", "Aa1!shortish").await;
+    assert_eq!(
+        status, 400,
+        "case \"the first policy\": a 12-character password must break the 24-character \
+         minimum, got {status}: {body}"
+    );
+
+    // The second write names ONE parameter, so every other rule reverts to its default:
+    // the minimum falls back to 6 and no character class is required any more.
+    set_policy(
+        &router,
+        "the second policy",
+        &[("MinimumPasswordLength", "8".to_string())],
+    )
+    .await;
+    let (status, body) = create_login_profile(&router, "replaced", "aaaaaaaa").await;
+    assert_eq!(
+        status, 200,
+        "case \"the second policy\": the replaced policy must demand no character class, \
+         got {status}: {body}"
+    );
+
+    // And the third write names NOTHING at all, so the minimum itself reverts to the
+    // documented default of 6.
+    set_policy(&router, "the third policy", &[]).await;
+    create_user(&router, "the third policy", "defaulted").await;
+    let (status, body) = create_login_profile(&router, "defaulted", "aaaaaa").await;
+    assert_eq!(
+        status, 200,
+        "case \"the third policy\": a policy naming nothing must hold the documented \
+         6-character minimum, got {status}: {body}"
+    );
+    // A user of its own, so what refuses the five-character password is the policy and not
+    // the profile the row above created.
+    create_user(&router, "the third policy", "defaulted-too").await;
+    let (status, body) = create_login_profile(&router, "defaulted-too", "aaaaa").await;
+    assert_eq!(
+        status, 400,
+        "case \"the third policy\": five characters must still break that minimum, got \
+         {status}: {body}"
+    );
+    assert_eq!(
+        element(&body, "Message"),
+        format!("Password should have a minimum length of {MIN_MINIMUM_PASSWORD_LENGTH}"),
+        "case \"the third policy\": expected the default minimum in the refusal, got {body}"
+    );
+}
+
+/// RULE: the symbol rule is satisfied by EVERY symbol
+/// `PasswordPolicy$RequireSymbols` lists, and by none outside that set — so the catalog the
+/// refusal spells out is the catalog the check reads.
+#[tokio::test]
+async fn every_published_symbol_satisfies_the_symbol_rule() {
+    let router = router();
+    set_policy(
+        &router,
+        "symbols",
+        &[("RequireSymbols", "true".to_string())],
+    )
+    .await;
+
+    for (row, symbol) in POLICY_SYMBOLS.iter().enumerate() {
+        let user = format!("symbol{row}");
+        create_user(&router, &format!("the symbol {symbol:?}"), &user).await;
+        let password = format!("passwordWith{symbol}");
+        let (status, body) = create_login_profile(&router, &user, &password).await;
+        assert_eq!(
+            status, 200,
+            "case {symbol:?}: a published symbol must satisfy the rule, got {status}: {body}"
+        );
+    }
+
+    // A character the published set does NOT carry does not satisfy the rule, and the
+    // refusal spells the set out.
+    for (row, outside) in ['~', '"', '<', ':', ';', ',', '.', '?', '/', '\\']
+        .iter()
+        .enumerate()
+    {
+        let user = format!("outside{row}");
+        create_user(&router, &format!("the character {outside:?}"), &user).await;
+        let password = format!("passwordWith{outside}");
+        let (status, body) = create_login_profile(&router, &user, &password).await;
+        assert_eq!(
+            status, 400,
+            "case {outside:?}: a character outside the published set must not satisfy the \
+             rule, got {status}: {body}"
+        );
+        let message = element(&body, "Message");
+        assert_eq!(
+            message, SYMBOL_RULE_MESSAGE,
+            "case {outside:?}: expected the refusal to spell the published set out, got \
+             {message:?}"
+        );
+    }
+}

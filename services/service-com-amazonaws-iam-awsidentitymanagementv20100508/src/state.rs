@@ -15,7 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ops::types::{
     AttachedPermissionsBoundary, DelegationRequest, Group, InstanceProfile, LoginProfile,
     ParameterDefinition, Policy, PolicyVersion, Role, RoleTemplateVersion, SAMLPrivateKey,
-    ServerCertificateMetadata, ServiceSpecificCredentialMetadata, SigningCertificate, Tag, User,
+    ServerCertificateMetadata, ServiceSpecificCredentialMetadata, SigningCertificate, Tag,
+    UpdateAccountPasswordPolicyInput, User,
 };
 
 pub mod authorization;
@@ -1272,6 +1273,159 @@ pub struct LoginProfileRecord {
     pub password: PasswordVerifier,
 }
 
+/// The account's password policy, as `UpdateAccountPasswordPolicy` wrote it.
+///
+/// One record per account, because the policy IS the account's own configuration:
+/// "updates the password policy settings for the Amazon Web Services account", and the
+/// operation "does not support partial updates … if you do not specify a parameter, that
+/// parameter's value reverts to its default value", so a write REPLACES the whole record
+/// rather than merging into it.
+///
+/// Every member is held as the account holds it, not as the request spelled it: the
+/// request's optional integers already carry the defaults the operation documents
+/// ([`Self::from_request`]), so the stored record answers every rule directly and nothing
+/// reading it has to re-apply a default.
+///
+/// Every member the write carries is held, not only the ones a password check reads: the
+/// policy is what the account CONFIGURED, and the operation that reports it back —
+/// `GetAccountPasswordPolicy`, which this emulator does not route yet — reports all of
+/// them, so the members about expiry, reuse and self-service are stored for that reader
+/// rather than dropped on the floor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountPasswordPolicy {
+    /// "The minimum number of characters allowed in an IAM user password"; the default
+    /// `6` when the write named none.
+    pub minimum_password_length: i32,
+    /// Whether a password "must contain at least one of the following symbols: ! @ # $ %
+    /// ^ & * ( ) _ + - = [ ] { } | '" (`PasswordPolicy$RequireSymbols`).
+    pub require_symbols: bool,
+    /// Whether a password "must contain at least one numeric character (0 to 9)"
+    /// (`PasswordPolicy$RequireNumbers`).
+    pub require_numbers: bool,
+    /// Whether a password "must contain at least one uppercase character (A to Z)"
+    /// (`PasswordPolicy$RequireUppercaseCharacters`).
+    pub require_uppercase_characters: bool,
+    /// Whether a password "must contain at least one lowercase character (a to z)"
+    /// (`PasswordPolicy$RequireLowercaseCharacters`).
+    pub require_lowercase_characters: bool,
+    /// Whether IAM users "are allowed to change their own password"
+    /// (`PasswordPolicy$AllowUsersToChangePassword`).
+    pub allow_users_to_change_password: bool,
+    /// "The number of days that an IAM user password is valid", or `None` for the
+    /// documented default under which "IAM user passwords never expire".
+    pub max_password_age: Option<i32>,
+    /// "The number of previous passwords that IAM users are prevented from reusing", or
+    /// `None` for the documented default under which users "are not prevented from
+    /// reusing previous passwords".
+    pub password_reuse_prevention: Option<i32>,
+    /// Whether IAM users are "prevented from setting a new password via the
+    /// Amazon Web Services Management Console after their password has expired"
+    /// (`PasswordPolicy$HardExpiry`), or `None` when the write named no value, which the
+    /// operation documents as `false`.
+    pub hard_expiry: Option<bool>,
+}
+
+/// The `MinimumPasswordLength` an account's policy holds when a write named none: "if you
+/// do not specify a value for this parameter, then the operation uses the default value of
+/// `6`" (`UpdateAccountPasswordPolicy$MinimumPasswordLength`), which is also
+/// `minimumPasswordLengthType`'s own published minimum.
+pub const DEFAULT_MINIMUM_PASSWORD_LENGTH: i32 = 6;
+
+/// The symbols a password satisfies `RequireSymbols` by carrying one of, as a set to test
+/// a character against: the characters `PasswordPolicy$RequireSymbols` itself lists.
+const PASSWORD_POLICY_SYMBOLS: &str = "!@#$%^&*()_+-=[]{}|'";
+
+/// The same set as the refusal SPELLS it — "! @ # $ % ^ & * ( ) _ + - = [ ] { } | '",
+/// space-separated, exactly as `PasswordPolicy$RequireSymbols` writes it out. Held beside
+/// [`PASSWORD_POLICY_SYMBOLS`] rather than rendered from it so the sentence is the
+/// documented one character for character; `tests/all/account_password_policy.rs` drives a
+/// password carrying each of these symbols and one carrying none, so the two cannot drift
+/// apart unnoticed.
+const PASSWORD_POLICY_SYMBOL_LIST: &str = "! @ # $ % ^ & * ( ) _ + - = [ ] { } | '";
+
+impl AccountPasswordPolicy {
+    /// The policy an `UpdateAccountPasswordPolicy` request sets, with every member the
+    /// request omitted at the default that operation documents for it — the write "does
+    /// not support partial updates", so what is not named is not kept but reset.
+    pub fn from_request(request: &UpdateAccountPasswordPolicyInput) -> Self {
+        Self {
+            minimum_password_length: request
+                .minimum_password_length
+                .unwrap_or(DEFAULT_MINIMUM_PASSWORD_LENGTH),
+            require_symbols: request.require_symbols,
+            require_numbers: request.require_numbers,
+            require_uppercase_characters: request.require_uppercase_characters,
+            require_lowercase_characters: request.require_lowercase_characters,
+            allow_users_to_change_password: request.allow_users_to_change_password,
+            max_password_age: request.max_password_age,
+            password_reuse_prevention: request.password_reuse_prevention,
+            hard_expiry: request.hard_expiry,
+        }
+    }
+
+    /// Which rule of this policy `password` breaks, worded as AWS words that refusal, or
+    /// `None` when the policy admits it.
+    ///
+    /// Only the rules about the SUPPLIED PASSWORD's content are decided here, because they
+    /// are the only ones a password-setting call can break: the length and the four
+    /// character classes. `MaxPasswordAge` and `HardExpiry` govern a password already in
+    /// force rather than one being set, `AllowUsersToChangePassword` grants a permission,
+    /// and `PasswordReusePrevention` is a rule about passwords the account no longer holds
+    /// — this store keeps the verifier of the password IN FORCE and of no superseded one
+    /// ([`LoginProfileRecord::password`]), so there is nothing to compare a new password
+    /// against.
+    ///
+    /// The rules are taken in the order `PasswordPolicy` declares them, so a password
+    /// breaking several is refused by the first of them and one call cannot answer two
+    /// sentences for one password.
+    pub fn violation(&self, password: &str) -> Option<String> {
+        // "Minimum length to require for IAM user passwords"
+        // (`PasswordPolicy$MinimumPasswordLength`), counted in characters, the unit
+        // `passwordType`'s own length bound is taken in. The minimum is a
+        // `minimumPasswordLengthType` (range 6..128), so it is never below the documented
+        // default; the floor is taken ONCE and both the check and the sentence read that
+        // same value, so the rule enforced and the rule reported cannot differ.
+        let minimum = self
+            .minimum_password_length
+            .max(DEFAULT_MINIMUM_PASSWORD_LENGTH);
+        if password.chars().count() < usize::try_from(minimum).unwrap_or(0) {
+            return Some(format!("Password should have a minimum length of {minimum}"));
+        }
+        if self.require_symbols
+            && !password
+                .chars()
+                .any(|character| PASSWORD_POLICY_SYMBOLS.contains(character))
+        {
+            return Some(format!(
+                "Password should have at least one of the following symbols: \
+                 {PASSWORD_POLICY_SYMBOL_LIST}"
+            ));
+        }
+        if self.require_numbers && !password.chars().any(|character| character.is_ascii_digit()) {
+            return Some("Password should have at least one numeric character (0 to 9)".to_string());
+        }
+        if self.require_uppercase_characters
+            && !password
+                .chars()
+                .any(|character| character.is_ascii_uppercase())
+        {
+            return Some(
+                "Password should have at least one uppercase character (A to Z)".to_string(),
+            );
+        }
+        if self.require_lowercase_characters
+            && !password
+                .chars()
+                .any(|character| character.is_ascii_lowercase())
+        {
+            return Some(
+                "Password should have at least one lowercase character (a to z)".to_string(),
+            );
+        }
+        None
+    }
+}
+
 /// One Organizations service-last-accessed report job the account has asked for, keyed in
 /// [`ComAmazonawsIamAwsidentitymanagementv20100508State::organizations_access_reports`] by
 /// the `JobId` the generate answered with.
@@ -1784,6 +1938,19 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// key is a name the caller chose, so there is no case to fold and no
     /// [`name_key`] to build.
     pub account_properties: BTreeMap<String, String>,
+    /// The account's password policy, or `None` while the account has none.
+    ///
+    /// `UpdateAccountPasswordPolicy` is what fills this field — "updates the password
+    /// policy settings for the Amazon Web Services account" — and every operation that
+    /// SETS a user's console password reads it, because a password the policy does not
+    /// admit is refused rather than held
+    /// ([`Self::password_policy_violation`]).
+    ///
+    /// An `Option` rather than a record with defaults, and `None` rather than a policy
+    /// holding every documented default: an account starts with NO custom password policy
+    /// at all, which is a different fact from holding one that happens to be lenient — it
+    /// is what the read of the policy reports as a missing entity.
+    pub account_password_policy: Option<AccountPasswordPolicy>,
     /// The persisted delegation requests, keyed by their `DelegationRequestId` — the
     /// handle every operation on one takes (`GetDelegationRequest$DelegationRequestId`,
     /// "the unique identifier of the delegation request"), and the last segment of the
@@ -2006,6 +2173,7 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             fido_security_keys: BTreeMap::new(),
             account_alias: None,
             account_properties: BTreeMap::new(),
+            account_password_policy: None,
             delegation_requests: BTreeMap::new(),
             delegation_request_workflow_ids: BTreeMap::new(),
             role_templates: BTreeMap::new(),
@@ -2298,6 +2466,21 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     pub fn hold_password(&mut self, password: &str) -> PasswordVerifier {
         self.password_salt_seq += 1;
         PasswordVerifier::new(self.password_salt_seq, password)
+    }
+
+    /// Which rule of the account's password policy `password` breaks, or `None` when the
+    /// account admits it.
+    ///
+    /// `None` for an account holding NO policy, which is the account this emulator starts
+    /// out as: there is no rule to break until [`Self::account_password_policy`] holds one.
+    /// Every operation that sets a console password asks THIS question — the create, the
+    /// administrative update and the user's own change — so the policy in force is
+    /// evaluated in one place and the three cannot disagree about which passwords the
+    /// account accepts. A READ: asking changes nothing a later caller sees.
+    pub fn password_policy_violation(&self, password: &str) -> Option<String> {
+        self.account_password_policy
+            .as_ref()
+            .and_then(|policy| policy.violation(password))
     }
 
     /// Whether `account_id` manages the organization `organization_id` — the question an
@@ -4327,6 +4510,54 @@ pub const ARN_UNPARSEABLE: &str = "Invalid ARN:  Could not be parsed!";
 /// `EntityArn` of the wrong resource type with, shared from here for the same reason
 /// [`ARN_UNPARSEABLE`] is.
 pub const ARN_WRONG_RESOURCE_TYPE: &str = "Invalid resource type in ARN";
+
+/// How IAM refuses an ARN supplied for a member that names a TEMPLATE when that ARN
+/// carries an account number.
+///
+/// A template is pre-registered content published by a service rather than a resource an
+/// account owns — `DelegationPermission$PolicyTemplateArn` "maps to a pre-registered policy
+/// content for this partner" and `managedByTypeType` declares the single value `Service` —
+/// so its ARN is written with the publisher in the account field (the `aws` spelling an
+/// AWS-published policy ARN uses, [`AWS_MANAGED_POLICY_ACCOUNT`]) and never with an
+/// account's own number. Measured wording, entirely fixed: it quotes neither the member nor
+/// the value.
+pub const TEMPLATE_ARN_WITH_ACCOUNT_NUMBER: &str =
+    "Invalid ARN: account numbers are not acceptable for template ARNs!";
+
+/// Whether `arn` — a value already read as a well-formed ARN — names a template by an
+/// account NUMBER, which is the one thing a template ARN may not carry
+/// ([`TEMPLATE_ARN_WITH_ACCOUNT_NUMBER`]).
+///
+/// The account field of an ARN is "empty for an account-less resource" and carries the
+/// publisher for a published one, so what is refused here is specifically a field that
+/// spells a number: `accountIdType`'s pattern is `^\d{12}$`, and a field of digits is that
+/// number however many of them a caller sent. A field naming a publisher (`aws`) or no
+/// account at all is not one.
+pub fn template_arn_carries_account_number(arn: &str) -> bool {
+    ::service_common::arn::parse(arn).is_some_and(|parsed| {
+        !parsed.account.is_empty()
+            && parsed
+                .account
+                .chars()
+                .all(|character| character.is_ascii_digit())
+    })
+}
+
+/// The one sentence IAM refuses a change to a SERVICE-LINKED role's maximum session
+/// duration with — the duration belongs to the service the role is linked to, which is the
+/// only party that may change the role ("only the service that depends on the
+/// service-linked role can modify or delete the role on your behalf",
+/// `UnmodifiableEntityException`).
+///
+/// A different sentence from [`protected_role_message`], and deliberately so: that one
+/// states the protection of the role as a whole, while this one is the wording measured for
+/// a request that asked to move `MaxSessionDuration`, and names both the role and the
+/// setting. Its only variable part is the role as the request spelled it.
+pub fn service_linked_role_session_duration_message(role_name: &str) -> String {
+    format!(
+        "{role_name} is an AWS service linked role, max session duration cannot be changed."
+    )
+}
 
 /// The message a call that cannot resolve a delegation request the account does not hold
 /// is refused with: the entity type that was looked for, then the identifier the request
