@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSessions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSessions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSessions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! "Retrieve a list of sessions": every session the Region this request is served in holds
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::sessions`]), narrowed to those carrying
+//! every pair a `Tags` filter names, in `Id` order and one `MaxResults`-sized page at a
+//! time, with a `NextToken` that resumes the walk after the last id of the page. A Region
+//! holding no session has an EMPTY listing rather than a refusal.
+//!
+//! Each listed session is projected through the same
+//! [`crate::state::SessionEntry::to_session`] the single-session read serves, so a client
+//! working from this listing is never less informed than one re-reading each session; and,
+//! as that read does, the listing first materialises the status changes the clock had
+//! already made due on this Region's sessions, which is the only write it makes.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +81,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page `MaxResults` accepts, from the member's own range
+/// (`ListSessionsRequest$MaxResults`, `PageSize` range 1..1000) — and so the page size for a
+/// request that names none. The response members carry no length bound of their own
+/// (`SessionIdList`, `SessionList`), so that range is the only published ceiling on a page.
+const MAX_PAGE_SIZE: i32 = 1_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +159,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSessions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSessionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSessions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(ListSessionsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue session store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The origin of the request" names who is asking, not which sessions are asked
+        // for, so it changes nothing about this listing.
+        let _ = &input.request_origin;
+        // "The maximum number of results" (`MaxResults`, range 1..1000). Absent, the page is
+        // the largest the model accepts for it; the clamp re-states that range here so the
+        // page size is never 0 even if the boundary validator ever stops enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+        // "Tags belonging to the session": a session qualifies only when it carries EVERY
+        // pair named, the same filter this crate's other tag-narrowed listings apply. An
+        // empty map narrows nothing.
+        let required_tags = input.tags.unwrap_or_default();
+
+        // A session is served only through the endpoint that created it, so only THIS
+        // Region's sessions are in scope for this listing.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(sessions) = store.sessions.get_mut(&region) else {
+            // A Region nothing has created a session in lists nothing: an empty listing,
+            // not an absent one and not a refusal.
+            return Ok(ListSessionsOutput {
+                ids: Some(Vec::new()),
+                sessions: Some(Vec::new()),
+                next_token: None,
+            });
+        };
+        // The only write a read makes: the status changes the clock had already made due,
+        // materialised exactly as the single-session read materialises them, so a session
+        // this listing reports carries the status a read of that id reports.
+        for session in sessions.values_mut() {
+            session.settle_if_due(now);
+        }
+
+        // `Id` order: the store holds a Region's sessions in an ordered map keyed by the id,
+        // so one page follows another deterministically and the token below names a position
+        // in that order.
+        let listed: Vec<&crate::state::SessionEntry> = sessions
+            .values()
+            .filter(|session| {
+                required_tags
+                    .iter()
+                    .all(|(key, value)| session.tags.get(key) == Some(value))
+            })
+            .collect();
+
+        // The token is the last id of the previous page, so the page resumes at the first
+        // stored id strictly after it — which stays correct across sessions created or
+        // deleted between two calls. A token this service never issued is DELIBERATELY a
+        // position in that order rather than a refusal, exactly as the sibling listings of
+        // this crate resolve a cursor.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => listed.partition_point(|session| session.id.as_str() <= cursor),
+            None => 0,
+        };
+        // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose can
+        // never index outside the set.
+        let page: Vec<&crate::state::SessionEntry> =
+            listed.iter().copied().skip(start).take(page_size).collect();
+        let end = start.saturating_add(page.len());
+
+        // "Returns the ID of the session" and "Returns the session object": one page,
+        // reported both ways, so the two members agree element for element.
+        let ids: Vec<String> = page.iter().map(|session| session.id.clone()).collect();
+        let projected: Vec<Session> = page.iter().map(|session| session.to_session()).collect();
+        // "The token for the next set of results, or null if there are no more result": it
+        // names the last entry of the page, taken from the page itself so there is no index
+        // arithmetic to underflow on an empty page.
+        let next_token = if end < listed.len() {
+            ids.last().cloned()
+        } else {
+            None
+        };
+
+        Ok(ListSessionsOutput {
+            ids: Some(ids),
+            sessions: Some(projected),
+            next_token,
+        })
     }
 }
