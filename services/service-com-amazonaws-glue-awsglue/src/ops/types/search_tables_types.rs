@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#SearchTablesRequest")]
+// `skip_validation = ["ResourceShareType"]`: a share type outside the enum this member
+// targets is a Glue input error — this operation's own `InvalidInputException`, naming the
+// value the request sent — and not the cross-service `ValidationException` the boundary
+// walk answers with. The handler judges the value against the model-derived value set
+// (`crate::ops::search_tables`). Every other member keeps its modelled constraint at the
+// boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.glue#SearchTablesRequest",
+    skip_validation = ["ResourceShareType"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct SearchTablesInput {
     pub catalog_id: Option<String>,

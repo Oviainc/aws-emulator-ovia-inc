@@ -41,9 +41,10 @@
 //!
 //! `Comparator` is "used only for time fields, and can be omitted for other field
 //! types", so it orders a comparison against `CreateTime`, `UpdateTime`,
-//! `LastAccessTime` or `LastAnalyzedTime` (defaulting to `EQUALS`) and is not used on a
-//! text property. A time predicate's `Value` is read as epoch seconds or as an RFC 3339
-//! instant; anything else is refused with `InvalidInputException`.
+//! `LastAccessTime` or `LastAnalyzedTime` (defaulting to `EQUALS`); one sent beside a
+//! predicate that names no time field orders nothing and is refused rather than ignored.
+//! A time predicate's `Value` is read as epoch seconds or as an RFC 3339 instant;
+//! anything else is refused with `InvalidInputException`.
 //!
 //! `SortCriteria` orders the result by one property — the same key namespace the
 //! predicates use — ascending by default, and `DESC` is the exact reverse of that order.
@@ -60,7 +61,10 @@
 //! that reference an entity outside the catalog (a stored table carrying a
 //! `FederatedTable`), `FOREIGN` selects only tables shared with this account from
 //! another, of which a single-account store holds none, and `ALL` selects both those and
-//! the local ones; absent, only this account's own tables are searched.
+//! the local ones; absent, only this account's own tables are searched. A value outside
+//! that enum is judged by this handler rather than by the framework boundary
+//! ([`crate::service::resource_share_type_not_valid`]), so it earns the catalog's own
+//! `InvalidInputException` naming the value the request sent.
 //!
 //! ## Shape of an operation
 //!
@@ -194,6 +198,13 @@ const TIME_FIELDS: [&str; 4] = [
     "lastaccesstime",
     "lastanalyzedtime",
 ];
+
+/// The sentence this search refuses a `Comparator` sent beside a predicate that names no
+/// time field with.
+///
+/// RECORDED constant, and the whole message: it names neither the comparator the request
+/// sent nor the key it was sent beside, so one wording answers every such predicate.
+const COMPARATOR_ONLY_TIME_FIELDS: &str = "Comparator can only apply to time fields";
 
 /// `at` as milliseconds since the epoch, the one scale every time comparison here uses.
 fn system_time_millis(at: SystemTime) -> i64 {
@@ -541,12 +552,19 @@ fn read_predicate(predicate: &PropertyPredicate) -> Result<Predicate, SearchTabl
         ));
     };
     let folded = crate::state::fold_name(wanted);
-    let Some(key) = predicate.key.as_deref() else {
+    let key = predicate.key.as_deref();
+    // "The `Comparator` member of the `PropertyPredicate` struct is used only for time
+    // fields, and can be omitted for other field types": a comparator sent beside a
+    // predicate that names no time field — a text property, or no property at all —
+    // orders nothing, so it is REFUSED rather than ignored, which is the only answer that
+    // tells the caller its filter was not applied the way it asked.
+    if predicate.comparator.is_some() && !key.is_some_and(is_time_field) {
+        return Err(invalid_input(COMPARATOR_ONLY_TIME_FIELDS.to_string()));
+    }
+    let Some(key) = key else {
         return Ok(Predicate::AnyProperty(folded));
     };
     if !is_time_field(key) {
-        // "The Comparator member ... is used only for time fields, and can be omitted
-        // for other field types", so a comparator sent beside a text key is not used.
         return Ok(Predicate::Text {
             key: key.to_string(),
             wanted: folded,
@@ -655,10 +673,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some("ALL") => Share::All,
             Some("FEDERATED") => Share::Federated,
             Some("FOREIGN") => Share::Foreign,
+            // A share type outside the enum this member targets is judged here rather than
+            // at the framework boundary (`skip_validation` on `SearchTablesRequest`), so it
+            // earns the catalog's own sentence naming the value the request sent.
             Some(other) => {
-                return Err(invalid_input(format!(
-                    "ResourceShareType {other} is not one of FOREIGN, ALL, FEDERATED"
-                )))
+                return Err(invalid_input(
+                    crate::service::resource_share_type_not_valid(other),
+                ))
             }
         };
 

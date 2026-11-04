@@ -11,7 +11,17 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#GetTableRequest")]
+// `skip_validation = ["AttributesToGet"]`: an entry that is no member of the enum this
+// list targets is a Glue input error — this operation's own `InvalidInputException`, whose
+// prose travels in `Message` — and not the cross-service `ValidationException` the
+// boundary walk answers with. The handler judges it (`crate::ops::get_table`). The two
+// name members keep their modelled `@length` at the boundary: a value PAST that maximum is
+// a constraint refusal, and one supplied as null or empty is answered by
+// `crate::service`'s pre-handler wrapper.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.glue#GetTableRequest",
+    skip_validation = ["AttributesToGet"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct GetTableInput {
     pub catalog_id: Option<String>,

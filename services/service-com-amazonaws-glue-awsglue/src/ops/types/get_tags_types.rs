@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#GetTagsRequest")]
+// `skip_validation = ["ResourceArn"]`: a `ResourceArn` outside `GlueResourceArn`'s
+// modelled `@pattern` or `@length` is a Glue input error — this operation's own
+// `InvalidInputException`, whose prose travels in `Message` — and not the cross-service
+// `ValidationException` the boundary walk answers with. The handler decides what a
+// taggable ARN is (`crate::ops::get_tags`), which is the same resolution every tag read
+// and write of this crate goes through.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.glue#GetTagsRequest",
+    skip_validation = ["ResourceArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct GetTagsInput {
     pub resource_arn: String,

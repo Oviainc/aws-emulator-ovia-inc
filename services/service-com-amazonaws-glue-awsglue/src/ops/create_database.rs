@@ -12,6 +12,11 @@
 //! A `CatalogId` this emulator does not hold is refused rather than created: see
 //! [`crate::state::is_known_catalog`].
 //!
+//! A create that supplies no name at all — a `DatabaseInput$Name` absent or empty — is
+//! refused with this operation's own `InvalidInputException` and the catalog's sentence for
+//! that check, stated before any handler runs by [`crate::service`]'s pre-handler wrapper,
+//! because an absent required member never reaches a handler at all.
+//!
 //! A create that names no `CreateTableDefaultPermissions` records the catalog's default
 //! grant instead (`ALL` to `IAM_ALLOWED_PRINCIPALS` — see
 //! [`crate::state::default_create_table_default_permissions`]); an explicitly EMPTY list

@@ -46,6 +46,14 @@
 //! unqualified state for a point-in-time, transactional or view-status read would be a
 //! wrong-but-live answer.
 //!
+//! `DatabaseName` supplied as null or empty, `ResourceShareType` and the entries of
+//! `AttributesToGet` are judged outside the framework's constraint walk: the name by
+//! [`crate::service`]'s pre-handler wrapper (an absent required member never reaches a
+//! handler) and the two enumerated members by this handler
+//! ([`crate::service::resource_share_type_not_valid`],
+//! [`crate::service::ATTRIBUTE_NOT_VALID_TO_GET`]), so each earns the catalog's own
+//! `InvalidInputException` and its own sentence.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -325,6 +333,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
             Some(attributes) => {
+                // An entry that is no member of the enum this list targets
+                // (`TableAttributes`) is judged here rather than at the framework boundary
+                // (`skip_validation` on `GetTablesRequest`), so it earns the catalog's own
+                // sentence for an attribute it does not get. Which values the enum admits
+                // comes from the generated, model-derived value set.
+                if crate::service::attribute_outside_set(attributes, TABLE_ATTRIBUTES_VALUES) {
+                    return Err(GetTablesErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                crate::service::ATTRIBUTE_NOT_VALID_TO_GET.to_string(),
+                            ),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into());
+                }
                 let wanted: Vec<&str> = attributes.iter().map(String::as_str).collect();
                 match wanted.as_slice() {
                     ["NAME"] => Projection::Name,
@@ -354,12 +378,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let federated_only = match input.resource_share_type.as_deref() {
             None | Some("ALL") => false,
             Some("FEDERATED") => true,
+            // A share type outside the enum this member targets
+            // (`TableResourceShareType`) is judged here rather than at the framework
+            // boundary (`skip_validation` on `GetTablesRequest`), so it earns the
+            // catalog's own sentence naming the value the request sent.
             Some(other) => {
                 return Err(GetTablesErrorModeled::InvalidInputException(
                     InvalidInputException {
-                        message: Some(format!(
-                            "ResourceShareType {other} is not one of FEDERATED, ALL"
-                        )),
+                        message: Some(crate::service::resource_share_type_not_valid(other)),
                         from_federation_source: None,
                     },
                 )

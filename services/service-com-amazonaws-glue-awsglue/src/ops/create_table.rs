@@ -20,6 +20,12 @@
 //! carrying a `ViewDefinition` still answers 501: a Glue view's dialect representations
 //! are a layer this slice does not keep.
 //!
+//! A create that supplies no name at all — a `DatabaseName` or a `TableInput$Name` absent
+//! or empty — is refused with this operation's own `InvalidInputException` and the
+//! catalog's sentence for that member, stated before any handler runs by
+//! [`crate::service`]'s pre-handler wrapper, because an absent required member never
+//! reaches a handler at all.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

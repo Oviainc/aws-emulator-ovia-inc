@@ -25,6 +25,12 @@
 //! `FederatedDatabase`, and none being foreign, because this store holds one account's
 //! catalog.
 //!
+//! `ResourceShareType` and the entries of `AttributesToGet` are judged by this handler
+//! rather than by the framework boundary
+//! ([`crate::service::resource_share_type_not_valid`],
+//! [`crate::service::ATTRIBUTE_NOT_VALID_TO_GET`]), so a value outside what the model
+//! admits for either earns the catalog's own `InvalidInputException` and its own sentence.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -274,6 +280,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
             Some(attributes) => {
+                // An entry that is no member of the enum this list targets
+                // (`DatabaseAttributes`) is judged here rather than at the framework
+                // boundary (`skip_validation` on `GetDatabasesRequest`), so it earns the
+                // catalog's own sentence for an attribute it does not get. Which values
+                // the enum admits comes from the generated, model-derived value set.
+                if crate::service::attribute_outside_set(attributes, DATABASE_ATTRIBUTES_VALUES) {
+                    return Err(GetDatabasesErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                crate::service::ATTRIBUTE_NOT_VALID_TO_GET.to_string(),
+                            ),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into());
+                }
                 let wanted: Vec<&str> = attributes.iter().map(String::as_str).collect();
                 match wanted.as_slice() {
                     ["NAME"] => Projection::Name,
@@ -301,12 +323,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some("ALL") => Share::All,
             Some("FEDERATED") => Share::Federated,
             Some("FOREIGN") => Share::Foreign,
+            // A share type outside the enum this member targets (`ResourceShareType`) is
+            // judged here rather than at the framework boundary (`skip_validation` on
+            // `GetDatabasesRequest`), so it earns the catalog's own sentence naming the
+            // value the request sent.
             Some(other) => {
                 return Err(GetDatabasesErrorModeled::InvalidInputException(
                     InvalidInputException {
-                        message: Some(format!(
-                            "ResourceShareType {other} is not one of FEDERATED, FOREIGN, ALL"
-                        )),
+                        message: Some(crate::service::resource_share_type_not_valid(other)),
                         from_federation_source: None,
                     },
                 )

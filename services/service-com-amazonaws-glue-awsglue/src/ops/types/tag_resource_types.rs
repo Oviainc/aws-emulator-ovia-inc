@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#TagResourceRequest")]
+// `skip_validation = ["ResourceArn"]`: the same member, the same reason as
+// `GetTagsInput`'s — a `ResourceArn` outside `GlueResourceArn`'s modelled `@pattern` or
+// `@length` is this operation's own `InvalidInputException`, not the cross-service
+// `ValidationException`. `TagsToAdd` keeps its modelled bound at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.glue#TagResourceRequest",
+    skip_validation = ["ResourceArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct TagResourceInput {
     pub resource_arn: String,

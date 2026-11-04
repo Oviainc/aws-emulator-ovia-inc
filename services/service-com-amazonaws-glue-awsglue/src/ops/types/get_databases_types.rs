@@ -11,7 +11,15 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#GetDatabasesRequest")]
+// `skip_validation = ["ResourceShareType", "AttributesToGet"]`: the same two members
+// `GetTablesRequest` carries them for, and the same reason — a share type outside its
+// enum, or an attribute that is no member of the attribute enum, is a Glue input error
+// (`InvalidInputException`, prose in `Message`) rather than the cross-service
+// `ValidationException`. The handler judges both (`crate::ops::get_databases`).
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.glue#GetDatabasesRequest",
+    skip_validation = ["ResourceShareType", "AttributesToGet"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct GetDatabasesInput {
     pub catalog_id: Option<String>,

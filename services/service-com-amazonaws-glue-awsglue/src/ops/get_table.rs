@@ -24,6 +24,13 @@
 //! metadata is maintained here. `AuditContext` is input-only Lake Formation audit
 //! metadata that does not change this operation's answer.
 //!
+//! `DatabaseName` and `Name` supplied as null or empty, and the entries of
+//! `AttributesToGet`, are judged outside the framework's constraint walk: the names by
+//! [`crate::service`]'s pre-handler wrapper (an absent required member never reaches a
+//! handler) and the attributes by this handler
+//! ([`crate::service::ATTRIBUTE_NOT_VALID_TO_GET`]), so each earns the catalog's own
+//! `InvalidInputException` and its own sentence.
+//!
 //! A table written while its catalog encrypted catalog writes under a customer managed KMS
 //! key is answered only through that key: the read recovers the table's data key from KMS
 //! first, and a key KMS refuses — one that has been disabled, scheduled for deletion or
@@ -244,6 +251,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
             Some(attributes) => {
+                // An entry that is no member of the enum this list targets
+                // (`TableAttributes`) is judged here rather than at the framework boundary
+                // (`skip_validation` on `GetTableRequest`), so it earns the catalog's own
+                // sentence for an attribute it does not get. Which values the enum admits
+                // comes from the generated, model-derived value set.
+                if crate::service::attribute_outside_set(attributes, TABLE_ATTRIBUTES_VALUES) {
+                    return Err(GetTableErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                crate::service::ATTRIBUTE_NOT_VALID_TO_GET.to_string(),
+                            ),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into());
+                }
                 let wanted: Vec<&str> = attributes.iter().map(String::as_str).collect();
                 if wanted.contains(&"LATEST_ICEBERG_METADATA") {
                     return Err(crate::scaffolded::Scaffolded::not_implemented(

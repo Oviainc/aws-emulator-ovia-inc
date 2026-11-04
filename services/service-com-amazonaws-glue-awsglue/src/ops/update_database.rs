@@ -2,6 +2,13 @@
 
 //! @op UpdateDatabase
 //!
+//! A write that supplies no name at all for either of the two name members it carries —
+//! `Name`, the database it addresses, and `DatabaseInput$Name`, the name the updated
+//! definition takes — is refused with this operation's own `InvalidInputException` and the
+//! catalog's sentence for that member, stated before any handler runs by
+//! [`crate::service`]'s pre-handler wrapper, because an absent required member never
+//! reaches a handler at all.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

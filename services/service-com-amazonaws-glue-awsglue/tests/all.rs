@@ -51,6 +51,8 @@ mod catalog_encryption;
 mod catalog_identity;
 #[path = "all/catalog_import_status.rs"]
 mod catalog_import_status;
+#[path = "all/catalog_input_refusals.rs"]
+mod catalog_input_refusals;
 #[path = "all/catalog_mutations.rs"]
 mod catalog_mutations;
 #[path = "all/catalog_projections.rs"]

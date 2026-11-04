@@ -17,9 +17,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // page size it DOES reject is a Glue input error (`InvalidInputException`), not the
 // cross-service `ValidationException` the boundary walk answers with. The handler decides
 // what the page size may be (`crate::ops::get_tables`).
+// `ResourceShareType` and `AttributesToGet` carry it for the one reason the catalog's
+// other enumerated input members carry it: a value outside the enum the member targets is
+// a Glue input error (`InvalidInputException`, prose in `Message`), not the cross-service
+// `ValidationException`. The handler judges both (`crate::ops::get_tables`). `DatabaseName`
+// keeps its modelled `@length` at the boundary: a value PAST that maximum is a constraint
+// refusal, and one supplied as null or empty is answered by `crate::service`'s
+// pre-handler wrapper.
 #[smithy_macros::smithy(
     shape = "com.amazonaws.glue#GetTablesRequest",
-    skip_validation = ["MaxResults"]
+    skip_validation = ["MaxResults", "ResourceShareType", "AttributesToGet"]
 )]
 #[derive(Debug, Clone, Default)]
 pub struct GetTablesInput {

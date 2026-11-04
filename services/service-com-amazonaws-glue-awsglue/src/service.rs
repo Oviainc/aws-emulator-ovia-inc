@@ -39,10 +39,19 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Below the seams, this file also holds the service-wide WORDING of the Data Catalog's
+//! own refusal of a member value outside what the model admits ([`database_name_refusal`]
+//! and the functions beside it): those members are judged by the operation that reads
+//! them rather than by the framework boundary, and several operations declare the same
+//! member, so the sentences live here once instead of once per operation.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, Refused,
+    ServerHttpProtocol, Service, Violation, ViolationKind,
 };
+use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// The `com-amazonaws-glue-awsglue` emulated service: the generated [`ServiceDefinition`] plus
@@ -52,6 +61,13 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// One [`CatalogNameValidation`] per operation whose name members this service words
+    /// its own refusal for, keyed by the routing key the model names that operation by
+    /// ([`Operation::NAME`], the key the generated routing table uses). Built once here,
+    /// never per request; each entry is zero-sized, so this is a table of NAMES rather
+    /// than a second set of operations — the operation that serves a request is still the
+    /// one the generated table built from the shared engine.
+    name_refusals: HashMap<&'static str, Box<dyn ErasedOperation>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +77,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            name_refusals: catalog_name_validation_table::<Eng>(),
         }
     }
 }
@@ -87,12 +104,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Serve the catalog operations whose name members this service judges itself
+        // through their [`CatalogNameValidation`] wrapper, so a request that leaves one of
+        // those members ABSENT is refused in the operation's own modelled
+        // `InvalidInputException` instead of the framework's refusal body — the same
+        // answer an EMPTY name earns inside the handler, because the catalog's sentence
+        // for the check covers both. The wrapper hands every request it does not refuse to
+        // the generated operation in the routing table, which remains the only thing that
+        // serves one.
+        //
+        // Keyed by the protocol's own routing key, so a request the model names no
+        // operation for resolves to nothing here and keeps the framework's routing
+        // failure.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.name_refusals.get(key).map(|wrapper| &**wrapper)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -136,4 +161,346 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// How the Data Catalog refuses an input value its own validation rejects
+// ---------------------------------------------------------------------------
+//
+// Two layers refuse a Glue request, and the recordings say which one answers what. The
+// cross-service constraint validator answers a value past a `@length` MAXIMUM or outside
+// a `@range` — HTTP 400 `ValidationException`, whose lowercase `message` carries the
+// "N validation error(s) detected: …" envelope — and that is the framework boundary's
+// own answer here, left exactly as it is. Everything else below is GLUE's own input
+// validation: a value outside an enum's value set, an ARN outside `GlueResourceArn`'s
+// pattern, and a required name member supplied as null or empty. Each of those is the
+// operation's own modelled `InvalidInputException` (HTTP 400, prose in the `Message`
+// member the model declares), carrying the sentence this service words that check with.
+//
+// So the members Glue judges itself are taken off the centralized boundary walk
+// (`skip_validation` on their input shapes in `src/ops/types/`) and judged by the
+// operation that read them — except for the one refusal no handler can reach, which the
+// wrapper at the end of this file answers.
+//
+// The SENTENCES live here, once, because several operations declare the same member: a
+// refusal `GetTable` makes has to read exactly like the one `CreateTable` makes.
+
+/// The sentence the catalog refuses a resource's OWN name member supplied as null or
+/// empty with, for a database (`DatabaseInput$Name`, and the `Name` a database write
+/// addresses).
+///
+/// RECORDED constant, and the whole message: it states both halves of the check at once
+/// and names neither the operation nor a value — there is no value to name.
+const DATABASE_NAME_NULL_OR_EMPTY: &str = "Database name cannot be equal to null or empty";
+
+/// The same for a table's own name member (`TableInput$Name`, and the `Name` a table read
+/// or write addresses). RECORDED constant, and the whole message.
+const TABLE_NAME_NULL_OR_EMPTY: &str = "Table name cannot be equal to null or empty";
+
+/// The sentence the catalog refuses a `DatabaseName` — the member that addresses the
+/// database a table operation works IN, rather than a database's own name — supplied as
+/// null or empty with.
+///
+/// RECORDED constant, and a DIFFERENT sentence from [`DATABASE_NAME_NULL_OR_EMPTY`]: the
+/// catalog states the parent reference as a requirement and a resource's own name as a
+/// value it will not take, so the two are not one shared string.
+const DATABASE_NAME_REQUIRED: &str = "Database name is required";
+
+/// The sentence the catalog refuses a `ResourceShareType` outside the enum its member
+/// targets with.
+///
+/// RECORDED template: fixed text plus ONE variable part, the value the request sent,
+/// echoed exactly as sent — so a client reading the refusal sees which of its own values
+/// the service would not take.
+pub fn resource_share_type_not_valid(submitted: &str) -> String {
+    format!("Resource share type {submitted} is not valid")
+}
+
+/// The sentence the catalog refuses an `AttributesToGet` entry that is no member of the
+/// attribute enum its list targets with.
+///
+/// RECORDED constant, and the whole message: it names neither the entry the request sent
+/// nor the set it had to come from, so one wording answers every such entry.
+pub const ATTRIBUTE_NOT_VALID_TO_GET: &str = "Attribute name is not a valid attribute to get.";
+
+/// Whether `attributes` carries an entry that is no member of `admitted` — the
+/// generated, model-derived value set of the enum the list's member targets
+/// (`crate::ops::types::TABLE_ATTRIBUTES_VALUES` and its siblings), so a value added to
+/// the model reaches this check with the model.
+pub fn attribute_outside_set(attributes: &[String], admitted: &[&str]) -> bool {
+    attributes
+        .iter()
+        .any(|attribute| !admitted.contains(&attribute.as_str()))
+}
+
+// ---------------------------------------------------------------------------
+// The name refusal the framework boundary would answer instead
+// ---------------------------------------------------------------------------
+//
+// A required name member supplied as null or empty is GLUE's refusal, not the constraint
+// validator's, but neither half of it can be made inside a handler: an ABSENT member is
+// found while the request is being READ, so no input value ever exists to judge (the
+// model makes such a member non-`Option` on the generated input struct), and an EMPTY one
+// breaks the member's modelled `@length` minimum, which the boundary walk answers before
+// any handler runs. Taking the member off that walk is not the answer either, because the
+// SAME `@length` carries the maximum the validator does answer. So the wrapper below runs
+// the framework's own boundary walk first, answers exactly those two violations in the
+// catalog's own error, and leaves every other violation — the `@length` maximum included
+// — to the boundary.
+
+/// `InvalidInputException`'s wire error code and its modelled `@httpError`
+/// (`smithy_query(query="shape",shape="InvalidInputException")`), restated here because
+/// this file renders that error itself rather than returning it from a handler.
+const INVALID_INPUT_EXCEPTION: &str = "InvalidInputException";
+
+/// See [`INVALID_INPUT_EXCEPTION`].
+const INVALID_INPUT_EXCEPTION_STATUS: u16 = 400;
+
+/// The status the constraint validator's refusal carries, which this file renders itself
+/// for a wrapped operation — the same 400 the framework's own boundary answers with
+/// (`crate::scaffolded::Scaffolded::ValidationException`).
+const VALIDATION_EXCEPTION_STATUS: u16 = 400;
+
+/// The catalog operations whose name members Glue judges itself, each wrapped so a name
+/// supplied as null or empty is answered in the catalog's own error.
+///
+/// Exactly the database and table operations whose name members the sentences above word a
+/// refusal for: an operation added to that set is wrapped by adding one line here, and one
+/// that judges no name member is served straight from the generated routing table.
+fn catalog_name_validation_table<Eng: Send + Sync + 'static>(
+) -> HashMap<&'static str, Box<dyn ErasedOperation>> {
+    let mut refusals: HashMap<&'static str, Box<dyn ErasedOperation>> = HashMap::new();
+    register_name_validation::<crate::ops::create_database::CreateDatabase<Eng>>(&mut refusals);
+    register_name_validation::<crate::ops::update_database::UpdateDatabase<Eng>>(&mut refusals);
+    register_name_validation::<crate::ops::create_table::CreateTable<Eng>>(&mut refusals);
+    register_name_validation::<crate::ops::update_table::UpdateTable<Eng>>(&mut refusals);
+    register_name_validation::<crate::ops::get_table::GetTable<Eng>>(&mut refusals);
+    register_name_validation::<crate::ops::get_tables::GetTables<Eng>>(&mut refusals);
+    refusals
+}
+
+/// Register one operation's wrapper under the key the model names that operation by, read
+/// off the operation itself so the table cannot be keyed by a hand-typed name that drifts
+/// from the model.
+fn register_name_validation<Op: Operation>(
+    refusals: &mut HashMap<&'static str, Box<dyn ErasedOperation>>,
+) {
+    refusals.insert(Op::NAME, Box::new(CatalogNameValidation::<Op>::new()));
+}
+
+/// One modelled operation, served so that a request leaving one of its name members ABSENT
+/// is answered in the operation's own modelled `InvalidInputException` rather than in the
+/// framework's refusal body, which carries an error code and a lowercase `message` and
+/// nothing else (`smithy_server_runtime::Refused`).
+///
+/// Zero-sized: the wrapper holds no engine and no operation instance. It carries the
+/// operation TYPE, which is all it needs — the input shape to read the request into and
+/// the input `Schema` to read it against — and hands a request it does not refuse to the
+/// one operation instance the generated routing table built from the shared engine. There
+/// is therefore no second instance of any operation and no second store.
+///
+/// A request this wrapper does not refuse is READ TWICE, once here and once in the
+/// operation's own sequence, because the framework hands no already-built input to an
+/// operation. That cost is deliberate, bounded by the body limits the framework already
+/// enforces, and paid only by the few operations the table above names.
+struct CatalogNameValidation<Op> {
+    operation: PhantomData<fn() -> Op>,
+}
+
+impl<Op> CatalogNameValidation<Op> {
+    const fn new() -> Self {
+        Self {
+            operation: PhantomData,
+        }
+    }
+}
+
+impl<Op: Operation> ErasedOperation for CatalogNameValidation<Op> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            // The protocol is read, used and dropped inside this one block:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
+            // below would make this future non-`Send`.
+            let refused = {
+                let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
+                // The framework's OWN boundary walk, collected through the shared half
+                // every service that words its own pre-handler refusal uses — the
+                // protocol's deserializer plus `constraints::validate` over the built
+                // input — so this cannot find a different violation set from the sequence
+                // that follows it. It additionally restores each clause's echoed value to
+                // the bytes the caller sent, which only this side of the walk can do: the
+                // framework's own rendering elides a long value, and AWS quotes it whole.
+                let violations =
+                    ::service_common::validation::refusing_violations::<Op>(protocol, req);
+                match absent_name_exception(Op::NAME, &violations) {
+                    // Glue's own refusal of a name it was given none of.
+                    Some(modelled) => serialized_refusal::<Op>(
+                        protocol,
+                        &modelled,
+                        &crate::ops::types::SCHEMA_INVALID_INPUT_EXCEPTION,
+                        INVALID_INPUT_EXCEPTION,
+                        INVALID_INPUT_EXCEPTION_STATUS,
+                    ),
+                    // Every other violation is the constraint validator's, and is stated
+                    // the way AWS states one: the envelope and clauses the shared renderer
+                    // owns, over the restored values above.
+                    None => ::service_common::validation_message::aws_validation_refusal(
+                        &Refusal::Invalid(violations),
+                    )
+                    .and_then(|stated| {
+                        serialized_refusal::<Op>(
+                            protocol,
+                            &crate::scaffolded::ValidationException::new(stated.message),
+                            &crate::scaffolded::VALIDATION_EXCEPTION_SCHEMA,
+                            &stated.code,
+                            VALIDATION_EXCEPTION_STATUS,
+                        )
+                    }),
+                }
+            };
+            if let Some(response) = refused {
+                // The row the framework sequence would have recorded for this request, so
+                // a refused one is not a hole in the telemetry series.
+                record_name_refusal::<Op>(ctx, started.elapsed());
+                return response;
+            }
+            // Nothing to state: the request is served by the generated operation, which
+            // runs the whole framework sequence (deserialize, validate, handle, serialize)
+            // plus its telemetry over the same bytes. Reached through the routing table
+            // rather than through `override_operation`, which would route straight back
+            // here.
+            match svc.definition().routing_table().get(Op::NAME) {
+                Some(operation) => operation.run(svc, req, ctx).await,
+                // Unreachable in practice: this wrapper is only reachable under the key
+                // the generated table registered. Answer the framework's own
+                // no-such-operation response rather than inventing one.
+                None => svc.definition().routing_error_response(req),
+            }
+        })
+    }
+
+    /// `None` — the framework reads the schemes off the MODELLED operation the request's
+    /// routing key names (the generated table's instance), which is what the model bakes
+    /// them on, so wrapping an operation cannot change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        None
+    }
+}
+
+/// Serialize one refusal in the protocol the request is served in, or `None` when it will
+/// not serialize — which leaves the request to the framework, refused in the framework's
+/// own envelope. That is the very divergence this wrapper removes, so it is logged rather
+/// than passed over silently.
+fn serialized_refusal<Op: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    error: &dyn ::aws_smithy_schema::serde::SerializableStruct,
+    error_schema: &::aws_smithy_schema::Schema,
+    error_code: &str,
+    http_status: u16,
+) -> Option<aws_smithy_runtime_api::http::Response> {
+    match protocol.serialize_error(error, error_schema, error_code, http_status) {
+        Ok(response) => Some(response),
+        Err(error) => {
+            ::tracing::warn!(
+                operation = Op::NAME,
+                %error,
+                "this service's own refusal would not serialize; it falls back to the \
+                 framework's own envelope"
+            );
+            None
+        }
+    }
+}
+
+/// The modelled refusal for a request that supplied no value for one of `operation`'s name
+/// members, or `None` for every other violation set — which keeps the framework's own
+/// envelope.
+///
+/// Only a name supplied as null or empty is answered here: those are the two violations
+/// Glue words itself ([`DATABASE_NAME_NULL_OR_EMPTY`] and the sentences beside it). A
+/// violation of any other member, or of any other class — a name PAST the member's
+/// modelled maximum, a value outside a `@range` — is left to the boundary, which answers
+/// it in the constraint envelope the recordings show the validator answering.
+fn absent_name_exception(
+    operation: &str,
+    violations: &[Violation],
+) -> Option<crate::ops::types::InvalidInputException> {
+    // Every violation of the set has to be one of these, so a request that ALSO broke a
+    // constraint the validator answers keeps the validator's envelope rather than losing
+    // that clause to this sentence. The first one states the refusal, as a service that
+    // checks its members one at a time states it.
+    if violations.is_empty() || !violations.iter().all(supplies_no_name) {
+        return None;
+    }
+    let message = violations
+        .iter()
+        .find_map(|violation| name_refusal_message(operation, &violation.path))?;
+    Some(crate::ops::types::InvalidInputException {
+        message: Some(message.to_string()),
+        from_federation_source: None,
+    })
+}
+
+/// Whether this violation says the request supplied NO value for the member: it carried
+/// none at all, or carried one shorter than the member's modelled `@length` minimum, which
+/// for every name member of the catalog (`NameString`, min 1) means the empty string.
+///
+/// A value that merely breaks a different bound is not this refusal, so nothing else is
+/// folded into it.
+fn supplies_no_name(violation: &Violation) -> bool {
+    match violation.kind {
+        ViolationKind::MissingRequiredMember => true,
+        ViolationKind::MinLength(_) => violation.value.as_deref() == Some(""),
+        _ => false,
+    }
+}
+
+/// The catalog's sentence for the name member at `path` of `operation`, or `None` when
+/// `path` is no name member of the catalog's databases and tables.
+///
+/// The member paths are the ones the model declares, spelled as the framework spells a
+/// violation path (lowerCamel, a nested member under its enclosing member). Which sentence
+/// a member takes is a property of what it names, not of the operation that carries it: a
+/// resource's OWN name member is the one the catalog will not take null or empty, the
+/// `DatabaseName` that addresses the database an operation works in is the one it states as
+/// a requirement, and a bare `Name` is the own name of the resource that operation
+/// addresses — which is what the operation's name says it is.
+fn name_refusal_message(operation: &str, path: &str) -> Option<&'static str> {
+    match path {
+        "databaseName" => Some(DATABASE_NAME_REQUIRED),
+        "databaseInput.name" => Some(DATABASE_NAME_NULL_OR_EMPTY),
+        "tableInput.name" => Some(TABLE_NAME_NULL_OR_EMPTY),
+        "name" if operation.ends_with("Database") => Some(DATABASE_NAME_NULL_OR_EMPTY),
+        "name" if operation.ends_with("Table") => Some(TABLE_NAME_NULL_OR_EMPTY),
+        _ => None,
+    }
+}
+
+/// Record the refusal answered above as the operation row the framework sequence would
+/// have recorded, so a request refused by the wrapper is not a hole in the telemetry
+/// series: the same classification (from the refusal's status and error shape), the same
+/// folded handle (this service's signing name and the operation's own name), and the same
+/// already-sanitized request metadata. Everything is gated on a client collecting, exactly
+/// as the framework gates it.
+fn record_name_refusal<Op: Operation>(ctx: &OperationContext<'_>, latency: std::time::Duration) {
+    if !emulator_telemetry::recording_active() {
+        return;
+    }
+    let handle =
+        emulator_telemetry::OperationHandle::folded(ctx.identity().signing_name_static(), Op::NAME);
+    emulator_telemetry::record_generated_operation_with_handle(
+        &handle,
+        latency,
+        Some(emulator_telemetry::OperationFailure::classify(
+            INVALID_INPUT_EXCEPTION_STATUS,
+            INVALID_INPUT_EXCEPTION,
+        )),
+        smithy_server_runtime::RequestTelemetry::from_headers(&ctx.parts().headers).into_metadata(),
+    );
 }

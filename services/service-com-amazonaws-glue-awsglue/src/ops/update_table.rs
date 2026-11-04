@@ -8,6 +8,11 @@
 //! while that version is the table's current one, and is refused with
 //! `ConcurrentModificationException` — writing nothing at all — when it is not.
 //!
+//! A write that supplies no name at all — a `DatabaseName` or a `TableInput$Name` absent or
+//! empty — is refused with this operation's own `InvalidInputException` and the catalog's
+//! sentence for that member, stated before any handler runs by [`crate::service`]'s
+//! pre-handler wrapper, because an absent required member never reaches a handler at all.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

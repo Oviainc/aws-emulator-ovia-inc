@@ -22,6 +22,13 @@
 //! `EntityNotFoundException`, as does one naming another Region's or another account's
 //! estate.
 //!
+//! That client-input refusal is this handler's, not the framework boundary's
+//! (`skip_validation` on `GetTagsRequest` in `src/ops/types/`): a `ResourceArn` outside
+//! `GlueResourceArn`'s modelled `@pattern` or `@length` — a bare resource name, an ARN of
+//! another service — is no taggable Glue resource either, so it is answered by the one
+//! resolution above with this operation's own `InvalidInputException`, and never with the
+//! cross-service `ValidationException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

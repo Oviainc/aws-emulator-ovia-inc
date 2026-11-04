@@ -906,6 +906,84 @@ async fn g_a_searched_table_is_the_table_the_single_read_serves() {
     );
 }
 
+/// A `Comparator` sent beside a predicate that names no time field is refused rather than
+/// ignored: the model states it "is used only for time fields", so there is nothing for it
+/// to order and a search that applied the predicate anyway would answer a filter the
+/// caller did not ask for.
+///
+/// The rows differ along which non-time key the comparator was sent beside — a text
+/// property of the table, a property of its parent database, a `Parameters` key, and a
+/// predicate naming no key at all — and every value of the `Comparator` enum is covered by
+/// the time-field suite above, which keeps serving them.
+#[tokio::test]
+async fn h_a_comparator_beside_a_key_that_is_no_time_field_is_refused() {
+    let router = seeded_catalog().await;
+
+    // (case, the Filters the request carries).
+    let refused: Vec<(&str, Value)> = vec![
+        (
+            "a comparator beside the table's own Name",
+            json!({ "Filters": [ { "Key": "Name", "Value": "events", "Comparator": "EQUALS" } ] }),
+        ),
+        (
+            "a comparator beside the parent database's name",
+            json!({ "Filters": [
+                { "Key": "DatabaseName", "Value": "sales", "Comparator": "GREATER_THAN" }
+            ] }),
+        ),
+        (
+            "a comparator beside a Parameters key",
+            json!({ "Filters": [
+                { "Key": "classification", "Value": "parquet", "Comparator": "LESS_THAN" }
+            ] }),
+        ),
+        (
+            "a comparator beside a predicate naming no key",
+            json!({ "Filters": [ { "Value": "events", "Comparator": "EQUALS" } ] }),
+        ),
+    ];
+
+    for (case, request) in &refused {
+        let (status, body) = call(&router, "SearchTables", request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a comparator with no time field to order must be refused, got \
+             {status} with {body}"
+        );
+        assert!(
+            error_code(&body).contains("InvalidInputException"),
+            "case {case:?}: expected InvalidInputException, got {}",
+            error_code(&body)
+        );
+        assert_eq!(
+            body.get("Message").and_then(Value::as_str).unwrap_or_default(),
+            "Comparator can only apply to time fields",
+            "case {case:?}: unexpected wording, got {body}"
+        );
+    }
+
+    // The same predicates WITHOUT a comparator are served, so the refusals above are about
+    // the comparator and not about the keys.
+    for (case, request) in &refused {
+        let mut without = request.clone();
+        for predicate in without["Filters"]
+            .as_array_mut()
+            .expect("Filters is a list")
+        {
+            predicate
+                .as_object_mut()
+                .expect("a predicate is an object")
+                .remove("Comparator");
+        }
+        let (status, body) = call(&router, "SearchTables", &without).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the same predicate without a comparator is served, got {status} \
+             with {body}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Refusals
 // ---------------------------------------------------------------------------
