@@ -47,10 +47,11 @@ use serde_json::{json, Value};
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
 };
+use crate::entity_set_id_refusal_classes::assert_entity_set_id_constraint_violation;
 use crate::set_delete_terminality::assert_entity_set_absent;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     DETECTOR_ID_MEMBER, ENTITY_SET_ACTIVATING, ENTITY_SET_ACTIVE, ENTITY_SET_DEACTIVATING,
-    ENTITY_SET_INACTIVE, ENTITY_SET_TRANSITION_MILLIS,
+    ENTITY_SET_INACTIVE, ENTITY_SET_TRANSITION_MILLIS, THREAT_ENTITY_SET_ID_MEMBER,
 };
 
 /// The error class every client rejection on this service carries in the body's
@@ -714,9 +715,12 @@ async fn an_unresolvable_id_is_refused_rather_than_answered() {
             "case {row_case:?}: a refused update must not touch the stored set, got {got:?}"
         );
     }
-    for (row_case, set_arg) in [
-        ("absent set", ABSENT_SET_ID),
-        ("malformed set", "not-a-set"),
+    // A well-formed set id the detector does not hold is the entity-set families'
+    // absence refusal; one outside the alphabet the member is constrained to is the
+    // constraint violation, decided from the request before anything is resolved.
+    for (row_case, set_arg, well_formed) in [
+        ("absent set", ABSENT_SET_ID, true),
+        ("malformed set", "not-a-set", false),
     ] {
         let (status, body) = update_set(
             &router,
@@ -725,7 +729,17 @@ async fn an_unresolvable_id_is_refused_rather_than_answered() {
             json!({"name": "unreachable"}),
         )
         .await;
-        assert_entity_set_absent(row_case, status, &body, set_arg);
+        if well_formed {
+            assert_entity_set_absent(row_case, status, &body, set_arg);
+        } else {
+            assert_entity_set_id_constraint_violation(
+                row_case,
+                status,
+                &body,
+                THREAT_ENTITY_SET_ID_MEMBER,
+                set_arg,
+            );
+        }
         let got = read(&router, &detector_id, &set_id, row_case).await;
         assert_eq!(
             got["name"], "base_set-1",

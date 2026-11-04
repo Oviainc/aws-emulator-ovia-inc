@@ -5,7 +5,10 @@
 //! [`crate::state`] — the detector no longer HAS it, so `GetThreatEntitySet` and a
 //! second `DeleteThreatEntitySet` refuse its id with the entity-set families'
 //! absence refusal and `ListThreatEntitySets` stops naming it. The slot it held
-//! among the detector's threat entity sets is freed, so a later create succeeds.
+//! among the detector's threat entity sets is freed, so a later create succeeds. An
+//! id outside the alphabet the member is constrained to never reaches that lookup:
+//! it is refused with the constraint-violation template
+//! ([`crate::scaffolded::entity_set_id_constraint_rejection`]).
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -142,6 +145,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // The identifier's FORM is a constraint on the request, so it is checked
+        // before the store is consulted at all: a value outside the alphabet the
+        // member is constrained to is refused with the constraint-violation
+        // template, whatever this detector happens to hold.
+        if let Some(message) = crate::scaffolded::entity_set_id_constraint_rejection(
+            crate::state::THREAT_ENTITY_SET_ID_MEMBER,
+            &input.threat_entity_set_id,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(message));
+        }
 
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();

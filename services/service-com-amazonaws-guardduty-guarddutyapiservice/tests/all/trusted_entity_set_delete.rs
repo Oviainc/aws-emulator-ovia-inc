@@ -38,10 +38,11 @@ use serde_json::{json, Value};
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
 };
+use crate::entity_set_id_refusal_classes::assert_entity_set_id_constraint_violation;
 use crate::set_delete_terminality::assert_entity_set_absent;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     DETECTOR_ID_MEMBER, ENTITY_SET_ACTIVATING, ENTITY_SET_ACTIVE, ENTITY_SET_INACTIVE,
-    ENTITY_SET_TRANSITION_MILLIS,
+    ENTITY_SET_TRANSITION_MILLIS, TRUSTED_ENTITY_SET_ID_MEMBER,
 };
 
 /// The error class every client rejection on this service carries in the body's
@@ -573,12 +574,25 @@ async fn an_unresolvable_id_is_refused_rather_than_answered() {
             "case {case:?}: a refused delete must not touch the stored set, got {status} {body:?}"
         );
     }
-    for (case, set_arg) in [
-        ("absent set", ABSENT_SET_ID),
-        ("malformed set", "not-a-set"),
+    // A well-formed set id the detector does not hold is the entity-set families'
+    // absence refusal; one outside the alphabet the member is constrained to is the
+    // constraint violation, decided from the request before anything is resolved.
+    for (case, set_arg, well_formed) in [
+        ("absent set", ABSENT_SET_ID, true),
+        ("malformed set", "not-a-set", false),
     ] {
         let (status, body) = delete_set(&router, &detector_id, set_arg).await;
-        assert_entity_set_absent(case, status, &body, set_arg);
+        if well_formed {
+            assert_entity_set_absent(case, status, &body, set_arg);
+        } else {
+            assert_entity_set_id_constraint_violation(
+                case,
+                status,
+                &body,
+                TRUSTED_ENTITY_SET_ID_MEMBER,
+                set_arg,
+            );
+        }
         let (status, body) = get_set(&router, &detector_id, &set_id).await;
         assert_eq!(
             status, 200,

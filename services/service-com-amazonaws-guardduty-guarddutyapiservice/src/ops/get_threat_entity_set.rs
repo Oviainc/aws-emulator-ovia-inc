@@ -2,7 +2,11 @@
 
 //! @op GetThreatEntitySet
 //! IMPLEMENTED: reports the threat entity set `CreateThreatEntitySet` persisted in
-//! [`crate::state`], under the detector that owns it. It is a REPORTING operation: the only
+//! [`crate::state`], under the detector that owns it. An id outside the alphabet the
+//! member is constrained to is refused with the constraint-violation template
+//! ([`crate::scaffolded::entity_set_id_constraint_rejection`]); an id of the right form
+//! that names no set is refused with the family's own absence sentence under the
+//! modelled 404. It is a REPORTING operation: the only
 //! write it makes is materialising the status change the CLOCK already owed the set
 //! ([`crate::state::EntitySetRecord::settle`]), which was due at that instant whether or
 //! not anybody called, so a read never changes what a later reader sees.
@@ -162,6 +166,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The identifier's FORM is a constraint on the request, so it is checked
+        // before the store is consulted at all: a value outside the alphabet the
+        // member is constrained to is refused with the constraint-violation
+        // template, whatever this detector happens to hold.
+        if let Some(message) = crate::scaffolded::entity_set_id_constraint_rejection(
+            crate::state::THREAT_ENTITY_SET_ID_MEMBER,
+            &input.threat_entity_set_id,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(message));
+        }
+
         let region = crate::state::request_region(ctx);
 
         // The lock is taken MUTABLY only to materialise the clock-owed status

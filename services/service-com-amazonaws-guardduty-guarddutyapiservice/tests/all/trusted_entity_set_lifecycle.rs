@@ -36,8 +36,11 @@ use serde_json::{json, Value};
 use crate::detector_lifecycle::{
     call, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
 };
+use crate::entity_set_id_refusal_classes::assert_entity_set_id_constraint_violation;
 use crate::set_delete_terminality::assert_entity_set_absent;
-use service_com_amazonaws_guardduty_guarddutyapiservice::state::ENTITY_SET_TRANSITION_MILLIS;
+use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
+    ENTITY_SET_TRANSITION_MILLIS, TRUSTED_ENTITY_SET_ID_MEMBER,
+};
 
 /// `TrustedEntitySetStatus` members (`smithy_query(shape="TrustedEntitySetStatus")`).
 const INACTIVE: &str = "INACTIVE";
@@ -582,12 +585,25 @@ async fn an_id_the_store_does_not_hold_is_refused_rather_than_answered() {
             "case {case:?}: a refusal must report no entity set, got {got:?}"
         );
     }
-    for (case, set) in [
-        ("absent set", ABSENT_SET_ID),
-        ("malformed set", "not-a-set"),
+    // A well-formed set id the detector does not hold is the entity-set families'
+    // absence refusal; one outside the alphabet the member is constrained to is the
+    // constraint violation, decided from the request before anything is resolved.
+    for (case, set, well_formed) in [
+        ("absent set", ABSENT_SET_ID, true),
+        ("malformed set", "not-a-set", false),
     ] {
         let (status, got) = get_set(&router, &detector_id, set).await;
-        assert_entity_set_absent(case, status, &got, set);
+        if well_formed {
+            assert_entity_set_absent(case, status, &got, set);
+        } else {
+            assert_entity_set_id_constraint_violation(
+                case,
+                status,
+                &got,
+                TRUSTED_ENTITY_SET_ID_MEMBER,
+                set,
+            );
+        }
         assert!(
             got.get("status").is_none(),
             "case {case:?}: a refusal must report no entity set, got {got:?}"

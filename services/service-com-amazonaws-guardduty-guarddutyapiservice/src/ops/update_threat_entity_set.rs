@@ -3,7 +3,12 @@
 //! @op UpdateThreatEntitySet
 //! IMPLEMENTED: applies the members a request carries to the threat entity set the
 //! request's detector holds under `ThreatEntitySetId`, leaving every member the
-//! request omits where it was, so `GetThreatEntitySet` reports the updated set.
+//! request omits where it was, so `GetThreatEntitySet` reports the updated set. An id
+//! outside the alphabet the member is constrained to is refused with the
+//! constraint-violation template
+//! ([`crate::scaffolded::entity_set_id_constraint_rejection`]); an id of the right form
+//! that names no live set is refused with the family's own absence sentence under the
+//! modelled 404.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -153,6 +158,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // The identifier's FORM is a constraint on the request, so it is checked
+        // before the store is consulted at all: a value outside the alphabet the
+        // member is constrained to is refused with the constraint-violation
+        // template, whatever this detector happens to hold.
+        if let Some(message) = crate::scaffolded::entity_set_id_constraint_rejection(
+            crate::state::THREAT_ENTITY_SET_ID_MEMBER,
+            &input.threat_entity_set_id,
+        ) {
+            return Err(bad_request(message));
+        }
 
         // The two documented value rules the model cannot express hold of the
         // entity set's members whichever call writes them, so they are checked

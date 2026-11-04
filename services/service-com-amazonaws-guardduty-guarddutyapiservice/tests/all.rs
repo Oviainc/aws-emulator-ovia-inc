@@ -61,6 +61,8 @@ mod detector_sub_resource_deletes;
 mod detector_update_without_configuration;
 #[path = "all/entity_set_delete_retention.rs"]
 mod entity_set_delete_retention;
+#[path = "all/entity_set_id_refusal_classes.rs"]
+mod entity_set_id_refusal_classes;
 #[path = "all/expected_bucket_owner_form.rs"]
 mod expected_bucket_owner_form;
 #[path = "all/filter_action_suppression.rs"]

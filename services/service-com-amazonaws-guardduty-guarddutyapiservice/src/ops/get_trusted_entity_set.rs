@@ -2,9 +2,11 @@
 
 //! @op GetTrustedEntitySet
 //! IMPLEMENTED: reports the trusted entity set `CreateTrustedEntitySet` stored under the
-//! detector, materialising only the status change the CLOCK already made due. An id the
-//! detector does not hold is refused with HTTP 400 under the `InvalidInputException`
-//! class, never a hollow 200.
+//! detector, materialising only the status change the CLOCK already made due. An id outside
+//! the alphabet the member is constrained to is refused with the constraint-violation
+//! template ([`crate::scaffolded::entity_set_id_constraint_rejection`]); an id of the right
+//! form that names no set is refused with the family's own absence sentence under the
+//! modelled 404, never a hollow 200.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -160,6 +162,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The identifier's FORM is a constraint on the request, so it is checked
+        // before the store is consulted at all: a value outside the alphabet the
+        // member is constrained to is refused with the constraint-violation
+        // template, whatever this detector happens to hold.
+        if let Some(message) = crate::scaffolded::entity_set_id_constraint_rejection(
+            crate::state::TRUSTED_ENTITY_SET_ID_MEMBER,
+            &input.trusted_entity_set_id,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(message));
+        }
+
         let region = crate::state::request_region(ctx);
 
         // The lock is taken MUTABLY only to materialise the clock-owed status

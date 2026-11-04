@@ -23,7 +23,9 @@
 //!    ever minted, or one a delete took out of the detector's holdings: the uploaded
 //!    lists answer HTTP 400 under the `InvalidInputException` class, the entity sets
 //!    HTTP 404 under `ResourceNotFoundException`, each with its own fixed sentence
-//!    (see [`assert_uploaded_list_absent`] and [`assert_entity_set_absent`]).
+//!    (see [`assert_uploaded_list_absent`] and [`assert_entity_set_absent`]) — except
+//!    that an id outside the alphabet an entity-set id is constrained to is refused
+//!    as a CONSTRAINT violation there, before anything is resolved.
 //! 3. A SECOND delete is that same refusal, and writes nothing: the detector's own
 //!    `UpdatedAt` moved on the first delete and does not move again.
 //! 4. The collection stops naming a deleted set, and the name it held is free: a
@@ -33,6 +35,7 @@
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{call, enabled_detector, error_code, error_shape, new_router, Router};
+use crate::entity_set_id_refusal_classes::assert_entity_set_id_constraint_violation;
 use service_com_amazonaws_guardduty_guarddutyapiservice::scaffolded::{
     BAD_REQUEST_EXCEPTION, ENTITY_SET_NOT_FOUND_MESSAGE, INVALID_INPUT_EXCEPTION,
     RESOURCE_NOT_FOUND_EXCEPTION,
@@ -204,6 +207,19 @@ impl Family {
             assert_entity_set_absent(case, status, body, id);
         } else {
             assert_uploaded_list_absent(case, status, body, id);
+        }
+    }
+
+    /// Assert how this family refuses `id`. An id outside the alphabet an entity-set
+    /// id is constrained to is a CONSTRAINT violation on the two entity-set
+    /// families, decided from the request before anything is resolved; everything
+    /// else, and every form on the uploaded lists, is the family's own absence
+    /// refusal.
+    fn assert_refused(&self, case: &str, status: u16, body: &Value, id: &str, well_formed: bool) {
+        if self.refuses_with_not_found() && !well_formed {
+            assert_entity_set_id_constraint_violation(case, status, body, self.id_member, id);
+        } else {
+            self.assert_absent(case, status, body, id);
         }
     }
 
@@ -410,18 +426,21 @@ async fn an_id_the_detector_never_held_is_refused_the_same_way() {
 
         // The rows differ along the FORM of the id: one this service could have
         // minted, one that is far too short to be one, and one with characters a
-        // minted id never carries.
-        for (form, absent) in [
-            ("well-formed but never minted", ABSENT_SET_ID),
-            ("too short to be an id", "abc"),
-            ("characters an id never carries", "not-a-set-id!"),
+        // minted id never carries. The last is outside the alphabet an ENTITY-SET id
+        // is constrained to, so those two families answer it with the constraint
+        // violation their own suite pins rather than with an absence; the uploaded
+        // lists answer their one absence sentence whatever the form.
+        for (form, absent, well_formed) in [
+            ("well-formed but never minted", ABSENT_SET_ID, true),
+            ("too short to be an id", "abc", true),
+            ("characters an id never carries", "not-a-set-id!", false),
         ] {
             let row = format!("{case}: {form}");
             let (status, body) = family.get(&router, &detector_id, absent).await;
-            family.assert_absent(&row, status, &body, absent);
+            family.assert_refused(&row, status, &body, absent, well_formed);
 
             let (status, body) = family.delete(&router, &detector_id, absent).await;
-            family.assert_absent(&row, status, &body, absent);
+            family.assert_refused(&row, status, &body, absent, well_formed);
 
             // The refusals touched nothing: the live set is still there.
             let (status, body) = family.get(&router, &detector_id, &live).await;
