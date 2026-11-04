@@ -10,7 +10,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::Instance;
+use crate::ops::types::{
+    DataLakeDataset, DataLakeDatasetPartitionSpec, DataLakeDatasetSchema, Instance,
+};
 
 /// The sentence AWS Supply Chain refuses the Product Bill Of Materials (BOM) import API
 /// with: that API is WITHDRAWN, so both of its operations
@@ -168,6 +170,116 @@ fn as_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(time)
 }
 
+/// The ARN namespace every AWS Supply Chain resource carries: `AscResourceArn`'s
+/// modelled pattern fixes the prefix `arn:aws:scn`.
+pub const ARN_SERVICE: &str = "scn";
+
+/// The region a request that carries no SigV4 credential scope is served in.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The region the caller addressed, read from the request's SigV4 credential scope, so a
+/// resource's ARN names the region the call that created it was signed for. Falls back to
+/// [`DEFAULT_REGION`] for a request with no scope to read.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
+}
+
+/// The ARN of one data-lake dataset.
+///
+/// `AscResourceArn` (the shape `DataLakeDataset::arn` targets) fixes the form: the
+/// partition and service are literal, the region and account are the instance ARN's, and
+/// everything after the instance id is free `[-_./A-Za-z0-9]*` — so the dataset's
+/// namespace and name extend the instance's resource portion along the same path segments
+/// the operation's URI uses (`.../namespaces/{namespace}/datasets/{name}`).
+pub fn dataset_arn(region: &str, instance_id: &str, namespace: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("instance/{instance_id}/namespaces/{namespace}/datasets/{name}"),
+    )
+}
+
+/// The data-lake namespaces an instance has without anybody creating them.
+///
+/// SOURCE: the `namespace` member's own documentation on the dataset operations — "besides
+/// the custom defined namespace, every instance comes with below pre-defined namespaces:
+/// asc […] default […]". Every other namespace exists only once it has been created, so a
+/// dataset addressed to one that was never created names no namespace at all.
+pub const PREDEFINED_NAMESPACES: [&str; 2] = ["asc", "default"];
+
+/// Whether `namespace` is one an instance comes with ([`PREDEFINED_NAMESPACES`]).
+pub fn is_predefined_namespace(namespace: &str) -> bool {
+    PREDEFINED_NAMESPACES.contains(&namespace)
+}
+
+/// The number of datasets one instance holds, across all of its namespaces.
+///
+/// Same reasoning as [`MAX_INSTANCES`]: the store keeps its records for the life of the
+/// process, each record's size is already bounded by the modelled `@length` constraints
+/// on its members, so the entry COUNT is the remaining growth term and it is capped at
+/// the one site that adds a dataset — refused with the modelled
+/// `ServiceQuotaExceededException` (HTTP 402) that `CreateDataLakeDataset` declares and
+/// no read does. The number is the emulator's own bound, not a published AWS value: AWS
+/// quotas datasets per instance as an adjustable limit, so no single number is the
+/// contract, and this one is far above any ordinary workflow.
+pub const MAX_DATASETS_PER_INSTANCE: usize = 200;
+
+/// How a data-lake dataset is addressed: `(instanceId, namespace, name)`, the three
+/// `@httpLabel` members every dataset operation's URI carries, in that order.
+///
+/// A `BTreeMap` keyed by it therefore groups one instance's namespaces, and one
+/// namespace's datasets, contiguously and in name order — the order
+/// `ListDataLakeDatasets` pages through.
+pub type DatasetKey = (String, String, String);
+
+/// The [`DatasetKey`] for one dataset, so every handler builds the key the same way.
+pub fn dataset_key(instance_id: &str, namespace: &str, name: &str) -> DatasetKey {
+    (
+        instance_id.to_string(),
+        namespace.to_string(),
+        name.to_string(),
+    )
+}
+
+/// One persisted data-lake dataset — the whole record, not the wire shape.
+/// [`DataLakeDatasetRecord::to_wire`] projects it onto the modelled `DataLakeDataset`
+/// structure, so every handler answers from exactly these stored values.
+#[derive(Debug, Clone)]
+pub struct DataLakeDatasetRecord {
+    pub instance_id: String,
+    pub namespace: String,
+    pub name: String,
+    pub arn: String,
+    pub schema: DataLakeDatasetSchema,
+    pub description: Option<String>,
+    pub partition_spec: Option<DataLakeDatasetPartitionSpec>,
+    pub created_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    /// The dataset's tags. `tags` is `notProperty` on the request and absent from the
+    /// `DataLakeDataset` shape, so they are stored for the tagging operations to report
+    /// rather than projected onto the wire shape here.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl DataLakeDatasetRecord {
+    /// This record as the modelled `DataLakeDataset` shape every dataset operation
+    /// returns.
+    pub fn to_wire(&self) -> DataLakeDataset {
+        DataLakeDataset {
+            instance_id: self.instance_id.clone(),
+            namespace: self.namespace.clone(),
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            schema: self.schema.clone(),
+            description: self.description.clone(),
+            partition_spec: self.partition_spec.clone(),
+            created_time: as_date_time(self.created_time),
+            last_modified_time: as_date_time(self.last_modified_time),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-supplychain-galaxypublicapigateway. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSupplychainGalaxypublicapigatewayState {
@@ -178,6 +290,9 @@ pub struct ComAmazonawsSupplychainGalaxypublicapigatewayState {
     /// `@idempotent` and its `clientToken` is an `@idempotencyToken`) returns the
     /// instance the first call created instead of creating a second one.
     pub idempotency: HashMap<String, String>,
+    /// Every live data-lake dataset, keyed by [`DatasetKey`]. A `BTreeMap` so an
+    /// instance's datasets are contiguous and in namespace-then-name order.
+    pub datasets: BTreeMap<DatasetKey, DataLakeDatasetRecord>,
 }
 
 impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
@@ -220,6 +335,22 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
         (0..ID_MINT_ATTEMPTS)
             .map(|_| new_uuid_v4())
             .find(|candidate| !self.instances.contains_key(candidate))
+    }
+
+    /// How many datasets `instance_id` holds, across all of its namespaces — what
+    /// [`MAX_DATASETS_PER_INSTANCE`] caps.
+    pub fn dataset_count(&self, instance_id: &str) -> usize {
+        self.datasets
+            .keys()
+            .filter(|(instance, _, _)| instance == instance_id)
+            .count()
+    }
+
+    /// Drop every dataset of `instance_id`: a dataset is addressed by its instance, so
+    /// none of them outlives the instance whose deletion removed it.
+    pub fn drop_instance_datasets(&mut self, instance_id: &str) {
+        self.datasets
+            .retain(|(instance, _, _), _| instance != instance_id);
     }
 }
 

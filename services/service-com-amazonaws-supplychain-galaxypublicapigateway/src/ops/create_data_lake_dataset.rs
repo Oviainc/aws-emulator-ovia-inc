@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataLakeDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataLakeDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation persists a data-lake dataset in the shared store
+//! ([`crate::state`]) under the instance, namespace and name its URI addresses, and
+//! answers from the record it stored, so `GetDataLakeDataset` reports exactly what this
+//! call persisted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataLakeDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The dataset's schema comes from the request: the pre-defined schema of an `asc`
+//! dataset belongs to the AWS Supply Chain data model, which this service's model does
+//! not carry, so a create naming no `schema` is refused rather than answered with an
+//! invented one.
 //!
 //! ## Shape of an operation
 //!
@@ -138,6 +138,15 @@ impl From<CreateDataLakeDatasetErrorModeled> for CreateDataLakeDatasetError {
     }
 }
 
+/// The sentence `ValidationException` (HTTP 400) carries for a create that named no
+/// `schema`.
+///
+/// Its SOURCE is the `schema` member's own documentation — "The custom schema of the data
+/// lake dataset and required for dataset in default and custom namespaces" — stated as
+/// one fixed sentence because nothing in it comes from the request. No recording fixes
+/// AWS's own wording for this refusal, so a later reader re-verifies it against one.
+pub const SCHEMA_REQUIRED_MESSAGE: &str = "Schema is required to create a dataset.";
+
 /// The `CreateDataLakeDataset` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -174,18 +183,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataLakeDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataLakeDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataLakeDataset"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDataLakeDatasetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the supplychain instance store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A dataset's schema is what gives its records a shape and it is a required
+        // member of the stored resource, so a create that carries none is a bad request.
+        let Some(schema) = input.schema else {
+            return Err(CreateDataLakeDatasetErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(SCHEMA_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due_transitions(now);
+
+        // A dataset belongs to an instance and to one of that instance's namespaces, so
+        // either of them not existing is a not-found rather than a dataset created under
+        // nothing.
+        if !store.instances.contains_key(&input.instance_id) {
+            return Err(CreateDataLakeDatasetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("instance {} does not exist", input.instance_id)),
+                },
+            )
+            .into());
+        }
+        if !crate::state::is_predefined_namespace(&input.namespace) {
+            return Err(CreateDataLakeDatasetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "namespace {} does not exist in instance {}",
+                        input.namespace, input.instance_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let key = crate::state::dataset_key(&input.instance_id, &input.namespace, &input.name);
+        // The triple names one dataset, and this operation declares `ConflictException`
+        // while no read of a dataset does: a create for a triple that already holds one
+        // is refused rather than silently replacing it. (The `@idempotent` trait comes
+        // from the `put` lifecycle binding Smithy requires it on, not from a promise that
+        // a repeat creates again.)
+        if store.datasets.contains_key(&key) {
+            return Err(CreateDataLakeDatasetErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "dataset {} already exists in namespace {} of instance {}",
+                    input.name, input.namespace, input.instance_id
+                )),
+            })
+            .into());
+        }
+
+        // The store holds its datasets for the life of the process and this is the only
+        // operation that adds one, so the per-instance count is capped here and a create
+        // past the cap is refused with the modelled quota error rather than stored.
+        if store.dataset_count(&input.instance_id) >= crate::state::MAX_DATASETS_PER_INSTANCE {
+            return Err(CreateDataLakeDatasetErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the number of datasets in instance {} has reached the quota of {}",
+                        input.instance_id,
+                        crate::state::MAX_DATASETS_PER_INSTANCE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::DataLakeDatasetRecord {
+            instance_id: input.instance_id.clone(),
+            namespace: input.namespace.clone(),
+            name: input.name.clone(),
+            arn: crate::state::dataset_arn(
+                &region,
+                &input.instance_id,
+                &input.namespace,
+                &input.name,
+            ),
+            schema,
+            description: input.description,
+            partition_spec: input.partition_spec,
+            created_time: now,
+            last_modified_time: now,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        // The response is projected from the record that is about to be persisted, so
+        // nothing in it can differ from what a later GetDataLakeDataset reports.
+        let dataset = record.to_wire();
+        store.datasets.insert(key, record);
+
+        Ok(CreateDataLakeDatasetOutput { dataset })
     }
 }
