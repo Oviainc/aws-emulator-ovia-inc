@@ -166,19 +166,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetCodeInterpreterErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the code interpreter store is unavailable".to_string()),
             })
         })?;
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // A code interpreter whose accepted deletion the clock has already made
         // due is gone before this read looks for it — the removal was due at
         // this instant whether or not anybody called.
         store.expire_deleted_code_interpreters(now);
+
+        // The code interpreter tool the SERVICE provides is held by every
+        // account without anything having created it, and `CodeInterpreterId`
+        // reserves its id, so a read of that id reports the tool rather than
+        // looking for it among the interpreters this account created.
+        if input.code_interpreter_id == crate::state::SYSTEM_CODE_INTERPRETER_ID {
+            return Ok(store.system_tools.code_interpreter(&region).get_output(now));
+        }
 
         // The store is keyed by the `codeInterpreterId` the create minted; an id
         // naming no stored interpreter is the modelled 404 rather than an empty

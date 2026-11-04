@@ -169,7 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The store is keyed by the `codeInterpreterId` the create minted; an id
         // naming no stored interpreter is the modelled 404 — which is also what
-        // a delete of an already-removed interpreter answers.
+        // a delete of an already-removed interpreter answers, and what a delete
+        // naming the code interpreter tool the SERVICE provides answers: a
+        // delete addresses only an interpreter this account created, and that
+        // tool is in no account's store.
         let record = store
             .code_interpreters
             .get_mut(&input.code_interpreter_id)

@@ -168,7 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The store is keyed by the `browserId` the create minted; an id naming
         // no stored browser is the modelled 404 — which is also what a delete of
-        // an already-removed browser answers.
+        // an already-removed browser answers, and what a delete naming the
+        // browser tool the SERVICE provides answers: a delete addresses only a
+        // browser this account created, and that tool is in no account's store.
         let record = store.browsers.get_mut(&input.browser_id).ok_or_else(|| {
             DeleteBrowserErrorModeled::ResourceNotFoundException(crate::state::browser_not_found(
                 &input.browser_id,

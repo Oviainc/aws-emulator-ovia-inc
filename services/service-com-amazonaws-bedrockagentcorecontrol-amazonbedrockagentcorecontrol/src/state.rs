@@ -42,6 +42,10 @@
 //! * the token vault ([`TokenVaults`]): the KMS configuration each vault of the
 //!   account is encrypted under, so `SetTokenVaultCMK` and `GetTokenVault`
 //!   answer from one store;
+//! * the tools the SERVICE provides ([`SystemTools`]): the browser and the code
+//!   interpreter every account holds without having created one, so a read of
+//!   either reports it, while a delete — which addresses only what this account
+//!   created — does not find it;
 //! * the configuration bundle (`/configuration-bundles/`): one
 //!   [`ConfigurationBundleRecord`] per `bundleId`, holding every version ever
 //!   committed to it ([`ConfigurationBundleVersionRecord`]), so a create and
@@ -2168,6 +2172,12 @@ pub const BROWSER_VPC_CONFIG_MEMBER: &str = "networkConfiguration.vpcConfig";
 /// shape=BrowserNetworkMode`).
 pub const BROWSER_NETWORK_MODE_VPC: &str = "VPC";
 
+/// `BrowserNetworkMode` for a browser that reaches the network without one — the
+/// modelled DEFAULT of `BrowserNetworkConfiguration.networkMode` (`smithy_query
+/// shape=BrowserNetworkConfiguration`), so it is the mode of a browser no caller
+/// configured a VPC for.
+pub const BROWSER_NETWORK_MODE_PUBLIC: &str = "PUBLIC";
+
 /// One custom browser: everything `CreateBrowser` persisted for it, and the
 /// statuses the clock owes it.
 ///
@@ -2470,6 +2480,12 @@ pub const CODE_INTERPRETER_VPC_CONFIG_MEMBER: &str = "networkConfiguration.vpcCo
 /// (`smithy_query shape=CodeInterpreterNetworkMode`).
 pub const CODE_INTERPRETER_NETWORK_MODE_VPC: &str = "VPC";
 
+/// `CodeInterpreterNetworkMode` for an interpreter isolated from the network —
+/// the modelled DEFAULT of `CodeInterpreterNetworkConfiguration.networkMode`
+/// (`smithy_query shape=CodeInterpreterNetworkConfiguration`), so it is the mode
+/// of an interpreter no caller configured a network for.
+pub const CODE_INTERPRETER_NETWORK_MODE_SANDBOX: &str = "SANDBOX";
+
 /// One custom code interpreter: everything `CreateCodeInterpreter` persisted for
 /// it, and the statuses the clock owes it.
 ///
@@ -2558,6 +2574,156 @@ impl CodeInterpreterRecord {
             code_interpreter_id: self.code_interpreter_id.clone(),
             status: self.status_at(now).to_string(),
             last_updated_at: timestamp(self.updated_at),
+        }
+    }
+}
+
+/// The `browserId` of the browser tool this service provides to every account:
+/// the first alternative of `BrowserId`'s pattern
+/// `^(aws\.browser\.v1|[a-zA-Z][a-zA-Z0-9_]{0,47}-[a-zA-Z0-9]{10})$`
+/// (`smithy_query operation=GetBrowser`), which no create can mint — a minted id
+/// is `{name}-{suffix}` and `SandboxName` admits no `.`.
+pub const SYSTEM_BROWSER_ID: &str = "aws.browser.v1";
+
+/// The `codeInterpreterId` of the code interpreter tool this service provides to
+/// every account: the first alternative of `CodeInterpreterId`'s pattern
+/// `^(aws\.codeinterpreter\.v1|[a-zA-Z][a-zA-Z0-9_]{0,47}-[a-zA-Z0-9]{10})$`
+/// (`smithy_query operation=GetCodeInterpreter`), minted by no create for the
+/// same reason as [`SYSTEM_BROWSER_ID`].
+pub const SYSTEM_CODE_INTERPRETER_ID: &str = "aws.codeinterpreter.v1";
+
+/// The ARN resource type of the browser tool THIS SERVICE PROVIDES: the bare
+/// spelling of `BrowserArn`'s `browser(-custom)?`, the `-custom` one being the
+/// customer-created browser ([`BROWSER_ARN_RESOURCE`]).
+const SYSTEM_BROWSER_ARN_RESOURCE: &str = "browser";
+
+/// The ARN resource type of the code interpreter tool THIS SERVICE PROVIDES: the
+/// bare spelling of `CodeInterpreterArn`'s `code-interpreter(-custom)?`, the
+/// `-custom` one being the customer-created interpreter
+/// ([`CODE_INTERPRETER_ARN_RESOURCE`]).
+const SYSTEM_CODE_INTERPRETER_ARN_RESOURCE: &str = "code-interpreter";
+
+/// The `name` the service-provided browser reports.
+///
+/// `SandboxName` is `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` (`smithy_query
+/// operation=GetBrowser`), which admits no `.`, so the tool is named after the
+/// reserved id it answers to with that id's separators spelled as `_`.
+pub const SYSTEM_BROWSER_NAME: &str = "aws_browser_v1";
+
+/// The `name` the service-provided code interpreter reports, rendered from its
+/// reserved id exactly as [`SYSTEM_BROWSER_NAME`] is.
+pub const SYSTEM_CODE_INTERPRETER_NAME: &str = "aws_codeinterpreter_v1";
+
+/// `arn:aws:bedrock-agentcore:{region}:{account}:browser/{browserId}` — the
+/// service-provided alternative of `BrowserArn`'s pattern, whose resource type
+/// carries no `-custom` because nothing of this account created the tool.
+pub fn system_browser_arn(region: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{SYSTEM_BROWSER_ARN_RESOURCE}/{SYSTEM_BROWSER_ID}"),
+    )
+}
+
+/// `arn:aws:bedrock-agentcore:{region}:{account}:code-interpreter/{codeInterpreterId}`
+/// — the service-provided alternative of `CodeInterpreterArn`'s pattern, for the
+/// same reason as [`system_browser_arn`].
+pub fn system_code_interpreter_arn(region: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{SYSTEM_CODE_INTERPRETER_ARN_RESOURCE}/{SYSTEM_CODE_INTERPRETER_ID}"),
+    )
+}
+
+/// The tools this service provides to every account without anything having
+/// created them: the browser [`SYSTEM_BROWSER_ID`] and the code interpreter
+/// [`SYSTEM_CODE_INTERPRETER_ID`], which `ResourceType`'s `SYSTEM` member names
+/// (`smithy_query shape=ResourceType`).
+///
+/// A type of its own rather than records in the stores beside it, because of the
+/// invariant no caller establishes: nothing creates these tools and nothing
+/// deletes them, so a read neither finds one absent nor re-dates it, exactly as
+/// the default token vault is present from the moment the account's state is
+/// ([`TokenVaults`]). It holds that one instant; the record a read reports is
+/// built per request, because the ARN on it carries the region the request was
+/// signed for.
+#[derive(Debug)]
+pub struct SystemTools {
+    /// When this account's state came into being, and with it the tools the
+    /// service provides in it.
+    created_at: SystemTime,
+}
+
+impl Default for SystemTools {
+    fn default() -> Self {
+        Self {
+            created_at: SystemTime::now(),
+        }
+    }
+}
+
+impl SystemTools {
+    /// The service-provided browser, described by the same record a created
+    /// browser is, so every read reports it through one envelope.
+    ///
+    /// It is `READY` from the instant the state is and stays there: the clock
+    /// owes a tool nobody created no transition, and nothing can delete it. It
+    /// carries no execution role, description, recording, signing, certificate,
+    /// enterprise policy, mounted file system or tag — those are what a CREATE
+    /// persists for a browser of the caller's own — and its network mode is the
+    /// modelled default [`BROWSER_NETWORK_MODE_PUBLIC`], with no VPC of the
+    /// caller's.
+    pub fn browser(&self, region: &str) -> BrowserRecord {
+        BrowserRecord {
+            browser_id: SYSTEM_BROWSER_ID.to_string(),
+            browser_arn: system_browser_arn(region),
+            name: SYSTEM_BROWSER_NAME.to_string(),
+            description: None,
+            execution_role_arn: None,
+            network_configuration: BrowserNetworkConfiguration {
+                network_mode: BROWSER_NETWORK_MODE_PUBLIC.to_string(),
+                vpc_config: None,
+            },
+            recording: None,
+            browser_signing: None,
+            enterprise_policies: None,
+            certificates: None,
+            filesystem_configurations: None,
+            tags: BTreeMap::new(),
+            created_at: self.created_at,
+            updated_at: self.created_at,
+            transient_status: BROWSER_STATUS_READY.to_string(),
+            settled_status: BROWSER_STATUS_READY.to_string(),
+            settles_at: self.created_at,
+            removal_due_at: None,
+        }
+    }
+
+    /// The service-provided code interpreter, on the same rule as
+    /// [`Self::browser`]: `READY` from the instant the state is, carrying only
+    /// what no caller supplied, with the modelled default network mode
+    /// [`CODE_INTERPRETER_NETWORK_MODE_SANDBOX`].
+    pub fn code_interpreter(&self, region: &str) -> CodeInterpreterRecord {
+        CodeInterpreterRecord {
+            code_interpreter_id: SYSTEM_CODE_INTERPRETER_ID.to_string(),
+            code_interpreter_arn: system_code_interpreter_arn(region),
+            name: SYSTEM_CODE_INTERPRETER_NAME.to_string(),
+            description: None,
+            execution_role_arn: None,
+            network_configuration: CodeInterpreterNetworkConfiguration {
+                network_mode: CODE_INTERPRETER_NETWORK_MODE_SANDBOX.to_string(),
+                vpc_config: None,
+            },
+            certificates: None,
+            filesystem_configurations: None,
+            tags: BTreeMap::new(),
+            created_at: self.created_at,
+            updated_at: self.created_at,
+            transient_status: CODE_INTERPRETER_STATUS_READY.to_string(),
+            settled_status: CODE_INTERPRETER_STATUS_READY.to_string(),
+            settles_at: self.created_at,
+            removal_due_at: None,
         }
     }
 }
@@ -3010,6 +3176,12 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// type: no operation of this service creates a vault, so the map holds the
     /// one default vault [`TokenVaults`] seeds and never grows.
     pub token_vaults: TokenVaults,
+    /// The tools the service provides in every account — the browser
+    /// `aws.browser.v1` and the code interpreter `aws.codeinterpreter.v1`.
+    /// Bounded by its own type: nothing creates or deletes a system tool, so
+    /// this holds the one instant [`SystemTools`] dates them from and never
+    /// grows.
+    pub system_tools: SystemTools,
     /// Bumped on every mint, so two runtimes created in the same instant with
     /// the same name still get distinct ids.
     mint_counter: u64,
