@@ -116,46 +116,36 @@ pub fn reports_engine_media_type(engine: &str) -> bool {
 /// using `CreateCustomDBEngineVersion`" — which is what every record here was.
 pub const MEDIA_TYPE_CUSTOMER_PROVIDED: &str = "Customer Provided";
 
-/// The IAM action `DeleteCustomDBEngineVersion` asks for, written in this service's own
-/// action namespace (`<arn namespace>:<API name>`), which is how a refusal names it.
-const DELETE_ACTION: &str = "rds:DeleteCustomDBEngineVersion";
-
-/// The ARN a CEV is NAMED by when a request over it is authorized: the published resource
-/// form `cev:<engine name>/<engine version name>/<CEV id>`, with the id segment left as a
-/// wildcard because a request carries the engine and the CEV name only — the id belongs to
-/// whichever record of that name exists, which an authorization refusal does not resolve.
+/// The ARN a custom engine version is NAMED by: the published resource form
+/// `cev:<engine name>/<engine version name>/<CEV id>`, where the id is the minted,
+/// immutable one that makes a single ARN name a single record even after a CEV of the same
+/// name has been deleted and created again.
 #[must_use]
 pub fn custom_db_engine_version_resource_arn(
     region: &str,
     engine: &str,
     engine_version: &str,
+    cev_id: &str,
 ) -> String {
     emulator_server::emulator_arn(
         ARN_NAMESPACE,
         region,
-        &format!("{ARN_RESOURCE_TYPE}:{engine}/{engine_version}/*"),
+        &format!("{ARN_RESOURCE_TYPE}:{engine}/{engine_version}/{cev_id}"),
     )
 }
 
-/// How a `DeleteCustomDBEngineVersion` request that names a custom engine version the
-/// account does not hold in the request's region is refused: the principal the caller's
-/// credential speaks for, the action it asked for, and the CEV ARN it asked for.
+/// How a `DeleteCustomDBEngineVersion` this service will not serve a delete for is refused:
+/// ONE sentence, the same for every such request, which is why it takes no argument.
 ///
-/// Every value in it comes from the request and from the account contract, and NOTHING in
-/// it comes from the named version — whether an account could own one of that name, and
-/// whether one exists, are exactly what a denial does not disclose.
+/// The deletion of a custom engine version is withheld both from a caller that may not
+/// manage CEVs at all and for a `(Engine, EngineVersion)` pair that names no CEV the
+/// account holds, and the two are answered with the IDENTICAL text — nothing in it is taken
+/// from the request, from the caller's identity or from the store, so the refusal cannot be
+/// used to learn whether a version of that name exists or who asked about it.
 #[must_use]
-pub fn custom_db_engine_version_deletion_denied_message(
-    region: &str,
-    engine: &str,
-    engine_version: &str,
-) -> String {
-    let principal = ::service_common::caller_principal::ambient_user_arn();
-    let resource = custom_db_engine_version_resource_arn(region, engine, engine_version);
-    format!(
-        "User: {principal} is not authorized to perform: {DELETE_ACTION} on resource: \
-         {resource} because no identity-based policy allows the {DELETE_ACTION} action"
-    )
+pub fn custom_db_engine_version_deletion_denied_message() -> &'static str {
+    "The custom engine version you requested may not exist or you don't have the required \
+     permission."
 }
 
 /// The second half of a CEV's store key: one `(Engine, EngineVersion)` pair names one
@@ -234,16 +224,13 @@ impl CustomDbEngineVersionRecord {
     }
 
     /// `DBEngineVersionArn` — "the ARN of the custom engine version": the engine and the
-    /// CEV name it is known by, plus the minted id that makes one ARN name one record even
-    /// after a CEV of the same name has been deleted and created again.
+    /// CEV name it is known by, plus its minted id, in the one ARN form above.
     pub fn arn(&self) -> String {
-        emulator_server::emulator_arn(
-            ARN_NAMESPACE,
+        custom_db_engine_version_resource_arn(
             &self.region,
-            &format!(
-                "{ARN_RESOURCE_TYPE}:{}/{}/{}",
-                self.engine, self.engine_version, self.cev_id
-            ),
+            &self.engine,
+            &self.engine_version,
+            &self.cev_id,
         )
     }
 }

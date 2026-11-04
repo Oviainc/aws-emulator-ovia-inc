@@ -12,10 +12,12 @@
 //! * `(Engine, EngineVersion)` that names no CEV the account holds in the region the
 //!   request was signed for is a resource the account cannot act on at all — an AWS-managed
 //!   engine version, a CEV of another region, a name nothing created — and is refused with
-//!   HTTP 403 `AccessDenied`
-//!   ([`crate::state::custom_db_engine_version_deletion_denied_message`]), which discloses
-//!   nothing about the named version: not whether an account could own one of that name,
-//!   and not whether one exists;
+//!   HTTP 403 `AccessDenied` carrying the ONE fixed sentence this service words that
+//!   refusal with ([`crate::state::custom_db_engine_version_deletion_denied_message`]):
+//!   the same text whether the deletion is withheld from the caller or the pair names
+//!   nothing, with no part of it taken from the request, the caller's identity or the
+//!   store, so it discloses nothing about the named version — not whether an account could
+//!   own one of that name, and not whether one exists;
 //! * a CEV the account DOES hold is deleted only once its prerequisites hold — it must have
 //!   finished being created ([`crate::state::custom_engine_version_is_modifiable`]) and must
 //!   "not be associated with an RDS Custom DB instance, RDS Custom instance snapshot, or
@@ -293,15 +295,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         // This operation deletes an engine version the ACCOUNT minted. A pair that names
         // none is a resource the account does not hold, so the action over it is withheld
-        // before it is resolved: the refusal names the principal, the action and the CEV ARN
-        // the request asked for, and nothing about the version itself.
+        // before it is resolved: the refusal is the one fixed sentence, carrying nothing
+        // about the request, the caller or the version itself.
         let Some(record) = store.custom_db_engine_versions.get(&key) else {
             return Err(crate::scaffolded::Scaffolded::access_denied(
-                crate::state::custom_db_engine_version_deletion_denied_message(
-                    &region,
-                    &engine,
-                    &engine_version,
-                ),
+                crate::state::custom_db_engine_version_deletion_denied_message(),
             ));
         };
 

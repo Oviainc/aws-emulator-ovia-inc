@@ -19,8 +19,10 @@
 //! * the denial is a row per way a `(Engine, EngineVersion)` can name no CEV the account
 //!   holds in the region the request was signed for: a CEV name nothing created, a stored
 //!   name under another engine, a CEV of another region, an engine version this service
-//!   PUBLISHES rather than one an account minted, and an engine no account mints custom
-//!   versions of at all — every one of them answered identically, because a denial
+//!   PUBLISHES rather than one an account minted, an engine no account mints custom
+//!   versions of at all, and names at both ends of the length the two members' patterns
+//!   admit — every one of them answered with the IDENTICAL sentence, which carries no part
+//!   of the request, of the caller's identity or of the account contract, because a denial
 //!   discloses nothing about the version it was asked about;
 //! * the prerequisite gate is driven over the engine families again for the CEV that has
 //!   not finished being created, and over both kinds of record that USE a CEV (an RDS
@@ -45,29 +47,26 @@ const CREATE: &str = "CreateCustomDBEngineVersion";
 /// told from a default-filled one.
 const DESCRIPTION: &str = "deletable-cev";
 
-/// The account every generated emulator presents, as every ARN below carries it.
+/// The account every generated emulator presents. A denial must carry no trace of it.
 const ACCOUNT: &str = "000000000000";
 
-/// The principal a denial names: the IAM user this emulator's own long-term credential
-/// speaks for, which is the identity STS reports for the caller.
+/// The principal the caller's credential speaks for: the IAM user this emulator's own
+/// long-term credential presents, which is the identity STS reports. A denial must name
+/// neither it nor any other caller identity.
 const PRINCIPAL: &str = "arn:aws:iam::000000000000:user/emulator";
 
 /// The IAM action a `DeleteCustomDBEngineVersion` request asks for, in this service's own
-/// action namespace.
+/// action namespace — another thing a denial must not spell out.
 const DELETE_ACTION: &str = "rds:DeleteCustomDBEngineVersion";
 
-/// The denial a request that names no CEV the account holds is refused with: the principal,
-/// the action and the CEV ARN the request asked for, and nothing about the named version.
+/// The sentence a `DeleteCustomDBEngineVersion` this service will not serve is refused
+/// with: one fixed text, the same for every such request, with nothing interpolated into
+/// it.
 ///
 /// Spelled out here rather than read from the service, so the wording is pinned by the test
 /// and not by the code under test.
-fn denial(region: &str, engine: &str, engine_version: &str) -> String {
-    let resource = format!("arn:aws:rds:{region}:{ACCOUNT}:cev:{engine}/{engine_version}/*");
-    format!(
-        "User: {PRINCIPAL} is not authorized to perform: {DELETE_ACTION} on resource: \
-         {resource} because no identity-based policy allows the {DELETE_ACTION} action"
-    )
-}
+const DENIAL: &str = "The custom engine version you requested may not exist or you don't \
+                      have the required permission.";
 
 /// One `CreateCustomDBEngineVersion` call in `region`, answered with its
 /// `<DBEngineVersion>`, `<Image>` stripped.
@@ -109,16 +108,30 @@ async fn delete(
     .await
 }
 
-/// Assert the denial: HTTP 403, the wire code `AccessDenied`, and the sentence
-/// [`denial`] words it with.
+/// Assert the denial: HTTP 403, the wire code `AccessDenied`, and exactly the [`DENIAL`]
+/// sentence — with none of the request, the caller or the account anywhere in it.
 fn expect_denied(case: &str, response: (u16, String), region: &str, engine: &str, version: &str) {
     let body = expect_error(case, response, 403, "AccessDenied");
+    let message = text(&body, "Message");
     assert_eq!(
-        text(&body, "Message"),
-        denial(region, engine, version),
-        "case {case:?}: the denial must name the principal, the action and the CEV ARN, got \
+        message, DENIAL,
+        "case {case:?}: the denial must be the fixed custom-engine-version sentence, got \
          {body}"
     );
+    // The equality above already pins the whole text; this scan says WHAT may not appear in
+    // it, so a future rewording cannot reintroduce the oracle. Runs of three characters or
+    // fewer are skipped: ordinary words in the sentence contain such runs, so they are no
+    // evidence of disclosure.
+    for leaked in [region, engine, version, PRINCIPAL, ACCOUNT, DELETE_ACTION, "arn:"] {
+        if leaked.len() <= 3 {
+            continue;
+        }
+        assert!(
+            !message.contains(leaked),
+            "case {case:?}: the denial must disclose nothing about the request or the \
+             caller, but it carries {leaked:?}: {message}"
+        );
+    }
 }
 
 /// One row of the delete table: a CEV of one engine family, and the members that family's
@@ -293,6 +306,39 @@ const UNHELD: &[Unheld] = &[
         region: REGION,
         engine: "mysql",
         engine_version: "8.0.35",
+    },
+    Unheld {
+        // `DeleteCustomDBEngineVersion$EngineVersion` is a `CustomEngineVersion`, pattern
+        // ^[a-z0-9_.-]{1,60}$ — this name is at that 60-character maximum, and the denial
+        // is the same sentence however long the name asked about is.
+        case: "a CEV name at the published sixty-character maximum",
+        region: REGION,
+        engine: "custom-oracle-ee",
+        engine_version: "19.cev_name_at_the_published_sixty_character_maximum_length1",
+    },
+    Unheld {
+        // The other end of both patterns: `CustomEngineName` is ^[A-Za-z0-9-]{1,35}$, so a
+        // one-character engine and a one-character CEV name are admitted requests too.
+        case: "the shortest engine and CEV name the two patterns admit",
+        region: REGION,
+        engine: "x",
+        engine_version: "0",
+    },
+    Unheld {
+        // `CustomEngineName`'s pattern admits upper case, which this service folds before
+        // resolving anything with it; the denial still carries no trace of either form.
+        case: "a mixed-case engine name",
+        region: REGION,
+        engine: "Custom-Oracle-EE",
+        engine_version: "19.never_created_cev",
+    },
+    Unheld {
+        // A third region's credential scope, so the row differs from the held CEV's region
+        // and from the other unheld region alike.
+        case: "a region that holds no CEV at all",
+        region: "ap-southeast-2",
+        engine: "custom-sqlserver-ee",
+        engine_version: "15.00.4249.2.other_region_cev",
     },
 ];
 
