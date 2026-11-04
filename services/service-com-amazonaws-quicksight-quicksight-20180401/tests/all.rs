@@ -19,6 +19,8 @@ mod data_source_data_set_lifecycle;
 mod data_source_update;
 #[path = "all/iam_policy_assignment_lifecycle.rs"]
 mod iam_policy_assignment_lifecycle;
+#[path = "all/namespace_lifecycle.rs"]
+mod namespace_lifecycle;
 #[path = "all/search_data_sets.rs"]
 mod search_data_sets;
 #[path = "all/state_roundtrip.rs"]

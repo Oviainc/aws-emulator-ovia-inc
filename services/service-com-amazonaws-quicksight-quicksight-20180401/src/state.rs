@@ -17,8 +17,8 @@ use crate::ops::types::{
     AccountInfo, ColumnGroup, ColumnLevelPermissionRule, CustomInstructions,
     DataPrepConfiguration, DataSet, DataSetSummary, DataSetUsageConfiguration, DataSource,
     DataSourceErrorInfo, DataSourceParameters, DatasetParameter, FieldFolder, IAMPolicyAssignment,
-    InputColumn, LogicalTable, OutputColumn, PerformanceConfiguration, PhysicalTable,
-    ResourcePermission,
+    InputColumn, LogicalTable, NamespaceInfoV2, OutputColumn, PerformanceConfiguration,
+    PhysicalTable, ResourcePermission,
     RowLevelPermissionDataSet, RowLevelPermissionTagConfiguration, SemanticModelConfiguration,
     SslProperties, Tag, Theme, ThemeConfiguration, ThemeVersion, TopicDetails,
     VpcConnectionProperties,
@@ -48,6 +48,11 @@ pub struct ComAmazonawsQuicksightQuicksight20180401State {
     /// namespace the assignment was created in is held on the record — it is the
     /// address a later call must present, not part of the name's identity.
     pub iam_policy_assignments: HashMap<(String, String), IamPolicyAssignmentRecord>,
+    /// Namespaces by `(AwsAccountId, Namespace)`.
+    ///
+    /// The name alone identifies a namespace inside its account: the model documents
+    /// that a namespace must be unique within the Amazon Web Services account.
+    pub namespaces: HashMap<(String, String), NamespaceRecord>,
     /// The sign-up details `CreateAccountSubscription` stored, by `AwsAccountId`.
     ///
     /// An account with no entry here is still a QuickSight account — see
@@ -345,6 +350,147 @@ pub const EDITION_ENTERPRISE_AND_Q: &str = "ENTERPRISE_AND_Q";
 /// request's `AwsAccountId`, so — as for data sources and data sets — the bound that
 /// holds for the process is a total one.
 pub const MAX_ACCOUNT_SUBSCRIPTIONS: usize = 10_000;
+
+impl ComAmazonawsQuicksightQuicksight20180401State {
+    /// The namespace `aws_account_id` holds under `name`, or `None` when that account
+    /// never created one — the stored record a read answers from.
+    pub fn namespace(&self, aws_account_id: &str, name: &str) -> Option<&NamespaceRecord> {
+        self.namespaces
+            .get(&(aws_account_id.to_string(), name.to_string()))
+    }
+
+    /// The namespace a read of `(aws_account_id, name)` reports.
+    ///
+    /// Owned rather than borrowed because the namespace every account has — the one
+    /// the model's `Namespace` members call `default` — was minted by no create, so it
+    /// is described from the account and the request's region rather than from the map.
+    pub fn namespace_info(
+        &self,
+        aws_account_id: &str,
+        name: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<NamespaceInfoV2> {
+        match self.namespace(aws_account_id, name) {
+            Some(record) => Some(record.to_namespace_info(now)),
+            None if name == DEFAULT_NAMESPACE => {
+                Some(default_namespace(region, aws_account_id).to_namespace_info(now))
+            }
+            None => None,
+        }
+    }
+
+    /// How many namespaces `aws_account_id` holds — what
+    /// [`MAX_NAMESPACES_PER_ACCOUNT`] is checked against.
+    pub fn namespace_count(&self, aws_account_id: &str) -> usize {
+        self.namespaces
+            .keys()
+            .filter(|(account, _)| account == aws_account_id)
+            .count()
+    }
+}
+
+/// A stored namespace: what `CreateNamespace` persisted, which is what every later
+/// namespace read reports.
+///
+/// The record carries no timestamps: the modelled `NamespaceInfoV2` structure declares
+/// none, so nothing is stored that no read can report.
+#[derive(Debug, Clone)]
+pub struct NamespaceRecord {
+    pub arn: String,
+    pub name: String,
+    /// The Region whose free SPICE capacity the namespace uses: the Region the
+    /// `CreateNamespace` call ran in.
+    pub capacity_region: String,
+    pub identity_store: String,
+    /// When the clock owes this namespace its move out of `CREATING`. Stored rather
+    /// than waited on: a reader materialises the transition the clock has already made
+    /// due.
+    pub creation_settles_at: SystemTime,
+    pub tags: Vec<Tag>,
+}
+
+impl NamespaceRecord {
+    /// This namespace's `NamespaceStatus` as of `now`: the non-terminal creation status
+    /// until the transition the clock owes falls due, `CREATED` from then on.
+    pub fn status_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.creation_settles_at {
+            NAMESPACE_STATUS_CREATED
+        } else {
+            NAMESPACE_STATUS_CREATING
+        }
+    }
+
+    /// The modelled `NamespaceInfoV2` structure this record describes, as of `now`.
+    pub fn to_namespace_info(&self, now: SystemTime) -> NamespaceInfoV2 {
+        NamespaceInfoV2 {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            capacity_region: Some(self.capacity_region.clone()),
+            creation_status: Some(self.status_at(now).to_string()),
+            identity_store: Some(self.identity_store.clone()),
+            // A namespace whose creation succeeded carries no error, and nothing in
+            // this emulator fails a namespace creation.
+            namespace_error: None,
+            // This emulator has no IAM Identity Center instance, so a namespace is
+            // backed by no Identity Center application either.
+            iam_identity_center_application_arn: None,
+            iam_identity_center_instance_arn: None,
+        }
+    }
+}
+
+/// The namespace every QuickSight account already has, which no create minted.
+///
+/// It is ready from the instant the account exists — this emulator's accounts are all
+/// subscribed, as [`ComAmazonawsQuicksightQuicksight20180401State::account_info`]
+/// states — so its creation transition is already due and it carries no tags.
+fn default_namespace(region: &str, aws_account_id: &str) -> NamespaceRecord {
+    NamespaceRecord {
+        arn: namespace_arn(region, aws_account_id, DEFAULT_NAMESPACE),
+        name: DEFAULT_NAMESPACE.to_string(),
+        capacity_region: region.to_string(),
+        identity_store: IDENTITY_STORE_QUICKSIGHT.to_string(),
+        creation_settles_at: SystemTime::UNIX_EPOCH,
+        tags: Vec::new(),
+    }
+}
+
+/// The name of the namespace every account has: the one the model's `Namespace`
+/// members document a caller that uses no custom namespace to address.
+pub const DEFAULT_NAMESPACE: &str = "default";
+
+/// `NamespaceStatus` of a namespace that is ready to use (model enum
+/// `com.amazonaws.quicksight#NamespaceStatus`).
+pub const NAMESPACE_STATUS_CREATED: &str = "CREATED";
+
+/// `NamespaceStatus` of a namespace whose creation is still in flight (same model
+/// enum). A namespace is created in this non-terminal status — the model calls the
+/// creation an asynchronous process — and leaves it once [`NAMESPACE_CREATION_SPAN`]
+/// has elapsed.
+pub const NAMESPACE_STATUS_CREATING: &str = "CREATING";
+
+/// The only `IdentityStore` the model admits, and so the store every namespace uses.
+pub const IDENTITY_STORE_QUICKSIGHT: &str = "QUICKSIGHT";
+
+/// How long a new namespace stays in `CREATING` before the clock owes it its terminal
+/// status. Chosen (QuickSight publishes no duration): long enough that a caller
+/// reading the namespace straight after the create still observes the non-terminal
+/// status the create reported, short enough to be over by the time anything polls.
+pub const NAMESPACE_CREATION_SPAN: Duration = Duration::from_secs(3);
+
+/// How many namespaces one account may hold before `CreateNamespace` refuses with the
+/// modelled `LimitExceededException`. The model documents the limit: by default there
+/// is a limit of 100 namespaces per Amazon Web Services account.
+pub const MAX_NAMESPACES_PER_ACCOUNT: usize = 100;
+
+/// The TOTAL number of namespaces this emulator holds, across every account — the
+/// process bound, for the same reason as [`MAX_DATA_SOURCES`].
+pub const MAX_NAMESPACES: usize = 10_000;
+
+/// `ExceptionResourceType` of a namespace — what a refusal about one reports (model
+/// enum `com.amazonaws.quicksight#ExceptionResourceType`).
+pub const EXCEPTION_RESOURCE_TYPE_NAMESPACE: &str = "NAMESPACE";
 
 /// A stored data source.
 ///
@@ -857,6 +1003,11 @@ pub fn ingestion_arn(
 /// The ARN of a Q topic: `.../topic/<TopicId>`.
 pub fn topic_arn(region: &str, aws_account_id: &str, topic_id: &str) -> String {
     quicksight_arn(region, aws_account_id, &format!("topic/{topic_id}"))
+}
+
+/// The ARN of a namespace: `.../namespace/<Namespace>`.
+pub fn namespace_arn(region: &str, aws_account_id: &str, namespace: &str) -> String {
+    quicksight_arn(region, aws_account_id, &format!("namespace/{namespace}"))
 }
 
 /// The ARN of a theme: `.../theme/<ThemeId>`.
