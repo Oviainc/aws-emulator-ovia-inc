@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFolder
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFolder`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFolder::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an empty folder under `(AwsAccountId, FolderId)` and persists what the call
+//! submitted — the display name, the folder type, the sharing model, the resource
+//! permissions and the tags — so every later folder read answers from that record.
+//!
+//! A `ParentFolderArn` nests the new folder under an existing one: the folder's
+//! ancestor chain becomes the parent's chain followed by the parent itself, which is
+//! what the modelled `FolderPath` reports. An absent or empty `ParentFolderArn` creates
+//! a root-level folder, which has no ancestors.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +178,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFolder` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFolderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFolder"))
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFolderErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::folder_arn(&region, &input.aws_account_id, &input.folder_id);
+        let created_time = crate::state::now_timestamp(std::time::SystemTime::now());
+
+        let mut store = state.lock();
+        let key = (input.aws_account_id.clone(), input.folder_id.clone());
+        if store.folders.contains_key(&key) {
+            return Err(CreateFolderErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: Some(format!(
+                        "The folder with ID {} already exists.",
+                        input.folder_id
+                    )),
+                    // `ExceptionResourceType` declares no member for a folder, so this
+                    // refusal reports none rather than an unmodelled value.
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // Both halves of the store key come from the request — the account id is an
+        // `@httpLabel` the caller chooses — so the total-records ceiling is what bounds
+        // this process and the per-account one is the fidelity limit on top of it.
+        if store.folders.len() >= crate::state::MAX_FOLDERS {
+            return Err(CreateFolderErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This QuickSight emulator holds the maximum of {} folders.",
+                        crate::state::MAX_FOLDERS
+                    )),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+        if store.folder_count(&input.aws_account_id) >= crate::state::MAX_FOLDERS_PER_ACCOUNT {
+            return Err(CreateFolderErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} folders.",
+                        crate::state::MAX_FOLDERS_PER_ACCOUNT
+                    )),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // The ancestors of the new folder are the parent's own ancestors followed by
+        // the parent itself. An absent or empty `ParentFolderArn` names no parent, so
+        // the folder is root-level and has none.
+        let parent_folder_arn = input
+            .parent_folder_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| !arn.is_empty());
+        let ancestor_arns = match parent_folder_arn {
+            None => Vec::new(),
+            Some(parent_folder_arn) => {
+                let Some(parent) = store.folder_by_arn(&input.aws_account_id, parent_folder_arn)
+                else {
+                    return Err(CreateFolderErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "The parent folder {parent_folder_arn} was not found."
+                            )),
+                            resource_type: None,
+                            request_id: Some(request_id),
+                        },
+                    )
+                    .into());
+                };
+                let mut ancestor_arns = parent.ancestor_arns.clone();
+                ancestor_arns.push(parent.arn.clone());
+                if ancestor_arns.len() > crate::state::MAX_FOLDER_ANCESTORS {
+                    return Err(CreateFolderErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(format!(
+                                "A folder can have at most {} ancestor folders.",
+                                crate::state::MAX_FOLDER_ANCESTORS
+                            )),
+                            resource_type: None,
+                            request_id: Some(request_id),
+                        },
+                    )
+                    .into());
+                }
+                ancestor_arns
+            }
+        };
+
+        store.folders.insert(
+            key,
+            crate::state::FolderRecord {
+                arn: arn.clone(),
+                folder_id: input.folder_id.clone(),
+                name: input.name,
+                // The model documents both defaults, so a create that names neither
+                // stores the default rather than nothing: a later read reports the
+                // folder's type and its sharing scope either way.
+                folder_type: input
+                    .folder_type
+                    .unwrap_or_else(|| crate::state::FOLDER_TYPE_SHARED.to_string()),
+                sharing_model: input
+                    .sharing_model
+                    .unwrap_or_else(|| crate::state::SHARING_MODEL_ACCOUNT.to_string()),
+                ancestor_arns,
+                created_time,
+                last_updated_time: created_time,
+                permissions: input.permissions.unwrap_or_default(),
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateFolderOutput {
+            arn: Some(arn),
+            folder_id: Some(input.folder_id),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

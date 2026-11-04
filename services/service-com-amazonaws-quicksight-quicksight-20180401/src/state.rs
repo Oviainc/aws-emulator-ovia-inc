@@ -16,9 +16,9 @@ use ::aws_smithy_types::DateTime;
 use crate::ops::types::{
     AccountInfo, ColumnGroup, ColumnLevelPermissionRule, CustomInstructions,
     DataPrepConfiguration, DataSet, DataSetSummary, DataSetUsageConfiguration, DataSource,
-    DataSourceErrorInfo, DataSourceParameters, DatasetParameter, FieldFolder, IAMPolicyAssignment,
-    InputColumn, LogicalTable, NamespaceInfoV2, OutputColumn, PerformanceConfiguration,
-    PhysicalTable, ResourcePermission,
+    DataSourceErrorInfo, DataSourceParameters, DatasetParameter, FieldFolder, Folder,
+    IAMPolicyAssignment, InputColumn, LogicalTable, NamespaceInfoV2, OutputColumn,
+    PerformanceConfiguration, PhysicalTable, ResourcePermission,
     RowLevelPermissionDataSet, RowLevelPermissionTagConfiguration, SemanticModelConfiguration,
     SslProperties, Tag, Theme, ThemeConfiguration, ThemeVersion, TopicDetails,
     VpcConnectionProperties,
@@ -41,6 +41,11 @@ pub struct ComAmazonawsQuicksightQuicksight20180401State {
     pub topics: HashMap<(String, String), TopicRecord>,
     /// Themes by `(AwsAccountId, ThemeId)`.
     pub themes: HashMap<(String, String), ThemeRecord>,
+    /// Folders by `(AwsAccountId, FolderId)`.
+    ///
+    /// Nesting is held on the record as the ancestors' ARNs rather than as a tree of
+    /// its own, so a folder is reached by its id in one lookup however deep it sits.
+    pub folders: HashMap<(String, String), FolderRecord>,
     /// IAM policy assignments by `(AwsAccountId, AssignmentName)`.
     ///
     /// The name alone identifies the assignment inside its account: the model states
@@ -130,6 +135,36 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
     /// checked against.
     pub fn theme_count(&self, aws_account_id: &str) -> usize {
         self.themes
+            .keys()
+            .filter(|(account, _)| account == aws_account_id)
+            .count()
+    }
+
+    /// The folder a call addressing `(aws_account_id, folder_id)` reaches, if the
+    /// account holds one under that id.
+    pub fn folder(&self, aws_account_id: &str, folder_id: &str) -> Option<&FolderRecord> {
+        self.folders
+            .get(&(aws_account_id.to_string(), folder_id.to_string()))
+    }
+
+    /// The folder in `aws_account_id` whose ARN is `arn`, if any — what resolving a
+    /// submitted `ParentFolderArn` means.
+    ///
+    /// Resolved the same way as [`Self::data_source_by_arn`]: a QuickSight folder ARN
+    /// ends in `folder/<FolderId>`, so the id is read off the ARN and the candidate's
+    /// own ARN is then compared in full — an ARN that differs anywhere else (another
+    /// account, another region, another service) matches nothing.
+    pub fn folder_by_arn(&self, aws_account_id: &str, arn: &str) -> Option<&FolderRecord> {
+        let folder_id = arn.rsplit_once("folder/").map(|(_, id)| id)?;
+        self.folders
+            .get(&(aws_account_id.to_string(), folder_id.to_string()))
+            .filter(|record| record.arn == arn)
+    }
+
+    /// How many folders `aws_account_id` holds — what [`MAX_FOLDERS_PER_ACCOUNT`] is
+    /// checked against.
+    pub fn folder_count(&self, aws_account_id: &str) -> usize {
+        self.folders
             .keys()
             .filter(|(account, _)| account == aws_account_id)
             .count()
@@ -852,6 +887,77 @@ impl ThemeVersionRecord {
     }
 }
 
+/// The `FolderType` a folder has when the create names none. The model documents the
+/// default: by default, folderType is SHARED.
+pub const FOLDER_TYPE_SHARED: &str = "SHARED";
+
+/// The `SharingModel` a folder has when the create names none. The model documents the
+/// default: the default value for this parameter is ACCOUNT.
+pub const SHARING_MODEL_ACCOUNT: &str = "ACCOUNT";
+
+/// How many ancestors a folder may have. The modelled `Path` list — the shape
+/// `Folder`'s `FolderPath` targets — admits at most 10 ARNs, so a folder nested deeper
+/// than that could not be reported and is refused instead.
+/// Source: smithy_query(query="shape", shape="Path").
+pub const MAX_FOLDER_ANCESTORS: usize = 10;
+
+/// How many folders one account may hold before `CreateFolder` refuses with the
+/// modelled `LimitExceededException`. Same standing as
+/// [`MAX_DATA_SOURCES_PER_ACCOUNT`]: a fidelity limit, not the process bound.
+pub const MAX_FOLDERS_PER_ACCOUNT: usize = 1_000;
+
+/// The TOTAL number of folders this emulator holds, across every account — the process
+/// bound, for the same reason as [`MAX_DATA_SOURCES`].
+pub const MAX_FOLDERS: usize = 10_000;
+
+/// A stored folder: what `CreateFolder` persisted, which is what every later folder
+/// read reports.
+///
+/// The folder carries no status: the modelled `Folder` structure declares none —
+/// QuickSight hands a folder back ready to use — so there is no transition for the
+/// clock to owe it.
+#[derive(Debug, Clone)]
+pub struct FolderRecord {
+    pub arn: String,
+    pub folder_id: String,
+    /// The display name, absent when the create submitted none: `Name` is optional on
+    /// `CreateFolder`, and a folder created without one has nothing to report.
+    pub name: Option<String>,
+    pub folder_type: String,
+    pub sharing_model: String,
+    /// The ARNs of this folder's ancestors, outermost first — the root-level folder of
+    /// the chain at index 0 and the immediate parent last. Empty for a folder created
+    /// with no `ParentFolderArn`, which is a root-level folder.
+    pub ancestor_arns: Vec<String>,
+    pub created_time: DateTime,
+    pub last_updated_time: DateTime,
+    pub permissions: Vec<ResourcePermission>,
+    pub tags: Vec<Tag>,
+}
+
+impl FolderRecord {
+    /// The modelled `Folder` structure this record describes.
+    pub fn to_folder(&self) -> Folder {
+        Folder {
+            folder_id: Some(self.folder_id.clone()),
+            arn: Some(self.arn.clone()),
+            name: self.name.clone(),
+            folder_type: Some(self.folder_type.clone()),
+            // `Path` is a list of at least one ARN, so a root-level folder — which has
+            // no ancestor to name — reports no path at all rather than an empty list
+            // the model does not admit.
+            folder_path: if self.ancestor_arns.is_empty() {
+                None
+            } else {
+                Some(self.ancestor_arns.clone())
+            },
+            created_time: Some(self.created_time),
+            last_updated_time: Some(self.last_updated_time),
+            sharing_model: Some(self.sharing_model.clone()),
+        }
+    }
+}
+
 /// A stored IAM policy assignment: the rule `CreateIAMPolicyAssignment` persisted,
 /// which is what every later read of that assignment reports.
 ///
@@ -1008,6 +1114,11 @@ pub fn topic_arn(region: &str, aws_account_id: &str, topic_id: &str) -> String {
 /// The ARN of a namespace: `.../namespace/<Namespace>`.
 pub fn namespace_arn(region: &str, aws_account_id: &str, namespace: &str) -> String {
     quicksight_arn(region, aws_account_id, &format!("namespace/{namespace}"))
+}
+
+/// The ARN of a folder: `.../folder/<FolderId>`.
+pub fn folder_arn(region: &str, aws_account_id: &str, folder_id: &str) -> String {
+    quicksight_arn(region, aws_account_id, &format!("folder/{folder_id}"))
 }
 
 /// The ARN of a theme: `.../theme/<ThemeId>`.
