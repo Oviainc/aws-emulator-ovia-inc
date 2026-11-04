@@ -67,7 +67,11 @@ fn past_the_transition(span: Duration) -> Duration {
 }
 
 /// One `awsJson1_1` call to EventBridge over the router.
-async fn events(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn events(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -99,7 +103,7 @@ async fn events(router: &MultiServiceRouter, operation: &str, body: &Value) -> (
     (status, parsed)
 }
 
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -109,7 +113,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// The wire error code of a failure body (`__type` on awsJson), without its
 /// namespace.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .map(|name| name.rsplit('#').next().unwrap_or(name).to_string())
@@ -117,7 +121,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// The `message` an error body carries.
-fn message(body: &Value) -> String {
+pub(crate) fn message(body: &Value) -> String {
     body.get("message")
         .or_else(|| body.get("Message"))
         .and_then(Value::as_str)
@@ -134,7 +138,11 @@ fn expected_missing_wording(verb: &str, name: &str) -> String {
 
 /// An API-key connection called `name`, already settled into `AUTHORIZED` when
 /// `settled`; answers its ARN.
-async fn given_connection(router: &MultiServiceRouter, name: &str, settled: bool) -> String {
+pub(crate) async fn given_connection(
+    router: &MultiServiceRouter,
+    name: &str,
+    settled: bool,
+) -> String {
     let (status, body) = events(
         router,
         "CreateConnection",
@@ -159,7 +167,11 @@ async fn given_connection(router: &MultiServiceRouter, name: &str, settled: bool
 
 /// A destination called `name` on `connection`, created with the baseline
 /// members; answers the whole `CreateApiDestination` response.
-async fn given_destination(router: &MultiServiceRouter, name: &str, connection: &str) -> Value {
+pub(crate) async fn given_destination(
+    router: &MultiServiceRouter,
+    name: &str,
+    connection: &str,
+) -> Value {
     let (status, created) = events(
         router,
         "CreateApiDestination",
@@ -181,7 +193,11 @@ async fn given_destination(router: &MultiServiceRouter, name: &str, connection: 
 }
 
 /// One `UpdateApiDestination` call on `name` carrying `members` beside it.
-async fn update(router: &MultiServiceRouter, name: &str, members: &Value) -> (u16, Value) {
+pub(crate) async fn update(
+    router: &MultiServiceRouter,
+    name: &str,
+    members: &Value,
+) -> (u16, Value) {
     let mut request = json!({ "Name": name });
     for (member, value) in members.as_object().expect("the update members are an object") {
         request[member] = value.clone();

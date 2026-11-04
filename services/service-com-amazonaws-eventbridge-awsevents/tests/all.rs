@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/api_destination_delivery.rs"]
 mod api_destination_delivery;
+#[path = "all/api_destination_rate_limit_refusal.rs"]
+mod api_destination_rate_limit_refusal;
 #[path = "all/api_destination_state_settles_with_its_connection.rs"]
 mod api_destination_state_settles_with_its_connection;
 #[path = "all/api_destination_update.rs"]
@@ -41,6 +43,8 @@ mod connection_refusal_wording;
 mod cross_region_bus_target;
 #[path = "all/dead_letter_error_code.rs"]
 mod dead_letter_error_code;
+#[path = "all/encrypted_bus_key_state.rs"]
+mod encrypted_bus_key_state;
 #[path = "all/entry_level_semantics.rs"]
 mod entry_level_semantics;
 #[path = "all/envelope_time_precision.rs"]
@@ -133,5 +137,7 @@ mod target_delivery;
 mod target_dispatch;
 #[path = "all/target_response_members.rs"]
 mod target_response_members;
+#[path = "all/topic_target_policy_authorization.rs"]
+mod topic_target_policy_authorization;
 #[path = "all/trace_header_propagation.rs"]
 mod trace_header_propagation;

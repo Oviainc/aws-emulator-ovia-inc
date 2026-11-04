@@ -99,6 +99,12 @@ pub(crate) fn emulator() -> Emulator {
     router.register_service(
         service_com_amazonaws_glue_awsglue::EmulatedService::new(Arc::clone(&engine)),
     );
+    // KMS: the key an event bus is encrypted with lives in that service's own store,
+    // and a publication onto such a bus is decided against the state its handlers
+    // (`DisableKey`/`EnableKey`) left on the key.
+    router.register_service(
+        service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(&engine)),
+    );
     Emulator { router, engine }
 }
 
@@ -109,7 +115,7 @@ pub(crate) const AMBIENT_KEY: &str = "AKIDTESTTESTTEST";
 
 /// One `awsJson` RPC call against the service whose signing name is
 /// `signing_name` — the credential scope is what routes it.
-async fn rpc(
+pub(crate) async fn rpc(
     emulator: &Emulator,
     signing_name: &str,
     target_prefix: &str,
@@ -339,7 +345,7 @@ pub(crate) async fn iam(
     query(emulator, "iam", "2010-05-08", action, params).await
 }
 
-async fn sns(
+pub(crate) async fn sns(
     emulator: &Emulator,
     action: &str,
     params: &[(&str, &str)],
@@ -654,6 +660,36 @@ async fn given_target(emulator: &Emulator, kind: Kind) -> (String, Observe) {
             assert_eq!(status, 200, "CreateTopic answered {status}: {created}");
             let arn = xml_text(&created, "TopicArn")
                 .unwrap_or_else(|| panic!("no TopicArn in {created}"));
+            // The grant is part of the PREREQUISITE, for the reason [`given_queue`]
+            // gives: "for Lambda functions, Amazon SNS topics and Amazon SQS queues,
+            // EventBridge relies on resource-based policies", so a topic that has
+            // granted this service nothing is published nothing — which is the rule
+            // `tests/all/topic_target_policy_authorization.rs` is the suite for.
+            let policy = json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Sid": "AllowEventBridge",
+                    "Effect": "Allow",
+                    "Principal": {"Service": SERVICE_PRINCIPAL},
+                    "Action": "sns:Publish",
+                    "Resource": arn,
+                }],
+            })
+            .to_string();
+            let (status, written) = sns(
+                emulator,
+                "SetTopicAttributes",
+                &[
+                    ("TopicArn", &arn),
+                    ("AttributeName", "Policy"),
+                    ("AttributeValue", &policy),
+                ],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "SetTopicAttributes answered {status}: {written}"
+            );
             // A delivery is observed on a SUBSCRIPTION, so the topic has one.
             let (_, queue_arn) = given_queue(emulator, "topic-subscriber").await;
             let (status, subscribed) = sns(

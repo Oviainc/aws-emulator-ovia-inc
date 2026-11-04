@@ -224,11 +224,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if rate > crate::state::MAX_API_DESTINATION_RATE_LIMIT {
                 return Err(UpdateApiDestinationErrorModeled::LimitExceededException(
                     LimitExceededException {
-                        message: Some(format!(
-                            "InvocationRateLimitPerSecond {rate} exceeds the maximum of {} \
-                             requests per second for an api destination.",
-                            crate::state::MAX_API_DESTINATION_RATE_LIMIT
-                        )),
+                        message: Some(
+                            // The create path's own wording, called rather than
+                            // repeated: both calls refuse this value in the same
+                            // sentence and differ only in their verb.
+                            crate::ops::create_api_destination::rate_limit_exceeded(
+                                VERB,
+                                &input.name,
+                                rate,
+                            ),
+                        ),
                     },
                 )
                 .into());

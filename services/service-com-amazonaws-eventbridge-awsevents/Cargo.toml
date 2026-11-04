@@ -62,6 +62,12 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # the identity the access key id a client's `PutEvents` presents speaks for,
 # together with that identity's own policies (`state::authorization`).
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The KMS store holds the state of the customer managed key an event bus is
+# encrypted with: a publication onto such a bus has to be encrypted under that
+# key, so `PutEvents` resolves the bus's `KmsKeyIdentifier` in the KMS service's
+# OWN store (the one `DisableKey`/`EnableKey` write) rather than keeping a second
+# copy of a key's state.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 # A rule target that is a Glue WORKFLOW is delivered to by counting the event
 # against that workflow's EVENT trigger in the Glue store of this same shared
 # engine (`ops::put_events`). Glue serves no API for that ingress — the action a
@@ -88,6 +94,7 @@ service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
+service-com-amazonaws-kms-trentservice = { workspace = true }
 
 [lints]
 workspace = true

@@ -221,11 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if rate > crate::state::MAX_API_DESTINATION_RATE_LIMIT {
             return Err(CreateApiDestinationErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "InvocationRateLimitPerSecond {rate} exceeds the maximum of {} \
-                         requests per second for an api destination.",
-                        crate::state::MAX_API_DESTINATION_RATE_LIMIT
-                    )),
+                    message: Some(rate_limit_exceeded(VERB, &input.name, rate)),
                 },
             )
             .into());
@@ -267,3 +263,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The verb of THIS call, as the clause every refusal of it that names the call
 /// opens with ([`crate::state::api_destination_refusal`]).
 const VERB: &str = "create";
+
+/// How an api-destination call is refused for an `InvocationRateLimitPerSecond`
+/// past the maximum the service enforces
+/// ([`crate::state::MAX_API_DESTINATION_RATE_LIMIT`]).
+///
+/// The sentence is the one EventBridge answers for the condition: the api-destination
+/// clause every refusal of such a call opens with
+/// ([`crate::state::api_destination_refusal`]), then the rate limit clause — which
+/// names the DESTINATION the request asked for beside the rate it asked for and the
+/// maximum in force, each quoted, so a client refusing a batch of destinations can
+/// tell which one was refused.
+///
+/// `verb` is the verb of the call being refused, `name` the `Name` the request
+/// carried and `rate` its `InvocationRateLimitPerSecond`. Written ONCE, here, and
+/// called from `crate::ops::update_api_destination` too: the create path and the
+/// update path refuse the same value for the same reason, so they word it in the
+/// same place and differ only in the verb of the call that failed.
+pub(crate) fn rate_limit_exceeded(verb: &str, name: &str, rate: i32) -> String {
+    crate::state::api_destination_refusal(
+        verb,
+        &format!(
+            "Invalid Invocation Rate Limit: Rate specified '{rate}' for '{name}' exceeds \
+             maximum allowed of '{}'.",
+            crate::state::MAX_API_DESTINATION_RATE_LIMIT
+        ),
+    )
+}

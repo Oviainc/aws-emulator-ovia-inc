@@ -9620,6 +9620,7 @@ dependencies = [
  "service-com-amazonaws-glue-awsglue",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-kinesis-kinesis-20131202",
+ "service-com-amazonaws-kms-trentservice",
  "service-com-amazonaws-sfn-awsstepfunctions",
  "service-com-amazonaws-sns-amazonsimplenotificationservice",
  "service-com-amazonaws-sqs-amazonsqs",
