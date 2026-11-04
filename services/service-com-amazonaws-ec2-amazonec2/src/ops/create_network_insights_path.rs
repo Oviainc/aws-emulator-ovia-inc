@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNetworkInsightsPath
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNetworkInsightsPath`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stores ONE Reachability Analyzer path out of what the request names — the source and
+//! destination, the addresses, the protocol, the destination port and the filters scoping it
+//! at either end — and answers it exactly as it was stored, so
+//! `DescribeNetworkInsightsPaths` reports the same path and `StartNetworkInsightsAnalysis`
+//! resolves it. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNetworkInsightsPath::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Nothing here analyzes the path: a path is the DESCRIPTION of what to analyze, and the
+//! analysis of one is `StartNetworkInsightsAnalysis`'s own operation, so this call mints the
+//! path record and no analysis.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +154,286 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNetworkInsightsPath` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNetworkInsightsPathErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNetworkInsightsPath"))
+        use crate::state;
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`ClientToken`): the model puts no `@length` on it, so its length is
+        // bounded the way every other client token of this crate is.
+        if input.client_token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // A filter at one end of the path and the individual members describing that same end
+        // select mutually exclusively, so a request giving both is refused rather than served
+        // with one of them ignored: "if you specify this parameter, you can't specify the
+        // parameters for the source IP address or the destination port" (`FilterAtSource`),
+        // and "if you specify this parameter, you can't specify the parameter for the
+        // destination IP address" (`FilterAtDestination`).
+        if input.filter_at_source.is_some() {
+            if input.source_ip.is_some() {
+                return Err(state::parameters_cannot_be_combined(
+                    "FilterAtSource",
+                    "SourceIp",
+                ));
+            }
+            if input.destination_port.is_some() {
+                return Err(state::parameters_cannot_be_combined(
+                    "FilterAtSource",
+                    "DestinationPort",
+                ));
+            }
+        }
+        if input.filter_at_destination.is_some() && input.destination_ip.is_some() {
+            return Err(state::parameters_cannot_be_combined(
+                "FilterAtDestination",
+                "DestinationIp",
+            ));
+        }
+
+        // "The ID or ARN of the source" and "the ID or ARN of the destination" (`Source` /
+        // `Destination`): a path is analyzed BETWEEN resources, and only the kinds of resource
+        // an end of a path can BE may be named — so a value naming any other kind, or naming
+        // no resource at all, is refused with the catalog that member accepts rather than
+        // stored as an end nothing could be analyzed from.
+        for (member, named) in [
+            ("Source", Some(input.source.as_str())),
+            ("Destination", input.destination.as_deref()),
+        ] {
+            if let Some(named) = named {
+                if endpoint_type(named).is_none() {
+                    return Err(unsupported_endpoint_type(member, named));
+                }
+            }
+        }
+
+        // "The tags to add to the path" (`TagSpecifications`) — "you must specify the
+        // resource type to tag, otherwise the request will fail" (`TagSpecification`), and the
+        // only type this action tags is the path it creates. The tag payload's own bounds (the
+        // count per resource, each key and value's length, no key twice, nothing in the
+        // reserved namespace) are applied by the one shared reader every writer holds its tags
+        // to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_NETWORK_INSIGHTS_PATH,
+            Self::NAME,
+        )?;
+
+        // Everything the store needs to hold this path, assembled once here so the budget
+        // check below charges exactly what the insert stores. What the caller chose — the
+        // source, the destination, the addresses, the protocol, the port and the filters — is
+        // kept as it was given, since that is what a path IS; the Region is the one the
+        // request was signed for, which the path's ARN names, and `ctx` carries no other fact
+        // this operation reads.
+        let spec = state::NetworkInsightsPathSpec {
+            source: Some(input.source),
+            destination: input.destination,
+            source_ip: input.source_ip,
+            destination_ip: input.destination_ip,
+            protocol: Some(input.protocol),
+            destination_port: input.destination_port,
+            filter_at_source: input.filter_at_source.as_ref().map(stored_filter),
+            filter_at_destination: input.filter_at_destination.as_ref().map(stored_filter),
+            region: state::request_region(ctx.parts()),
+            tags,
+        };
+        let payload_bytes = state::network_insights_path_payload_bytes(&spec);
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_network_insights_path_capacity() {
+            return Err(state::resource_count_exceeded(format!(
+                "This emulator holds {max} network insights paths, which is as many as it \
+                 stores",
+                max = state::MAX_STORED_RECORDS_PER_STORE,
+            )));
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_count_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The path itself, stored the one way this crate stores one — the id, the ARN and the
+        // creation date all come from the store, never from the request. The store refuses the
+        // write itself when it is full, so the ceiling holds even if the gate above is ever
+        // moved.
+        let path_id = store.insert_network_insights_path(spec).ok_or_else(|| {
+            state::resource_count_exceeded(format!(
+                "This emulator holds {max} network insights paths, which is as many as it \
+                 stores",
+                max = state::MAX_STORED_RECORDS_PER_STORE,
+            ))
+        })?;
+
+        // The answer is the path as it was STORED, so this create and every later reader of it
+        // cannot drift apart.
+        let path = store
+            .network_insights_paths
+            .get(&path_id)
+            .cloned()
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the path '{path_id}' just created could not be read back"
+                ))
+            })?;
+        Ok(CreateNetworkInsightsPathOutput {
+            network_insights_path: Some(path),
+        })
+    }
+}
+
+/// The resource types an end of a path may name, each beside the id prefix EC2 issues that
+/// type's ids under, in the order the service's own refusal lists them.
+///
+/// A path is analyzed BETWEEN resources, and only some kinds of resource can be one of its
+/// ends; the service names that catalog in the refusal it answers a value of any other kind
+/// with ([`unsupported_endpoint_type`]), which is where this list comes from. Each entry's
+/// prefix is the one the rest of this crate mints and reads that type's ids under, so the
+/// catalog cannot name a type whose ids the crate spells differently.
+const ENDPOINT_TYPES: [(&str, &str); 9] = [
+    // The instance id prefix `crate::state::instance_id_is_well_formed` reads.
+    ("instance", "i"),
+    (
+        crate::state::RESOURCE_TYPE_NETWORK_INTERFACE,
+        crate::state::NETWORK_INTERFACE_ID_PREFIX,
+    ),
+    // The `ResourceType` member of an internet gateway, whose ids this crate mints under
+    // `crate::state::INTERNET_GATEWAY_ID_PREFIX`.
+    ("internet-gateway", crate::state::INTERNET_GATEWAY_ID_PREFIX),
+    (
+        crate::state::RESOURCE_TYPE_VPN_GATEWAY,
+        crate::state::VPN_GATEWAY_ID_PREFIX,
+    ),
+    (
+        crate::state::RESOURCE_TYPE_VPC_ENDPOINT,
+        crate::state::VPC_ENDPOINT_ID_PREFIX,
+    ),
+    (
+        crate::state::RESOURCE_TYPE_VPC_ENDPOINT_SERVICE,
+        crate::state::VPC_ENDPOINT_SERVICE_ID_PREFIX,
+    ),
+    (
+        crate::state::RESOURCE_TYPE_VPC_PEERING_CONNECTION,
+        crate::state::VPC_PEERING_CONNECTION_ID_PREFIX,
+    ),
+    (
+        crate::state::RESOURCE_TYPE_TRANSIT_GATEWAY,
+        TRANSIT_GATEWAY_ID_PREFIX,
+    ),
+    (
+        crate::state::RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT,
+        crate::state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
+    ),
+];
+
+/// The id prefix of a transit gateway, the one kind in [`ENDPOINT_TYPES`] this crate names no
+/// prefix constant for: the `tgw-` every transit gateway id of this service carries, which
+/// [`crate::state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX`] extends for an attachment.
+const TRANSIT_GATEWAY_ID_PREFIX: &str = "tgw";
+
+/// Refuse an end of the path whose value names no resource a path can be analyzed between:
+/// HTTP 400 `InvalidParameterValue`, worded as the service words it — the value, the member
+/// that carried it, and the catalog of types that member accepts.
+///
+/// The member's name is taken from the request, since either end can be the one that names an
+/// unsupported kind, and the catalog is [`ENDPOINT_TYPES`] itself, so the sentence cannot list
+/// a type this operation would refuse. The echo of the value is bounded by the one reader every
+/// refusal of this crate quotes a caller-chosen id through.
+fn unsupported_endpoint_type(member: &str, value: &str) -> CreateNetworkInsightsPathError {
+    let supported: Vec<&str> = ENDPOINT_TYPES
+        .iter()
+        .map(|(resource_type, _)| *resource_type)
+        .collect();
+    crate::state::invalid_parameter_value(format!(
+        "{value} is not a supported {member} type. Supported {member} types include: \
+         [{supported}]",
+        value = crate::state::echoed_resource_id(value),
+        supported = supported.join(", "),
+    ))
+}
+
+/// The type of the resource an end of the path names, or `None` when it names no resource of
+/// the [`ENDPOINT_TYPES`] catalog.
+///
+/// "The ID or ARN of the source. If the resource is in another account, you must specify an
+/// ARN" (`Source`, and the same sentence for `Destination`), so a value carrying the `arn:`
+/// scheme is read for the type its resource part names and anything else as a resource id,
+/// whose type is the kind whose prefix it reads under
+/// ([`crate::state::prefixed_id_is_well_formed`], the two forms EC2 has issued ids in). A value
+/// in neither form names nothing at all, whatever resources the account holds, which is why
+/// this is decided before the store is reached.
+fn endpoint_type(value: &str) -> Option<&'static str> {
+    if let Some((resource_type, named)) = arn_resource(value) {
+        if named.is_empty() {
+            return None;
+        }
+        return ENDPOINT_TYPES
+            .iter()
+            .find(|(supported, _)| *supported == resource_type)
+            .map(|(supported, _)| *supported);
+    }
+    ENDPOINT_TYPES
+        .iter()
+        .find(|(_, prefix)| crate::state::prefixed_id_is_well_formed(prefix, value))
+        .map(|(supported, _)| *supported)
+}
+
+/// The resource type and the resource an ARN's resource part names: `<type>/<id>` or
+/// `<type>:<id>` under the six colon-separated fields of
+/// `arn:<partition>:<service>:<region>:<account>:<resource>` (AWS General Reference, "Amazon
+/// Resource Names"). `None` for a value that is no ARN at all, which therefore names its
+/// resource as a bare id instead.
+fn arn_resource(value: &str) -> Option<(&str, &str)> {
+    if !value.starts_with("arn:") {
+        return None;
+    }
+    let resource = value.splitn(6, ':').nth(5)?;
+    resource
+        .split_once('/')
+        .or_else(|| resource.split_once(':'))
+}
+
+/// One requested filter as the modelled [`PathFilter`] the store holds and every reader of a
+/// path reports.
+///
+/// The request and the stored path describe the same scoping at one end of the path through
+/// two shapes — `PathRequestFilter` on the way in, `PathFilter` on the way out — whose members
+/// correspond one for one, so the path keeps exactly what the request scoped it with.
+fn stored_filter(requested: &PathRequestFilter) -> PathFilter {
+    PathFilter {
+        source_address: requested.source_address.clone(),
+        source_port_range: requested.source_port_range.as_ref().map(stored_port_range),
+        destination_address: requested.destination_address.clone(),
+        destination_port_range: requested
+            .destination_port_range
+            .as_ref()
+            .map(stored_port_range),
+    }
+}
+
+/// One requested port range as the modelled [`FilterPortRange`] the stored filter carries:
+/// `RequestFilterPortRange`'s two bounds, each kept as the request gave it, and left absent
+/// where it gave none.
+fn stored_port_range(requested: &RequestFilterPortRange) -> FilterPortRange {
+    FilterPortRange {
+        from_port: requested.from_port,
+        to_port: requested.to_port,
     }
 }

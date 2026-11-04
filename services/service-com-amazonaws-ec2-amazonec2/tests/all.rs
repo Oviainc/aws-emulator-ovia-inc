@@ -377,6 +377,13 @@ mod delete_network_insights_path;
 // serialized squash merge is lost.
 #[path = "all/describe_network_insights_paths.rs"]
 mod describe_network_insights_paths;
+// What `CreateNetworkInsightsPath` stores for one Reachability Analyzer path, what it answers,
+// which parameter pairings it refuses and what a dry run of it performs. Declared beside the
+// three path suites above — topically its neighbours — rather than in sorted position or at
+// the tail, for the reason this file's header note gives: both are contended regions where a
+// serialized squash merge is lost.
+#[path = "all/create_network_insights_path.rs"]
+mod create_network_insights_path;
 // The transit gateway prefix list reference slice (create, then read it back) and the
 // error envelope's request id. Declared beside the suites above for the reason they
 // give: the sorted region is where every new ec2 suite inserts its lines, and these two
