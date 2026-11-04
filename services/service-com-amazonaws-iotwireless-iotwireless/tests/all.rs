@@ -25,3 +25,5 @@ mod service_profile_lifecycle;
 mod state_roundtrip;
 #[path = "all/wireless_gateway_lifecycle.rs"]
 mod wireless_gateway_lifecycle;
+#[path = "all/wireless_gateway_task_definition_lifecycle.rs"]
+mod wireless_gateway_task_definition_lifecycle;

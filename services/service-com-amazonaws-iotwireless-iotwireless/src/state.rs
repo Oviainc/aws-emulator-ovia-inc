@@ -10,7 +10,7 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     LoRaWANDevice, LoRaWANDeviceProfile, LoRaWANGateway, LoRaWANMulticast, LoRaWANServiceProfile,
-    ResourceNotFoundException, SidewalkDevice, Tag,
+    ResourceNotFoundException, SidewalkDevice, Tag, UpdateWirelessGatewayTaskCreate,
 };
 
 /// The ARN service namespace (`arn:aws:iotwireless:...`) and the SigV4 signing name
@@ -58,6 +58,15 @@ pub fn multicast_group_arn(region: &str, id: &str) -> String {
 /// `arn:aws:iotwireless:<region>:<account>:WirelessGateway/<id>`.
 pub fn wireless_gateway_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("WirelessGateway/{id}"))
+}
+
+/// `arn:aws:iotwireless:<region>:<account>:WirelessGatewayTaskDefinition/<id>`.
+pub fn wireless_gateway_task_definition_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("WirelessGatewayTaskDefinition/{id}"),
+    )
 }
 
 /// `ExpressionType`'s modelled values, as the model-generated
@@ -276,6 +285,36 @@ pub struct WirelessGateway {
     pub tags: Vec<Tag>,
 }
 
+/// A wireless gateway task definition: the firmware update one gateway task applies.
+///
+/// `update` is the settings the create carried, reported back unchanged by the
+/// definition's reader; `auto_create_tasks` is the modelled flag that says whether the
+/// service creates a task for every gateway on the named current version by itself,
+/// rather than only when `CreateWirelessGatewayTask` asks for one.
+#[derive(Debug, Clone)]
+pub struct WirelessGatewayTaskDefinition {
+    pub id: String,
+    pub arn: String,
+    pub name: Option<String>,
+    pub auto_create_tasks: bool,
+    pub update: Option<UpdateWirelessGatewayTaskCreate>,
+    pub tags: Vec<Tag>,
+}
+
+/// The `ResourceNotFoundException` body for a wireless gateway task definition the
+/// account does not hold.
+///
+/// One function, so every operation that addresses a task definition by `Id` — its
+/// reader, and the task operations that reference one — refuses a missing one with the
+/// same body.
+pub fn wireless_gateway_task_definition_not_found(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("No wireless gateway task definition with Id {id}")),
+        resource_id: Some(id.to_string()),
+        resource_type: Some("WirelessGatewayTaskDefinition".to_string()),
+    }
+}
+
 /// A multicast group: the LoRaWAN downlink settings a set of wireless devices shares.
 ///
 /// The membership itself lives on the devices (`WirelessDevice::multicast_group_id`),
@@ -364,6 +403,20 @@ pub const MAX_MULTICAST_GROUPS: usize = 100;
 /// refuses with `ValidationException`.
 pub const MAX_WIRELESS_GATEWAYS: usize = 100;
 
+/// The most wireless gateway task definitions this emulator stores. A ceiling, for the
+/// same reason as [`MAX_DESTINATIONS`]; `CreateWirelessGatewayTaskDefinition` models no
+/// quota error either (`smithy_query(query="operation",
+/// operation="CreateWirelessGatewayTaskDefinition")` lists AccessDenied / Conflict /
+/// InternalServer / ResourceNotFound / Throttling / Validation), so a full store refuses
+/// with `ValidationException`.
+pub const MAX_WIRELESS_GATEWAY_TASK_DEFINITIONS: usize = 100;
+
+/// The most `ClientRequestToken` entries kept for
+/// `CreateWirelessGatewayTaskDefinition` idempotency. Bounded for the same reason as
+/// [`MAX_DESTINATION_TOKENS`].
+pub const MAX_WIRELESS_GATEWAY_TASK_DEFINITION_TOKENS: usize =
+    MAX_WIRELESS_GATEWAY_TASK_DEFINITIONS;
+
 /// The most `ClientRequestToken` entries kept for `CreateDestination` idempotency.
 ///
 /// At most one token is recorded per stored destination and a token is dropped with the
@@ -401,18 +454,20 @@ pub const MAX_WIRELESS_GATEWAY_TOKENS: usize = MAX_WIRELESS_GATEWAYS;
 /// Every store here is BOUNDED: the resource maps by [`MAX_DESTINATIONS`] /
 /// [`MAX_WIRELESS_DEVICES`] / [`MAX_DEVICE_PROFILES`] / [`MAX_SERVICE_PROFILES`] /
 /// [`MAX_MULTICAST_GROUPS`] /
-/// [`MAX_WIRELESS_GATEWAYS`] (the
+/// [`MAX_WIRELESS_GATEWAYS`] / [`MAX_WIRELESS_GATEWAY_TASK_DEFINITIONS`] (the
 /// creates refuse once full), `dev_eui_index` by one entry per stored device,
 /// `gateway_eui_index` by one entry per stored gateway, and the
 /// token maps by [`MAX_DESTINATION_TOKENS`] / [`MAX_WIRELESS_DEVICE_TOKENS`] /
 /// [`MAX_DEVICE_PROFILE_TOKENS`] / [`MAX_SERVICE_PROFILE_TOKENS`] /
 /// [`MAX_MULTICAST_GROUP_TOKENS`] /
-/// [`MAX_WIRELESS_GATEWAY_TOKENS`] with oldest-entry
+/// [`MAX_WIRELESS_GATEWAY_TOKENS`] /
+/// [`MAX_WIRELESS_GATEWAY_TASK_DEFINITION_TOKENS`] with oldest-entry
 /// eviction. The token maps are private so every write goes through
 /// [`Self::record_destination_token`] / [`Self::record_wireless_device_token`] /
 /// [`Self::record_device_profile_token`] / [`Self::record_service_profile_token`] /
 /// [`Self::record_multicast_group_token`] /
-/// [`Self::record_wireless_gateway_token`] and
+/// [`Self::record_wireless_gateway_token`] /
+/// [`Self::record_wireless_gateway_task_definition_token`] and
 /// cannot bypass the cap.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotwirelessIotwirelessState {
@@ -428,6 +483,9 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
     pub multicast_groups: BTreeMap<String, MulticastGroup>,
     /// Wireless gateways by `Id`. Bounded by [`MAX_WIRELESS_GATEWAYS`].
     pub wireless_gateways: BTreeMap<String, WirelessGateway>,
+    /// Wireless gateway task definitions by `Id`. Bounded by
+    /// [`MAX_WIRELESS_GATEWAY_TASK_DEFINITIONS`].
+    pub wireless_gateway_task_definitions: BTreeMap<String, WirelessGatewayTaskDefinition>,
     /// `GatewayEui` -> gateway id, so `GetWirelessGateway?identifierType=GatewayEui`
     /// resolves without scanning and a duplicate `GatewayEui` is refusable. At most one
     /// entry per stored gateway.
@@ -468,6 +526,12 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
     wireless_gateway_tokens: HashMap<String, IdempotentCreate>,
     /// Write order for [`Self::wireless_gateway_tokens`].
     wireless_gateway_token_order: VecDeque<String>,
+    /// `CreateWirelessGatewayTaskDefinition` client request tokens, bounded by
+    /// [`MAX_WIRELESS_GATEWAY_TASK_DEFINITION_TOKENS`]. Private, like the destination
+    /// tokens.
+    wireless_gateway_task_definition_tokens: HashMap<String, IdempotentCreate>,
+    /// Write order for [`Self::wireless_gateway_task_definition_tokens`].
+    wireless_gateway_task_definition_token_order: VecDeque<String>,
 }
 
 /// Record `token` in `tokens`, evicting the oldest recorded token first if that would
@@ -595,6 +659,36 @@ impl ComAmazonawsIotwirelessIotwirelessState {
         );
     }
 
+    /// Mint a fresh, unused `WirelessGatewayTaskDefinitionId`.
+    pub fn mint_wireless_gateway_task_definition_id(&mut self) -> String {
+        mint_unused_uuid(&self.wireless_gateway_task_definitions)
+    }
+
+    /// What a `CreateWirelessGatewayTaskDefinition` `ClientRequestToken` already minted,
+    /// if anything.
+    pub fn wireless_gateway_task_definition_token(
+        &self,
+        token: &str,
+    ) -> Option<&IdempotentCreate> {
+        self.wireless_gateway_task_definition_tokens.get(token)
+    }
+
+    /// Record `token` as having minted the task definition named by `record`, evicting
+    /// the oldest token first if that would push the map past
+    /// [`MAX_WIRELESS_GATEWAY_TASK_DEFINITION_TOKENS`].
+    pub fn record_wireless_gateway_task_definition_token(
+        &mut self,
+        token: String,
+        record: IdempotentCreate,
+    ) {
+        record_token(
+            &mut self.wireless_gateway_task_definition_tokens,
+            &mut self.wireless_gateway_task_definition_token_order,
+            MAX_WIRELESS_GATEWAY_TASK_DEFINITION_TOKENS,
+            token,
+            record,
+        );
+    }
 
     /// How many stored wireless devices belong to multicast group `id`.
     ///
