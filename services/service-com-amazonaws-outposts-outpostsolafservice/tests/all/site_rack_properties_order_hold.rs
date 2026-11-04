@@ -283,7 +283,10 @@ async fn an_order_at_another_site_holds_nothing_at_this_one() {
         "the quiet site is created with no rack properties at all, got {quiet:?}"
     );
 
-    let mut expected = json!({});
+    // What the quiet site holds after each accepted row: nothing until a row carries a
+    // property, since a request carrying none writes nothing at all — the structure
+    // included, which a site created without one is still without.
+    let mut expected: Option<Value> = None;
     for (shape, patch) in rack_patches() {
         let case = format!("{shape} at a site with no order of its own");
         let reply = update_rack_properties(&outposts, &quiet_site, &patch).await;
@@ -292,11 +295,13 @@ async fn an_order_at_another_site_holds_nothing_at_this_one() {
             "case {case:?}: another site's order must hold nothing up here, got {} {:?}",
             reply.status, reply.body
         );
-        expected = overlay(&expected, &patch);
+        if patch.as_object().is_some_and(|patch| !patch.is_empty()) {
+            expected = Some(overlay(expected.as_ref().unwrap_or(&json!({})), &patch));
+        }
         let read = stored_properties(&outposts, &quiet_site).await;
         assert_eq!(
             read.as_ref(),
-            Some(&expected),
+            expected.as_ref(),
             "case {case:?}: the accepted change must read back, got {read:?}"
         );
 

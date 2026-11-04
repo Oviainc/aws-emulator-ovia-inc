@@ -5,8 +5,10 @@
 //! for the site the `SiteId` names (bare id or full ARN alike). Every rack property the
 //! request carries replaces the stored one — including one the site had no value for,
 //! which the properties structure gains — and a property the request omits keeps the
-//! value it had. The answer is the site as it now stands, so it is exactly what `GetSite`
-//! and `ListSites` report afterwards.
+//! value it had. Every property is optional, so a request may carry none at all: that
+//! one writes nothing, down to the properties structure itself, which a site stored
+//! without one still has none of afterwards. The answer is the site as it now stands,
+//! so it is exactly what `GetSite` and `ListSites` report afterwards.
 //!
 //! The change waits for an order in progress at the site, which this operation's
 //! contract states (see the modelled sentence below): while an order placed at the site
@@ -265,31 +267,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // Whether this request carries a rack property at all. Every one of them is
+        // optional, so a request that names only the site is valid — and a partial
+        // update writes only what its request carried, so that one writes NOTHING.
+        let carries_property = input.power_draw_kva.is_some()
+            || input.power_phase.is_some()
+            || input.power_connector.is_some()
+            || input.power_feed_drop.is_some()
+            || input.uplink_gbps.is_some()
+            || input.uplink_count.is_some()
+            || input.fiber_optic_cable_type.is_some()
+            || input.optical_standard.is_some()
+            || input.maximum_supported_weight_lbs.is_some();
         let record = store.site_mut(&region, &site_id).ok_or_else(not_found)?;
-        // A site created without rack properties at all gains the structure as soon
-        // as this call sets its first property, so a property set only here is
-        // reported rather than dropped.
-        let properties = record
-            .site
-            .rack_physical_properties
-            .get_or_insert_with(RackPhysicalProperties::default);
-        // Every rack property `RackPhysicalProperties` declares, each written only
-        // when the request carried it.
-        crate::state::apply(&mut properties.power_draw_kva, input.power_draw_kva);
-        crate::state::apply(&mut properties.power_phase, input.power_phase);
-        crate::state::apply(&mut properties.power_connector, input.power_connector);
-        crate::state::apply(&mut properties.power_feed_drop, input.power_feed_drop);
-        crate::state::apply(&mut properties.uplink_gbps, input.uplink_gbps);
-        crate::state::apply(&mut properties.uplink_count, input.uplink_count);
-        crate::state::apply(
-            &mut properties.fiber_optic_cable_type,
-            input.fiber_optic_cable_type,
-        );
-        crate::state::apply(&mut properties.optical_standard, input.optical_standard);
-        crate::state::apply(
-            &mut properties.maximum_supported_weight_lbs,
-            input.maximum_supported_weight_lbs,
-        );
+        if carries_property {
+            // A site created without rack properties at all gains the structure as
+            // soon as this call sets its first property, so a property set only here
+            // is reported rather than dropped. Nothing materialises it when the call
+            // sets none: absent and present-but-empty are two different answers from
+            // `GetSite`, `ListSites` and this operation, so a site stored without the
+            // structure keeps reporting none, and one stored with an empty structure
+            // keeps reporting it.
+            let properties = record
+                .site
+                .rack_physical_properties
+                .get_or_insert_with(RackPhysicalProperties::default);
+            // Every rack property `RackPhysicalProperties` declares, each written only
+            // when the request carried it.
+            crate::state::apply(&mut properties.power_draw_kva, input.power_draw_kva);
+            crate::state::apply(&mut properties.power_phase, input.power_phase);
+            crate::state::apply(&mut properties.power_connector, input.power_connector);
+            crate::state::apply(&mut properties.power_feed_drop, input.power_feed_drop);
+            crate::state::apply(&mut properties.uplink_gbps, input.uplink_gbps);
+            crate::state::apply(&mut properties.uplink_count, input.uplink_count);
+            crate::state::apply(
+                &mut properties.fiber_optic_cable_type,
+                input.fiber_optic_cable_type,
+            );
+            crate::state::apply(&mut properties.optical_standard, input.optical_standard);
+            crate::state::apply(
+                &mut properties.maximum_supported_weight_lbs,
+                input.maximum_supported_weight_lbs,
+            );
+        }
 
         Ok(UpdateSiteRackPhysicalPropertiesOutput {
             site: Some(record.site.clone()),

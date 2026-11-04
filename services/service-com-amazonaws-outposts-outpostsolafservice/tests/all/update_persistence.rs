@@ -12,7 +12,9 @@
 //! > An update operation applies exactly the members its request carries to the stored
 //! > resource — replacing the stored value, including one the resource had no value for
 //! > — leaves every member the request omits exactly as it was, and answers the record
-//! > as it now stands, which is what every later read answers too.
+//! > as it now stands, which is what every later read answers too. A request carrying no
+//! > updatable member at all writes nothing, down to a nested structure the resource has
+//! > none of: it reads back exactly as it did before the call.
 //!
 //! The rows differ along which members the request carries (none, one, several, all),
 //! which value each carries (every value the member's modelled enum declares, for the
@@ -424,6 +426,77 @@ async fn update_rack_properties_leaves_omitted_properties_alone() {
             expected,
             "case {case:?}: GetSite must answer the updated rack properties"
         );
+    }
+}
+
+/// The no-op form of the rule: a request carrying no rack property writes NOTHING, so
+/// the site it names reads back exactly as it did before the call — down to whether it
+/// has a `RackPhysicalProperties` structure at all.
+///
+/// The rows differ along what the site's rack properties are BEFORE the call, which is
+/// what the rule generalises over here: no structure at all, a structure with no
+/// property in it, one property, and every property the structure declares. Each row is
+/// read back through `GetSite` and `ListSites` as well as the update's own answer, and
+/// the call is repeated, since a request that changes nothing cannot start changing
+/// something on a later try.
+#[tokio::test]
+async fn update_rack_properties_carrying_no_property_changes_nothing() {
+    let outposts = Outposts::new();
+    // Every property at its last modelled value, so the richest row differs from the
+    // one-property row in more than its count.
+    let every_property: Value = RACK_PROPERTY_VALUES
+        .iter()
+        .map(|(member, values)| ((*member).to_string(), json!(values[values.len() - 1])))
+        .collect::<serde_json::Map<String, Value>>()
+        .into();
+    let cases: Vec<(&str, Option<Value>)> = vec![
+        ("no rack properties at all", None),
+        ("a rack properties structure with nothing in it", Some(json!({}))),
+        (
+            "one rack property",
+            Some(json!({ "PowerDrawKva": "POWER_15_KVA" })),
+        ),
+        ("every rack property", Some(every_property)),
+    ];
+
+    for (case, at_create) in &cases {
+        let mut request = serde_json::Map::new();
+        request.insert("Name".to_string(), json!(format!("no-op rack: {case}")));
+        if let Some(properties) = at_create {
+            request.insert("RackPhysicalProperties".to_string(), properties.clone());
+        }
+        let created = outposts.create_site(&Value::Object(request)).await;
+        let site_id = text(&created, "SiteId");
+        let site_arn = text(&created, "SiteArn");
+        assert_eq!(
+            created.get("RackPhysicalProperties"),
+            at_create.as_ref(),
+            "case {case:?}: a created site reports exactly the rack properties it was created with, got {created:?}"
+        );
+
+        for attempt in 1..=2 {
+            let answered = update_rack_properties(&outposts, &site_id, &json!({})).await;
+            assert_eq!(
+                answered, created,
+                "case {case:?} attempt {attempt}: a request carrying no property must answer the site unchanged, got {answered:?}"
+            );
+            let read = outposts.get_site(&site_arn).await;
+            assert_eq!(
+                read, created,
+                "case {case:?} attempt {attempt}: GetSite must answer the site unchanged, got {read:?}"
+            );
+            let listed = outposts.list_sites("").await["Sites"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|site| text(site, "SiteId") == site_id);
+            assert_eq!(
+                listed.as_ref(),
+                Some(&created),
+                "case {case:?} attempt {attempt}: ListSites must report the site unchanged, got {listed:?}"
+            );
+        }
     }
 }
 
