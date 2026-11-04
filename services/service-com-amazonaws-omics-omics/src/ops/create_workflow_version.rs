@@ -297,11 +297,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             CreateWorkflowVersionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    // Worded as the service words a missing workflow/version pair (see
-                    // `crate::state::get_workflow_version_not_found_message`), with the
-                    // workflow id the request named as its variable part: there is no
-                    // version to look for when the workflow itself is absent.
-                    message: format!("Workflow {} not found", input.workflow_id),
+                    // Worded as the service words a workflow whose version collection
+                    // cannot be reached, with the workflow id the request named as its
+                    // variable part: there is no version to look for when the workflow
+                    // itself is absent.
+                    message: crate::state::workflow_not_found_message(&input.workflow_id),
                 },
             )
         })?;

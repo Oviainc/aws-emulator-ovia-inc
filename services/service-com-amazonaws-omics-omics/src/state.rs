@@ -179,6 +179,15 @@ pub fn is_deletable_run_status(status: &str) -> bool {
     DELETABLE_RUN_STATUSES.contains(&status)
 }
 
+/// What an operation on a workflow's VERSIONS answers when the workflow itself is not
+/// one this emulator holds: there is no version collection to reach when its workflow
+/// is absent.
+///
+/// The variable part is the workflow id the REQUEST carried.
+pub fn workflow_not_found_message(workflow_id: &str) -> String {
+    format!("Workflow {workflow_id} not found")
+}
+
 /// What `GetWorkflowVersion` answers when the workflow version the request names is
 /// not one this emulator holds — either the workflow or the version is missing, which
 /// are the same answer: the pair was not found.
@@ -926,33 +935,57 @@ pub const RUN_PAGE_TOKEN_TAG: &str = "run_";
 /// The same, for `ListWorkflows`.
 pub const WORKFLOW_PAGE_TOKEN_TAG: &str = "wf_";
 
-/// A page token naming the record the NEXT page of a listing starts at.
+/// The same, for `ListWorkflowVersions`. A version is keyed by its NAME inside its
+/// workflow, so that listing's token names a name rather than a numeric id; the tag is
+/// still distinct from every other, so no token can resume another listing's walk.
+pub const WORKFLOW_VERSION_PAGE_TOKEN_TAG: &str = "wfv_";
+
+/// A page token naming the record the NEXT page of a listing starts at, by that
+/// record's own key.
 ///
-/// One codec for every listing in this crate, so `ListRuns` and `ListWorkflows` mint
-/// and read tokens the same way. Both `RunListToken` and `WorkflowListToken` are
-/// modelled opaque, so the id is hex-encoded rather than handed back in the clear —
-/// opaque to a caller, not secret: hex is trivially reversible and the token carries
-/// nothing beyond a record id. `tag` names the collection the token belongs to, so one
-/// listing's token cannot resume another's walk.
+/// One codec for every listing in this crate, so each mints and reads tokens the same
+/// way. Every list token this service models is opaque, so the key is hex-encoded
+/// rather than handed back in the clear — opaque to a caller, not secret: hex is
+/// trivially reversible and the token carries nothing beyond a record key. `tag` names
+/// the collection the token belongs to, so one listing's token cannot resume another's
+/// walk.
 ///
-/// Both members' modelled pattern is
-/// `^[\p{L}||\p{M}||\p{Z}||\p{S}||\p{N}||\p{P}]+$` and their length is 1..128. Every
-/// character this produces is admitted: the hex digits are `\p{N}`/`\p{L}` and the tag's
-/// `_` is `\p{Pc}`, a `\p{P}` subcategory. The longest possible result is the tag plus
-/// two hex characters per decimal digit of `u64::MAX` — 20 digits, so 40 — well inside
-/// that length for either tag.
+/// Every modelled token member's pattern is
+/// `^[\p{L}||\p{M}||\p{Z}||\p{S}||\p{N}||\p{P}]+$`, and every character this produces is
+/// admitted: the hex digits are `\p{N}`/`\p{L}` and a tag's `_` is `\p{Pc}`, a `\p{P}`
+/// subcategory. The result is the tag plus two hex characters per byte of the key, which
+/// stays inside each member's modelled length: a numeric id is at most the 20 digits of
+/// `u64::MAX` (40 characters, inside the 1..128 of `RunListToken` and
+/// `WorkflowListToken`) and a `WorkflowVersionName` at most 64 (128 characters, inside
+/// the 1..256 of `WorkflowVersionListToken`).
+pub fn encode_name_page_token(tag: &str, key: &str) -> String {
+    format!("{tag}{}", hex::encode(key))
+}
+
+/// The record key a page token tagged `tag` names, or `None` when the token is not one
+/// THAT listing issued. The caller renders that as its own 400 refusal.
+pub fn decode_name_page_token(tag: &str, token: &str) -> Option<String> {
+    let body = token.strip_prefix(tag)?;
+    let key = hex::decode(body)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())?;
+    // A token that names no key at all resumes nothing, so it is not one this service
+    // issued either.
+    (!key.is_empty()).then_some(key)
+}
+
+/// The same token, for a listing whose records are keyed by the numeric id
+/// [`numeric_id`] reads.
 pub fn encode_page_token(tag: &str, id: u64) -> String {
-    format!("{tag}{}", hex::encode(id.to_string()))
+    encode_name_page_token(tag, &id.to_string())
 }
 
 /// The record id a page token tagged `tag` names, or `None` when the token is not one
 /// THAT listing issued. The caller renders that as its own 400 refusal.
 pub fn decode_page_token(tag: &str, token: &str) -> Option<u64> {
-    let body = token.strip_prefix(tag)?;
-    hex::decode(body)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|id| numeric_id(&id))
+    decode_name_page_token(tag, token)
+        .as_deref()
+        .and_then(numeric_id)
 }
 
 /// The ARN of the workflow `id` in `region`.

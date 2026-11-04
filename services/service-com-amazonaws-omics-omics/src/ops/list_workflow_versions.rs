@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkflowVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkflowVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkflowVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the versions stored inside ONE workflow as `items`, resolving that workflow
+//! from the request's `workflowId` narrowed by `type` and `workflowOwnerId` exactly as the
+//! single-version read resolves it, and honouring the `maxResults`/`startingToken` page
+//! bounds. Reporting-only: it materialises the `CREATING` -> `ACTIVE` move the clock
+//! already owed each record and writes nothing else. A version `DeleteWorkflowVersion`
+//! removed is gone from its workflow, so it cannot appear here.
 //!
 //! ## Shape of an operation
 //!
@@ -132,6 +129,59 @@ impl From<ListWorkflowVersionsErrorModeled> for ListWorkflowVersionsError {
     }
 }
 
+/// What a page token's key carries between the workflow the listing walked and the
+/// version the next page starts at.
+///
+/// Neither modelled member admits it — `WorkflowId` is `^[0-9]+$` and
+/// `WorkflowVersionName` is `^[A-Za-z0-9][A-Za-z0-9\-\._]*$` — so the first occurrence
+/// always separates the two.
+const PAGE_TOKEN_SEPARATOR: char = '/';
+
+/// A page token naming the workflow the listing walked and the version the NEXT page
+/// starts at.
+///
+/// A version is keyed by its `WorkflowVersionName` inside its workflow, so a name alone
+/// is a position only within ONE workflow's collection: the workflow is part of the key,
+/// and a token replayed against another workflow is refused rather than read as a
+/// position among that workflow's names. The codec and the page bound are
+/// [`crate::state::encode_name_page_token`] / [`crate::state::decode_name_page_token`]
+/// and [`crate::state::MAX_LIST_PAGE_SIZE`], shared with this crate's other listings; the
+/// key is well inside the modelled `WorkflowVersionListToken` length (1..256), being two
+/// hex characters per character of an at most 18-digit id, the separator and an at most
+/// 64-character name.
+fn encode_page_token(workflow_id: &str, version_name: &str) -> String {
+    crate::state::encode_name_page_token(
+        crate::state::WORKFLOW_VERSION_PAGE_TOKEN_TAG,
+        &format!("{workflow_id}{PAGE_TOKEN_SEPARATOR}{version_name}"),
+    )
+}
+
+/// The workflow id and version name a token names, or THIS operation's 400 refusal when
+/// it is not a token this listing issued.
+fn decode_page_token(token: &str) -> Result<(String, String), ListWorkflowVersionsError> {
+    crate::state::decode_name_page_token(crate::state::WORKFLOW_VERSION_PAGE_TOKEN_TAG, token)
+        .and_then(|key| {
+            let (workflow_id, version_name) = key.split_once(PAGE_TOKEN_SEPARATOR)?;
+            (!workflow_id.is_empty() && !version_name.is_empty())
+                .then(|| (workflow_id.to_string(), version_name.to_string()))
+        })
+        .ok_or_else(unissued_page_token)
+}
+
+/// What this operation answers for a `startingToken` it did not issue for the workflow
+/// the request names.
+///
+/// This operation declares its own `ValidationException`, so the refusal carries the
+/// SERVICE's shape rather than the scaffold channel's synthetic one.
+fn unissued_page_token() -> ListWorkflowVersionsError {
+    ListWorkflowVersionsErrorModeled::ValidationException(ValidationException {
+        message: "startingToken is not a pagination token issued by ListWorkflowVersions \
+                  for this workflow"
+            .to_string(),
+    })
+    .into()
+}
+
 /// The `ListWorkflowVersions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -168,18 +218,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkflowVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkflowVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkflowVersions"))
+        // Every branch below records the call through `crate::state::audit`, so one log
+        // reader sees the whole slice's traffic and not only its state changes. A
+        // listing resolves no single version, so its records carry the workflow whose
+        // collection was walked.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            ListWorkflowVersionsErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics workflow store is unavailable".to_string(),
+            })
+        })?;
+
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_LIST_PAGE_SIZE, |requested| {
+                requested.clamp(1, crate::state::MAX_LIST_PAGE_SIZE as i32) as usize
+            });
+        let start = match input.starting_token.as_deref().map(decode_page_token) {
+            Some(Err(refusal)) => {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                    Some(&input.workflow_id),
+                );
+                return Err(refusal);
+            }
+            Some(Ok(start)) => Some(start),
+            None => None,
+        };
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut store = state.lock();
+        store.settle(now_ms);
+
+        // A version collection lives inside one workflow, so the workflow is resolved
+        // first and an id no workflow carries is "not found" rather than an empty page,
+        // which would read as "the workflow exists and holds no versions". `type` and
+        // `workflowOwnerId` narrow that lookup the way they narrow every other read in
+        // this slice: a request naming another type or owner resolves no workflow rather
+        // than this account's private record.
+        let foreign_owner = input
+            .workflow_owner_id
+            .as_deref()
+            .is_some_and(|owner| !crate::state::is_emulator_account(owner));
+        let wanted_type = input.r#type.as_deref();
+        let workflow = store
+            .workflow(&input.workflow_id)
+            .filter(|_| !foreign_owner)
+            .filter(|workflow| wanted_type.is_none_or(|wanted| wanted == workflow.r#type))
+            .ok_or_else(|| {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::NotFound,
+                    Some(&input.workflow_id),
+                );
+                ListWorkflowVersionsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::workflow_not_found_message(&input.workflow_id),
+                    },
+                )
+            })?;
+
+        // The versions are keyed by the name each is unique under, so the map's own key
+        // order IS the order they are reported in: stable across calls even when a
+        // version in between is deleted, which is what lets a token name the version the
+        // next page resumes at — within the workflow that token was issued for, and no
+        // other.
+        let start = match start {
+            Some((token_workflow_id, version_name)) => {
+                if token_workflow_id != workflow.id {
+                    crate::state::audit(
+                        Self::NAME,
+                        ctx,
+                        crate::state::AuditOutcome::ValidationRefused,
+                        Some(&input.workflow_id),
+                    );
+                    return Err(unissued_page_token());
+                }
+                Some(version_name)
+            }
+            None => None,
+        };
+        let lower = match &start {
+            Some(name) => ::std::ops::Bound::Included(name.as_str()),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut items = Vec::with_capacity(page_size.min(workflow.versions.len()));
+        let mut next_token = None;
+        for (name, version) in workflow
+            .versions
+            .range::<str, _>((lower, ::std::ops::Bound::Unbounded))
+        {
+            // The first version that does not fit becomes the next page's start, and
+            // only then is a `nextToken` emitted — the last page carries none.
+            if items.len() == page_size {
+                next_token = Some(encode_page_token(&workflow.id, name));
+                break;
+            }
+            items.push(WorkflowVersionListItem {
+                arn: Some(version.arn.clone()),
+                workflow_id: Some(workflow.id.clone()),
+                version_name: Some(version.version_name.clone()),
+                description: version.description.clone(),
+                status: Some(version.status.clone()),
+                r#type: Some(version.r#type.clone()),
+                digest: version.digest.clone(),
+                creation_time: Some(crate::state::timestamp(version.creation_time_ms)),
+                // `metadata` is documented as metadata for the workflow version; this
+                // slice derives none, so it reports none rather than inventing entries.
+                metadata: None,
+            });
+        }
+
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::Reported,
+            Some(&workflow.id),
+        );
+
+        Ok(ListWorkflowVersionsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

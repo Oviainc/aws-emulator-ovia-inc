@@ -19,6 +19,12 @@
 //!     created rather than minting a second one;
 //! * a freshly created version owes the clock its move to `ACTIVE`, which a read
 //!   observes but never causes;
+//! * the listing reports every version its workflow holds and nothing else: each item
+//!   carries exactly the members the list shape models, read from the same record the
+//!   single-version read answers from, in one stable order the page bounds walk; the
+//!   workflow it lists is resolved from the request's id narrowed by `type` and
+//!   `workflowOwnerId`, so an id, type or owner no workflow of this account matches is a
+//!   modelled 404 rather than an empty page;
 //! * a version `DeleteWorkflowVersion` removed is a modelled 404 everywhere afterwards,
 //!   and while a workflow still holds any version, deleting the workflow is refused.
 
@@ -29,7 +35,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::private_workflow_runs::{
     assert_absent, assert_arn, assert_members, assert_timestamp, assert_uuid, call,
     create_workflow, created_id, delete_workflow, emulator, error_code, expected_digest,
-    get_workflow, tag_map, ACCOUNT, CAPACITY_RANGE, POLL_INTERVAL, SETTLE_DEADLINE,
+    get_workflow, items, tag_map, ACCOUNT, CAPACITY_RANGE, POLL_INTERVAL, SETTLE_DEADLINE,
     STORAGE_TYPES, WORKFLOW_ENGINES,
 };
 
@@ -76,6 +82,34 @@ async fn delete_version(
         None,
     )
     .await
+}
+
+/// `GET /workflow/{workflowId}/version{query}`.
+async fn list_versions(
+    router: &MultiServiceRouter,
+    workflow_id: &str,
+    query: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "GET",
+        &format!("/workflow/{workflow_id}/version{query}"),
+        None,
+    )
+    .await
+}
+
+/// The `versionName` of each item in a listing page, in the order the page reported
+/// them.
+fn item_version_names(page: &[Value]) -> Vec<String> {
+    page.iter()
+        .map(|item| {
+            item.get("versionName")
+                .and_then(Value::as_str)
+                .unwrap_or("<no versionName>")
+                .to_string()
+        })
+        .collect()
 }
 
 /// The `message` a modelled error carried.
@@ -860,5 +894,513 @@ async fn more_tags_than_the_service_accepts_are_refused() {
                 "case {case:?}: expected ValidationException, got {body:?}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ListWorkflowVersions
+// ---------------------------------------------------------------------------
+
+/// Every member the listing's item shape models — which is everything an item may carry.
+/// Source: `smithy_query(query="shape",shape="WorkflowVersionListItem")` -> arn,
+/// workflowId, versionName, description, status, type, digest, creationTime, metadata.
+const VERSION_LIST_ITEM_MEMBERS: &[&str] = &[
+    "arn",
+    "workflowId",
+    "versionName",
+    "description",
+    "status",
+    "type",
+    "digest",
+    "creationTime",
+    "metadata",
+];
+
+/// Members `GetWorkflowVersion` reports that the list item shape does NOT model, so no
+/// listing may carry them.
+const NOT_ON_A_VERSION_LIST_ITEM: &[&str] = &[
+    "uuid",
+    "engine",
+    "main",
+    "definition",
+    "parameterTemplate",
+    "storageCapacity",
+    "storageType",
+    "accelerators",
+    "tags",
+    "readmePath",
+    "workflowBucketOwnerId",
+    "definitionRepositoryDetails",
+    "statusMessage",
+];
+
+#[tokio::test]
+async fn the_listing_reports_every_version_from_the_record_the_read_answers_from() {
+    let router = emulator();
+    let workflow_id = workflow_for_versions(&router, "listing").await;
+    // The rule is "the listing reports each stored version's own members", so the rows
+    // are the create/read-back table: every form a version can have been stored in,
+    // including the ones that decide whether a `description` or a content `digest` exists
+    // to report at all.
+    let cases = version_cases();
+    for version in &cases {
+        let (status, body) = create_version(&router, &workflow_id, &version_request(version)).await;
+        assert_eq!(
+            status, 201,
+            "case {:?}: expected 201, got {body:?}",
+            version.case
+        );
+    }
+    // Settle every version first, so the listing and the read are compared on the same
+    // side of the clock.
+    for version in &cases {
+        await_version_status(&router, &workflow_id, version.case, "ACTIVE").await;
+    }
+
+    let (status, body) = list_versions(&router, &workflow_id, "").await;
+    let page = items("every version", status, &body);
+    let mut expected_names: Vec<String> = cases.iter().map(|row| row.case.to_string()).collect();
+    expected_names.sort();
+    assert_eq!(
+        item_version_names(&page),
+        expected_names,
+        "expected every stored version once, got {page:?}"
+    );
+    assert!(
+        body.get("nextToken").is_none(),
+        "a page holding the whole collection must carry no nextToken, got {body:?}"
+    );
+
+    for version in &cases {
+        let item = page
+            .iter()
+            .find(|item| {
+                item.get("versionName").and_then(Value::as_str) == Some(version.case)
+            })
+            .unwrap_or_else(|| {
+                panic!("case {:?}: the listing omitted it, got {page:?}", version.case)
+            });
+        let (status, read) = get_version(&router, &workflow_id, version.case).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected 200 from the read, got {read:?}",
+            version.case
+        );
+        // One record, two readers: every member the item shape models carries what the
+        // single-version read reports for it, present or absent.
+        for member in VERSION_LIST_ITEM_MEMBERS {
+            assert_eq!(
+                item.get(*member),
+                read.get(*member),
+                "case {:?}: expected {member} = {:?} as GetWorkflowVersion reports it, \
+                 got {:?} in the whole item {item:?}",
+                version.case,
+                read.get(*member),
+                item.get(*member)
+            );
+        }
+        assert_absent(version.case, NOT_ON_A_VERSION_LIST_ITEM, item);
+        assert_members(
+            version.case,
+            "ListWorkflowVersions",
+            &json!({
+                "workflowId": workflow_id,
+                "versionName": version.case,
+                "type": "PRIVATE",
+                "status": "ACTIVE",
+            }),
+            item,
+        );
+        assert_arn(
+            version.case,
+            item.get("arn").and_then(Value::as_str).unwrap_or_default(),
+            "workflow",
+            &format!("{workflow_id}/version/{}", version.case),
+        );
+        assert_timestamp(version.case, "creationTime", item);
+        // The two members a row's own stored configuration decides.
+        for member in ["digest", "description"] {
+            assert_eq!(
+                item.get(member),
+                version.expected.get(member),
+                "case {:?}: expected {member} = {:?} as the create stored it, got {:?}",
+                version.case,
+                version.expected.get(member),
+                item.get(member)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_listing_pages_through_one_stable_order() {
+    let router = emulator();
+    let workflow_id = workflow_for_versions(&router, "version-paging").await;
+    // Created in an order that is NOT the order the listing reports, so what the pages
+    // concatenate to is the collection's own order rather than the order of the creates.
+    let created = ["beta", "alpha", "echo", "charlie", "delta"];
+    for name in created {
+        let (status, body) = create_version(
+            &router,
+            &workflow_id,
+            &json!({ "versionName": name, "requestId": format!("paging-{name}") }),
+        )
+        .await;
+        assert_eq!(status, 201, "case {name:?}: expected 201, got {body:?}");
+    }
+    // A version is keyed by the name it is unique under, so that name's order is the one
+    // stable order the pages walk.
+    let mut expected: Vec<String> = created.iter().map(|name| name.to_string()).collect();
+    expected.sort();
+
+    // The rule generalises over the page size: the pages concatenate to the whole
+    // collection in that order whatever size is asked for, and only a page with more
+    // behind it carries a nextToken.
+    for page_size in [1usize, 2, 3, 5, 100] {
+        let mut seen = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let query = match &token {
+                Some(token) => format!("?maxResults={page_size}&startingToken={token}"),
+                None => format!("?maxResults={page_size}"),
+            };
+            let (status, body) = list_versions(&router, &workflow_id, &query).await;
+            let page = items(&format!("page size {page_size}"), status, &body);
+            assert!(
+                page.len() <= page_size,
+                "page size {page_size}: a page carried {} items",
+                page.len()
+            );
+            seen.extend(item_version_names(&page));
+            pages += 1;
+            assert!(
+                pages <= expected.len() + 1,
+                "page size {page_size}: paging did not terminate"
+            );
+            match body.get("nextToken").and_then(Value::as_str) {
+                Some(next) => token = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen, expected,
+            "page size {page_size}: expected every version in version-name order"
+        );
+    }
+
+    // The last page of an exactly-filled collection carries no token.
+    let (status, body) = list_versions(&router, &workflow_id, "?maxResults=5").await;
+    let page = items("exact fit", status, &body);
+    assert_eq!(page.len(), 5, "expected all five versions, got {page:?}");
+    assert!(
+        body.get("nextToken").is_none(),
+        "a page with nothing behind it must carry no nextToken, got {body:?}"
+    );
+
+    // A token this operation never issued is a bad request, not a page.
+    let (status, body) = list_versions(&router, &workflow_id, "?startingToken=not-a-token").await;
+    assert_eq!(
+        status, 400,
+        "an unissued startingToken must be refused, got {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "expected ValidationException, got {body:?}"
+    );
+
+    // Nor is another listing's token one this listing issued: a second workflow gives
+    // `ListWorkflows` a further page, so it mints a token of its own.
+    let _second = workflow_for_versions(&router, "version-paging-second").await;
+    let (status, body) = call(&router, "GET", "/workflow?maxResults=1", None).await;
+    items("workflow page", status, &body);
+    let workflow_token = body
+        .get("nextToken")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("expected a ListWorkflows nextToken, got {body:?}"))
+        .to_string();
+    let (status, body) = list_versions(&router, &workflow_id, "?maxResults=1").await;
+    items("version page", status, &body);
+    let version_token = body
+        .get("nextToken")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("expected a ListWorkflowVersions nextToken, got {body:?}"))
+        .to_string();
+
+    // Each token resumes its OWN listing,
+    let (status, body) =
+        list_versions(&router, &workflow_id, &format!("?startingToken={version_token}")).await;
+    assert_eq!(
+        status, 200,
+        "a ListWorkflowVersions token must resume ListWorkflowVersions, got {body:?}"
+    );
+    let (status, body) = call(
+        &router,
+        "GET",
+        &format!("/workflow?startingToken={workflow_token}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a ListWorkflows token must resume ListWorkflows, got {body:?}"
+    );
+
+    // and is refused by the other, rather than silently resuming the wrong collection.
+    for (case, token, into_versions) in [
+        ("workflow token given to the version listing", &workflow_token, true),
+        ("version token given to ListWorkflows", &version_token, false),
+    ] {
+        let (status, body) = if into_versions {
+            list_versions(&router, &workflow_id, &format!("?startingToken={token}")).await
+        } else {
+            call(
+                &router,
+                "GET",
+                &format!("/workflow?startingToken={token}"),
+                None,
+            )
+            .await
+        };
+        assert_eq!(status, 400, "case {case:?}: expected 400, got {body:?}");
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body:?}"
+        );
+    }
+
+    // A version name is a position inside ONE workflow's collection, so a token minted
+    // while paging one workflow is not a resume point in another's: it is refused rather
+    // than read as a position among that workflow's own names.
+    let other_workflow = workflow_for_versions(&router, "version-paging-other").await;
+    for name in ["alpha", "zulu"] {
+        let (status, body) = create_version(
+            &router,
+            &other_workflow,
+            &json!({ "versionName": name, "requestId": format!("other-{name}") }),
+        )
+        .await;
+        assert_eq!(status, 201, "case {name:?}: expected 201, got {body:?}");
+    }
+    let (status, body) =
+        list_versions(&router, &other_workflow, &format!("?startingToken={version_token}")).await;
+    assert_eq!(
+        status, 400,
+        "a token issued for another workflow must be refused, got {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "expected ValidationException, got {body:?}"
+    );
+    // The other workflow pages with its OWN token, and the token it mints is refused
+    // back on the first workflow for the same reason.
+    let (status, body) = list_versions(&router, &other_workflow, "?maxResults=1").await;
+    let page = items("other workflow page", status, &body);
+    assert_eq!(
+        item_version_names(&page),
+        vec!["alpha".to_string()],
+        "expected the other workflow's own first page, got {page:?}"
+    );
+    let other_token = body
+        .get("nextToken")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("expected a nextToken for the other workflow, got {body:?}"))
+        .to_string();
+    let (status, body) =
+        list_versions(&router, &other_workflow, &format!("?startingToken={other_token}")).await;
+    let page = items("other workflow resumed", status, &body);
+    assert_eq!(
+        item_version_names(&page),
+        vec!["zulu".to_string()],
+        "a workflow's own token must resume its own walk, got {page:?}"
+    );
+    let (status, body) =
+        list_versions(&router, &workflow_id, &format!("?startingToken={other_token}")).await;
+    assert_eq!(
+        status, 400,
+        "a token issued for another workflow must be refused, got {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "expected ValidationException, got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_listing_resolves_its_workflow_before_it_reports_any_version() {
+    let router = emulator();
+    let workflow_id = workflow_for_versions(&router, "narrowed").await;
+    let (status, body) = create_version(
+        &router,
+        &workflow_id,
+        &json!({ "versionName": "present", "requestId": "narrowed" }),
+    )
+    .await;
+    assert_eq!(status, 201, "expected 201, got {body:?}");
+
+    // The collection belongs to the workflow the request's id, `type` and
+    // `workflowOwnerId` resolve: a type the workflow is not, or an owner that is not this
+    // emulator's account, resolves no workflow at all.
+    // Source: `smithy_query(query="shape",shape="WorkflowType")` -> PRIVATE | READY2RUN.
+    let rows: Vec<(&str, String, u16)> = vec![
+        ("no narrowing", String::new(), 200),
+        ("this account", format!("?workflowOwnerId={ACCOUNT}"), 200),
+        (
+            "another account",
+            "?workflowOwnerId=210987654321".to_string(),
+            404,
+        ),
+        ("the workflow's own type", "?type=PRIVATE".to_string(), 200),
+        ("another type", "?type=READY2RUN".to_string(), 404),
+        (
+            "both, matching",
+            format!("?type=PRIVATE&workflowOwnerId={ACCOUNT}"),
+            200,
+        ),
+    ];
+    for (case, query, expected) in &rows {
+        let (status, body) = list_versions(&router, &workflow_id, query).await;
+        assert_eq!(
+            status, *expected,
+            "case {case:?}: expected {expected}, got {body:?}"
+        );
+        if *expected == 200 {
+            let page = items(case, status, &body);
+            assert_eq!(
+                item_version_names(&page),
+                vec!["present".to_string()],
+                "case {case:?}: expected the one stored version, got {page:?}"
+            );
+        } else {
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+            );
+        }
+    }
+
+    // An id no workflow carries is that same modelled 404, worded as this slice words an
+    // absent workflow, and never an empty page.
+    for absent in ["999999999", "1"] {
+        let (status, body) = list_versions(&router, absent, "").await;
+        assert_eq!(status, 404, "case {absent:?}: expected 404, got {body:?}");
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {absent:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("Workflow {absent} not found"),
+            "case {absent:?}: unexpected message in {body:?}"
+        );
+    }
+
+    // A workflow that holds no version is an EMPTY page, not a 404: that workflow exists.
+    let empty = workflow_for_versions(&router, "no-versions").await;
+    let (status, body) = list_versions(&router, &empty, "").await;
+    let page = items("no versions", status, &body);
+    assert!(
+        page.is_empty(),
+        "a workflow with no version must list nothing, got {page:?}"
+    );
+    assert!(
+        body.get("nextToken").is_none(),
+        "an empty page must carry no nextToken, got {body:?}"
+    );
+
+    // What the store holds is what the listing reports: a deleted version leaves it, and
+    // the rest stay.
+    let (status, body) = create_version(
+        &router,
+        &workflow_id,
+        &json!({ "versionName": "second", "requestId": "narrowed-second" }),
+    )
+    .await;
+    assert_eq!(status, 201, "expected 201, got {body:?}");
+    let (status, body) = delete_version(&router, &workflow_id, "present").await;
+    assert_eq!(status, 202, "the delete must be accepted, got {body:?}");
+    let (status, body) = list_versions(&router, &workflow_id, "").await;
+    let page = items("after a delete", status, &body);
+    assert_eq!(
+        item_version_names(&page),
+        vec!["second".to_string()],
+        "a deleted version must leave the listing, got {page:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_listing_observes_the_clock_and_changes_nothing() {
+    let router = emulator();
+    let workflow_id = workflow_for_versions(&router, "clock-listing").await;
+    for name in ["v1", "v2"] {
+        let (status, body) = create_version(
+            &router,
+            &workflow_id,
+            &json!({ "versionName": name, "requestId": format!("clock-list-{name}") }),
+        )
+        .await;
+        assert_eq!(status, 201, "case {name:?}: expected 201, got {body:?}");
+    }
+
+    // The transient status is observable through the listing as well, so the span the
+    // clock owes is never zero.
+    let (status, body) = list_versions(&router, &workflow_id, "").await;
+    let page = items("before the clock", status, &body);
+    for item in &page {
+        assert_eq!(
+            item.get("status").and_then(Value::as_str),
+            Some("CREATING"),
+            "a version listed before its transition is due must still be CREATING, \
+             got {item:?}"
+        );
+    }
+
+    for name in ["v1", "v2"] {
+        await_version_status(&router, &workflow_id, name, "ACTIVE").await;
+    }
+
+    let (status, body) = list_versions(&router, &workflow_id, "").await;
+    let settled = items("after the clock", status, &body);
+    for item in &settled {
+        assert_eq!(
+            item.get("status").and_then(Value::as_str),
+            Some("ACTIVE"),
+            "a settled version must be listed as ACTIVE, got {item:?}"
+        );
+    }
+
+    // Listing again reports exactly the same page: the read moved nothing on and
+    // restamped nothing, so a later caller sees what this one did.
+    let (status, body) = list_versions(&router, &workflow_id, "").await;
+    let again = items("repeated", status, &body);
+    assert_eq!(
+        again, settled,
+        "a repeated listing must report the same page, got {again:?}"
+    );
+
+    // And the single-version read agrees with it, instant for instant.
+    for item in &settled {
+        let name = item
+            .get("versionName")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (status, read) = get_version(&router, &workflow_id, name).await;
+        assert_eq!(status, 200, "case {name:?}: expected 200, got {read:?}");
+        assert_eq!(
+            item.get("creationTime"),
+            read.get("creationTime"),
+            "case {name:?}: expected the same creationTime the read reports, got {item:?}"
+        );
+        assert_eq!(
+            item.get("status"),
+            read.get("status"),
+            "case {name:?}: expected the same status the read reports, got {item:?}"
+        );
     }
 }
