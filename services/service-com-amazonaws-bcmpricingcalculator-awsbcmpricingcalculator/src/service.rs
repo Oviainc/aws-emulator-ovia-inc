@@ -57,6 +57,16 @@
 //! service rather than at a call site. The suite
 //! `tests/all/validation_refusal_framing.rs` pins both halves.
 //!
+//! That is the ENVELOPE's clause. A `fieldList` ENTRY's own message is the other half of
+//! the same refusal and is worded differently, which is recorded behaviour: the entry
+//! already identifies its member in its own `name`, so its message identifies nothing a
+//! second time and is a sentence about the VALUE the entry refused and the requirement
+//! that value failed — `Value [redacted] failed to satisfy constraint: <requirement>`,
+//! where the value stands as the fixed [`WITHHELD_VALUE`] marker because this service
+//! echoes no submitted value. The requirement is the one the envelope's clause states, so
+//! the two halves cannot word one constraint two ways; only the subject differs
+//! ([`field_clause`], pinned by `tests/all/field_list_value_subject.rs`).
+//!
 //! ## The media type this service announces
 //!
 //! TWO media types, because the recorded wire shows two announcers: the dispatcher that
@@ -80,7 +90,7 @@
 //! the framework.
 //!
 //! STILL TO MIGRATE, carrying the note `services/common/src/validation.rs` asks every
-//! new copy to carry: the requirement half, the no-value subject half and the
+//! new copy to carry: the requirement half, the envelope's no-value subject half and the
 //! unanchored `@pattern` below are NOT a dialect — they are the same three rules that
 //! module's header stages for itself, already inlined in ~24 service crates
 //! (`grep -rln 'fn unanchored' services/*/src`), each pinned by its own recordings and
@@ -102,9 +112,10 @@
 //! (through `override_operation`), it collects the violations the framework's own walk
 //! would collect, and answers them as the modelled `ValidationException` with
 //! [`REASON_FIELD_VALIDATION_FAILED`] and one `fieldList` entry per violation. The
-//! `message` is the SAME envelope over the SAME clauses `override_refusal` words, so the
-//! two halves of the body cannot state one violation two ways and the wording above is
-//! unchanged. A request the model accepts is handed to the generated walk untouched.
+//! `message` is the SAME envelope over the SAME clauses `override_refusal` words, and each
+//! entry states the SAME requirement about the value it refused, so the two halves of the
+//! body cannot state one violation two ways and the wording above is unchanged. A request
+//! the model accepts is handed to the generated walk untouched.
 
 pub mod response_media_type;
 
@@ -164,15 +175,16 @@ const MAX_VIOLATIONS: usize = service_common::validation::MAX_VIOLATIONS;
 const DISPATCHER: ResponseMediaTypeOperation =
     ResponseMediaTypeOperation::announcing(DISPATCHER_RESPONSE_MEDIA_TYPE, not_a_validation_refusal);
 
-/// Render one constraint violation the way this service states it: the member path and
-/// the violated constraint, and NOTHING of the value that was rejected.
+/// What a violated constraint REQUIRED, as this service words it — the half both halves
+/// of a refusal body share, so an envelope clause and a `fieldList` entry cannot describe
+/// one constraint two ways.
 ///
 /// Returns `None` for a violation class this service has no wording for, which lets
 /// [`constraint_envelope`] decline the whole refusal and keep the framework's wording
 /// rather than invent a sentence for it ([`ViolationKind`] is `#[non_exhaustive]`, so a
 /// class can be added upstream).
-fn constraint_clause(violation: &Violation) -> Option<String> {
-    let requirement = match &violation.kind {
+fn requirement(kind: &ViolationKind) -> Option<String> {
+    let requirement = match kind {
         ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
         ViolationKind::MinLength(min) => {
             format!("Member must have length greater than or equal to {min}")
@@ -204,11 +216,19 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
         _ => return None,
     };
+    Some(requirement)
+}
+
+/// Render one constraint violation as a clause of the `message` ENVELOPE: the member path
+/// and the violated constraint, and NOTHING of the value that was rejected.
+///
+/// `None` for a violation class this service has no wording for — see [`requirement`].
+fn constraint_clause(violation: &Violation) -> Option<String> {
+    let requirement = requirement(&violation.kind)?;
     // An absent member has no submitted value at all, so it is reported as the null it
     // was: that is a fact of the request's SHAPE, not a rendering of a value the caller
-    // sent. Every other violation names the member only — the submitted value is never
-    // echoed back into the 400 body, so a caller's own input cannot reach a log through
-    // this service's error text.
+    // sent. Every other violation names the member only — the prose half of the body
+    // states what the request had to satisfy and not what it carried.
     let subject = match &violation.kind {
         ViolationKind::MissingRequiredMember => "Value null",
         _ => "Value",
@@ -216,6 +236,37 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
     Some(format!(
         "{subject} at '{}' failed to satisfy constraint: {requirement}",
         violation.path
+    ))
+}
+
+/// The token a `fieldList` entry's message states where the value it refused would go.
+///
+/// A fixed text, the same for every member and every value and never derived from a
+/// request: this service echoes no submitted value (see this module's docs), and an
+/// entry's message is a sentence ABOUT the value it refused, so this marker is what
+/// stands at the head of that sentence — saying the value was withheld rather than that
+/// there was none, which is what a support tool reads it as.
+const WITHHELD_VALUE: &str = "[redacted]";
+
+/// Render one constraint violation as the `message` of the `fieldList` ENTRY that reports
+/// it: the VALUE the entry refused and the requirement that value failed, and no member
+/// path — the entry names its member in its own `name` member, so its message identifies
+/// it nowhere a second time.
+///
+/// `None` for a violation class this service has no wording for — see [`requirement`].
+///
+/// The subject is about the value rather than about the member, which is the one place
+/// the two halves of this service's refusal body differ: a value the request DID carry
+/// stands as the [`WITHHELD_VALUE`] marker, and a member the request did not carry keeps
+/// the `null` its absence is — there was no value to withhold.
+fn field_clause(violation: &Violation) -> Option<String> {
+    let requirement = requirement(&violation.kind)?;
+    let value = match &violation.kind {
+        ViolationKind::MissingRequiredMember => "null",
+        _ => WITHHELD_VALUE,
+    };
+    Some(format!(
+        "Value {value} failed to satisfy constraint: {requirement}"
     ))
 }
 
@@ -300,16 +351,17 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 }
 
 /// The 400 `ValidationException` that states `violations` in the shape's own modelled
-/// members, or `None` to decline the refusal — see [`constraint_clause`], whose wording
-/// this is built from.
+/// members, or `None` to decline the refusal — see [`requirement`], whose wording both
+/// halves of the body are built from.
 ///
 /// One rendering for every refused member of every operation: `message` is the envelope
-/// [`constraint_envelope`] builds, `reason` is [`REASON_FIELD_VALIDATION_FAILED`] — a
-/// named member of the request carries a value the service does not accept — and
-/// `fieldList` carries one entry per violation, `name` the member path the walk reports
-/// it at and `message` that violation's own clause, naming the constraint that member
-/// must satisfy. A client can therefore branch on `reason` and report WHICH member it
-/// got wrong, instead of parsing the prose.
+/// [`constraint_envelope`] builds over [`constraint_clause`], `reason` is
+/// [`REASON_FIELD_VALIDATION_FAILED`] — a named member of the request carries a value the
+/// service does not accept — and `fieldList` carries one entry per violation, `name` the
+/// member path the walk reports it at and `message` that violation's own
+/// [`field_clause`], naming the value it refused and the constraint that value had to
+/// satisfy. A client can therefore branch on `reason` and report WHICH member it got
+/// wrong and with which value, instead of parsing the prose.
 ///
 /// Nothing here is keyed to an operation, a member or a value: the rule is applied to
 /// whatever [`Violation`] the walk produces, so it holds for every constrained member of
@@ -324,16 +376,10 @@ fn field_validation_failed(violations: &[Violation]) -> Option<ValidationExcepti
         .map(|violation| {
             Some(ValidationExceptionField {
                 name: violation.path.clone(),
-                // The SAME clause the envelope states for this member, so the two halves
-                // of the body cannot word one violation two ways. The recorded entry
-                // carries a SCRUBBED text here — the corpus replaced the subject span of
-                // the clause with a literal `[redacted]`, which no rule of this service
-                // produces. What that span held is settled by the SAME recorded response:
-                // its `message` carries this very sentence unredacted, with the member
-                // path and no submitted value, and the emulator answers it byte for byte.
-                // So the clause is what the rule gives, and the scrubbed copy is read as
-                // the one it is a copy of.
-                message: constraint_clause(violation)?,
+                // The same REQUIREMENT the envelope states for this member, about the
+                // value this entry refused rather than about the member path the
+                // envelope names: the entry's own `name` carries that path already.
+                message: field_clause(violation)?,
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -429,7 +475,7 @@ impl<Op: Operation> ErasedOperation for ModelledValidation<Op> {
             // serialize) plus its telemetry over the same bytes. Reached through the
             // routing table rather than through `override_operation`, which would route
             // straight back here. A refusal this wrapper declined — a violation class
-            // `constraint_clause` has no wording for, or an error that would not
+            // `requirement` has no wording for, or an error that would not
             // serialize — is refused there instead, in the framework's own envelope.
             //
             // A dispatcher-fronted operation goes through [`DISPATCHER`], which runs that
@@ -633,7 +679,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // what the framework would have answered; only the wording changes.
         //
         // Reached only for a refusal [`ModelledValidation`] declined (a violation class
-        // [`constraint_clause`] has no wording for), because that wrapper answers every
+        // [`requirement`] has no wording for), because that wrapper answers every
         // other one in the modelled shape BEFORE the framework renders it — the words
         // are not the only problem there: the generic refusal body cannot carry the
         // modelled `reason`/`fieldList` members at all, and `Refused` is a code and a
@@ -776,6 +822,90 @@ mod tests {
             constraint_envelope(&[]),
             None,
             "no violations: the framework's own wording stands"
+        );
+    }
+
+    /// The two subjects of one refusal, over every violation class this service words: the
+    /// envelope clause names the member path, the `fieldList` entry's message is about the
+    /// value it refused and names no member path, and both state the same requirement.
+    #[test]
+    fn a_field_entry_is_about_the_value_and_the_envelope_names_the_member() {
+        let cases = [
+            (
+                ViolationKind::Pattern("^[a-zA-Z0-9-]+$".to_string()),
+                "Member must satisfy regular expression pattern: [a-zA-Z0-9-]+",
+            ),
+            (
+                ViolationKind::MaxLength(64),
+                "Member must have length less than or equal to 64",
+            ),
+            (
+                ViolationKind::MinLength(36),
+                "Member must have length greater than or equal to 36",
+            ),
+            (
+                ViolationKind::MaxValue("25".to_string()),
+                "Member must have value less than or equal to 25",
+            ),
+            (
+                ViolationKind::MinValue("1".to_string()),
+                "Member must have value greater than or equal to 1",
+            ),
+            (
+                ViolationKind::EnumValue(vec!["one".to_string(), "two".to_string()]),
+                "Member must satisfy enum value set: [one, two]",
+            ),
+            (ViolationKind::UniqueItems, "Member must have unique values"),
+        ];
+        for (kind, requirement) in cases {
+            let violation = Violation {
+                path: "name".to_string(),
+                kind,
+                value: Some("submitted".to_string()),
+                sensitive: false,
+            };
+            let expected =
+                format!("Value {WITHHELD_VALUE} failed to satisfy constraint: {requirement}");
+            let actual = field_clause(&violation);
+            assert_eq!(
+                actual.as_deref(),
+                Some(expected.as_str()),
+                "case {:?}: expected {expected:?}, got {actual:?}",
+                violation.kind
+            );
+            let envelope_clause =
+                format!("Value at 'name' failed to satisfy constraint: {requirement}");
+            let actual = constraint_clause(&violation);
+            assert_eq!(
+                actual.as_deref(),
+                Some(envelope_clause.as_str()),
+                "case {:?}: expected {envelope_clause:?}, got {actual:?}",
+                violation.kind
+            );
+        }
+    }
+
+    /// The one case a field entry has no value to be about: an ABSENT member, which keeps
+    /// the null its absence is in both halves of the body.
+    #[test]
+    fn an_absent_member_is_reported_as_the_null_it_was() {
+        let absent = Violation {
+            path: "name".to_string(),
+            kind: ViolationKind::MissingRequiredMember,
+            value: None,
+            sensitive: false,
+        };
+        let actual = field_clause(&absent);
+        assert_eq!(
+            actual.as_deref(),
+            Some("Value null failed to satisfy constraint: Member must not be null"),
+            "case absent member, field entry: got {actual:?}"
+        );
+        let actual = constraint_clause(&absent);
+        assert_eq!(
+            actual.as_deref(),
+            Some("Value null at 'name' failed to satisfy constraint: Member must not be null"),
+            "case absent member, envelope clause: got {actual:?}"
         );
     }
 }

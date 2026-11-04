@@ -12,14 +12,14 @@
 //!    cannotParse, fieldValidationFailed, invalidRequestFromMember, disallowedRate,
 //!    other]`); and
 //! 2. `fieldList` = one `ValidationExceptionField` per violation, whose `name` is the
-//!    member path the violation sits at and whose `message` is that violation's own
-//!    clause, naming the constraint the member must satisfy
+//!    member path the violation sits at and whose `message` states the constraint that
+//!    member had to satisfy, about the value the entry refused
 //!    (`ValidationExceptionField` declares `name` and `message`, both `@required` —
 //!    smithy_query: `shape="ValidationExceptionField"`).
 //!
-//! The `message` envelope itself is pinned by `validation_refusal_framing.rs`, whose
-//! clause builders these suites reuse, so the two halves of one body cannot be asserted
-//! two ways.
+//! The `message` envelope itself is pinned by `validation_refusal_framing.rs` and the
+//! SUBJECT each entry's own message states by `field_list_value_subject.rs`, whose clause
+//! builders these suites reuse, so no two suites assert one body two ways.
 //!
 //! The rows span what the rule generalises over: the constraint class (pattern, length
 //! maximum, length minimum on a list, range, absence), the member and its shape, the
@@ -34,6 +34,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_bcmpricingcalculator_awsbcmpricingcalculator::state;
 
 use crate::bill_scenario_lifecycle::{error_code, Emulator};
+use crate::field_list_value_subject::{field_list, field_message, NULL, WITHHELD};
 use crate::validation_refusal_framing::{
     clause, envelope, error_message, pattern_requirement, ARN_PATTERN, NAME_PATTERN,
     PATTERN_ONLY_ARN, PATTERN_ONLY_RESOURCE_ID, RESOURCE_ID_PATTERN, TAG_VALUE_PATTERN,
@@ -43,12 +44,31 @@ use crate::validation_refusal_framing::{
 /// own spelling of the enum value (see the module docs).
 const FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 
-/// One `fieldList` entry a row expects: the member path, the subject its clause states
-/// (`Value`, or `Value null` for a member that was absent), and the requirement.
+/// One `fieldList` entry a row expects: the member path, whether that member was ABSENT
+/// from the request — the one case the entry has no value to be about — and the
+/// requirement it states.
 struct Field {
     name: &'static str,
-    subject: &'static str,
+    absent: bool,
     requirement: String,
+}
+
+impl Field {
+    /// The whole message this entry carries: the subject its own half of the body states,
+    /// and the requirement.
+    fn message(&self) -> String {
+        field_message(if self.absent { NULL } else { WITHHELD }, &self.requirement)
+    }
+
+    /// The clause the ENVELOPE states for the same violation: the member path and the same
+    /// requirement.
+    fn clause(&self) -> String {
+        clause(
+            if self.absent { "Value null" } else { "Value" },
+            self.name,
+            &self.requirement,
+        )
+    }
 }
 
 /// One row: a request the model refuses, and every entry its `fieldList` must carry, in
@@ -94,7 +114,7 @@ fn cases() -> Vec<Case> {
             request: json!({ "name": "bad name!" }),
             fields: vec![Field {
                 name: "name",
-                subject: "Value",
+                absent: false,
                 requirement: pattern_requirement(NAME_PATTERN),
             }],
         },
@@ -107,7 +127,7 @@ fn cases() -> Vec<Case> {
             }),
             fields: vec![Field {
                 name: "workloadEstimateId",
-                subject: "Value",
+                absent: false,
                 requirement: pattern_requirement(RESOURCE_ID_PATTERN),
             }],
         },
@@ -117,7 +137,7 @@ fn cases() -> Vec<Case> {
             request: json!({ "identifier": PATTERN_ONLY_RESOURCE_ID }),
             fields: vec![Field {
                 name: "identifier",
-                subject: "Value",
+                absent: false,
                 requirement: pattern_requirement(RESOURCE_ID_PATTERN),
             }],
         },
@@ -127,7 +147,7 @@ fn cases() -> Vec<Case> {
             request: json!({ "arn": PATTERN_ONLY_ARN }),
             fields: vec![Field {
                 name: "arn",
-                subject: "Value",
+                absent: false,
                 requirement: pattern_requirement(ARN_PATTERN),
             }],
         },
@@ -137,7 +157,7 @@ fn cases() -> Vec<Case> {
             request: json!({ "name": "bad name!" }),
             fields: vec![Field {
                 name: "name",
-                subject: "Value",
+                absent: false,
                 requirement: pattern_requirement(NAME_PATTERN),
             }],
         },
@@ -147,7 +167,7 @@ fn cases() -> Vec<Case> {
             request: json!({ "name": over_long_name }),
             fields: vec![Field {
                 name: "name",
-                subject: "Value",
+                absent: false,
                 requirement: "Member must have length less than or equal to 64".to_string(),
             }],
         },
@@ -157,7 +177,7 @@ fn cases() -> Vec<Case> {
             request: json!({ "maxResults": 26 }),
             fields: vec![Field {
                 name: "maxResults",
-                subject: "Value",
+                absent: false,
                 requirement: "Member must have value less than or equal to 25".to_string(),
             }],
         },
@@ -167,7 +187,7 @@ fn cases() -> Vec<Case> {
             request: json!({}),
             fields: vec![Field {
                 name: "name",
-                subject: "Value null",
+                absent: true,
                 requirement: "Member must not be null".to_string(),
             }],
         },
@@ -178,12 +198,12 @@ fn cases() -> Vec<Case> {
             fields: vec![
                 Field {
                     name: "name",
-                    subject: "Value",
+                    absent: false,
                     requirement: "Member must have length less than or equal to 64".to_string(),
                 },
                 Field {
                     name: "name",
-                    subject: "Value",
+                    absent: false,
                     requirement: pattern_requirement(NAME_PATTERN),
                 },
             ],
@@ -195,12 +215,12 @@ fn cases() -> Vec<Case> {
             fields: vec![
                 Field {
                     name: "workloadEstimateId",
-                    subject: "Value",
+                    absent: false,
                     requirement: pattern_requirement(RESOURCE_ID_PATTERN),
                 },
                 Field {
                     name: "usage",
-                    subject: "Value",
+                    absent: false,
                     requirement: "Member must have length greater than or equal to 1".to_string(),
                 },
             ],
@@ -211,29 +231,11 @@ fn cases() -> Vec<Case> {
             request: json!({ "arn": valid_arn(), "tags": { "team": "finops!" } }),
             fields: vec![Field {
                 name: "tags.team",
-                subject: "Value",
+                absent: false,
                 requirement: pattern_requirement(TAG_VALUE_PATTERN),
             }],
         },
     ]
-}
-
-/// The `fieldList` of `body` as `(name, message)` in the order the body carries them.
-fn field_list(body: &Value) -> Vec<(String, String)> {
-    body["fieldList"]
-        .as_array()
-        .map(|entries| {
-            entries
-                .iter()
-                .map(|entry| {
-                    (
-                        entry["name"].as_str().unwrap_or_default().to_string(),
-                        entry["message"].as_str().unwrap_or_default().to_string(),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// RULE (1) and (2): every refused member is named in `fieldList` with the constraint it
@@ -267,12 +269,7 @@ async fn every_refused_member_is_named_with_the_constraint_it_failed() {
         let expected: Vec<(String, String)> = case
             .fields
             .iter()
-            .map(|field| {
-                (
-                    field.name.to_string(),
-                    clause(field.subject, field.name, &field.requirement),
-                )
-            })
+            .map(|field| (field.name.to_string(), field.message()))
             .collect();
         let actual = field_list(&body);
         assert_eq!(
@@ -284,36 +281,45 @@ async fn every_refused_member_is_named_with_the_constraint_it_failed() {
 }
 
 /// The INVARIANT that ties the two halves of a refusal body together, over the same
-/// table: the `message` is the envelope over exactly the clauses the `fieldList` entries
-/// carry, in the same order — so a client reading either half is told about the same
-/// members, and the structured half can never state a member the prose does not.
+/// table: the `message` is the envelope over one clause per `fieldList` entry, in the same
+/// order — so a client reading either half is told about the same members, and the
+/// structured half can never state a member the prose does not. The two halves differ in
+/// the SUBJECT alone, which is `field_list_value_subject.rs`'s own rule.
 #[tokio::test]
 async fn the_field_list_and_the_message_state_the_same_violations() {
     let emulator = Emulator::new();
     for case in cases() {
         let (_, body) = emulator.call(case.operation, case.request.clone()).await;
         let entries = field_list(&body);
-        let clauses: Vec<String> = entries.iter().map(|(_, message)| message.clone()).collect();
+        let clauses: Vec<String> = case.fields.iter().map(Field::clause).collect();
         let message = error_message(&body);
         assert!(
-            !clauses.is_empty(),
+            !entries.is_empty(),
             "case {:?} ({}): expected a fieldList, got {body}",
+            case.case,
+            case.operation
+        );
+        assert_eq!(
+            entries.len(),
+            clauses.len(),
+            "case {:?} ({}): expected one clause per entry, got entries {entries:?} and \
+             clauses {clauses:?}",
             case.case,
             case.operation
         );
         assert_eq!(
             message,
             envelope(&clauses),
-            "case {:?} ({}): expected the message to be the envelope over the fieldList \
-             clauses {clauses:?}, got {message:?}",
+            "case {:?} ({}): expected the message to be the envelope over the clauses \
+             {clauses:?}, got {message:?}",
             case.case,
             case.operation
         );
-        for (name, entry_message) in &entries {
+        for ((name, _), stated) in entries.iter().zip(&clauses) {
             assert!(
-                entry_message.contains(&format!("at '{name}'")),
-                "case {:?} ({}): entry {name:?} does not name its own member: \
-                 {entry_message:?}",
+                stated.contains(&format!("at '{name}'")),
+                "case {:?} ({}): the envelope clause {stated:?} does not name the member \
+                 {name:?} its entry reports",
                 case.case,
                 case.operation
             );

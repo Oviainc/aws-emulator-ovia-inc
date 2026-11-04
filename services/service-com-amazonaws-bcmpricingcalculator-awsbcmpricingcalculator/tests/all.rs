@@ -15,6 +15,8 @@
 mod account_class_gate;
 #[path = "all/bill_scenario_lifecycle.rs"]
 mod bill_scenario_lifecycle;
+#[path = "all/field_list_value_subject.rs"]
+mod field_list_value_subject;
 #[path = "all/not_found_message_framing.rs"]
 mod not_found_message_framing;
 #[path = "all/preferences.rs"]
