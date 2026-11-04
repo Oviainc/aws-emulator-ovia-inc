@@ -217,16 +217,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is: a role this emulator's own IAM does not hold, or one whose trust policy does
         // not let this service assume it, is the modelled 400 and no provider is stored.
         //
-        // The question is the ONE reading this crate has, which a function's execution role
-        // goes through too (`crate::state::execution_role_is_unassumable`): a provider's
-        // operator role is assumed by the same service principal, so only the sentence it is
-        // refused with is this surface's own. It is put to the emulator's OWN IAM over its
-        // OWN in-process transport (that reading asks through `service_common::iam_role`,
-        // whose client is built from the operation callback): nothing here opens a socket,
-        // resolves a host or reads an ambient credential. An emulator with no IAM mounted
-        // refuses nothing, so a missing answer never becomes a refusal. It is awaited with
-        // no store guard held.
-        if crate::state::execution_role_is_unassumable(
+        // The question is `crate::state::capacity_provider::operator_role_is_unassumable`,
+        // which states why a provider's operator role is answered on an ABSENT IAM record
+        // where a function's execution role is not: the provider is compute this service
+        // manages for the client, so the role it manages it as is part of what the client
+        // provisions here. It is put to the emulator's OWN IAM over its OWN in-process
+        // transport (that reading asks through `service_common::iam_role`, whose client is
+        // built from the operation callback): nothing here opens a socket, resolves a host
+        // or reads an ambient credential. An emulator with no IAM mounted to ask refuses
+        // nothing, so a missing answer never becomes a refusal. It is awaited with no store
+        // guard held.
+        if crate::state::capacity_provider::operator_role_is_unassumable(
             ctx,
             &region,
             &input.permissions_config.capacity_provider_operator_role_arn,

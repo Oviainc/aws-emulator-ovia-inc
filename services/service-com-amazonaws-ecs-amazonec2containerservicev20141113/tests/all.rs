@@ -53,6 +53,8 @@ mod daemon_task_definitions;
 mod daemons;
 #[path = "all/delete_attributes.rs"]
 mod delete_attributes;
+#[path = "all/deployment_rollout_report_coupling.rs"]
+mod deployment_rollout_report_coupling;
 #[path = "all/describe_failure_identifiers.rs"]
 mod describe_failure_identifiers;
 #[path = "all/describe_service_deployments.rs"]

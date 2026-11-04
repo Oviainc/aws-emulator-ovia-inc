@@ -111,10 +111,42 @@ pub fn capacity_provider_not_found_message(capacity_provider_name: &str) -> Stri
 /// question failed, because a caller that may not use the role is not told whether it
 /// exists.
 ///
-/// The question itself is not asked here: the role a capacity provider manages compute as is
-/// assumed by the same service principal as the role a function runs as, so the ONE reading
-/// this crate has ([`super::execution_role_is_unassumable`]) answers for both, and only this
-/// sentence is the capacity-provider surface's own.
+/// The question it answers is [`operator_role_is_unassumable`], which is the reading this
+/// surface takes; only this sentence is the capacity-provider surface's own.
 pub const OPERATOR_ROLE_INVALID_MESSAGE: &str =
     "The operator role is invalid or doesn't have sufficient permissions. Verify the role \
      and permissions and try again.";
+
+/// Whether IAM ANSWERED that `operator_role_arn` is a role this service cannot manage a
+/// provider's compute as: this account's IAM holds no role under the name the ARN carries,
+/// or the trust policy of the role it does hold does not let this service assume it.
+///
+/// A capacity provider IS compute this service manages for the client, and the role it
+/// manages that compute as is part of what the client provisions here — so "this account's
+/// IAM holds no such role" is an ANSWER about the role the request named, and the create is
+/// refused with [`OPERATOR_ROLE_INVALID_MESSAGE`] with nothing stored. That is the
+/// difference from a function's EXECUTION role, which takes the weaker reading
+/// ([`super::execution_role_is_unassumable`]): an execution role is routinely provisioned
+/// out of band, so an absent record there says nothing about the role itself. Both are the
+/// shared readings of the one question (`service_common::iam_role`), so neither restates
+/// which role of this account an ARN names, how IAM is asked, or how a trust document is
+/// read.
+///
+/// `false` — do not refuse — wherever nothing is KNOWN: a value that names no role of THIS
+/// account (another account's IAM is not this emulator's to ask), an emulator with no IAM
+/// mounted to ask at all, and an answer this emulator could not read. The principal that
+/// has to be admitted is the one a function's execution role admits
+/// ([`super::EXECUTION_ROLE_PRINCIPAL`]): this service is what assumes both.
+pub async fn operator_role_is_unassumable(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operator_role_arn: &str,
+) -> bool {
+    ::service_common::iam_role::role_is_unassumable(
+        ctx,
+        region,
+        operator_role_arn,
+        super::EXECUTION_ROLE_PRINCIPAL,
+    )
+    .await
+}
