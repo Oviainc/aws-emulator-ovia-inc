@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachInternetGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachInternetGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: records that the stored internet gateway the request names is attached to
+//! the stored VPC it names, which is what makes a route to that gateway usable.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachInternetGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +146,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachInternetGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachInternetGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachInternetGateway"))
+        // The Region this request was signed for: the account's default network is a fact
+        // of the Region, and a request may attach a gateway to the default VPC it holds.
+        let region = crate::state::request_region(ctx.parts());
+        use crate::state;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed transitions this call is allowed to apply before it reads, and the
+        // ambient default network of the Region, on the terms `DescribeSubnets` applies
+        // them: both were already owed at this instant whether or not anybody called.
+        store.materialize_due_transitions();
+        store.ensure_default_network(&region);
+
+        // "The ID of the internet gateway" and "the ID of the VPC": an id this account
+        // holds no resource for is a refusal, not an attachment to nothing. The gateway is
+        // resolved first, it being the resource the operation acts on.
+        if !store.internet_gateways.contains_key(&input.internet_gateway_id) {
+            return Err(state::invalid_internet_gateway_id_not_found(
+                &input.internet_gateway_id,
+            ));
+        }
+        if !store.vpcs.contains_key(&input.vpc_id) {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        }
+
+        // "You can attach only one internet gateway to a VPC at a time" (Amazon VPC User
+        // Guide, "Connect to the internet using an internet gateway"), and a gateway
+        // attaches at most one VPC — so an attachment either side of the pair already has
+        // is refused rather than silently added beside the one that holds. The refusal
+        // names the pair that is in the way, whichever side the request collided with.
+        if let Some(attached_vpc) = store.internet_gateway_attached_vpc(&input.internet_gateway_id)
+        {
+            return Err(state::resource_already_attached(
+                &input.internet_gateway_id,
+                &attached_vpc,
+            ));
+        }
+        if let Some(attached_gateway) = store.internet_gateway_of_vpc(&input.vpc_id) {
+            return Err(state::resource_already_attached(
+                &attached_gateway,
+                &input.vpc_id,
+            ));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (DryRun).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        if !store.attach_internet_gateway(&input.internet_gateway_id, &input.vpc_id) {
+            // The gateway was resolved a moment ago, so this cannot happen — and if it ever
+            // did, the request must not answer 200 with nothing attached.
+            return Err(state::internal_error(
+                "the internet gateway checked a moment ago could not be attached",
+            ));
+        }
+        Ok(AttachInternetGatewayOutput)
     }
 }

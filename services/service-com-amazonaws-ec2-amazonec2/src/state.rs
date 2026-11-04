@@ -1748,7 +1748,7 @@ use crate::ops::types::{
     Region, ReplaceRootVolumeTask, RequestLaunchTemplateData, RevokedSecurityGroupRule,
     RouteServer, RouteServerBfdStatus,
     RouteServerBgpOptions, RouteServerBgpStatus, RouteServerEndpoint, RouteServerPeer,
-    RouteServerAssociation,
+    RouteServerAssociation, RouteTable,
     RunInstancesOutput, SecondaryInterface, SecondaryInterfaceAttachment,
     SecondaryInterfaceIpv4Address, SecondaryNetwork,
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
@@ -1782,6 +1782,14 @@ use crate::scaffolded::Scaffolded;
 // and every rule that moves one in or out of it, in a module of its own.
 mod image_recycle_bin;
 pub use image_recycle_bin::{RecycledImageRecord, recycled_image, require_recycled_image};
+
+/// A VPC's ROUTE TABLES and the ATTACHMENT an internet gateway of one carries: the store,
+/// the ids, the byte charge and the error channel `CreateRouteTable`, `CreateRoute`,
+/// `AssociateRouteTable`, `AttachInternetGateway` and `DescribeRouteTables` share. The
+/// internet gateway store itself is [`internet_gateways`]'s. Re-exported, so a handler
+/// reaches them as `crate::state::<item>` like every other primitive of this module.
+pub mod vpc_internet_path;
+pub use vpc_internet_path::*;
 
 /// What `CreateNetworkAcl` adds to the network ACL store in the "Network ACLs" section
 /// below: the `ResourceType` its tag specification may name, the entries a caller-created
@@ -3496,6 +3504,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// entry as the ACL is removed — so the map is bounded by the ACL ceiling and by the
     /// token length [`MAX_CLIENT_TOKEN_CHARS`] holds a token to.
     pub network_acl_client_tokens: HashMap<String, String>,
+    /// A `CreateRouteTable` `ClientToken` and the route table id it minted, so a repeat of
+    /// the same request answers with that table instead of creating a second one — the same
+    /// map [`Self::network_acl_client_tokens`] is for an ACL, bounded the same way by
+    /// [`Self::forget_route_table_client_tokens_of`] and [`MAX_CLIENT_TOKEN_CHARS`].
+    pub route_table_client_tokens: HashMap<String, String>,
     /// Every VPC flow log the account holds, by `FlowLogId`, as the modelled
     /// [`FlowLog`] shape beside the one fact that shape carries no member for — the bytes
     /// the record was charged ([`FlowLogRecord`]) — so a member a writer sets round-trips
@@ -3644,8 +3657,20 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// id the next page starts at.
     ///
     /// A fresh account holds NONE here: `CreateInternetGateway` is what creates one. See the
-    /// [`internet_gateways`] module for the store's own primitives.
+    /// [`internet_gateways`] module for the store's own primitives, and the
+    /// [`vpc_internet_path`] module for the attachment `AttachInternetGateway` records on
+    /// one.
     pub internet_gateways: BTreeMap<String, InternetGateway>,
+    /// Every route table the account holds, by `RouteTableId`, as the modelled
+    /// [`crate::ops::types::RouteTable`] shape itself — the routes it holds and the
+    /// associations it has included, since both live on that shape, so
+    /// `DescribeRouteTables` reports exactly what a writer stored. Ordered by id, the one
+    /// stable order the describe reports and pages over.
+    ///
+    /// Every VPC already has one: "your VPC automatically comes with a main route table"
+    /// (Amazon VPC User Guide, "Route tables"), so [`Self::insert_vpc`] writes it and
+    /// [`Self::remove_vpc`] takes it away with the VPC.
+    pub route_tables: BTreeMap<String, RouteTable>,
     /// Every network interface the account holds, by `NetworkInterfaceId`, as the modelled
     /// [`NetworkInterface`] shape itself — the same reason the VPC and subnet stores hold
     /// their modelled shapes: a member a writer sets round-trips through
@@ -4782,6 +4807,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // A fresh account has created no network ACL of its own, so no `ClientToken` has
             // minted one.
             network_acl_client_tokens: HashMap::new(),
+            route_table_client_tokens: HashMap::new(),
             // A fresh account monitors nothing, so it holds no flow log.
             flow_logs: BTreeMap::new(),
             flow_log_client_tokens: HashMap::new(),
@@ -4855,8 +4881,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // default network below seeds.
             network_acls: BTreeMap::new(),
             // Nothing in AWS gives an account an internet gateway until something asks for
-            // one, so a fresh account holds none.
+            // one, so a fresh account holds none; a fresh account's route tables are exactly
+            // the main table of every VPC `insert_vpc` stored.
             internet_gateways: BTreeMap::new(),
+            route_tables: BTreeMap::new(),
             network_interfaces: BTreeMap::new(),
             network_interfaces_by_instance: BTreeMap::new(),
             network_interface_client_tokens: HashMap::new(),
@@ -5350,6 +5378,12 @@ impl ComAmazonawsEc2Amazonec2State {
         // ceiling gets a VPC without one rather than growing past that ceiling, the way
         // [`Self::insert_default_subnets`] stops at the subnet ceiling.
         self.insert_default_network_acl(&vpc_id);
+        // And the main route table it comes with, on exactly the same terms: "your VPC
+        // automatically comes with a main route table that you can modify" (Amazon VPC User
+        // Guide, "Route tables"), whose only route is the local one for the VPC's own CIDR
+        // block. A store already at the route-table ceiling gets a VPC without one rather
+        // than growing past that ceiling.
+        self.insert_main_route_table(&vpc_id, cidr_block);
         vpc_id
     }
 
@@ -10262,6 +10296,7 @@ impl ComAmazonawsEc2Amazonec2State {
             images,
             import_image_tasks => view,
             import_snapshot_tasks,
+            internet_gateways,
             ipam_policies => view,
             ipam_pools,
             ipam_resource_discoveries,
@@ -10285,6 +10320,7 @@ impl ComAmazonawsEc2Amazonec2State {
             route_server_endpoints,
             route_server_peers,
             route_servers => view,
+            route_tables,
             secondary_interfaces,
             secondary_networks => view,
             secondary_subnets,
@@ -23164,6 +23200,15 @@ impl ComAmazonawsEc2Amazonec2State {
                 found.push(carrier_gateway_id.clone());
             }
         }
+        // An internet gateway still attached to the VPC is a gateway "associated with the
+        // VPC" that the caller has to detach first ("You must detach or delete all gateways
+        // and resources that are associated with the VPC before you can delete it" —
+        // `DeleteVpc`), and the delete does not detach it.
+        for (internet_gateway_id, internet_gateway) in &self.internet_gateways {
+            if internet_gateway_attaches_vpc(internet_gateway, vpc_id) {
+                found.push(internet_gateway_id.clone());
+            }
+        }
         for (group_id, group) in &self.security_groups {
             if group.vpc_id.as_deref() == Some(vpc_id)
                 && group.group_name.as_deref() != Some(DEFAULT_SECURITY_GROUP_NAME)
@@ -23226,6 +23271,11 @@ impl ComAmazonawsEc2Amazonec2State {
         // it goes here rather than being left behind for `DescribeNetworkAcls` to report an
         // ACL associated with a subnet that no longer exists.
         self.disassociate_subnet_from_network_acls(subnet_id);
+        // An association between a route table and THIS subnet cannot outlive the subnet
+        // either, on the same terms: an association is the pair, so it goes here rather than
+        // being left behind for `DescribeRouteTables` to report a route table associated
+        // with a subnet that no longer exists.
+        self.disassociate_subnet_from_route_tables(subnet_id);
         self.release_stored_bytes(subnet_payload_bytes(&subnet));
         Some(subnet)
     }
@@ -23325,6 +23375,21 @@ impl ComAmazonawsEc2Amazonec2State {
             .collect();
         for network_acl_id in network_acl_ids {
             self.remove_network_acl(&network_acl_id);
+        }
+        // The route tables of this VPC go with it on the same documented terms: "when you
+        // delete the VPC, it deletes the default security group, network ACL, and route
+        // table for the VPC" (`DeleteVpc`). A route table names the VPC it routes for, so
+        // none may be left behind for `DescribeRouteTables` to report a VPC that no longer
+        // exists — the caller has already had to detach every gateway
+        // ([`Self::vpc_dependencies`]).
+        let route_table_ids: Vec<String> = self
+            .route_tables
+            .iter()
+            .filter(|(_, route_table)| route_table.vpc_id.as_deref() == Some(vpc_id))
+            .map(|(route_table_id, _)| route_table_id.clone())
+            .collect();
+        for route_table_id in route_table_ids {
+            self.remove_route_table(&route_table_id);
         }
         // A route server association IS the connection between a route server and THIS VPC
         // (`RouteServerAssociation`), so it cannot outlive the VPC: it goes here rather than

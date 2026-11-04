@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRouteTables
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRouteTables`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the account's route tables out of [`crate::state`] — the whole
+//! store by default, or the ids the request names, narrowed by the documented filters and
+//! paged in id order. Each table is reported with the routes and associations it holds.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRouteTables::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +84,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::borrow::Cow;
+use std::collections::HashSet;
+
+// A boolean attribute renders as a filter value the same way in every describe of this
+// crate, and so the ceilings a filtered describe holds a request to, the compiled filter,
+// the step budget and the one AND/OR evaluation of a `Filters` member live in
+// `crate::state` rather than once per operation: every describe of this crate reads a
+// filter the same way and bounds the same product.
+use crate::state::{
+    boolean_filter_values, CompiledFilter, MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS,
+    MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS, TAG_FILTER_PREFIX,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -155,18 +164,336 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRouteTables` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRouteTablesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The Region this request was signed for: "describes your route tables" is answered
+        // for the Region the caller is asking in, and that Region is what says which
+        // ambient default network the account already holds.
+        let region = crate::state::request_region(ctx.parts());
+
+        // "If you have the required permissions, the error response is DryRunOperation"
+        // (`DescribeRouteTablesRequest$DryRun`). Every caller of this emulator is
+        // permitted, so a dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+
+        // "The token returned from a previous paginated request" (`$NextToken`) — anything
+        // else is refused rather than read as an id, and before any other member is looked
+        // at.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // A page size and an explicit id selection cannot be given together, the way
+        // `DescribeSubnets` refuses the same pair: a request that NAMES the tables it wants
+        // is not walking the account's tables.
+        if input
+            .route_table_ids
+            .as_deref()
+            .is_some_and(|ids| !ids.is_empty())
+            && input.max_results.is_some()
+        {
+            return Err(crate::state::parameters_cannot_be_combined(
+                "RouteTableIds",
+                "MaxResults",
+            ));
+        }
+
+        // Matching cost is filters x values x value length x stored tables (and, for a
+        // `route.…` or `association.…` filter, the routes or associations one table holds),
+        // and the model bounds none of them (`FilterList` and `Filter$Values` carry no
+        // `@length`), so every request-controlled factor is capped HERE, before any work
+        // proportional to it is done and before the store is locked — the same ceilings the
+        // sibling describes enforce, from `crate::state`.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any
+        // table would have matched it, so an unsupported filter can never read as "no
+        // results". Each value is compiled into its pattern ONCE here, rather than
+        // recompiled for every candidate table.
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !filter_name_is_documented(name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so a value's size is bounded
+            // here too.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            compiled.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The IDs of the route tables" (`DescribeRouteTablesRequest$RouteTableIds`). The
+        // list is caller-sized and each entry is resolved against the store, so it is capped
+        // the way every other EC2 describe of this crate caps a resource-id list.
+        let requested: &[String] = input.route_table_ids.as_deref().unwrap_or_default();
+        if requested.len() > MAX_RESOURCE_IDS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "RouteTableIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested.len()
+            )));
+        }
+
+        let mut store = state.lock();
+        // The clock-owed transitions this read is allowed to apply, and the ambient default
+        // network of the Region — every VPC comes with a main route table, so the default
+        // VPC's is already the account's whatever it has created. Both were owed at this
+        // instant whether or not anybody called.
+        store.materialize_due_transitions();
+        store.ensure_default_network(&region);
+
+        // An id that names no route table of the account is an error, not an absent row.
+        if let Some(unknown) = requested
+            .iter()
+            .find(|id| !store.route_tables.contains_key(id.as_str()))
+        {
+            return Err(crate::state::invalid_route_table_id_not_found(unknown));
+        }
+        // A set, so narrowing below costs one lookup per table rather than a scan of the
+        // asked-for list.
+        let wanted: HashSet<&str> = requested.iter().map(String::as_str).collect();
+
+        // "Default: Describes all your route tables": `RouteTableIds` narrows the store to
+        // the ids named, and every filter must then hold ("if you specify multiple filters,
+        // the filters are joined with an AND" — `Filter`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRouteTables"))
+        // Every comparison is charged to ONE budget, so the product of stored tables, the
+        // routes and associations each holds, filters, values and value length is bounded
+        // however the caller combines them — which is also what bounds how long this holds
+        // the store's lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<&RouteTable> = Vec::new();
+        for route_table in store.route_tables.values() {
+            if budget.exhausted() {
+                break;
+            }
+            if !wanted.is_empty()
+                && !wanted.contains(route_table.route_table_id.as_deref().unwrap_or_default())
+            {
+                continue;
+            }
+            if crate::state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(route_table, name)
+            }) {
+                selected.push(route_table);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them or page with MaxResults"
+                ),
+            ));
+        }
+
+        // Page in `RouteTableId` order, which the cursor below names a position in.
+        selected.sort_by(|left, right| left.route_table_id.cmp(&right.route_table_id));
+
+        // "The maximum number of items to return for this request" (`$MaxResults`). A
+        // request that names none gets the largest page the model publishes, and the page
+        // ceiling is held here as well, so this handler cannot serve a page larger than the
+        // one it publishes even if nothing refused the size first.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_ROUTE_TABLES_PAGE_SIZE)
+            .clamp(1, MAX_ROUTE_TABLES_PAGE_SIZE);
+
+        // The page and the token that follows it, through the one definition of EC2 paging.
+        let (page, next_token) = crate::state::page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            crate::state::PageTokenRule::WhenAnotherItemFollows,
+            |route_table| route_table.route_table_id.as_deref().unwrap_or_default(),
+        );
+
+        Ok(DescribeRouteTablesOutput {
+            route_tables: Some(page.iter().map(|table| (*table).clone()).collect()),
+            next_token,
+        })
+    }
+}
+
+/// The largest page this operation serves, and the page it serves when the request names no
+/// size: the top of the modelled `MaxResults` range (`DescribeRouteTablesMaxResults`,
+/// `range 5..100`), so a request that names no page size is answered with the largest page
+/// the operation can be ASKED for and the `NextToken` path behaves the same either way.
+const MAX_ROUTE_TABLES_PAGE_SIZE: usize = 100;
+
+/// The filter names this operation documents, from `DescribeRouteTablesRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeRouteTablesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather than
+/// listed here. Every entry must be answered by [`filter_values`]. This operation's doc
+/// publishes no alternative spelling for any of them, and `tag-key` is listed with the rest.
+const ROUTE_TABLE_FILTERS: [&str; 20] = [
+    "association.gateway-id",
+    "association.main",
+    "association.route-table-association-id",
+    "association.route-table-id",
+    "association.subnet-id",
+    "owner-id",
+    "route-table-id",
+    "route.destination-cidr-block",
+    "route.destination-ipv6-cidr-block",
+    "route.destination-prefix-list-id",
+    "route.egress-only-internet-gateway-id",
+    "route.gateway-id",
+    "route.instance-id",
+    "route.nat-gateway-id",
+    "route.origin",
+    "route.state",
+    "route.transit-gateway-id",
+    "route.vpc-peering-connection-id",
+    "tag-key",
+    "vpc-id",
+];
+
+/// Whether this operation documents the filter the request named.
+///
+/// The tag filter is the one name with a variable part — "use the tag key in the filter name
+/// and the tag value as the filter value" (`DescribeRouteTablesRequest$Filters`) — so it is
+/// matched by [`TAG_FILTER_PREFIX`], the one spelling every describe of this crate reads a
+/// tag filter by, and the key must not be empty: a `tag:` with no key names no tag.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every other comparison is exact.
+fn filter_name_is_documented(name: &str) -> bool {
+    name.strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+        || ROUTE_TABLE_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against this route table.
+///
+/// The `association.*` and `route.*` families compare against EVERY association and every
+/// route the table holds, so a table matches when ANY of them does — which is what "the ID
+/// of a gateway specified in a route in the table" asks. A filter naming an attribute no
+/// row of the table carries compares against no values, so it selects nothing. `name` is a
+/// name the handler has already found documented.
+///
+/// The AND/OR evaluation of these values, and the budget that bounds it, live in
+/// [`crate::state::matches_every_filter`], which every filtered describe of this crate
+/// shares: "If you specify multiple filters, the filters are joined with an AND" (`Filter`),
+/// and within one filter "if you specify multiple values for a filter, the values are joined
+/// with an OR" (`Filter$Values`). So a filter carrying NO value matches nothing — one
+/// reading of `Filter$Values`, shared with the sibling describes, rather than one this
+/// operation invents for itself.
+fn filter_values<'a>(route_table: &'a RouteTable, name: &str) -> Vec<Cow<'a, str>> {
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return route_table
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let associations = || route_table.associations.iter().flatten();
+    let routes = || route_table.routes.iter().flatten();
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    let from_associations = |read: fn(&'a RouteTableAssociation) -> Option<&'a str>| {
+        associations()
+            .filter_map(|association| read(association).map(Cow::Borrowed))
+            .collect::<Vec<Cow<'a, str>>>()
+    };
+    let from_routes = |read: fn(&'a Route) -> Option<&'a str>| {
+        routes()
+            .filter_map(|route| read(route).map(Cow::Borrowed))
+            .collect::<Vec<Cow<'a, str>>>()
+    };
+    match name {
+        "association.gateway-id" => {
+            from_associations(|association| association.gateway_id.as_deref())
+        }
+        // "Route tables that do not have an association ID are not returned in the
+        // response" (`$Filters`), which falls out of comparing against the associations the
+        // table holds: a table with none compares against no values.
+        "association.main" => associations()
+            .flat_map(|association| boolean_filter_values(association.main))
+            .collect(),
+        "association.route-table-association-id" => from_associations(|association| {
+            association.route_table_association_id.as_deref()
+        }),
+        "association.route-table-id" => {
+            from_associations(|association| association.route_table_id.as_deref())
+        }
+        "association.subnet-id" => {
+            from_associations(|association| association.subnet_id.as_deref())
+        }
+        "owner-id" => text(route_table.owner_id.as_deref()),
+        "route-table-id" => text(route_table.route_table_id.as_deref()),
+        "route.destination-cidr-block" => {
+            from_routes(|route| route.destination_cidr_block.as_deref())
+        }
+        "route.destination-ipv6-cidr-block" => {
+            from_routes(|route| route.destination_ipv6_cidr_block.as_deref())
+        }
+        "route.destination-prefix-list-id" => {
+            from_routes(|route| route.destination_prefix_list_id.as_deref())
+        }
+        "route.egress-only-internet-gateway-id" => {
+            from_routes(|route| route.egress_only_internet_gateway_id.as_deref())
+        }
+        "route.gateway-id" => from_routes(|route| route.gateway_id.as_deref()),
+        "route.instance-id" => from_routes(|route| route.instance_id.as_deref()),
+        "route.nat-gateway-id" => from_routes(|route| route.nat_gateway_id.as_deref()),
+        "route.origin" => from_routes(|route| route.origin.as_deref()),
+        "route.state" => from_routes(|route| route.state.as_deref()),
+        "route.transit-gateway-id" => from_routes(|route| route.transit_gateway_id.as_deref()),
+        "route.vpc-peering-connection-id" => {
+            from_routes(|route| route.vpc_peering_connection_id.as_deref())
+        }
+        "tag-key" => route_table
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "vpc-id" => text(route_table.vpc_id.as_deref()),
+        // Unreachable: the handler has already refused every other name. An undefined name
+        // compares against nothing, so it could never widen a result even if that check were
+        // bypassed.
+        _ => Vec::new(),
     }
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRouteTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRouteTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates a route table in a stored VPC, with the local route every table
+//! comes with for each of that VPC's IPv4 CIDR blocks, and answers it as stored (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::route_tables`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRouteTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +137,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRouteTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRouteTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRouteTable"))
+        // The Region this request was signed for: the ambient default network of a Region
+        // is part of what the account holds there, so a request may create a table in the
+        // default VPC.
+        let region = crate::state::request_region(ctx.parts());
+        use crate::state;
+
+        // "The tags to assign to the route table"
+        // (`CreateRouteTableRequest$TagSpecifications`) — the shared reader refuses a
+        // specification naming any other resource type and holds the payload to the
+        // documented bounds.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_ROUTE_TABLE,
+            Self::NAME,
+        )?;
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`CreateRouteTableRequest$ClientToken`). The model puts no `@length`
+        // on it and the store keeps it for the process's lifetime, so the bound this crate
+        // holds every client token to is enforced here.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        let payload_bytes = state::route_table_payload_bytes(&tags);
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        store.materialize_due_transitions();
+        store.ensure_default_network(&region);
+
+        // Idempotency: one token names the one table it minted, so a replay of the SAME
+        // request reports that table and creates nothing.
+        let replayed_id = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.route_table_minted_by_client_token(token));
+
+        // "Creates a route table for the specified VPC": an id this account holds no VPC
+        // for is a refusal rather than a table in no VPC.
+        let Some(vpc) = store.vpcs.get(&input.vpc_id) else {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        };
+        // "Every route table contains a local route for communication within the VPC"
+        // (Amazon VPC User Guide, "Route tables") — one per block the VPC has associated,
+        // the primary one and any a later association added, so a table of a VPC with two
+        // blocks routes both of them locally. "Routes to IPv4 and IPv6 addresses within a
+        // VPC" are both such routes (same guide), so an associated IPv6 block gets one too.
+        let local_cidr_blocks: Vec<String> = vpc
+            .cidr_block_association_set
+            .iter()
+            .flatten()
+            .filter_map(|association| association.cidr_block.clone())
+            .collect();
+        let local_ipv6_cidr_blocks: Vec<String> = vpc
+            .ipv6_cidr_block_association_set
+            .iter()
+            .flatten()
+            .filter_map(|association| association.ipv6_cidr_block.clone())
+            .collect();
+
+        let replayed = match replayed_id {
+            None => None,
+            Some(route_table_id) => {
+                let route_table =
+                    store.route_tables.get(&route_table_id).cloned().ok_or_else(|| {
+                        state::internal_error(format!(
+                            "a client token names route table '{route_table_id}', which is \
+                             not stored"
+                        ))
+                    })?;
+                // A token is only idempotent for the REQUEST it was first given with:
+                // replayed with a different parameter it names a table the caller did not
+                // ask for, which EC2 refuses rather than answers.
+                if !same_request(&route_table, &input.vpc_id, &tags) {
+                    return Err(state::idempotent_parameter_mismatch());
+                }
+                Some(route_table)
+            }
+        };
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of. A
+        // replay stores nothing, so it is charged nothing and clears both gates.
+        if replayed.is_none() && !store.has_route_table_capacity() {
+            return Err(state::route_table_limit_exceeded(format!(
+                "This emulator holds {max} route tables, which is as many as it stores",
+                max = state::MAX_STORED_RECORDS_PER_STORE,
+            )));
+        }
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (DryRun).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The table that token already minted, exactly as it is stored now.
+        if let Some(route_table) = replayed {
+            return Ok(CreateRouteTableOutput {
+                route_table: Some(route_table),
+                client_token: input.client_token,
+            });
+        }
+
+        let Some(route_table_id) = store.insert_route_table(state::RouteTableSpec {
+            vpc_id: input.vpc_id.clone(),
+            local_cidr_blocks,
+            local_ipv6_cidr_blocks,
+            // "Your VPC automatically comes with a main route table" (same guide): the main
+            // table is the one the VPC came with, so a table this operation creates is not
+            // it — making it the main one is `ReplaceRouteTableAssociation`.
+            main: false,
+            tags,
+        }) else {
+            // Unreachable: both bounds the insert enforces were asked above, and the store
+            // is locked throughout. Answered rather than unwrapped, so a store at a ceiling
+            // can only ever refuse.
+            return Err(state::route_table_limit_exceeded(
+                "This emulator has no room for another route table",
+            ));
+        };
+        // The token is recorded with the table it minted, so a replay of this request
+        // reports that table instead of creating a second one.
+        if let Some(token) = input.client_token.clone() {
+            store.record_route_table_client_token(token, &route_table_id);
+        }
+
+        // The answer is the record as it was stored, so `CreateRouteTable` and
+        // `DescribeRouteTables` cannot drift apart.
+        let Some(route_table) = store.route_tables.get(&route_table_id).cloned() else {
+            return Err(state::internal_error(
+                "the route table just created could not be read back",
+            ));
+        };
+        Ok(CreateRouteTableOutput {
+            route_table: Some(route_table),
+            // "Only returned if a client token was provided in the request"
+            // (`CreateRouteTableResult$ClientToken`): the token the REQUEST carried, echoed,
+            // and nothing at all when it carried none.
+            client_token: input.client_token,
+        })
     }
+}
+
+/// Does `route_table` — the table a replayed `ClientToken` names — hold what THIS request
+/// asks for?
+///
+/// Every member the request decides is compared, so a token replayed with any different
+/// parameter is refused with `IdempotentParameterMismatch` rather than answered with a table
+/// the caller did not ask for; the same contract `create_network_acl`'s `same_request` has
+/// for a network ACL. The members this service derives (the id, the owning account, the local
+/// routes a create mints and the empty association set) are not compared: they follow from
+/// the ones that are. Tags are a SET, so the order a request names them in is not a
+/// difference.
+fn same_request(route_table: &RouteTable, vpc_id: &str, tags: &[Tag]) -> bool {
+    route_table.vpc_id.as_deref() == Some(vpc_id)
+        && crate::state::tag_pairs(route_table.tags.as_deref().unwrap_or_default())
+            == crate::state::tag_pairs(tags)
 }

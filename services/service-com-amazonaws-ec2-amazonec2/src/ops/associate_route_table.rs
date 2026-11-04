@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateRouteTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateRouteTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: associates a stored subnet with a stored route table of the SAME VPC and
+//! answers the association's id and state (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::associate_subnet_with_route_table`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateRouteTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +141,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateRouteTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateRouteTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateRouteTable"))
+        // `ctx` carries request metadata only; this operation reads none of it — both sides
+        // of the association are named by id. The store is reached through the engine held
+        // on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of a public IPv4 pool" is part of the edge association this emulator
+        // holds no state for — an ingress route table associated with a BYOIP pool — so a
+        // 501 ("nobody has written this yet") is the honest answer rather than a refusal
+        // that blames the caller.
+        if input.public_ipv4_pool.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "AssociateRouteTable with a public IPv4 pool",
+            ));
+        }
+        // "Associates a subnet in your VPC or an internet gateway or virtual private
+        // gateway attached to your VPC with a route table": the two are alternatives, so
+        // neither and both are refusals. The gateway form is the edge association, which
+        // this emulator holds no state for either.
+        match (input.subnet_id.as_deref(), input.gateway_id.as_deref()) {
+            (None, None) => {
+                return Err(state::missing_parameter(
+                    "The request must contain either the parameter subnetId or gatewayId",
+                ))
+            }
+            (Some(_), Some(_)) => {
+                return Err(state::invalid_parameter_combination(
+                    "The parameters subnetId and gatewayId cannot be used together",
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "AssociateRouteTable with a gateway",
+                ))
+            }
+            (Some(_), None) => {}
+        }
+        let subnet_id = input.subnet_id.clone().unwrap_or_default();
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        store.materialize_due_transitions();
+
+        // An id this account holds no resource for is a refusal, not an association with
+        // nothing. The table is resolved first, it being the resource the operation acts on.
+        let Some(route_table) = store.route_tables.get(&input.route_table_id) else {
+            return Err(state::invalid_route_table_id_not_found(&input.route_table_id));
+        };
+        let route_table_vpc_id = route_table.vpc_id.clone();
+        let Some(subnet) = store.subnets.get(&subnet_id) else {
+            return Err(state::invalid_subnet_id_not_found(&subnet_id));
+        };
+        // "Associates a subnet IN YOUR VPC … with a route table IN YOUR VPC": a route table
+        // routes for one VPC, so a subnet of another VPC cannot be associated with it — the
+        // routes would be in a network the subnet is not in.
+        if subnet.vpc_id != route_table_vpc_id {
+            return Err(state::invalid_parameter_value(format!(
+                "route table {route_table_id} and subnet {subnet_id} \
+                 belong to different networks",
+                route_table_id = input.route_table_id,
+            )));
+        }
+        // "Each subnet in your VPC must be associated with a route table" (Amazon VPC User
+        // Guide, "Route tables"), and with exactly one: an explicit association the subnet
+        // already has is refused rather than added beside the one that holds — changing
+        // which table a subnet uses is `ReplaceRouteTableAssociation`.
+        if let Some(associated) = store.route_table_associated_with_subnet(&subnet_id) {
+            return Err(state::subnet_already_associated(&subnet_id, &associated));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (DryRun).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let Some(association_id) =
+            store.associate_subnet_with_route_table(&input.route_table_id, &subnet_id)
+        else {
+            // The table was resolved a moment ago, so this cannot happen — and if it ever
+            // did, the request must not answer 200 with nothing associated.
+            return Err(state::internal_error(
+                "the route table checked a moment ago could not be associated",
+            ));
+        };
+
+        // The answer is the association as it was stored: its id, and the state the store
+        // reports it in, read back off the record so this call and `DescribeRouteTables`
+        // cannot drift apart.
+        let association_state = store
+            .route_tables
+            .get(&input.route_table_id)
+            .and_then(|route_table| route_table.associations.as_deref())
+            .and_then(|associations| {
+                associations
+                    .iter()
+                    .find(|association| {
+                        association.route_table_association_id.as_deref()
+                            == Some(association_id.as_str())
+                    })
+                    .and_then(|association| association.association_state.clone())
+            });
+        Ok(AssociateRouteTableOutput {
+            association_id: Some(association_id),
+            association_state,
+        })
     }
 }

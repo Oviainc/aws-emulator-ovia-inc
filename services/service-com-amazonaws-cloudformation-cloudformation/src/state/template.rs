@@ -2595,6 +2595,12 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // lowercase), numbers, underscores, and hyphens are allowed" (Amazon ECS API
         // reference) — ECS's model carries no `@length` for it.
         ECS_CLUSTER => rules(255, Characters::AsGenerated),
+        // Amazon EKS `CreateCluster.name`: "The unique name to give to your cluster", whose
+        // own `@length` is 1..100 and whose pattern is `^[0-9A-Za-z][A-Za-z0-9\-_]*$`
+        // (`ClusterName` in that service's model) — a generated name is inside that
+        // character set and starts with one of its characters, but may be longer than the
+        // bound.
+        EKS_CLUSTER => rules(100, Characters::AsGenerated),
         // AWS Batch `CreateComputeEnvironment.computeEnvironmentName` and
         // `CreateJobQueue.jobQueueName`: each "can be up to 128 characters long. It can
         // contain uppercase and lowercase letters, numbers, hyphens (-), and underscores
@@ -3181,6 +3187,8 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     ECS_CLUSTER,
     ECS_SERVICE,
     ECS_TASK_DEFINITION,
+    EKS_CLUSTER,
+    EKS_POD_IDENTITY_ASSOCIATION,
     ELB_LISTENER,
     ELB_LISTENER_RULE,
     ELB_LOAD_BALANCER,
@@ -3801,6 +3809,51 @@ fn return_values(
                 ::emulator_server::emulator_arn("ecs", region, &format!("cluster/{name}")),
             );
             (name.to_string(), attributes)
+        }
+        // "Ref returns the name of the cluster"; Fn::GetAtt: Arn, CertificateAuthorityData,
+        // ClusterSecurityGroupId, EncryptionConfigKeyArn, Endpoint, OpenIdConnectIssuerUrl.
+        // This is the type `super::provisioning` creates in Amazon EKS itself, so the
+        // cluster a stack's output names is one `eks describe-cluster` finds — and every
+        // attribute but the ARN is a value only that service can produce (the API server's
+        // endpoint, the cluster CA, the OIDC issuer, the security group it made for the
+        // control plane), so each stands in until the create reports what EKS really
+        // answered.
+        EKS_CLUSTER => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(EKS_ARN_NAMESPACE, region, &format!("cluster/{name}")),
+            );
+            for attribute in [
+                "CertificateAuthorityData",
+                "ClusterSecurityGroupId",
+                "EncryptionConfigKeyArn",
+                "Endpoint",
+                "OpenIdConnectIssuerUrl",
+            ] {
+                attributes.insert(
+                    attribute.to_string(),
+                    service_assigned_document(name, attribute),
+                );
+            }
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the association ARN"; Fn::GetAtt: AssociationArn, AssociationId.
+        // Amazon EKS ASSIGNS both — `CreatePodIdentityAssociation` takes the cluster, the
+        // namespace, the service account and the role and answers the association it minted
+        // — so a declaration reports a stand-in until `super::provisioning` has created the
+        // association and reported the ARN and the id that service really assigned.
+        EKS_POD_IDENTITY_ASSOCIATION => {
+            let arn = ::emulator_server::emulator_arn(
+                EKS_ARN_NAMESPACE,
+                region,
+                &format!("podidentityassociation/{name}"),
+            );
+            attributes.insert("AssociationArn".to_string(), arn.clone());
+            attributes.insert(
+                "AssociationId".to_string(),
+                service_assigned_document(name, "AssociationId"),
+            );
+            (arn, attributes)
         }
         // "Ref returns the compute environment ARN"; Fn::GetAtt: ComputeEnvironmentArn.
         // This is the type `super::provisioning` creates in AWS Batch itself, so the
@@ -4580,6 +4633,15 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         KINESIS_STREAM => &["Arn"],
         ECR_REPOSITORY => &["Arn", "RepositoryUri"],
         ECS_CLUSTER => &["Arn"],
+        EKS_CLUSTER => &[
+            "Arn",
+            "CertificateAuthorityData",
+            "ClusterSecurityGroupId",
+            "EncryptionConfigKeyArn",
+            "Endpoint",
+            "OpenIdConnectIssuerUrl",
+        ],
+        EKS_POD_IDENTITY_ASSOCIATION => &["AssociationArn", "AssociationId"],
         BATCH_COMPUTE_ENVIRONMENT => &["ComputeEnvironmentArn"],
         BATCH_JOB_QUEUE => &["JobQueueArn"],
         BATCH_SERVICE_ENVIRONMENT => &["ServiceEnvironmentArn"],
@@ -4721,6 +4783,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// the record name", which is the `Name` its own declaration states.)
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == APIGATEWAYV2_API
+        // An Amazon EKS pod identity association is one more: that create takes no
+        // identifier and answers the ARN and the id Amazon EKS minted for the association,
+        // and "Ref returns the association ARN" — a template declares the cluster, the
+        // namespace, the service account and the role, never the association's own id.
+        || resource_type == EKS_POD_IDENTITY_ASSOCIATION
         // An IAM access key is one more: "Ref returns the AWS::IAM::AccessKey resource's
         // access key ID", `CreateAccessKey` takes no identifier — the declaration states
         // only the user the key belongs to — and that id is what every IAM operation on a
@@ -5228,6 +5295,10 @@ pub const BATCH_SERVICE_ENVIRONMENT: &str = "AWS::Batch::ServiceEnvironment";
 /// AWS Batch's ARN namespace, from its model's `awsService.arnNamespace`.
 const BATCH_ARN_NAMESPACE: &str = "batch";
 
+/// Amazon EKS's ARN namespace, from its model's `awsService.arnNamespace`, which the ARNs
+/// of a cluster and of a pod identity association are built under.
+const EKS_ARN_NAMESPACE: &str = "eks";
+
 /// The three CodeDeploy resource types `super::provisioning` creates in CodeDeploy itself
 /// (that model: `cloudFormationName: CodeDeploy`).
 ///
@@ -5296,6 +5367,24 @@ pub const WAFV2_WEB_ACL_ASSOCIATION: &str = "AWS::WAFv2::WebACLAssociation";
 /// `@httpLabel`s, so this type's physical resource id is that pair too
 /// ([`composite_identity_properties`]).
 pub const EKS_ACCESS_ENTRY: &str = "AWS::EKS::AccessEntry";
+
+/// The type of an Amazon EKS cluster: the Kubernetes control plane that service runs (the
+/// Amazon EKS model's `awsService.cloudFormationName: EKS`).
+///
+/// "Ref returns the name of the cluster", which is also the handle every Amazon EKS
+/// operation on one takes (`DescribeCluster$name`) and the `Name` property a declaration
+/// states, so the physical resource id the naming rules compute for the type is already the
+/// identifier in force.
+pub const EKS_CLUSTER: &str = "AWS::EKS::Cluster";
+
+/// The type of an Amazon EKS pod identity association: the IAM role one Kubernetes service
+/// account of one cluster assumes (same model).
+///
+/// `CreatePodIdentityAssociation` takes no identifier — a declaration states the cluster,
+/// the namespace, the service account and the role — and answers the association's own ARN
+/// and id, which is why this type's identity is the owning service's
+/// ([`identity_is_service_assigned`]).
+pub const EKS_POD_IDENTITY_ASSOCIATION: &str = "AWS::EKS::PodIdentityAssociation";
 
 /// The separator CloudFormation joins the parts of a COMPOSITE physical resource id with.
 const COMPOSITE_IDENTITY_SEPARATOR: &str = "|";

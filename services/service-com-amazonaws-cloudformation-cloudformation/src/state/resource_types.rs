@@ -486,6 +486,7 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::EKS::FargateProfile",
     "AWS::EKS::IdentityProviderConfig",
     "AWS::EKS::Nodegroup",
+    "AWS::EKS::PodIdentityAssociation",
     // Amazon EMR
     "AWS::EMR::Cluster",
     "AWS::EMR::InstanceFleetConfig",

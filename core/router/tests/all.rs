@@ -445,6 +445,12 @@ mod cloudformation_provisions_codedeploy_resources;
 // are both regions concurrently landing suites put their line in.
 #[path = "all/cloudformation_provisions_eks_access_entries.rs"]
 mod cloudformation_provisions_eks_access_entries;
+// Declared in this same quiet span of the sorted list, for the reason the note above gives:
+// a stack that declares an `AWS::EKS::Cluster` or an `AWS::EKS::PodIdentityAssociation`
+// really creates it in Amazon EKS, holds the cluster's creation open until that service
+// reports it ACTIVE, and reports what it minted in the stack's own outputs.
+#[path = "all/cloudformation_provisions_eks_clusters.rs"]
+mod cloudformation_provisions_eks_clusters;
 #[path = "all/cloudformation_provisions_cognito_user_pool_groups.rs"]
 mod cloudformation_provisions_cognito_user_pool_groups;
 // Declared in this same quiet span of the sorted list, for the reason the note above gives:

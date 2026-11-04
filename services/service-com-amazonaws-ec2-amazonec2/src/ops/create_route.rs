@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRoute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRoute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: adds one route to a stored route table — one destination, one target the
+//! store holds — and answers `true` (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::insert_route`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRoute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +164,337 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRoute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRouteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRoute"))
+        // `ctx` carries request metadata only; this operation reads none of it — a route is
+        // named by the table it goes in. The store is reached through the engine on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "You must specify either a destination CIDR block or a prefix list ID"
+        // (`CreateRoute`), and one route matches on ONE destination — the member it carries
+        // is what identifies it in its table — so two of them together have no defined
+        // winner and are refused rather than silently collapsed.
+        let destinations = [
+            ("destinationCidrBlock", input.destination_cidr_block.as_deref()),
+            (
+                "destinationIpv6CidrBlock",
+                input.destination_ipv6_cidr_block.as_deref(),
+            ),
+            (
+                "destinationPrefixListId",
+                input.destination_prefix_list_id.as_deref(),
+            ),
+        ];
+        let named_destinations: Vec<&str> = destinations
+            .iter()
+            .filter(|(_, value)| value.is_some_and(|value| !value.is_empty()))
+            .map(|(member, _)| *member)
+            .collect();
+        if named_destinations.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain either the parameter destinationCidrBlock, \
+                 destinationIpv6CidrBlock or destinationPrefixListId",
+            ));
+        }
+        if named_destinations.len() > 1 {
+            return Err(state::invalid_parameter_combination(format!(
+                "The parameters {named} cannot be used together",
+                named = named_destinations.join(", "),
+            )));
+        }
+
+        // "We modify the specified CIDR block to its canonical form; for example, if you
+        // specify 100.68.0.18/18, we modify it to 100.68.0.0/18"
+        // (`CreateRouteRequest$DestinationCidrBlock`). A route's destination has no
+        // published block size — `0.0.0.0/0` is the commonest one of all — so only the form
+        // is checked.
+        let destination_cidr_block = match input.destination_cidr_block.as_deref() {
+            None => None,
+            Some(block) => match state::canonical_ipv4_cidr(block) {
+                Ok(canonical) => Some(canonical),
+                Err(_) => {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value ({block}) for parameter destinationCidrBlock is invalid. \
+                         This is not a valid CIDR block."
+                    )))
+                }
+            },
+        };
+        let destination_ipv6_cidr_block = match input.destination_ipv6_cidr_block.as_deref() {
+            None => None,
+            Some(block) => match state::canonical_ipv6_cidr(block) {
+                Ok(canonical) => Some(canonical),
+                Err(_) => {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value ({block}) for parameter destinationIpv6CidrBlock is invalid. \
+                         This is not a valid IPv6 CIDR block."
+                    )))
+                }
+            },
+        };
+
+        // "You must also specify exactly one of the resources from the parameter list"
+        // (`CreateRoute`): the target members are alternatives, so none and more than one
+        // are both refusals.
+        let targets: Vec<(&str, &str)> = [
+            ("gatewayId", input.gateway_id.as_deref()),
+            ("natGatewayId", input.nat_gateway_id.as_deref()),
+            ("instanceId", input.instance_id.as_deref()),
+            ("networkInterfaceId", input.network_interface_id.as_deref()),
+            ("transitGatewayId", input.transit_gateway_id.as_deref()),
+            ("localGatewayId", input.local_gateway_id.as_deref()),
+            ("carrierGatewayId", input.carrier_gateway_id.as_deref()),
+            (
+                "vpcPeeringConnectionId",
+                input.vpc_peering_connection_id.as_deref(),
+            ),
+            ("vpcEndpointId", input.vpc_endpoint_id.as_deref()),
+            (
+                "egressOnlyInternetGatewayId",
+                input.egress_only_internet_gateway_id.as_deref(),
+            ),
+            ("coreNetworkArn", input.core_network_arn.as_deref()),
+            ("odbNetworkArn", input.odb_network_arn.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(member, value)| {
+            value
+                .filter(|value| !value.is_empty())
+                .map(|value| (member, value))
+        })
+        .collect();
+        let Some(&(target_member, target_value)) = targets.first() else {
+            return Err(state::missing_parameter(
+                "The request must contain exactly one of the parameters gatewayId, \
+                 natGatewayId, instanceId, networkInterfaceId, transitGatewayId, \
+                 localGatewayId, carrierGatewayId, vpcPeeringConnectionId, vpcEndpointId, \
+                 egressOnlyInternetGatewayId, coreNetworkArn or odbNetworkArn",
+            ));
+        };
+        if targets.len() > 1 {
+            return Err(state::invalid_parameter_combination(format!(
+                "The parameters {named} cannot be used together",
+                named = targets
+                    .iter()
+                    .map(|(member, _)| *member)
+                    .collect::<Vec<&str>>()
+                    .join(", "),
+            )));
+        }
+        // Three targets this emulator holds no resource for at all, so a 501 ("nobody has
+        // written this yet") is the honest answer rather than a refusal that blames the
+        // caller: there is no egress-only internet gateway store
+        // (`CreateEgressOnlyInternetGateway` is still a scaffold), and no Cloud WAN core
+        // network or ODB network resource in this emulator to route to.
+        if matches!(
+            target_member,
+            "egressOnlyInternetGatewayId" | "coreNetworkArn" | "odbNetworkArn"
+        ) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "CreateRoute with a {target_member} target"
+            )));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // Whether a target is available is a question about the CURRENT states, so a
+        // transition the clock already owed is applied before it is asked: the move was due
+        // at that instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "The ID of the route table for the route": an id this account holds no table for
+        // is a refusal, not a route in no table.
+        let Some(route_table) = store.route_tables.get(&input.route_table_id) else {
+            return Err(state::invalid_route_table_id_not_found(&input.route_table_id));
+        };
+        // The VPC the table routes for, which is what a gateway target has to be attached
+        // to: "the ID of an internet gateway or virtual private gateway attached to your
+        // VPC" (`CreateRouteRequest$GatewayId`).
+        let vpc_id = route_table.vpc_id.clone().unwrap_or_default();
+
+        // The target, resolved against the store: a route is only ever stored pointing at
+        // a resource this account holds, so a describe can never report a route to nothing.
+        let target = resolve_target(
+            &store,
+            target_member,
+            target_value,
+            &input.route_table_id,
+            &vpc_id,
+        )?;
+
+        // "The ID of a prefix list used for the destination match"
+        // (`$DestinationPrefixListId`): a list this account does not hold matches nothing,
+        // so it is refused rather than stored.
+        if let Some(prefix_list_id) = input.destination_prefix_list_id.as_deref() {
+            if !store.managed_prefix_lists.contains_key(prefix_list_id) {
+                return Err(state::invalid_prefix_list_id_not_found(prefix_list_id));
+            }
+        }
+
+        let spec = state::RouteSpec {
+            destination_cidr_block,
+            destination_ipv6_cidr_block,
+            destination_prefix_list_id: input.destination_prefix_list_id.clone(),
+            target,
+            // "`CreateRoute` - The route was manually added to the route table"
+            // (`Route$Origin`).
+            origin: state::ROUTE_ORIGIN_CREATE_ROUTE,
+        };
+        // One destination has one target, so a second route for a destination the table
+        // already routes is refused rather than replacing the first — that is
+        // `ReplaceRoute`.
+        if store.route_table_holds_destination(&input.route_table_id, spec.destination()) {
+            return Err(state::route_already_exists(spec.destination()));
+        }
+        if store.route_count(&input.route_table_id) >= state::MAX_ROUTES_PER_ROUTE_TABLE {
+            return Err(state::route_limit_exceeded());
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (DryRun).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        if !store.insert_route(&input.route_table_id, spec) {
+            // Every bound the insert enforces was asked above, and the store is locked
+            // throughout. Answered rather than unwrapped, so a table at its ceiling can
+            // only ever refuse.
+            return Err(state::route_limit_exceeded());
+        }
+
+        // "Returns true if the request succeeds; otherwise, it returns an error"
+        // (`CreateRouteResult$Return`).
+        Ok(CreateRouteOutput {
+            r#return: Some(true),
+        })
+    }
+}
+
+/// The target `member` names, resolved against the store.
+///
+/// "Each route in a route table specifies a destination and a target" (Amazon VPC User
+/// Guide, "Route tables"), and a target is a resource: one this account does not hold is
+/// refused with that resource's own `Invalid<Kind>.NotFound`, so no route is ever stored
+/// pointing at nothing. A GATEWAY target carries one rule more — it has to be attached to
+/// the VPC the route table routes for, a gateway of another VPC being unreachable from this
+/// one.
+///
+/// `member` is one of the member names the handler collected, and `value` the id it carried;
+/// `route_table_id` and `vpc_id` are the table the route goes in and the VPC it routes for.
+fn resolve_target(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    member: &str,
+    value: &str,
+    route_table_id: &str,
+    vpc_id: &str,
+) -> Result<crate::state::RouteTarget, CreateRouteError> {
+    use crate::state::{self, RouteTarget};
+    match member {
+        "gatewayId" => {
+            // "Every route table contains a local route for communication within the VPC"
+            // and that route is the table's own: `local` is not a gateway a caller can
+            // point a route at.
+            if value == state::LOCAL_ROUTE_GATEWAY_ID {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({value}) for parameter gatewayId is invalid. \
+                     The local route of a route table cannot be created."
+                )));
+            }
+            // An internet gateway or a virtual private gateway: the two kinds this member
+            // documents, told apart by the id form each kind carries.
+            let attached_vpc = if store.internet_gateways.contains_key(value) {
+                store.internet_gateway_attached_vpc(value)
+            } else if let Some(vpn_gateway) = store.vpn_gateways.get(value) {
+                vpn_gateway
+                    .view
+                    .vpc_attachments
+                    .iter()
+                    .flatten()
+                    .find_map(|attachment| attachment.vpc_id.clone())
+            } else if store.vpc_endpoints.contains_key(value) {
+                // "The ID of a VPC endpoint. Supported for Gateway Load Balancer endpoints
+                // only" reaches the stored route through the same member, an endpoint being
+                // reported as the route's `GatewayId`; the endpoint names the VPC it is in.
+                store
+                    .vpc_endpoints
+                    .get(value)
+                    .and_then(|endpoint| endpoint.vpc_id.clone())
+            } else {
+                return Err(state::invalid_gateway_id_not_found(value));
+            };
+            // A gateway attached to another VPC — or to none — cannot carry this VPC's
+            // traffic, which is the refusal EC2 answers naming both sides.
+            if attached_vpc.as_deref() != Some(vpc_id) {
+                return Err(state::invalid_parameter_value(format!(
+                    "route table {route_table_id} and network gateway {value} \
+                     belong to different networks"
+                )));
+            }
+            Ok(RouteTarget::Gateway(value.to_string()))
+        }
+        "vpcEndpointId" => {
+            let Some(endpoint) = store.vpc_endpoints.get(value) else {
+                return Err(state::invalid_gateway_id_not_found(value));
+            };
+            if endpoint.vpc_id.as_deref() != Some(vpc_id) {
+                return Err(state::invalid_parameter_value(format!(
+                    "route table {route_table_id} and network gateway {value} \
+                     belong to different networks"
+                )));
+            }
+            // An endpoint target is reported in `Route$GatewayId`, the modelled `Route`
+            // carrying no member of its own for a VPC endpoint.
+            Ok(RouteTarget::Gateway(value.to_string()))
+        }
+        "natGatewayId" => {
+            if !store.nat_gateways.contains_key(value) {
+                return Err(state::nat_gateway_not_found(value));
+            }
+            Ok(RouteTarget::NatGateway(value.to_string()))
+        }
+        "instanceId" => {
+            if !store.instances.contains_key(value) {
+                return Err(crate::scaffolded::Scaffolded::invalid_instance_id_not_found(
+                    value,
+                ));
+            }
+            Ok(RouteTarget::Instance(value.to_string()))
+        }
+        "networkInterfaceId" => {
+            if !store.network_interfaces.contains_key(value) {
+                return Err(state::invalid_network_interface_id_not_found(value));
+            }
+            Ok(RouteTarget::NetworkInterface(value.to_string()))
+        }
+        "transitGatewayId" => {
+            if !store.transit_gateways.contains_key(value) {
+                return Err(state::invalid_transit_gateway_id_not_found(value));
+            }
+            Ok(RouteTarget::TransitGateway(value.to_string()))
+        }
+        "localGatewayId" => {
+            if !store.local_gateways.contains_key(value) {
+                return Err(state::invalid_local_gateway_id_not_found(value));
+            }
+            Ok(RouteTarget::LocalGateway(value.to_string()))
+        }
+        "carrierGatewayId" => {
+            if !store.carrier_gateways.contains_key(value) {
+                return Err(state::invalid_carrier_gateway_id_not_found(value));
+            }
+            Ok(RouteTarget::CarrierGateway(value.to_string()))
+        }
+        "vpcPeeringConnectionId" => {
+            if !store.vpc_peering_connections.contains_key(value) {
+                return Err(state::invalid_vpc_peering_connection_id_not_found(value));
+            }
+            Ok(RouteTarget::VpcPeeringConnection(value.to_string()))
+        }
+        // Unreachable: the handler collected these member names itself and answered the
+        // three it holds no store for before reaching here.
+        _ => Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+            "CreateRoute with a {member} target"
+        ))),
     }
 }

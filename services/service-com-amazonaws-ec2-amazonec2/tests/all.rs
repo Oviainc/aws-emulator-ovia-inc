@@ -17,6 +17,14 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The route path out of a VPC: an internet gateway attached to exactly one VPC, a route
+// table created for one VPC with the local route it comes with, one route per destination
+// against a target of that VPC, and a subnet associated with one table of its own VPC — each
+// read back through its own describe. Declared beside `prefix_lists` for the reason the note
+// above gives: the sorted neighbourhood and the tail of this file are where every new ec2
+// suite inserts its lines.
+#[path = "all/vpc_internet_path.rs"]
+mod vpc_internet_path;
 // An account's internet gateways: what `CreateInternetGateway` stores and
 // `DescribeInternetGateways` reports back out of that store — the id, the owning account, the
 // empty attachment set, the tags, and how the id list, the documented filters and the page

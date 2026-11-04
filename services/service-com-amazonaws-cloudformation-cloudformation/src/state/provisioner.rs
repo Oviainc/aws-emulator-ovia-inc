@@ -467,7 +467,8 @@ use super::template::{
     CODEDEPLOY_DEPLOYMENT_CONFIG, CODEDEPLOY_DEPLOYMENT_GROUP,
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_SECURITY_GROUP, EC2_SUBNET,
     EC2_VOLUME, EC2_VPC,
-    ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, EKS_ACCESS_ENTRY,
+    ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, EKS_ACCESS_ENTRY, EKS_CLUSTER,
+    EKS_POD_IDENTITY_ASSOCIATION,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
     ELASTIC_BEANSTALK_ENVIRONMENT, GLUE_CRAWLER, GLUE_DATABASE, GLUE_TABLE, GRAFANA_WORKSPACE,
@@ -752,6 +753,15 @@ pub(super) enum Provisioner {
     BatchJobQueue,
     BatchServiceEnvironment,
     EksAccessEntry,
+    /// `AWS::EKS::Cluster`: the Kubernetes control plane `CreateCluster` creates under the
+    /// name the template states and `DeleteCluster` removes. That create is asynchronous,
+    /// so the resource's creation is held open until Amazon EKS reports the cluster
+    /// `ACTIVE`.
+    EksCluster,
+    /// `AWS::EKS::PodIdentityAssociation`: the IAM role one Kubernetes service account
+    /// assumes, which `CreatePodIdentityAssociation` makes and
+    /// `DeletePodIdentityAssociation` removes.
+    EksPodIdentityAssociation,
     /// `AWS::ApiGateway::DomainName`: a custom domain name of the REST control plane, which
     /// `CreateDomainName` creates under the name the template states and
     /// `DeleteDomainName` removes.
@@ -895,6 +905,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         BATCH_JOB_QUEUE => Some(Provisioner::BatchJobQueue),
         BATCH_SERVICE_ENVIRONMENT => Some(Provisioner::BatchServiceEnvironment),
         EKS_ACCESS_ENTRY => Some(Provisioner::EksAccessEntry),
+        EKS_CLUSTER => Some(Provisioner::EksCluster),
+        EKS_POD_IDENTITY_ASSOCIATION => Some(Provisioner::EksPodIdentityAssociation),
         APIGATEWAY_DOMAIN_NAME => Some(Provisioner::ApiGatewayDomainName),
         APIGATEWAYV2_API => Some(Provisioner::ApiGatewayV2Api),
         APIGATEWAYV2_DOMAIN_NAME => Some(Provisioner::ApiGatewayV2DomainName),
@@ -1226,6 +1238,10 @@ impl Provisioner {
                 create_service_environment(ctx, region, resource, propagated).await
             }
             Self::EksAccessEntry => create_access_entry(ctx, region, resource, propagated).await,
+            Self::EksCluster => create_eks_cluster(ctx, region, resource, propagated).await,
+            Self::EksPodIdentityAssociation => {
+                create_pod_identity_association(ctx, region, resource, propagated).await
+            }
             Self::ApiGatewayDomainName => {
                 create_apigateway_domain_name(ctx, region, resource, propagated).await
             }
@@ -1530,6 +1546,12 @@ impl Provisioner {
             // just answered for handles no connection yet and the resource's creation is
             // finished once Amazon RDS reports it `available`.
             Self::RdsDbProxy => db_proxy_readiness(ctx, region, physical_resource_id).await,
+            // "When you create a new cluster, the Amazon EKS API server endpoint is private
+            // to your VPC" only once the control plane is up: a created cluster is reported
+            // `CREATING` and "you must wait for the cluster status to become ACTIVE before
+            // you can … add nodes" (`CreateCluster` / `Cluster$status`), so the resource's
+            // creation is finished once that service reports it `ACTIVE`.
+            Self::EksCluster => eks_cluster_readiness(ctx, region, physical_resource_id).await,
             _ => Ok(Readiness::Ready),
         }
     }
@@ -1560,6 +1582,18 @@ impl Provisioner {
             // domain once that service reports it settled.
             Self::OpenSearchServiceDomain => {
                 domain_ready_attributes(ctx, region, resource_type, physical_resource_id).await
+            }
+            // "Nothing of the control plane itself exists yet" while Amazon EKS reports a
+            // cluster `CREATING`: its API server endpoint, the certificate authority a
+            // client verifies that endpoint with, the OIDC issuer of its identity provider
+            // and the security group it makes for the control plane are all values that
+            // service fills in as it provisions the control plane, so they are read off the
+            // cluster once it reports it ready.
+            Self::EksCluster => {
+                Ok(read_eks_cluster(ctx, region, physical_resource_id)
+                    .await?
+                    .map(|cluster| eks_cluster_attributes(&cluster))
+                    .unwrap_or_default())
             }
             _ => Ok(BTreeMap::new()),
         }
@@ -2162,6 +2196,12 @@ impl Provisioner {
             // The delete addresses the entry by the PAIR Amazon EKS keys one by, both
             // halves of which are on the resource's own declaration.
             Self::EksAccessEntry => delete_access_entry(ctx, region, resource).await,
+            Self::EksCluster => delete_eks_cluster(ctx, region, physical_resource_id).await,
+            // The delete addresses the association by the cluster that holds it and the id
+            // Amazon EKS assigned it, both of which are on the resource's own record.
+            Self::EksPodIdentityAssociation => {
+                delete_pod_identity_association(ctx, region, resource).await
+            }
             Self::ApiGatewayDomainName => {
                 delete_apigateway_domain_name(ctx, region, physical_resource_id).await
             }
@@ -2526,6 +2566,10 @@ impl Provisioner {
             }
             // Read back by the same cluster-and-principal pair the delete uses.
             Self::EksAccessEntry => describe_access_entry(ctx, region, resource).await,
+            Self::EksCluster => describe_eks_cluster(ctx, region, physical_resource_id).await,
+            Self::EksPodIdentityAssociation => {
+                describe_pod_identity_association(ctx, region, resource).await
+            }
             Self::ApiGatewayDomainName => {
                 describe_apigateway_domain_name(ctx, region, physical_resource_id).await
             }
@@ -21656,6 +21700,526 @@ fn access_policy_request(resource: &StoredResource, declared: &Value) -> Result<
         mapped_members(scope, EKS_ACCESS_SCOPE_MEMBERS),
     );
     Ok(Value::Object(request))
+}
+
+// ---------------------------------------------------------------------------
+// Amazon EKS: AWS::EKS::Cluster and AWS::EKS::PodIdentityAssociation
+// ---------------------------------------------------------------------------
+
+/// The URI Amazon EKS binds a cluster's pod identity associations to, as that model's
+/// `@http` traits declare it: `POST /clusters/{clusterName}/pod-identity-associations`
+/// creates one and `DELETE /clusters/{clusterName}/pod-identity-associations/{associationId}`
+/// removes it
+/// (`smithy_query(query="operation",operation="CreatePodIdentityAssociation,\
+/// DeletePodIdentityAssociation")` on that service's model).
+const EKS_POD_IDENTITY_ASSOCIATIONS_PATH: &str = "pod-identity-associations";
+
+/// The `Cluster$status` a cluster is usable in: "you must wait for the cluster status to
+/// become `ACTIVE` before you can add nodes" (`CreateCluster`).
+const EKS_CLUSTER_ACTIVE: &str = "ACTIVE";
+
+/// The `Cluster$status` a created cluster starts in, which that create answers with.
+const EKS_CLUSTER_CREATING: &str = "CREATING";
+
+/// The `AWS::EKS::Cluster` properties `CreateCluster` takes under its own member name, as
+/// (property, member) pairs — each a SCALAR of the declaration.
+///
+/// Source: AWS's CloudFormation resource reference for the type against the
+/// `CreateClusterRequest` shape. The Amazon EKS model spells its members in lower camel
+/// case and renames none of these, so the only difference is the first character's case.
+/// `Name` is not here because the cluster's name is its physical resource id, which the
+/// create below sends; `Tags` is not because the call takes a tag MAP while the type
+/// publishes a tag LIST.
+const EKS_CLUSTER_MEMBERS: &[(&str, &str)] = &[
+    ("BootstrapSelfManagedAddons", "bootstrapSelfManagedAddons"),
+    ("DeletionProtection", "deletionProtection"),
+    ("RoleArn", "roleArn"),
+    ("Version", "version"),
+];
+
+/// The members of the type's `ResourcesVpcConfig` property as `CreateCluster`'s
+/// `resourcesVpcConfig` (a `VpcConfigRequest`) takes them.
+const EKS_VPC_CONFIG_MEMBERS: &[(&str, &str)] = &[
+    ("EndpointPrivateAccess", "endpointPrivateAccess"),
+    ("EndpointPublicAccess", "endpointPublicAccess"),
+    ("PublicAccessCidrs", "publicAccessCidrs"),
+    ("SecurityGroupIds", "securityGroupIds"),
+    ("SubnetIds", "subnetIds"),
+];
+
+/// The members of the type's `AccessConfig` property as that create's `accessConfig` (a
+/// `CreateAccessConfigRequest`) takes them.
+const EKS_ACCESS_CONFIG_MEMBERS: &[(&str, &str)] = &[
+    ("AuthenticationMode", "authenticationMode"),
+    (
+        "BootstrapClusterCreatorAdminPermissions",
+        "bootstrapClusterCreatorAdminPermissions",
+    ),
+];
+
+/// The members of the type's `KubernetesNetworkConfig` property as that create's
+/// `kubernetesNetworkConfig` (a `KubernetesNetworkConfigRequest`) takes them.
+const EKS_NETWORK_CONFIG_MEMBERS: &[(&str, &str)] = &[
+    ("IpFamily", "ipFamily"),
+    ("ServiceIpv4Cidr", "serviceIpv4Cidr"),
+];
+
+/// The members of the type's `UpgradePolicy` property as that create's `upgradePolicy` (an
+/// `UpgradePolicyRequest`) takes them.
+const EKS_UPGRADE_POLICY_MEMBERS: &[(&str, &str)] = &[("SupportType", "supportType")];
+
+/// The members of the type's `ZonalShiftConfig` property as that create's
+/// `zonalShiftConfig` (a `ZonalShiftConfigRequest`) takes them.
+const EKS_ZONAL_SHIFT_MEMBERS: &[(&str, &str)] = &[("Enabled", "enabled")];
+
+/// The members of one `EncryptionConfig` entry as that create's `encryptionConfig` list
+/// takes them: the resources it covers, and the provider whose one member is the KMS key.
+const EKS_ENCRYPTION_CONFIG_MEMBERS: &[(&str, &str)] = &[("Resources", "resources")];
+
+/// The members of an `EncryptionConfig` entry's `Provider` as that list's `provider` (a
+/// `Provider`) takes them.
+const EKS_ENCRYPTION_PROVIDER_MEMBERS: &[(&str, &str)] = &[("KeyArn", "keyArn")];
+
+/// Every `AWS::EKS::Cluster` property this arm maps onto `CreateCluster`, so a declared
+/// property it does NOT map is refused rather than dropped
+/// ([`refuse_unmapped_properties`]): a cluster created without what its declaration asked
+/// for is not the cluster the template declared.
+///
+/// `ComputeConfig`, `StorageConfig`, `RemoteNetworkConfig`, `OutpostConfig` and `Logging`
+/// are the properties no arm maps: each is a nested configuration of a cluster this
+/// emulator holds no state for (auto mode's compute and storage, a hybrid remote network,
+/// an Outpost control plane, control-plane log export to Amazon CloudWatch Logs), so a
+/// declaration that asks for one is refused rather than silently created without it.
+const EKS_CLUSTER_MAPPED_PROPERTIES: &[&str] = &[
+    "AccessConfig",
+    "BootstrapSelfManagedAddons",
+    "DeletionProtection",
+    "EncryptionConfig",
+    "KubernetesNetworkConfig",
+    "Name",
+    "ResourcesVpcConfig",
+    "RoleArn",
+    "Tags",
+    "UpgradePolicy",
+    "Version",
+    "ZonalShiftConfig",
+];
+
+/// The members `DescribeCluster` reports under this type's own property names, as
+/// `(property, member)` pairs, for drift detection.
+///
+/// Only the scalars that are a property of the declaration: the version in force, the role
+/// the control plane assumes and the name itself. The nested configurations that service
+/// reports back are its own `…Response` shapes rather than the request shapes a declaration
+/// states, so they are not evidence of a declared value ([`super::drift`]), and `Tags` is
+/// left out for the same reason as everywhere else here.
+const EKS_CLUSTER_REPORTED_PROPERTIES: &[(&str, &str)] = &[
+    ("Name", "name"),
+    ("RoleArn", "roleArn"),
+    ("Version", "version"),
+];
+
+/// The `AWS::EKS::PodIdentityAssociation` properties `CreatePodIdentityAssociation` takes
+/// under its own member name. `ClusterName` is not here because that create binds it to its
+/// URI, and `Tags` is not because the call takes a tag MAP.
+const EKS_POD_IDENTITY_MEMBERS: &[(&str, &str)] = &[
+    ("DisableSessionTags", "disableSessionTags"),
+    ("Namespace", "namespace"),
+    ("RoleArn", "roleArn"),
+    ("ServiceAccount", "serviceAccount"),
+    ("TargetRoleArn", "targetRoleArn"),
+];
+
+/// Every `AWS::EKS::PodIdentityAssociation` property this arm maps, on the terms
+/// [`EKS_CLUSTER_MAPPED_PROPERTIES`] records.
+const EKS_POD_IDENTITY_MAPPED_PROPERTIES: &[&str] = &[
+    "ClusterName",
+    "DisableSessionTags",
+    "Namespace",
+    "RoleArn",
+    "ServiceAccount",
+    "Tags",
+    "TargetRoleArn",
+];
+
+/// Create the cluster an `AWS::EKS::Cluster` declares, in Amazon EKS — so a client that
+/// deployed the stack and then calls `eks describe-cluster` for the declared name reads the
+/// cluster back, and finds it in `eks list-clusters`, rather than a
+/// `ResourceNotFoundException` for a cluster nothing created.
+///
+/// The cluster's name is the resource's physical id (the `Name` the declaration states, or
+/// the name CloudFormation computed for it), and its own properties are that create's
+/// members — the scalars of [`EKS_CLUSTER_MEMBERS`] and the nested configurations mapped
+/// member by member — with the declared tags beside the ones CloudFormation gives the
+/// resource as the tag MAP the call takes.
+///
+/// What Amazon EKS answers is what the stack reports: the ARN it minted, the API server
+/// endpoint, the cluster's certificate authority data, the OIDC issuer URL of its identity
+/// provider and the security group it made for the control plane are each an attribute the
+/// type publishes that only that service can produce, so each is read off the created
+/// cluster rather than computed here. The create leaves the cluster `CREATING`, and
+/// [`eks_cluster_readiness`] is what the resource's creation is held open on.
+async fn create_eks_cluster(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    refuse_unmapped_properties(resource, EKS_CLUSTER_MAPPED_PROPERTIES)?;
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    let mut request = Map::new();
+    request.insert(
+        "name".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    copy_members(&properties, EKS_CLUSTER_MEMBERS, &mut request);
+    for (property, member, pairs) in [
+        (
+            "ResourcesVpcConfig",
+            "resourcesVpcConfig",
+            EKS_VPC_CONFIG_MEMBERS,
+        ),
+        ("AccessConfig", "accessConfig", EKS_ACCESS_CONFIG_MEMBERS),
+        (
+            "KubernetesNetworkConfig",
+            "kubernetesNetworkConfig",
+            EKS_NETWORK_CONFIG_MEMBERS,
+        ),
+        ("UpgradePolicy", "upgradePolicy", EKS_UPGRADE_POLICY_MEMBERS),
+        ("ZonalShiftConfig", "zonalShiftConfig", EKS_ZONAL_SHIFT_MEMBERS),
+    ] {
+        if let Some(declared) = properties.get(property) {
+            request.insert(member.to_string(), mapped_members(declared, pairs));
+        }
+    }
+    // "The encryption configuration for the cluster" is a LIST of at most one entry, each
+    // naming the resources it covers and the KMS key provider that encrypts them, so every
+    // entry is mapped the same way its own members are.
+    let encryption: Vec<Value> = declared_list(&resource.properties, "EncryptionConfig")
+        .iter()
+        .map(|declared| {
+            let mut entry = mapped_members(declared, EKS_ENCRYPTION_CONFIG_MEMBERS);
+            if let (Some(provider), Value::Object(members)) =
+                (declared.get("Provider"), &mut entry)
+            {
+                members.insert(
+                    "provider".to_string(),
+                    mapped_members(provider, EKS_ENCRYPTION_PROVIDER_MEMBERS),
+                );
+            }
+            entry
+        })
+        .collect();
+    if !encryption.is_empty() {
+        request.insert("encryptionConfig".to_string(), Value::Array(encryption));
+    }
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let answered = call_rest_json(
+        ctx,
+        EKS_SIGNING_NAME,
+        region,
+        "POST",
+        EKS_CLUSTERS_URI,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let cluster = answered.get("cluster").cloned().unwrap_or(Value::Null);
+    let name = cluster
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "Amazon EKS answered CreateCluster without a cluster name".to_string(),
+        })?
+        .to_string();
+    Ok(Created {
+        // "Ref returns the name of the cluster": the handle every Amazon EKS operation on
+        // one takes, as that service reported it.
+        physical_resource_id: Some(name),
+        attributes: eks_cluster_attributes(&cluster),
+    })
+}
+
+/// The attributes an `AWS::EKS::Cluster` publishes that only Amazon EKS can produce, read
+/// off the cluster record that service reported.
+///
+/// One reading for both the create and the readiness read, so the attributes a stack
+/// reports for a cluster cannot depend on which call last looked at it. An attribute that
+/// service does not report is left out rather than invented: the stand-in the naming rules
+/// computed stays in place, which is what says the value is not available.
+fn eks_cluster_attributes(cluster: &Value) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::new();
+    let mut insert = |attribute: &str, value: Option<&str>| {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            attributes.insert(attribute.to_string(), value.to_string());
+        }
+    };
+    insert("Arn", cluster.get("arn").and_then(Value::as_str));
+    insert("Endpoint", cluster.get("endpoint").and_then(Value::as_str));
+    insert(
+        "CertificateAuthorityData",
+        cluster
+            .get("certificateAuthority")
+            .and_then(|authority| authority.get("data"))
+            .and_then(Value::as_str),
+    );
+    insert(
+        "OpenIdConnectIssuerUrl",
+        cluster
+            .get("identity")
+            .and_then(|identity| identity.get("oidc"))
+            .and_then(|oidc| oidc.get("issuer"))
+            .and_then(Value::as_str),
+    );
+    insert(
+        "ClusterSecurityGroupId",
+        cluster
+            .get("resourcesVpcConfig")
+            .and_then(|config| config.get("clusterSecurityGroupId"))
+            .and_then(Value::as_str),
+    );
+    insert(
+        "EncryptionConfigKeyArn",
+        cluster
+            .get("encryptionConfig")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry.get("provider"))
+            .and_then(|provider| provider.get("keyArn"))
+            .and_then(Value::as_str),
+    );
+    attributes
+}
+
+/// Whether Amazon EKS has finished bringing up the cluster a stack created.
+///
+/// A created cluster is reported [`EKS_CLUSTER_CREATING`] and "you must wait for the
+/// cluster status to become `ACTIVE` before you can … add nodes" (`CreateCluster`), so
+/// `ACTIVE` is the state the resource's creation is finished in, `CREATING` the state it is
+/// still coming up in, and every other status is one no wait will bring a cluster out of: a
+/// cluster that failed, one being deleted or updated out of this stack's reach. A cluster
+/// that service no longer holds is in the same position, nothing being left to create it.
+async fn eks_cluster_readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Readiness, Refusal> {
+    let Some(cluster) = read_eks_cluster(ctx, region, physical_resource_id).await? else {
+        return Ok(Readiness::Failed(format!(
+            "Amazon EKS holds no cluster {physical_resource_id}"
+        )));
+    };
+    match cluster.get("status").and_then(Value::as_str).unwrap_or_default() {
+        EKS_CLUSTER_ACTIVE => Ok(Readiness::Ready),
+        EKS_CLUSTER_CREATING => Ok(Readiness::Pending(EKS_CLUSTER_CREATING.to_string())),
+        other => Ok(Readiness::Failed(format!(
+            "Amazon EKS reports cluster {physical_resource_id} as {other}"
+        ))),
+    }
+}
+
+/// The cluster Amazon EKS holds under `name`, or `None` when it holds none
+/// (`ResourceNotFoundException`, judged on the CODE and never on a message).
+async fn read_eks_cluster(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) -> Result<Option<Value>, Refusal> {
+    let uri = format!("{EKS_CLUSTERS_URI}/{}", percent_encoded(name));
+    match call_rest_json(ctx, EKS_SIGNING_NAME, region, "GET", &uri, None).await {
+        Ok(answer) => Ok(answer.get("cluster").cloned()),
+        Err(refusal) if refusal.code == EKS_RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The cluster's configuration as Amazon EKS reports it, for drift detection:
+/// `DescribeCluster`'s own record, read by the name the stack published. One that service no
+/// longer holds was deleted.
+async fn describe_eks_cluster(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    Ok(read_eks_cluster(ctx, region, physical_resource_id)
+        .await?
+        .map(|cluster| reported_as_properties(&cluster, EKS_CLUSTER_REPORTED_PROPERTIES)))
+}
+
+/// Delete the cluster a stack created, addressed by the name Amazon EKS knows it by. A
+/// cluster that service no longer holds is already in the state the delete asks for.
+async fn delete_eks_cluster(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let uri = format!("{EKS_CLUSTERS_URI}/{}", percent_encoded(physical_resource_id));
+    match call_rest_json(ctx, EKS_SIGNING_NAME, region, "DELETE", &uri, None).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == EKS_RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Create the association an `AWS::EKS::PodIdentityAssociation` declares, in Amazon EKS —
+/// so a client that deployed the stack reads the association back through
+/// `eks describe-pod-identity-association`, and a pod of the declared service account gets
+/// the declared role's credentials, rather than nothing having been associated at all.
+///
+/// The cluster is the create's URI label and the rest of the declaration its members
+/// ([`EKS_POD_IDENTITY_MEMBERS`]), with the declared tags beside the ones CloudFormation
+/// gives the resource as the tag MAP the call takes. The ARN and the id Amazon EKS minted
+/// are the type's two published attributes and its `Ref`, so both are read off the
+/// association that service created.
+async fn create_pod_identity_association(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    refuse_unmapped_properties(resource, EKS_POD_IDENTITY_MAPPED_PROPERTIES)?;
+    let cluster_name = required_property(resource, "ClusterName")?;
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    let mut request = Map::new();
+    copy_members(&properties, EKS_POD_IDENTITY_MEMBERS, &mut request);
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let answered = call_rest_json(
+        ctx,
+        EKS_SIGNING_NAME,
+        region,
+        "POST",
+        &format!(
+            "{EKS_CLUSTERS_URI}/{}/{EKS_POD_IDENTITY_ASSOCIATIONS_PATH}",
+            percent_encoded(&cluster_name)
+        ),
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let association = answered.get("association").cloned().unwrap_or(Value::Null);
+    let arn = association
+        .get("associationArn")
+        .and_then(Value::as_str)
+        .filter(|arn| !arn.is_empty())
+        .ok_or_else(|| Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "Amazon EKS answered CreatePodIdentityAssociation without an \
+                      associationArn"
+                .to_string(),
+        })?
+        .to_string();
+    let mut attributes = BTreeMap::new();
+    attributes.insert("AssociationArn".to_string(), arn.clone());
+    if let Some(association_id) = association
+        .get("associationId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        attributes.insert("AssociationId".to_string(), association_id.to_string());
+    }
+    Ok(Created {
+        // "Ref returns the association ARN", which is this type's primary identifier.
+        physical_resource_id: Some(arn),
+        attributes,
+    })
+}
+
+/// Delete the pod identity association a stack created, addressed by the cluster that holds
+/// it and the id Amazon EKS assigned it — the two `@httpLabel`s of that delete.
+///
+/// The id is the one the create reported, kept on the resource's own `AssociationId`
+/// attribute; a record that carries none names no association that could be deleted, so it
+/// is refused here rather than with a request that service would reject. An association
+/// Amazon EKS no longer holds — and a cluster it no longer holds, which took the
+/// association with it — is already in the state the delete asks for.
+async fn delete_pod_identity_association(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let cluster_name = required_property(resource, "ClusterName")?;
+    let association_id = resource
+        .attributes
+        .get("AssociationId")
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "{} carries no AssociationId to delete",
+                resource.resource_type
+            ),
+        })?;
+    let uri = format!(
+        "{EKS_CLUSTERS_URI}/{}/{EKS_POD_IDENTITY_ASSOCIATIONS_PATH}/{}",
+        percent_encoded(&cluster_name),
+        percent_encoded(association_id)
+    );
+    match call_rest_json(ctx, EKS_SIGNING_NAME, region, "DELETE", &uri, None).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == EKS_RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The members `DescribePodIdentityAssociation` reports under this type's own property
+/// names, as `(property, member)` pairs, for drift detection — the scalars of the
+/// declaration, `Tags` left out for the reason it is everywhere else here.
+const EKS_POD_IDENTITY_REPORTED_PROPERTIES: &[(&str, &str)] = &[
+    ("ClusterName", "clusterName"),
+    ("DisableSessionTags", "disableSessionTags"),
+    ("Namespace", "namespace"),
+    ("RoleArn", "roleArn"),
+    ("ServiceAccount", "serviceAccount"),
+    ("TargetRoleArn", "targetRoleArn"),
+];
+
+/// The association's configuration as Amazon EKS reports it, for drift detection:
+/// `DescribePodIdentityAssociation`'s own record, read by the pair that addresses one. One
+/// that service no longer holds — or whose cluster it no longer holds — was deleted.
+///
+/// A record carrying no `AssociationId` names no association to read, which is the same
+/// answer as one that service does not hold: there is nothing to compare a declaration
+/// against.
+async fn describe_pod_identity_association(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let cluster_name = required_property(resource, "ClusterName")?;
+    let Some(association_id) = resource
+        .attributes
+        .get("AssociationId")
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(None);
+    };
+    let uri = format!(
+        "{EKS_CLUSTERS_URI}/{}/{EKS_POD_IDENTITY_ASSOCIATIONS_PATH}/{}",
+        percent_encoded(&cluster_name),
+        percent_encoded(association_id)
+    );
+    match call_rest_json(ctx, EKS_SIGNING_NAME, region, "GET", &uri, None).await {
+        Ok(answer) => Ok(Some(reported_as_properties(
+            answer.get("association").unwrap_or(&Value::Null),
+            EKS_POD_IDENTITY_REPORTED_PROPERTIES,
+        ))),
+        Err(refusal) if refusal.code == EKS_RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
 }
 
 // ---------------------------------------------------------------------------
