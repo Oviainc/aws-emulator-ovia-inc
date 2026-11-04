@@ -33,17 +33,23 @@ use crate::spending_limits::{
 
 /// The region the harness's SigV4 credential scope names, so an ARN it mints carries it —
 /// and so a hand-written ARN has to carry it to name anything at all.
-const REGION: &str = "eu-west-1";
+///
+/// `pub(crate)` with [`ACCOUNT`] below so the delete suite writes the ARNs it probes with
+/// from the same pair this one does.
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// The account id every emulated ARN carries.
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// The amount every limit in these suites is created with, so a row that changes it is
 /// visibly a change.
 const ORIGINAL_AMOUNT: &str = "100.50";
 
 /// `PATCH /spending-limit/{spendingLimitArn}/update`.
-async fn update_limit(braket: &Braket, arn: &str, body: Value) -> Reply {
+///
+/// `pub(crate)` so the delete suite drives the other door of the resource through this one
+/// helper rather than keeping a second copy of the route.
+pub(crate) async fn update_limit(braket: &Braket, arn: &str, body: Value) -> Reply {
     braket
         .call(
             "PATCH",
