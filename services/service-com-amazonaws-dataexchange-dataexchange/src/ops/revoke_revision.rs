@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeRevision
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeRevision`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeRevision::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Revokes subscribers' access to a revision, which is admitted only while something
+//! is sharing that revision's data. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +168,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeRevision` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeRevisionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeRevision"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RevokeRevisionErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        let revoked = {
+            let mut store = state.lock();
+            // Whether anything shares this data set is read before the revision is
+            // borrowed to write, so one lock covers the precondition and the write.
+            let shared = store.data_set_is_granted(&input.data_set_id);
+            let Some(data_set) = store.data_sets.get_mut(&input.data_set_id) else {
+                return Err(RevokeRevisionErrorModeled::ResourceNotFoundException(
+                    crate::state::data_set_not_found(&input.data_set_id),
+                )
+                .into());
+            };
+            let Some(record) = data_set.revisions.get_mut(&input.revision_id) else {
+                return Err(RevokeRevisionErrorModeled::ResourceNotFoundException(
+                    crate::state::revision_not_found(&input.revision_id),
+                )
+                .into());
+            };
+
+            // A revision whose access has already been revoked admits nothing
+            // further, so a second revoke cannot overwrite the comment or the instant
+            // the first one recorded.
+            if record.revoked {
+                return Err(RevokeRevisionErrorModeled::ConflictException(
+                    crate::state::revision_conflict(
+                        &input.revision_id,
+                        crate::state::REVISION_ACTION_REFUSED_MESSAGE,
+                    ),
+                )
+                .into());
+            }
+            // Revoking withdraws subscribers' access, so there has to be access to
+            // withdraw: the revision's data set has to be shared. A data grant is the
+            // one such inclusion this service models. The guard is checked before
+            // anything is written, so a refused revoke leaves the whole record as it
+            // was.
+            if !shared {
+                return Err(RevokeRevisionErrorModeled::ConflictException(
+                    crate::state::revision_conflict(
+                        &input.revision_id,
+                        crate::state::REVISION_NOT_SHARED_MESSAGE,
+                    ),
+                )
+                .into());
+            }
+
+            let revoked_at = crate::state::now();
+            record.revoked = true;
+            record.revocation_comment = Some(input.revocation_comment);
+            record.revoked_at = Some(revoked_at);
+            record.updated_at = revoked_at;
+            record.clone()
+        };
+
+        // `RevokeRevisionResponse` models no `Tags` member, so the stored record is
+        // reported without them; `ListTagsForResource` is the tag reader.
+        Ok(RevokeRevisionOutput {
+            arn: Some(revoked.arn),
+            comment: revoked.comment,
+            created_at: Some(revoked.created_at),
+            data_set_id: Some(revoked.data_set_id),
+            finalized: revoked.finalized,
+            id: Some(revoked.id),
+            source_id: revoked.source_id,
+            updated_at: Some(revoked.updated_at),
+            revocation_comment: revoked.revocation_comment,
+            revoked: revoked.revoked,
+            revoked_at: revoked.revoked_at,
+        })
     }
 }

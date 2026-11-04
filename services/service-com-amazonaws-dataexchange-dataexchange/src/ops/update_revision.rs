@@ -196,6 +196,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             };
 
+            // A revision whose subscribers' access has been revoked is in the
+            // read-only state for good — revoking requires it to be finalized — so no
+            // later call may change it. Checked before anything is written, so a
+            // refused update leaves the whole record as it was.
+            if record.revoked {
+                return Err(UpdateRevisionErrorModeled::ConflictException(
+                    crate::state::revision_conflict(
+                        &input.revision_id,
+                        crate::state::REVISION_ACTION_REFUSED_MESSAGE,
+                    ),
+                )
+                .into());
+            }
+
             // Finalizing publishes the revision's assets to subscribers, so a
             // revision holding none cannot be finalized. The guard is checked before
             // anything is written, so a refused finalize leaves the whole record —

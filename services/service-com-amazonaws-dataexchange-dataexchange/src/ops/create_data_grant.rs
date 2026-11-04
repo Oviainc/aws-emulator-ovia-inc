@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataGrant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataGrant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataGrant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a data grant: a share of one of this account's data sets with another
+//! account, which that account has to accept before the grant takes effect. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +171,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataGrant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataGrantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataGrant"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDataGrantErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // `Name` (`@length(1, 256)`), `GrantDistributionScope` (an enum),
+        // `ReceiverPrincipal` and `SourceDataSetId` (both `@pattern`) are bounded by
+        // the model, so the boundary validator has already refused anything outside
+        // them. What the model does NOT bound is how much caller-sized text the
+        // stored record may carry, so those bounds are enforced here.
+        if let Err(message) = crate::state::bound_chars(
+            "Description",
+            input.description.as_deref().unwrap_or_default(),
+            crate::state::MAX_DESCRIPTION_CHARS,
+        )
+        .and_then(|()| crate::state::bound_tags(input.tags.as_ref()))
+        {
+            return Err(CreateDataGrantErrorModeled::ValidationException(
+                crate::state::invalid_request(message),
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+
+        // Persist first, then answer out of what was stored: the response is the
+        // state a later read sees, not a second copy assembled from the request.
+        // Both guards are checked under the same lock the insert takes, and before
+        // any id is minted, so a refused create consumes nothing.
+        let stored = {
+            let mut store = state.lock();
+            // The store is bounded, and the model declares the 402 for exactly this.
+            if store.data_grants.len() >= crate::state::MAX_DATA_GRANTS {
+                return Err(CreateDataGrantErrorModeled::ServiceLimitExceededException(
+                    crate::state::data_grant_limit_exceeded(),
+                )
+                .into());
+            }
+            // A grant shares a data set, so there has to be one to share: an id that
+            // addresses none is the modelled 404.
+            if !store.data_sets.contains_key(&input.source_data_set_id) {
+                return Err(CreateDataGrantErrorModeled::ResourceNotFoundException(
+                    crate::state::data_set_not_found(&input.source_data_set_id),
+                )
+                .into());
+            }
+            let id = crate::state::mint_id();
+            let created_at = crate::state::now();
+            let record = crate::state::DataGrant {
+                arn: crate::state::data_grant_arn(&region, &id),
+                id: id.clone(),
+                name: input.name,
+                description: input.description,
+                // The sender is whoever created the grant, which is this caller.
+                sender_principal: crate::state::caller_account().to_string(),
+                receiver_principal: input.receiver_principal,
+                // Only the receiver's own accept can move a grant on, so a freshly
+                // created one is pending that call and has been accepted at no
+                // instant.
+                acceptance_state: crate::state::DATA_GRANT_PENDING_RECEIVER_ACCEPTANCE.to_string(),
+                accepted_at: None,
+                ends_at: input.ends_at,
+                grant_distribution_scope: input.grant_distribution_scope,
+                data_set_id: input.source_data_set_id.clone(),
+                source_data_set_id: input.source_data_set_id,
+                tags: input.tags.unwrap_or_default(),
+                created_at,
+                updated_at: created_at,
+            };
+            let stored = record.clone();
+            store.data_grant_order.push(id.clone());
+            store.data_grants.insert(id, record);
+            stored
+        };
+
+        Ok(CreateDataGrantOutput {
+            name: stored.name,
+            sender_principal: stored.sender_principal,
+            receiver_principal: stored.receiver_principal,
+            description: stored.description,
+            acceptance_state: stored.acceptance_state,
+            accepted_at: stored.accepted_at,
+            ends_at: stored.ends_at,
+            grant_distribution_scope: stored.grant_distribution_scope,
+            data_set_id: stored.data_set_id,
+            source_data_set_id: stored.source_data_set_id,
+            id: stored.id,
+            arn: stored.arn,
+            created_at: stored.created_at,
+            updated_at: stored.updated_at,
+            // An untagged grant carries no Tags member at all, not an empty map.
+            tags: (!stored.tags.is_empty()).then_some(stored.tags),
+        })
     }
 }

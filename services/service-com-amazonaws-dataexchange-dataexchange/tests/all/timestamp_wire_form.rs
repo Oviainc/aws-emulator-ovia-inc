@@ -174,8 +174,14 @@ fn shape_rows() -> Vec<ShapeRow> {
             shapes::API_GATEWAY_API_ASSET_SCHEMA,
             &["ApiSpecificationDownloadUrlExpiresAt"],
         ),
-        // Data grants, whose operations are still scaffolds: the rule is about the member,
-        // not about which operation answers it.
+        // Data grants: the rule is about the member, not about which operation answers
+        // it, and it decides the READ of an instant as much as the write — the create's
+        // own input carries `EndsAt`.
+        (
+            "CreateDataGrantRequest",
+            shapes::CREATE_DATA_GRANT_INPUT_SCHEMA,
+            &["EndsAt"],
+        ),
         (
             "CreateDataGrantResponse",
             shapes::CREATE_DATA_GRANT_OUTPUT_SCHEMA,

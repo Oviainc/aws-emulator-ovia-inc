@@ -391,6 +391,42 @@ pub struct EventAction {
     pub updated_at: DateTime,
 }
 
+/// One stored data grant: who granted what to whom, and where the grant is in its
+/// acceptance lifecycle.
+///
+/// `accepted_at` is the instant the receiver accepted, so it is absent for as long as
+/// `acceptance_state` is [`DATA_GRANT_PENDING_RECEIVER_ACCEPTANCE`] — the two are one
+/// fact, written together by the accept.
+#[derive(Debug, Clone)]
+pub struct DataGrant {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// The account that created the grant: the caller of the create.
+    pub sender_principal: String,
+    /// The account the grant is for, and so the only one that can accept it.
+    pub receiver_principal: String,
+    /// One of the model's `DataGrantAcceptanceState` values, enumerated by
+    /// `crate::ops::types::DATA_GRANT_ACCEPTANCE_STATE_VALUES`.
+    pub acceptance_state: String,
+    pub accepted_at: Option<DateTime>,
+    pub ends_at: Option<DateTime>,
+    /// One of the model's `GrantDistributionScope` values, enumerated by
+    /// `crate::ops::types::GRANT_DISTRIBUTION_SCOPE_VALUES`.
+    pub grant_distribution_scope: String,
+    /// The data set the grant gives access to. This emulator mints no second,
+    /// entitled copy of the data set the grant was created from, so the data set
+    /// associated to the grant IS that source data set and both members report it;
+    /// `source_data_set_id` is kept beside it because the two are distinct members of
+    /// every data-grant response.
+    pub data_set_id: String,
+    pub source_data_set_id: String,
+    pub tags: HashMap<String, String>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
 /// Per-service state for com-amazonaws-dataexchange-dataexchange. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsDataexchangeDataexchangeState {
@@ -407,6 +443,10 @@ pub struct ComAmazonawsDataexchangeDataexchangeState {
     /// Creation order of `event_actions`, so `ListEventActions` pages
     /// deterministically.
     pub event_action_order: Vec<String>,
+    /// Every data grant this emulator holds, keyed by its `Id`.
+    pub data_grants: HashMap<String, DataGrant>,
+    /// Creation order of `data_grants`, so `ListDataGrants` pages deterministically.
+    pub data_grant_order: Vec<String>,
 }
 
 impl ComAmazonawsDataexchangeDataexchangeState {
@@ -582,11 +622,9 @@ impl ComAmazonawsDataexchangeDataexchangeState {
     /// and at most [`MAX_DATA_SETS`] data sets, each holding at most
     /// [`MAX_REVISIONS_PER_DATA_SET`] revisions.
     ///
-    /// A data set, its revisions and the event actions this emulator stores are the
-    /// taggable resources it holds. The model's remaining one — a data grant, whose
-    /// create also carries `Tags` — is minted by an operation that is still a
-    /// scaffold, so no ARN can address one yet, and one will be found here as soon as
-    /// the record exists.
+    /// A data set, its revisions, the event actions and the data grants this emulator
+    /// stores are the taggable resources it holds, which is every resource of this
+    /// service whose create carries `Tags`.
     pub fn resource_tags(&self, resource_arn: &str) -> Option<&HashMap<String, String>> {
         if let Some(event_action) = self
             .event_actions
@@ -594,6 +632,13 @@ impl ComAmazonawsDataexchangeDataexchangeState {
             .find(|event_action| event_action.arn == resource_arn)
         {
             return Some(&event_action.tags);
+        }
+        if let Some(data_grant) = self
+            .data_grants
+            .values()
+            .find(|data_grant| data_grant.arn == resource_arn)
+        {
+            return Some(&data_grant.tags);
         }
         self.data_sets.values().find_map(|data_set| {
             if data_set.arn == resource_arn {
@@ -604,6 +649,20 @@ impl ComAmazonawsDataexchangeDataexchangeState {
                 .values()
                 .find(|revision| revision.arn == resource_arn)
                 .map(|revision| &revision.tags)
+        })
+    }
+
+    /// Whether any data grant this emulator holds gives access to `data_set_id`.
+    ///
+    /// A revision can only be revoked while the data it belongs to is being shared —
+    /// included in a data product or a data grant — and a data grant is the one such
+    /// inclusion this service models, so this is what that precondition reads.
+    ///
+    /// The scan is bounded by the store, which holds at most [`MAX_DATA_GRANTS`]
+    /// grants.
+    pub fn data_set_is_granted(&self, data_set_id: &str) -> bool {
+        self.data_grants.values().any(|data_grant| {
+            data_grant.data_set_id == data_set_id || data_grant.source_data_set_id == data_set_id
         })
     }
 
@@ -618,6 +677,13 @@ impl ComAmazonawsDataexchangeDataexchangeState {
             .find(|event_action| event_action.arn == resource_arn)
         {
             return Some(&mut event_action.tags);
+        }
+        if let Some(data_grant) = self
+            .data_grants
+            .values_mut()
+            .find(|data_grant| data_grant.arn == resource_arn)
+        {
+            return Some(&mut data_grant.tags);
         }
         self.data_sets.values_mut().find_map(|data_set| {
             if data_set.arn == resource_arn {
@@ -688,6 +754,19 @@ pub const RESOURCE_TYPE_JOB: &str = "JOB";
 /// `ResourceType` for an event action, from the same `ResourceType` enum.
 pub const RESOURCE_TYPE_EVENT_ACTION: &str = "EVENT_ACTION";
 
+/// `ResourceType` for a data grant, from the same `ResourceType` enum.
+pub const RESOURCE_TYPE_DATA_GRANT: &str = "DATA_GRANT";
+
+/// The `AcceptanceState` a data grant carries until its receiver accepts it: one of
+/// the model's `DataGrantAcceptanceState` values, enumerated by
+/// `crate::ops::types::DATA_GRANT_ACCEPTANCE_STATE_VALUES`. A created grant is in it,
+/// because only the receiver's own call can move it on.
+pub const DATA_GRANT_PENDING_RECEIVER_ACCEPTANCE: &str = "PENDING_RECEIVER_ACCEPTANCE";
+
+/// The `AcceptanceState` of a data grant its receiver has accepted, from the same
+/// `DataGrantAcceptanceState` value set.
+pub const DATA_GRANT_ACCEPTED: &str = "ACCEPTED";
+
 /// The `State` a job is in before anything has started it: one of the model's
 /// `State` values, enumerated by `crate::ops::types::STATE_VALUES`. A job does no
 /// work until `StartJob` moves it on, so this is the state a created job carries.
@@ -752,6 +831,24 @@ fn import_target_not_found(resource_id: &str, resource_type: &str) -> JobError {
 pub fn revision_is_finalized_message(revision_id: &str) -> String {
     format!("The revision {revision_id} is finalized and can't be modified.")
 }
+
+/// Why nothing more can be done to a revision whose subscribers' access has been
+/// revoked.
+///
+/// A revision is revocable only while it is finalized — the state the model's
+/// `Finalized` documentation calls read-only — so a revoked revision is in that state
+/// for good, and every later call that would change it is refused with this sentence.
+/// It is entirely fixed text: the identity of the revision travels in the exception's
+/// own `ResourceId`/`ResourceType` members, as it does in every other refusal this
+/// service composes.
+pub const REVISION_ACTION_REFUSED_MESSAGE: &str = "Cannot take action on a Finalized Revision.";
+
+/// Why a revision nothing is sharing cannot be revoked: revoking withdraws
+/// subscribers' access, so there has to be access to withdraw — the revision's data
+/// has to be included in a data product or a data grant. Fixed text, for the reason
+/// [`REVISION_ACTION_REFUSED_MESSAGE`] states.
+pub const REVISION_NOT_SHARED_MESSAGE: &str =
+    "Can only revoke a Revision that is included in a data product or data grant.";
 
 /// How long a started job's execution runs before the clock owes it a terminal
 /// `State`, in seconds.
@@ -935,6 +1032,16 @@ pub fn event_action_not_found(event_action_id: &str) -> ResourceNotFoundExceptio
 /// The modelled 404 for a well-formed `JobId` that names no stored job.
 pub fn job_not_found(job_id: &str) -> ResourceNotFoundException {
     resource_not_found(job_id, Some(RESOURCE_TYPE_JOB))
+}
+
+/// The modelled 404 for a `DataGrantId`/`DataGrantArn` that addresses no data grant
+/// this caller can reach: one no create minted, and one whose receiver the caller is
+/// not where the route is the receiver's.
+///
+/// `identifier` is the value the caller wrote, which is the only identifier of the
+/// grant the request named — an id or the ARN, whichever the member carries.
+pub fn data_grant_not_found(identifier: &str) -> ResourceNotFoundException {
+    resource_not_found(identifier, Some(RESOURCE_TYPE_DATA_GRANT))
 }
 
 /// The modelled 404 for a tagging `ResourceArn` that is an ARN but addresses no
@@ -1215,6 +1322,10 @@ pub fn invalid_request(message: impl Into<String>) -> ValidationException {
 // Event actions too: at most MAX_EVENT_ACTIONS of them, each holding one action
 // whose caller-sized text is bounded by MAX_BUCKET_CHARS, MAX_KEY_PATTERN_CHARS and
 // MAX_KMS_KEY_ARN_CHARS, plus the same bounded tag map.
+//
+// Data grants too: at most MAX_DATA_GRANTS of them, each holding a Name the model
+// already bounds at 256 characters, a Description bounded by MAX_DESCRIPTION_CHARS
+// and the same bounded tag map.
 // ---------------------------------------------------------------------------
 
 /// Emulator resource guard, NOT an AWS-published value: how many data sets this
@@ -1252,6 +1363,15 @@ pub const MAX_EVENT_ACTIONS: usize = 250;
 /// The model's `LimitName` value for the event-action count limit, reported on the
 /// modelled `ServiceLimitExceededException`.
 pub const LIMIT_EVENT_ACTIONS_PER_ACCOUNT: &str = "Event actions per account";
+
+/// Emulator resource guard, NOT an AWS-published value: how many data grants this
+/// emulator stores. The limit is the one the model's `LimitName` enum calls
+/// [`LIMIT_ACTIVE_AND_PENDING_DATA_GRANTS`]; the model carries no number for it.
+pub const MAX_DATA_GRANTS: usize = 250;
+
+/// The model's `LimitName` value for the data-grant count limit, reported on the
+/// modelled `ServiceLimitExceededException`.
+pub const LIMIT_ACTIVE_AND_PENDING_DATA_GRANTS: &str = "Active and pending data grants";
 
 /// Amazon S3's own bucket-naming rule: a bucket name is 3-63 characters long. The
 /// destination bucket of an auto-export action is stored, so it is bounded by the
@@ -1352,6 +1472,17 @@ pub fn event_action_limit_exceeded() -> ServiceLimitExceededException {
         limit_value: MAX_EVENT_ACTIONS as f64,
         message: format!(
             "The {LIMIT_EVENT_ACTIONS_PER_ACCOUNT} limit of {MAX_EVENT_ACTIONS} has been reached."
+        ),
+    }
+}
+
+/// The modelled 402 for a create that would take the store past [`MAX_DATA_GRANTS`].
+pub fn data_grant_limit_exceeded() -> ServiceLimitExceededException {
+    ServiceLimitExceededException {
+        limit_name: Some(LIMIT_ACTIVE_AND_PENDING_DATA_GRANTS.to_string()),
+        limit_value: MAX_DATA_GRANTS as f64,
+        message: format!(
+            "The {LIMIT_ACTIVE_AND_PENDING_DATA_GRANTS} limit of {MAX_DATA_GRANTS} has been reached."
         ),
     }
 }
@@ -1469,6 +1600,33 @@ pub fn revision_arn(region: &str, data_set_id: &str, revision_id: &str) -> Strin
 /// `arn:aws:dataexchange:<region>:<account>:event-actions/<event_action_id>`.
 pub fn event_action_arn(region: &str, event_action_id: &str) -> String {
     ::engine::emulator_arn(SERVICE, region, &format!("event-actions/{event_action_id}"))
+}
+
+/// The resource segment every data grant ARN carries, which is also what tells an
+/// ARN apart from a bare id in the model's `DataGrantId`
+/// (`^[a-zA-Z0-9]{30,40}$|^arn:aws:dataexchange:[\-a-z0-9]*:(\d{12}):data-grants\/[a-zA-Z0-9]{30,40}$`).
+const DATA_GRANT_RESOURCE_PREFIX: &str = "data-grants/";
+
+/// `arn:aws:dataexchange:<region>:<account>:data-grants/<data_grant_id>`.
+pub fn data_grant_arn(region: &str, data_grant_id: &str) -> String {
+    ::engine::emulator_arn(
+        SERVICE,
+        region,
+        &format!("{DATA_GRANT_RESOURCE_PREFIX}{data_grant_id}"),
+    )
+}
+
+/// The data grant a `DataGrantId` or a `DataGrantArn` member addresses, as the store
+/// keys it.
+///
+/// The model lets `DataGrantId` carry either the bare id or the grant's ARN, and
+/// `DataGrantArn` carries the ARN, so both forms are read here: the id is the segment
+/// after the ARN's own resource prefix, and a value carrying no ARN IS the id. The
+/// boundary walk has already refused anything outside those two patterns.
+pub fn data_grant_key(identifier: &str) -> &str {
+    identifier
+        .rsplit_once(DATA_GRANT_RESOURCE_PREFIX)
+        .map_or(identifier, |(_, id)| id)
 }
 
 /// `arn:aws:dataexchange:<region>:<account>:data-sets/<data_set_id>/revisions/<revision_id>/assets/<asset_id>`.
