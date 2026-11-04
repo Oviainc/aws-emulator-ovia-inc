@@ -21,6 +21,8 @@ mod instance_properties;
 mod managed_node_filter_validation;
 #[path = "all/managed_node_information.rs"]
 mod managed_node_information;
+#[path = "all/ops_items.rs"]
+mod ops_items;
 #[path = "all/parameter_deletion.rs"]
 mod parameter_deletion;
 #[path = "all/parameter_deletion_visibility.rs"]

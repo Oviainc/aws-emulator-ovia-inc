@@ -60,6 +60,11 @@
 //! the filter keys [`is_activation_filter_key`] accepts, and `DeleteActivation` drops it
 //! again. The code a create mints is the activation's password and is handed to its
 //! creator once; no read reports it.
+//!
+//! Last are **OpsCenter's OpsItems**, which live in [`ops_items`]: `CreateOpsItem`
+//! mints one and `GetOpsItem` reports it, keyed by `(region, ops item id)` the same way,
+//! and everything a read reports — the status, the version, who created it and when —
+//! comes from what the create persisted.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -72,6 +77,10 @@ pub mod secure_string;
 /// A command a caller sent to the managed nodes of one Region, and the invocation each of
 /// those nodes holds of it.
 pub mod commands;
+
+/// The OpsItems OpsCenter holds: the record a create persists, the rules it is held to
+/// and the store the reads project.
+pub mod ops_items;
 
 use crate::ops::types::{
     Activation, AttachmentInformation, DocumentDescription, DocumentParameter, DocumentRequires,
@@ -2493,6 +2502,17 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// rather than from an offset.
     pub activations: BTreeMap<(String, String), ActivationRecord>,
 
+    /// Every OpsItem, keyed by `(region, ops item id)`: an OpsItem is created through one
+    /// Region's endpoint and is reached through that endpoint by the id the create minted
+    /// ([`ops_items::mint_ops_item_id`]). A `BTreeMap` so a listing walks a stable, total
+    /// order.
+    pub ops_items: BTreeMap<(String, String), ops_items::OpsItemRecord>,
+
+    /// How many OpsItem ids this store has minted, which is what the next mint is drawn
+    /// from ([`ComAmazonawsSsmAmazonssmState::next_ops_item_id`]) — so two OpsItems of one
+    /// store never carry one id.
+    pub ops_item_sequence: u64,
+
     /// When this store came into being, and so how old the documents Systems Manager
     /// publishes ([`PUBLISHED_DOCUMENTS`]) are here: they exist for as long as the
     /// account does, so there is no create to date them from. Captured ONCE, so two
@@ -2509,6 +2529,8 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             minted_command_ids: 0,
             managed_nodes: BTreeMap::new(),
             activations: BTreeMap::new(),
+            ops_items: BTreeMap::new(),
+            ops_item_sequence: 0,
             created_at: SystemTime::now(),
         }
     }
