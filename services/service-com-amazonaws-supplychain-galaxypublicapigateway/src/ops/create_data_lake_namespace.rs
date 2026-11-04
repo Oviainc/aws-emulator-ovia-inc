@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataLakeNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataLakeNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataLakeNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation mints a data lake namespace in the shared store
+//! ([`crate::state`]) and answers from the persisted record, so `GetDataLakeNamespace`
+//! reports exactly what this one persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +151,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataLakeNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataLakeNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataLakeNamespace"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDataLakeNamespaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the supplychain data lake store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        // ONE lock for the whole check-then-insert, so concurrent creates of the same
+        // instance and name serialize: exactly one of them inserts, and every other one
+        // finds that record and is refused as a conflict.
+        let mut store = state.lock();
+        store.materialize_due_transitions(now);
+
+        // The gateway authorizes an instance-scoped call against the instance BEFORE it
+        // looks the addressed resource up, so an `instanceId` naming no instance of this
+        // account is an authorization failure rather than a not-found - which is why
+        // this operation models `AccessDeniedException` and no `ResourceNotFoundException`.
+        if !store.instances.contains_key(&input.instance_id) {
+            return Err(CreateDataLakeNamespaceErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::instance_authorization_failure_message(
+                        input.instance_id.as_str(),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The reserved-prefix rule the `name` member documents. The model's `@pattern`
+        // cannot express it, so it is refused here with the modelled 400.
+        if crate::state::namespace_name_is_reserved(input.name.as_str()) {
+            return Err(CreateDataLakeNamespaceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::reserved_namespace_name_message()),
+                },
+            )
+            .into());
+        }
+
+        // Despite the `@idempotent` PUT shape, a name this instance's data lake already
+        // holds is a conflict, not an overwrite: the first create owns the name.
+        if store.namespace(&input.instance_id, &input.name).is_some() {
+            return Err(CreateDataLakeNamespaceErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::namespace_conflict_message(&input.name)),
+                },
+            )
+            .into());
+        }
+
+        // The store holds its namespaces for the life of the process and this is the
+        // only operation that adds one, so the per-instance count is capped here and a
+        // create past the cap is refused with the modelled quota error.
+        if store.namespaces_at_capacity(&input.instance_id) {
+            return Err(
+                CreateDataLakeNamespaceErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "the number of namespaces of instance {} has reached the quota of {}",
+                            input.instance_id,
+                            crate::state::MAX_NAMESPACES_PER_INSTANCE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut record = crate::state::DataLakeNamespaceRecord::new(
+            input.instance_id.clone(),
+            input.name.clone(),
+            &region,
+            now,
+        );
+        record.description = input.description;
+        if let Some(tags) = input.tags {
+            record.tags = tags.into_iter().collect();
+        }
+
+        // The response is projected from the record that is about to be persisted, so
+        // nothing in it can differ from what a later GetDataLakeNamespace reports.
+        let namespace = record.to_wire();
+        store.namespaces.insert(
+            crate::state::namespace_key(&input.instance_id, &input.name),
+            record,
+        );
+
+        Ok(CreateDataLakeNamespaceOutput { namespace })
     }
 }

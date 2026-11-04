@@ -15,6 +15,8 @@
 mod bill_of_materials_import_jobs;
 #[path = "all/data_lake_datasets.rs"]
 mod data_lake_datasets;
+#[path = "all/data_lake_namespaces.rs"]
+mod data_lake_namespaces;
 #[path = "all/instance_lifecycle.rs"]
 mod instance_lifecycle;
 #[path = "all/state_roundtrip.rs"]

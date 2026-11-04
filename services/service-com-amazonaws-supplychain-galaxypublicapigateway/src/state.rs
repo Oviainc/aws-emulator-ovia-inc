@@ -11,7 +11,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    DataLakeDataset, DataLakeDatasetPartitionSpec, DataLakeDatasetSchema, Instance,
+    DataLakeDataset, DataLakeDatasetPartitionSpec, DataLakeDatasetSchema, DataLakeNamespace,
+    Instance,
 };
 
 /// The sentence AWS Supply Chain refuses the Product Bill Of Materials (BOM) import API
@@ -185,6 +186,149 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
         .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
 }
 
+/// The ARN of one data lake namespace.
+///
+/// The modelled `AscResourceArn` pattern
+/// (`^arn:aws:scn(?::([a-z0-9-]+):([0-9]+):instance)?/(<uuid>)[-_./A-Za-z0-9]*$`) is what
+/// fixes the shape: the instance segment carries the `instanceId`, and everything after
+/// it names the resource within that instance.
+pub fn namespace_arn(region: &str, instance_id: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("instance/{instance_id}/namespaces/{name}"),
+    )
+}
+
+/// How this service's gateway refuses an instance-scoped call whose `instanceId` names
+/// no instance of this account.
+///
+/// Its SOURCE is the recorded wire response of such a call: the gateway authorizes
+/// against the instance resource BEFORE looking the addressed resource up, so a request
+/// naming an unknown instance is answered as an authorization failure (HTTP 403
+/// `AccessDeniedException`) rather than as a not-found. The whole sentence is fixed
+/// except the `instanceId`, which comes from the request, and the account id, which is
+/// the identity the request was served for. Stated once, here, so the instance-scoped
+/// operations cannot drift into several sentences for one refusal.
+pub fn instance_authorization_failure_message(instance_id: &str) -> String {
+    format!(
+        "Authorization Failed (Public). The instanceId {instance_id} does not exist, or does not \
+         belong to the account {}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// How a namespace read refuses a name this instance's data lake does not hold.
+///
+/// Its SOURCE is the recorded wire response of this service's not-found refusals, which
+/// carry a FIXED sentence and echo nothing from the request (the instance reads answer
+/// "Instance not found." the same way). Stated once, here, so the namespace operations
+/// cannot drift into several sentences for one refusal.
+pub const NAMESPACE_NOT_FOUND_MESSAGE: &str = "Namespace not found.";
+
+/// The namespace-name prefixes AWS Supply Chain keeps for itself.
+///
+/// SOURCE: the `name` member of `CreateDataLakeNamespaceRequest`, which documents
+/// "Noted you cannot create namespace with name starting with asc, default, scn, aws,
+/// amazon, amzn". `asc` and `default` are the data lake's own pre-defined namespaces
+/// (the `name` member of `GetDataLakeNamespaceRequest` describes both), and the rest are
+/// the vendor prefixes the service reserves.
+pub const RESERVED_NAMESPACE_PREFIXES: [&str; 6] =
+    ["asc", "default", "scn", "aws", "amazon", "amzn"];
+
+/// Whether `name` starts with one of the prefixes the service reserves. The rule is on the
+/// PREFIX, not on the whole name, so `aws_orders` is refused just as `aws` is.
+///
+/// The comparison is byte-exact because `DataLakeNamespaceName`'s own `@pattern`
+/// (`^[a-z0-9_]+$`) admits no uppercase: a name carrying any is refused by the modelled
+/// constraint before a handler runs, so there is no mixed-case form left for this rule to
+/// miss.
+pub fn namespace_name_is_reserved(name: &str) -> bool {
+    RESERVED_NAMESPACE_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// The sentence a namespace create carrying a reserved name is refused with, built from
+/// [`RESERVED_NAMESPACE_PREFIXES`] so the refusal and the rule cannot drift apart.
+pub fn reserved_namespace_name_message() -> String {
+    format!(
+        "Cannot create namespace with name starting with {}",
+        RESERVED_NAMESPACE_PREFIXES.join(", ")
+    )
+}
+
+/// How a namespace create refuses a name this instance's data lake already holds.
+///
+/// The recorded behaviour pins the CLASS of this refusal — a duplicate instance and name is
+/// answered `ConflictException` (HTTP 409) rather than overwritten. No recording pins this
+/// sentence, so its FORM is taken from the one this service IS recorded wording for a
+/// duplicate data-lake resource, the sibling dataset conflict ("Dataset <name> already exist
+/// in namespace <namespace>"): the capitalised resource noun, the resource's own name from
+/// the request, and the service's "already exist". Stated once, beside the service's other
+/// refusal sentences, rather than inlined in the handler.
+pub fn namespace_conflict_message(name: &str) -> String {
+    format!("Namespace {name} already exist")
+}
+
+/// How many namespaces one instance's data lake holds in this store.
+///
+/// The same reasoning as [`MAX_INSTANCES`]: the store keeps every namespace for the life
+/// of the process and the create is the only thing that adds one, so the entry COUNT is
+/// the growth term a caller controls (each record's size is already bounded by the
+/// modelled `@length` constraints on its members). A create past it is refused with the
+/// modelled `ServiceQuotaExceededException` (HTTP 402) the create declares. The number is
+/// the emulator's own bound, not a published AWS value.
+pub const MAX_NAMESPACES_PER_INSTANCE: usize = 100;
+
+/// One persisted data lake namespace — the whole record, not the wire shape.
+/// [`DataLakeNamespaceRecord::to_wire`] projects it onto the modelled `DataLakeNamespace`
+/// structure, so every handler answers from exactly these stored values.
+#[derive(Debug, Clone)]
+pub struct DataLakeNamespaceRecord {
+    pub instance_id: String,
+    pub name: String,
+    pub arn: String,
+    pub description: Option<String>,
+    pub created_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    /// The namespace's tags, as the create's `tags` member supplied them. Kept on the
+    /// record so the tagging operations report what the create persisted.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl DataLakeNamespaceRecord {
+    /// A brand-new namespace of `instance_id`, created at `now` in `region`.
+    ///
+    /// `description` and `tags` are left absent/empty for the caller to fill from the
+    /// request, so a member the request omitted stays absent rather than being invented.
+    pub fn new(instance_id: String, name: String, region: &str, now: SystemTime) -> Self {
+        let arn = namespace_arn(region, &instance_id, &name);
+        Self {
+            instance_id,
+            name,
+            arn,
+            description: None,
+            created_time: now,
+            last_modified_time: now,
+            tags: BTreeMap::new(),
+        }
+    }
+
+    /// This record as the modelled `DataLakeNamespace` shape every namespace operation
+    /// returns.
+    pub fn to_wire(&self) -> DataLakeNamespace {
+        DataLakeNamespace {
+            instance_id: self.instance_id.clone(),
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            description: self.description.clone(),
+            created_time: as_date_time(self.created_time),
+            last_modified_time: as_date_time(self.last_modified_time),
+        }
+    }
+}
+
 /// The ARN of one data-lake dataset.
 ///
 /// `AscResourceArn` (the shape `DataLakeDataset::arn` targets) fixes the form: the
@@ -280,6 +424,15 @@ impl DataLakeDatasetRecord {
     }
 }
 
+/// The key one namespace is stored under: its instance, then its name.
+///
+/// A `BTreeMap` over this pair orders every namespace of one instance together and in
+/// name order, so a listing pages in one stable order and a page token can name the key
+/// to resume at.
+pub fn namespace_key(instance_id: &str, name: &str) -> (String, String) {
+    (instance_id.to_string(), name.to_string())
+}
+
 /// Per-service state for com-amazonaws-supplychain-galaxypublicapigateway. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSupplychainGalaxypublicapigatewayState {
@@ -290,6 +443,10 @@ pub struct ComAmazonawsSupplychainGalaxypublicapigatewayState {
     /// `@idempotent` and its `clientToken` is an `@idempotencyToken`) returns the
     /// instance the first call created instead of creating a second one.
     pub idempotency: HashMap<String, String>,
+    /// Every data lake namespace a caller created, keyed by [`namespace_key`]
+    /// (`instanceId` then `name`) — the pair that identifies one namespace, as the
+    /// create's two `@httpLabel` members do.
+    pub namespaces: BTreeMap<(String, String), DataLakeNamespaceRecord>,
     /// Every live data-lake dataset, keyed by [`DatasetKey`]. A `BTreeMap` so an
     /// instance's datasets are contiguous and in namespace-then-name order.
     pub datasets: BTreeMap<DatasetKey, DataLakeDatasetRecord>,
@@ -337,6 +494,29 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
             .find(|candidate| !self.instances.contains_key(candidate))
     }
 
+    /// The stored namespace `name` of instance `instance_id`, or `None` when this
+    /// instance's data lake holds no namespace under that name.
+    pub fn namespace(&self, instance_id: &str, name: &str) -> Option<&DataLakeNamespaceRecord> {
+        self.namespaces.get(&namespace_key(instance_id, name))
+    }
+
+    /// How many namespaces `instance_id`'s data lake holds — one range scan over the keys
+    /// that instance's namespaces occupy, which is what
+    /// [`MAX_NAMESPACES_PER_INSTANCE`] caps.
+    pub fn namespace_count(&self, instance_id: &str) -> usize {
+        self.namespaces
+            .range(namespace_key(instance_id, "")..)
+            .take_while(|((stored, _), _)| stored == instance_id)
+            .count()
+    }
+
+    /// Whether a further namespace create for `instance_id` would push its data lake
+    /// past [`MAX_NAMESPACES_PER_INSTANCE`]. Checked at that one growth site, before
+    /// anything is inserted.
+    pub fn namespaces_at_capacity(&self, instance_id: &str) -> bool {
+        self.namespace_count(instance_id) >= MAX_NAMESPACES_PER_INSTANCE
+    }
+
     /// How many datasets `instance_id` holds, across all of its namespaces — what
     /// [`MAX_DATASETS_PER_INSTANCE`] caps.
     pub fn dataset_count(&self, instance_id: &str) -> usize {
@@ -351,6 +531,16 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
     pub fn drop_instance_datasets(&mut self, instance_id: &str) {
         self.datasets
             .retain(|(instance, _, _), _| instance != instance_id);
+    }
+
+    /// Drop every namespace of `instance_id`, for the same reason as
+    /// [`Self::drop_instance_datasets`]: a namespace is addressed by its instance, so it
+    /// does not outlive the instance whose deletion removed it — which is also what keeps
+    /// [`MAX_NAMESPACES_PER_INSTANCE`], a bound counted per live instance, dominating the
+    /// store's growth across instances coming and going.
+    pub fn drop_instance_namespaces(&mut self, instance_id: &str) {
+        self.namespaces
+            .retain(|(instance, _), _| instance != instance_id);
     }
 }
 

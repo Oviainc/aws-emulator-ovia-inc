@@ -221,7 +221,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if !crate::state::is_predefined_namespace(&input.namespace) {
+        // A namespace exists either because the instance comes with it
+        // ([`crate::state::PREDEFINED_NAMESPACES`]) or because a caller created it, which
+        // `CreateDataLakeNamespace` persists in the same store: both are namespaces of this
+        // instance, and anything else names none.
+        if !crate::state::is_predefined_namespace(&input.namespace)
+            && store
+                .namespace(&input.instance_id, &input.namespace)
+                .is_none()
+        {
             return Err(CreateDataLakeDatasetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(
