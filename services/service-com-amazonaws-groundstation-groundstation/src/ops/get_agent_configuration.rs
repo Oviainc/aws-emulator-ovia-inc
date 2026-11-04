@@ -98,6 +98,20 @@ impl From<GetAgentConfigurationErrorModeled> for GetAgentConfigurationError {
     }
 }
 
+/// What this service answers when an `{agentId}` label names no registered agent.
+///
+/// Ground Station resolves an agent id as a PARAMETER of the request rather than as a
+/// resource the request addresses: an id no registration minted is not a missing agent, it
+/// is a value that names none, so it is refused `InvalidParameterException` (HTTP 431) with
+/// this sentence — FIXED text in full, disclosing neither the id that was asked for nor any
+/// agent this account holds.
+///
+/// Shared by the three operations the model addresses at an `Agent` by that label — this
+/// read, `GetAgentTaskResponseUrl` and `UpdateAgentStatus` (`smithy_query(query="shape",
+/// shape="Agent")`) — so a read, an upload-URL request and a status report for an agent
+/// that is not there answer one text.
+pub const INVALID_AGENT_ID: &str = "Invalid AgentID.";
+
 /// The `GetAgentConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -146,13 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // makes it the `Agent` resource's read — `smithy_query(query="shape",
         // shape="Agent")`).
         let guard = state.lock();
-        let agent = guard.agents.get(&input.agent_id).ok_or_else(|| {
-            GetAgentConfigurationErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::agent_not_found_message(&input.agent_id)),
-                },
-            )
-        })?;
+        let agent = guard
+            .agents
+            .get(&input.agent_id)
+            .ok_or_else(invalid_agent_id)?;
 
         Ok(GetAgentConfigurationOutput {
             agent_id: Some(agent.agent_id.clone()),
@@ -164,4 +175,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tasking_document: agent.tasking_document.clone(),
         })
     }
+}
+
+/// The modelled answer to an `{agentId}` no agent was registered under: HTTP 431
+/// `InvalidParameterException` carrying [`INVALID_AGENT_ID`]. No `parameterName`: the
+/// sentence is the whole of what the service says about it.
+fn invalid_agent_id() -> GetAgentConfigurationError {
+    GetAgentConfigurationErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(INVALID_AGENT_ID.to_string()),
+        parameter_name: None,
+    })
+    .into()
 }

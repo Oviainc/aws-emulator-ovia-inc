@@ -11,7 +11,7 @@
 //! whatever form it registered in; being the resource's read (`readonly` —
 //! `smithy_query(query="operation", operation="GetAgentConfiguration")`) it leaves the
 //! store exactly as it found it, so repeated reads answer identically; and an `{agentId}`
-//! no agent was registered under is refused `ResourceNotFoundException` (HTTP 434).
+//! no agent was registered under is refused `InvalidParameterException` (HTTP 431).
 //!
 //! `tests/all/agent_lifecycle.rs` asserts the lifecycle as a whole (register, report,
 //! read); what is asserted HERE is the read's own rule, over a table of registration
@@ -20,9 +20,7 @@
 //! registered one.
 
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_groundstation_groundstation::state::{
-    agent_not_found_message, service_state,
-};
+use service_com_amazonaws_groundstation_groundstation::state::service_state;
 use smithy_server_runtime::MultiServiceRouter;
 
 // The front door of the `Agent` resource is written once, in `agent_lifecycle`: this
@@ -110,13 +108,14 @@ fn registration_forms() -> Vec<(&'static str, Value)> {
     vec![
         (
             "the smallest agent the model admits: every list at its published minimum, \
-             the instance id at its minimum length, no optional member",
+             the instance id at its minimum length, the agent cpu cores empty",
             json!({
                 "agentDetails": {
                     "agentVersion": "1.0.0",
                     "instanceId": instance_id(INSTANCE_ID_MIN_LEN),
                     "instanceType": "m5.large",
                     "componentVersions": component_versions(LIST_MIN),
+                    "agentCpuCores": Vec::<i64>::new(),
                 },
                 "discoveryData": {
                     "publicIpAddresses": ip_addresses(0, LIST_MIN),
@@ -345,20 +344,20 @@ async fn an_agent_id_no_agent_was_registered_under_is_refused() {
         );
         let refused = get_configuration(&router, agent_id).await;
         assert_eq!(
-            refused.status, 434,
-            "case {label}: expected HTTP 434, got {} {}",
+            refused.status, 431,
+            "case {label}: expected HTTP 431, got {} {}",
             refused.status, refused.body
         );
         assert_eq!(
             refused.error_code(),
-            "ResourceNotFoundException",
-            "case {label}: expected ResourceNotFoundException, got {}",
+            "InvalidParameterException",
+            "case {label}: expected InvalidParameterException, got {}",
             refused.body
         );
         assert_eq!(
             refused.field("message").as_str(),
-            Some(agent_not_found_message(agent_id).as_str()),
-            "case {label}: the refusal names the agent that is not there, got {}",
+            Some("Invalid AgentID."),
+            "case {label}: the refusal is about the id as a parameter and names none, got {}",
             refused.body
         );
     }

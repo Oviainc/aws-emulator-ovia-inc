@@ -111,14 +111,18 @@ impl From<GetSatelliteErrorModeled> for GetSatelliteError {
 }
 
 /// What this operation answers when the `{satelliteId}` a request carries names no
-/// onboarding of this account: a fixed literal, in the form this service's other
-/// not-found literals take (`<Resource> not found`), that discloses neither the id that
-/// was asked for nor any satellite this account does hold.
+/// onboarding of this account.
+///
+/// Ground Station resolves a satellite id as a PARAMETER of the request rather than as a
+/// resource the request addresses — nothing in this API onboards a satellite, so an id this
+/// account holds no onboarding for is a value that names none — so the refusal is
+/// `InvalidParameterException` (HTTP 431) carrying this sentence: FIXED text in full, which
+/// discloses neither the id that was asked for nor any satellite this account does hold.
 ///
 /// It lives here rather than in `crate::state` because `GetSatellite` is the only
 /// operation of this service that resolves a satellite by id — the listing beside it
 /// reports every onboarding and resolves none — so this is one operation's text.
-pub const SATELLITE_NOT_FOUND: &str = "Satellite not found";
+pub const SATELLITE_DOES_NOT_EXIST: &str = "Satellite does not exist.";
 
 /// The `GetSatellite` operation.
 ///
@@ -159,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// and from the clock, both of which stood as they are whether or not anybody called.
     /// Nothing in this API onboards a satellite — AWS does that outside it — so an id this
     /// account holds no onboarding for names no satellite and is refused with
-    /// [`SATELLITE_NOT_FOUND`].
+    /// [`SATELLITE_DOES_NOT_EXIST`].
     async fn handle(
         &self,
         input: Self::Input,
@@ -183,8 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.refresh_current_ephemerides();
 
         let stored = guard.satellites.get(&input.satellite_id).ok_or_else(|| {
-            GetSatelliteErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(SATELLITE_NOT_FOUND.to_string()),
+            GetSatelliteErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(SATELLITE_DOES_NOT_EXIST.to_string()),
+                parameter_name: None,
             })
         })?;
 

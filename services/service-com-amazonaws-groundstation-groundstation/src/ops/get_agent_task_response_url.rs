@@ -153,8 +153,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The resource this operation addresses is the AGENT: both its request and its
         // response carry a reference to the `Agent` resource and nothing else
-        // (`smithy_query(query="operation", operation="GetAgentTaskResponseUrl")`), so an
-        // `{agentId}` no agent was registered under is the missing resource, while the
+        // (`smithy_query(query="operation", operation="GetAgentTaskResponseUrl")`), and the
+        // `{agentId}` label is resolved as a PARAMETER of the request, so an id no agent
+        // was registered under is refused as the value that names none, while the
         // `{taskId}` label names the task of that agent whose response log is being
         // uploaded.
         //
@@ -168,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let agent = guard
                 .agents
                 .get_mut(&input.agent_id)
-                .ok_or_else(|| agent_not_found(&input.agent_id))?;
+                .ok_or_else(invalid_agent_id)?;
             let expired = agent.take_expired_log_uploads(now);
             let held = agent
                 .log_uploads
@@ -232,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 // Unreachable through this model, which declares no operation that
                 // removes a registered agent: an agent that is gone is answered as the
-                // missing resource it is, and the credential that would have signed its
+                // id naming none that it is, and the credential that would have signed its
                 // upload is withdrawn.
                 None => (None, Some(minted.credential_id)),
             }
@@ -240,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(credential_id) = withdrawn {
             crate::state::withdraw_credential(ctx, &credential_id);
         }
-        let presigned_log_url = presigned_log_url.ok_or_else(|| agent_not_found(&agent_id))?;
+        let presigned_log_url = presigned_log_url.ok_or_else(invalid_agent_id)?;
 
         Ok(GetAgentTaskResponseUrlOutput {
             agent_id,
@@ -250,12 +251,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled answer to an `{agentId}` no agent was registered under: HTTP 434
-/// `ResourceNotFoundException`, carrying the text every operation of this service
-/// addressed at an agent by that label answers (`crate::state::agent_not_found_message`).
-fn agent_not_found(agent_id: &str) -> GetAgentTaskResponseUrlError {
-    GetAgentTaskResponseUrlErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::agent_not_found_message(agent_id)),
+/// The modelled answer to an `{agentId}` no agent was registered under: HTTP 431
+/// `InvalidParameterException` carrying the text every operation of this service addressed
+/// at an agent by that label answers
+/// (`crate::ops::get_agent_configuration::INVALID_AGENT_ID`). The id is resolved as a
+/// PARAMETER of the request, so one that names no agent is refused as the bad value it is,
+/// and the sentence says nothing of the id itself.
+fn invalid_agent_id() -> GetAgentTaskResponseUrlError {
+    GetAgentTaskResponseUrlErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(crate::ops::get_agent_configuration::INVALID_AGENT_ID.to_string()),
+        parameter_name: None,
     })
     .into()
 }

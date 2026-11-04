@@ -199,7 +199,8 @@ pub(crate) struct Taggable {
     pub(crate) created_with: BTreeMap<String, String>,
 }
 
-/// A `RegisterAgent` request: the required members of `AgentDetails` and `DiscoveryData`
+/// A `RegisterAgent` request: the required members of `AgentDetails` and `DiscoveryData`,
+/// and the cpu-core member the service requires one of
 /// (`smithy_query(query="shape", shape="AgentDetails,DiscoveryData")`).
 fn agent_registration(tags: &BTreeMap<String, String>) -> Value {
     json!({
@@ -207,6 +208,7 @@ fn agent_registration(tags: &BTreeMap<String, String>) -> Value {
             "agentVersion": "1.4.0",
             "instanceId": "i-0123456789abcdef0",
             "instanceType": "m5.large",
+            "agentCpuCores": [0, 1],
             "componentVersions": [{"componentType": "Agent", "versions": ["1.4.0"]}],
         },
         "discoveryData": {

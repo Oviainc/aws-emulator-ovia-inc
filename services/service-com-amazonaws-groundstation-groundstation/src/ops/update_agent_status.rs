@@ -151,11 +151,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The `{agentId}` label addresses the `Agent` resource `RegisterAgent` created
         // (`smithy_query(query="shape", shape="Agent")` names this operation that
-        // resource's update), so a report for an id no agent was registered under updates
-        // nothing and is answered as the missing resource it names.
+        // resource's update), and the id is resolved as a PARAMETER of the report: an id no
+        // registration minted updates nothing and is refused as the value that names no
+        // agent, in the words every operation of this service addressed at an agent by that
+        // label answers
+        // (`crate::ops::get_agent_configuration::INVALID_AGENT_ID`).
         let agent = guard.agents.get_mut(&input.agent_id).ok_or_else(|| {
-            UpdateAgentStatusErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::agent_not_found_message(&input.agent_id)),
+            UpdateAgentStatusErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(crate::ops::get_agent_configuration::INVALID_AGENT_ID.to_string()),
+                parameter_name: None,
             })
         })?;
 

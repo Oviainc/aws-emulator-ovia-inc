@@ -10,7 +10,7 @@
 //! storage; the URL reported for a task is reported again while it is still signed for,
 //! and goes on being taken whatever else is read, because only an upload the clock has run
 //! out on is withdrawn; and an `{agentId}` no agent was registered under is refused
-//! `ResourceNotFoundException` (HTTP 434).
+//! `InvalidParameterException` (HTTP 431).
 //!
 //! So this suite mounts the S3 service beside Ground Station on ONE engine — what the
 //! assembled emulator does — and FOLLOWS each URL it is handed through S3's own front
@@ -19,7 +19,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
-    agent_not_found_message, service_state, AGENT_TASK_RESPONSE_URL_VALIDITY,
+    service_state, AGENT_TASK_RESPONSE_URL_VALIDITY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -39,15 +39,17 @@ const S3_AUTH: &str = "AWS4-HMAC-SHA256 Credential=AKIDTESTS3/20260101/us-east-1
 /// AWS's published query-string authentication parameters.
 const PRESIGN_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 
-/// A `RegisterAgent` body for the `index`th agent of a table: the required members only,
-/// with an instance, an address and a capability of its own so no two agents of a table
-/// are the same registration.
+/// A `RegisterAgent` body for the `index`th agent of a table: the required members, with
+/// the agent cpu cores the service requires one of the `AgentDetails` pair for, and an
+/// instance, an address and a capability of its own so no two agents of a table are the
+/// same registration.
 fn registration(index: usize) -> Value {
     json!({
         "agentDetails": {
             "agentVersion": "1.0.0",
             "instanceId": format!("i-{index:010x}"),
             "instanceType": "m5.large",
+            "agentCpuCores": [0, 1],
             "componentVersions": [{"componentType": "Agent", "versions": ["1.0.0"]}],
         },
         "discoveryData": {
@@ -449,19 +451,19 @@ async fn an_upload_url_is_refused_for_an_agent_that_was_never_registered() {
         for (task_case, task_id) in task_ids() {
             let refused = response_url(&router, &agent_id, &task_id).await;
             assert_eq!(
-                refused.status, 434,
-                "case {case} with {task_case}: expected 434, got {} {}",
+                refused.status, 431,
+                "case {case} with {task_case}: expected 431, got {} {}",
                 refused.status, refused.body
             );
             assert_eq!(
                 refused.error_code(),
-                "ResourceNotFoundException",
-                "case {case} with {task_case}: expected ResourceNotFoundException, got {}",
+                "InvalidParameterException",
+                "case {case} with {task_case}: expected InvalidParameterException, got {}",
                 refused.body
             );
             assert_eq!(
                 refused.string("message"),
-                agent_not_found_message(&agent_id),
+                "Invalid AgentID.",
                 "case {case} with {task_case}: wrong refusal text, got {}",
                 refused.body
             );

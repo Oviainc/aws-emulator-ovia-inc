@@ -754,7 +754,8 @@ async fn a_full_mission_profile_store_still_answers_what_is_wrong_with_the_creat
     assert_owed("at the bound", &well_formed, &reply);
 }
 
-/// A `RegisterAgent` body with the required members of `AgentDetails` and `DiscoveryData`
+/// A `RegisterAgent` body: the required members of `AgentDetails` and `DiscoveryData`
+/// plus the cpu-core member the service requires one of
 /// (`smithy_query(query="shape", shape="AgentDetails,DiscoveryData")`), where `row`
 /// distinguishes one registration's EC2 instance from the next and `public` and `private`
 /// are the address lists the discovery data carries.
@@ -764,6 +765,7 @@ fn registration(row: usize, public: &[String], private: &[String]) -> Value {
             "agentVersion": "2.0.1",
             "instanceId": format!("i-{row:016x}"),
             "instanceType": "c5.xlarge",
+            "agentCpuCores": [0, 1],
             "componentVersions": [{"componentType": "Agent", "versions": ["2.0.1"]}],
         },
         "discoveryData": {

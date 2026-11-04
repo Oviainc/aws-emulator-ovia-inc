@@ -166,6 +166,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::validate_tags(input.tags.as_ref())
             .map_err(RegisterAgentErrorModeled::InvalidParameterException)?;
 
+        // `AgentDetails` offers TWO members for the CPU cores an agent runs on, one
+        // superseding the other: `reservedCpuCores` ("This field should not be used. Use
+        // agentCpuCores instead.") and `agentCpuCores`, both optional
+        // `AgentCpuCoresList`s (`smithy_query(query="shape", shape="AgentDetails")`). The
+        // model marks neither `@required` on its own, because supplying EITHER satisfies the
+        // service, and the service requires one of the pair: an agent reports its core
+        // assignment through the superseded member or through the current one, and a
+        // registration that supplies neither reports none at all. Refused before an id and
+        // an ARN are minted, so no agent is registered on a configuration that describes no
+        // cores — and checked on `agentDetails`, the input's first member, before the
+        // `discoveryData` below it. It comes AFTER the tagging gate above for the reason
+        // that gate states: a `tags` map is judged before anything else about the request,
+        // in every operation of this service that accepts one, so a caller never holds a
+        // resource AWS would not have tagged that way.
+        if input.agent_details.reserved_cpu_cores.is_none()
+            && input.agent_details.agent_cpu_cores.is_none()
+        {
+            return Err(RegisterAgentErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(CPU_CORES_UNSPECIFIED.to_string()),
+                    parameter_name: None,
+                },
+            )
+            .into());
+        }
+
         // The discovery data's addresses are IPv4 addresses (`IpAddressList`'s member is
         // `IpV4Address` — `smithy_query(query="shape", shape="IpAddressList")`), and that
         // shape's pattern only holds them to four dot-separated runs of up to three
@@ -258,6 +284,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// What this operation answers when a registration reports its CPU-core assignment through
+/// NEITHER of the two members `AgentDetails` offers for it.
+///
+/// FIXED text, naming BOTH member paths because supplying either satisfies the
+/// requirement, and carrying no `parameterName` for the same reason: neither member on its
+/// own is the one at fault.
+pub const CPU_CORES_UNSPECIFIED: &str =
+    "agentDetails.reservedCpuCores or agentDetails.agentCpuCores must be specified";
 
 /// The modelled refusal of a request this operation cannot register an agent from: HTTP
 /// 431 `InvalidParameterException`, naming the member that is wrong and why.

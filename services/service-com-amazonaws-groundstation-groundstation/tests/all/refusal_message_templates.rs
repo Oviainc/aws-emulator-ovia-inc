@@ -52,7 +52,12 @@ const CONTACT_SECONDS: i64 = 600;
 
 /// Read `reply` as a bad-parameter refusal of this service — `InvalidParameterException`,
 /// HTTP 431 — and answer its `message`.
-fn bad_parameter_message(case: &str, reply: &Reply) -> String {
+///
+/// `pub(crate)` for the same reason `crate::not_found_messages::not_found_message` is: every
+/// suite that reads a refusal TEXT asserts the status and the error shape through this ONE
+/// helper (`crate::identifier_parameter_refusals` and `crate::satellite_reads` do), so the
+/// target cannot drift into two notions of what a bad-parameter answer is.
+pub(crate) fn bad_parameter_message(case: &str, reply: &Reply) -> String {
     assert_eq!(
         reply.status, 431,
         "case {case}: expected the modelled InvalidParameterException status 431, got {} {}",

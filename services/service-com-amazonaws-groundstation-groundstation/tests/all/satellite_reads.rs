@@ -20,7 +20,7 @@
 //! * the same reads repeated, and the listing taken after them, so a read is shown to
 //!   change nothing;
 //! * ids that name no onboarding — several well-formed `Uuid`s, on an account on-boarded to
-//!   satellites and on one on-boarded to none — refused as a missing resource;
+//!   satellites and on one on-boarded to none — refused as a bad parameter;
 //! * ids outside the modelled `Uuid`, refused as a bad request before the handler runs.
 //!
 //! Satellites are not created through this API (the model declares no operation that
@@ -28,13 +28,13 @@
 //! `state::SATELLITES_ENV` lands it — and then read back through the front door.
 
 use serde_json::Value;
-use service_com_amazonaws_groundstation_groundstation::ops::get_satellite::SATELLITE_NOT_FOUND;
 use service_com_amazonaws_groundstation_groundstation::ops::types::EphemerisMetaData;
 use service_com_amazonaws_groundstation_groundstation::state::{
     service_state, Satellite, BAD_REQUEST_ERROR_CODE, INVALID_REQUEST_BODY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::refusal_message_templates::bad_parameter_message;
 use crate::satellite_catalog::{assert_satellite_arn, in_listing_order, member, onboard};
 use crate::scheduling_loop::{harness_with_engine, is_uuid, list_pages, send, Reply, ABSENT_UUID};
 
@@ -143,24 +143,6 @@ fn assert_reports(case: &str, reported: &Value, satellite: &Satellite) {
     }
 }
 
-/// The `message` of a not-found answer, after asserting the answer really is this
-/// service's `ResourceNotFoundException`: HTTP 434 and that error shape, per
-/// `smithy_query(query="operation", operation="GetSatellite")`.
-fn not_found_message(case: &str, reply: &Reply) -> String {
-    assert_eq!(
-        reply.status, 434,
-        "case {case}: expected the modelled ResourceNotFoundException status 434, got {} {}",
-        reply.status, reply.body
-    );
-    assert_eq!(
-        reply.error_code(),
-        "ResourceNotFoundException",
-        "case {case}: wrong error shape, got {}",
-        reply.body
-    );
-    reply.string("message")
-}
-
 #[tokio::test]
 async fn get_satellite_reports_the_satellite_its_path_addresses() {
     let (router, engine) = harness_with_engine();
@@ -254,9 +236,9 @@ async fn get_satellite_refuses_an_id_that_names_no_onboarding() {
     for satellite_id in ABSENT_UUIDS {
         let case = format!("onboarded-account {satellite_id}");
         let reply = get(&router, satellite_id).await;
-        let message = not_found_message(&case, &reply);
+        let message = bad_parameter_message(&case, &reply);
         assert_eq!(
-            message, SATELLITE_NOT_FOUND,
+            message, "Satellite does not exist.",
             "case {case}: GetSatellite answers its satellite literal, got {message:?}"
         );
         assert!(
@@ -277,9 +259,9 @@ async fn get_satellite_refuses_an_id_that_names_no_onboarding() {
     for satellite_id in ABSENT_UUIDS {
         let case = format!("no-onboarding {satellite_id}");
         let reply = get(&bare_router, satellite_id).await;
-        let message = not_found_message(&case, &reply);
+        let message = bad_parameter_message(&case, &reply);
         assert_eq!(
-            message, SATELLITE_NOT_FOUND,
+            message, "Satellite does not exist.",
             "case {case}: an account on-boarded to nothing reads no satellite, got {message:?}"
         );
     }

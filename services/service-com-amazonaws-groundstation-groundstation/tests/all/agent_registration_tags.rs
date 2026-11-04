@@ -30,15 +30,17 @@ use crate::scheduling_loop::{harness_with_engine, is_uuid};
 use crate::tag_rules::{illegal_tag_maps, legal_tag_maps};
 
 /// A `RegisterAgent` request carrying `tags` when the row names a map, with the required
-/// members of `AgentDetails` and `DiscoveryData` (`smithy_query(query="shape",
-/// shape="AgentDetails,DiscoveryData")`). `row` distinguishes one registration's EC2
-/// instance from the next, so no two rows of a table register the same instance.
+/// members of `AgentDetails` and `DiscoveryData` and the cpu-core member the service
+/// requires one of (`smithy_query(query="shape", shape="AgentDetails,DiscoveryData")`).
+/// `row` distinguishes one registration's EC2 instance from the next, so no two rows of a
+/// table register the same instance.
 fn registration(row: usize, tags: Option<&Value>) -> Value {
     let mut body = json!({
         "agentDetails": {
             "agentVersion": "2.0.1",
             "instanceId": format!("i-{row:016x}"),
             "instanceType": "c5.xlarge",
+            "agentCpuCores": [0, 1],
             "componentVersions": [{"componentType": "Agent", "versions": ["2.0.1"]}],
         },
         "discoveryData": {

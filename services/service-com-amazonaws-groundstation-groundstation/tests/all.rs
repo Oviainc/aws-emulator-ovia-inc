@@ -103,6 +103,8 @@ mod ephemeris_updates;
 mod ground_station_inventory;
 #[path = "all/ground_station_reservations.rs"]
 mod ground_station_reservations;
+#[path = "all/identifier_parameter_refusals.rs"]
+mod identifier_parameter_refusals;
 #[path = "all/lifecycle_writes.rs"]
 mod lifecycle_writes;
 #[path = "all/minute_usage.rs"]

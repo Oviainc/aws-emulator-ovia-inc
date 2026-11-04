@@ -445,6 +445,7 @@ async fn the_endpoints_of_a_created_group_follow_the_agent_registered_for_its_ar
                     "agentVersion": "1.4.2",
                     "instanceId": "i-00000000000000aa",
                     "instanceType": "m5.large",
+                    "agentCpuCores": [0, 1],
                     "componentVersions": [{"componentType": "Agent", "versions": ["1.4.2"]}],
                 },
                 "discoveryData": {

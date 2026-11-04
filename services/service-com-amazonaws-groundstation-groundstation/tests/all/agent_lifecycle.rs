@@ -16,7 +16,7 @@
 //!   replaces the report before it, for every `AgentStatus` value, at each published bound
 //!   of `ComponentStatusList`, with and without the optional counters and signature map;
 //! * a report or a read for an id no agent was registered under is refused
-//!   `ResourceNotFoundException` (HTTP 434) and changes nothing;
+//!   `InvalidParameterException` (HTTP 431) and changes nothing;
 //! * a discovery address that is not an IPv4 address is refused
 //!   `InvalidParameterException` (HTTP 431) naming the member, and nothing is stored,
 //!   while each published octet bound is accepted;
@@ -25,7 +25,7 @@
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
-    agent_not_found_message, service_state, ResourceRef, AGENT_INACTIVE, BAD_REQUEST_ERROR_CODE,
+    service_state, ResourceRef, AGENT_INACTIVE, BAD_REQUEST_ERROR_CODE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -222,12 +222,14 @@ struct Registration {
 fn registrations() -> Vec<Registration> {
     vec![
         Registration {
-            label: "the required members only",
+            label: "the required members, with the agent cpu cores at the published \
+                    minimum of AgentCpuCoresList",
             body: json!({
                 "agentDetails": {
                     "agentVersion": "1.0.0",
                     "instanceId": "i-0123456789",
                     "instanceType": "m5.large",
+                    "agentCpuCores": Vec::<i64>::new(),
                     "componentVersions": [{"componentType": "Agent", "versions": ["1.0.0"]}],
                 },
                 "discoveryData": {
@@ -266,12 +268,14 @@ fn registrations() -> Vec<Registration> {
             tags: vec![("mission", "aqua"), ("stage", "registered")],
         },
         Registration {
-            label: "addresses at both published octet bounds",
+            label: "the superseded cpu-core member alone, and addresses at both published \
+                    octet bounds",
             body: json!({
                 "agentDetails": {
                     "agentVersion": "3",
                     "instanceId": "i-9876543210",
                     "instanceType": "m5.4xlarge",
+                    "reservedCpuCores": [0, 1],
                     "componentVersions": [{"componentType": "Agent", "versions": ["3"]}],
                 },
                 "discoveryData": {
@@ -608,33 +612,33 @@ async fn an_agent_that_was_never_registered_is_refused_and_nothing_changes() {
         let report = reports().remove(1);
         let refused = update_status(&router, id, report.body).await;
         assert_eq!(
-            refused.status, 434,
-            "case {id}: expected UpdateAgentStatus 434 for an unregistered agent, got {} {}",
+            refused.status, 431,
+            "case {id}: expected UpdateAgentStatus 431 for an unregistered agent, got {} {}",
             refused.status, refused.body
         );
         assert_eq!(
             refused.error_code(),
-            "ResourceNotFoundException",
-            "case {id}: expected ResourceNotFoundException, got {}",
+            "InvalidParameterException",
+            "case {id}: expected InvalidParameterException, got {}",
             refused.body
         );
         assert_eq!(
             refused.field("message").as_str(),
-            Some(agent_not_found_message(id).as_str()),
-            "case {id}: the refusal names the agent that is not there, got {}",
+            Some("Invalid AgentID."),
+            "case {id}: the refusal is about the id as a parameter and names none, got {}",
             refused.body
         );
 
         let read = get_configuration(&router, id).await;
         assert_eq!(
-            read.status, 434,
-            "case {id}: expected GetAgentConfiguration 434 for an unregistered agent, got {} {}",
+            read.status, 431,
+            "case {id}: expected GetAgentConfiguration 431 for an unregistered agent, got {} {}",
             read.status, read.body
         );
         assert_eq!(
             read.error_code(),
-            "ResourceNotFoundException",
-            "case {id}: expected ResourceNotFoundException, got {}",
+            "InvalidParameterException",
+            "case {id}: expected InvalidParameterException, got {}",
             read.body
         );
     }
@@ -695,6 +699,7 @@ async fn a_discovery_address_that_is_not_an_ipv4_address_is_refused() {
                 "agentVersion": "1.0.0",
                 "instanceId": "i-0123456789",
                 "instanceType": "m5.large",
+                "agentCpuCores": [0, 1],
                 "componentVersions": [{"componentType": "Agent", "versions": ["1.0.0"]}],
             },
             "discoveryData": discovery,

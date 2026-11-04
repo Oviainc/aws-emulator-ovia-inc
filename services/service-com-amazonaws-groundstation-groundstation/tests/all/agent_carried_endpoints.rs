@@ -109,13 +109,14 @@ fn other_capability(index: usize) -> String {
 }
 
 /// The `RegisterAgent` body of the `row`th agent of a suite, registered for
-/// `capability_arns`.
+/// `capability_arns`, with the cpu-core member the service requires one of.
 fn registration(row: usize, capability_arns: Vec<String>) -> Value {
     json!({
         "agentDetails": {
             "agentVersion": "1.4.2",
             "instanceId": format!("i-{row:010x}"),
             "instanceType": "m5.large",
+            "agentCpuCores": [0, 1],
             "componentVersions": [{"componentType": "Agent", "versions": ["1.4.2"]}],
         },
         "discoveryData": {
