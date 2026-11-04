@@ -13628,6 +13628,20 @@ impl ColumnStatisticsTaskRunEntry {
         }
     }
 
+    /// This run's place in a listing of runs, as that listing's continuation token renders
+    /// it: the shared history cursor ([`history_page_cursor`]) over the instant the run
+    /// started and its own id.
+    ///
+    /// ONE copy, so the two listings that page over these runs
+    /// (`GetColumnStatisticsTaskRuns` over one table, `ListColumnStatisticsTaskRuns` over
+    /// the account) cannot drift apart on the token format. Ordering runs by this key
+    /// DESCENDING is the newest-first order both pages are served in, and comparing a token
+    /// against it is what resumes a page — so any string a request sends names a
+    /// well-defined place in that order.
+    pub fn page_cursor(&self) -> String {
+        history_page_cursor(self.start_time, &self.id)
+    }
+
     /// Rebuild the modelled `ColumnStatisticsTaskRun` output shape from what is stored.
     pub fn to_column_statistics_task_run(&self) -> ColumnStatisticsTaskRun {
         ColumnStatisticsTaskRun {

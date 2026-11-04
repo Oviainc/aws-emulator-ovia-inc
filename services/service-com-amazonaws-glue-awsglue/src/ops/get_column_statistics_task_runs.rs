@@ -202,13 +202,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && run.database_name == database
                     && run.table_name == table
             })
-            .map(|run| (page_cursor(run), run))
+            .map(|run| (run.page_cursor(), run))
             .collect();
         // The model states no order for this listing, so the runs are reported newest
         // first — the order this service's other run history documents ("GetJobRuns
         // returns the job runs in chronological order, with the newest jobs returned
         // first") — with the run's id breaking a tie between two runs started in the same
-        // nanosecond so the order is total and the same on every call.
+        // nanosecond so the order is total and the same on every call. The key is the run's
+        // own ([`ColumnStatisticsTaskRunEntry::page_cursor`]), shared with the account-wide
+        // listing so the two cannot page by different tokens.
         ordered.sort_by(|(left, _), (right, _)| right.cmp(left));
 
         // The token is the ordering key of the last run of the previous page, so the page
@@ -245,15 +247,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
         })
     }
-}
-
-/// One run's place in this listing, as the continuation token renders it: the shared
-/// history cursor ([`crate::state::history_page_cursor`]) over the instant this run
-/// started and its own id — the same token format the sibling run history pages by.
-///
-/// Ordering runs by this key DESCENDING is the newest-first order the page is served in,
-/// and comparing a token against it is what resumes a page — so any string a request sends
-/// names a well-defined place in that order.
-fn page_cursor(run: &ColumnStatisticsTaskRunEntry) -> String {
-    crate::state::history_page_cursor(run.start_time, &run.id)
 }

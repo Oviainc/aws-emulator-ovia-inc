@@ -71,6 +71,8 @@ mod classifiers;
 mod column_statistics_task_conflicts;
 #[path = "all/column_statistics_task_run_history.rs"]
 mod column_statistics_task_run_history;
+#[path = "all/column_statistics_task_run_index.rs"]
+mod column_statistics_task_run_index;
 #[path = "all/column_statistics_task_runs.rs"]
 mod column_statistics_task_runs;
 #[path = "all/column_statistics_task_settings.rs"]
