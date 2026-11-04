@@ -6,7 +6,9 @@
 //! then reads the AppConfig control plane for the configuration version deployed into
 //! the session's (application, environment, configuration profile) triple and returns
 //! the content only when that version differs from the one the session was last
-//! served. Every answer — the content, the content type, the version label, the
+//! served. A triple the control plane can no longer resolve leaves the session served
+//! from the configuration it is bound to, because resolving the triple is what STARTING
+//! a session does. Every answer — the content, the content type, the version label, the
 //! rotated token and the poll interval — is read out of persisted state: the session
 //! out of this service's own store, the configuration out of AppConfig's.
 //!
@@ -335,10 +337,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (session, state.name_bindings())
         };
 
-        // STEP 2 — the configuration the session polls is read out of the AppConfig
-        // CONTROL PLANE: the application, environment and configuration profile the
-        // session named must exist there, and the version the environment's in-force
-        // deployment deployed is what this call serves.
+        // STEP 2 — the configuration this poll serves. The session is already BOUND to
+        // one (`crate::state::Session::bound_configuration`, recorded when the session
+        // was started and carried forward by every poll): the AppConfig CONTROL PLANE is
+        // re-read here only to pick up a configuration deployed since, so a triple that
+        // no longer resolves there leaves the session serving what it is bound to rather
+        // than refusing a token that is live.
+        //
+        // Resolving the application, environment and configuration profile is what
+        // STARTING a session does — that is where a level the control plane does not hold
+        // is `ResourceNotFoundException` — and the model bounds a token by TIME and
+        // nothing else, so a control-plane edit made after the session was bound cannot
+        // retroactively unmake it. Only a session bound to no configuration at all has
+        // nothing to serve, and that is what this operation reports as not found.
         //
         // A name is resolved through the bindings the session's own mint recorded, not
         // against whatever the control plane says carries that name now, so renaming a
@@ -354,18 +365,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(control_plane_unavailable());
         };
-        let deployed = match deployed {
-            Ok(deployed) => deployed,
-            Err(unresolved) => {
-                return Err(GetLatestConfigurationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(unresolved.message.clone()),
-                        resource_type: Some(unresolved.resource_type.to_string()),
-                        referenced_by: unresolved.referenced_by(),
-                    },
-                )
-                .into());
-            }
+        let deployed: std::sync::Arc<crate::state::ServedConfiguration> = match deployed {
+            // The control plane answered, so the session is re-bound to what it reports.
+            // A configuration VERSION is immutable once written — it is what a deployment
+            // names, and no operation rewrites its bytes, its content type or its label —
+            // so a live answer naming the version this session is already bound to IS that
+            // configuration, and the existing binding is kept rather than a second copy of
+            // the same bytes held for every token in the poll chain.
+            Ok(live) => match &session.bound_configuration {
+                Some(bound) if bound.version == live.version => std::sync::Arc::clone(bound),
+                _ => std::sync::Arc::new(live),
+            },
+            Err(unresolved) => match &session.bound_configuration {
+                Some(bound) => std::sync::Arc::clone(bound),
+                None => {
+                    return Err(GetLatestConfigurationErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(unresolved.message.clone()),
+                            resource_type: Some(unresolved.resource_type.to_string()),
+                            referenced_by: unresolved.referenced_by(),
+                        },
+                    )
+                    .into());
+                }
+            },
         };
 
         // STEP 3 — content is returned ONLY when the deployed version differs from
@@ -396,6 +419,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.record_token_use(&token, now);
             let mut next_session = session.clone();
             next_session.last_served_version = Some(deployed.version.clone());
+            // The successor is bound to what this poll served, so a poll after the
+            // control plane stops resolving the triple still has a configuration to be
+            // served from.
+            next_session.bound_configuration = Some(std::sync::Arc::clone(&deployed));
             next_session.last_polled_at = Some(now);
             state.store_session(next_session, now)
         };
@@ -431,13 +458,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             configuration: Some(if already_has_latest {
                 Vec::new()
             } else {
-                deployed.content
+                deployed.content.clone()
             }),
-            content_type: Some(deployed.content_type),
+            content_type: Some(deployed.content_type.clone()),
             version_label: if already_has_latest {
                 None
             } else {
-                deployed.version_label
+                deployed.version_label.clone()
             },
         })
     }

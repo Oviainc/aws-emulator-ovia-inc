@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/configuration_session_poll.rs"]
 mod configuration_session_poll;
+#[path = "all/deletion_does_not_break_a_bound_session.rs"]
+mod deletion_does_not_break_a_bound_session;
 #[path = "all/feature_flag_resolution.rs"]
 mod feature_flag_resolution;
 #[path = "all/name_bindings_survive_renames.rs"]

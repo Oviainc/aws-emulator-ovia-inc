@@ -1523,13 +1523,13 @@ fn the_session_store_is_bounded() {
     let now = SystemTime::now();
 
     // An entry whose lifetime has passed is reclaimed, not kept for ever.
-    let stale = state.start_session("MyApp", "Prod", "MyProfile", None, now);
+    let stale = state.start_session("MyApp", "Prod", "MyProfile", None, None, now);
     state
         .sessions
         .get_mut(&stale)
         .expect("the session was persisted under its token")
         .expires_at = now - Duration::from_secs(1);
-    let fresh = state.start_session("MyApp", "Prod", "MyProfile", None, now);
+    let fresh = state.start_session("MyApp", "Prod", "MyProfile", None, None, now);
     assert!(
         state.session(&stale).is_none(),
         "case expired entry: an entry past its expiry must be reclaimed"
@@ -1542,7 +1542,7 @@ fn the_session_store_is_bounded() {
     // And minting far past the cap holds the store at the cap.
     let mut latest = fresh;
     for round in 0..(MAX_SESSIONS + 200) {
-        latest = state.start_session("MyApp", "Prod", "MyProfile", None, now);
+        latest = state.start_session("MyApp", "Prod", "MyProfile", None, None, now);
         assert!(
             state.sessions.len() <= MAX_SESSIONS,
             "case round {round}: the store must stay within {MAX_SESSIONS} entries, holds {}",

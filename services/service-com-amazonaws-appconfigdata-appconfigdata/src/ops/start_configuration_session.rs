@@ -203,6 +203,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no configuration to poll, the missing resource is the deployment, and no token
         // is minted (a client bootstrapping against the service reads that refusal as
         // "nothing deployed yet" and keeps waiting).
+        //
+        // Resolving the triple is what STARTING a session does, so this call is also
+        // where the session is BOUND to the configuration that triple has in force: a
+        // poll is served from that binding when the control plane can no longer resolve
+        // the triple, instead of making the records' continued existence a precondition
+        // of every poll (`crate::state::Session::bound_configuration`).
+        let now = std::time::SystemTime::now();
         let bindings = state.lock().name_bindings();
         let Some(resolution) = crate::state::resolve_deployed_triple(
             &*self.engine,
@@ -210,6 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.application_identifier,
             &input.environment_identifier,
             &input.configuration_profile_identifier,
+            now,
         ) else {
             return Err(StartConfigurationSessionErrorModeled::InternalServerException(
                 InternalServerException {
@@ -221,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let learned_names = match resolution {
+        let binding = match resolution {
             Err(unresolved) => {
                 tracing::debug!(
                     operation = "StartConfigurationSession",
@@ -238,7 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            Ok(learned_names) => learned_names,
+            Ok(binding) => binding,
         };
 
         // The stored session carries its own expiry (`crate::state::TOKEN_LIFETIME`,
@@ -250,15 +258,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The names this call resolved for the first time are bound here, under the same
         // guard the session is stored under — only a call that MINTS a session records
         // anything, so a refused session still persists nothing.
-        let now = std::time::SystemTime::now();
         let token = {
             let mut store = state.lock();
-            store.bind_names(learned_names, now);
+            store.bind_names(binding.learned_names, now);
             store.start_session(
                 &input.application_identifier,
                 &input.environment_identifier,
                 &input.configuration_profile_identifier,
                 input.required_minimum_poll_interval_in_seconds,
+                binding.configuration,
                 now,
             )
         };

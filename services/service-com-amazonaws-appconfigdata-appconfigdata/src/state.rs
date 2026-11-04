@@ -18,7 +18,13 @@
 //! [`served_configuration`]). A configuration deployed through `StartDeployment` is
 //! therefore the one a poll serves.
 //!
-//! The one thing the data plane keeps of its own about that hierarchy is how a NAME
+//! What a session keeps of its own about that hierarchy is the configuration it is
+//! BOUND to ([`Session::bound_configuration`]): the one its last successful resolution
+//! produced. A poll re-reads the control plane to pick up a newer version, and falls
+//! back on that binding when the triple no longer resolves there, so a control-plane
+//! edit made after a session was bound never breaks the session's poll chain.
+//!
+//! The other thing the data plane keeps of its own about that hierarchy is how a NAME
 //! resolves. Every session identifier is "the ID or the name" of its level, and an id
 //! is immutable while a name is not: the control plane may rename a record, which frees
 //! the old name for another record to take. So the data plane binds a name the first
@@ -29,6 +35,7 @@
 //! next.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
@@ -100,6 +107,23 @@ pub struct Session {
     /// [`ServedConfiguration::version`] names it; `None` before its first poll, so the
     /// first poll always returns content.
     pub last_served_version: Option<String>,
+    /// The configuration this session is BOUND to: the one the last resolution of its
+    /// triple against the AppConfig control plane produced — recorded when the session
+    /// was started and carried forward by every poll that resolves.
+    ///
+    /// Resolving the triple is what STARTING a session does, so a poll serves this
+    /// binding whenever the control plane can no longer resolve the triple: a record
+    /// deleted or made unreachable after the session was bound does not retroactively
+    /// unmake the session. `None` only for a session that was bound to no configuration
+    /// at all — its triple had nothing in force when the session started — which is the
+    /// one case a poll has nothing to serve.
+    ///
+    /// Shared behind an `Arc` because rotating a token clones the session: every token of
+    /// one poll chain shares the one configuration it is bound to, so polling in a loop
+    /// holds no more of them than the chain's current version. What the store holds at
+    /// once is bounded by the same two limits as the sessions themselves — each entry's
+    /// expiry and [`MAX_SESSIONS`].
+    pub bound_configuration: Option<Arc<ServedConfiguration>>,
     /// When the session itself was started.
     pub created_at: SystemTime,
     /// When THIS token stops being usable ([`TOKEN_LIFETIME`] after it was minted).
@@ -268,12 +292,16 @@ impl ComAmazonawsAppconfigdataAppconfigdataState {
 
     /// Start a session over `(application, environment, profile)` and return the
     /// token that resolves to it.
+    ///
+    /// `bound_configuration` is what the triple resolved to as the session was started
+    /// ([`Session::bound_configuration`]).
     pub fn start_session(
         &mut self,
         application_identifier: &str,
         environment_identifier: &str,
         configuration_profile_identifier: &str,
         required_minimum_poll_interval_in_seconds: Option<i32>,
+        bound_configuration: Option<Arc<ServedConfiguration>>,
         now: SystemTime,
     ) -> String {
         let session = Session {
@@ -282,6 +310,7 @@ impl ComAmazonawsAppconfigdataAppconfigdataState {
             configuration_profile_identifier: configuration_profile_identifier.to_string(),
             required_minimum_poll_interval_in_seconds,
             last_served_version: None,
+            bound_configuration,
             created_at: now,
             expires_at: expiry(now),
             last_polled_at: None,
@@ -551,9 +580,24 @@ fn app_config_state<Eng: Send + Sync + 'static>(
     ::service_com_amazonaws_appconfig_amazonappconfig::state::service_state(engine)
 }
 
+/// What a session is bound to the moment it is started: the names its resolution
+/// learned, and the configuration its triple had in force.
+#[derive(Debug, Clone)]
+pub struct SessionBinding {
+    /// The names this resolution resolved against the control plane for the first time,
+    /// for the caller to record once it has decided the call succeeds
+    /// ([`ComAmazonawsAppconfigdataAppconfigdataState::bind_names`]).
+    pub learned_names: Vec<LearnedName>,
+    /// The configuration the triple serves at this instant, as
+    /// [`Session::bound_configuration`] carries it — `None` when the profile has been
+    /// deployed into the environment but has nothing in force there.
+    pub configuration: Option<Arc<ServedConfiguration>>,
+}
+
 /// Resolve what a session polls against the AppConfig control plane, as
 /// `StartConfigurationSession` must before it mints a session: the three identifiers,
-/// and the deployment that put a configuration into that environment.
+/// the deployment that put a configuration into that environment, and the configuration
+/// the session is thereby bound to.
 ///
 /// Each identifier is "the ID or the name" of its level, so each resolves either way. An
 /// id is resolved against the control plane's records, because an id names one record for
@@ -585,10 +629,11 @@ pub fn resolve_deployed_triple<Eng: Send + Sync + 'static>(
     application_identifier: &str,
     environment_identifier: &str,
     configuration_profile_identifier: &str,
-) -> Option<Result<Vec<LearnedName>, UnresolvedResource>> {
+    now: SystemTime,
+) -> Option<Result<SessionBinding, UnresolvedResource>> {
     let state = app_config_state(engine)?;
     let store = state.lock();
-    let (resolved, learned) = match resolve_in(
+    let (resolved, learned_names) = match resolve_in(
         &store,
         bindings,
         application_identifier,
@@ -614,7 +659,23 @@ pub fn resolve_deployed_triple<Eng: Send + Sync + 'static>(
             configuration_profile_identifier,
         )));
     }
-    Some(Ok(learned))
+    // What the triple has in force right now is what the session is bound to. A triple
+    // that has been deployed into but has nothing in force binds no configuration, and
+    // that is the one session a poll has nothing to serve for.
+    let configuration = served_in(
+        &store,
+        &resolved,
+        application_identifier,
+        environment_identifier,
+        configuration_profile_identifier,
+        now,
+    )
+    .and_then(Result::ok)
+    .map(Arc::new);
+    Some(Ok(SessionBinding {
+        learned_names,
+        configuration,
+    }))
 }
 
 /// The configuration a session over this triple polls, at `now`.
@@ -658,7 +719,30 @@ pub fn served_configuration<Eng: Send + Sync + 'static>(
         Err(unresolved) => return Some(Err(unresolved.unreferenced())),
         Ok(resolution) => resolution,
     };
-    // Every id came out of the resolution above, so each lookup holds.
+    served_in(
+        &store,
+        &resolved,
+        application_identifier,
+        environment_identifier,
+        configuration_profile_identifier,
+        now,
+    )
+}
+
+/// The configuration a triple whose ids are already resolved has in force at `now`,
+/// inside an already-locked AppConfig store — the one read both the session's mint and
+/// its polls answer from, so neither decides what "in force" means for itself.
+///
+/// `None` only for ids the store does not hold, which cannot happen for a resolution
+/// this store itself produced.
+fn served_in(
+    store: &AppConfigState,
+    resolved: &ResolvedTriple,
+    application_identifier: &str,
+    environment_identifier: &str,
+    configuration_profile_identifier: &str,
+    now: SystemTime,
+) -> Option<Result<ServedConfiguration, UnresolvedResource>> {
     let application = store.application(&resolved.application_id)?;
     let profile = application.profiles.get(&resolved.configuration_profile_id)?;
     let environment = application.environments.get(&resolved.environment_id)?;
