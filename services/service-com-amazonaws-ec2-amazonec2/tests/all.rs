@@ -541,6 +541,11 @@ mod delete_vpn_connection;
 // insert their two lines, and these two lost three serialized squash merges at the tail.
 #[path = "all/create_snapshots.rs"]
 mod create_snapshots;
+// What `CreateSnapshot` makes of one volume, and the refusals that store nothing. Declared
+// here for the reason the suite above gives: the head and the tail of this list are where
+// concurrent ec2 landings insert their lines.
+#[path = "all/create_snapshot.rs"]
+mod create_snapshot;
 // What `DescribeSnapshots` reports of the snapshots the account holds — the members, the
 // narrowings, the paging, the refusals and the clock-owed completion. Declared in the MIDDLE
 // of the list for the reason the suite above gives: the head and the tail are both where

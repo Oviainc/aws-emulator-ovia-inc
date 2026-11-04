@@ -523,6 +523,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(client_request_token),
                 );
             }
+            // A wait condition this deployment CREATES again — the template it carries
+            // changed its handle — waits for its own signals: the ones that satisfied the
+            // wait condition it replaces belong to the deployment that created that one
+            // ([`crate::state::StoredStack::retire_signals_of_open_waits`]).
+            stack.retire_signals_of_open_waits();
             // A template this service cannot deploy — one whose transforms it cannot
             // apply, or one its reader will not read — ends the operation in the modelled
             // failure state with the reason, rather than in a completion reporting a
@@ -688,6 +693,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                     Some((
                                         stack.current_resources(),
                                         stack.held_resource_ids(),
+                                        crate::state::provisioning::dependencies_in_flight(
+                                            stack,
+                                        ),
                                         stack.rolled_back_resource_policies(),
                                     ))
                                 }
@@ -712,10 +720,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Removing what the failed create had made, with the store unlocked: the same
         // unwind `CreateStack` performs, since the clock already owes the rolled-back
         // status.
-        if let Some((resources, held, policies)) = unwind {
+        if let Some((resources, held, needs, policies)) = unwind {
             let deleted = crate::state::service_role::acting_as(
                 ::std::sync::Arc::clone(&role),
-                crate::state::provisioning::unwind(ctx, &region, &resources, &held, policies),
+                crate::state::provisioning::unwind(
+                    ctx,
+                    &region,
+                    &resources,
+                    &crate::state::provisioning::Teardown {
+                        held: &held,
+                        needs: &needs,
+                        on_refusal: crate::state::provisioning::OnRefusal::Stop,
+                        policies,
+                    },
+                ),
             )
             .await;
             let mut store = state.lock();

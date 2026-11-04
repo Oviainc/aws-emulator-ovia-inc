@@ -373,3 +373,291 @@ impl WaitConditionBarrier {
         }
     }
 }
+
+/// The status an operation an expired wait FAILED leaves the stack in, by the
+/// `*_IN_PROGRESS` status that operation was in.
+///
+/// A rollback has a failed status of its own — `UPDATE_ROLLBACK_FAILED` is the state
+/// `ContinueUpdateRollback` resumes from — and a create's and an update's are the ones every
+/// other failure of those operations reports ([`super::failed_status_of`]).
+fn failed_status(in_progress: &str) -> &'static str {
+    match in_progress {
+        super::status::UPDATE_ROLLBACK_IN_PROGRESS => super::status::UPDATE_ROLLBACK_FAILED,
+        super::status::ROLLBACK_IN_PROGRESS => super::status::ROLLBACK_FAILED,
+        other => super::failed_status_of(other),
+    }
+}
+
+/// What the failure of an expired wait OWES the services that own the stack's resources —
+/// work no read of the store can do, since each item of it is a call to another service.
+///
+/// Answered by [`super::StoredStack::fail_expired_wait`] to the caller that is in a position
+/// to make those calls ([`super::provisioning::advance_stabilisations`]).
+#[derive(Debug, Clone)]
+pub enum ExpiredWaitOwes {
+    /// A failed CREATE: "ROLLBACK — Roll back the stack creation. This is the default", so
+    /// the resources the create had already made are REMOVED again in the services that own
+    /// them, with the records the stack holds and the policies that rollback reads
+    /// ([`super::provisioning::unwind`]).
+    Removal {
+        resources: Vec<StoredResource>,
+        held: BTreeSet<String>,
+        needs: super::provisioning::Dependencies,
+        policies: super::provisioning::Policies,
+    },
+    /// A failed UPDATE: the previous stack configuration goes back in the services that own
+    /// the resources the update changed, which is the one path every rollback this service
+    /// owes goes through ([`super::settle_due_rollbacks`]).
+    Revert,
+}
+
+impl super::StoredStack {
+    /// Materialise the failure an EXPIRED, unsatisfied wait of the operation in flight owes
+    /// at `now`, and answer the work that failure leaves for the services that own the
+    /// stack's resources.
+    ///
+    /// "If the wait condition doesn't receive the specified number of success signals before
+    /// the `Timeout` period expires, CloudFormation assumes that the wait condition has
+    /// failed": the operation takes its failed status carrying that reason — owed at that
+    /// instant even if nobody had called — and a failed operation does not stop there. Which
+    /// operation expired decides what it owes:
+    ///
+    /// * a CREATE is rolled back ("ROLLBACK … This is the default"), so the stack goes
+    ///   through `ROLLBACK_IN_PROGRESS` to `ROLLBACK_COMPLETE` and the resources it had made
+    ///   are removed again ([`ExpiredWaitOwes::Removal`]);
+    /// * an UPDATE is rolled back to the previous stack configuration, which the stack
+    ///   records as owed ([`super::StoredStack::begin_owed_update_rollback`]) and the caller
+    ///   performs ([`ExpiredWaitOwes::Revert`]) — and the rollback itself WAITS at the wait
+    ///   conditions the configuration it puts back declares and that it has to re-create,
+    ///   since such a wait condition is created again and waits for its own signals;
+    /// * a ROLLBACK that expires at one of those cannot be carried through, so the stack is
+    ///   left in the failed rollback status — `UPDATE_ROLLBACK_FAILED`, the state
+    ///   `ContinueUpdateRollback` resumes from — with what the owning services are still
+    ///   holding kept for that resumption.
+    ///
+    /// Nothing is rolled back for a caller that asked for the failed state to be kept
+    /// (`DisableRollback`, `OnFailure=DO_NOTHING`), which is the one operation that parks in
+    /// its failed status.
+    ///
+    /// Called with the store locked and the result acted on with it RELEASED. `None` is a
+    /// stack with no wait that has run out, and one whose failure owes those services
+    /// nothing.
+    pub fn fail_expired_wait(&mut self, now: SystemTime) -> Option<ExpiredWaitOwes> {
+        // A barrier left behind by an operation that has already concluded belongs to no
+        // operation: there is nothing to fail.
+        self.pending.as_ref()?;
+        let reason = self
+            .wait_conditions
+            .iter()
+            .find(|barrier| barrier.has_expired(now) && !self.barrier_satisfied(barrier))
+            .map(|barrier| {
+                barrier.timed_out_reason(self.successful_signals(barrier.logical_id()))
+            })?;
+        let creating = self.status == super::status::CREATE_IN_PROGRESS;
+        let updating = self.status == super::status::UPDATE_IN_PROGRESS;
+        // A ROLLBACK is the third operation a wait can run out in: it deploys the previous
+        // configuration, so a wait condition it puts back waits as any deployment's does.
+        let rolling_back = !creating && !updating;
+        let failed_status = failed_status(&self.status);
+        // The RESOURCE the wait was for did not come up: its own terminal event becomes that
+        // failure rather than the completion the walk had planned for it, so the event stream
+        // says which resource the operation failed at and why — the same rewrite a resource
+        // its owning service never got ready gets
+        // ([`super::StoredStack::fail_stabilisation`]).
+        let expired: Vec<String> = self
+            .wait_conditions
+            .iter()
+            .filter(|barrier| barrier.has_expired(now) && !self.barrier_satisfied(barrier))
+            .map(|barrier| barrier.logical_id().to_string())
+            .collect();
+        for logical_id in &expired {
+            let deployed_before = self
+                .resources
+                .iter()
+                .any(|deployed| &deployed.resource.logical_id == logical_id);
+            let resource_status = if rolling_back || (deployed_before && updating) {
+                super::resource_status::UPDATE_FAILED
+            } else {
+                super::resource_status::CREATE_FAILED
+            };
+            self.fail_planned_resource_event(logical_id, resource_status, &reason);
+            if rolling_back {
+                // "You can specify only resources that are in the UPDATE_FAILED state
+                // because a rollback failed" (`ContinueUpdateRollback$ResourcesToSkip`): the
+                // resource the rollback could not get through is the one in that state, so
+                // that is what it reports — with the event that says so.
+                self.fail_deployed_resource(logical_id, resource_status, &reason, now);
+            }
+        }
+        // What a rollback of this update would have to put back, and so which of the
+        // previous configuration's wait conditions it re-creates — read BEFORE the failure
+        // below retires the plan that says so.
+        let rollback_waits = if updating {
+            self.waits_the_rollback_deploys()
+        } else {
+            Vec::new()
+        };
+        self.fail_transition(now, failed_status, reason.clone());
+        if self.disable_rollback {
+            return None;
+        }
+        if updating {
+            self.begin_owed_update_rollback(now, reason);
+            // The rollback deploys the previous configuration, so a wait condition it
+            // re-creates waits for signals exactly as the deployment that first created it
+            // did: the rollback is not complete while one of them is unsatisfied, and a wait
+            // that runs out leaves it UPDATE_ROLLBACK_FAILED.
+            self.wait_conditions = rollback_waits
+                .into_iter()
+                .map(|declared| WaitConditionBarrier::open(declared, now))
+                .collect();
+            self.retire_signals_of_open_waits();
+            return Some(ExpiredWaitOwes::Revert);
+        }
+        if !creating {
+            // A ROLLBACK that could not be carried through: the stack keeps what the owning
+            // services are still holding, because that is what a resumed rollback has to put
+            // back ([`crate::ops::continue_update_rollback`]).
+            return None;
+        }
+        self.begin_rollback(now, reason);
+        Some(ExpiredWaitOwes::Removal {
+            resources: self.current_resources(),
+            held: self.held_resource_ids(),
+            needs: super::provisioning::dependencies_in_flight(self),
+            policies: self.rolled_back_resource_policies(),
+        })
+    }
+
+    /// Record that the resource `logical_id` names is the one the operation in flight could
+    /// not get through, with the event that says so.
+    ///
+    /// The record a client reads back for the resource takes the failed status and the
+    /// reason, and the stack's event log carries that transition: a rollback that could not
+    /// be carried through has to say WHICH resource it stopped at, because that is the
+    /// resource a resumed rollback may be told to skip.
+    fn fail_deployed_resource(
+        &mut self,
+        logical_id: &str,
+        resource_status: &str,
+        reason: &str,
+        now: SystemTime,
+    ) {
+        let Some(deployed) = self
+            .resources
+            .iter_mut()
+            .find(|deployed| deployed.resource.logical_id == logical_id)
+        else {
+            return;
+        };
+        deployed.status = resource_status.to_string();
+        deployed.status_timestamp = now;
+        deployed.status_reason = Some(reason.to_string());
+        let physical_resource_id = deployed.resource.physical_resource_id.clone();
+        let resource_type = deployed.resource.resource_type.clone();
+        let operation_id = self
+            .last_operation()
+            .map(|operation| operation.operation_id.clone());
+        let client_request_token = self.client_request_token.clone();
+        self.record_resource_event(
+            now,
+            logical_id,
+            Some(physical_resource_id),
+            &resource_type,
+            resource_status,
+            Some(reason.to_string()),
+            None,
+            operation_id,
+            client_request_token,
+        );
+    }
+
+    /// The wait conditions of the configuration a rollback of the update in flight puts back
+    /// that the rollback DEPLOYS again.
+    /// A rollback deploys the previous configuration of the resources the failed update
+    /// changed — the ones the plan it holds has under `previous` differently from what that
+    /// update `applied` ([`super::OwedRollback`]) — and a wait condition it deploys again is
+    /// not the satisfied one the stack had: "you can't update a wait condition that has
+    /// already been satisfied unless you also change the handle", which is the same reading
+    /// of a declaration that decides whether the UPDATE waits at one
+    /// ([`super::StoredStack::opening_barriers`]). A wait condition the update left exactly
+    /// as it was is not one the rollback deploys, and a `CreationPolicy`'s wait governs a
+    /// create alone.
+    fn waits_the_rollback_deploys(&self) -> Vec<DeclaredWaitCondition> {
+        let Some(plan) = self.rollback_plan.as_ref() else {
+            return Vec::new();
+        };
+        let deployed_again: BTreeSet<&str> = plan
+            .previous
+            .iter()
+            .filter(|previous| {
+                plan.applied
+                    .iter()
+                    .find(|applied| applied.logical_id == previous.logical_id)
+                    .is_none_or(|applied| {
+                        applied.physical_resource_id != previous.physical_resource_id
+                            || applied.properties != previous.properties
+                    })
+            })
+            .map(|previous| previous.logical_id.as_str())
+            .collect();
+        if deployed_again.is_empty() {
+            return Vec::new();
+        }
+        // The template that is going back in force is the one the previous configuration
+        // carries, which is also where those resources were declared.
+        let Some(body) = self
+            .previous_configuration
+            .as_ref()
+            .and_then(|configuration| {
+                configuration
+                    .processed_template_body
+                    .as_deref()
+                    .or(configuration.template_body.as_deref())
+            })
+        else {
+            return Vec::new();
+        };
+        let Some(declared_template) = template::parse(body) else {
+            return Vec::new();
+        };
+        let mut budget = template::Budget::new();
+        declared(&declared_template, &plan.previous, &mut budget)
+            .into_iter()
+            .filter(|wait| {
+                !wait.only_on_create() && deployed_again.contains(wait.logical_id.as_str())
+            })
+            .collect()
+    }
+
+    /// Drop the signals recorded for a wait condition the operation in flight is waiting at
+    /// that arrived BEFORE that wait was opened.
+    ///
+    /// "If you send multiple signals to a single resource (such as signaling a wait
+    /// condition), each signal requires a different unique ID" — and the signals a wait
+    /// condition receives are the ones sent to the handle it was created with. A deployment
+    /// that CREATES a wait condition again (the template changed its handle, or a rollback
+    /// put the previous one back) is therefore waiting on a wait condition that has received
+    /// nothing: the signals that satisfied the earlier one satisfied THAT deployment, and
+    /// cannot stand in for the signals this one is waiting for. A wait condition the stack
+    /// already has and the deployment declares unchanged opens no barrier at all
+    /// ([`super::StoredStack::opening_barriers`]), so its signals are left exactly as they
+    /// are.
+    ///
+    /// Called by the operation that opened the barriers, right after it did.
+    pub fn retire_signals_of_open_waits(&mut self) {
+        if self.wait_conditions.is_empty() || self.signals.is_empty() {
+            return;
+        }
+        let opened: Vec<(String, SystemTime)> = self
+            .wait_conditions
+            .iter()
+            .map(|barrier| (barrier.logical_id().to_string(), barrier.opened_at))
+            .collect();
+        self.signals.retain(|signal| {
+            !opened.iter().any(|(logical_id, opened_at)| {
+                *logical_id == signal.logical_resource_id && signal.received_at < *opened_at
+            })
+        });
+    }
+}

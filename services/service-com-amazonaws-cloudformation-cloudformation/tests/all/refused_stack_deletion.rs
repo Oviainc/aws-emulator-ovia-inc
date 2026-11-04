@@ -8,7 +8,9 @@
 //! resource-failure summary alone, and leaves every resource reporting the conclusion that
 //! deletion walk reached about IT — `DELETE_FAILED` carrying the owning service's own
 //! refusal for the resource it would not delete, `DELETE_COMPLETE` for each resource the
-//! same walk did delete, and the status its create left for one the walk never reached.**
+//! same walk did delete (a refusal stops nothing the refused resource is not NEEDED BY),
+//! and the status its create left for one that resource still needs, which cannot be
+//! deleted while it is there.**
 //!
 //! `StackResource$ResourceStatus` is that resource's "Current status" and
 //! `StackResource$ResourceStatusReason` the "success/failure message associated with the
@@ -19,8 +21,8 @@
 //! The rows here extend the class that suite spans (Amazon RDS refusing a protected DB
 //! instance, Amazon S3 refusing a bucket that still holds an object) along the two
 //! dimensions it leaves open: a THIRD owning service with a refusal of its own (IAM, which
-//! will not delete a role an inline policy still holds), and a resource the walk NEVER
-//! REACHED, which must still report the status its create left and must still be there in
+//! will not delete a role an inline policy still holds), and a resource the refused one
+//! DEPENDS ON, which must still report the status its create left and must still be there in
 //! the service that owns it. Each row reads the owning services back, so a
 //! `DELETE_COMPLETE` record means the resource really went and an untouched record means it
 //! really stayed.
@@ -94,18 +96,17 @@ struct Refused {
     expected: &'static [(&'static str, &'static str)],
     /// A DB instance that must have survived the refused deletion, still protected.
     surviving_instance: Option<&'static str>,
-    /// A topic the walk really deleted before the refusal, which Amazon SNS must no longer
-    /// hold.
-    deleted_topic: Option<&'static str>,
-    /// A topic the walk never reached, which Amazon SNS must still hold.
+    /// The topics the walk really deleted, which Amazon SNS must no longer hold.
+    deleted_topics: &'static [&'static str],
+    /// A topic the refused resource NEEDS, which the deletion left alone and Amazon SNS must
+    /// still hold.
     untouched_topic: Option<&'static str>,
 }
 
 fn refused_rows() -> Vec<Refused> {
     vec![
         Refused {
-            case: "a protected DB instance after a resource the walk deleted and before one \
-                   it never reached",
+            case: "a protected DB instance between two topics it does not depend on",
             stack: "refused-delete-middle",
             template: json!({
                 "Resources": {
@@ -119,17 +120,51 @@ fn refused_rows() -> Vec<Refused> {
             refused: "Db",
             // Amazon RDS's own wording for an instance its deletion protection holds.
             diagnosis: "deletion protection is enabled",
-            // The walk runs newest first, so the topic declared after the database is
-            // deleted, the database is refused, and the topic declared before it is never
-            // asked about.
+            // The walk runs newest first, and nothing here depends on the database: both
+            // topics are deleted and the database alone is reported as the failure.
             expected: &[
-                ("ATopic", resource_status::CREATE_COMPLETE),
+                ("ATopic", resource_status::DELETE_COMPLETE),
                 ("Db", resource_status::DELETE_FAILED),
                 ("ZTopic", resource_status::DELETE_COMPLETE),
             ],
             surviving_instance: Some("refused-delete-middle-db"),
-            deleted_topic: Some("refused-delete-z-topic"),
-            untouched_topic: Some("refused-delete-a-topic"),
+            deleted_topics: &["refused-delete-a-topic", "refused-delete-z-topic"],
+            untouched_topic: None,
+        },
+        Refused {
+            case: "a protected DB instance that DEPENDS ON a topic, beside one it does not",
+            stack: "refused-delete-needed",
+            template: json!({
+                "Resources": {
+                    "ADep": topic("refused-delete-needed-topic"),
+                    "Db": {
+                        "Type": "AWS::RDS::DBInstance",
+                        "DependsOn": "ADep",
+                        "Properties": {
+                            "DBInstanceIdentifier": "refused-delete-needed-db",
+                            "Engine": "mysql",
+                            "DBInstanceClass": "db.t3.micro",
+                            "DeletionProtection": true
+                        }
+                    },
+                    "ZTopic": topic("refused-delete-needed-z-topic")
+                }
+            })
+            .to_string(),
+            given: Given::Nothing,
+            refused: "Db",
+            diagnosis: "deletion protection is enabled",
+            // The topic the database DEPENDS ON cannot be deleted while the database is
+            // still there, so the walk leaves it exactly as its create left it; the topic
+            // the database has nothing to do with is deleted.
+            expected: &[
+                ("ADep", resource_status::CREATE_COMPLETE),
+                ("Db", resource_status::DELETE_FAILED),
+                ("ZTopic", resource_status::DELETE_COMPLETE),
+            ],
+            surviving_instance: Some("refused-delete-needed-db"),
+            deleted_topics: &["refused-delete-needed-z-topic"],
+            untouched_topic: Some("refused-delete-needed-topic"),
         },
         Refused {
             case: "a role IAM will not delete while an inline policy holds it",
@@ -156,7 +191,7 @@ fn refused_rows() -> Vec<Refused> {
                 ("ZTopic", resource_status::DELETE_COMPLETE),
             ],
             surviving_instance: None,
-            deleted_topic: Some("refused-delete-role-topic"),
+            deleted_topics: &["refused-delete-role-topic"],
             untouched_topic: None,
         },
     ]
@@ -345,7 +380,7 @@ async fn a_refused_deletion_leaves_the_resources_it_did_not_reach_alone() {
                 row.case
             );
         }
-        if let Some(name) = row.deleted_topic {
+        for name in row.deleted_topics {
             let (code, attributes) = sns(
                 &router,
                 "GetTopicAttributes",
@@ -368,7 +403,7 @@ async fn a_refused_deletion_leaves_the_resources_it_did_not_reach_alone() {
             .await;
             assert_eq!(
                 code, 200,
-                "case {:?}: a resource the walk never reached must still be there, got \
+                "case {:?}: a resource the refused one needs must still be there, got \
                  {code} {attributes}",
                 row.case
             );

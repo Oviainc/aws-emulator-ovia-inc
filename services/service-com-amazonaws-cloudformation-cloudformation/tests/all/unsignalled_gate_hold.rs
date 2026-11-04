@@ -327,15 +327,15 @@ async fn a_gate_nothing_signals_fails_the_create_once_the_span_it_asked_for_is_o
         // One instant past the span the declaration asked for: the far bound, where the wait
         // is over and the clock owes the failure "if the wait condition doesn't receive the
         // specified number of success signals before the Timeout period expires". What AWS
-        // then does with such a stack — roll the create back — is a different rule and not
-        // what this case reads: the far bound asserted here is only that the wait HAS an end.
+        // then does with such a stack is roll the create back ("ROLLBACK — Roll back the
+        // stack creation. This is the default"), so the statuses the far bound admits are
+        // that rollback's: what this case reads is only that the wait HAS an end.
         age_the_wait(&engine, stack, row.asked_for + Duration::from_secs(1));
         let reported = stack_status_of(case, &router, stack).await;
-        assert_eq!(
-            reported,
-            status::CREATE_FAILED,
-            "case {case:?}: expected the create to fail once the {:?} the gates asked for was \
-             over, got {reported:?}",
+        assert!(
+            reported == status::ROLLBACK_IN_PROGRESS || reported == status::ROLLBACK_COMPLETE,
+            "case {case:?}: expected the create to fail and roll back once the {:?} the gates \
+             asked for was over, got {reported:?}",
             row.asked_for
         );
         let (_, body) = call(&router, "DescribeStacks", &[member("StackName", stack)]).await;

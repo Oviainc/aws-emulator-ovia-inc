@@ -323,6 +323,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 Some((
                                     stack.current_resources(),
                                     stack.held_resource_ids(),
+                                    crate::state::provisioning::dependencies_in_flight(stack),
                                     stack.rolled_back_resource_policies(),
                                 )),
                             )
@@ -335,7 +336,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The resources the failed create had made are removed again in the services that
         // own them, with the store UNLOCKED: each delete reaches another service's own
         // handler, exactly as the create's did.
-        if let Some((resources, held, policies)) = unwind {
+        if let Some((resources, held, needs, policies)) = unwind {
             // The removal's calls are the stack's, made under its service role
             // ([`crate::state::service_role`]), read back under a lock of its own: the
             // block above released the store before these calls are made.
@@ -349,7 +350,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::service_role::ServiceRole::of(&*self.engine, role_arn.as_deref());
             let deleted = crate::state::service_role::acting_as(
                 role,
-                crate::state::provisioning::unwind(ctx, &region, &resources, &held, policies),
+                crate::state::provisioning::unwind(
+                    ctx,
+                    &region,
+                    &resources,
+                    &crate::state::provisioning::Teardown {
+                        held: &held,
+                        needs: &needs,
+                        on_refusal: crate::state::provisioning::OnRefusal::Stop,
+                        policies,
+                    },
+                ),
             )
             .await;
             let mut store = state.lock();

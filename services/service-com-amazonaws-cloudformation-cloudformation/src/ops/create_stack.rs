@@ -458,10 +458,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resolved HERE because the template's own processing reads them — a
         // language-extensions directive counting a list-typed parameter's items among them.
         let parameters = crate::state::parameters_in_force(&template_body, parameters);
-        let parameter_values: ::std::collections::BTreeMap<String, String> = parameters
-            .iter()
-            .map(|parameter| (parameter.key.clone(), parameter.value.clone()))
-            .collect();
+        // What the DEPLOYMENT evaluates the template against: the values in force, with a
+        // parameter declared under an SSM parameter type carrying the value Parameter Store
+        // holds under the name it supplies
+        // ([`crate::state::dynamic_references::resolved_parameter_values`]). The stack goes
+        // on reporting the submitted value, which is what `Parameter$ParameterValue` is.
+        let parameter_values = crate::state::dynamic_references::resolved_parameter_values(
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &template_body,
+            &parameters,
+        )
+        .await;
         // Applying the template's transforms is caller-sized work, so it happens HERE —
         // before the store lock below — and never while every other request waits on that
         // lock. The stage it computes is what the stack deploys.
@@ -887,6 +895,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         Some((
                             stack.current_resources(),
                             stack.held_resource_ids(),
+                            crate::state::provisioning::dependencies_in_flight(stack),
                             stack.rolled_back_resource_policies(),
                         ))
                     }
@@ -900,10 +909,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // into is already due on the stack's clock; only a delete the owning service
         // REFUSES changes it, and then to the failed status for that unwind rather than to
         // one that claims the resources are gone.
-        if let Some((resources, held, policies)) = unwind {
+        if let Some((resources, held, needs, policies)) = unwind {
             let deleted = crate::state::service_role::acting_as(
                 role,
-                crate::state::provisioning::unwind(ctx, &region, &resources, &held, policies),
+                crate::state::provisioning::unwind(
+                    ctx,
+                    &region,
+                    &resources,
+                    &crate::state::provisioning::Teardown {
+                        held: &held,
+                        needs: &needs,
+                        on_refusal: crate::state::provisioning::OnRefusal::Stop,
+                        policies,
+                    },
+                ),
             )
             .await;
             let mut store = state.lock();

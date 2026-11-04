@@ -657,9 +657,9 @@ async fn a_resource_signal_wait_that_runs_out_fails_the_create_as_aws_words_it()
         tokio::time::sleep(Duration::from_millis(1_300)).await;
 
         let stack_status = status_of(case.case, &router, case.stack).await;
-        assert_eq!(
-            stack_status, "CREATE_FAILED",
-            "case {:?}: expected the create to fail once the wait ran out, got \
+        assert!(
+            stack_status == "ROLLBACK_IN_PROGRESS" || stack_status == "ROLLBACK_COMPLETE",
+            "case {:?}: expected the create to fail and roll back once the wait ran out, got \
              {stack_status:?}",
             case.case
         );

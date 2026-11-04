@@ -1,17 +1,21 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudformation.cfn-bootstrap-version-rule-blocks-stale-qualifier cloudformation.cfn-topstacks-e2e-top-stacks-resource-breakdown-lifecycle cloudformation.stack-rollback-events-golden-failed-and-cancelled cloudformation.stack-continue-update-rollback-client-request-token-marks-its-events cloudformation.stack-continue-update-rollback-force-rollback-skips-failed-resource cloudformation.stack-rollback-stack-client-request-token-marks-rollback-events cloudformation.cdk-s3-auto-delete-objects-empties-past-destroy-manual-bucket-blocks-on-bucketnotempty cloudformation.deep-cloudformation-2-snapshot-volume
+Issue-Trace-Ids: cloudformation.cfn-bootstrap-version-rule-blocks-stale-qualifier cloudformation.stack-rollback-events-golden-failed-and-cancelled cloudformation.deep-cloudformation-2-snapshot-volume
 Issue-Shape-Id: com.amazonaws.cloudformation#CloudFormation
 Issue-Key: cloudformation.cfn-bootstrap-version-rule-blocks-stale-qualifier|run#27|AssertionError|assert status == "ROLLBACK_COMPLETE", (
-Issue-Key: cloudformation.cfn-topstacks-e2e-top-stacks-resource-breakdown-lifecycle|phase#8|AssertionError|raise AssertionError(f"[phase {i}/{len(self.phases)} {name}] {exc}") from exc
 Issue-Key: cloudformation.stack-rollback-events-golden-failed-and-cancelled|run#4|AssertionError|assert _settle(cfn, stack_id, timeout_s=_cap(ctx, _DEADLINE_S)) == "ROLLBACK_COMPLETE", f"create ended {_stack(cfn, stack_id)!r}"
-Issue-Key: cloudformation.stack-continue-update-rollback-client-request-token-marks-its-events|run#8|AssertionError|assert _settle(cfn, stack_id, timeout_s=_cap(ctx, _DEADLINE_S)) == "UPDATE_ROLLBACK_FAILED", f"the failing update ended {_stack(cfn, stack_id)!r}"
-Issue-Key: cloudformation.stack-continue-update-rollback-force-rollback-skips-failed-resource|run#6|AssertionError|assert _settle(cfn, stack_id, timeout_s=_cap(ctx, _DEADLINE_S)) == "UPDATE_ROLLBACK_FAILED", f"the failing update ended {_stack(cfn, stack_id)!r}"
-Issue-Key: cloudformation.stack-rollback-stack-client-request-token-marks-rollback-events|run#14|AssertionError|assert failed == [
-Issue-Key: cloudformation.cdk-s3-auto-delete-objects-empties-past-destroy-manual-bucket-blocks-on-bucketnotempty|run#12|AssertionError|assert auto_resource is None or auto_resource["ResourceStatus"] == "DELETE_COMPLETE", (
 Issue-Key: cloudformation.deep-cloudformation-2-snapshot-volume|run#28|AssertionError|assert len(snaps) == 1, (
 Issue-Commit: 765add48a71cdb59193040bf215c1324536972c5
+
+> _This report carries the replay keys that NOW PASS: cause 1 (the `Rules` section is
+> evaluated against the values in force, with an SSM parameter type resolved through Parameter
+> Store), cause 3 (a create whose resource-signal wait runs out fails and is rolled back to
+> ROLLBACK_COMPLETE, removing what it had made) and cause 7 (`DeletionPolicy: Snapshot` leaves
+> exactly one snapshot of the resource behind). The keys of causes 2, 4, 5 and 6 do NOT pass
+> and are re-filed under
+> `issues/things-that-do-not-work/20261104T170000Z-cloudformation-4-of-the-7-failed-create-causes-remain-open.md`
+> so nothing that still fails is recorded as working._
 
 # cloudformation: 7 net-new root causes — failed creates/updates are never rolled back, rollback events are absent, and DeletionPolicy:Snapshot is a no-op
 

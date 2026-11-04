@@ -157,9 +157,22 @@ fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dy
 /// [`ErasedOperation::run`]. So the framework still owns the whole
 /// deserialize → validate → handle → serialize sequence (and every status, code and
 /// message it answers with), and this wrapper owns one element of the envelope.
-pub struct RequestIdEnvelopeOperation;
+pub struct RequestIdEnvelopeOperation<Eng: Send + Sync + 'static> {
+    engine: std::sync::Arc<Eng>,
+}
 
-impl ErasedOperation for RequestIdEnvelopeOperation {
+impl<Eng: Send + Sync + 'static> RequestIdEnvelopeOperation<Eng> {
+    /// Build the wrapper from the shared engine — which it holds for one reason: it is the
+    /// ONE place every request of this service passes through, so the transitions the CLOCK
+    /// has made due whose conclusion needs calls into other services are concluded here,
+    /// once, rather than by each handler
+    /// ([`crate::state::provisioning::settle_expired_wait_failures`]).
+    pub fn new(engine: std::sync::Arc<Eng>) -> Self {
+        Self { engine }
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for RequestIdEnvelopeOperation<Eng> {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -168,7 +181,21 @@ impl ErasedOperation for RequestIdEnvelopeOperation {
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
             match modeled_operation(svc, req) {
-                Some(op) => with_request_id(op.run(svc, req, ctx).await),
+                Some(op) => {
+                    // A resource-signal wait whose `Timeout` has run out failed its stack's
+                    // operation at the instant it expired, and that failure owes a ROLLBACK
+                    // whose deletes reach the services that own the stack's resources —
+                    // calls neither the store's clock nor a read under its lock can make. So
+                    // they are made HERE, before the operation runs: this wrapper is the one
+                    // path every request of this service takes, so the expiry is concluded
+                    // in one place whichever operation a client calls after it.
+                    crate::state::provisioning::settle_expired_wait_failures(
+                        ctx,
+                        &*self.engine,
+                    )
+                    .await;
+                    with_request_id(op.run(svc, req, ctx).await)
+                }
                 // Unreachable through `Service::override_operation`, which claims a
                 // request only when the routing table holds its key; answered as the
                 // framework answers an unroutable request rather than guessed at.

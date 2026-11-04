@@ -616,10 +616,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A parameter the template declares and the request passed no value for takes the
         // template's own `Default`, exactly as on a create.
         let parameters = crate::state::parameters_in_force(&template_body, parameters);
-        let parameter_values: ::std::collections::BTreeMap<String, String> = parameters
-            .iter()
-            .map(|parameter| (parameter.key.clone(), parameter.value.clone()))
-            .collect();
+        // What the DEPLOYMENT evaluates the template against: the values in force, with a
+        // parameter declared under an SSM parameter type carrying the value Parameter Store
+        // holds under the name it supplies — the same resolution a create runs
+        // ([`crate::state::dynamic_references::resolved_parameter_values`]).
+        let parameter_values = crate::state::dynamic_references::resolved_parameter_values(
+            ctx,
+            &request_region,
+            &template_body,
+            &parameters,
+        )
+        .await;
         // The stage this update would deploy, computed from the values in force: a
         // language-extensions directive reads them, so the stage depends on them. An update
         // reusing the stack's own template keeps the stage that was computed for it.
@@ -997,6 +1004,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(operation_id.clone()),
                 Some(client_request_token),
             );
+            // A wait condition this update CREATES again — the template changed its handle —
+            // waits for its own signals: the ones that satisfied the wait condition it
+            // replaces belong to the deployment that created that one
+            // ([`crate::state::StoredStack::retire_signals_of_open_waits`]).
+            stack.retire_signals_of_open_waits();
             // A template this service cannot deploy ends the update in the modelled
             // UPDATE_FAILED with the reason, rather than in an UPDATE_COMPLETE that
             // reports a deployment nothing performed. The resources and outputs in force

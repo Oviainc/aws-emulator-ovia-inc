@@ -4,10 +4,8 @@
 //!
 //! Put a new suite at `tests/all/<name>.rs` and declare it below, keeping the list
 //! sorted.
-//!
 //! A suite that is not declared here compiles nowhere and its tests never run. A
 //! suite left at the top level of `tests/` fails the build.
-
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
@@ -383,3 +381,9 @@ mod vpc_network_teardown;
 mod waf_regional_ip_set_resources;
 #[path = "all/wait_conditions.rs"]
 mod wait_conditions;
+#[path = "all/deletion_policy_snapshot.rs"]
+mod deletion_policy_snapshot;
+#[path = "all/expired_wait_rollback.rs"]
+mod expired_wait_rollback;
+#[path = "all/ssm_parameter_types.rs"]
+mod ssm_parameter_types;

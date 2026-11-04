@@ -218,7 +218,7 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: CloudFormationDefinition<Eng>,
     /// The envelope wrapper every routable request is served through. Held in a field,
     /// built once, because `override_operation` hands back a reference to it.
-    envelope: RequestIdEnvelopeOperation,
+    envelope: RequestIdEnvelopeOperation<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -236,7 +236,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 Arc::clone(&engine),
                 management_events::audited_table(&engine),
             ),
-            envelope: RequestIdEnvelopeOperation,
+            envelope: RequestIdEnvelopeOperation::new(Arc::clone(&engine)),
         }
     }
 }

@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that delete the stack's resources run after it, and each of those reaches
         // another service's own handler, which takes that service's lock.
-        let (stack_id, region, resources, held, deletion_mode, role_arn) = {
+        let (stack_id, region, resources, held, needs, deletion_mode, role_arn) = {
             let mut store = state.lock();
             store.settle(now);
 
@@ -372,6 +372,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // of this emulator provisions, whose removal a client reads exactly as it
                 // reads every other resource's.
                 stack.held_resource_ids(),
+                // What each of the stack's resources NEEDS, which is what says which
+                // resources a refused deletion holds back
+                // ([`crate::state::provisioning::Dependencies`]).
+                stack.resource_dependencies.clone(),
                 // The mode THIS deletion runs under, which is what decides whether a
                 // resource an owning service refuses to delete fails the stack or is
                 // abandoned.
@@ -394,12 +398,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ctx,
                 &region,
                 &resources,
-                &held,
-                crate::state::on_refused_resource_deletion(deletion_mode.as_deref()),
-                // The stack is being deleted, which is the event each resource's
-                // `DeletionPolicy` governs: "preserve, and in some cases, backup a resource
-                // when its stack is deleted".
-                crate::state::provisioning::Policies::Honoured,
+                &crate::state::provisioning::Teardown {
+                    held: &held,
+                    needs: &needs,
+                    on_refusal: crate::state::on_refused_resource_deletion(
+                        deletion_mode.as_deref(),
+                    ),
+                    // The stack is being deleted, which is the event each resource's
+                    // `DeletionPolicy` governs: "preserve, and in some cases, backup a resource
+                    // when its stack is deleted".
+                    policies: crate::state::provisioning::Policies::Honoured,
+                },
             ),
         )
         .await;

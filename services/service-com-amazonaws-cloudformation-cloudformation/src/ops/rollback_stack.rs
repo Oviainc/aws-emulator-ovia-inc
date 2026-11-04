@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that put the resources back — or delete them — run after it, and each of
         // those reaches another service's own handler, which takes that service's lock.
-        let (stack_id, region, operation_id, provenance, work, held, policies, role_arn) = {
+        let (stack_id, region, operation_id, provenance, work, held, needs, policies, role_arn) = {
             let mut store = state.lock();
             store.settle(now);
 
@@ -272,6 +272,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The records the stack HOLDS, which is the set a discarding rollback
                 // reports a deletion of.
                 stack.held_resource_ids(),
+                // What each of the stack's resources NEEDS, which says which resources a
+                // refused deletion holds back
+                // ([`crate::state::provisioning::Dependencies`]).
+                crate::state::provisioning::dependencies_in_flight(stack),
                 // What that rollback does with the `DeletionPolicy` of the resources the
                 // failed operation created.
                 stack.rolled_back_resource_policies(),
@@ -300,8 +304,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ctx,
                         &region,
                         &resources,
-                        &held,
-                        policies,
+                        &crate::state::provisioning::Teardown {
+                            held: &held,
+                            needs: &needs,
+                            on_refusal: crate::state::provisioning::OnRefusal::Stop,
+                            policies,
+                        },
                     ),
                 )
                 .await;

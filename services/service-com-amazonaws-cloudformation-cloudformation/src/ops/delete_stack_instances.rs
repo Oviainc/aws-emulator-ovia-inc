@@ -442,13 +442,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ctx,
                 &removal.region,
                 &removal.resources,
-                &removal.held,
-                // `DeleteStackInstances` carries no `DeletionMode`, so a resource an owning
-                // service refuses to delete is this instance's deletion failure.
-                crate::state::provisioning::OnRefusal::Stop,
-                // An instance's stack is being deleted, so each resource's own
-                // `DeletionPolicy` decides what becomes of the physical resource.
-                crate::state::provisioning::Policies::Honoured,
+                &crate::state::provisioning::Teardown {
+                    held: &removal.held,
+                    // A stack instance's resources are a stack set's deployment of one
+                    // template: this path holds no dependency relation of its own, so a
+                    // refusal holds nothing else back
+                    // ([`crate::state::provisioning::Dependencies`]).
+                    needs: &crate::state::provisioning::Dependencies::new(),
+                    // `DeleteStackInstances` carries no `DeletionMode`, so a resource an
+                    // owning service refuses to delete is this instance's deletion failure.
+                    on_refusal: crate::state::provisioning::OnRefusal::Stop,
+                    // An instance's stack is being deleted, so each resource's own
+                    // `DeletionPolicy` decides what becomes of the physical resource.
+                    policies: crate::state::provisioning::Policies::Honoured,
+                },
             )
             .await;
             let failure = deleted.failure.clone();

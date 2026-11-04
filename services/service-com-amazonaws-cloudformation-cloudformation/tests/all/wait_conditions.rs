@@ -32,7 +32,7 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 /// `SignalResource` for one resource of one stack.
-async fn signal(
+pub(crate) async fn signal(
     router: &MultiServiceRouter,
     stack: &str,
     logical_id: &str,
@@ -606,17 +606,74 @@ async fn a_wait_condition_whose_timeout_runs_out_fails_the_operation() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
 
+        // The create FAILS when the wait runs out and is then rolled back, which is what
+        // `OnFailure`'s documented default asks for: the status a waiter ends on is the
+        // rolled-back one, reached on the clock with nothing the client does.
         let reported_status = status_of(&router, stack).await;
-        assert_eq!(
-            reported_status, "CREATE_FAILED",
-            "case {case:?}: expected the create to fail once the wait ran out, got \
+        assert!(
+            reported_status == "ROLLBACK_IN_PROGRESS" || reported_status == "ROLLBACK_COMPLETE",
+            "case {case:?}: expected the create that ran out of wait to be rolling back, got \
              {reported_status:?}"
+        );
+        wait_for_the_transition().await;
+        let settled = status_of(&router, stack).await;
+        assert_eq!(
+            settled, "ROLLBACK_COMPLETE",
+            "case {case:?}: expected the create to roll back once the wait ran out, got \
+             {settled:?}"
         );
         let reason = status_reason_of(&router, stack).await;
         assert!(
             reason.contains("Received 0 conditions when expecting 2"),
             "case {case:?}: expected the reason to carry the counts the wait was judged on, \
              got {reason:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_expiry_is_concluded_whichever_operation_is_called_after_it() {
+    // The expiry and the rollback it owes are materialised by ONE path, driven by every
+    // operation that settles the store — so the stack a client reads is the rolled-back one
+    // whether the first call after the wait ran out is a describe, a template read or a
+    // mutating operation. `GetTemplate` is the row that reads nothing about the stack's
+    // status at all, and `SignalResource` the row that writes.
+    let cases: [(&str, &str, &str); 3] = [
+        ("GetTemplate, which reports no status", "concluded-template", "GetTemplate"),
+        ("SignalResource, a mutating operation", "concluded-signal", "SignalResource"),
+        ("RollbackStack, which acts on the failure", "concluded-rollback", "RollbackStack"),
+    ];
+    for (case, stack, first_call) in cases {
+        let router = router();
+        let template = one_wait_condition(stack, "0", "1");
+        let (status, body) = create_stack(&router, stack, &template, &[]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected CreateStack to succeed, got {status} {body}"
+        );
+
+        // The wait is over the moment it starts, so the failure and its rollback are already
+        // owed when this call arrives.
+        let members = match first_call {
+            "SignalResource" => vec![
+                member("StackName", stack),
+                member("LogicalResourceId", "Wait"),
+                member("UniqueId", "late"),
+                member("Status", "SUCCESS"),
+            ],
+            _ => vec![member("StackName", stack)],
+        };
+        let (status, body) = call(&router, first_call, &members).await;
+        assert!(
+            status == 200 || status == 400,
+            "case {case:?}: expected {first_call} to be answered, got {status} {body}"
+        );
+        wait_for_the_transition().await;
+        let settled = status_of(&router, stack).await;
+        assert!(
+            settled == "ROLLBACK_COMPLETE" || settled == "ROLLBACK_IN_PROGRESS",
+            "case {case:?}: expected the create whose wait ran out to be rolling back after \
+             {first_call}, got {settled:?}"
         );
     }
 }

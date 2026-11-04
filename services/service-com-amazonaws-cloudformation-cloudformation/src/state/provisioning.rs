@@ -530,6 +530,7 @@ pub async fn advance_stabilisations(
 ) {
     let region = super::request_region(ctx.parts());
     let region = region.as_str();
+    settle_expired_waits(ctx, state, region).await;
     // Which resources are still waiting, read under a lock of its own: the readiness calls
     // below reach other services' handlers, which take those services' locks, so a client
     // reading THIS service must not be blocked behind them.
@@ -659,6 +660,7 @@ pub async fn advance_stabilisations(
                     (
                         resources,
                         stack.held_resource_ids(),
+                        dependencies_in_flight(stack),
                         stack.rolled_back_resource_policies(),
                     )
                 })
@@ -668,10 +670,21 @@ pub async fn advance_stabilisations(
             // them, exactly as `crate::ops::create_stack`'s own failure path removes them,
             // and only a delete one of those services REFUSES changes the status the
             // rollback settles into.
-            let Some((resources, held, policies)) = unwinding else {
+            let Some((resources, held, needs, policies)) = unwinding else {
                 continue;
             };
-            let deleted = unwind(ctx, region, &resources, &held, policies).await;
+            let deleted = unwind(
+                ctx,
+                region,
+                &resources,
+                &Teardown {
+                    held: &held,
+                    needs: &needs,
+                    on_refusal: OnRefusal::Stop,
+                    policies,
+                },
+            )
+            .await;
             let mut store = state.lock();
             let Some(stack) = store.resolve_mut(region, &stack_id) else {
                 continue;
@@ -687,6 +700,100 @@ pub async fn advance_stabilisations(
             }
         }
     }
+}
+
+/// Materialise the failures the WAIT CONDITIONS of this Region's stacks have run out on, and
+/// perform the work each one owes the services that own those stacks' resources.
+///
+/// "If the wait condition doesn't receive the specified number of success signals before the
+/// `Timeout` period expires, CloudFormation assumes that the wait condition has failed", and
+/// a failed operation is rolled back: a failed CREATE's rollback removes what the create had
+/// already made and a failed UPDATE's puts the previous stack configuration back
+/// ([`super::wait_conditions::ExpiredWaitOwes`]). Both are CALLS to the services that own
+/// those resources, which neither the store's own clock nor a read under its lock can make —
+/// so they are made here, by the next operation of this service to be called, exactly as the
+/// waits for a resource to come up above are read here.
+///
+/// What this records was owed at the instant the wait ran out, whether or not anybody called.
+async fn settle_expired_waits(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    state: &::engine::ServiceState<super::ComAmazonawsCloudformationCloudformationState>,
+    region: &str,
+) {
+    // The failures the clock has made due, and what each one owes — taken under the lock and
+    // performed with it RELEASED, like every other call this module makes.
+    let owed: Vec<(String, super::wait_conditions::ExpiredWaitOwes)> = {
+        let mut store = state.lock();
+        let now = SystemTime::now();
+        store
+            .stacks
+            .iter_mut()
+            .filter(|stack| stack.region == region)
+            .filter_map(|stack| {
+                let owes = stack.fail_expired_wait(now)?;
+                Some((stack.stack_id.clone(), owes))
+            })
+            .collect()
+    };
+    for (stack_id, owes) in owed {
+        // A failed UPDATE's rollback is the one path every rollback this service owes goes
+        // through, which the operation calling this drives for itself
+        // ([`super::settle_due_rollbacks`]).
+        let super::wait_conditions::ExpiredWaitOwes::Removal {
+            resources,
+            held,
+            needs,
+            policies,
+        } = owes
+        else {
+            continue;
+        };
+        // The removal's calls are made exactly as the ones the create's own failure path
+        // makes them, and as the waits above are read: through this request's own context.
+        let deleted = unwind(
+            ctx,
+            region,
+            &resources,
+            &Teardown {
+                held: &held,
+                needs: &needs,
+                on_refusal: OnRefusal::Stop,
+                policies,
+            },
+        )
+        .await;
+        let mut store = state.lock();
+        let Some(stack) = store.resolve_mut(region, &stack_id) else {
+            continue;
+        };
+        stack.schedule_resource_events(&deleted.transitions);
+        stack.record_materialised_resources(deleted.resources);
+        // A resource whose owning service accepted the delete and still holds it holds this
+        // rollback open: it is not reported complete while a resource it removed is there.
+        stack.record_stabilisations(&deleted.removing, SystemTime::now());
+        if let Some(failure) = deleted.failure {
+            stack.fail_transition(SystemTime::now(), super::status::ROLLBACK_FAILED, failure);
+        }
+    }
+}
+
+/// [`settle_expired_waits`] for a handler that is about to read or write the store: the
+/// failures the wait conditions of this Region's stacks have run out on are materialised, and
+/// the work each one owes the owning services performed, BEFORE that handler takes the lock.
+///
+/// Every operation of this service that settles the store calls this first, so the expiry is
+/// concluded in ONE place — the one that can make those calls — whichever operation a client
+/// happens to call after the wait ran out. Call it with the handler's `ctx` and
+/// `&*self.engine`, holding no store lock.
+pub async fn settle_expired_wait_failures<Eng: Send + Sync + 'static>(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    engine: &Eng,
+) {
+    let Some(state) = super::service_state(engine) else {
+        return;
+    };
+    let region = super::request_region(ctx.parts());
+    settle_expired_waits(ctx, &state, region.as_str()).await;
 }
 
 /// Reconcile what a stack's newly deployed template declares with what the stack already
@@ -824,11 +931,11 @@ pub async fn reconcile(
         repoint_references(&mut deployed_properties, &minted);
         if let Some(existing) = previous
             .iter()
-            .find(|existing| existing.materialised && is_same_resource(existing, &resource))
+            .find(|existing| already_deployed(existing) && is_same_resource(existing, &resource))
         {
-            // The owning service already created exactly this resource and the deployment
-            // did not change its identity, so nothing is created again; what that service
-            // reported about it, and the configuration it really has, are carried forward.
+            // The stack already has exactly this resource and the deployment did not change
+            // its identity, so nothing is created again; what the owning service reported
+            // about it, and the configuration it really has, are carried forward.
             let declared_properties = resource.properties.clone();
             let changed = declared_properties != existing.properties;
             carry_forward(existing, &mut resource);
@@ -856,7 +963,10 @@ pub async fn reconcile(
                         )
                         .await
                     }
-                    None => Ok(None),
+                    // Nothing exists in any owning service for this type, so there is
+                    // nothing anywhere to change: the stack's own record IS the resource,
+                    // and the declared configuration is applied by recording it.
+                    None => Ok(Some(Created::default())),
                 };
                 match applied {
                     // The owning service applied it, so the configuration in force is the
@@ -1167,7 +1277,7 @@ pub async fn reconcile(
         repoint_references(&mut resource.properties, &minted);
         if let Some(existing) = previous
             .iter()
-            .find(|existing| existing.materialised && is_same_resource(existing, &resource))
+            .find(|existing| already_deployed(existing) && is_same_resource(existing, &resource))
         {
             carry_forward(existing, &mut resource);
         }
@@ -1224,20 +1334,21 @@ pub async fn reconcile(
     // both, and sharing the set is what keeps that true of the records as well.
     let mut opened = BTreeSet::new();
     // A deployment is not a `DeleteStack`, so no `DeletionMode` chose for it: a resource an
-    // owning service refuses to delete is this deployment's failure.
-    let mut deleted = delete_pass(
-        ctx,
-        region,
-        &replacements,
-        &held,
-        &mut opened,
-        OnRefusal::Stop,
-        Policies::Ignored,
-    )
-    .await;
+    // owning service refuses to delete is this deployment's failure. The relation these two
+    // walks are judged against is EMPTY: what they take down is what this deployment
+    // replaced or dropped, and the dependency relation of a template being deployed is not
+    // the one in force on the stack ([`Dependencies`]).
+    let no_relation = Dependencies::new();
+    let replacement_walk = Teardown {
+        held: &held,
+        needs: &no_relation,
+        on_refusal: OnRefusal::Stop,
+        policies: Policies::Ignored,
+    };
+    let mut deleted = delete_pass(ctx, region, &replacements, &replacement_walk, &mut opened).await;
     if deleted.failure.is_some() {
-        // The walk stopped on a refusal, so the resources the second one would have taken
-        // down were never asked about: their records are kept exactly as the stack held
+        // A refusal is the deployment's failure, so the resources the second walk would have
+        // taken down are not asked about: their records are kept exactly as the stack held
         // them, so a later deletion still deletes them.
         deleted.resources.extend(removals);
     } else {
@@ -1245,10 +1356,11 @@ pub async fn reconcile(
             ctx,
             region,
             &removals,
-            &held,
+            &Teardown {
+                policies: removal_policies,
+                ..replacement_walk
+            },
             &mut opened,
-            OnRefusal::Stop,
-            removal_policies,
         )
         .await;
         deleted.resources.append(&mut removed.resources);
@@ -1414,7 +1526,10 @@ fn adopt_minted_identity(resource: &mut StoredResource, assigned: Option<String>
 /// the record still states the configuration the resource really has, never one that was
 /// only asked for.
 fn carry_forward(existing: &StoredResource, resource: &mut StoredResource) {
-    resource.materialised = true;
+    // Whether the resource exists in a service that owns it is what the EXISTING record
+    // says: carrying one resource forward cannot make a declared-only resource — one of a
+    // type no service here provisions — into a resource some service holds.
+    resource.materialised = existing.materialised;
     for (name, value) in &existing.attributes {
         resource.attributes.insert(name.clone(), value.clone());
     }
@@ -1444,6 +1559,23 @@ pub fn is_same_resource(left: &StoredResource, right: &StoredResource) -> bool {
     left.logical_id == right.logical_id
         && left.resource_type == right.resource_type
         && left.physical_resource_id == right.physical_resource_id
+}
+
+/// Whether a record of the set a deployment reconciles against is a resource the stack has
+/// ALREADY DEPLOYED, so a deployment that re-declares it with the same identity
+/// ([`is_same_resource`]) acts on nothing.
+///
+/// A deployment creates a resource the stack does not have yet, and that is what a RECORD
+/// says: one the owning service created carries `materialised`, and one of a type no service
+/// here provisions carries no flag because there was never anything to create — the stack
+/// still recorded it as a resource it created, under the identifier the naming rules
+/// computed, and the next deployment of the same declaration must not report it as created
+/// all over again. What the flag separates is therefore the DECLARED-ONLY record (nothing to
+/// create, nothing to carry out) from one whose create an owning service refused or never
+/// reached: that resource does not exist there, so a deployment that declares it again
+/// creates it.
+fn already_deployed(existing: &StoredResource) -> bool {
+    existing.materialised || provisioner_for(&existing.resource_type).is_none()
 }
 
 /// What deleting a stack's resources left.
@@ -1525,20 +1657,75 @@ pub async fn delete(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resources: &[StoredResource],
-    held: &BTreeSet<String>,
-    on_refusal: OnRefusal,
-    policies: Policies,
+    walk: &Teardown<'_>,
 ) -> Deleted {
-    delete_pass(
-        ctx,
-        region,
-        resources,
-        held,
-        &mut BTreeSet::new(),
-        on_refusal,
-        policies,
-    )
-    .await
+    delete_pass(ctx, region, resources, walk, &mut BTreeSet::new()).await
+}
+
+/// What one teardown walk is judged by, beside the resources it is walking: the records the
+/// stack HOLDS, what each of them needs, what a refusal does, and whether the walk reads each
+/// resource's own `DeletionPolicy`.
+///
+/// One value rather than four arguments, because every caller of [`delete`], [`unwind`] and
+/// the passes behind them answers all four for the same walk.
+#[derive(Debug, Clone, Copy)]
+pub struct Teardown<'a> {
+    /// The logical ids the stack holds a record of
+    /// ([`super::StoredStack::held_resource_ids`]) — the resources this teardown is
+    /// responsible for.
+    pub held: &'a BTreeSet<String>,
+    /// What each of those resources needs ([`Dependencies`]).
+    pub needs: &'a Dependencies,
+    /// What the walk does with a resource the owning service refuses to delete.
+    pub on_refusal: OnRefusal,
+    /// Whether the walk reads each resource's own `DeletionPolicy` ([`Policies`]).
+    pub policies: Policies,
+}
+
+/// The DIRECT dependency relation of the resources a teardown is walking, keyed by logical
+/// id: what each resource needs ([`super::StoredStack::resource_dependencies`]).
+///
+/// A deletion asks the owning services in reverse creation order — a resource before
+/// whatever it depends on — and the relation is what says WHICH resources a refusal holds
+/// back: a resource the refused one needs cannot be deleted while that one is still there, so
+/// the walk leaves it alone and the stack keeps its record. An EMPTY relation is one the
+/// caller does not know (a deployment taking down what it replaced knows the template it is
+/// deploying, not the stack's), and then a refusal holds nothing else back.
+pub type Dependencies = BTreeMap<String, BTreeSet<String>>;
+
+/// The dependency relation the teardown of the operation IN FLIGHT on `stack` is judged
+/// against ([`Dependencies`]): the one of the template that operation is deploying where it
+/// has one — a failed CREATE's rollback takes down what that create was deploying — and the
+/// one in force on the stack otherwise, which is what its own deletion walks.
+///
+/// Read under the same lock the resources are, by the operation that is about to drive the
+/// teardown, so the relation and the records it is asked about are one reading of the stack.
+pub fn dependencies_in_flight(stack: &super::StoredStack) -> Dependencies {
+    match stack.pending_deployment.as_ref() {
+        Some(deployment) => deployment.dependencies.clone(),
+        None => stack.resource_dependencies.clone(),
+    }
+}
+
+/// Every resource `refused` needs, directly or through another resource — the set a teardown
+/// that could not delete `refused` must leave alone.
+///
+/// Walked breadth-first over the relation, visiting each logical id at most once, so a
+/// relation with a cycle in it (which no deployable template has) terminates.
+fn needed_by(needs: &Dependencies, refused: &str) -> BTreeSet<String> {
+    let mut closure: BTreeSet<String> = BTreeSet::new();
+    let mut frontier: Vec<&str> = vec![refused];
+    while let Some(logical_id) = frontier.pop() {
+        let Some(needed) = needs.get(logical_id) else {
+            continue;
+        };
+        for dependency in needed {
+            if closure.insert(dependency.clone()) {
+                frontier.push(dependency.as_str());
+            }
+        }
+    }
+    closure
 }
 
 /// Whether a teardown reads each resource's own `DeletionPolicy`
@@ -1606,6 +1793,59 @@ fn final_snapshot_identifier(resource: &StoredResource) -> String {
     )
 }
 
+/// The resource types whose `DeletionPolicy: Snapshot` snapshot is a CALL OF THE OWNING
+/// SERVICE'S OWN, with the operation that takes it.
+///
+/// "For resources that support snapshots, CloudFormation creates a snapshot for the resource
+/// before deleting it", and the published list of types that support the policy is wider than
+/// the ones whose delete takes a final-snapshot member (Amazon RDS's
+/// `FinalDBSnapshotIdentifier`, Amazon Redshift's `FinalClusterSnapshotIdentifier`): an
+/// `AWS::EC2::Volume`'s snapshot is an `ec2:CreateSnapshot` of the volume, which `DeleteVolume`
+/// models no member for. For such a type the snapshot is taken by the call named here, before
+/// the delete; every other type's is the delete's own member
+/// ([`super::provisioner::Provisioner::delete`]), and a type that is neither has no snapshot
+/// to take.
+///
+/// Each entry is the template type, the signing name of the service that owns the snapshot,
+/// its awsQuery API version and the action: the snapshot is the OWNING service's own record,
+/// made through its own wire, so what a stack leaves behind is a snapshot that service's own
+/// reads report.
+const SNAPSHOT_BY_A_CALL_OF_ITS_OWN: &[(&str, &str, &str, &str)] =
+    &[("AWS::EC2::Volume", "ec2", "2016-11-15", "CreateSnapshot")];
+
+/// Take the snapshot a `Snapshot` deletion policy owes for one resource, where that snapshot
+/// is a call of the owning service's own ([`SNAPSHOT_BY_A_CALL_OF_ITS_OWN`]).
+///
+/// `identifier` is the name CloudFormation asks for the snapshot under
+/// ([`final_snapshot_identifier`]), which travels as the snapshot's `Description`: EC2 mints
+/// the `snap-…` id itself, so the identifier CloudFormation derived is what names the
+/// snapshot's provenance rather than its id.
+///
+/// `Ok(())` for a type whose snapshot this is not the call for — the delete's own member
+/// carries it, or there is no snapshot of that type to take — so nothing is asked of any
+/// service for it. `Err(refusal)` is the owning service's own answer, which leaves the
+/// resource undeleted: the policy exists to preserve the data, so a snapshot that could not
+/// be taken is not a resource that may be removed.
+async fn take_final_snapshot(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    identifier: &str,
+) -> Result<(), Refusal> {
+    let Some((_, signing_name, version, action)) = SNAPSHOT_BY_A_CALL_OF_ITS_OWN
+        .iter()
+        .find(|(resource_type, _, _, _)| *resource_type == resource.resource_type)
+    else {
+        return Ok(());
+    };
+    let parameters = vec![
+        ("VolumeId".to_string(), resource.physical_resource_id.clone()),
+        ("Description".to_string(), identifier.to_string()),
+    ];
+    call_query(ctx, signing_name, region, version, action, &parameters).await?;
+    Ok(())
+}
+
 /// One pass of [`delete`] over the set, recording what it transitioned.
 ///
 /// `opened` is the logical ids whose deletion has already been OPENED, which this pass adds
@@ -1620,21 +1860,38 @@ async fn delete_pass(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resources: &[StoredResource],
-    held: &BTreeSet<String>,
+    walk: &Teardown<'_>,
     opened: &mut BTreeSet<String>,
-    on_refusal: OnRefusal,
-    policies: Policies,
 ) -> Deleted {
+    let Teardown {
+        held,
+        needs,
+        on_refusal,
+        policies,
+    } = *walk;
     let mut outcome = Deleted {
         resources: resources.to_vec(),
         failure: None,
         transitions: Vec::new(),
         removing: Vec::new(),
     };
+    // The resources an owning service REFUSED to delete, and everything those resources need
+    // ([`needed_by`]): the refusals are what the teardown reports as its failure, and what
+    // they need is what it leaves alone, because a resource that is still there is one
+    // whatever it depends on is still in use by.
+    let mut refused: Vec<String> = Vec::new();
+    let mut still_needed: BTreeSet<String> = BTreeSet::new();
     // Newest first, over the indices of the set being reported back, so each resource's
     // record is updated in place as its deletion succeeds.
     for index in (0..outcome.resources.len()).rev() {
         let resource = &outcome.resources[index];
+        if still_needed.contains(&resource.logical_id) {
+            // A resource that one the owning service would not delete still needs: deleting
+            // it is not something that service could carry out while that resource is there,
+            // so nothing is asked about it and the stack keeps its record — a later deletion
+            // is what deletes it.
+            continue;
+        }
         // Which service is asked to delete the resource. `None` is a type this emulator
         // provisions nowhere: there is no API to call for it.
         let owner = provisioner_for(&resource.resource_type);
@@ -1681,14 +1938,45 @@ async fn delete_pass(
             ));
         }
         // "For resources that support snapshots, CloudFormation creates a snapshot for the
-        // resource before deleting it": the snapshot is the OWNING service's own, and the
-        // call that takes it is that service's delete carrying the final-snapshot
-        // identifier CloudFormation names it under
-        // ([`super::provisioner::Provisioner::delete`]). A type whose owning service takes
-        // no snapshot on the way out is deleted as it is for the default policy — there is
-        // no snapshot of it to take.
+        // resource before deleting it": for a type whose owning API takes that snapshot as a
+        // member of the delete it rides on that call
+        // ([`super::provisioner::Provisioner::delete`]), and for one whose snapshot is a CALL
+        // OF ITS OWN it is made here, BEFORE the delete — so the snapshot outlives the
+        // resource either way. A type whose owning service takes no snapshot on the way out
+        // is deleted as it is for the default policy: there is no snapshot of it to take.
         let final_snapshot = (policy == super::deletion_policy::SNAPSHOT)
             .then(|| final_snapshot_identifier(resource));
+        if let Some(identifier) = final_snapshot.as_deref() {
+            let resource = &outcome.resources[index];
+            let snapshotted = super::service_role::on_resource(
+                super::service_role::target_of(resource),
+                take_final_snapshot(ctx, region, resource, identifier),
+            )
+            .await;
+            if let Err(refusal) = snapshotted {
+                // The snapshot the policy asked for could not be taken, so the resource is
+                // NOT deleted: deleting it would destroy the data the policy exists to
+                // preserve. The refusal is reported exactly as a refused delete is.
+                let reason = handler_failure_reason(owner, &refusal);
+                if on_refusal == OnRefusal::Abandon {
+                    outcome.transitions.push(ResourceTransition::finished(
+                        resource,
+                        super::resource_status::DELETE_SKIPPED,
+                        Some(reason),
+                    ));
+                    continue;
+                }
+                refused.push(resource.logical_id.clone());
+                still_needed.extend(needed_by(needs, &resource.logical_id));
+                outcome.transitions.push(ResourceTransition::finished(
+                    resource,
+                    super::resource_status::DELETE_FAILED,
+                    Some(reason),
+                ));
+                continue;
+            }
+        }
+        let resource = &outcome.resources[index];
         let deleted = match owner {
             Some(provisioner) => {
                 super::service_role::on_resource(
@@ -1759,19 +2047,27 @@ async fn delete_pass(
                     ));
                     continue;
                 }
-                outcome.failure = Some(super::resource_failure_summary(
-                    super::failed_action::DELETE,
-                    [outcome.resources[index].logical_id.as_str()],
-                ));
+                // The refusal is this teardown's FAILURE, and the resource is reported as the
+                // one it failed on. The walk goes on with the resources that do not depend on
+                // it: CloudFormation deletes what it can and reports what it could not, so a
+                // sibling the refused resource has nothing to do with is deleted rather than
+                // left behind by the refusal of another.
                 let resource = &outcome.resources[index];
+                refused.push(resource.logical_id.clone());
+                still_needed.extend(needed_by(needs, &resource.logical_id));
                 outcome.transitions.push(ResourceTransition::finished(
                     resource,
                     super::resource_status::DELETE_FAILED,
                     Some(reason),
                 ));
-                return outcome;
             }
         }
+    }
+    if !refused.is_empty() {
+        outcome.failure = Some(super::resource_failure_summary(
+            super::failed_action::DELETE,
+            refused.iter().map(String::as_str),
+        ));
     }
     outcome
 }
@@ -1818,8 +2114,7 @@ pub async fn unwind(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resources: &[StoredResource],
-    held: &BTreeSet<String>,
-    policies: Policies,
+    walk: &Teardown<'_>,
 ) -> Deleted {
     // The deletions already opened, carried across the attempts: a re-ask of one still in
     // flight does not open it again, and one a stopped pass never reached is opened by the
@@ -1827,16 +2122,7 @@ pub async fn unwind(
     let mut opened = BTreeSet::new();
     // An unwind is not a `DeleteStack`, so no `DeletionMode` chose for it: a refusal that
     // outlives the retries is the rollback's own failure.
-    let mut outcome = delete_pass(
-        ctx,
-        region,
-        resources,
-        held,
-        &mut opened,
-        OnRefusal::Stop,
-        policies,
-    )
-    .await;
+    let mut outcome = delete_pass(ctx, region, resources, walk, &mut opened).await;
     for _ in 1..UNWIND_ATTEMPTS {
         if outcome.failure.is_none() {
             break;
@@ -1858,16 +2144,7 @@ pub async fn unwind(
         // The waits the earlier attempts opened are the deletions they carried through, and
         // they stand: this attempt is about the resources those passes could NOT delete.
         let mut removing = ::std::mem::take(&mut outcome.removing);
-        outcome = delete_pass(
-            ctx,
-            region,
-            &remaining,
-            held,
-            &mut opened,
-            OnRefusal::Stop,
-            policies,
-        )
-        .await;
+        outcome = delete_pass(ctx, region, &remaining, walk, &mut opened).await;
         transitioned.append(&mut outcome.transitions);
         outcome.transitions = transitioned;
         removing.append(&mut outcome.removing);
