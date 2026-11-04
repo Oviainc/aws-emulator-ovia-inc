@@ -235,6 +235,19 @@ pub struct ControlPanelRecord {
 }
 
 impl ControlPanelRecord {
+    /// Move the control panel onto `name` — the only thing an update changes — making the
+    /// deployment of the renamed panel due again.
+    ///
+    /// A request naming the name the panel already carries writes NOTHING, so it does not
+    /// restart a deployment either.
+    pub fn set_name(&mut self, name: String) {
+        if self.name == name {
+            return;
+        }
+        self.name = name;
+        self.deploy_due = deploy_due();
+    }
+
     /// This record as the modelled `ControlPanel` shape.
     ///
     /// `routing_control_count` is passed in because it is counted from the routing
@@ -582,6 +595,25 @@ impl ComAmazonawsRoute53recoverycontrolconfigRoute53recoverycontrolconfigState {
             rule.control_panel_arn == control_panel_arn
                 && rule.name == name
                 && except_arn.is_none_or(|arn| rule.arn != arn)
+        })
+    }
+
+    /// Whether `cluster_arn` already holds a control panel called `name`, other than the
+    /// panel `except_arn` names.
+    ///
+    /// A control panel's name identifies it within its cluster, so this is what the create
+    /// and the rename both ask before taking a name. Scanned in place: no ordering is
+    /// needed to answer it.
+    pub fn control_panel_name_taken(
+        &self,
+        cluster_arn: &str,
+        name: &str,
+        except_arn: Option<&str>,
+    ) -> bool {
+        self.control_panels.values().any(|panel| {
+            panel.cluster_arn == cluster_arn
+                && panel.name == name
+                && except_arn.is_none_or(|arn| panel.arn != arn)
         })
     }
 

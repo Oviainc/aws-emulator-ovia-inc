@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateControlPanel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateControlPanel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: writes the name the request carries onto the stored control panel the ARN
+//! identifies - the only thing this operation changes, as its documentation states - and
+//! answers with the SAME stored record `DescribeControlPanel` projects.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateControlPanel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A rename is a configuration change the cluster has to deploy, so the record's
+//! deployment becomes due again and the panel reads `PENDING` right after this call and
+//! `DEPLOYED` once that instant has passed. A request naming the name the panel already
+//! carries changes nothing, so it does not restart that deployment.
+//!
+//! A panel's name identifies it inside its cluster, so a rename onto a name another panel
+//! of the same cluster holds is refused the way the create states it (400); an ARN holding
+//! no control panel is `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +158,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateControlPanel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateControlPanelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateControlPanel"))
+        let _ = ctx;
+        // The authorization check this service's ARN-addressed operations share: decided
+        // from the request alone, so it runs before the ARN is looked up.
+        crate::state::authorize_resource_arn(Self::NAME, &input.control_panel_arn)
+            .map_err(UpdateControlPanelErrorModeled::AccessDeniedException)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateControlPanelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the route53-recovery-control-config store is unavailable on this \
+                              engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        // One read of the addressed panel, for the cluster its name is scoped to; taken
+        // before the record is borrowed mutably.
+        let Some(cluster_arn) = guard
+            .control_panels
+            .get(&input.control_panel_arn)
+            .map(|record| record.cluster_arn.clone())
+        else {
+            return Err(panel_not_found(&input.control_panel_arn));
+        };
+
+        // The name is scoped to the panel's cluster, so a rename onto a name another panel
+        // of that cluster already holds is refused the way the create states it.
+        if guard.control_panel_name_taken(
+            &cluster_arn,
+            &input.control_panel_name,
+            Some(&input.control_panel_arn),
+        ) {
+            return Err(UpdateControlPanelErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::already_exists_message(
+                        crate::state::CONTROL_PANEL_RESOURCE,
+                        &input.control_panel_name,
+                        crate::state::CLUSTER_RESOURCE,
+                        &cluster_arn,
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let Some(record) = guard.control_panels.get_mut(&input.control_panel_arn) else {
+            return Err(panel_not_found(&input.control_panel_arn));
+        };
+
+        // The name is the only thing this operation changes, and `set_name` owns both
+        // halves of the rename, so the written name cannot be seen without the deployment
+        // it makes due.
+        record.set_name(input.control_panel_name);
+
+        // Answer from the STORED record, with the routing-control count read back out of
+        // state, so this body is what `DescribeControlPanel` answers with afterwards.
+        let count = guard.routing_control_count(&input.control_panel_arn);
+        Ok(UpdateControlPanelOutput {
+            control_panel: guard
+                .control_panels
+                .get(&input.control_panel_arn)
+                .map(|record| record.to_control_panel(count)),
+        })
     }
 }
+
+/// The 404 an ARN holding no control panel is refused with, in the one sentence this
+/// service words every such refusal as.
+fn panel_not_found(arn: &str) -> UpdateControlPanelError {
+    UpdateControlPanelErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::not_found_message(crate::state::CONTROL_PANEL_NOUN, arn),
+    })
+    .into()
+}
+

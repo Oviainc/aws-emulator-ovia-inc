@@ -143,6 +143,14 @@ fn control_panel_cases(panel_arn: &str) -> Vec<Case> {
             noun: "control panel",
             requested_arn: panel_arn.to_string(),
         },
+        Case {
+            label: format!("UpdateControlPanel({panel_arn})"),
+            method: "PUT",
+            path: "/controlpanel".to_string(),
+            body: Some(json!({ "ControlPanelArn": panel_arn, "ControlPanelName": "renamed" })),
+            noun: "control panel",
+            requested_arn: panel_arn.to_string(),
+        },
     ]
 }
 

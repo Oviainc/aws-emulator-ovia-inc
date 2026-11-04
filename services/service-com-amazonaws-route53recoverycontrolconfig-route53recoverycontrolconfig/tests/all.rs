@@ -35,3 +35,5 @@ mod safety_rules;
 mod state_roundtrip;
 #[path = "all/update_cluster.rs"]
 mod update_cluster;
+#[path = "all/update_control_panel.rs"]
+mod update_control_panel;

@@ -173,6 +173,14 @@ fn cases_for(cluster_arn: &str, own_cluster_arn: &str) -> Vec<Case> {
             resource: panel_arn.clone(),
         },
         Case {
+            label: format!("UpdateControlPanel({panel_arn})"),
+            method: "PUT",
+            path: "/controlpanel".to_string(),
+            body: Some(json!({ "ControlPanelArn": panel_arn, "ControlPanelName": "renamed" })),
+            action: "UpdateControlPanel",
+            resource: panel_arn.clone(),
+        },
+        Case {
             label: format!("DescribeRoutingControl({control_arn})"),
             method: "GET",
             path: format!("/routingcontrol/{}", enc(&control_arn)),
