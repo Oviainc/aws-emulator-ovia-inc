@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCloudConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCloudConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mint a cloud connector — the write half of this service's cloud connector slice.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCloudConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it persists is read back by `GetCloudConnector` and changed by
+//! `UpdateCloudConnector`; all three reach the one store in
+//! [`crate::state::cloud_connectors`]. The connector is held at the Region whose
+//! endpoint created it, under a server-generated `CloudConnectorId`
+//! ([`crate::state::cloud_connectors::new_cloud_connector_id`]) — no input member
+//! carries an id, so two identical creates are two connectors.
+//!
+//! `CreatedAt` and `UpdatedAt` are both when this call ran; every other member a read
+//! reports is what this request supplied. The store is bounded
+//! ([`crate::state::cloud_connectors::MAX_CLOUD_CONNECTORS`]): a create past that
+//! ceiling is refused with `ServiceQuotaExceededException` and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +164,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCloudConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCloudConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCloudConnector"))
+        // Every member's length and pattern — the display name, the IAM role ARN, the
+        // Config connector ARN, the description — is a MODELLED constraint the
+        // centralized walk has already refused anything outside of, and the required
+        // ones are present by the same walk.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateCloudConnectorErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the cloud connector store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The store is BOUNDED: past the emulator's own ceiling a create is refused
+        // rather than admitting another record, through the modelled refusal for exactly
+        // that. The ceiling is what stops the one connector map growing for as long as
+        // creates keep arriving, and the message says whose ceiling it is.
+        if store.cloud_connectors.len() >= crate::state::cloud_connectors::MAX_CLOUD_CONNECTORS {
+            return Err(
+                CreateCloudConnectorErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: crate::state::cloud_connectors::cloud_connector_ceiling_message(),
+                        // Nothing was created, so the resource that reached the ceiling is
+                        // the account holding the connectors.
+                        resource_id: Some(::engine::emulator_account_id().to_string()),
+                        resource_type: Some(
+                            crate::state::cloud_connectors::CLOUD_CONNECTOR_RESOURCE_TYPE
+                                .to_string(),
+                        ),
+                        // This service's own code, which is its signing name, endpoint
+                        // prefix and ARN namespace alike.
+                        service_code: crate::state::ARN_SERVICE.to_string(),
+                        // `QuotaCode` is `@required`, and the ceiling this reports is the
+                        // EMULATOR's own: the code names what it bounds rather than
+                        // claiming an identifier Service Quotas issues, which this
+                        // emulator does not model.
+                        quota_code: "EmulatorCloudConnectorsPerAccount".to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::cloud_connectors::CloudConnectorRecord {
+            // The id is the SERVICE's to choose: no input member carries one.
+            id: crate::state::cloud_connectors::new_cloud_connector_id(),
+            region,
+            display_name: input.display_name,
+            description: input.description,
+            role_arn: input.role_arn,
+            config_connector_arn: input.config_connector_arn,
+            configuration: input.configuration,
+            tags: crate::state::to_btree_map(input.tags),
+            created_at: now,
+            // Nothing has updated the connector yet, so it was last written when it was
+            // created.
+            updated_at: now,
+        };
+        let id = record.id.clone();
+        store.insert_cloud_connector(record);
+
+        // "The ID of the cloud connector that was created": the id this call minted,
+        // which is the key the connector is now held under.
+        Ok(CreateCloudConnectorOutput {
+            cloud_connector_id: Some(id),
+        })
     }
 }
