@@ -36,12 +36,14 @@ use std::time::{Duration, SystemTime};
 use serde_json::json;
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
     ServiceSoftware, SoftwareDeployment, DOMAIN_NOT_AVAILABLE_FOR_UPDATE, MAINTAINABLE_DATA_NODES,
-    MAINTENANCE_LISTING_NOT_FOUND_STATUS, NODE_INFORMATION_UNAVAILABLE, NODE_TYPE_DATA,
-    PROCESSING_STATUS_CREATING, PROCESSING_STATUS_MODIFYING,
-    PROCESSING_STATUS_UPDATING_SERVICE_SOFTWARE, PROCESSING_STATUS_UPGRADING_ENGINE_VERSION,
+    NODE_INFORMATION_UNAVAILABLE, NODE_TYPE_DATA, PROCESSING_STATUS_CREATING,
+    PROCESSING_STATUS_MODIFYING, PROCESSING_STATUS_UPDATING_SERVICE_SOFTWARE,
+    PROCESSING_STATUS_UPGRADING_ENGINE_VERSION,
 };
 
-use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX, SETTLE_WAIT};
+use super::domain_lifecycle::{
+    error_code, string_member, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS, SETTLE_WAIT,
+};
 use super::service_software_update::{seed, with_update_available};
 
 /// How far out a held record's due instants are pushed: long enough that no case
@@ -401,7 +403,7 @@ async fn a_domain_with_work_in_flight_refuses_every_call_that_needs_a_quiet_one(
         // its shape declares.
         assert_refusal(
             &maintenances(&emulator, name).await,
-            MAINTENANCE_LISTING_NOT_FOUND_STATUS,
+            RECORDED_NOT_FOUND_STATUS,
             "ResourceNotFoundException",
             INVALID_NODE_ID,
             &format!("ListDomainMaintenances({work:?})"),

@@ -15,6 +15,11 @@
 //! own wording for one is not published, and the status itself is reported in
 //! `Status`, so none is invented.
 //!
+//! A name this account holds no domain under is refused with the GENERIC envelope this
+//! operation models beside its not-found error, as every READ of a domain's
+//! maintenance and observability state is; the `MaintenanceId` of a domain it DOES
+//! hold resolves an action or is the modelled missing-resource refusal.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -171,9 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting the action materialises only what the clock already owed at
         // `now`: a step whose span has passed has happened whether or not anybody
         // asked. Nothing else about the record changes on a read.
+        //
+        // A name this account holds no domain under is refused with the GENERIC
+        // envelope this operation models beside its not-found error — the one recorded
+        // for the maintenance READS of an absent domain, as for the sibling listing
+        // ([`crate::ops::list_domain_maintenances`]) and the observability reads.
         let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
-            GetDomainMaintenanceStatusErrorModeled::ResourceNotFoundException(
-                crate::state::domain_not_found(&input.domain_name),
+            GetDomainMaintenanceStatusErrorModeled::BaseException(
+                crate::state::domain_not_found_base(&input.domain_name),
             )
         })?;
 

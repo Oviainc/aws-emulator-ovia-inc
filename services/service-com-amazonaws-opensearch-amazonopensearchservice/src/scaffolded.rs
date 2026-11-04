@@ -177,6 +177,19 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The HTTP status this service answers the missing-resource refusals BELOW with.
+///
+/// The model annotates `ResourceNotFoundException` with `@httpError(409)`, which is
+/// the status the shape renders by default; the recorded wire answer of each refusal
+/// that reaches for this is HTTP 404. What a client sees is the requirement and no
+/// modeled annotation can express it, so the status is stated once here and named at
+/// each refusal that carries it ([`Scaffolded::not_found`]).
+///
+/// It is NOT applied to every refusal of the shape: which operations' refusals the
+/// recordings cover is what the evidence bounds, and the status of the rest is their
+/// own open question.
+pub const RESOURCE_NOT_FOUND_STATUS: u16 = 404;
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -190,11 +203,11 @@ pub enum Scaffolded<E> {
     ///
     /// The error code and the body are the model's own; only the HTTP status is the
     /// handler's. This service annotates `ResourceNotFoundException` with
-    /// `@httpError(409)`, and the recorded wire answer for some of the operations
-    /// that raise it is HTTP 404 — which no modeled annotation can express. Reach for
-    /// this ONLY with recorded evidence of the status the service answers with, and
-    /// cite that evidence where you construct it: a status chosen without evidence
-    /// silently contradicts the model.
+    /// `@httpError(409)` while the recorded wire answer of the refusals that reach for
+    /// [`Scaffolded::not_found`] is HTTP 404 — which no modeled annotation can express.
+    /// Reach for this ONLY with recorded evidence of the status the service answers
+    /// with, and cite that evidence where you construct it: a status chosen without
+    /// evidence silently contradicts the model.
     ModeledWithStatus { error: E, status: u16 },
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -219,6 +232,15 @@ impl<E> Scaffolded<E> {
     /// declares. See [`Scaffolded::ModeledWithStatus`].
     pub fn modeled_with_status(error: E, status: u16) -> Self {
         Self::ModeledWithStatus { error, status }
+    }
+
+    /// Answer `error` — a MISSING-RESOURCE refusal whose recorded wire answer is
+    /// [`RESOURCE_NOT_FOUND_STATUS`] — on that status rather than the shape's own.
+    ///
+    /// One place states the status, so the refusals that carry it cannot drift apart;
+    /// cite the recorded refusal where you call this.
+    pub fn not_found(error: E) -> Self {
+        Self::modeled_with_status(error, RESOURCE_NOT_FOUND_STATUS)
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.

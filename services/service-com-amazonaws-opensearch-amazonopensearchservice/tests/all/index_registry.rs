@@ -32,7 +32,9 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::INDEX_
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::INDEX_STATUS_CREATED;
 
 use super::data_source_registry::created_domain;
-use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX};
+use super::domain_lifecycle::{
+    error_code, string_member, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS,
+};
 
 /// `CreateIndex`: `POST /opensearch/domain/{DomainName}/index`. A sibling suite drives
 /// the same path for the creates it refuses, rather than growing a second copy of it.
@@ -477,10 +479,12 @@ async fn both_operations_refuse_a_domain_or_an_index_the_store_does_not_hold() {
         )
         .await;
         assert_eq!(
-            create_answer.status, 409,
-            "case CreateIndex({domain:?}): expected 409 for a domain the store does not hold, \
-             got {} with {:?}",
-            create_answer.status, create_answer.body
+            create_answer.status,
+            RECORDED_NOT_FOUND_STATUS,
+            "case CreateIndex({domain:?}): expected {RECORDED_NOT_FOUND_STATUS} for a domain the \
+             store does not hold, got {} with {:?}",
+            create_answer.status,
+            create_answer.body
         );
         assert_eq!(
             error_code(&create_answer),

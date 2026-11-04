@@ -45,6 +45,14 @@ pub(crate) const DEFAULT_ACCESS_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
 /// shorter) to have fallen due, so the next read materialises the settled record.
 pub(crate) const SETTLE_WAIT: Duration = Duration::from_millis(3_300);
 
+/// The HTTP status this service's RECORDED wire answer carries a missing-resource
+/// refusal on, where the shape's own `@httpError(409)` is not what a client sees.
+///
+/// Stated here, independently of the constant the implementation decides it by, so an
+/// expectation asserts the recorded status rather than whatever the handler currently
+/// answers: a change to that constant moves no expectation with it.
+pub(crate) const RECORDED_NOT_FOUND_STATUS: u16 = 404;
+
 /// One emulator with this service mounted on a fresh shared engine.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,

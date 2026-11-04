@@ -41,7 +41,9 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 };
 
 use super::data_source_attachments::application;
-use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX};
+use super::domain_lifecycle::{
+    error_code, string_member, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS,
+};
 
 /// The ARN of the data source a row migrates saved objects out of, unless it names
 /// another.
@@ -741,10 +743,18 @@ async fn an_id_naming_no_job_is_refused() {
 
     for (case, held_by, pinned) in rows {
         let answer = get_migration(&emulator, &case).await;
+        // The refusal for an APPLICATION this account does not hold is answered on the
+        // status this service's recorded wire answer carries it on; the refusal for a
+        // JOB of an application it DOES hold is covered by no recording, so it keeps the
+        // status its shape declares.
+        let expected_status = match held_by {
+            Some(_) => 409,
+            None => RECORDED_NOT_FOUND_STATUS,
+        };
         assert_eq!(
             (answer.status, error_code(&answer).as_str()),
-            (409, "ResourceNotFoundException"),
-            "case {case:?}: expected 409 ResourceNotFoundException, got {} with {:?}",
+            (expected_status, "ResourceNotFoundException"),
+            "case {case:?}: expected {expected_status} ResourceNotFoundException, got {} with {:?}",
             answer.status,
             answer.body
         );

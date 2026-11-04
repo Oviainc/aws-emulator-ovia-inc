@@ -198,8 +198,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(CreateIndexErrorModeled::AccessDeniedException)?;
 
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An index belongs to a domain, and the domain the request URI addresses is
+        // resolved BEFORE this handler's own rules about the request body are applied:
+        // a name the store holds no domain for addresses nothing those rules could be
+        // about, so it is the missing-resource refusal whatever the body carries.
+        // `settled_mut` first materialises any configuration change the clock already
+        // owes that domain, which this call neither starts nor changes. Answered on the
+        // status its recorded wire answer carries
+        // ([`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`]).
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_found(
+                CreateIndexErrorModeled::ResourceNotFoundException(crate::state::domain_not_found(
+                    &input.domain_name,
+                )),
+            )
+        })?;
+
         // The schema is a set of named sections, so a document carrying a scalar or
         // an array instead is refused rather than persisted as this index's schema.
+        // `IndexSchema` is a modelled document, so this is the service's own rule about
+        // the body rather than a constraint the request boundary enforces.
         if !matches!(input.index_schema, ::aws_smithy_types::Document::Object(_)) {
             return Err(CreateIndexErrorModeled::ValidationException(
                 crate::state::malformed_index_schema("IndexSchema"),
@@ -228,18 +248,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-
-        let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        // An index belongs to a domain, so a create against a name the store holds no
-        // domain for is the modelled not-found refusal. `settled_mut` first
-        // materialises any configuration change the clock already owes that domain,
-        // which this call neither starts nor changes.
-        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
-            CreateIndexErrorModeled::ResourceNotFoundException(crate::state::domain_not_found(
-                &input.domain_name,
-            ))
-        })?;
 
         // An index's name identifies it within its domain, so a create cannot land on
         // a name the domain already holds: the existing index keeps the schema it has

@@ -8,7 +8,8 @@
 //! The RULE under test: an operation this emulator serves answers every request with one
 //! of the answers its model declares — the modelled success status carrying an output
 //! member the model allows, or one of the errors the operation lists, at the HTTP status
-//! the model gives that error. No request is answered with a code outside that set, the
+//! this service answers that error on. No request is answered with a code outside that
+//! set, the
 //! 501 of an operation nobody has written yet included: a client branches on the error
 //! code, so a code the model does not declare for the operation cannot be told apart from
 //! a service fault, and an authorization refusal in particular has to arrive as the
@@ -26,7 +27,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::INDEX_STATUS_VALUES;
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::INDEX_STATUS_UPDATED;
 
-use super::domain_lifecycle::{error_code, string_member, Answer, DEFAULT_ACCESS_KEY_ID, PREFIX};
+use super::domain_lifecycle::{
+    error_code, string_member, Answer, DEFAULT_ACCESS_KEY_ID, PREFIX, RECORDED_NOT_FOUND_STATUS,
+};
 use super::index_authorization::{
     added_property, allow, assert_refused, created_schema, Fixture, Refusal, DOMAIN, INDEX,
     SESSION_KEY_ID,
@@ -66,6 +69,10 @@ struct Row {
     /// The modelled error the row must be refused with, or `None` where the operation
     /// serves it.
     refused_with: Option<&'static str>,
+    /// The HTTP status the refusal is answered on where that is NOT the status the model
+    /// gives the error the row names — the recorded wire answer, which no modelled
+    /// annotation can express.
+    refused_on: Option<u16>,
 }
 
 /// One row per class of answer `UpdateIndex` can reach: the authorization refusal, the
@@ -81,6 +88,7 @@ fn rows() -> Vec<Row> {
             index: INDEX,
             schema: added_property(ADDED_PROPERTY, "text"),
             refused_with: Some("AccessDeniedException"),
+            refused_on: None,
         },
         Row {
             case: "a domain the store does not hold",
@@ -89,6 +97,7 @@ fn rows() -> Vec<Row> {
             index: INDEX,
             schema: added_property(ADDED_PROPERTY, "text"),
             refused_with: Some("ResourceNotFoundException"),
+            refused_on: Some(RECORDED_NOT_FOUND_STATUS),
         },
         Row {
             case: "a name that names no index of a domain the store does hold",
@@ -97,6 +106,7 @@ fn rows() -> Vec<Row> {
             index: "catalog-absent",
             schema: added_property(ADDED_PROPERTY, "text"),
             refused_with: Some("ResourceNotFoundException"),
+            refused_on: None,
         },
         Row {
             case: "an index name no index could carry",
@@ -107,6 +117,7 @@ fn rows() -> Vec<Row> {
             index: "_catalog",
             schema: added_property(ADDED_PROPERTY, "text"),
             refused_with: Some("ValidationException"),
+            refused_on: None,
         },
         Row {
             case: "a schema that is not a set of sections",
@@ -115,6 +126,7 @@ fn rows() -> Vec<Row> {
             index: INDEX,
             schema: json!(7),
             refused_with: Some("ValidationException"),
+            refused_on: None,
         },
         Row {
             case: "a schema re-typing a field the index already maps",
@@ -123,6 +135,7 @@ fn rows() -> Vec<Row> {
             index: INDEX,
             schema: added_property("title", "keyword"),
             refused_with: Some("ValidationException"),
+            refused_on: None,
         },
         Row {
             case: "the same document from a principal that may update the index",
@@ -131,6 +144,7 @@ fn rows() -> Vec<Row> {
             index: INDEX,
             schema: added_property(ADDED_PROPERTY, "text"),
             refused_with: None,
+            refused_on: None,
         },
     ]
 }
@@ -155,8 +169,9 @@ async fn update_as(
 }
 
 /// Assert `answer` is an answer the model declares for `UpdateIndex`: `expected` names the
-/// error code the row must be refused with, or is `None` for the row the operation serves.
-fn assert_modelled_answer(answer: &Answer, case: &str, expected: Option<&str>) {
+/// error code the row must be refused with, or is `None` for the row the operation serves;
+/// `on` names the status the refusal is answered on where that is not the model's own.
+fn assert_modelled_answer(answer: &Answer, case: &str, expected: Option<&str>, on: Option<u16>) {
     let Some(code) = expected else {
         assert_eq!(
             answer.status, SUCCESS_STATUS,
@@ -188,9 +203,11 @@ fn assert_modelled_answer(answer: &Answer, case: &str, expected: Option<&str>) {
         answer.body
     );
     assert_eq!(
-        answer.status, *modelled_status,
-        "case {case:?}: expected the status the model gives {answered}, got {} with {:?}",
-        answer.status, answer.body
+        answer.status,
+        on.unwrap_or(*modelled_status),
+        "case {case:?}: expected the status this service answers {answered} on, got {} with {:?}",
+        answer.status,
+        answer.body
     );
 }
 
@@ -217,7 +234,7 @@ async fn every_update_answer_is_one_the_model_declares_for_the_operation() {
             &row.schema,
         )
         .await;
-        assert_modelled_answer(&answer, row.case, row.refused_with);
+        assert_modelled_answer(&answer, row.case, row.refused_with, row.refused_on);
 
         // The authorization refusal is IAM's own: it names the principal, the action it
         // asked about and the resource the request addressed.

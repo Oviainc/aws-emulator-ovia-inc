@@ -193,9 +193,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(UpdateIndexErrorModeled::AccessDeniedException)?;
 
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An index belongs to a domain, and the domain the request URI addresses is
+        // resolved BEFORE this handler's own rules about the request body are applied:
+        // a name the store holds no domain for addresses nothing those rules could be
+        // about, so it is the missing-resource refusal whatever the body carries.
+        // `settled_mut` first materialises any configuration change the clock already
+        // owes that domain, which this call neither starts nor changes. Answered on the
+        // status its recorded wire answer carries
+        // ([`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`]).
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_found(
+                UpdateIndexErrorModeled::ResourceNotFoundException(crate::state::domain_not_found(
+                    &input.domain_name,
+                )),
+            )
+        })?;
+
         // The schema is a set of named sections, so a document carrying a scalar or
         // an array instead names no change to make and is refused rather than
-        // becoming this index's schema.
+        // becoming this index's schema. `IndexSchema` is a modelled document, so this
+        // is the service's own rule about the body rather than a constraint the
+        // request boundary enforces.
         if !matches!(input.index_schema, ::aws_smithy_types::Document::Object(_)) {
             return Err(UpdateIndexErrorModeled::ValidationException(
                 crate::state::malformed_index_schema("IndexSchema"),
@@ -222,17 +242,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        // An index belongs to a domain, so an update against a name the store holds
-        // no domain for is the modelled not-found refusal. `settled_mut` first
-        // materialises any configuration change the clock already owes that domain,
-        // which this call neither starts nor changes.
-        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
-            UpdateIndexErrorModeled::ResourceNotFoundException(crate::state::domain_not_found(
-                &input.domain_name,
-            ))
-        })?;
         // An index is served by the CLUSTER, so every file its analysis settings name
         // has to be there to be read: each path they name under a custom package's
         // mount point is resolved against the packages this domain holds in place, and

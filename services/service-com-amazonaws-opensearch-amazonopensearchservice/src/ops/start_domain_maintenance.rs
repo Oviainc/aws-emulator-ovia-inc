@@ -171,23 +171,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state =
             crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
 
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The domain the request URI addresses is resolved BEFORE this handler's own
+        // rules about the request are applied: a name this account holds no domain
+        // under addresses nothing for those rules to be about, so it is the
+        // missing-resource refusal whatever else the request carries — answered on the
+        // status its recorded wire answer carries
+        // ([`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`]).
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_found(
+                StartDomainMaintenanceErrorModeled::ResourceNotFoundException(
+                    crate::state::domain_not_found(&input.domain_name),
+                ),
+            )
+        })?;
+
         // "Starts the node maintenance process on the data node": the action runs on
-        // one node, so a request that names none names nothing to act on.
+        // one node, so a request that names none names nothing to act on. `NodeId` is
+        // an OPTIONAL member of the modelled input, so this is the service's own rule
+        // rather than a constraint the request boundary enforces, and it is therefore
+        // applied to a request that addresses a domain this account holds.
         let Some(node_id) = input.node_id.as_deref() else {
             return Err(StartDomainMaintenanceErrorModeled::ValidationException(
                 crate::state::node_id_required(),
             )
             .into());
         };
-
-        let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-
-        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
-            StartDomainMaintenanceErrorModeled::ResourceNotFoundException(
-                crate::state::domain_not_found(&input.domain_name),
-            )
-        })?;
 
         // The node has to be one of this domain's data nodes, and its role has to be
         // able to lose it; any other id names no node this service can maintain. A

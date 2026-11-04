@@ -463,7 +463,11 @@ fn the_es_endpoint_serves_both_api_versions() {
                     method: "GET",
                     path: "/2021-01-01/opensearch/app-migrations/router-migration-id",
                     body: None,
-                    expected_status: 409,
+                    // The status this service's recorded wire answer carries that
+                    // refusal on, which the modern model's own `@httpError(409)` is not
+                    // (`service_com_amazonaws_opensearch_amazonopensearchservice::
+                    // scaffolded::RESOURCE_NOT_FOUND_STATUS`).
+                    expected_status: 404,
                     expected_error: Some("ResourceNotFoundException"),
                     expected_contains: &["Application router not found"],
                     expected_absent: &[],

@@ -22,9 +22,9 @@
 //!   expression — for `IndexName`, whose pattern the request boundary cannot run;
 //! * a `migrationId` that names neither an application nor a job is refused as the
 //!   malformed value it is, over a table of ways to fail the form;
-//! * the observability reads of a domain this account does not hold answer the GENERIC
-//!   envelope those four operations model, while the scheduled-action listing beside
-//!   them answers its modelled not-found.
+//! * the observability and maintenance READS of a domain this account does not hold
+//!   answer the GENERIC envelope those operations model, while the scheduled-action
+//!   listing beside them answers its modelled not-found.
 
 use serde_json::json;
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
@@ -36,7 +36,9 @@ use super::data_source_attachments::{
     application, attach, describe_attachment, list_attachments,
 };
 use super::data_source_registry::created_domain;
-use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX, SETTLE_WAIT};
+use super::domain_lifecycle::{
+    error_code, string_member, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS, SETTLE_WAIT,
+};
 use super::index_registry::{create as create_index, get as get_index, stored_names};
 use super::migration_listing::list_migrations;
 use super::saved_object_migrations::get_migration;
@@ -53,8 +55,9 @@ fn absent_application_ids() -> Vec<String> {
     ]
 }
 
-/// The error message of a refused answer.
-fn message(answer: &Answer) -> String {
+/// The error message of a refused answer. Shared with the suites that assert the
+/// refusals of other surfaces in this crate.
+pub(crate) fn message(answer: &Answer) -> String {
     answer.body["message"]
         .as_str()
         .or_else(|| answer.body["Message"].as_str())
@@ -485,7 +488,7 @@ async fn a_migration_id_that_names_no_migration_is_refused_as_malformed() {
         let expected = format!("Application {application_id} not found");
         assert_eq!(
             (answer.status, error_code(&answer).as_str()),
-            (409, "ResourceNotFoundException"),
+            (RECORDED_NOT_FOUND_STATUS, "ResourceNotFoundException"),
             "case GetMigration({id:?}): expected the modelled not-found, got {} with {:?}",
             answer.status,
             answer.body
@@ -522,8 +525,8 @@ async fn the_observability_reads_of_an_absent_domain_answer_the_generic_envelope
 
     for name in ["wording-absent", deleted] {
         let not_found = format!("Domain not found: {name}");
-        // (operation, the request, the status, the code, the sentence). The four reads
-        // that answer the generic envelope, and the scheduled-action listing beside them
+        // (operation, the request, the status, the code, the sentence). The reads that
+        // answer the generic envelope, and the scheduled-action listing beside them
         // that answers its modelled not-found.
         let rows: Vec<(&str, String, u16, &str, &str)> = vec![
             (
@@ -543,6 +546,19 @@ async fn the_observability_reads_of_an_absent_domain_answer_the_generic_envelope
             (
                 "ListDomainMaintenances",
                 format!("{PREFIX}/opensearch/domain/{name}/domainMaintenances"),
+                400,
+                "BaseException",
+                not_found.as_str(),
+            ),
+            (
+                // The sibling READ of ONE action: `MaintenanceId` is `@required`, so the
+                // row names one — the domain is what resolves to nothing, and that is
+                // what the answer is about.
+                "GetDomainMaintenanceStatus",
+                format!(
+                    "{PREFIX}/opensearch/domain/{name}/domainMaintenance\
+                     ?maintenanceId=00000000-0000-0000-0000-000000000000"
+                ),
                 400,
                 "BaseException",
                 not_found.as_str(),

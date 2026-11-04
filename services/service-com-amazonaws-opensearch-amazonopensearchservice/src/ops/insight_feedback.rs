@@ -189,6 +189,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `InsightId` targets `GUID`, whose own pattern is 8-4-4-4-12 hexadecimal
+        // groups. The request boundary enforces the length bound but not the pattern, so
+        // a value of the right length that is no `GUID` is refused here with the SAME
+        // constraint report a boundary refusal states — before anything is resolved, so
+        // a value no insight id could have is never reported as an insight that merely
+        // does not exist. The same check the detail read of one insight makes.
+        if !crate::state::is_guid(&input.insight_id) {
+            return Err(InsightFeedbackErrorModeled::ValidationException(
+                crate::state::malformed_guid("InsightId", &input.insight_id),
+            )
+            .into());
+        }
+
         // "Optional text feedback providing additional details about the insight.
         // Maximum length is 1000 characters": text past that bound is refused rather
         // than recorded in part, and its length is measured in the characters the bound

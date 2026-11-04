@@ -38,7 +38,9 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 };
 
 use super::data_source_registry::created_domain;
-use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX};
+use super::domain_lifecycle::{
+    error_code, string_member, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS,
+};
 use super::index_registry::{create as create_index_call, created_index, get as get_index, stored_names};
 
 /// `UpdateIndex`: `PUT /opensearch/domain/{DomainName}/index/{IndexName}`. A sibling
@@ -1007,10 +1009,12 @@ async fn an_update_refuses_what_the_store_does_not_hold_and_a_malformed_request(
     for domain in ["never-created", "also-never-created"] {
         let answer = update(&emulator, domain, "present-index", &change).await;
         assert_eq!(
-            answer.status, 409,
-            "case UpdateIndex({domain:?}): expected 409 for a domain the store does not hold, got \
-             {} with {:?}",
-            answer.status, answer.body
+            answer.status,
+            RECORDED_NOT_FOUND_STATUS,
+            "case UpdateIndex({domain:?}): expected {RECORDED_NOT_FOUND_STATUS} for a domain the \
+             store does not hold, got {} with {:?}",
+            answer.status,
+            answer.body
         );
         assert_eq!(
             error_code(&answer),

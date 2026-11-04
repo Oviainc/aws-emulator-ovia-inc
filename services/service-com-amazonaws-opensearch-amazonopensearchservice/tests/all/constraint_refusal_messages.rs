@@ -576,6 +576,32 @@ async fn a_constraint_checked_after_the_boundary_states_the_same_report() {
             None,
             "reservedInstanceId",
         ),
+        (
+            // The id a detail read addresses one insight by, judged for its shape before
+            // the address it belongs to is resolved — so the entity the row names needs
+            // to hold nothing for the clause to be the answer.
+            "an insight id naming the insight to detail",
+            "POST",
+            format!("{PREFIX}/opensearch/insight-details"),
+            Some(json!({
+                "Entity": { "Type": "Account" },
+                "InsightId": MALFORMED_GUID,
+            })),
+            "insightId",
+        ),
+        (
+            // The same id on the submission that RATES one insight: one shape rule for
+            // both operations that address an insight by id.
+            "an insight id naming the insight to rate",
+            "POST",
+            format!("{PREFIX}/opensearch/insight-feedback"),
+            Some(json!({
+                "Entity": { "Type": "DomainName", "Value": WELL_FORMED_DOMAIN },
+                "InsightId": MALFORMED_GUID,
+                "Thumbs": "Up",
+            })),
+            "insightId",
+        ),
     ];
 
     for (case, method, uri, body, path) in rows {

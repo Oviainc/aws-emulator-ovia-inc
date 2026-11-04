@@ -135,6 +135,8 @@ mod instance_type_limits;
 mod migration_listing;
 #[path = "all/migration_source_constraint.rs"]
 mod migration_source_constraint;
+#[path = "all/missing_resource_refusals.rs"]
+mod missing_resource_refusals;
 #[path = "all/package_association_listings.rs"]
 mod package_association_listings;
 #[path = "all/package_associations.rs"]
