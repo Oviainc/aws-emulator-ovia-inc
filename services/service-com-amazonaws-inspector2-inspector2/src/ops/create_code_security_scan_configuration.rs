@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCodeSecurityScanConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCodeSecurityScanConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCodeSecurityScanConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a scan configuration ARN, stores the configuration exactly as it
+//! was sent, and returns that ARN. `GetCodeSecurityScanConfiguration` reads the record
+//! back and `DeleteCodeSecurityScanConfiguration` removes it.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +160,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCodeSecurityScanConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCodeSecurityScanConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCodeSecurityScanConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateCodeSecurityScanConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "Amazon Inspector code security scan configuration state is \
+                              unavailable"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // The owner segment of a `ScanConfigurationArn` is either a 12-digit account or an
+        // organization id, and this emulator presents exactly one account and has recorded
+        // no organization id, so a configuration of either level is owned by that account —
+        // the account form the ARN pattern admits — rather than by an organization nothing
+        // has recorded.
+        let owner_id = ::engine::emulator_account_id().to_string();
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        // The store grows by one record per create and only the delete removes one, so the
+        // number of stored configurations is capped. Refused with the operation's own
+        // modelled quota error, BEFORE the ARN is minted, so a refused request neither
+        // stores a record nor consumes an id.
+        if guard.code_security_scan_configurations.len()
+            >= crate::state::MAX_STORED_CODE_SECURITY_SCAN_CONFIGURATIONS
+        {
+            return Err(
+                CreateCodeSecurityScanConfigurationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "You have reached the limit of {} code security scan \
+                             configurations. Delete a scan configuration and try again.",
+                            crate::state::MAX_STORED_CODE_SECURITY_SCAN_CONFIGURATIONS
+                        ),
+                        resource_id: owner_id,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let arn = guard.mint_code_security_scan_configuration_arn(&region, &owner_id);
+        guard.code_security_scan_configurations.insert(
+            arn.clone(),
+            crate::state::StoredCodeSecurityScanConfiguration {
+                arn: arn.clone(),
+                owner_id,
+                name: input.name,
+                level: input.level,
+                configuration: input.configuration,
+                // Stored as sent: a create carrying `scopeSettings` asks for a DEFAULT
+                // scan configuration and one without it for a general one, so the absence
+                // is kept rather than filled in with a scope the caller did not ask for.
+                scope_settings: input.scope_settings,
+                tags: input.tags.map(|tags| tags.into_iter().collect()),
+                created_at: now,
+                // A configuration that was never updated reports its creation instant as
+                // its last update, which is what the real service returns.
+                updated_at: now,
+            },
+        );
+
+        Ok(CreateCodeSecurityScanConfigurationOutput {
+            scan_configuration_arn: arn,
+        })
     }
 }

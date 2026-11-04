@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-inspector2-inspector2 service.
 //!
-//! Five resources live here, and every implemented operation computes its answer from
+//! Six resources live here, and every implemented operation computes its answer from
 //! them:
 //!
 //! * `accounts` — per-account Amazon Inspector enablement, written by `Enable` and read
@@ -17,13 +17,18 @@
 //!   `ListCisScanConfigurations` and removed by `DeleteCisScanConfiguration`.
 //! * `encryption_keys` — the customer managed KMS key in force per resource type and scan
 //!   type, written by `UpdateEncryptionKey` and read back by `GetEncryptionKey`.
+//! * `code_security_scan_configurations` — the code security scan configurations, keyed by
+//!   their own ARN for the same reason, written by
+//!   `CreateCodeSecurityScanConfiguration`, read back by
+//!   `GetCodeSecurityScanConfiguration` and removed by
+//!   `DeleteCodeSecurityScanConfiguration`.
 //! * `org_package_paths` — the organization-wide deep inspection custom paths both deep
 //!   inspection reads report alongside an account's own.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{FilterCriteria, Schedule};
+use crate::ops::types::{CodeSecurityScanConfiguration, FilterCriteria, Schedule, ScopeSettings};
 
 /// The region a request is scoped to when it carries no SigV4 credential scope to read
 /// one from: the region every generated emulator defaults to (see `emulator_arn` in
@@ -88,6 +93,14 @@ pub const MAX_STORED_FILTERS: usize = 1_000;
 /// no quota error, so the refusal is its `ValidationException`
 /// ([`too_many_cis_scan_configurations_message`]).
 pub const MAX_STORED_CIS_SCAN_CONFIGURATIONS: usize = 1_000;
+
+/// The most code security scan configurations this emulator stores before refusing to
+/// mint another, so a caller looping `CreateCodeSecurityScanConfiguration` cannot grow the
+/// process heap without bound. That operation models
+/// `ServiceQuotaExceededException` precisely because the real service caps scan
+/// configurations per account too; this is the emulator's own bound, of the same order as
+/// the filter bound above.
+pub const MAX_STORED_CODE_SECURITY_SCAN_CONFIGURATIONS: usize = 1_000;
 
 /// The refusal text for a `CreateCisScanConfiguration` that would take the number of
 /// stored CIS scan configurations past [`MAX_STORED_CIS_SCAN_CONFIGURATIONS`].
@@ -177,6 +190,35 @@ pub struct StoredCisScanConfiguration {
     /// map when it carried an empty one, so a read renders back exactly what was stored.
     /// Sorted so the rendering order is stable.
     pub tags: Option<BTreeMap<String, String>>,
+}
+
+/// One stored code security scan configuration: exactly what
+/// `CreateCodeSecurityScanConfiguration` was given, plus the ARN the service minted, the
+/// owner it was created under and the two timestamps the service maintains for it.
+#[derive(Debug, Clone)]
+pub struct StoredCodeSecurityScanConfiguration {
+    /// The minted ARN; also this record's key in
+    /// [`ComAmazonawsInspector2Inspector2State::code_security_scan_configurations`].
+    pub arn: String,
+    /// The owner the configuration was created under, as the ARN's `owner/` segment and
+    /// `CodeSecurityScanConfigurationSummary$ownerAccountId` report it.
+    pub owner_id: String,
+    pub name: String,
+    /// A `ConfigurationLevel` token: `ACCOUNT` or `ORGANIZATION`.
+    pub level: String,
+    /// The scan settings as sent — the rule set categories and the periodic and
+    /// continuous-integration settings — so a read renders back exactly what was stored.
+    pub configuration: CodeSecurityScanConfiguration,
+    /// The scope settings as sent: `None` for a general scan configuration, and present
+    /// for a default one, which is the distinction the create's `scopeSettings` member
+    /// draws.
+    pub scope_settings: Option<ScopeSettings>,
+    /// The tags as sent: `None` when the request carried no `tags` member, and an empty
+    /// map when it carried an empty one, so a read renders back exactly what was stored.
+    /// Sorted so the rendering order is stable.
+    pub tags: Option<BTreeMap<String, String>>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
 }
 
 /// One account's Amazon Inspector deep inspection configuration for Amazon EC2.
@@ -332,6 +374,14 @@ pub struct ComAmazonawsInspector2Inspector2State {
     pub cis_scan_configurations: BTreeMap<String, StoredCisScanConfiguration>,
     /// Monotonic source for the id segment of a minted CIS scan configuration ARN.
     pub next_cis_scan_configuration_id: u64,
+    /// Stored code security scan configurations, keyed by ARN. Bounded by
+    /// [`MAX_STORED_CODE_SECURITY_SCAN_CONFIGURATIONS`]:
+    /// `CreateCodeSecurityScanConfiguration` refuses once the map holds that many, and
+    /// only `DeleteCodeSecurityScanConfiguration` removes one.
+    pub code_security_scan_configurations: BTreeMap<String, StoredCodeSecurityScanConfiguration>,
+    /// Monotonic source for the id segment of a minted code security scan configuration
+    /// ARN.
+    pub next_code_security_scan_configuration_id: u64,
     /// The customer managed KMS key in force for one `ResourceType` / `ScanType` pair —
     /// the scope Amazon Inspector configures an encryption key at, for the single account
     /// this emulator presents (neither encryption-key operation carries an account
@@ -395,6 +445,20 @@ pub fn account_view(
 /// of them reporting an empty list.
 pub fn path_list(paths: &[String]) -> Option<Vec<String>> {
     (!paths.is_empty()).then(|| paths.to_vec())
+}
+
+/// Render a stored tag map for the wire: the tags as stored when the resource carries a
+/// `tags` member at all, and the member left ABSENT when it does not — so a resource
+/// created without tags and one created with an empty map render differently, which is
+/// what each of them was sent as.
+pub fn tag_map(
+    tags: Option<&BTreeMap<String, String>>,
+) -> Option<::std::collections::HashMap<String, String>> {
+    tags.map(|tags| {
+        tags.iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    })
 }
 
 /// The scope one encryption-key setting belongs to: a `ResourceType` token and a
@@ -463,6 +527,33 @@ impl ComAmazonawsInspector2Inspector2State {
             SERVICE_NAMESPACE,
             region,
             &format!("owner/{owner_id}/cis-configuration/{id}"),
+        )
+    }
+
+    /// Mint the ARN for a new code security scan configuration:
+    /// `arn:aws:inspector2:<region>:<account>:owner/<owner>/codesecurity-configuration/<id>`.
+    ///
+    /// `ScanConfigurationArn` ends `/codesecurity-configuration/[a-f0-9-]{36}`, which is
+    /// the hyphenated UUID form the real service mints that segment in. The 16 bytes
+    /// behind it are this emulator's monotonic counter, so no two configurations of one run
+    /// collide; the UUID LAYOUT is `service_common`'s one rendering of 16 opaque bytes, so
+    /// it is not restated here.
+    pub fn mint_code_security_scan_configuration_arn(
+        &mut self,
+        region: &str,
+        owner_id: &str,
+    ) -> String {
+        self.next_code_security_scan_configuration_id += 1;
+        let counter = self.next_code_security_scan_configuration_id.to_be_bytes();
+        let mut bytes = [0u8; 16];
+        // The counter's low 56 bits, placed BELOW the byte the variant bits land in, so
+        // the layout never overwrites a digit of the counter.
+        bytes[9..].copy_from_slice(&counter[1..]);
+        let id = ::service_common::uuid_from_random_bytes(bytes);
+        ::engine::emulator_arn(
+            SERVICE_NAMESPACE,
+            region,
+            &format!("owner/{owner_id}/codesecurity-configuration/{id}"),
         )
     }
 

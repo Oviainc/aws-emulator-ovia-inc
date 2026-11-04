@@ -15,6 +15,8 @@
 mod account_disable;
 #[path = "all/cis_scan_configurations.rs"]
 mod cis_scan_configurations;
+#[path = "all/code_security_scan_configurations.rs"]
+mod code_security_scan_configurations;
 #[path = "all/ec2_deep_inspection.rs"]
 mod ec2_deep_inspection;
 #[path = "all/encryption_key.rs"]

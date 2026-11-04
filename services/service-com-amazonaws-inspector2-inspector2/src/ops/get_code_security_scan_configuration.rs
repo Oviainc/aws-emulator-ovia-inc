@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCodeSecurityScanConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCodeSecurityScanConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCodeSecurityScanConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored code security scan configuration the ARN names —
+//! everything `CreateCodeSecurityScanConfiguration` stored, plus the instants it was
+//! created and last updated at — and refuses an ARN that names no stored configuration.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +159,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCodeSecurityScanConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCodeSecurityScanConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCodeSecurityScanConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCodeSecurityScanConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "Amazon Inspector code security scan configuration state is \
+                              unavailable"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+
+        // A pure read: the answer is built from the stored record, so reporting it writes
+        // nothing and a later caller sees exactly what this one did.
+        let guard = state.lock();
+        let stored = guard
+            .code_security_scan_configurations
+            .get(&input.scan_configuration_arn)
+            .ok_or_else(|| {
+                GetCodeSecurityScanConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        // The service's own wording for a scan configuration ARN that
+                        // names nothing: the sentence states the class of failure and
+                        // nothing about the request, so it is the same for every ARN that
+                        // is not stored.
+                        message: "Scan configuration not found".to_string(),
+                    },
+                )
+            })?;
+
+        Ok(GetCodeSecurityScanConfigurationOutput {
+            scan_configuration_arn: Some(stored.arn.clone()),
+            name: Some(stored.name.clone()),
+            configuration: Some(stored.configuration.clone()),
+            level: Some(stored.level.clone()),
+            // Absent for a general scan configuration, which is what a create carrying no
+            // `scopeSettings` asks for.
+            scope_settings: stored.scope_settings.clone(),
+            created_at: Some(crate::state::timestamp(stored.created_at)),
+            last_updated_at: Some(crate::state::timestamp(stored.updated_at)),
+            // Rendered exactly as stored: absent when the create carried no `tags`, and an
+            // empty map when it carried an empty one.
+            tags: crate::state::tag_map(stored.tags.as_ref()),
+        })
     }
 }
