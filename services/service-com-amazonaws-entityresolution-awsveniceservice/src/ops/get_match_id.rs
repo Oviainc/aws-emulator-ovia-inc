@@ -11,9 +11,9 @@
 //! [`crate::state::MAX_INDEXED_RECORDS_PER_WORKFLOW`] candidate records, and the
 //! modelled rule, matching-key, input-source and schema-field maxima.
 //!
-//! Authorization is deliberately NOT emulated: the modelled `AccessDeniedException`
-//! is unreachable here, because this emulator holds no principals or policies to
-//! decide a 403 from. Every other modelled refusal is reachable.
+//! The caller's identity-based policies decide this call before anything is read
+//! ([`crate::state::authorization`]): a caller they do not allow is refused with the
+//! modelled `AccessDeniedException` (HTTP 403). Every other modelled refusal is reachable.
 //!
 //! What it reports is what the writer STORED for the record its attributes identify —
 //! both the `matchId` and the `matchRule` — never a rule re-derived here, so this
@@ -171,6 +171,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Authorization comes FIRST, before anything is read: the match index belongs to the
+        // workflow the request names, so that workflow is the resource the caller's
+        // identity-based policies have to allow this action on, else the request is refused
+        // with the modelled `AccessDeniedException` (HTTP 403) (see
+        // [`crate::state::authorization`]).
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::resource_arn(
+                &region,
+                crate::state::MATCHING_WORKFLOW_RESOURCE_TYPE,
+                &input.workflow_name,
+            ),
+        ) {
+            return Err(GetMatchIdErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetMatchIdErrorModeled::InternalServerException(InternalServerException {
                 message: Some(

@@ -143,8 +143,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Authorization comes FIRST, before anything is read: a listing addresses the
+        // account's schema mappings rather than one record ([`crate::state::authorization`]),
+        // so a caller whose identity-based policies do not allow this action over them is
+        // refused with the modelled `AccessDeniedException` (HTTP 403) and learns nothing
+        // about what the account holds.
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::resource_arn(
+                &region,
+                crate::state::SCHEMA_MAPPING_RESOURCE_TYPE,
+                crate::state::authorization::ANY_RESOURCE,
+            ),
+        ) {
+            return Err(ListSchemaMappingsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListSchemaMappingsErrorModeled::InternalServerException(InternalServerException {
                 message: Some(

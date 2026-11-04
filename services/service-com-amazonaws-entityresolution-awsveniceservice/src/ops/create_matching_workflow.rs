@@ -13,7 +13,12 @@
 //! `UpdateMatchingWorkflow` applies identically. A `roleArn` this account's IAM shows
 //! the service cannot assume is refused with the modelled `AccessDeniedException`
 //! (HTTP 403) before anything is stored ([`crate::state::role_refusal`], the one reading
-//! every write that takes a role shares).
+//! every write that takes a role shares). An `inputSourceConfig` entry whose `schemaName`
+//! names no stored schema mapping is refused with the modelled `ValidationException`
+//! (HTTP 400) naming what is missing
+//! ([`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::missing_schema_mappings`],
+//! the one reading `UpdateMatchingWorkflow` shares), so no workflow here holds a reference
+//! to a schema mapping that does not exist.
 //!
 //! ## Shape of an operation
 //!
@@ -203,6 +208,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx.parts());
+
+        // Authorization comes FIRST, before anything is minted or stored: a caller whose
+        // identity-based policies do not allow this action on the workflow the request would
+        // create is refused with the modelled `AccessDeniedException` (HTTP 403) and nothing
+        // is stored (see [`crate::state::authorization`]).
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::resource_arn(
+                &region,
+                crate::state::MATCHING_WORKFLOW_RESOURCE_TYPE,
+                &input.workflow_name,
+            ),
+        ) {
+            return Err(CreateMatchingWorkflowErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // One instant for both stamps: a workflow that has only just been created has
         // not been updated since, so `createdAt` and `updatedAt` are equal.
         let created = crate::state::now();
@@ -246,6 +273,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(
                         crate::state::messages::CREATE_MATCHING_WORKFLOW_CONFLICT.to_string(),
                     ),
+                },
+            )
+            .into());
+        }
+
+        // Every `inputSourceConfig[].schemaName` is the workflow's @required reference to a
+        // schema mapping, so each is resolved against the stored mappings BEFORE anything
+        // is minted or stored: a reference to nothing is refused with the modelled
+        // `ValidationException` (HTTP 400) naming what is missing, and no workflow is
+        // created.
+        let missing = store.missing_schema_mappings(
+            input
+                .input_source_config
+                .iter()
+                .map(|source| source.schema_name.as_str()),
+        );
+        if !missing.is_empty() {
+            return Err(CreateMatchingWorkflowErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::messages::references_missing_schema_mappings(
+                        &missing,
+                    )),
                 },
             )
             .into());

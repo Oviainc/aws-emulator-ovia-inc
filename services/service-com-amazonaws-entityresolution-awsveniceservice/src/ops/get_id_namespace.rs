@@ -185,6 +185,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         };
         let region = crate::state::request_region(ctx.parts());
+
+        // Authorization comes FIRST, before anything is read: a caller whose identity-based
+        // policies do not allow this action on the namespace the request addresses is refused
+        // with the modelled `AccessDeniedException` (HTTP 403) and learns nothing about what
+        // the account holds — not even whether the value names a namespace at all (see
+        // [`crate::state::authorization`]).
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::id_namespace_resource(
+                &region,
+                &input.id_namespace_name,
+            ),
+        ) {
+            return Err(GetIdNamespaceErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let key = crate::state::id_namespace_key(&input.id_namespace_name, &region)
             .ok_or_else(not_found)?;
 

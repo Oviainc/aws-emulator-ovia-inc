@@ -202,6 +202,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx.parts());
+
+        // Authorization comes FIRST, before anything is minted or stored: a caller whose
+        // identity-based policies do not allow this action on the workflow the request would
+        // create is refused with the modelled `AccessDeniedException` (HTTP 403) and nothing
+        // is stored (see [`crate::state::authorization`]).
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::resource_arn(
+                &region,
+                crate::state::ID_MAPPING_WORKFLOW_RESOURCE_TYPE,
+                &input.workflow_name,
+            ),
+        ) {
+            return Err(CreateIdMappingWorkflowErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // One instant for both stamps: a workflow that has only just been created has
         // not been updated since, so `createdAt` and `updatedAt` are equal.
         let created = crate::state::now();

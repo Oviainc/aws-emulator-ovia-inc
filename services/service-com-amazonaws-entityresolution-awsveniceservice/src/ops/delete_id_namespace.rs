@@ -31,14 +31,14 @@
 //! and collects it when the policy path next runs
 //! ([`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::prune_orphaned_policies`]).
 //!
-//! ## Authorization is not modelled
+//! ## Authorization
 //!
-//! The emulator verifies the request SIGNATURE centrally and evaluates no principal,
-//! IAM policy or resource-based policy, here or anywhere else in this service, so the
-//! modelled `AccessDeniedException` (403) below is not reachable from this handler: a
-//! caller whose signature the emulator accepted may delete any namespace this store
-//! holds. The destructive call is recorded instead — the attempt and its outcome,
-//! with the presented access key id — so a test can observe who asked for what.
+//! The emulator verifies the request SIGNATURE centrally, and the caller's identity-based
+//! IAM policies decide this call before anything is read or written
+//! ([`crate::state::authorization`]): a caller they do not allow is refused with the
+//! modelled `AccessDeniedException` (403) and the namespace survives. The destructive call
+//! is recorded as well — the attempt and its outcome, with the presented access key id — so
+//! a test can observe who asked for what.
 //!
 //! ## Shape of an operation
 //!
@@ -181,7 +181,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same caller. Request metadata only: nothing of the stored namespace is logged.
         let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
 
-        // The attempt, recorded before any refusal can return.
+        // The attempt, recorded before any refusal can return — the authorization decision
+        // below included.
         ::tracing::info!(
             operation = "DeleteIdNamespace",
             id_namespace_name = %input.id_namespace_name,
@@ -189,6 +190,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             outcome = "requested",
             "id namespace deletion requested"
         );
+
+        // Authorization comes FIRST, before anything is read or written: a caller whose
+        // identity-based policies do not allow this action on the namespace the request
+        // addresses is refused with the modelled `AccessDeniedException` (HTTP 403), the
+        // store is untouched, and the caller learns nothing about what the account holds
+        // (see [`crate::state::authorization`]).
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::id_namespace_resource(
+                &region,
+                &input.id_namespace_name,
+            ),
+        ) {
+            ::tracing::info!(
+                operation = "DeleteIdNamespace",
+                id_namespace_name = %input.id_namespace_name,
+                akid = %akid,
+                outcome = "AccessDeniedException",
+                "id namespace deletion refused: not authorized"
+            );
+            return Err(DeleteIdNamespaceErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ::tracing::error!(

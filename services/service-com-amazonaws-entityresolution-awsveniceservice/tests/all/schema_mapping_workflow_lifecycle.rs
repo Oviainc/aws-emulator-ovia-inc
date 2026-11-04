@@ -200,6 +200,26 @@ impl Emulator {
             .await
     }
 
+    /// Create a minimal schema mapping under `name` and assert it was stored.
+    ///
+    /// For a suite whose subject is something else: a matching-workflow write resolves
+    /// every `inputSourceConfig[].schemaName` against the stored schema mappings, so a
+    /// workflow seeded with a reference needs the mapping it names to exist.
+    pub(crate) async fn seed_schema_mapping(&self, name: &str) {
+        let request = json!({
+            "schemaName": name,
+            "mappedInputFields": [
+                { "fieldName": "id", "type": "UNIQUE_ID" },
+                { "fieldName": "email", "type": "EMAIL_ADDRESS" },
+            ],
+        });
+        let reply = self.create_schema_mapping(&request).await;
+        assert_eq!(
+            reply.status, 200,
+            "seeding the schema mapping {name:?} failed, got {reply:?}"
+        );
+    }
+
     pub(crate) async fn delete_schema_mapping(&self, schema_name: &str) -> Reply {
         self.call("DELETE", &format!("/schemas/{schema_name}"), None)
             .await
@@ -1457,11 +1477,17 @@ fn quota_schema(name: &str) -> Value {
 }
 
 /// The smallest `CreateMatchingWorkflow` request the model admits, for the quota walk.
+///
+/// Its one input source references `q1`, a schema mapping the SCHEMA half of the walk
+/// above created and did not delete: a matching-workflow write resolves every
+/// `inputSourceConfig[].schemaName` against the stored mappings, and the schema store is
+/// at its own cap by the time the workflow half runs, so the reference names one of the
+/// records already there rather than adding another.
 fn quota_workflow(name: &str) -> Value {
     json!({
         "workflowName": name,
         "inputSourceConfig": [
-            { "inputSourceARN": glue_table_arn("customers"), "schemaName": "customers" },
+            { "inputSourceARN": glue_table_arn("customers"), "schemaName": "q1" },
         ],
         "outputSourceConfig": [{
             "outputS3Path": "s3://er-output/quota",

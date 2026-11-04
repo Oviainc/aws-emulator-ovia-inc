@@ -164,6 +164,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx.parts());
+
+        // Authorization comes FIRST, before anything is read: a policy belongs to the
+        // resource its `arn` names, so that resource is what the caller's identity-based
+        // policies have to allow this action on, else the request is refused with the
+        // modelled `AccessDeniedException` (HTTP 403) and the caller learns nothing about
+        // what the account holds (see [`crate::state::authorization`]).
+        if let Some(message) =
+            crate::state::authorization::refusal(&*self.engine, ctx, Self::NAME, &input.arn)
+        {
+            return Err(GetPolicyErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // A pure read: nothing about the store changes, and two consecutive calls
         // answer identically.
         let store = state.lock();

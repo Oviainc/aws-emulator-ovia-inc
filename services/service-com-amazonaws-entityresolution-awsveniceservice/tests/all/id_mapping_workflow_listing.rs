@@ -234,6 +234,10 @@ async fn seed(emulator: &Emulator) -> Vec<String> {
 /// A matching workflow under `name`: a DIFFERENT resource in a different collection,
 /// seeded so the assertions below prove the listing reports only its own.
 async fn seed_matching_workflow(emulator: &Emulator, name: &str) {
+    // The workflow's `inputSourceConfig` references a schema mapping by name, and a
+    // matching-workflow write resolves every such reference, so the mapping is created
+    // first.
+    emulator.seed_schema_mapping(name).await;
     let request = json!({
         "workflowName": name,
         "inputSourceConfig": [

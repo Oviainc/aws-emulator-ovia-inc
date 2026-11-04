@@ -11,12 +11,13 @@
 //! member of a `Delete*` output, and the `message` of a `ResourceNotFoundException`
 //! or `ConflictException` — is that OPERATION'S OWN text, naming the resource TYPE as
 //! the API spells it (`SchemaMapping`, `MatchingWorkflow`, `IdNamespace`) and
-//! substituting the requested name only where that operation's template includes one.
-//! It is never a sentence composed from the stored record, so for a path whose text
-//! carries no name it is INVARIANT over the name, the size and the shape of the
-//! resource; and the wording is per-operation, so `GetMatchingWorkflow`'s not-found
-//! text and `DeleteMatchingWorkflow`'s are different strings, and two `Delete*`
-//! success texts need not even share their capitalization.
+//! substituting a name only where that operation's template includes one: the requested
+//! `@httpLabel` for the `Delete*` not-found texts, and the REFERENCING workflow read out of
+//! the store for the in-use conflict, which is what tells a caller which workflow blocks
+//! the delete. For a path whose text carries no name it is INVARIANT over the name, the
+//! size and the shape of the resource; and the wording is per-operation, so
+//! `GetMatchingWorkflow`'s not-found text and `DeleteMatchingWorkflow`'s are different
+//! strings, and two `Delete*` success texts need not even share their capitalization.
 //!
 //! Each table row differs along what the rule generalises over: the resource name
 //! (every character class the modelled `EntityName` pattern `^[a-zA-Z_0-9-]*$`
@@ -59,6 +60,12 @@ fn delete_matching_workflow_not_found(workflow_name: &str) -> String {
 /// The same template for the ID-namespace delete.
 fn delete_id_namespace_not_found(id_namespace_name: &str) -> String {
     format!("IdNamespace {id_namespace_name} does not exist")
+}
+
+/// The in-use conflict's text is a template over the STORE: the matching workflow whose
+/// `inputSourceConfig` still names the schema mapping is substituted into it.
+fn schema_mapping_in_use(workflow_name: &str) -> String {
+    format!("SchemaMapping associated with Matching Workflow: {workflow_name}")
 }
 
 /// One resource name plus the size of the record it is used with: the two things the
@@ -504,9 +511,8 @@ async fn a_duplicate_create_answers_the_operations_constant_conflict_message() {
 }
 
 #[tokio::test]
-async fn deleting_a_referenced_schema_mapping_answers_a_constant_conflict_message() {
+async fn deleting_a_referenced_schema_mapping_names_the_referencing_workflow() {
     let emulator = Emulator::new();
-    let mut seen = BTreeSet::new();
 
     for case in name_cases() {
         let label = case.case;
@@ -533,18 +539,17 @@ async fn deleting_a_referenced_schema_mapping_answers_a_constant_conflict_messag
                 refused.error_code
             );
             let message = string_member(&refused.body, "message");
+            assert_eq!(
+                message,
+                schema_mapping_in_use(&case.name),
+                "case {label:?}: the conflict message must name the workflow that references \
+                 {schema:?}, got {message:?}"
+            );
             assert!(
                 !message.contains(schema.as_str()),
                 "case {label:?}: the conflict message must not be composed from the \
                  requested name, got {message:?}"
             );
-            seen.insert(message);
         }
     }
-
-    assert_eq!(
-        seen.len(),
-        1,
-        "the in-use conflict message must not depend on the schema mapping, saw {seen:?}"
-    );
 }

@@ -653,6 +653,7 @@ async fn an_unknown_workflow_name_is_refused_and_persists_nothing() {
     // A MATCHING workflow is a different namespace keyed by the same kind of name, so
     // an ID mapping update addressed to its name must not find — or touch — it.
     let matching_name = "shared-name";
+    emulator.seed_schema_mapping("customers").await;
     let matching = json!({
         "workflowName": matching_name,
         "inputSourceConfig": [

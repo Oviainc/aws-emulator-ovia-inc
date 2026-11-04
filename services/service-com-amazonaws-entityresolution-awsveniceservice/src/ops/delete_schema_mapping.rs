@@ -152,8 +152,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Authorization comes FIRST, before anything is read or written: a caller whose
+        // identity-based policies do not allow this action on the resource the request
+        // addresses is refused with the modelled `AccessDeniedException` (HTTP 403), the
+        // store is untouched, and the caller learns nothing about what the account holds
+        // (see [`crate::state::authorization`]).
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::resource_arn(
+                &region,
+                crate::state::SCHEMA_MAPPING_RESOURCE_TYPE,
+                &input.schema_name,
+            ),
+        ) {
+            return Err(DeleteSchemaMappingErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteSchemaMappingErrorModeled::InternalServerException(InternalServerException {
                 message: Some(
@@ -177,13 +200,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Refused while a workflow still names this schema in its `inputSourceConfig`,
         // and refused BEFORE the removal, so a conflicting delete leaves the store
-        // exactly as it was.
-        if store.schema_has_workflows(&input.schema_name) {
+        // exactly as it was. The refusal NAMES that workflow, read out of the store
+        // ([`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::referencing_workflow`]),
+        // so the caller is told which workflow to delete before retrying.
+        if let Some(workflow_name) = store
+            .referencing_workflow(&input.schema_name)
+            .map(str::to_string)
+        {
             return Err(DeleteSchemaMappingErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(
-                        crate::state::messages::DELETE_SCHEMA_MAPPING_IN_USE.to_string(),
-                    ),
+                    message: Some(crate::state::messages::delete_schema_mapping_in_use(
+                        &workflow_name,
+                    )),
                 },
             )
             .into());

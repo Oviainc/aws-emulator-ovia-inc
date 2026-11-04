@@ -150,8 +150,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Authorization comes FIRST, before anything is read: a listing addresses the
+        // catalog's entries rather than one of them — narrowed to one provider when the
+        // request names one — so a caller whose identity-based policies do not allow this
+        // action over them is refused with the modelled `AccessDeniedException` (HTTP 403)
+        // (see [`crate::state::authorization`]).
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            // A provider service is named by the PAIR `providerName`/`providerServiceName`,
+            // and the catalog entry's own `providerServiceArn` is what a statement scoped to
+            // it matches ([`crate::state::provider_service_arn`], the one speller).
+            &crate::state::provider_service_arn(
+                &region,
+                input
+                    .provider_name
+                    .as_deref()
+                    .unwrap_or(crate::state::authorization::ANY_RESOURCE),
+                crate::state::authorization::ANY_RESOURCE,
+            ),
+        ) {
+            return Err(ListProviderServicesErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListProviderServicesErrorModeled::InternalServerException(InternalServerException {
                 message: Some(

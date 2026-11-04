@@ -180,8 +180,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Authorization comes FIRST, before anything is read: the provider-service catalog is
+        // AWS-managed data, and the entry a request names is still the resource the caller's
+        // identity-based policies have to allow this action on, else the request is refused
+        // with the modelled `AccessDeniedException` (HTTP 403) (see
+        // [`crate::state::authorization`]).
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            // A provider service is named by the PAIR `providerName`/`providerServiceName`,
+            // and the catalog entry's own `providerServiceArn` is what a statement scoped to
+            // it matches ([`crate::state::provider_service_arn`], the one speller).
+            &crate::state::provider_service_arn(
+                &region,
+                &input.provider_name,
+                &input.provider_service_name,
+            ),
+        ) {
+            return Err(GetProviderServiceErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetProviderServiceErrorModeled::InternalServerException(InternalServerException {
                 message: Some(

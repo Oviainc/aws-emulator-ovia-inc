@@ -10,7 +10,14 @@ build = "build.rs"
 engine = { workspace = true }
 # `addresses_modeled_http_route`: the one reader that decides which operation a request
 # ADDRESSES when the REST router's required-header discrimination matched no route.
+# `iam_authorization`: the shared evaluation of IAM policy documents against
+# (action, resource), which this service's authorization gate runs.
 service-common = { path = "../common" }
+# The IAM store holds the identity-based policies of the principal a request speaks for, and
+# the STS store resolves WHICH principal a request is: the authorization gate reads both
+# services' OWN state accessors rather than keeping a second copy of either fact.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -38,6 +45,9 @@ emulator-core-build-support = { workspace = true }
 # role-resolution suite: a write that hands this service a `roleArn` asks IAM about that
 # role over the emulator's in-process callback, so IAM has to be there to answer.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The authorization suite makes the principals it calls as through IAM's and STS's own
+# operations, so the policies the gate reads are the ones those services wrote.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [lints]
 workspace = true

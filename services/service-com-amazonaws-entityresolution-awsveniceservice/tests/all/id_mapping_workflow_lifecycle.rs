@@ -544,6 +544,7 @@ async fn an_unknown_workflow_name_reads_as_not_found() {
         // under this name must not make the ID mapping reader find it.
         "shared-name".to_string(),
     ];
+    emulator.seed_schema_mapping("customers").await;
     let matching = json!({
         "workflowName": "shared-name",
         "inputSourceConfig": [
@@ -615,13 +616,13 @@ async fn an_id_mapping_workflow_and_a_matching_workflow_may_share_a_name() {
         "roleArn": role_arn(),
     });
 
+    emulator.seed_schema_mapping("customers").await;
     let created_matching = emulator.create_matching_workflow(&matching).await;
     assert_eq!(
         created_matching.status, 200,
         "expected HTTP 200 from CreateMatchingWorkflow, got {created_matching:?}"
     );
-    let created_id_mapping = create_id_mapping_workflow(&emulator, &id_mapping.request()).await;
-    assert_eq!(
+    let created_id_mapping = create_id_mapping_workflow(&emulator, &id_mapping.request()).await;    assert_eq!(
         created_id_mapping.status, 200,
         "the two kinds are separate namespaces, so this create must succeed, got \
          {created_id_mapping:?}"

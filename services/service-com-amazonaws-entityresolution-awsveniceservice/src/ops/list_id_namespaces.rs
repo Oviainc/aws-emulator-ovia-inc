@@ -147,6 +147,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Authorization comes FIRST, before anything is read: a listing addresses the
+        // account's ID namespaces rather than one record ([`crate::state::authorization`]),
+        // so a caller whose identity-based policies do not allow this action over them is
+        // refused with the modelled `AccessDeniedException` (HTTP 403) and learns nothing
+        // about what the account holds.
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::resource_arn(
+                &region,
+                crate::state::ID_NAMESPACE_RESOURCE_TYPE,
+                crate::state::authorization::ANY_RESOURCE,
+            ),
+        ) {
+            return Err(ListIdNamespacesErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
         let _ = (&input, ctx, &self.engine);

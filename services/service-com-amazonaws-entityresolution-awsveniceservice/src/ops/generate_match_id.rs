@@ -14,9 +14,9 @@
 //! `DeleteMatchingWorkflow`), and the comparison by the modelled rule, matching-key,
 //! input-source and schema-field maxima.
 //!
-//! Authorization is deliberately NOT emulated: the modelled `AccessDeniedException`
-//! is unreachable here, because this emulator holds no principals or policies to
-//! decide a 403 from. Every other modelled refusal is reachable.
+//! The caller's identity-based policies decide this call before anything is read or written
+//! ([`crate::state::authorization`]): a caller they do not allow is refused with the
+//! modelled `AccessDeniedException` (HTTP 403). Every other modelled refusal is reachable.
 //!
 //! The writer and the reader agree on a group's `matchRule`: this operation matches a
 //! SUBMITTED record against the OTHER records of the workflow (its own `uniqueId` is
@@ -179,8 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // An access record for the ATTEMPT, emitted before any refusal can return, so
-        // a call that is refused is recorded too. Request metadata only.
+        // An access record for the ATTEMPT, emitted before any refusal can return — the
+        // authorization decision below included — so a call that is refused is recorded too.
+        // Request metadata only.
         ::tracing::info!(
             operation = "GenerateMatchId",
             workflow_name = %input.workflow_name,
@@ -188,6 +189,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             records = input.records.len(),
             "match id generation requested"
         );
+
+        // Authorization comes FIRST, before anything is read or written: the match index
+        // belongs to the workflow the request names, so that workflow is the resource the
+        // caller's identity-based policies have to allow this action on, else the request is
+        // refused with the modelled `AccessDeniedException` (HTTP 403) and nothing is indexed
+        // (see [`crate::state::authorization`]).
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::resource_arn(
+                &region,
+                crate::state::MATCHING_WORKFLOW_RESOURCE_TYPE,
+                &input.workflow_name,
+            ),
+        ) {
+            return Err(GenerateMatchIdErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // The batch is bounded BEFORE the store is touched — and before the guard is
         // taken — so neither the work this call does nor the growth it causes depends

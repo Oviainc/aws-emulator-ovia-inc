@@ -27,6 +27,8 @@ mod id_namespace_delete;
 mod id_namespace_lifecycle;
 #[path = "all/id_namespace_update.rs"]
 mod id_namespace_update;
+#[path = "all/identity_authorization.rs"]
+mod identity_authorization;
 #[path = "all/match_id_generation.rs"]
 mod match_id_generation;
 #[path = "all/matching_job_lifecycle.rs"]
@@ -49,6 +51,8 @@ mod response_fidelity;
 mod response_messages;
 #[path = "all/role_resolution.rs"]
 mod role_resolution;
+#[path = "all/schema_mapping_reference_validation.rs"]
+mod schema_mapping_reference_validation;
 #[path = "all/schema_mapping_update.rs"]
 mod schema_mapping_update;
 #[path = "all/schema_mapping_workflow_lifecycle.rs"]

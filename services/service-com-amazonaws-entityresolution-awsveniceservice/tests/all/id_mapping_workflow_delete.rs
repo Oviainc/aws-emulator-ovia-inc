@@ -346,6 +346,9 @@ async fn a_delete_touches_only_the_id_mapping_workflow_it_names() {
 #[tokio::test]
 async fn a_matching_workflow_of_the_same_name_survives_the_delete() {
     let emulator = Emulator::new();
+    // Every matching workflow below references this schema mapping, and a
+    // matching-workflow write resolves that reference, so it is created once up front.
+    emulator.seed_schema_mapping("customers").await;
 
     for case in delete_cases() {
         let label = case.case;

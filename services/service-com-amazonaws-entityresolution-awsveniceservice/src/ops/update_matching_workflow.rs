@@ -17,7 +17,12 @@
 //! [`crate::state::incremental_run_conflict`] states; and a replacement `roleArn` this
 //! account's IAM shows the service cannot assume answers the modelled
 //! `AccessDeniedException` (HTTP 403), the rule [`crate::state::role_refusal`] states,
-//! leaving the stored workflow with the role it had.
+//! leaving the stored workflow with the role it had. An `inputSourceConfig` entry whose
+//! `schemaName` names no stored schema mapping answers the same `ValidationException`
+//! naming what is missing
+//! ([`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::missing_schema_mappings`],
+//! the one reading `CreateMatchingWorkflow` shares), leaving the stored configuration as it
+//! was.
 //!
 //! ## Shape of an operation
 //!
@@ -197,6 +202,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolved against this account's IAM BEFORE the store is touched, and awaited
         // with no store guard held. Only what IAM ANSWERED refuses the request.
         let region = crate::state::request_region(ctx.parts());
+
+        // Authorization comes FIRST, before anything is written: a caller whose
+        // identity-based policies do not allow this action on the workflow the request
+        // addresses is refused with the modelled `AccessDeniedException` (HTTP 403) and the
+        // stored workflow is untouched (see [`crate::state::authorization`]).
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::resource_arn(
+                &region,
+                crate::state::MATCHING_WORKFLOW_RESOURCE_TYPE,
+                &input.workflow_name,
+            ),
+        ) {
+            return Err(UpdateMatchingWorkflowErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         if let Some(message) =
             crate::state::role_refusal(ctx, &region, Some(&input.role_arn)).await
         {
@@ -224,19 +251,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let updated = crate::state::now();
 
+        let not_found = || {
+            UpdateMatchingWorkflowErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(
+                        crate::state::messages::UPDATE_MATCHING_WORKFLOW_NOT_FOUND.to_string(),
+                    ),
+                },
+            )
+        };
+
         let mut store = state.lock();
+
+        // "The workflow must already exist for this operation to succeed", so the resource
+        // this request ADDRESSES is resolved before the configuration it carries is
+        // validated: an update of a workflow that is not there answers the modelled
+        // `ResourceNotFoundException` (HTTP 404) whatever the body names.
+        if !store.matching_workflows.contains_key(&input.workflow_name) {
+            return Err(not_found().into());
+        }
+
+        // Every `inputSourceConfig[].schemaName` is the workflow's @required reference to a
+        // schema mapping, so each is resolved against the stored mappings BEFORE anything
+        // is written: a reference to nothing is refused with the modelled
+        // `ValidationException` (HTTP 400) naming what is missing, and the workflow keeps
+        // the configuration it had.
+        let missing = store.missing_schema_mappings(
+            input
+                .input_source_config
+                .iter()
+                .map(|source| source.schema_name.as_str()),
+        );
+        if !missing.is_empty() {
+            return Err(UpdateMatchingWorkflowErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::messages::references_missing_schema_mappings(
+                        &missing,
+                    )),
+                },
+            )
+            .into());
+        }
+
         let stored = store
             .matching_workflows
             .get_mut(&input.workflow_name)
-            .ok_or_else(|| {
-                UpdateMatchingWorkflowErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(
-                            crate::state::messages::UPDATE_MATCHING_WORKFLOW_NOT_FOUND.to_string(),
-                        ),
-                    },
-                )
-            })?;
+            .ok_or_else(not_found)?;
 
         // The configuration members this operation models are replaced wholesale; the
         // identity members (`workflowName`, `workflowArn`, `createdAt`) and the tags

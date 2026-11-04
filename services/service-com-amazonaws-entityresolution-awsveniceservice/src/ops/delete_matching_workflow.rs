@@ -166,14 +166,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // An access record for this destructive call, emitted before any refusal can
-        // return so an attempt is recorded whatever its outcome. Request metadata
-        // only: nothing of the stored workflow is logged.
+        // return — the authorization decision below included — so an attempt is recorded
+        // whatever its outcome. Request metadata only: nothing of the stored workflow is
+        // logged.
         ::tracing::info!(
             operation = "DeleteMatchingWorkflow",
             workflow_name = %input.workflow_name,
             akid = %::emulator_server::extract_akid(&ctx.parts().headers),
             "matching workflow deletion requested"
         );
+
+        // Authorization comes FIRST, before anything is read or written: a caller whose
+        // identity-based policies do not allow this action on the workflow the request
+        // addresses is refused with the modelled `AccessDeniedException` (HTTP 403), the
+        // store is untouched, and the caller learns nothing about what the account holds
+        // (see [`crate::state::authorization`]).
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::resource_arn(
+                &region,
+                crate::state::MATCHING_WORKFLOW_RESOURCE_TYPE,
+                &input.workflow_name,
+            ),
+        ) {
+            return Err(DeleteMatchingWorkflowErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteMatchingWorkflowErrorModeled::InternalServerException(InternalServerException {

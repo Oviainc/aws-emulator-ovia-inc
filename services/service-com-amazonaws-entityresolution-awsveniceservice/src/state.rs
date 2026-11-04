@@ -40,6 +40,11 @@
 //! ([`policy_document_parts`], [`render_policy_document`]) — so a reader serves the
 //! document the last write produced and the two cannot drift.
 
+/// Whether IAM lets the principal a request speaks for perform the operation it asks for:
+/// the decision every operation whose model declares `AccessDeniedException` takes before
+/// it reads or writes anything.
+pub mod authorization;
+
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
@@ -366,11 +371,28 @@ impl ProviderService {
     /// region a request is signed for, and the ARN `ListProviderServices` reports is
     /// exactly the one `GetProviderService` resolves.
     pub fn arn(&self) -> String {
-        format!(
-            "arn:aws:entityresolution:{}::providerservice/{}/{}",
-            self.region, self.provider_name, self.provider_service_name
+        provider_service_arn(
+            &self.region,
+            &self.provider_name,
+            &self.provider_service_name,
         )
     }
+}
+
+/// The `providerServiceArn` of the catalog entry `provider_name`/`provider_service_name` in
+/// `region`.
+///
+/// The one speller of that ARN, so the entry's own [`ProviderService::arn`] and the resource
+/// a provider-service read is AUTHORIZED against cannot disagree. The modelled
+/// `ProviderServiceArn` pattern fixes its whole shape — an EMPTY account segment, because the
+/// catalog is AWS-managed data rather than this account's, then
+/// `providerservice/<providerName>/<providerServiceName>`.
+pub fn provider_service_arn(
+    region: &str,
+    provider_name: &str,
+    provider_service_name: &str,
+) -> String {
+    format!("arn:aws:entityresolution:{region}::providerservice/{provider_name}/{provider_service_name}")
 }
 
 /// One ID mapping workflow as this service persists it.
@@ -1252,6 +1274,35 @@ pub mod messages {
         )
     }
 
+    /// The `ValidationException$message` (HTTP 400) both schema-mapping write paths answer
+    /// when `mappedInputFields` names one input column TWICE (see
+    /// [`super::duplicate_field_name_defect`]).
+    ///
+    /// AWS's own text for this refusal, a TEMPLATE over the request: the field names that are
+    /// repeated are what tells the caller which entries to fix, so they are taken from the
+    /// request's own list — in the order the list states them, once each — and never from any
+    /// one recorded run.
+    pub fn schema_mapping_duplicate_field_names(duplicates: &[String]) -> String {
+        format!(
+            "SchemaMapping is not allowed to have repeated input fields in attributes: {}",
+            duplicates.join(", ")
+        )
+    }
+
+    /// The `ValidationException$message` (HTTP 400) a write whose input source configuration
+    /// names a schema mapping this account does not hold answers (see
+    /// [`super::ComAmazonawsEntityresolutionAwsveniceserviceState::missing_schema_mappings`]).
+    ///
+    /// A TEMPLATE over the request and the store: AWS names the schema mapping(s) that could
+    /// not be resolved, which is what tells the caller which reference to fix, so the names
+    /// come from the request's own `inputSourceConfig` and never from any one recorded run.
+    pub fn references_missing_schema_mappings(missing: &[String]) -> String {
+        format!(
+            "References schema mapping(s) which does not exist: [{}]",
+            missing.join(", ")
+        )
+    }
+
     /// The `AccessDeniedException$message` (HTTP 403) a WORKFLOW write that hands this
     /// service a caller-supplied `roleArn` answers when IAM shows the service cannot
     /// assume it (see [`super::role_refusal`], which states which writes ask).
@@ -1348,20 +1399,29 @@ pub mod messages {
     /// workflow still names the schema in its `inputSourceConfig` — the refusal this
     /// operation's own doc describes ("This operation will fail if there is a
     /// MatchingWorkflow object that references the SchemaMapping in the workflow's
-    /// InputSourceConfig"). Not recorded; a constant, not a composed sentence.
-    pub const DELETE_SCHEMA_MAPPING_IN_USE: &str =
-        "SchemaMapping is referenced by the InputSourceConfig of a MatchingWorkflow";
+    /// InputSourceConfig").
+    ///
+    /// A TEMPLATE over the store: AWS identifies the workflow that BLOCKS the delete, which
+    /// is what tells the caller which workflow to delete before retrying, so the name comes
+    /// from the referencing workflow this store holds
+    /// ([`super::ComAmazonawsEntityresolutionAwsveniceserviceState::referencing_workflow`])
+    /// and never from any one recorded run.
+    pub fn delete_schema_mapping_in_use(workflow_name: &str) -> String {
+        format!("SchemaMapping associated with Matching Workflow: {workflow_name}")
+    }
 
     /// `UpdateSchemaMapping`'s `ConflictException$message` (HTTP 400) when a matching
     /// workflow still names the schema in its `inputSourceConfig` — the refusal this
     /// operation's own doc describes ("A schema is immutable if it is being used by a
     /// workflow. Therefore, you can't update a schema mapping if it's associated with a
-    /// workflow"). Not itself recorded; this operation's OWN constant, kept apart from
-    /// [`DELETE_SCHEMA_MAPPING_IN_USE`] because nothing says AWS words the two alike,
-    /// and spelled with the resource types the API uses.
-    pub const UPDATE_SCHEMA_MAPPING_IN_USE: &str =
-        "SchemaMapping is immutable while it is referenced by the InputSourceConfig of a \
-         MatchingWorkflow";
+    /// workflow").
+    ///
+    /// The same template as [`delete_schema_mapping_in_use`], and for the same reason: both
+    /// refuse on the same relationship, and a caller is told which workflow holds the schema
+    /// so it can act on it.
+    pub fn update_schema_mapping_in_use(workflow_name: &str) -> String {
+        delete_schema_mapping_in_use(workflow_name)
+    }
 
     /// `UpdateSchemaMapping`'s `ResourceNotFoundException$message` (HTTP 404) when no
     /// schema mapping carries the `schemaName` @httpLabel. Not itself recorded; it is
@@ -2193,6 +2253,45 @@ pub fn unique_id_cardinality_defect(
         .then(messages::schema_mapping_unique_id_cardinality)
 }
 
+/// Why a schema mapping whose `mappedInputFields` names one input column TWICE is refused —
+/// `None` when every `fieldName` in the list is distinct.
+///
+/// A `SchemaInputAttribute` "corresponds to a column the source data table" and its
+/// `fieldName` is the @required name of that column
+/// (`smithy_query(query="shape",shape="SchemaInputAttribute")`), so two entries carrying one
+/// name describe the same column twice and contradict each other: the column would have two
+/// attribute types, two match keys and two group names at once. The model constrains
+/// `SchemaInputAttributes` only by LENGTH (2..60) and each `fieldName` only by its own
+/// pattern and length, so it cannot express a condition ACROSS the list and the boundary
+/// validator passes such a request; both write paths that take the list
+/// (`CreateSchemaMapping` and `UpdateSchemaMapping`, whose `mappedInputFields` is @required
+/// on each) refuse it here with the modelled `ValidationException` (HTTP 400) before
+/// anything is stored, so no schema this service holds is one AWS would have refused.
+///
+/// The names are reported in the order the list states them, each named once however many
+/// times it repeats, and the comparison is on the whole `fieldName` as the request spelled
+/// it — the key a schema's columns are addressed by elsewhere in this API
+/// (`Rule$matchingKeys`, `GenerateMatchId`'s record attributes).
+pub fn duplicate_field_name_defect(
+    mapped_input_fields: &[SchemaInputAttribute],
+) -> Option<String> {
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for attribute in mapped_input_fields {
+        *seen.entry(attribute.field_name.as_str()).or_default() += 1;
+    }
+    let mut duplicates: Vec<String> = Vec::new();
+    for attribute in mapped_input_fields {
+        let repeated = seen
+            .get(attribute.field_name.as_str())
+            .is_some_and(|count| *count > 1);
+        if repeated && !duplicates.iter().any(|named| named == &attribute.field_name) {
+            duplicates.push(attribute.field_name.clone());
+        }
+    }
+    (!duplicates.is_empty())
+        .then(|| messages::schema_mapping_duplicate_field_names(&duplicates))
+}
+
 /// The service principal a caller-supplied `roleArn` has to let assume it.
 ///
 /// Entity Resolution reads the caller's records and writes its output ITSELF, acting as
@@ -2370,12 +2469,52 @@ impl ComAmazonawsEntityresolutionAwsveniceserviceState {
     /// `smithy_query(query="shape",shape="InputSource")`), so this is what both
     /// `hasWorkflows` and `DeleteSchemaMapping`'s conflict check read.
     pub fn schema_has_workflows(&self, schema_name: &str) -> bool {
-        self.matching_workflows.values().any(|workflow| {
-            workflow
-                .input_source_config
-                .iter()
-                .any(|source| source.schema_name == schema_name)
-        })
+        self.referencing_workflow(schema_name).is_some()
+    }
+
+    /// The `workflowName` of the matching workflow whose `inputSourceConfig` names
+    /// `schema_name`, or `None` when no stored workflow does.
+    ///
+    /// The one reading of that relationship: `hasWorkflows` is derived from it
+    /// ([`Self::schema_has_workflows`]) and the two refusals that are ABOUT it —
+    /// `DeleteSchemaMapping`'s and `UpdateSchemaMapping`'s `ConflictException` — word their
+    /// message with the workflow it names, so a caller is told which workflow holds the
+    /// schema. `matching_workflows` is ordered by `workflowName`, so a schema several
+    /// workflows reference resolves to the FIRST of them in that order rather than to
+    /// whichever one a hash happened to put first.
+    pub fn referencing_workflow(&self, schema_name: &str) -> Option<&str> {
+        self.matching_workflows
+            .values()
+            .find(|workflow| {
+                workflow
+                    .input_source_config
+                    .iter()
+                    .any(|source| source.schema_name == schema_name)
+            })
+            .map(|workflow| workflow.workflow_name.as_str())
+    }
+
+    /// The names among `schema_names` that this store holds NO schema mapping for, in the
+    /// order they were given and each named once.
+    ///
+    /// `InputSource$schemaName` is a matching workflow's @required reference to the schema
+    /// mapping that describes one of its input tables ("The name of the schema to be
+    /// retrieved", `smithy_query(query="shape",shape="InputSource")`), so a name no schema
+    /// mapping carries is a reference to nothing: the workflow could not read its input at
+    /// all. The writes that take such a configuration resolve every name through this and
+    /// refuse with the modelled `ValidationException` (HTTP 400) naming what is missing
+    /// ([`messages::references_missing_schema_mappings`]) before anything is stored.
+    pub fn missing_schema_mappings<'a, I>(&self, schema_names: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut missing: Vec<String> = Vec::new();
+        for name in schema_names {
+            if !self.schema_mappings.contains_key(name) && !missing.iter().any(|held| held == name) {
+                missing.push(name.to_string());
+            }
+        }
+        missing
     }
 
     /// The record attributes a rule's `matchingKey` compares, in schema order.

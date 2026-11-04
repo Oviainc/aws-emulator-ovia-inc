@@ -209,6 +209,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx.parts());
+
+        // Authorization comes FIRST, before anything is minted or stored: a caller whose
+        // identity-based policies do not allow this action on the namespace the request would
+        // create is refused with the modelled `AccessDeniedException` (HTTP 403) and nothing
+        // is stored (see [`crate::state::authorization`]).
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::resource_arn(
+                &region,
+                crate::state::ID_NAMESPACE_RESOURCE_TYPE,
+                &input.id_namespace_name,
+            ),
+        ) {
+            return Err(CreateIdNamespaceErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // One instant for both stamps: a namespace that has only just been created has
         // not been updated since, so `createdAt` and `updatedAt` are equal.
         let created = crate::state::now();

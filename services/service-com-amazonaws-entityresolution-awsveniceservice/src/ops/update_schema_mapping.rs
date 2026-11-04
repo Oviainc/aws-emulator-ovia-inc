@@ -9,14 +9,15 @@
 //! `schemaArn`, `createdAt`) and the tags are not members of this request, so they stay
 //! as the create and `TagResource` left them.
 //!
-//! Three refusals, each taken BEFORE anything is written, so a refused update leaves the
+//! Four refusals, each taken BEFORE anything is written, so a refused update leaves the
 //! stored mapping exactly as it was: a `mappedInputFields` that does not declare exactly
 //! one `UNIQUE_ID` attribute is the modelled `ValidationException` (HTTP 400)
 //! ([`crate::state::unique_id_cardinality_defect`], the one reading
-//! `CreateSchemaMapping` shares); a `schemaName` no mapping carries is the modelled
-//! `ResourceNotFoundException` (HTTP 404); and a mapping some matching workflow still
-//! names in its `inputSourceConfig` is the modelled `ConflictException` (HTTP 400),
-//! because "a schema is immutable if it is being used by a workflow".
+//! `CreateSchemaMapping` shares); one that names an input column twice is the same refusal
+//! ([`crate::state::duplicate_field_name_defect`]); a `schemaName` no mapping carries is the
+//! modelled `ResourceNotFoundException` (HTTP 404); and a mapping some matching workflow
+//! still names in its `inputSourceConfig` is the modelled `ConflictException` (HTTP 400),
+//! naming that workflow, because "a schema is immutable if it is being used by a workflow".
 //!
 //! ## Shape of an operation
 //!
@@ -185,6 +186,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "schema mapping update requested"
         );
 
+        // Authorization comes FIRST, before anything is read or written: a caller whose
+        // identity-based policies do not allow this action on the resource the request
+        // addresses is refused with the modelled `AccessDeniedException` (HTTP 403) and the
+        // stored mapping is untouched (see [`crate::state::authorization`]).
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::resource_arn(
+                &region,
+                crate::state::SCHEMA_MAPPING_RESOURCE_TYPE,
+                &input.schema_name,
+            ),
+        ) {
+            return Err(UpdateSchemaMappingErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateSchemaMappingErrorModeled::InternalServerException(InternalServerException {
                 message: Some(
@@ -193,10 +217,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The list-wide rule the model cannot express is decided BEFORE the store is
+        // The list-wide rules the model cannot express are decided BEFORE the store is
         // touched, so a refused update leaves the stored mapping exactly as it was.
         if let Some(message) =
             crate::state::unique_id_cardinality_defect(&input.mapped_input_fields)
+        {
+            return Err(UpdateSchemaMappingErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        if let Some(message) =
+            crate::state::duplicate_field_name_defect(&input.mapped_input_fields)
         {
             return Err(UpdateSchemaMappingErrorModeled::ValidationException(
                 ValidationException {
@@ -216,7 +250,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // relationship is derived from the workflows that exist NOW — the same reading
         // `GetSchemaMapping` serves `hasWorkflows` from and `DeleteSchemaMapping`
         // refuses on — so it cannot go stale.
-        let referenced = store.schema_has_workflows(&input.schema_name);
+        let referencing = store
+            .referencing_workflow(&input.schema_name)
+            .map(str::to_string);
 
         let stored = store
             .schema_mappings
@@ -231,12 +267,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
-        if referenced {
+        if let Some(workflow_name) = referencing {
             return Err(UpdateSchemaMappingErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(
-                        crate::state::messages::UPDATE_SCHEMA_MAPPING_IN_USE.to_string(),
-                    ),
+                    message: Some(crate::state::messages::update_schema_mapping_in_use(
+                        &workflow_name,
+                    )),
                 },
             )
             .into());

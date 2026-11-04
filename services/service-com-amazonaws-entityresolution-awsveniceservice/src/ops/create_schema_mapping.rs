@@ -10,7 +10,8 @@
 //! that does not declare exactly one `UNIQUE_ID` attribute is refused with the modelled
 //! `ValidationException` (HTTP 400) before anything is stored
 //! ([`crate::state::unique_id_cardinality_defect`], the one reading
-//! `UpdateSchemaMapping` shares).
+//! `UpdateSchemaMapping` shares). A `mappedInputFields` that names one input column twice
+//! is refused the same way ([`crate::state::duplicate_field_name_defect`]).
 //!
 //! ## Shape of an operation
 //!
@@ -181,15 +182,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx.parts());
+
+        // Authorization comes FIRST, before anything is minted or stored: a caller whose
+        // identity-based policies do not allow this action on the resource the request would
+        // create is refused with the modelled `AccessDeniedException` (HTTP 403) and nothing
+        // is stored (see [`crate::state::authorization`]).
+        if let Some(message) = crate::state::authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::resource_arn(
+                &region,
+                crate::state::SCHEMA_MAPPING_RESOURCE_TYPE,
+                &input.schema_name,
+            ),
+        ) {
+            return Err(CreateSchemaMappingErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // One instant for both stamps: a schema mapping that has only just been
         // created has not been updated since, so `createdAt` and `updatedAt` are equal.
         let created = crate::state::now();
 
-        // The list-wide rule the model cannot express is decided BEFORE the store is
+        // The list-wide rules the model cannot express are decided BEFORE the store is
         // touched, so a refused create leaves it exactly as it was and no schema this
         // service holds is one AWS would have refused.
         if let Some(message) =
             crate::state::unique_id_cardinality_defect(&input.mapped_input_fields)
+        {
+            return Err(CreateSchemaMappingErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        if let Some(message) =
+            crate::state::duplicate_field_name_defect(&input.mapped_input_fields)
         {
             return Err(CreateSchemaMappingErrorModeled::ValidationException(
                 ValidationException {
