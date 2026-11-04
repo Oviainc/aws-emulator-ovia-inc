@@ -447,10 +447,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_name: input.client_name.clone(),
             creation_date: now,
             last_modified_date: now,
-            refresh_token_validity: input.refresh_token_validity,
+            // The server-applied token-validity defaults are materialised here,
+            // so the stored app client carries the values it is configured with
+            // and every read of it projects them unchanged.
+            refresh_token_validity: crate::state::effective_refresh_token_validity(
+                input.refresh_token_validity,
+            ),
             access_token_validity: input.access_token_validity,
             id_token_validity: input.id_token_validity,
-            token_validity_units: input.token_validity_units,
+            token_validity_units: crate::state::effective_token_validity_units(
+                input.token_validity_units,
+            ),
             read_attributes: input.read_attributes,
             write_attributes: input.write_attributes,
             explicit_auth_flows: input.explicit_auth_flows.unwrap_or_else(|| {
@@ -476,7 +483,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             enable_propagate_additional_user_context_data: input
                 .enable_propagate_additional_user_context_data
                 .unwrap_or(false),
-            auth_session_validity: input.auth_session_validity,
+            auth_session_validity: crate::state::effective_auth_session_validity(
+                input.auth_session_validity,
+            ),
             refresh_token_rotation: input.refresh_token_rotation,
             // A new app client holds no threat-protection settings of its own, so
             // it uses the pool's until `SetRiskConfiguration` gives it some.

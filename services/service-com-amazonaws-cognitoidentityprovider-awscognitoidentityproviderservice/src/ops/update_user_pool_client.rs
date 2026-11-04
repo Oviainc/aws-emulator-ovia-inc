@@ -432,12 +432,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client.client_name = client_name;
         }
 
-        // Members the model gives a default: `RefreshTokenValidity` defaults to `0`
-        // (which the client's `refresh_token_ttl` reads as the documented 30 days) and
-        // `AllowedOAuthFlowsUserPoolClient` defaults to `false`; the deserializer has
-        // already applied both, so the input's value IS the effective one.
-        client.refresh_token_validity = input.refresh_token_validity;
+        // Members the model gives a default: the deserializer has already applied
+        // `RefreshTokenValidity`'s modelled `0` and `AllowedOAuthFlowsUserPoolClient`'s
+        // `false`, and the service's own default replaces the `0` an app client
+        // cannot hold, exactly as the create path resolves it.
+        client.refresh_token_validity =
+            crate::state::effective_refresh_token_validity(input.refresh_token_validity);
         client.allowed_oauth_flows_user_pool_client = input.allowed_o_auth_flows_user_pool_client;
+        // The other two server-applied token-validity defaults: an update that
+        // names no session duration and no time units resets the app client to
+        // the ones every app client is configured with, the way the create does.
+        client.token_validity_units =
+            crate::state::effective_token_validity_units(input.token_validity_units);
+        client.auth_session_validity =
+            crate::state::effective_auth_session_validity(input.auth_session_validity);
 
         // Members with a documented default that `state.rs` owns, so a create and an
         // update agree on what "unset" means.
@@ -464,7 +472,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // member clears what the client held.
         client.access_token_validity = input.access_token_validity;
         client.id_token_validity = input.id_token_validity;
-        client.token_validity_units = input.token_validity_units;
         client.read_attributes = input.read_attributes;
         client.write_attributes = input.write_attributes;
         client.supported_identity_providers = input.supported_identity_providers;
@@ -474,7 +481,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         client.allowed_oauth_flows = input.allowed_o_auth_flows;
         client.allowed_oauth_scopes = input.allowed_o_auth_scopes;
         client.analytics_configuration = input.analytics_configuration;
-        client.auth_session_validity = input.auth_session_validity;
         client.refresh_token_rotation = input.refresh_token_rotation;
 
         // `ClientId`, `ClientSecret`, `UserPoolId` and `CreationDate` are not members

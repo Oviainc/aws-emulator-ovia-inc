@@ -222,8 +222,12 @@ struct UpdateCase {
 /// `PreventUserExistenceErrors` "Defaults to LEGACY",
 /// `EnableTokenRevocation` is "automatically activated",
 /// `AllowedOAuthFlowsUserPoolClient` and
-/// `EnablePropagateAdditionalUserContextData` default to `false`, and
-/// `RefreshTokenValidity` carries the model default `0`. `ExplicitAuthFlows` has
+/// `EnablePropagateAdditionalUserContextData` default to `false`,
+/// `RefreshTokenValidity` "can't" be the modelled `0` the deserializer applies —
+/// "Amazon Cognito overrides the value with the default value of 30 days" —
+/// `AuthSessionValidity` is the minimum of its modelled 3..15 range, and an app
+/// client always carries a `TokenValidityUnits` block, empty when no unit was
+/// named. `ExplicitAuthFlows` has
 /// a documented default for a CREATE — the set a NEW app client starts with —
 /// so an update that names no flows leaves the app client with NONE of them
 /// rather than putting that create-time set back.
@@ -231,7 +235,7 @@ fn reset_to_defaults() -> Vec<(&'static str, Value)> {
     vec![
         ("AccessTokenValidity", Value::Null),
         ("IdTokenValidity", Value::Null),
-        ("TokenValidityUnits", Value::Null),
+        ("TokenValidityUnits", json!({})),
         ("ReadAttributes", Value::Null),
         ("WriteAttributes", Value::Null),
         ("SupportedIdentityProviders", Value::Null),
@@ -241,9 +245,9 @@ fn reset_to_defaults() -> Vec<(&'static str, Value)> {
         ("AllowedOAuthFlows", Value::Null),
         ("AllowedOAuthScopes", Value::Null),
         ("AnalyticsConfiguration", Value::Null),
-        ("AuthSessionValidity", Value::Null),
+        ("AuthSessionValidity", json!(3)),
         ("RefreshTokenRotation", Value::Null),
-        ("RefreshTokenValidity", json!(0)),
+        ("RefreshTokenValidity", json!(30)),
         ("AllowedOAuthFlowsUserPoolClient", json!(false)),
         ("EnablePropagateAdditionalUserContextData", json!(false)),
         ("EnableTokenRevocation", json!(true)),

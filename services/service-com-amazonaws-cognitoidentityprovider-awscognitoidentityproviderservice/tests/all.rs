@@ -45,6 +45,8 @@ mod admin_user_pool_lifecycle;
 mod app_client_and_pool_configuration;
 #[path = "all/app_client_refusal_wording.rs"]
 mod app_client_refusal_wording;
+#[path = "all/app_client_validity_defaults.rs"]
+mod app_client_validity_defaults;
 #[path = "all/auth_flow_not_enabled.rs"]
 mod auth_flow_not_enabled;
 #[path = "all/authentication_refusal_classes.rs"]

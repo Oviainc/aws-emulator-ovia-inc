@@ -97,7 +97,49 @@ const DEFAULT_REFRESH_TOKEN_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 6
 /// `CreateUserPoolClient.AuthSessionValidity` is "the duration, in minutes, of
 /// that session token" and its modelled range is 3..15, so an app client that
 /// sets no value gets the range's minimum.
-const DEFAULT_AUTH_SESSION_VALIDITY_MINUTES: u64 = 3;
+const DEFAULT_AUTH_SESSION_VALIDITY_MINUTES: i32 = 3;
+
+/// `CreateUserPoolClient.RefreshTokenValidity`: "You can't set
+/// `RefreshTokenValidity` to 0. If you do, Amazon Cognito overrides the value
+/// with the default value of 30 days", and "the default time unit for
+/// `RefreshTokenValidity` in an API request is days" (this service's model), so
+/// the value an app client holds for a request that asked for none — or asked
+/// for the modelled default `0` — is 30.
+const DEFAULT_REFRESH_TOKEN_VALIDITY: i32 = 30;
+
+/// The `RefreshTokenValidity` an app client holds when a create or an update
+/// carried `requested`.
+///
+/// The member is modelled with a default of `0`, so the deserializer hands a
+/// request that named no value the same `0` a request that named one does, and
+/// `0` is the one value an app client cannot hold:
+/// [`DEFAULT_REFRESH_TOKEN_VALIDITY`] replaces it.
+pub fn effective_refresh_token_validity(requested: i32) -> i32 {
+    if requested == 0 {
+        DEFAULT_REFRESH_TOKEN_VALIDITY
+    } else {
+        requested
+    }
+}
+
+/// The `AuthSessionValidity` an app client holds when a create or an update
+/// carried `requested`: the value asked for, or the service default every app
+/// client gets.
+pub fn effective_auth_session_validity(requested: Option<i32>) -> i32 {
+    requested.unwrap_or(DEFAULT_AUTH_SESSION_VALIDITY_MINUTES)
+}
+
+/// The `TokenValidityUnits` an app client holds when a create or an update
+/// carried `requested`.
+///
+/// Every token-validity member has a documented default time unit of its own, so
+/// an app client always has a unit block; one that named no unit holds a block
+/// with no unit overridden in it.
+pub fn effective_token_validity_units(
+    requested: Option<TokenValidityUnitsType>,
+) -> TokenValidityUnitsType {
+    requested.unwrap_or_default()
+}
 
 /// `CreateUserPoolClient.ExplicitAuthFlows`: "If you don't specify a value for
 /// `ExplicitAuthFlows`, your app client supports `ALLOW_REFRESH_TOKEN_AUTH`,
@@ -4310,10 +4352,15 @@ pub struct UserPoolClient {
     pub client_name: String,
     pub creation_date: SystemTime,
     pub last_modified_date: SystemTime,
+    /// The effective `RefreshTokenValidity`: never `0`, which the model
+    /// documents as overridden by the service default
+    /// ([`effective_refresh_token_validity`]).
     pub refresh_token_validity: i32,
     pub access_token_validity: Option<i32>,
     pub id_token_validity: Option<i32>,
-    pub token_validity_units: Option<TokenValidityUnitsType>,
+    /// The app client's time units. Every app client has a block — empty when no
+    /// unit was overridden ([`effective_token_validity_units`]).
+    pub token_validity_units: TokenValidityUnitsType,
     pub read_attributes: Option<Vec<String>>,
     pub write_attributes: Option<Vec<String>>,
     pub explicit_auth_flows: Vec<String>,
@@ -4328,7 +4375,9 @@ pub struct UserPoolClient {
     pub prevent_user_existence_errors: String,
     pub enable_token_revocation: bool,
     pub enable_propagate_additional_user_context_data: bool,
-    pub auth_session_validity: Option<i32>,
+    /// The effective `AuthSessionValidity` in minutes: the value asked for, or
+    /// the service default ([`effective_auth_session_validity`]).
+    pub auth_session_validity: i32,
     pub refresh_token_rotation: Option<RefreshTokenRotationType>,
     /// This app client's own threat-protection settings, once a call has set
     /// them: `RiskConfigurationType.ClientId` is "the app client where this
@@ -4517,9 +4566,7 @@ impl UserPoolClient {
     pub fn access_token_ttl(&self) -> Duration {
         token_ttl(
             self.access_token_validity,
-            self.token_validity_units
-                .as_ref()
-                .and_then(|units| units.access_token.as_deref()),
+            self.token_validity_units.access_token.as_deref(),
             // "The default time unit for AccessTokenValidity in an API request is hours."
             TokenValidityUnit::Hours,
             DEFAULT_ACCESS_TOKEN_TTL,
@@ -4530,37 +4577,33 @@ impl UserPoolClient {
     pub fn id_token_ttl(&self) -> Duration {
         token_ttl(
             self.id_token_validity,
-            self.token_validity_units
-                .as_ref()
-                .and_then(|units| units.id_token.as_deref()),
+            self.token_validity_units.id_token.as_deref(),
             TokenValidityUnit::Hours,
             DEFAULT_ACCESS_TOKEN_TTL,
         )
     }
 
-    /// The refresh token lifetime this client issues. A stored `0` is the
-    /// model's "Amazon Cognito overrides the value with the default value of 30
-    /// days".
+    /// The refresh token lifetime this client issues. The stored validity is
+    /// already the effective one — never the `0` the model documents as
+    /// overridden — so it is what the lifetime is computed from.
     pub fn refresh_token_ttl(&self) -> Duration {
-        let validity = (self.refresh_token_validity != 0).then_some(self.refresh_token_validity);
         token_ttl(
-            validity,
-            self.token_validity_units
-                .as_ref()
-                .and_then(|units| units.refresh_token.as_deref()),
+            Some(self.refresh_token_validity),
+            self.token_validity_units.refresh_token.as_deref(),
             // "The default time unit for RefreshTokenValidity in an API request is days."
             TokenValidityUnit::Days,
             DEFAULT_REFRESH_TOKEN_TTL,
         )
     }
 
-    /// How long a challenge session this client starts stays valid.
+    /// How long a challenge session this client starts stays valid. The stored
+    /// duration is read at no less than the documented minimum, so a session
+    /// window is never zero-length.
     pub fn auth_session_validity(&self) -> Duration {
         let minutes = self
             .auth_session_validity
-            .and_then(|minutes| u64::try_from(minutes).ok())
-            .unwrap_or(DEFAULT_AUTH_SESSION_VALIDITY_MINUTES);
-        Duration::from_secs(minutes * 60)
+            .max(DEFAULT_AUTH_SESSION_VALIDITY_MINUTES);
+        Duration::from_secs(u64::try_from(minutes).unwrap_or_default() * 60)
     }
 
     /// The modelled view of this client, rendered from what is stored.
@@ -4575,7 +4618,7 @@ impl UserPoolClient {
             refresh_token_validity: self.refresh_token_validity,
             access_token_validity: self.access_token_validity,
             id_token_validity: self.id_token_validity,
-            token_validity_units: self.token_validity_units.clone(),
+            token_validity_units: Some(self.token_validity_units.clone()),
             read_attributes: self.read_attributes.clone(),
             write_attributes: self.write_attributes.clone(),
             explicit_auth_flows: Some(self.explicit_auth_flows.clone()),
@@ -4592,7 +4635,7 @@ impl UserPoolClient {
             enable_propagate_additional_user_context_data: Some(
                 self.enable_propagate_additional_user_context_data,
             ),
-            auth_session_validity: self.auth_session_validity,
+            auth_session_validity: Some(self.auth_session_validity),
             refresh_token_rotation: self.refresh_token_rotation.clone(),
         }
     }
