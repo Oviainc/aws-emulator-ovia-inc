@@ -38,6 +38,9 @@ mod create_workspaces_validation;
 #[path = "all/ip_access_control_groups.rs"]
 mod ip_access_control_groups;
 
+#[path = "all/ip_group_and_alias_refusal_messages.rs"]
+mod ip_group_and_alias_refusal_messages;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

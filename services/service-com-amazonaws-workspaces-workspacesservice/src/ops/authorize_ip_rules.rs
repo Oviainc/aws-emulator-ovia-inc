@@ -169,15 +169,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         match authorized {
             Ok(_) => Ok(AuthorizeIpRulesOutput {}),
-            // The model states this shape's message: `ResourceNotFoundException` and
-            // its `message` member are both documented as "The resource could not be
-            // found.", and the shape carries a separate `ResourceId` member — "The ID
-            // of the resource that could not be found" — which is where the group the
-            // caller asked for is named.
+            // The message is the sentence this service fixes for an IP access
+            // control group it does not hold (`crate::state::MESSAGE_IP_GROUP_NOT_FOUND`),
+            // the same one every operation that resolves a `GroupId` answers
+            // with, rather than the error shape's documentation. The group the
+            // caller asked for is named in the shape's separate `ResourceId`
+            // member — "The ID of the resource that could not be found".
             Err(crate::state::IpRuleAuthorizeRefusal::NoSuchGroup) => Err(
                 AuthorizeIpRulesErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some("The resource could not be found.".to_string()),
+                        message: Some(crate::state::MESSAGE_IP_GROUP_NOT_FOUND.to_string()),
                         resource_id: Some(input.group_id.clone()),
                     },
                 )

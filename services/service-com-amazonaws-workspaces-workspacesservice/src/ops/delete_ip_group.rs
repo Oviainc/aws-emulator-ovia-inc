@@ -158,14 +158,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let deleted = state.lock().delete_ip_group(&input.group_id);
 
         if deleted.is_none() {
-            // The model states this shape's message: `ResourceNotFoundException` and
-            // its `message` member are both documented as "The resource could not be
-            // found.", and the shape carries a separate `ResourceId` member — "The ID
-            // of the resource that could not be found" — which is where the group the
-            // caller asked for is named.
+            // The message is the sentence this service fixes for an IP access
+            // control group it does not hold (`crate::state::MESSAGE_IP_GROUP_NOT_FOUND`),
+            // not the error shape's documentation: a shape's doc sentence
+            // describes the shape, while the wire message is chosen by the error
+            // class and the resource kind. The group the caller asked for is
+            // named in the shape's separate `ResourceId` member — "The ID of the
+            // resource that could not be found".
             return Err(DeleteIpGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some("The resource could not be found.".to_string()),
+                    message: Some(crate::state::MESSAGE_IP_GROUP_NOT_FOUND.to_string()),
                     resource_id: Some(input.group_id.clone()),
                 },
             )

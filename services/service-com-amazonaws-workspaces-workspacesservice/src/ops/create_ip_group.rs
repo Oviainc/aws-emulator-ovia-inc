@@ -198,12 +198,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(record) => Ok(CreateIpGroupOutput {
                 group_id: Some(record.group_id),
             }),
-            Err(crate::state::IpGroupCreateError::NameTaken(group_id)) => Err(
+            // The duplicate-name refusal names the GroupName the caller asked
+            // for, and nothing this emulator generated: the sentence is the one
+            // fixed for this error class (see
+            // `crate::state::message_ip_group_name_taken`), not the error
+            // shape's documentation.
+            Err(crate::state::IpGroupCreateError::NameTaken) => Err(
                 CreateIpGroupErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
-                        message: Some(format!(
-                            "The IP access control group {group_id} is already named {}.",
-                            input.group_name
+                        message: Some(crate::state::message_ip_group_name_taken(
+                            &input.group_name,
                         )),
                     },
                 )

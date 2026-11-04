@@ -177,14 +177,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .request_delete_connection_alias(&input.alias_id)
             .is_none()
         {
-            // The model states this shape's message: `ResourceNotFoundException`
-            // and its `message` member are both documented as "The resource could
-            // not be found.", and the shape carries a separate `ResourceId` member
-            // — "The ID of the resource that could not be found" — which is where
-            // the alias the caller asked for is named.
+            // The message is the sentence this service fixes for a connection
+            // alias it does not hold (`crate::state::MESSAGE_CONNECTION_ALIAS_NOT_FOUND`),
+            // not the error shape's documentation: the shape's doc sentence
+            // describes the shape, while the wire message is chosen by the error
+            // class and the resource kind. The alias the caller asked for is
+            // named in the shape's separate `ResourceId` member — "The ID of the
+            // resource that could not be found".
             return Err(DeleteConnectionAliasErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some("The resource could not be found.".to_string()),
+                    message: Some(crate::state::MESSAGE_CONNECTION_ALIAS_NOT_FOUND.to_string()),
                     resource_id: Some(input.alias_id.clone()),
                 },
             )

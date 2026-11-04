@@ -263,6 +263,30 @@ pub const MAX_RULES_PER_IP_GROUP: usize = 100;
 /// for these members, so a value AWS accepts is not refused here.
 pub const MAX_IP_GROUP_TEXT_CHARS: usize = 255;
 
+/// The message a request naming an IP access control group this service does not
+/// hold is refused with, beside `ResourceNotFoundException` (HTTP 400).
+///
+/// A FIXED sentence chosen by the ERROR CLASS rather than built from the request:
+/// a recorded WorkSpaces response carries this text for a `GroupId` that appears
+/// nowhere in it. The identifier the caller sent travels in the error shape's own
+/// `ResourceId` member ("The ID of the resource that could not be found"), which
+/// is where this API carries resource identity. Shared by every operation that
+/// resolves a `GroupId`, so one condition is not reported two ways.
+pub const MESSAGE_IP_GROUP_NOT_FOUND: &str = "Ip Group Id is not found.";
+
+/// The message `CreateIpGroup` refuses a `GroupName` another stored group already
+/// holds with, beside `ResourceAlreadyExistsException` (HTTP 400).
+///
+/// The sentence is fixed text up to and including the final separator, and its one
+/// variable part is the name the request asked for, verbatim. The id of the group
+/// that holds the name is deliberately NOT in it: the refusal names what the
+/// caller sent, not a value this emulator generated.
+pub fn message_ip_group_name_taken(group_name: &str) -> String {
+    format!(
+        "Encountered an exception while creating IP Group - group already exists for given group name - {group_name}"
+    )
+}
+
 /// A per-item batch failure: the wire `ErrorCode` and `ErrorMessage` a
 /// `FailedCreateWorkspaceRequest` / `FailedWorkspaceChangeRequest` carries.
 ///
@@ -610,6 +634,16 @@ pub const MAX_STORED_CONNECTION_ALIASES: usize = 500;
 /// an alias no directory association names: the others each describe an
 /// association that exists, is being made or is being undone.
 pub const ASSOCIATION_STATUS_NOT_ASSOCIATED: &str = "NOT_ASSOCIATED";
+
+/// The message a request naming a connection alias this service does not hold is
+/// refused with, beside `ResourceNotFoundException` (HTTP 400).
+///
+/// A FIXED sentence chosen by the ERROR CLASS: it interpolates no request or state
+/// value, and the alias the caller named travels in the error shape's own
+/// `ResourceId` member instead. The apostrophe is U+2019, as the recorded
+/// WorkSpaces response spells it.
+pub const MESSAGE_CONNECTION_ALIAS_NOT_FOUND: &str = "The connection alias couldn\u{2019}t be found. \
+     Make sure that you have the correct connection alias, and then try again.";
 
 /// The operational state of a stored connection alias.
 ///
@@ -1003,10 +1037,10 @@ impl AccountLinkRecord {
 /// from and the wording next to the wire.
 #[derive(Debug, Clone)]
 pub enum IpGroupCreateError {
-    /// A stored group already carries the requested name; this is the
-    /// `GroupId` of the group that holds it. Answered as
-    /// `ResourceAlreadyExistsException`.
-    NameTaken(String),
+    /// A stored group already carries the requested name. Answered as
+    /// `ResourceAlreadyExistsException`, whose message names the requested name
+    /// and not the holding group's id (see [`message_ip_group_name_taken`]).
+    NameTaken,
     /// The registry already holds [`MAX_STORED_IP_GROUPS`] groups. Answered as
     /// `ResourceLimitExceededException`.
     LimitExceeded,
@@ -1882,8 +1916,8 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
         user_rules: Vec<IpRuleItem>,
         tags: Vec<Tag>,
     ) -> Result<IpGroupRecord, IpGroupCreateError> {
-        if let Some(existing) = self.ip_group_names.get(group_name) {
-            return Err(IpGroupCreateError::NameTaken(existing.clone()));
+        if self.ip_group_names.contains_key(group_name) {
+            return Err(IpGroupCreateError::NameTaken);
         }
         // The registry is bounded: refuse rather than grow without end.
         if self.ip_groups.len() >= MAX_STORED_IP_GROUPS {
