@@ -19,6 +19,8 @@ mod client_token_identifies_one_request;
 mod completed_validation_moves_the_plane_status;
 #[path = "all/create_path_tag_quota.rs"]
 mod create_path_tag_quota;
+#[path = "all/field_list_entry_message.rs"]
+mod field_list_entry_message;
 #[path = "all/fresh_validation_code_fresh_attempt_budget.rs"]
 mod fresh_validation_code_fresh_attempt_budget;
 #[path = "all/invoice_profile_membership.rs"]

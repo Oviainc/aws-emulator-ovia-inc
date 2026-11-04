@@ -156,6 +156,18 @@ fn enumerated_set(clause: &str, path: &str, case: &str) -> Vec<String> {
     values
 }
 
+/// The message the `fieldList` entry for `path` must state, built from the requirement
+/// the envelope's own clause for that member states: the value the entry refused —
+/// withheld behind the `[redacted]` marker — and that same requirement, with the member
+/// left to the entry's own `name`.
+fn field_message(clause: &str, path: &str, case: &str) -> String {
+    let opening = format!("Value at '{path}' failed to satisfy constraint: ");
+    let requirement = clause.strip_prefix(opening.as_str()).unwrap_or_else(|| {
+        panic!("case {case}: expected a clause for '{path}', got {clause:?}")
+    });
+    format!("Value [redacted] failed to satisfy constraint: {requirement}")
+}
+
 /// The value set a row expects the clause to enumerate, in the order a comparison uses.
 fn sorted(values: &[&str]) -> Vec<String> {
     let mut sorted: Vec<String> = values.iter().map(|value| (*value).to_string()).collect();
@@ -377,7 +389,10 @@ async fn a_member_targeting_an_enum_admits_only_its_declared_values() {
                  set, got {clause:?}",
                 spoiled.path
             );
-            // Both halves of the body state the SAME clause for that member.
+            // Both halves of the body state the SAME requirement for that member: the
+            // envelope names the member path, the entry names it in its own `name` and
+            // states the requirement about the value it refused, withheld behind the
+            // `[redacted]` marker.
             let entry = field_list
                 .iter()
                 .find(|entry| member(entry, "name") == spoiled.path)
@@ -388,10 +403,11 @@ async fn a_member_targeting_an_enum_admits_only_its_declared_values() {
                     )
                 });
             let entry_message = member(entry, "message");
+            let expected = field_message(&clause, spoiled.path, &label);
             assert_eq!(
-                entry_message, clause,
-                "case {label}: expected the entry for '{}' to state the envelope's own \
-                 clause {clause:?}, got {entry_message:?}",
+                entry_message, expected,
+                "case {label}: expected the entry for '{}' to state {expected:?}, got \
+                 {entry_message:?}",
                 spoiled.path
             );
         }

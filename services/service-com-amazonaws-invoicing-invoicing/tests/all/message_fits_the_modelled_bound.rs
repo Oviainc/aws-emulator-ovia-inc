@@ -131,6 +131,13 @@ fn clause(path: &str, requirement: &str) -> String {
     format!("Value at '{path}' failed to satisfy constraint: {requirement}")
 }
 
+/// The message the `fieldList` entry for a rejected member states: the requirement it
+/// failed, about the value the entry refused — withheld behind the `[redacted]` marker —
+/// with the member left to the entry's own `name`.
+fn field_message(requirement: &str) -> String {
+    format!("Value [redacted] failed to satisfy constraint: {requirement}")
+}
+
 /// The member path a clause names, read back out of it.
 fn path_of(clause: &str) -> String {
     clause
@@ -138,6 +145,14 @@ fn path_of(clause: &str) -> String {
         .nth(1)
         .unwrap_or_else(|| panic!("a clause names a member path, got {clause:?}"))
         .to_string()
+}
+
+/// The requirement a clause states, read back out of it.
+fn requirement_of(clause: &str) -> String {
+    clause
+        .split_once("failed to satisfy constraint: ")
+        .map(|(_, requirement)| requirement.to_string())
+        .unwrap_or_else(|| panic!("a clause states a requirement, got {clause:?}"))
 }
 
 /// The AWS envelope over `clauses`, which counts the clauses it states.
@@ -386,9 +401,10 @@ async fn a_refusal_states_as_many_whole_clauses_as_the_modelled_bound_admits() {
                  got {answer:?}"
             );
             assert_eq!(
-                entry_message, clauses[position],
-                "case {case:?}: entry {position} must state the clause the envelope \
-                 states, got {answer:?}"
+                entry_message,
+                field_message(&requirement_of(clauses[position])),
+                "case {case:?}: entry {position} must state the requirement the envelope \
+                 states for that member, got {answer:?}"
             );
             for (member, text) in [("name", name), ("message", entry_message)] {
                 let text_length = text.chars().count();

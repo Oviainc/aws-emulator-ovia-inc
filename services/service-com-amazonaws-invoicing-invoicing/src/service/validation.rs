@@ -20,6 +20,13 @@
 //!   what the request must satisfy, which the rejected value does not help with, and
 //!   anything that surfaces or persists the message would otherwise reproduce caller
 //!   input AWS deliberately omits;
+//! * a `fieldList` ENTRY's own message states that same requirement about the VALUE the
+//!   entry refused and names no member path at all — `Value [redacted] failed to satisfy
+//!   constraint: <requirement>` — because the entry already identifies its member in its
+//!   own `name` member, so the message has nothing left to identify and the withheld
+//!   value is what stands at the head of the sentence, as the literal [`REDACTED_VALUE`]
+//!   marker. An absent member keeps the `null` there for the same reason as above: there
+//!   was no value to withhold (see [`field_clause`]);
 //! * a `@pattern` requirement quotes the expression WITHOUT the `^` / `$` anchors a
 //!   model spells it with to demand a whole-string match: a caller that lifts the
 //!   advertised expression out of the message and re-applies it locally must get the
@@ -38,9 +45,12 @@
 //! and [`reportable_resource_arn`] is that rule for an identifier, which — unlike a
 //! sentence — cannot be cut down to the bound and still name what was asked about.
 //!
-//! Both halves of a refusal body are built from the same clause: the `message`
-//! envelope and each `fieldList` entry's own `message` (see
-//! [`field_validation_failed`]), so the two cannot drift.
+//! Both halves of a refusal body are built from the same violation and state the same
+//! REQUIREMENT for it — the `message` envelope and each `fieldList` entry's own `message`
+//! (see [`field_validation_failed`]) reach it through the one [`requirement`], so the two
+//! cannot word one constraint two ways. They differ only in how the member is identified:
+//! the envelope is prose about a whole request, so it names the member path, while an
+//! entry is a structure whose `name` names it.
 //!
 //! Nothing here is keyed to an operation, a member name or a value: the rule is applied
 //! to whatever [`Violation`] the walk produces, so it holds for every constrained member
@@ -52,13 +62,12 @@
 //! keeps the framework's own sentence rather than inventing one: [`ViolationKind`] is
 //! `#[non_exhaustive]`, so a class can be added upstream.
 //!
-//! One recorded body cannot be matched here and is deliberately not fitted: the wire
-//! recording this rendering was filed against carries a `fieldList` entry whose
-//! `message` is SCRUBBED — the part of the clause that named the rejected value was
-//! replaced, when the recording was taken, by a literal `[redacted]` placeholder (the
-//! same recording's top-level `message`, which this module reproduces exactly, carries
-//! no value at all). No rule of the service produces that placeholder, so the entry
-//! states the clause the rule gives.
+//! The redaction marker is the one part of this wording a value is not simply left out
+//! of: a `fieldList` entry's message is a sentence ABOUT the value, so leaving the value
+//! out of it altogether would leave the sentence saying nothing about what was refused.
+//! The marker says the value was withheld deliberately, which is what support tooling
+//! reads it as, and it is the same text whatever the member and whatever the value — it
+//! is never derived from the request.
 
 use smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
 
@@ -146,6 +155,14 @@ pub(crate) fn reportable_resource_arn(arn: &str) -> Option<String> {
         .then(|| arn.to_string())
 }
 
+/// The token a `fieldList` entry's message states where the value it refused would go.
+///
+/// The value itself is never reproduced (see this module's docs), and an entry's message
+/// is a sentence about that value, so this marker is what stands in its place — a fixed
+/// text, the same for every member and every value, that says the value was withheld
+/// rather than that there was none.
+const REDACTED_VALUE: &str = "[redacted]";
+
 /// The sentence a refusal falls back to when no violation has a wording here: the
 /// documentation of the modelled shape itself (`smithy_query(query="shape",
 /// shape="ValidationException")`).
@@ -201,8 +218,8 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
     Some(text)
 }
 
-/// One violation as the clause that goes into the envelope and into that member's
-/// `fieldList` entry, or `None` for a class this service has no wording for.
+/// One violation as the clause that goes into the envelope, or `None` for a class this
+/// service has no wording for.
 ///
 /// The rejected value is never rendered. An absent member is reported as the `null` it
 /// was, which is the shape of the request rather than a value the caller sent.
@@ -215,6 +232,26 @@ pub(crate) fn clause(violation: &Violation) -> Option<String> {
     Some(format!(
         "{subject} at '{}' failed to satisfy constraint: {requirement}",
         violation.path
+    ))
+}
+
+/// One violation as the `message` of the `fieldList` entry that reports it: the VALUE the
+/// entry refused and the requirement that value failed, and no member path — the entry
+/// names its member in its own `name` member, so its message identifies it nowhere a
+/// second time. `None` for a class this service has no wording for, as [`clause`].
+///
+/// The rejected value is never rendered here either: a value the request DID carry is
+/// stated as the [`REDACTED_VALUE`] marker, whatever the member and whatever the value,
+/// and an absent member — which had no value to withhold — keeps the `null` the request's
+/// shape held.
+pub(crate) fn field_clause(violation: &Violation) -> Option<String> {
+    let requirement = requirement(&violation.kind)?;
+    let value = match &violation.kind {
+        ViolationKind::MissingRequiredMember => "null",
+        _ => REDACTED_VALUE,
+    };
+    Some(format!(
+        "Value {value} failed to satisfy constraint: {requirement}"
     ))
 }
 
@@ -286,8 +323,8 @@ pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
 /// ONE rendering for every refused member, wherever the refusal is found: `message` is
 /// the `N validation error(s) detected: …` envelope, `reason` is
 /// [`REASON_FIELD_VALIDATION_FAILED`], and `fieldList` carries one entry per violation —
-/// `name` the dotted member path, `message` that violation's own clause naming the
-/// constraint it failed. A client can therefore branch on `reason` and report which
+/// `name` the dotted member path, `message` that violation's own [`field_clause`] naming
+/// the constraint it failed. A client can therefore branch on `reason` and report which
 /// member was rejected and why, instead of parsing the prose.
 ///
 /// Both halves state the SAME violations: the ones [`stated`] leaves after the count and
@@ -315,16 +352,11 @@ pub(crate) fn field_validation_failed(violations: &[Violation]) -> ValidationExc
                 .iter()
                 .map(|violation| ValidationExceptionField {
                     name: bounded_message(violation.path.clone()),
-                    // The same clause the envelope states for this member, so the two
-                    // halves of the body cannot word one violation two ways.
-                    //
-                    // The recording this rendering was filed against carries a SCRUBBED
-                    // text here (the corpus replaced the part of the clause that named
-                    // the rejected value with a literal `[redacted]` placeholder, which
-                    // no rule of the service produces), so the clause is what the rule
-                    // gives rather than what that one body holds.
+                    // The same requirement the envelope states for this member, about
+                    // the value the entry refused: the member is named by `name` just
+                    // above, so the message states no path of its own.
                     message: bounded_message(
-                        clause(violation)
+                        field_clause(violation)
                             .unwrap_or_else(|| VALIDATION_EXCEPTION_DOC.to_string()),
                     ),
                 })
@@ -426,6 +458,62 @@ mod tests {
             assert!(
                 !actual.contains(rejected),
                 "case {violation:?}: the clause must not reproduce the value, got {actual:?}"
+            );
+        }
+    }
+
+    /// A `fieldList` entry's own message states the VALUE and the requirement and no
+    /// member path, with the value withheld behind the marker; an absent member keeps
+    /// the `null` it was. The classes this model's own input shapes reach are covered
+    /// end-to-end by `tests/all/field_list_entry_message.rs`.
+    #[test]
+    fn a_field_clause_states_the_withheld_value_and_the_requirement_only() {
+        let rejected = "not-an-account-id";
+        let cases = [
+            (
+                Violation {
+                    path: "invoiceReceiver".to_string(),
+                    kind: ViolationKind::Pattern(r"^\d{12}$".to_string()),
+                    value: Some(rejected.to_string()),
+                    sensitive: false,
+                },
+                "Value [redacted] failed to satisfy constraint: Member must satisfy \
+                 regular expression pattern: \\d{12}",
+            ),
+            (
+                Violation {
+                    path: "name".to_string(),
+                    kind: ViolationKind::MaxLength(50),
+                    value: Some(rejected.to_string()),
+                    sensitive: false,
+                },
+                "Value [redacted] failed to satisfy constraint: Member must have length \
+                 less than or equal to 50",
+            ),
+            (
+                Violation {
+                    path: "name".to_string(),
+                    kind: ViolationKind::MissingRequiredMember,
+                    value: None,
+                    sensitive: false,
+                },
+                "Value null failed to satisfy constraint: Member must not be null",
+            ),
+        ];
+        for (violation, expected) in cases {
+            let actual = field_clause(&violation).expect("a modelled violation class is worded");
+            assert_eq!(
+                actual, expected,
+                "case {violation:?}: expected {expected:?}, got {actual:?}"
+            );
+            assert!(
+                !actual.contains(rejected),
+                "case {violation:?}: the entry must not reproduce the value, got {actual:?}"
+            );
+            assert!(
+                !actual.contains(violation.path.as_str()),
+                "case {violation:?}: the entry's own name identifies the member, got \
+                 {actual:?}"
             );
         }
     }

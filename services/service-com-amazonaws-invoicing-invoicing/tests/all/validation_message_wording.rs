@@ -18,8 +18,11 @@
 //! 2. A `@pattern` requirement quotes the expression WITHOUT the `^` / `$` anchors the
 //!    model spells it with, so a caller can lift the advertised expression out of the
 //!    message and re-apply it locally.
-//! 3. Both halves of the modelled refusal body state the SAME clause: the `message`
-//!    envelope and the `fieldList` entry of each rejected member.
+//! 3. Both halves of the modelled refusal body state the SAME requirement for the same
+//!    rejected member: the `message` envelope, as prose about the whole request, names
+//!    the member path, and the `fieldList` entry of that member names it in its own
+//!    `name` member and states the requirement about the value it refused — with the
+//!    value withheld behind the `[redacted]` marker, or the `null` an absent member was.
 //! 4. Every `fieldList` element carries the `__type` discriminator — a shape id naming
 //!    the field structure — the way the top-level error body does, so a client that
 //!    decides how to decode a JSON document from its discriminator can decode the
@@ -148,8 +151,8 @@ impl Expected {
         }
     }
 
-    /// The clause AWS states for this violation: the subject, the member path and the
-    /// requirement — and no rendering of the value.
+    /// The clause AWS states for this violation inside the envelope: the subject, the
+    /// member path and the requirement — and no rendering of the value.
     fn clause(&self) -> String {
         let subject = match self.subject {
             Subject::Present => "Value",
@@ -158,6 +161,20 @@ impl Expected {
         format!(
             "{subject} at '{}' failed to satisfy constraint: {}",
             self.path, self.requirement
+        )
+    }
+
+    /// The message the `fieldList` entry for this violation states: the value it refused
+    /// — withheld behind the `[redacted]` marker, or the `null` an absent member was —
+    /// and the same requirement, with the member left to the entry's own `name`.
+    fn field_message(&self) -> String {
+        let value = match self.subject {
+            Subject::Present => "[redacted]",
+            Subject::Absent => "null",
+        };
+        format!(
+            "Value {value} failed to satisfy constraint: {}",
+            self.requirement
         )
     }
 }
@@ -603,7 +620,8 @@ async fn a_refusal_states_the_member_and_the_constraint_and_nothing_of_the_value
             "case {case:?}: expected reason {FIELD_VALIDATION_FAILED:?}, got {answer:?}"
         );
 
-        // RULE 3: one entry per violation, stating the same clause the envelope does.
+        // RULE 3: one entry per violation, naming its member in `name` and stating the
+        // requirement the envelope states for it.
         let field_list = answer.body["fieldList"]
             .as_array()
             .unwrap_or_else(|| panic!("case {case:?}: expected a fieldList, got {answer:?}"));
@@ -619,7 +637,7 @@ async fn a_refusal_states_the_member_and_the_constraint_and_nothing_of_the_value
         let wanted: Vec<(String, String)> = case
             .expected
             .iter()
-            .map(|expected| (expected.path.to_string(), expected.clause()))
+            .map(|expected| (expected.path.to_string(), expected.field_message()))
             .collect();
         assert_eq!(
             entries, wanted,
