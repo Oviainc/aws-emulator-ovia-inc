@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What `AssociateTrunkInterface` answers, end to end over the wire the service actually
-//! speaks: `ec2Query`, an `application/x-www-form-urlencoded` POST whose body carries
-//! `Action=AssociateTrunkInterface`, answered with XML (README.md / OPERATIONS.md "Wire
+//! What the three interface-trunking operations answer, end to end over the wire the
+//! service actually speaks: `ec2Query`, an `application/x-www-form-urlencoded` POST whose
+//! body carries `Action=<Operation>`, answered with XML (README.md / OPERATIONS.md "Wire
 //! protocol"). ec2Query is selected by the `ec2` signing name in the request's SigV4
 //! credential scope, so every call here carries one.
 //!
-//! The rule under test: joining a `branch` network interface to a `trunk` one is a
-//! capability EC2 grants an ACCOUNT out of band, so a caller whose account does not hold it
-//! is refused the operation — HTTP 400 `OperationNotPermitted`, naming the account the
-//! request was made by — and told nothing about the interfaces, the VLAN id or the GRE key
-//! the request named. The refusal therefore does not depend on the request: it comes before
-//! any member of it is read, so it is the answer whatever the request carries and in
-//! whichever Region it was made.
+//! The rule under test: interface trunking — joining a `branch` network interface to a
+//! `trunk` one, reporting those joins and taking one down — is a capability EC2 grants an
+//! ACCOUNT out of band, so a caller whose account does not hold it is refused EVERY
+//! operation the capability gates — HTTP 400 `OperationNotPermitted`, naming the account the
+//! request was made by — and told nothing about the interfaces, the associations, the VLAN
+//! id or the GRE key the request named. The refusal therefore does not depend on the
+//! request: it comes before any member of it is read, so it is the answer whatever the
+//! request carries and in whichever Region it was made. For the reader that means a REFUSAL
+//! and not an empty page: an account outside the capability is not told that it holds no
+//! associations, it is told it may not ask.
 //!
 //! That is what the table below is: each row is a distinct input along what the rule
 //! generalises over — which interfaces the request names (two the account really holds,
@@ -29,15 +32,16 @@
 //! `DescribeNetworkInterfaces` after every refused call: a refused association stores
 //! nothing, so the account's interfaces have to read back exactly as they were created.
 //!
-//! `DescribeTrunkInterfaceAssociations` and `DisassociateTrunkInterface` are gated by the
-//! same capability and are still scaffolds, each with its own issue, so nothing here drives
-//! them.
+//! `DescribeTrunkInterfaceAssociations` and `DisassociateTrunkInterface` get a table each,
+//! below, varying what THEY generalise over — the association ids named, the filters, the
+//! page asked for, the idempotency token and the dry run — because the capability gates the
+//! operation rather than any one of its members.
 
 use ec2::state::ComAmazonawsEc2Amazonec2State as Ec2State;
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{element, elements, error_code, error_message};
+use super::ec2_query::{element, elements, error_code, error_message, filters, indexed};
 use super::wire::{Param, param};
 
 /// The Region the fixture's interfaces are created in: the account's default VPC and its
@@ -90,6 +94,24 @@ async fn associate(
     params: &[Param],
 ) -> (u16, String) {
     super::ec2_query::call(router, region, "AssociateTrunkInterface", params).await
+}
+
+/// One `DescribeTrunkInterfaceAssociations` call carrying `params`, made in `region`.
+async fn describe_associations(
+    router: &MultiServiceRouter,
+    region: &str,
+    params: &[Param],
+) -> (u16, String) {
+    super::ec2_query::call(router, region, "DescribeTrunkInterfaceAssociations", params).await
+}
+
+/// One `DisassociateTrunkInterface` call carrying `params`, made in `region`.
+async fn disassociate(
+    router: &MultiServiceRouter,
+    region: &str,
+    params: &[Param],
+) -> (u16, String) {
+    super::ec2_query::call(router, region, "DisassociateTrunkInterface", params).await
 }
 
 /// The first default subnet of the account's default VPC — a subnet the store really holds,
@@ -369,4 +391,260 @@ async fn every_association_request_is_refused_as_not_permitted() {
             "interface {id} must still read back as a {expected_type} interface, got {after:?}"
         );
     }
+}
+
+/// Assert a refused call reported nothing about an association: the reader's result list and
+/// its page token, and the id either side of the pair reports, are all absent.
+fn assert_reports_no_association(case: &str, body: &str) {
+    for absent in [
+        "interfaceAssociationSet",
+        "interfaceAssociation",
+        "associationId",
+        "nextToken",
+        "return",
+    ] {
+        assert!(
+            element(body, absent).is_none(),
+            "case {case:?}: a refused request reports no <{absent}>, got {body}"
+        );
+    }
+}
+
+/// Every `DescribeTrunkInterfaceAssociations` request, whatever it asks for, is refused the
+/// operation — not answered with an empty page — and changes nothing a later caller reads.
+#[tokio::test]
+async fn every_association_report_request_is_refused_as_not_permitted() {
+    let (router, engine) = emulator();
+    let subnet_id = default_subnet(&engine);
+    let trunk = create_interface(&router, &subnet_id, Some(TRUNK_TYPE)).await;
+    let branch = create_interface(&router, &subnet_id, Some(BRANCH_TYPE)).await;
+    let before = interface_report(&router, "before any report request").await;
+
+    // Each row varies one factor of the request: which associations it selects by id, which
+    // filter selects them, the page asked for, and whether the request is a `DryRun`. The
+    // two filter names are the ones the operation documents: "gre-key - The ID of a trunk
+    // interface association. interface-protocol - The interface protocol. Valid values are
+    // VLAN and GRE" (`DescribeTrunkInterfaceAssociationsRequest$Filters`).
+    //
+    // `MaxResults` is asked for at each of the bounds the model publishes for it
+    // (`DescribeTrunkInterfaceAssociationsMaxResults`, range 5..255) and once between them.
+    // A value OUTSIDE that range is not a row here: the modelled constraint is refused by
+    // the boundary validator before this handler runs, so such a request says nothing about
+    // the account-level rule under test.
+    let rows: Vec<(&str, Vec<Param>)> = vec![
+        ("naming nothing at all", vec![]),
+        (
+            "one association id",
+            indexed("AssociationId", &["tia-0123456789abcdef0"]),
+        ),
+        (
+            "three association ids",
+            indexed(
+                "AssociationId",
+                &[
+                    "tia-0123456789abcdef0",
+                    "tia-00112233445566778",
+                    "tia-aaaabbbbccccddddd",
+                ],
+            ),
+        ),
+        (
+            "an association id that is not an id at all",
+            indexed("AssociationId", &["not-an-association-id"]),
+        ),
+        (
+            "an association id present but empty",
+            indexed("AssociationId", &[""]),
+        ),
+        ("the gre-key filter", filters(&[("gre-key", &["7"])])),
+        (
+            "the interface-protocol filter, VLAN",
+            filters(&[("interface-protocol", &["VLAN"])]),
+        ),
+        (
+            "the interface-protocol filter, GRE",
+            filters(&[("interface-protocol", &["GRE"])]),
+        ),
+        (
+            "both documented filters together",
+            filters(&[
+                ("gre-key", &["7", "8"]),
+                ("interface-protocol", &["VLAN", "GRE"]),
+            ]),
+        ),
+        (
+            "a filter name the operation documents none of",
+            filters(&[("not-a-filter-this-operation-has", &["anything"])]),
+        ),
+        (
+            "the smallest page the model admits",
+            vec![param("MaxResults", "5")],
+        ),
+        (
+            "the largest page the model admits",
+            vec![param("MaxResults", "255")],
+        ),
+        (
+            "a page in between, continued from a token",
+            vec![
+                param("MaxResults", "100"),
+                param("NextToken", "a-token-no-page-of-this-account-handed-out"),
+            ],
+        ),
+        (
+            "a continuation token alone",
+            vec![param("NextToken", "another-token")],
+        ),
+        (
+            "ids, a filter and a page together",
+            {
+                let mut params = indexed("AssociationId", &["tia-0123456789abcdef0"]);
+                params.extend(filters(&[("interface-protocol", &["VLAN"])]));
+                params.push(param("MaxResults", "5"));
+                params
+            },
+        ),
+        ("a dry run", vec![param("DryRun", "true")]),
+        (
+            "a dry run of a request selecting one association",
+            {
+                let mut params = indexed("AssociationId", &["tia-0123456789abcdef0"]);
+                params.push(param("DryRun", "true"));
+                params
+            },
+        ),
+    ];
+
+    for (case, params) in &rows {
+        let (status, body) = describe_associations(&router, REGION, params).await;
+        assert_refused(case, status, &body);
+        assert_reports_no_association(case, &body);
+    }
+
+    // A report is a read, so asking twice answers twice the same way: the first call neither
+    // consumed anything nor moved anything the second one would have seen.
+    let (first_status, first_body) = describe_associations(&router, REGION, &[]).await;
+    let (second_status, second_body) = describe_associations(&router, REGION, &[]).await;
+    assert_eq!(
+        (first_status, error_code(&first_body), error_message(&first_body)),
+        (second_status, error_code(&second_body), error_message(&second_body)),
+        "case {:?}: a report changes nothing, so the second call must answer exactly as the \
+         first: got {first_status} {first_body} then {second_status} {second_body}",
+        "the same report asked twice"
+    );
+
+    // The capability belongs to the account, not to a Region, so the same request made in
+    // another Region reads the same refusal.
+    let (status, body) = describe_associations(&router, OTHER_REGION, &[]).await;
+    assert_refused("a report asked in another Region", status, &body);
+
+    // And the account's interfaces read back exactly as the creates left them: a refused
+    // report stores nothing, and an association request after one is still refused.
+    let after = interface_report(&router, "after every report request").await;
+    assert_eq!(
+        after, before,
+        "a refused report stores nothing, so the account's interfaces must read back \
+         unchanged: expected {before:?}, got {after:?}"
+    );
+    let (status, body) = associate(
+        &router,
+        REGION,
+        &[
+            param("TrunkInterfaceId", &trunk),
+            param("BranchInterfaceId", &branch),
+            param("VlanId", "101"),
+        ],
+    )
+    .await;
+    assert_refused("an association asked after a refused report", status, &body);
+}
+
+/// Every `DisassociateTrunkInterface` request, whatever association it names, is refused the
+/// operation and leaves the account's interfaces as they were.
+#[tokio::test]
+async fn every_disassociation_request_is_refused_as_not_permitted() {
+    let (router, engine) = emulator();
+    let subnet_id = default_subnet(&engine);
+    let trunk = create_interface(&router, &subnet_id, Some(TRUNK_TYPE)).await;
+    let branch = create_interface(&router, &subnet_id, Some(BRANCH_TYPE)).await;
+    let before = interface_report(&router, "before any disassociation request").await;
+
+    // Each row varies one factor of the request: the shape of the association id it names,
+    // whether an idempotency token is given and repeated, and whether it is a `DryRun`. No id
+    // can name an association the account holds, because the operation that would have made
+    // one is refused the same way.
+    let rows: Vec<(&str, Vec<Param>)> = vec![
+        (
+            "an association id in the form the API reports",
+            vec![param("AssociationId", "tia-0123456789abcdef0")],
+        ),
+        (
+            "another id of the same form",
+            vec![param("AssociationId", "tia-00112233445566778")],
+        ),
+        (
+            "an id that is not an association id at all",
+            vec![param("AssociationId", "not-an-association-id")],
+        ),
+        (
+            "an id that names one of the account's own interfaces instead",
+            vec![param("AssociationId", &trunk)],
+        ),
+        (
+            "an id present but empty",
+            vec![param("AssociationId", "")],
+        ),
+        (
+            "an idempotency token, first use",
+            vec![
+                param("AssociationId", "tia-0123456789abcdef0"),
+                param("ClientToken", "trunk-disassociation-token"),
+            ],
+        ),
+        (
+            "the same idempotency token again",
+            vec![
+                param("AssociationId", "tia-0123456789abcdef0"),
+                param("ClientToken", "trunk-disassociation-token"),
+            ],
+        ),
+        (
+            "a dry run",
+            vec![
+                param("AssociationId", "tia-0123456789abcdef0"),
+                param("DryRun", "true"),
+            ],
+        ),
+    ];
+
+    for (case, params) in &rows {
+        let (status, body) = disassociate(&router, REGION, params).await;
+        assert_refused(case, status, &body);
+        assert_reports_no_association(case, &body);
+    }
+
+    // The capability belongs to the account, not to a Region.
+    let (status, body) = disassociate(
+        &router,
+        OTHER_REGION,
+        &[param("AssociationId", "tia-0123456789abcdef0")],
+    )
+    .await;
+    assert_refused("the same id, asked in another Region", status, &body);
+
+    // Nothing was removed and nothing was stored: the account's interfaces read back exactly
+    // as the creates left them, and the branch interface is still a branch.
+    let after = interface_report(&router, "after every disassociation request").await;
+    assert_eq!(
+        after, before,
+        "a refused disassociation changes nothing, so the account's interfaces must read \
+         back unchanged: expected {before:?}, got {after:?}"
+    );
+    assert!(
+        after
+            .iter()
+            .any(|(reported, interface_type, _)| reported == &branch
+                && interface_type == BRANCH_TYPE),
+        "interface {branch} must still read back as a {BRANCH_TYPE} interface, got {after:?}"
+    );
 }

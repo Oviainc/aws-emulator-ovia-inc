@@ -17,8 +17,7 @@
 //! This emulator serves one account ([`::engine::emulator_account_id`]) and no operation of
 //! this API grants the capability to it, so every caller reads that refusal. The reader
 //! `DescribeTrunkInterfaceAssociations` and `DisassociateTrunkInterface` are gated by the
-//! same capability and are still scaffolds, each with its own issue: what they will answer
-//! is the shared refusal above rather than a second wording of it.
+//! same capability and answer the shared refusal above rather than a second wording of it.
 //!
 //! ## Reaching this service's state
 //!
