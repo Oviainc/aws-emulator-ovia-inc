@@ -478,7 +478,9 @@ pub fn validate_integration(
             )
         }
         Some(uri) => {
-            if AWS_INTEGRATION_TYPES.contains(&integration_type) && !uri.starts_with("arn:") {
+            if AWS_INTEGRATION_TYPES.contains(&integration_type)
+                && !uri.starts_with(crate::state::ARN_PREFIX)
+            {
                 return Err(format!(
                     "Invalid integration URI specified: an integration of type {integration_type} \
                      takes an AWS integration ARN of the form \

@@ -185,7 +185,18 @@ pub fn stage_body(entry: &StageEntry, web_acl_arn: Option<String>) -> CreateStag
         }),
         documentation_version: entry.documentation_version.clone(),
         access_log_settings: entry.access_log_settings.clone(),
-        canary_settings: entry.canary_settings.clone(),
+        canary_settings: entry.canary_settings.clone().map(|canary| CanarySettings {
+            // "The ID of the canary deployment" (`CanarySettings$deploymentId`): a canary
+            // configured on a stage serves a deployment, so one that carries no deployment
+            // of its own — a canary configured before it was pointed at one, or one whose
+            // own deployment was taken away — serves the deployment the STAGE serves.
+            // Derived on every report rather than stored, so re-pointing the stage moves
+            // such a canary with it.
+            deployment_id: canary
+                .deployment_id
+                .or_else(|| Some(entry.deployment_id.clone())),
+            ..canary
+        }),
         tracing_enabled: entry.tracing_enabled,
         // "The ARN of the WebAcl associated with the Stage" (`Stage$webAclArn`): set by
         // associating a web ACL with this stage's ARN through AWS WAF, so it is read from

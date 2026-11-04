@@ -39,6 +39,13 @@
 //! A `copy` is the canary PROMOTION rather than a patch of a member, so its legal
 //! `(path, from)` pairs are a grammar of their own — see [`CANARY_PROMOTIONS`].
 //!
+//! An `add` names one entry of a collection the stage keys by name and nothing else: every
+//! other pointer of a stage names a member that is already there, which is `replace`d, so
+//! an `add` of one is refused — see [`add_names_an_entry`]. A `remove` takes away the parts
+//! of a stage that can go away; a pointer that is none of them is read as a method
+//! setting's path, so it is answered with that sentence — see [`remove_method_setting`].
+//! A patch `value` for a boolean member is READ rather than validated: see [`stage_bool`].
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -120,7 +127,7 @@ use super::types::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::state::{
-    patch_bool, patch_enum_string, patch_f64_checked, patch_f64_in, patch_i32_in,
+    patch_enum_string, patch_f64_checked, patch_f64_in, patch_i32_in,
     patch_optional_string, patch_string_map, Patch, PatchFailure, PatchOpKind, StageEntry,
     MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
@@ -159,6 +166,18 @@ const CANARY_PROMOTIONS: &[(&str, &str)] = &[
     ("/variables", CANARY_OVERRIDES_POINTER),
 ];
 
+/// The `BadRequestException` message for an `op` a stage cannot apply to the pointer that
+/// `op` named: the op and the path, both quoted back exactly as the request spelled them,
+/// and nothing else.
+///
+/// This is the stage's sentence for an op that NAMES a pointer it cannot be applied to —
+/// as opposed to one the resource takes no pointer for at all, which is
+/// [`STAGE_INVALID_PATCH_OPERATION`] — and the `copy` grammar's refusal below opens with
+/// the same text, so the two are built from this one template.
+fn invalid_operation(op: PatchOpKind, path: &str) -> String {
+    format!("Invalid {} operation with path: {path}", op.as_str())
+}
+
 /// The `BadRequestException` message for a `copy` outside the stage's copy grammar.
 ///
 /// Fixed text states the two legal sets — the paths a `copy` may name and the pointers one
@@ -170,8 +189,8 @@ fn invalid_copy_operation(path: &str, from: &str) -> String {
     let paths: Vec<&str> = CANARY_PROMOTIONS.iter().map(|(path, _)| *path).collect();
     let sources: Vec<&str> = CANARY_PROMOTIONS.iter().map(|(_, from)| *from).collect();
     format!(
-        "Invalid copy operation with path: {path} and from {from}. Valid copy:path are \
-         [{}] and valid copy:from are [{}]",
+        "{} and from {from}. Valid copy:path are [{}] and valid copy:from are [{}]",
+        invalid_operation(PatchOpKind::Copy, path),
         paths.join(", "),
         sources.join(", ")
     )
@@ -214,9 +233,34 @@ fn enables_execution_logging(patch: &Patch, setting: &str) -> bool {
         "logging/loglevel" => patch.value.as_deref().is_some_and(|level| {
             level != LOGGING_LEVEL_OFF && LOGGING_LEVEL_VALUES.contains(&level)
         }),
-        "logging/dataTrace" => patch.require_bool().unwrap_or(false),
+        "logging/dataTrace" => stage_bool(patch).unwrap_or(false),
         _ => false,
     }
+}
+
+/// The boolean a stage's patch `value` spells.
+///
+/// A patch `value` is a bare string on the wire ("applicable for the add or replace
+/// operation", `PatchOperation$value`), and a boolean member of a stage always carries one
+/// of its two values, so reading one leaves no third answer for a text that spells
+/// neither: the member is TRUE when the text spells `true` and FALSE for every other text,
+/// which is what a recorded `cacheClusterEnabled` patch carrying a word shows API Gateway
+/// answering — 200, with the flag reported off. Case and surrounding space are not part of
+/// the spelling.
+fn stage_bool(patch: &Patch) -> Result<bool, PatchFailure> {
+    Ok(patch.require_value()?.trim().eq_ignore_ascii_case("true"))
+}
+
+/// Apply `patch` to a boolean member of a stage, reading the value the way
+/// [`stage_bool`] reads one. `remove` is refused, as it is for every boolean member the
+/// model declares with a default: such a member always has one of its two values.
+fn patch_stage_bool(current: &mut bool, patch: &Patch) -> Result<(), PatchFailure> {
+    patch.require_single_valued()?;
+    match patch.op {
+        PatchOpKind::Add | PatchOpKind::Replace => *current = stage_bool(patch)?,
+        _ => return Err(patch.unsupported_op()),
+    }
+    Ok(())
 }
 
 /// The range of `MethodSetting$cacheTtlInSeconds`: API Gateway documents a default TTL of
@@ -323,34 +367,107 @@ fn require_deployment(
     ))
 }
 
+/// The stored state a stage's patch is applied against, beside the record itself: what a
+/// patch VALUE naming another record is checked against, and the account-level
+/// precondition of a stage's execution logging. Read from the store once per request, so
+/// every op of one `patchOperations` list is applied against the same state.
+struct StagePatchContext<'a> {
+    /// The ids of the API's stored deployments: a stage, and a canary of it, serves a
+    /// deployment of its own API.
+    deployments: &'a BTreeSet<String>,
+    /// The ids of the account's client certificates: a stage presents one of them to its
+    /// integration endpoint.
+    client_certificates: &'a BTreeSet<String>,
+    /// Whether the ACCOUNT has a CloudWatch Logs role, which a patch turning execution
+    /// logging on requires (see [`ACCOUNT_CLOUDWATCH_ROLE_REQUIRED`]).
+    logging_role_configured: bool,
+}
+
 /// Apply one patch to a COPY of a stored stage.
 ///
-/// `deployments` is the set of the API's stored deployment ids, so a stage can only be
-/// pointed at a deployment that exists. `logging_role_configured` is whether the ACCOUNT
-/// has a CloudWatch Logs role, which a patch turning execution logging on requires (see
-/// [`ACCOUNT_CLOUDWATCH_ROLE_REQUIRED`]).
+/// An `add` is applied only where it names something to add ([`add_names_an_entry`]); on
+/// every other pointer of a stage it is refused as an op. The pointer and the VALUE are
+/// judged first, though — a pointer the stage could not apply at all, or a value the
+/// member would refuse, is refused on its own terms whichever op carried it — so such an
+/// `add` is run against a throwaway copy of the record and refused as an op only once that
+/// copy took it.
 fn apply_patch(
     entry: &mut StageEntry,
     patch: &Patch,
-    deployments: &BTreeSet<String>,
-    logging_role_configured: bool,
+    context: &StagePatchContext<'_>,
+) -> Result<(), PatchFailure> {
+    if matches!(patch.op, PatchOpKind::Add) && !add_names_an_entry(patch) {
+        apply_stage_patch(&mut entry.clone(), patch, context)?;
+        return Err(PatchFailure::BadRequest(invalid_operation(
+            patch.op,
+            &patch.path,
+        )));
+    }
+    apply_stage_patch(entry, patch, context)
+}
+
+/// Whether an `add` names a pointer of a stage it applies to.
+///
+/// `add` is the op that puts something THERE that was not: on a stage it names one entry
+/// of a collection the stage keys by name — a stage variable, one of the canary's variable
+/// overrides, or a method's setting, which the stage carries no entry for until a patch
+/// names it. Every other pointer of a stage names a single-valued member the stage already
+/// has, which is `replace`d, so an `add` of one puts nothing anywhere and is refused.
+///
+/// Stated positively, from the three collections only, so it cannot drift from the
+/// dispatch below: a pointer that names none of them names no entry.
+fn add_names_an_entry(patch: &Patch) -> bool {
+    match patch.member() {
+        "variables" => patch.tokens.len() > 1,
+        "canarySettings" => {
+            patch.tokens.len() > 2
+                && patch
+                    .tokens
+                    .get(1)
+                    .is_some_and(|member| member == "stageVariableOverrides")
+        }
+        // A method's settings, which the stage holds no entry for until one is added. A
+        // single-valued member of the `Stage` shape names no setting, so it answers here
+        // too.
+        _ => method_setting_tail(patch).is_some(),
+    }
+}
+
+/// Apply one patch that named an op and a pointer the stage takes, to the member of the
+/// record that pointer names.
+fn apply_stage_patch(
+    entry: &mut StageEntry,
+    patch: &Patch,
+    context: &StagePatchContext<'_>,
 ) -> Result<(), PatchFailure> {
     // A `copy` is the canary promotion, whose legal (path, from) pairs are the stage's
     // copy grammar — judged for the op as a whole rather than per member, because the
     // refusal names both sides of the pair the request sent.
     if matches!(patch.op, PatchOpKind::Copy) {
-        return apply_canary_promotion(entry, patch, deployments);
+        return apply_canary_promotion(entry, patch, context.deployments);
     }
     match patch.member() {
-        "deploymentId" => apply_deployment_id(entry, patch, deployments),
+        "deploymentId" => apply_deployment_id(entry, patch, context.deployments),
         "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
         "documentationVersion" => {
             patch_optional_string(&mut entry.documentation_version, patch, MAX_STRING_CHARS)
         }
         "clientCertificateId" => {
-            patch_optional_string(&mut entry.client_certificate_id, patch, MAX_STRING_CHARS)
+            patch_optional_string(&mut entry.client_certificate_id, patch, MAX_STRING_CHARS)?;
+            // "The identifier of a client certificate for an API stage"
+            // (`Stage$clientCertificateId`): the stage presents that certificate to its
+            // integration endpoint, so the value has to name one the ACCOUNT has —
+            // refused as a bad REQUEST for the reason [`require_deployment`] gives.
+            if let Some(certificate) = &entry.client_certificate_id {
+                if !context.client_certificates.contains(certificate) {
+                    return Err(PatchFailure::BadRequest(
+                        crate::state::NO_SUCH_CLIENT_CERTIFICATE.to_string(),
+                    ));
+                }
+            }
+            Ok(())
         }
-        "tracingEnabled" => patch_bool(&mut entry.tracing_enabled, patch),
+        "tracingEnabled" => patch_stage_bool(&mut entry.tracing_enabled, patch),
         "cacheClusterEnabled" => apply_cache_cluster_enabled(entry, patch),
         "cacheClusterSize" => apply_cache_cluster_size(entry, patch),
         "variables" => {
@@ -364,11 +481,11 @@ fn apply_patch(
                 MAX_STRING_CHARS,
             )
         }
-        "canarySettings" => apply_canary_patch(entry, patch, deployments),
+        "canarySettings" => apply_canary_patch(entry, patch, context.deployments),
         "accessLogSettings" => apply_access_log_patch(entry, patch),
         // Everything else is addressed as a method path rather than as a member of the
         // stage: `/{resource_path}/{http_method}/<setting>`.
-        _ => apply_method_setting_patch(entry, patch, logging_role_configured),
+        _ => apply_method_setting_patch(entry, patch, context.logging_role_configured),
     }
 }
 
@@ -385,17 +502,29 @@ fn apply_canary_promotion(
         .find(|(path, source)| *path == patch.path && *source == from)
         .map(|(path, _)| *path)
         .ok_or_else(|| PatchFailure::BadRequest(invalid_copy_operation(&patch.path, from)))?;
-    let canary = entry.canary_settings.clone().unwrap_or_default();
+    let canary = entry.canary_settings.clone();
     if promoted == "/deploymentId" {
-        // The deployment the canary serves becomes the one the stage serves, so it has to
-        // be a deployment of this API, exactly as a `replace` of the member does.
-        let deployment_id = canary.deployment_id.ok_or_else(|| {
-            PatchFailure::BadRequest(format!(
-                "{CANARY_DEPLOYMENT_POINTER} names no deployment on this stage, so there is \
-                 nothing to copy to {}",
-                patch.path
-            ))
-        })?;
+        // The deployment the canary SERVES becomes the one the stage serves, so it has to
+        // be a deployment of this API, exactly as a `replace` of the member does. A canary
+        // that is configured but carries no deployment of its own serves the stage's
+        // ([`crate::ops::create_stage::stage_body`] reports that), so promoting it leaves
+        // the stage serving what it already serves; a stage with no canary at all has
+        // nothing to promote.
+        let deployment_id = canary
+            .as_ref()
+            .map(|canary| {
+                canary
+                    .deployment_id
+                    .clone()
+                    .unwrap_or_else(|| entry.deployment_id.clone())
+            })
+            .ok_or_else(|| {
+                PatchFailure::BadRequest(format!(
+                    "{CANARY_DEPLOYMENT_POINTER} names no deployment on this stage, so there is \
+                     nothing to copy to {}",
+                    patch.path
+                ))
+            })?;
         require_deployment(deployments, &deployment_id)?;
         entry.deployment_id = deployment_id;
         return Ok(());
@@ -405,7 +534,11 @@ fn apply_canary_promotion(
     // not override keeps the stage's — so a canary that overrode nothing promotes nothing.
     // The result is bounded like every other caller-driven collection.
     let mut variables = entry.variables.clone();
-    variables.extend(canary.stage_variable_overrides.unwrap_or_default());
+    variables.extend(
+        canary
+            .and_then(|canary| canary.stage_variable_overrides)
+            .unwrap_or_default(),
+    );
     crate::state::bound_entries("variables", variables.len(), MAX_COLLECTION_ENTRIES)
         .map_err(PatchFailure::BadRequest)?;
     entry.variables = variables;
@@ -440,7 +573,7 @@ fn apply_deployment_id(
 /// clock now owes is due.
 fn apply_cache_cluster_enabled(entry: &mut StageEntry, patch: &Patch) -> Result<(), PatchFailure> {
     let was_enabled = entry.cache_cluster_enabled;
-    patch_bool(&mut entry.cache_cluster_enabled, patch)?;
+    patch_stage_bool(&mut entry.cache_cluster_enabled, patch)?;
     if entry.cache_cluster_enabled == was_enabled {
         // Asking for what the stage already has provisions nothing, so no transition is
         // owed and an outstanding one is left alone.
@@ -467,13 +600,16 @@ fn apply_cache_cluster_enabled(entry: &mut StageEntry, patch: &Patch) -> Result<
 /// Change the stage's cache capacity. Re-sizing a cluster the stage HAS provisions a
 /// cluster of the new capacity, which is a creation the clock owes; a size set on a stage
 /// with no cluster is stored and provisions nothing.
+///
+/// The capacity is stored exactly as the request spells it. A patch `value` is a bare
+/// string on the wire (`PatchOperation$value`), so the published catalogue of capacities
+/// the `CacheClusterSize` enum declares constrains the MODELLED member — where
+/// `CreateStage` or `CreateDeployment` carries one and the request-validation layer
+/// checks it — and not this member's stored string, which every reader of the stage
+/// echoes back as it was set.
 fn apply_cache_cluster_size(entry: &mut StageEntry, patch: &Patch) -> Result<(), PatchFailure> {
     let before = entry.cache_cluster_size.clone();
-    patch_enum_string(
-        &mut entry.cache_cluster_size,
-        patch,
-        CACHE_CLUSTER_SIZE_VALUES,
-    )?;
+    patch_optional_string(&mut entry.cache_cluster_size, patch, MAX_STRING_CHARS)?;
     if entry.cache_cluster_enabled && entry.cache_cluster_size != before {
         entry.cache_cluster_ready_at =
             Some(::std::time::Instant::now() + crate::state::CACHE_CLUSTER_CREATE_SPAN);
@@ -515,7 +651,7 @@ fn apply_canary_patch(
                 crate::state::accepted_percent_traffic,
             )?;
         }
-        "useStageCache" => patch_bool(&mut canary.use_stage_cache, &nested)?,
+        "useStageCache" => patch_stage_bool(&mut canary.use_stage_cache, &nested)?,
         "deploymentId" => {
             patch_optional_string(&mut canary.deployment_id, &nested, MAX_STRING_CHARS)?;
             if let Some(deployment_id) = &canary.deployment_id {
@@ -568,8 +704,26 @@ fn apply_access_log_patch(entry: &mut StageEntry, patch: &Patch) -> Result<(), P
     match nested.member() {
         "destinationArn" => {
             patch_optional_string(&mut settings.destination_arn, &nested, MAX_STRING_CHARS)?;
+            // "The Amazon Resource Name (ARN) of the CloudWatch Logs log group or Kinesis
+            // Data Firehose delivery stream to receive access logs"
+            // (`AccessLogSettings$destinationArn`): the destination is named by an ARN, so
+            // a value that is none is refused the way this service refuses an unreadable
+            // ARN on any member.
+            if let Some(arn) = &settings.destination_arn {
+                crate::state::require_arn(arn).map_err(PatchFailure::BadRequest)?;
+            }
         }
         "format" => {
+            // The format is not a part of a stage a `remove` takes away on its own: it is
+            // "a single line format of the access logs of data" the destination receives
+            // (`AccessLogSettings$format`), so it goes with the settings rather than
+            // separately, and the pointer is read the way every pointer that is no
+            // removable part of a stage is — as a method setting's, see
+            // [`remove_method_setting`]. A pointer reaching PAST the format names nothing
+            // of this structure whatever the op, so it keeps the structure's own refusal.
+            if matches!(patch.op, PatchOpKind::Remove) && nested.tokens.len() == 1 {
+                return remove_method_setting(entry, patch);
+            }
             patch_optional_string(&mut settings.format, &nested, MAX_STRING_CHARS)?;
             // From `AccessLogSettings$format`: "The format must include at least
             // $context.requestId."
@@ -650,6 +804,94 @@ fn method_setting_tail(patch: &Patch) -> Option<(usize, &'static str)> {
     None
 }
 
+/// The `methodSettings` key a patch's path addresses: the first `depth` segments of the
+/// path exactly as the request spelled them, escapes included, because that is the key
+/// the patch addressed.
+fn method_settings_key(patch: &Patch, depth: usize) -> Option<String> {
+    let raw: Vec<&str> = patch
+        .path
+        .strip_prefix('/')
+        .unwrap_or(&patch.path)
+        .split('/')
+        .collect();
+    raw.get(..depth).map(|segments| segments.join("/"))
+}
+
+/// The `BadRequestException` message API Gateway refuses a `remove` of a method setting
+/// the stage carries none of with.
+///
+/// A `remove` names a setting that goes AWAY, so the stage has to carry settings for the
+/// method the path addresses. The only variable part is the setting path the request
+/// sent, with the pointer's leading `/` dropped; the rest, the trailing space included,
+/// is the service's own fixed text.
+fn cannot_remove_method_setting(setting: &str) -> String {
+    format!(
+        "Cannot remove method setting {setting} because there is no method setting for this \
+         method "
+    )
+}
+
+/// Take a method's settings away.
+///
+/// `methodSettings` is "a map that defines the method settings for a Stage resource"
+/// (`Stage$methodSettings`), so a `remove` whose path ends in a setting puts that one
+/// setting back to the value a stage carries for a setting nobody configured, and a path
+/// naming the method alone takes its whole entry out of the map.
+///
+/// Either way the method has to HAVE an entry on this stage: there is nothing to take
+/// away otherwise, and that is the condition [`cannot_remove_method_setting`] words.
+/// Every pointer that is no removable part of a stage is read as a method setting's path,
+/// so such a `remove` lands here too and is refused by the same sentence.
+fn remove_method_setting(entry: &mut StageEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    let refuse = || {
+        PatchFailure::BadRequest(cannot_remove_method_setting(
+            patch.path.strip_prefix('/').unwrap_or(&patch.path),
+        ))
+    };
+    let named = method_setting_tail(patch);
+    let key = method_settings_key(patch, named.map_or(patch.tokens.len(), |(depth, _)| depth))
+        .ok_or_else(refuse)?;
+    let Some((_, setting)) = named else {
+        return entry
+            .method_settings
+            .remove(&key)
+            .map(|_| ())
+            .ok_or_else(refuse);
+    };
+    // The value a setting nobody configured carries, so a setting that was removed reads
+    // back exactly as it does on a method the patch never named.
+    let unconfigured = default_method_setting();
+    let settings = entry.method_settings.get_mut(&key).ok_or_else(refuse)?;
+    match setting {
+        "metrics/enabled" => settings.metrics_enabled = unconfigured.metrics_enabled,
+        "logging/loglevel" => settings.logging_level = unconfigured.logging_level,
+        "logging/dataTrace" => settings.data_trace_enabled = unconfigured.data_trace_enabled,
+        "throttling/burstLimit" => {
+            settings.throttling_burst_limit = unconfigured.throttling_burst_limit;
+        }
+        "throttling/rateLimit" => {
+            settings.throttling_rate_limit = unconfigured.throttling_rate_limit;
+        }
+        "caching/enabled" => settings.caching_enabled = unconfigured.caching_enabled,
+        "caching/ttlInSeconds" => {
+            settings.cache_ttl_in_seconds = unconfigured.cache_ttl_in_seconds;
+        }
+        "caching/dataEncrypted" => {
+            settings.cache_data_encrypted = unconfigured.cache_data_encrypted;
+        }
+        "caching/requireAuthorizationForCacheControl" => {
+            settings.require_authorization_for_cache_control =
+                unconfigured.require_authorization_for_cache_control;
+        }
+        "caching/unauthorizedCacheControlHeaderStrategy" => {
+            settings.unauthorized_cache_control_header_strategy =
+                unconfigured.unauthorized_cache_control_header_strategy;
+        }
+        _ => return Err(patch.unsupported_path()),
+    }
+    Ok(())
+}
+
 /// Apply one patch addressed as a METHOD path:
 /// `/{resource_path}/{http_method}/{group}/{setting}`, or `/*/*/{group}/{setting}` for
 /// every method of the stage.
@@ -663,6 +905,11 @@ fn apply_method_setting_patch(
     patch: &Patch,
     logging_role_configured: bool,
 ) -> Result<(), PatchFailure> {
+    // A `remove` takes settings AWAY rather than configuring one, so it is read against
+    // the settings the stage already carries — see [`remove_method_setting`].
+    if matches!(patch.op, PatchOpKind::Remove) {
+        return remove_method_setting(entry, patch);
+    }
     let Some((depth, setting)) = method_setting_tail(patch) else {
         return Err(patch.unsupported_path());
     };
@@ -674,13 +921,7 @@ fn apply_method_setting_patch(
             ACCOUNT_CLOUDWATCH_ROLE_REQUIRED.to_string(),
         ));
     }
-    let raw: Vec<&str> = patch
-        .path
-        .strip_prefix('/')
-        .unwrap_or(&patch.path)
-        .split('/')
-        .collect();
-    let Some(method_path) = raw.get(..depth).map(|segments| segments.join("/")) else {
+    let Some(method_path) = method_settings_key(patch, depth) else {
         return Err(patch.unsupported_path());
     };
     if !entry.method_settings.contains_key(&method_path) {
@@ -699,11 +940,11 @@ fn apply_method_setting_patch(
     // path carries.
     let nested = patch.rebased(patch.tokens.len() - 1);
     match setting {
-        "metrics/enabled" => patch_bool(&mut settings.metrics_enabled, &nested),
+        "metrics/enabled" => patch_stage_bool(&mut settings.metrics_enabled, &nested),
         "logging/loglevel" => {
             patch_enum_string(&mut settings.logging_level, &nested, LOGGING_LEVEL_VALUES)
         }
-        "logging/dataTrace" => patch_bool(&mut settings.data_trace_enabled, &nested),
+        "logging/dataTrace" => patch_stage_bool(&mut settings.data_trace_enabled, &nested),
         "throttling/burstLimit" => patch_i32_in(
             &mut settings.throttling_burst_limit,
             &nested,
@@ -714,12 +955,12 @@ fn apply_method_setting_patch(
             &nested,
             THROTTLE_RATE_RANGE,
         ),
-        "caching/enabled" => patch_bool(&mut settings.caching_enabled, &nested),
+        "caching/enabled" => patch_stage_bool(&mut settings.caching_enabled, &nested),
         "caching/ttlInSeconds" => {
             patch_i32_in(&mut settings.cache_ttl_in_seconds, &nested, CACHE_TTL_RANGE)
         }
-        "caching/dataEncrypted" => patch_bool(&mut settings.cache_data_encrypted, &nested),
-        "caching/requireAuthorizationForCacheControl" => patch_bool(
+        "caching/dataEncrypted" => patch_stage_bool(&mut settings.cache_data_encrypted, &nested),
+        "caching/requireAuthorizationForCacheControl" => patch_stage_bool(
             &mut settings.require_authorization_for_cache_control,
             &nested,
         ),
@@ -844,10 +1085,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cloudwatch_role_arn
             .as_deref()
             .is_some_and(|arn| !arn.trim().is_empty());
+        // The account's client certificates, one of which a stage presents to its
+        // integration endpoint.
+        let client_certificates: BTreeSet<String> =
+            store.client_certificates.keys().cloned().collect();
+        let context = StagePatchContext {
+            deployments: &deployments,
+            client_certificates: &client_certificates,
+            logging_role_configured,
+        };
 
         for patch in &patches {
-            apply_patch(&mut updated, patch, &deployments, logging_role_configured)
-                .map_err(patch_failure)?;
+            apply_patch(&mut updated, patch, &context).map_err(patch_failure)?;
         }
         // A successful patch is when the record last changed. An empty list changes
         // nothing, so it moves nothing.

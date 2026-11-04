@@ -123,16 +123,10 @@ async fn a_patch_sets_the_member_its_path_names_and_the_stage_reads_back() {
             vec![("tracingEnabled", json!(true))],
         ),
         (
-            "another string member and a client certificate",
+            "another string member",
             "s_documented",
-            json!([
-                { "op": "replace", "path": "/documentationVersion", "value": "v2" },
-                { "op": "replace", "path": "/clientCertificateId", "value": "abc123" }
-            ]),
-            vec![
-                ("documentationVersion", json!("v2")),
-                ("clientCertificateId", json!("abc123")),
-            ],
+            json!([{ "op": "replace", "path": "/documentationVersion", "value": "v2" }]),
+            vec![("documentationVersion", json!("v2"))],
         ),
         (
             "an entry added to the variables map",
@@ -477,8 +471,17 @@ async fn a_patch_the_stage_shape_does_not_support_is_refused_and_writes_nothing(
             "BadRequestException",
         ),
         (
-            "a cache size outside the published catalog",
-            replace("/cacheClusterSize", "2.0"),
+            // A stage presents "the identifier of a client certificate for an API stage",
+            // so the value names one the ACCOUNT has; `GenerateClientCertificate` is the
+            // operation that mints one and it is still scaffolded, so an account has none.
+            "a client certificate this account does not have",
+            replace("/clientCertificateId", "abcdef1234"),
+            400,
+            "BadRequestException",
+        ),
+        (
+            "an access log destination that is not an ARN",
+            replace("/accessLogSettings/destinationArn", "not-an-arn"),
             400,
             "BadRequestException",
         ),
@@ -503,12 +506,6 @@ async fn a_patch_the_stage_shape_does_not_support_is_refused_and_writes_nothing(
         (
             "a negative throttle rate",
             replace("/*/*/throttling/rateLimit", "-1"),
-            400,
-            "BadRequestException",
-        ),
-        (
-            "a boolean setting given a non-boolean",
-            replace("/*/*/caching/enabled", "yes"),
             400,
             "BadRequestException",
         ),
@@ -603,6 +600,18 @@ async fn a_patch_the_stage_shape_does_not_support_is_refused_and_writes_nothing(
         (
             "a cache size from the published catalog",
             replace("/cacheClusterSize", "1.6"),
+        ),
+        (
+            // The capacity is stored as the request spells it: the published catalogue
+            // constrains the modelled member, not the string a patch value carries.
+            "a cache size outside the published catalog",
+            replace("/cacheClusterSize", "2.0"),
+        ),
+        (
+            // A boolean patch value is read, not validated: the setting is true when the
+            // value spells true and false for any other word.
+            "a boolean setting given a word that is not true",
+            replace("/*/*/caching/enabled", "yes"),
         ),
     ] {
         let answer = update_stage(&gateway, &api, "refusals", operations).await;

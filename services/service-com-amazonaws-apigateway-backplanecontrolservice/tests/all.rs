@@ -349,3 +349,8 @@ mod collection_page_envelope;
 // dialect always writes.
 #[path = "all/stage_export_version_and_containers.rs"]
 mod stage_export_version_and_containers;
+// Appended for the reason the note above gives: a stage's CANARY RELEASE — whose
+// deployment a canary serves, what promoting it makes the stage's — and the grammar a
+// stage's `patchOperations` are read by.
+#[path = "all/stage_canary_and_patch_grammar.rs"]
+mod stage_canary_and_patch_grammar;

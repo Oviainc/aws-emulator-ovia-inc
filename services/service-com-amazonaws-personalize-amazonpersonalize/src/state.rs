@@ -426,7 +426,7 @@ pub fn take_page<T>(
         return (items, None);
     }
     items.truncate(page_size);
-    let token = items.last().map(&token_of);
+    let token = items.last().map(token_of);
     (items, token)
 }
 

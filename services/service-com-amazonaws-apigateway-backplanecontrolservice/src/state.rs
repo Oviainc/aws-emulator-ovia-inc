@@ -61,6 +61,16 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// the operation that lists them lists the account's, whichever domain name each one
     /// is for.
     pub domain_name_access_associations: BTreeMap<String, DomainNameAccessAssociationEntry>,
+    /// Every `ClientCertificate` of the account, keyed by its client certificate id —
+    /// the identifier `GetClientCertificate` takes in its `clientCertificateId` path
+    /// label and a `Stage`'s `clientCertificateId` names one of. A client certificate
+    /// belongs to the ACCOUNT rather than to one API, so it sits beside the APIs here.
+    ///
+    /// `GenerateClientCertificate` is the operation that mints one, and it is still
+    /// scaffolded, so this map is empty until that operation is implemented — a stage
+    /// therefore names no certificate of this account, which is the refusal
+    /// [`NO_SUCH_CLIENT_CERTIFICATE`] words.
+    pub client_certificates: BTreeMap<String, ClientCertificateEntry>,
     /// The account-level settings `UpdateAccount` writes and `GetAccount` reports.
     /// There is exactly one per account, so it is a field rather than a map.
     pub account: AccountEntry,
@@ -85,6 +95,33 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// record so a listing can report creation order rather than id order.
     pub sequence_counter: u64,
 }
+
+/// One `ClientCertificate` of the account: "a client certificate used to configure
+/// client-side SSL authentication while sending requests to the integration endpoint"
+/// (`smithy_query(query="shape", shape="ClientCertificate")`), whose members this record
+/// holds beside the id it is keyed by.
+#[derive(Debug, Clone, Default)]
+pub struct ClientCertificateEntry {
+    /// "The description of the client certificate".
+    pub description: Option<String>,
+    /// "The PEM-encoded public key of the client certificate".
+    pub pem_encoded_certificate: Option<String>,
+    /// "The timestamp when the client certificate was created".
+    pub created_date: Option<i64>,
+    /// "The timestamp when the client certificate will expire".
+    pub expiration_date: Option<i64>,
+    /// "The collection of tags" the certificate carries.
+    pub tags: BTreeMap<String, String>,
+}
+
+/// The `BadRequestException` message for a `clientCertificateId` that names no client
+/// certificate of the account.
+///
+/// A stage presents "the identifier of a client certificate for an API stage"
+/// (`Stage$clientCertificateId`), so the value has to name one the account has. Entirely
+/// fixed text, in the shape of this surface's other invalid-identifier sentences: it
+/// quotes neither the value nor the stage.
+pub const NO_SUCH_CLIENT_CERTIFICATE: &str = "Invalid client certificate id specified";
 
 /// The account's own `Account` settings: what `GetAccount` reports and `UpdateAccount`
 /// patches.
@@ -585,13 +622,22 @@ pub struct StageEntry {
     pub authorizers_cache_flushed_at: Option<::std::time::Instant>,
     pub variables: BTreeMap<String, String>,
     pub documentation_version: Option<String>,
+    /// The canary release configured on this stage: `CreateStage`'s or
+    /// `CreateDeployment`'s `canarySettings`, and what an `UpdateStage` patch of
+    /// `/canarySettings` changes; absent on a stage with no canary.
+    ///
+    /// A canary that carries no `deployment_id` of its own serves the deployment the
+    /// STAGE serves, which every reader derives when it reports the stage (see
+    /// [`crate::ops::create_stage::stage_body`]) rather than storing here, so re-pointing
+    /// the stage moves such a canary with it.
     pub canary_settings: Option<CanarySettings>,
     /// The access logging an `UpdateStage` patch of `/accessLogSettings` configured on
     /// this stage, kept as the modelled shape for the reason the module docs give;
     /// absent until a patch sets it.
     pub access_log_settings: Option<AccessLogSettings>,
     /// The client certificate an `UpdateStage` patch of `/clientCertificateId`
-    /// associated with this stage.
+    /// associated with this stage: one of the account's
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::client_certificates`].
     pub client_certificate_id: Option<String>,
     pub tracing_enabled: bool,
     /// The per-method settings `UpdateStage` writes, keyed by the method path the patch
@@ -4133,6 +4179,29 @@ pub fn no_such_tagged_resource(kind: &str, id: &str) -> String {
 /// shows. One copy for every member an ARN rides on, so the same unreadable value is
 /// refused the same way whichever one carried it.
 pub const INVALID_ARN: &str = "Invalid ARN specified in the request";
+
+/// The prefix every ARN begins with: "arn:", the first field of the Amazon Resource Name
+/// format, which is what a value has to carry to be read as one at all.
+pub const ARN_PREFIX: &str = "arn:";
+
+/// The `BadRequestException` message for a value set on an ARN-valued member that is no
+/// ARN at all: it does not begin with [`ARN_PREFIX`].
+///
+/// The service's own unreadable-ARN sentence ([`INVALID_ARN`]), and then — for the one
+/// condition it can state in full — the rule the value broke and the value exactly as the
+/// request spelled it, which is the only variable part.
+pub fn invalid_arn_prefix(value: &str) -> String {
+    format!("{INVALID_ARN}. ARNs must start with '{ARN_PREFIX}': {value}")
+}
+
+/// Refuse a value an ARN-valued member was set to that is no ARN: every ARN begins with
+/// [`ARN_PREFIX`], so a value that does not is not one, whichever member carried it.
+pub fn require_arn(value: &str) -> Result<(), String> {
+    if value.starts_with(ARN_PREFIX) {
+        return Ok(());
+    }
+    Err(invalid_arn_prefix(value))
+}
 
 /// The `NotFoundException` message for a `documentationPartId` that names no stored
 /// documentation part of the API.

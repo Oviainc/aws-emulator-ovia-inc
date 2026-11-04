@@ -3,6 +3,9 @@
 //! @op CreateDeployment
 //! IMPLEMENTED: stores a `Deployment` of `restApiId` — a snapshot of the API's methods
 //! at this instant — and, when the request names a `stageName`, points that stage at it.
+//! A request that carries `canarySettings` for a stage the API already has deploys to
+//! that stage's CANARY: the new deployment becomes `canarySettings.deploymentId` and the
+//! stage keeps serving the deployment it already points at.
 //!
 //! ## Shape of an operation
 //!
@@ -368,9 +371,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // configure a stage this call CREATES. A name the API already has a stage for
         // is therefore re-pointed at the new deployment — that is how an API is
         // redeployed — and keeps its own configuration, which `UpdateStage` is the call
-        // that changes.
+        // that changes; a request that carries `canarySettings` deploys to that stage's
+        // CANARY instead, see below.
         if let Some(stage_name) = input.stage_name {
             let cache_cluster_enabled = input.cache_cluster_enabled.unwrap_or(false);
+            let canary_settings = input.canary_settings;
             let variables = input
                 .variables
                 .unwrap_or_default()
@@ -378,7 +383,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect::<BTreeMap<String, String>>();
             match api.stages.get_mut(&stage_name) {
                 Some(stage) => {
-                    stage.deployment_id = id.clone();
+                    match canary_settings {
+                        // `canarySettings` is "the input configuration for the canary
+                        // deployment when the deployment IS a canary release deployment"
+                        // (`CreateDeployment$canarySettings`): the deployment this call
+                        // created is the CANARY's — the one the canary's share of the
+                        // traffic reaches — so the stage keeps serving the deployment it
+                        // already points at, and promoting the canary (the `copy` of
+                        // `/canarySettings/deploymentId` to `/deploymentId`
+                        // `PatchOperation$from` documents) is what makes it the stage's.
+                        Some(canary) => {
+                            stage.canary_settings = Some(CanarySettings {
+                                percent_traffic: canary.percent_traffic,
+                                deployment_id: Some(id.clone()),
+                                stage_variable_overrides: canary.stage_variable_overrides,
+                                use_stage_cache: canary.use_stage_cache,
+                            });
+                        }
+                        // A plain deployment to a stage the API already has is how an API
+                        // is redeployed: the stage serves the new deployment.
+                        None => stage.deployment_id = id.clone(),
+                    }
                     stage.last_updated_date = Some(now);
                 }
                 None => {
@@ -404,7 +429,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             authorizers_cache_flushed_at: None,
                             variables,
                             documentation_version: None,
-                            canary_settings: input.canary_settings.map(|canary| CanarySettings {
+                            canary_settings: canary_settings.map(|canary| CanarySettings {
                                 percent_traffic: canary.percent_traffic,
                                 // The canary serves the deployment this call created.
                                 deployment_id: Some(id.clone()),

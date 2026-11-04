@@ -1096,7 +1096,7 @@ pub fn paginate<T>(
     };
     let next_token = if items.len() > limit {
         items.truncate(limit);
-        items.last().map(&key)
+        items.last().map(key)
     } else {
         None
     };
