@@ -15,6 +15,11 @@
 //! of OU names, the `Path` invariant over every nesting depth the service publishes
 //! plus one past it, pagination over the modelled `MaxResults` bounds plus one outside
 //! each, and "not in use" over every operation of the slice.
+//!
+//! Every case here starts from a store put back into the state of an account that
+//! belongs to NO organization: mounting this control plane establishes the organization
+//! the emulated account belongs to, and THAT is asserted by the
+//! `default_organization_membership` suite.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -22,29 +27,56 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use service_com_amazonaws_organizations_awsorganizationsv20161128::ops::types::ORGANIZATION_FEATURE_SET_VALUES;
 use service_com_amazonaws_organizations_awsorganizationsv20161128::state::{
+    ComAmazonawsOrganizationsAwsorganizationsv20161128State as OrganizationsState,
     MAX_ORGANIZATIONAL_UNIT_DEPTH, MAX_PAGE_SIZE, MAX_TAGS_PER_RESOURCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The `X-Amz-Target` prefix this service routes on (`OPERATIONS.md`, "Wire protocol").
-const TARGET_PREFIX: &str = "AWSOrganizationsV20161128";
+///
+/// `pub(crate)` so a sibling suite in this test target addresses the same wire path
+/// rather than keeping a second copy of it.
+pub(crate) const TARGET_PREFIX: &str = "AWSOrganizationsV20161128";
 
 /// This service's SigV4 signing name, the routing key the front door reads off the
 /// `authorization` header's credential scope (`OPERATIONS.md`, "Wire protocol").
-const SIGNING_NAME: &str = "organizations";
+pub(crate) const SIGNING_NAME: &str = "organizations";
 
 /// The canonical account id every emulated service presents, and so the management
 /// account of the organization this service creates.
-fn account_id() -> &'static str {
+pub(crate) fn account_id() -> &'static str {
     engine::emulator_account_id()
 }
 
 /// A router carrying only this service, over one shared engine — what
-/// `core/router/src/lib.rs` builds, narrowed to the service under test. Request
-/// authentication is off so the suite needs no signing keys; routing still goes through
-/// the SigV4 credential scope on the `authorization` header below.
+/// `core/router/src/lib.rs` builds, narrowed to the service under test, over the store
+/// mounting it establishes. Request authentication is off so the suite needs no signing
+/// keys; routing still goes through the SigV4 credential scope on the `authorization`
+/// header below.
+///
+/// `pub(crate)` so a sibling suite drives the booted emulator through this harness.
+pub(crate) fn seeded_router() -> MultiServiceRouter {
+    router_over(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// [`seeded_router`], with the store put back into the state of an account that belongs
+/// to NO organization.
+///
+/// Mounting the Organizations control plane establishes the organization the emulated
+/// account belongs to (`service::EmulatedService::new`), so every case BELOW — each of
+/// which is about creating an organization, or about what an operation answers while none
+/// exists — clears that store AFTER the service is mounted. The organization that is
+/// there by default is asserted by the `default_organization_membership` suite.
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = router_over(Arc::clone(&engine));
+    *engine.state::<OrganizationsState>().lock() = OrganizationsState::default();
+    router
+}
+
+/// This service mounted on a router over `engine`, the way `core/router/src/lib.rs`
+/// mounts it.
+fn router_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false).register_service(
         service_com_amazonaws_organizations_awsorganizationsv20161128::EmulatedService::new(engine),
@@ -54,23 +86,23 @@ fn router() -> MultiServiceRouter {
 
 /// One answered request: the HTTP status, the `__type` error code when the answer is a
 /// failure, and the parsed JSON body (`Value::Null` for an empty body).
-struct Answer {
-    status: u16,
-    error: Option<String>,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// Whether this answer is the modelled failure `exception`. The awsJson `__type` is
     /// either the bare shape name or the namespaced shape id, so the suffix is matched.
-    fn is(&self, exception: &str) -> bool {
+    pub(crate) fn is(&self, exception: &str) -> bool {
         self.error
             .as_deref()
             .is_some_and(|found| found.ends_with(exception))
     }
 
     /// A required string member of the body, with the case named on failure.
-    fn string(&self, path: &[&str], case: &str) -> String {
+    pub(crate) fn string(&self, path: &[&str], case: &str) -> String {
         let mut cursor = &self.body;
         for member in path {
             cursor = &cursor[*member];
@@ -88,7 +120,9 @@ impl Answer {
 }
 
 /// Call one operation of this service over the wire.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Answer {
+///
+/// `pub(crate)` so a sibling suite drives the same deserialize → handle → serialize walk.
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Answer {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -198,7 +232,10 @@ fn listed_ous(answer: &Answer, case: &str) -> Vec<Value> {
 
 /// Whether `value` is `prefix` followed by `len_min..=len_max` characters drawn only
 /// from `[a-z0-9]` — the shape every id pattern in this model spells.
-fn matches_id(value: &str, prefix: &str, len_min: usize, len_max: usize) -> bool {
+///
+/// `pub(crate)` so a sibling suite checks an id against its modelled pattern the same
+/// way.
+pub(crate) fn matches_id(value: &str, prefix: &str, len_min: usize, len_max: usize) -> bool {
     let Some(suffix) = value.strip_prefix(prefix) else {
         return false;
     };

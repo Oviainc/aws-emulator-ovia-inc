@@ -58,8 +58,9 @@ fn emulator() -> Arc<engine::InMemoryEngine> {
 /// A caller for `region`, serving out of `engine`.
 ///
 /// AWS Organizations is mounted beside Service Quotas because the template gate reads
-/// the caller's organization membership from it — and NO organization is created here,
-/// so what these cases pin is the gate's answer for an account that is in none.
+/// the caller's organization membership from it — and mounting it establishes the
+/// organization the emulated account belongs to, so that store is cleared again right
+/// after: what these cases pin is the gate's answer for an account that is in none.
 fn client(engine: &Arc<engine::InMemoryEngine>, region: &str) -> Client {
     let mut router = MultiServiceRouter::new();
     // These tests sign nothing, so they must not be refused for it.
@@ -74,6 +75,9 @@ fn client(engine: &Arc<engine::InMemoryEngine>, region: &str) -> Client {
             Arc::clone(engine),
         ),
     );
+    *engine
+        .state::<service_com_amazonaws_organizations_awsorganizationsv20161128::state::ComAmazonawsOrganizationsAwsorganizationsv20161128State>()
+        .lock() = Default::default();
     Client {
         router,
         region: region.to_string(),

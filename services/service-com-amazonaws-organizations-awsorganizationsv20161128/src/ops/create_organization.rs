@@ -216,19 +216,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A root's enabled policy types follow from the feature set: all features
-        // enables service control policies in the root, consolidated billing enables
-        // none ("no policy types are enabled by default and you can't use organization
-        // policies").
-        let policy_types = if feature_set == crate::state::FEATURE_SET_CONSOLIDATED_BILLING {
-            Vec::new()
-        } else {
-            vec![crate::state::PolicyTypeRecord {
-                policy_type: crate::state::POLICY_TYPE_SERVICE_CONTROL_POLICY.to_string(),
-                status: crate::state::POLICY_TYPE_STATUS_ENABLED.to_string(),
-            }]
-        };
-
         let mut store = state.lock();
 
         // An account belongs to at most one organization, so a second create while one
@@ -244,74 +231,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let organization_id = store.mint_organization_id();
-        let root_id = store.mint_root_id();
-        // The calling account becomes the management account: "The account whose user is
-        // calling the CreateOrganization operation automatically becomes the management
-        // account of the new organization."
-        let master_account_id = ::engine::emulator_account_id().to_string();
-        let master_account_email = format!("{master_account_id}@{MANAGEMENT_EMAIL_DOMAIN}");
-
-        let organization = crate::state::OrganizationRecord {
-            arn: ::engine::emulator_arn(
-                crate::state::ARN_SERVICE,
-                crate::state::ARN_REGION,
-                &format!("organization/{organization_id}"),
-            ),
-            master_account_arn: ::engine::emulator_arn(
-                crate::state::ARN_SERVICE,
-                crate::state::ARN_REGION,
-                &format!("account/{organization_id}/{master_account_id}"),
-            ),
-            id: organization_id.clone(),
-            feature_set,
-            master_account_id: master_account_id.clone(),
-            master_account_email: master_account_email.clone(),
-            // Deprecated on the wire ("To determine the policies that are enabled and
-            // available for use in your organization, use the ListRoots operation
-            // instead"), so it reports exactly what the root reports.
-            available_policy_types: policy_types.clone(),
-        };
-
-        let root = crate::state::RootRecord {
-            arn: ::engine::emulator_arn(
-                crate::state::ARN_SERVICE,
-                crate::state::ARN_REGION,
-                &format!("root/{organization_id}/{root_id}"),
-            ),
-            id: root_id.clone(),
-            name: crate::state::ROOT_NAME.to_string(),
-            policy_types,
-        };
-
-        let management_account = crate::state::AccountRecord {
-            arn: ::engine::emulator_arn(
-                crate::state::ARN_SERVICE,
-                crate::state::ARN_REGION,
-                &format!("account/{organization_id}/{master_account_id}"),
-            ),
-            id: master_account_id.clone(),
-            email: master_account_email,
-            name: MANAGEMENT_ACCOUNT_NAME.to_string(),
-            status: crate::state::ACCOUNT_STATUS_ACTIVE.to_string(),
-            joined_method: crate::state::ACCOUNT_JOINED_METHOD_CREATED.to_string(),
-            joined_timestamp: ::aws_smithy_types::DateTime::from(
-                ::std::time::SystemTime::now(),
-            ),
-        };
-
-        store.organization = Some(organization);
-        store.roots.push(root);
-        store.children.insert(
-            root_id,
-            vec![crate::state::ChildRef {
-                id: master_account_id.clone(),
-                child_type: crate::state::CHILD_TYPE_ACCOUNT.to_string(),
-            }],
-        );
-        store
-            .accounts
-            .insert(master_account_id, management_account);
+        // The records this create persists - the organization with its feature set and
+        // the policy types that follow from it, the root, the management account ("The
+        // account whose user is calling the CreateOrganization operation automatically
+        // becomes the management account of the new organization") and the child edge
+        // between them - are written by the state module's single organization writer.
+        store.create_organization(&feature_set);
 
         // Read back what was stored, so the response is the persisted record rather
         // than a value built beside it.
@@ -336,15 +261,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The `InvalidInputExceptionReason` for a member whose value is outside its enum.
 const INVALID_ENUM_REASON: &str = "INVALID_ENUM";
-
-/// The domain of the management account's email address. The address is derived from
-/// the account id rather than invented per request, so it is stable across reads and
-/// satisfies `Email`'s modelled pattern `^[^\s@]+@[^\s@]+\.[^\s@]+$`. `example.com` is
-/// the RFC 2606 reserved domain, and it is a crate-local constant because the engine
-/// exposes no emulator-wide email or domain setting to source it from (`engine`'s
-/// public surface is `state`, `listeners`, `extract_akid`, `emulator_account_id` and
-/// `emulator_arn`).
-const MANAGEMENT_EMAIL_DOMAIN: &str = "example.com";
-
-/// The management account's friendly name.
-const MANAGEMENT_ACCOUNT_NAME: &str = "Management account";

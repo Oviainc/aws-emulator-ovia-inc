@@ -127,6 +127,14 @@ impl Emulator {
                 Arc::clone(&engine),
             ),
         );
+        // Mounting the Organizations control plane establishes the organization the
+        // emulated account belongs to, so that store is cleared again right after: these
+        // cases arrange the organization themselves — the one they create through that
+        // service's own `CreateOrganization`, and the roster they record beside it — and
+        // one of them is about the account being in none.
+        *engine
+            .state::<service_com_amazonaws_organizations_awsorganizationsv20161128::state::ComAmazonawsOrganizationsAwsorganizationsv20161128State>()
+            .lock() = Default::default();
         Self { engine, router }
     }
 

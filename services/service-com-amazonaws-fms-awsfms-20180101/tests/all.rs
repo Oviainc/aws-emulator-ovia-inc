@@ -23,6 +23,12 @@ mod third_party_firewall_firewall_policies;
 
 // Declared here too, outside the sorted list below, for the reason stated above:
 // inserting a `mod` into that list collides with every other fms suite landing
+// in the same window. The suite itself is an ordinary `tests/all/<name>.rs` file.
+#[path = "all/administrator_slot_not_found.rs"]
+mod administrator_slot_not_found;
+
+// Declared here too, outside the sorted list below, for the reason stated above:
+// inserting a `mod` into that list collides with every other fms suite landing
 // in the same window, and this suite's name sorts right into the stretch of it
 // the late-sorting suites keep landing in. The suite itself is an ordinary
 // `tests/all/<name>.rs` file.

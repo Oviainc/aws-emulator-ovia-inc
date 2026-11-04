@@ -5,7 +5,10 @@
 //! Reports the Firewall Manager default administrator account that
 //! `AssociateAdminAccount` persisted, and the status of its role. With no
 //! association ever made there is no administrator resource to report, which is
-//! `ResourceNotFoundException`.
+//! `ResourceNotFoundException` — and that one carries NO message: the
+//! administrator slot is not a resource this request names, so there is nothing
+//! to restate, and a client tells this state apart by the empty message
+//! ([`crate::state::administrator_association_not_found`]).
 //!
 //! A REPORTING operation: the only write it makes is the one the CLOCK already
 //! made due — a disassociation `DisassociateAdminAccount` recorded, whose
@@ -165,8 +168,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // status reported here is the one that holds at this instant.
         store.settle_admin_account();
         let Some(admin) = store.admin_account.as_ref() else {
+            // The administrator SLOT is empty, and nothing in the request named
+            // it: this is the keyless administrator-association miss, which
+            // answers no message at all rather than the text the keyed lookups
+            // of this service carry.
             return Err(GetAdminAccountErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(),
+                crate::state::administrator_association_not_found(),
             )
             .into());
         };

@@ -28,6 +28,12 @@ use std::sync::Arc;
 
 use aws_emulator_router::{build_router, InMemoryEngine};
 use service_com_amazonaws_billingconductor_awsbillingconductor::ComAmazonawsBillingconductorAwsbillingconductorState as BillingConductorState;
+use service_com_amazonaws_organizations_awsorganizationsv20161128::state::{
+    AccountRecord as OrganizationsAccountRecord, ChildRef,
+    ComAmazonawsOrganizationsAwsorganizationsv20161128State as OrganizationsState,
+    ACCOUNT_JOINED_METHOD_CREATED, ACCOUNT_STATUS_ACTIVE, ARN_REGION, ARN_SERVICE,
+    CHILD_TYPE_ACCOUNT,
+};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
@@ -41,6 +47,55 @@ const MANAGED_PLAN_ARN: &str = "arn:aws:billingconductor::aws:pricingplan/Passth
 
 /// A 12-digit account that is not the one this emulator's callers authenticate as.
 const ANOTHER_ACCOUNT: &str = "111122223333";
+
+/// The account the payer groups below: a linked account of the consolidated billing
+/// family, which it becomes by being a member account of the organization
+/// ([`link_account_to_the_organization`]).
+const LINKED_ACCOUNT: &str = "000000000001";
+
+/// Put `account_id` in the consolidated billing family the way an account joins one: as a
+/// member account of the organization the Organizations store records.
+///
+/// Billing Conductor adds no account to a family — it READS the family's roster from the
+/// Organizations store on the shared engine — so this is where a linked account of the
+/// emulated account's family comes from. The record is the one that store keeps for a
+/// member account, including the root's child edge, so the roster this links into is the
+/// same one `ListAccounts` would report.
+fn link_account_to_the_organization(engine: &InMemoryEngine, account_id: &str) {
+    let state = engine.state::<OrganizationsState>();
+    let mut store = state.lock();
+    let organization_id = store
+        .organization
+        .as_ref()
+        .expect("the emulated account belongs to an organization")
+        .id
+        .clone();
+    let root_id = store
+        .root()
+        .expect("the organization has a root")
+        .id
+        .clone();
+    store.children.entry(root_id).or_default().push(ChildRef {
+        id: account_id.to_string(),
+        child_type: CHILD_TYPE_ACCOUNT.to_string(),
+    });
+    store.accounts.insert(
+        account_id.to_string(),
+        OrganizationsAccountRecord {
+            arn: engine::emulator_arn(
+                ARN_SERVICE,
+                ARN_REGION,
+                &format!("account/{organization_id}/{account_id}"),
+            ),
+            id: account_id.to_string(),
+            email: format!("{account_id}@example.com"),
+            name: format!("Linked account {account_id}"),
+            status: ACCOUNT_STATUS_ACTIVE.to_string(),
+            joined_method: ACCOUNT_JOINED_METHOD_CREATED.to_string(),
+            joined_timestamp: aws_smithy_types::DateTime::from(std::time::SystemTime::now()),
+        },
+    );
+}
 
 /// A SigV4 `Authorization` header whose credential scope names this service. The
 /// signature is never checked: this router runs with authentication off.
@@ -146,7 +201,7 @@ fn every_kind_of_operation() -> Vec<(&'static str, &'static str, &'static str, s
             "an association",
             "AssociateAccounts",
             "/associate-accounts",
-            serde_json::json!({"Arn": absent_group, "AccountIds": ["000000000001"]}),
+            serde_json::json!({"Arn": absent_group, "AccountIds": [LINKED_ACCOUNT]}),
         ),
         (
             "a delete",
@@ -177,8 +232,8 @@ fn billing_conductor_gates_the_payer_account_over_the_assembled_router() {
             };
 
             // The two worlds in which the caller is NOT the payer account: the store as it
-            // stands up (no organization, so no payer account at all) and a store whose
-            // payer is some other account.
+            // stands up (its payer slot holds no account) and a store whose payer is some
+            // other account.
             for (world, payer) in [
                 ("the store records no payer account", None),
                 ("another account is the payer account", Some(ANOTHER_ACCOUNT)),
@@ -231,17 +286,20 @@ fn billing_conductor_gates_the_payer_account_over_the_assembled_router() {
             }
 
             // The third world: this account IS the payer account, so the control plane is
-            // served — and what it stores is read back through the paginated list.
+            // served — and what it stores is read back through the paginated list. The
+            // account it groups is a linked account of the family, which is an
+            // Organizations fact this service only reads.
             designate_payer(Some(engine::emulator_account_id()));
+            link_account_to_the_organization(&engine, LINKED_ACCOUNT);
             let group = billingconductor(
                 &router,
                 &runtime,
                 "/create-billing-group",
                 &serde_json::json!({
                     "Name": "PayerGroup",
-                    "AccountGrouping": {"LinkedAccountIds": ["000000000001"]},
+                    "AccountGrouping": {"LinkedAccountIds": [LINKED_ACCOUNT]},
                     "ComputationPreference": {"PricingPlanArn": MANAGED_PLAN_ARN},
-                    "PrimaryAccountId": "000000000001",
+                    "PrimaryAccountId": LINKED_ACCOUNT,
                 }),
             );
             assert_eq!(

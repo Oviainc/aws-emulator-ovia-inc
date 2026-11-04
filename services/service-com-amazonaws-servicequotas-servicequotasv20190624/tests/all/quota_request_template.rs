@@ -51,7 +51,14 @@ pub(crate) struct Emulator {
 }
 
 impl Emulator {
-    /// Both services on one engine, with no organization created yet.
+    /// Both services on one engine, with the Organizations store put back into the state
+    /// of an account that belongs to NO organization.
+    ///
+    /// Mounting the Organizations control plane establishes the organization the emulated
+    /// account belongs to, so the membership states BELOW the all-features one — no
+    /// organization at all, and a consolidated-billing organization — are reached by
+    /// clearing that store after both services are mounted and creating what the case
+    /// needs.
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
@@ -67,6 +74,9 @@ impl Emulator {
                 Arc::clone(&engine),
             ),
         );
+        *engine
+            .state::<service_com_amazonaws_organizations_awsorganizationsv20161128::state::ComAmazonawsOrganizationsAwsorganizationsv20161128State>()
+            .lock() = Default::default();
         Self { router }
     }
 

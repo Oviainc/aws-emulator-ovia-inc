@@ -11,10 +11,14 @@
 //!    `com.amazonaws.fms` declares exactly one member, `Message`, targeting
 //!    `ErrorMessage`). On awsJson1_1 the MEMBER NAME is the JSON key, so a body
 //!    that spells it any other way has, to a client, no message at all.
-//! 2. `ResourceNotFoundException`'s message is a service CONSTANT: it is the
-//!    same string whatever operation answered it and whatever was looked up, and
-//!    it never restates the identifier, ARN or name from the request. The
-//!    administrator-authorization refusal is the opposite kind of message — it is
+//! 2. `ResourceNotFoundException`'s message is a service CONSTANT for a lookup
+//!    that NAMES what it looked for: it is the same string whatever operation
+//!    answered it and whatever was looked up, and it never restates the
+//!    identifier, ARN or name from the request. (The one not-found that reports
+//!    the caller's own administrator association missing is a different class and
+//!    carries no message at all; the `administrator_slot_not_found` suite asserts
+//!    that rule and the contrast with this one.) The administrator-authorization
+//!    refusal is the opposite kind of message — it is
 //!    composed from the request, naming the calling account and the Region the
 //!    request was signed for — so it moves with the Region while the not-found
 //!    text does not move at all.
@@ -139,19 +143,13 @@ fn policy_update(policy_id: &str) -> Value {
     })
 }
 
-/// Not-found lookups that need NO administrator association: the two that are
+/// Not-found lookups that need NO administrator association: the one that is
 /// not-found precisely BECAUSE nothing is associated, the policy-id lookups,
 /// which are decided by the policy store alone, and the resource-level tagging
 /// lookups, which name their target by the model's generic `ResourceArn` and are
 /// answered from that ARN alone.
 fn not_found_without_administrator() -> Vec<Row> {
     vec![
-        Row {
-            case: "GetAdminAccount with no association at all",
-            operation: "GetAdminAccount",
-            body: json!({}),
-            lookup: None,
-        },
         Row {
             case: "ListAdminsManagingAccount when no administrator manages the caller",
             operation: "ListAdminsManagingAccount",

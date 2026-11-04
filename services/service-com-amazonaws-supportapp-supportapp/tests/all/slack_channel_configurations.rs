@@ -111,6 +111,13 @@ impl Emulator {
                 engine.clone(),
             ),
         );
+        // Mounting the Organizations control plane establishes the organization the
+        // emulated account belongs to, so that store is cleared again right after: what
+        // these cases arrange — and refuse — is the membership itself, which
+        // [`Emulator::create_organization`] then establishes over the wire.
+        *engine
+            .state::<service_com_amazonaws_organizations_awsorganizationsv20161128::state::ComAmazonawsOrganizationsAwsorganizationsv20161128State>()
+            .lock() = Default::default();
         Self { router, engine }
     }
 

@@ -23,7 +23,9 @@ use crate::ops::types::{Organization, OrganizationalUnit, PolicyTypeSummary, Roo
 ///
 /// `organization` is the whole "is this account in an organization" flag: `None` means
 /// not in use, and every operation other than `CreateOrganization` answers
-/// `AWSOrganizationsNotInUseException` for it.
+/// `AWSOrganizationsNotInUseException` for it. A store this control plane is MOUNTED on
+/// holds one from the moment it is mounted — see `crate::service::EmulatedService::new`,
+/// which establishes the organization the emulated account belongs to.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsOrganizationsAwsorganizationsv20161128State {
     /// The singleton organization `CreateOrganization` persists, or `None` while this
@@ -207,6 +209,18 @@ pub const POLICY_TYPE_STATUS_ENABLED: &str = "ENABLED";
 /// The friendly name Organizations gives the root it creates with an organization.
 pub const ROOT_NAME: &str = "Root";
 
+/// The domain of the management account's email address. The address is derived from
+/// the account id rather than invented per request, so it is stable across reads and
+/// satisfies `Email`'s modelled pattern `^[^\s@]+@[^\s@]+\.[^\s@]+$`. `example.com` is
+/// the RFC 2606 reserved domain, and it is a crate-local constant because the engine
+/// exposes no emulator-wide email or domain setting to source it from (`engine`'s
+/// public surface is `state`, `listeners`, `extract_akid`, `emulator_account_id` and
+/// `emulator_arn`).
+const MANAGEMENT_EMAIL_DOMAIN: &str = "example.com";
+
+/// The management account's friendly name.
+const MANAGEMENT_ACCOUNT_NAME: &str = "Management account";
+
 /// The `AccountStatus` of a member account that is in the organization.
 pub const ACCOUNT_STATUS_ACTIVE: &str = "ACTIVE";
 
@@ -359,6 +373,96 @@ const MINT_ATTEMPTS: u32 = 8;
 const MAX_SUFFIX_LEN: u32 = 24;
 
 impl ComAmazonawsOrganizationsAwsorganizationsv20161128State {
+    /// Persist an organization with `feature_set`, its single root, and the emulated
+    /// account as the management account.
+    ///
+    /// The ONE writer of the organization slot: `CreateOrganization` takes it for a
+    /// caller's create and `crate::service::EmulatedService::new` takes it for the
+    /// organization the emulated account already belongs to, so neither can build a
+    /// record the other would not.
+    ///
+    /// The management account is the calling account — "The account whose user is calling
+    /// the CreateOrganization operation automatically becomes the management account of
+    /// the new organization" — and it is seeded as a member account under the root, which
+    /// is what makes it a real child edge of the hierarchy rather than an id in the
+    /// organization record only.
+    ///
+    /// A root's enabled policy types follow from the feature set: all features enables
+    /// service control policies in the root, consolidated billing enables none ("no
+    /// policy types are enabled by default and you can't use organization policies").
+    ///
+    /// Whether an organization MAY be created is the caller's decision — an account
+    /// belongs to at most one, which is `AlreadyInOrganizationException` — so this writes
+    /// over whatever the slot holds.
+    pub fn create_organization(&mut self, feature_set: &str) {
+        let policy_types = if feature_set == FEATURE_SET_CONSOLIDATED_BILLING {
+            Vec::new()
+        } else {
+            vec![PolicyTypeRecord {
+                policy_type: POLICY_TYPE_SERVICE_CONTROL_POLICY.to_string(),
+                status: POLICY_TYPE_STATUS_ENABLED.to_string(),
+            }]
+        };
+
+        let organization_id = self.mint_organization_id();
+        let root_id = self.mint_root_id();
+        let master_account_id = ::engine::emulator_account_id().to_string();
+        let master_account_email = format!("{master_account_id}@{MANAGEMENT_EMAIL_DOMAIN}");
+        let master_account_arn = ::engine::emulator_arn(
+            ARN_SERVICE,
+            ARN_REGION,
+            &format!("account/{organization_id}/{master_account_id}"),
+        );
+
+        self.organization = Some(OrganizationRecord {
+            arn: ::engine::emulator_arn(
+                ARN_SERVICE,
+                ARN_REGION,
+                &format!("organization/{organization_id}"),
+            ),
+            master_account_arn: master_account_arn.clone(),
+            id: organization_id.clone(),
+            feature_set: feature_set.to_string(),
+            master_account_id: master_account_id.clone(),
+            master_account_email: master_account_email.clone(),
+            // Deprecated on the wire ("To determine the policies that are enabled and
+            // available for use in your organization, use the ListRoots operation
+            // instead"), so it reports exactly what the root reports.
+            available_policy_types: policy_types.clone(),
+        });
+        self.roots = vec![RootRecord {
+            arn: ::engine::emulator_arn(
+                ARN_SERVICE,
+                ARN_REGION,
+                &format!("root/{organization_id}/{root_id}"),
+            ),
+            id: root_id.clone(),
+            name: ROOT_NAME.to_string(),
+            policy_types,
+        }];
+        self.children.insert(
+            root_id,
+            vec![ChildRef {
+                id: master_account_id.clone(),
+                child_type: CHILD_TYPE_ACCOUNT.to_string(),
+            }],
+        );
+        self.accounts.insert(
+            master_account_id.clone(),
+            AccountRecord {
+                arn: master_account_arn,
+                id: master_account_id,
+                email: master_account_email,
+                name: MANAGEMENT_ACCOUNT_NAME.to_string(),
+                status: ACCOUNT_STATUS_ACTIVE.to_string(),
+                joined_method: ACCOUNT_JOINED_METHOD_CREATED.to_string(),
+                joined_timestamp: ::aws_smithy_types::DateTime::from(
+                    ::std::time::SystemTime::now(),
+                ),
+            },
+        );
+    }
+
     /// Mint a fresh `len`-character id suffix of lowercase alphanumerics.
     ///
     /// The suffix is derived from a counter through the bijection described on

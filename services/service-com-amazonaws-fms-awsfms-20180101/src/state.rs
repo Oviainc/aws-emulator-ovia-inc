@@ -2670,27 +2670,51 @@ pub fn is_account_id(value: &str) -> bool {
     (1..=1024).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// The `Message` Firewall Manager puts on EVERY `ResourceNotFoundException` it
-/// answers, whatever was looked up.
+/// The `Message` Firewall Manager puts on the `ResourceNotFoundException` of a
+/// lookup that NAMES what it looked for, whatever that was.
 ///
 /// The model declares the member but no literal, and the recordings of the live
 /// service carry this one string on five different operations, across three
 /// fixtures and across two kinds of lookup key (a policy UUID and a resource
 /// ARN) — never the identifier that was looked up. So the text is a service
 /// constant, not a per-call detail, and this is the single place it is written.
+///
+/// It is NOT the text of the one not-found this service answers for the
+/// caller's own administrator association; that error carries no message at all
+/// ([`administrator_association_not_found`]).
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The referenced item does not exist.";
 
-/// The modelled `ResourceNotFoundException` for anything this service could not
-/// find: the identifier, ARN or name that was looked up never reaches the wire.
+/// The modelled `ResourceNotFoundException` for a resource this service resolved
+/// and could not find: the identifier, ARN or name that was looked up never
+/// reaches the wire.
 ///
-/// Every not-found site goes through here, so no handler can word its own
-/// not-found text and no two of them can disagree. Which resource was missing is
-/// the caller's own request — it is not restated in the error, exactly as the
-/// live service does not restate it.
+/// Every not-found site that RESOLVED something goes through here, so no handler
+/// can word its own not-found text and no two of them can disagree. Which
+/// resource was missing is the caller's own request — it is not restated in the
+/// error, exactly as the live service does not restate it.
 pub fn resource_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
     }
+}
+
+/// The modelled `ResourceNotFoundException` reporting that the caller's account
+/// has no Firewall Manager administrator association — the account's single
+/// administrator slot, which no request names — carrying NO `Message` member at
+/// all.
+///
+/// The live service answers this one with an empty message body: a client reading
+/// the exception's message off it reads nothing, which is how the "Firewall
+/// Manager onboarding never happened" state is told apart from the not-found of
+/// a resource that was looked up by key ([`resource_not_found`], whose recorded
+/// text belongs to those keyed lookups). The slot is not a resource the request
+/// identifies, so there is nothing for a message to restate.
+///
+/// Separate from [`resource_not_found`] rather than a parameter of it, so the
+/// keyless administrator-slot miss cannot pick up the keyed-lookup text by
+/// default, and every site reporting that slot empty answers identically.
+pub fn administrator_association_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException { message: None }
 }
 
 /// The modelled refusal of an edit or a delete of a resource that the

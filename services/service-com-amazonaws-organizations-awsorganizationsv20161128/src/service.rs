@@ -58,7 +58,32 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// Build this service from the shared engine. The engine is threaded into the
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
+    ///
+    /// Mounting this control plane also establishes the organization the emulated
+    /// account belongs to, once, before any request is served. The emulator presents
+    /// exactly one account (`engine::emulator_account_id`), and Organizations' own rule
+    /// is that the account an organization is created from is its management account, so
+    /// the single account can only be that one: membership is part of what the account
+    /// IS, not something a caller has to establish before an organization-scoped API of
+    /// any service can answer. A client that resolves its organization
+    /// (`DescribeOrganization`, `ListRoots`) before calling such an API therefore gets
+    /// the organization it belongs to instead of being told it is in none.
+    ///
+    /// It is established HERE rather than in the store's `Default` because an engine
+    /// this control plane is not mounted on has no organization at all — there is then
+    /// no Organizations surface for the account to belong to one through — and because
+    /// construction happens once, before any request, so no read ever writes it. The
+    /// records are built by the state module's single organization writer, the one
+    /// `CreateOrganization` takes, with the feature set a create that names none asks
+    /// for; an organization already in the slot is left exactly as it is, so mounting
+    /// the service twice over one engine replaces nothing.
     pub fn new(engine: Arc<Eng>) -> Self {
+        if let Some(state) = crate::state::service_state(&*engine) {
+            let mut store = state.lock();
+            if store.organization.is_none() {
+                store.create_organization(crate::state::DEFAULT_FEATURE_SET);
+            }
+        }
         Self {
             entry: crate::ServiceDefinition::new(engine),
         }
