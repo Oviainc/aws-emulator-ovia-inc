@@ -75,3 +75,18 @@ Model evidence: smithy_query(query="operation", operation="DeleteCacheParameterG
 3. Cause 2: ModifyReplicationGroup(ReplicationGroupId=<an id never created>, ApplyImmediately=true). Expect HTTP 404, code ReplicationGroupNotFoundFault, message "Replication group '<id>' not found". Observe "ReplicationGroup <id> not found.". As a control, DescribeReplicationGroups(ReplicationGroupId=<the same id>) must KEEP answering "ReplicationGroup <id> not found.", and IncreaseReplicaCount/DecreaseReplicaCount on that id must keep answering InvalidParameterValue "Replication group <id> does not exist.".
 
 4. Cause 3: CreateUser twice (UserId=<fresh a>/<fresh b>, UserName same, Engine="redis", AccessString="on ~* +@all", NoPasswordRequired=true); CreateUserGroup(UserGroupId=<fresh group>, Engine="redis", UserIds=["default", <a>]); poll DescribeUserGroups until Status=="active"; then issue two ModifyUserGroup(UserGroupId=<group>, UserIdsToAdd=[<b>]) calls concurrently, released together so the second lands inside the first's modifying window. Exactly one must succeed and the other must be refused with HTTP 400, code InvalidUserGroupState and message "User group <UserGroupId> has status <current Status>. Only active user groups can be modified.". Observe the emulator's "User group <UserGroupId> is in status <status>; it must be active to be changed.". The converged membership (user <b> present exactly once, alongside "default" and <a>) already matches AWS and must stay that way.
+
+## Resolution note
+
+Causes 1 and 2 are served by `src/service/cache_parameter_group_not_found.rs` and by
+`ModifyReplicationGroup`'s own template in its handler; cause 3 by
+`src/service/refusal_messages.rs`, which the four handlers that need an active user group
+(ModifyUserGroup, ModifyReplicationGroup, CreateServerlessCache, ModifyServerlessCache)
+all call.
+
+Follow-up this fix could not carry out: `state::user_group_state_refusal` and
+`state::cache_parameter_group_not_found_message` are now called by nothing, but they still
+carry the superseded sentences, so a new handler can reach for the wrong one. Removing them
+means editing `src/state.rs`, which is over 10,000 lines and so past the length a change may
+touch a file at; it has to follow the split of that file into its module directory
+(`src/state/`), which is its own change.

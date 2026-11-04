@@ -211,6 +211,10 @@ mod serverless_cache_snapshots;
 #[path = "all/cache_subnet_group_delete.rs"]
 mod cache_subnet_group_delete;
 
+// Appended for the same reason: the suite about the sentence a change that needs an
+// ACTIVE user group is refused with while the group carries another status.
+#[path = "all/user_group_state_refusal.rs"]
+mod user_group_state_refusal;
 // Appended for the same reason: the suite about the TEMPLATES three refusals are worded
 // with — the two the parameter-group not-found fault has, the one `ModifyReplicationGroup`
 // has of its own, and the parameter value a published set does not cover.

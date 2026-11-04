@@ -559,7 +559,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            if let Some(message) = crate::state::user_group_state_refusal(user_group) {
+            if let Some(message) =
+                crate::service::refusal_messages::user_group_change_state_refusal(user_group)
+            {
                 return Err(
                     ModifyReplicationGroupErrorModeled::InvalidUserGroupStateFault(
                         InvalidUserGroupStateFault {

@@ -50,9 +50,9 @@
 //! Everything else about those paths — status, `<Type>`, `<Code>`, `<Message>` — stays
 //! with the framework.
 //!
-//! # How this service words two of its refusals
+//! # How this service words three of its refusals
 //!
-//! Two refusals are worded by more than one handler, and the words are the whole
+//! Three refusals are worded by more than one handler, and the words are the whole
 //! difference a client sees, so each is stated once beside this file rather than in the
 //! handlers that answer it:
 //!
@@ -62,10 +62,13 @@
 //! * [`access_string_categories`] — which of its two refusals an `AccessString` gets: a
 //!   rule list naming a command category the engine does not publish is diagnosed as that,
 //!   and only an input that is not rule-list syntax keeps the generic sentence.
+//! * [`refusal_messages`] — the sentence a change that needs an ACTIVE user group is
+//!   refused with while the group carries another status, which four handlers answer.
 
 pub mod access_string_categories;
 pub mod cache_parameter_group_not_found;
 pub mod query_error_envelope;
+pub mod refusal_messages;
 
 use query_error_envelope::{ElastiCacheDefinition, RequestIdEnvelopeOperation};
 use smithy_server_runtime::{
