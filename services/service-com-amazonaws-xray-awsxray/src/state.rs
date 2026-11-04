@@ -87,15 +87,28 @@
 //! conversion itself goes through [`timestamp_of`].
 
 pub mod filter;
+pub mod group_scope;
+pub mod graphs;
+pub mod query_window;
+pub mod retrievals;
+pub mod sampling_rules;
+pub mod sampling_statistics;
+
+// Each part above owns one concern of this service's state and is re-exported
+// here, so every handler keeps reaching the store through `crate::state::…` and
+// no caller has to know which part a record, a bound or a wording lives in.
+pub use graphs::*;
+pub use query_window::*;
+pub use retrievals::*;
+pub use sampling_rules::*;
+pub use sampling_statistics::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    Edge, EdgeStatistics, EncryptionConfig, ErrorStatistics, FaultStatistics, Group, GroupSummary,
-    HistogramEntry, IndexingRule, IndexingRuleValue, Insight, InsightsConfiguration,
-    ProbabilisticRuleValue, SamplingRateBoost, SamplingRule, SamplingRuleRecord,
-    SamplingStatisticSummary, Service, ServiceStatistics, TelemetryRecord,
+    EncryptionConfig, Group, GroupSummary, IndexingRule, IndexingRuleValue, Insight,
+    InsightsConfiguration, ProbabilisticRuleValue, TelemetryRecord,
 };
 
 /// The region an ARN carries when the request's SigV4 scope names none.
@@ -1354,6 +1367,25 @@ fn group_arn(region: &str, group_name: &str, seed: u64) -> String {
     )
 }
 
+/// The resource an ARN of a group names — the prefix of the resource half of
+/// every ARN [`group_arn`] mints, and so what tells a group's ARN from another
+/// resource's.
+const GROUP_ARN_RESOURCE: &str = "group/";
+
+/// Whether `candidate` is of the form a group's ARN has: the ARN prefix, this
+/// service's namespace, and a resource half naming a group.
+///
+/// What is judged is ARN SYNTAX, not existence: a value of this form may still
+/// name no stored group ([`GroupLookupError::NotFound`]), while a value that is
+/// not of it could never have named one and is a malformed parameter
+/// ([`GroupLookupError::InvalidArn`]). The region and the account are not judged
+/// — an ARN minted in another region is a well-formed ARN that resolves to
+/// nothing here.
+fn is_group_arn(candidate: &str) -> bool {
+    let fields: Vec<&str> = candidate.splitn(6, ':').collect();
+    matches!(fields.as_slice(), ["arn", _, ARN_NAMESPACE, _, _, resource] if resource.starts_with(GROUP_ARN_RESOURCE))
+}
+
 /// The reserved [`DEFAULT_GROUP_NAME`] group, as a caller in `region` reads it.
 ///
 /// DERIVED, never stored: the group exists in every account and region without
@@ -1395,6 +1427,25 @@ pub const FILTER_BUDGET_SPENT_MESSAGE: &str = "the FilterExpression could not be
 /// or widening the call to every group.
 pub const CONFLICTING_GROUP_SELECTORS_MESSAGE: &str = "Provide either GroupName or GroupARN";
 
+/// The refusal X-Ray answers for a `GroupARN` that is not of the form a group's
+/// ARN has: fixed text naming the MEMBER, because the value cannot be a group's
+/// ARN whatever groups exist. Judged before any lookup, so a malformed value is
+/// never reported as a group that does not exist.
+pub const INVALID_GROUP_ARN_MESSAGE: &str = "Invalid GroupARN";
+
+/// The refusal X-Ray answers when a read that SCOPES a derivation to a group is
+/// given a group that does not exist.
+///
+/// Entirely fixed text, the closing full stop included: it names neither
+/// selector, so no value from the request — and nothing about how this emulator
+/// represents a group — reaches the caller. Stated once here, because every read
+/// that resolves a group to scope itself by answers the same sentence for the
+/// same mistake: the derivations over a group's traffic, and the group a trace
+/// query scopes itself to ([`group_scope`]). The group RESOURCE's own reads word
+/// it differently ([`GroupLookupError::message`]), which is the service's own
+/// distinction and not this emulator's.
+pub const GROUP_NOT_FOUND_MESSAGE: &str = "Group not found.";
+
 /// The reserved [`DEFAULT_GROUP_NAME`] group `resource_arn` names, when it names
 /// that group's derived ARN.
 ///
@@ -1414,6 +1465,10 @@ pub enum GroupLookupError {
     NoSelector,
     /// BOTH selectors were supplied, so the request states two identities.
     ConflictingSelectors,
+    /// The `GroupARN` supplied is not of the form a group's ARN has
+    /// ([`is_group_arn`]), so it could never have named one: a malformed
+    /// parameter, judged before any lookup.
+    InvalidArn,
     /// A selector was supplied but no group matches it.
     NotFound,
 }
@@ -1423,10 +1478,13 @@ impl GroupLookupError {
     /// [`ComAmazonawsXrayAwsxrayState::find_group`], so `GetGroup` and
     /// `DeleteGroup` cannot drift into two wordings of one refusal.
     ///
-    /// A lookup that matched nothing is answered with the fixed text X-Ray uses,
-    /// `Group not found`: it names neither selector, so no value from the
-    /// request — and nothing about how this emulator represents one — reaches
-    /// the caller.
+    /// A lookup that matched nothing is answered with the fixed text X-Ray uses
+    /// on the group resource's own reads, `Group not found`: it names neither
+    /// selector, so no value from the request — and nothing about how this
+    /// emulator represents one — reaches the caller. A read that SCOPES a
+    /// derivation to a group words the same mistake with a closing full stop
+    /// ([`GROUP_NOT_FOUND_MESSAGE`]), which is the service's own distinction
+    /// between the two surfaces.
     pub fn message(self) -> &'static str {
         match self {
             // One sentence for both halves of "exactly one selector": a request
@@ -1434,6 +1492,10 @@ impl GroupLookupError {
             // states them identically (see
             // [`CONFLICTING_GROUP_SELECTORS_MESSAGE`]).
             Self::NoSelector | Self::ConflictingSelectors => CONFLICTING_GROUP_SELECTORS_MESSAGE,
+            // A value that is not an ARN at all is a malformed parameter, so the
+            // refusal names the MEMBER that carried it rather than the resource
+            // the request was looking for.
+            Self::InvalidArn => INVALID_GROUP_ARN_MESSAGE,
             Self::NotFound => "Group not found",
         }
     }
@@ -3095,6 +3157,13 @@ impl ComAmazonawsXrayAwsxrayState {
         if group_name.is_some() && group_arn.is_some() {
             return Err(GroupLookupError::ConflictingSelectors);
         }
+        // An ARN that is not of the form a group's ARN has could never have named
+        // one, so it is a malformed parameter rather than a group that is
+        // missing — judged before the stores are read, exactly as the
+        // exactly-one-selector rule above is.
+        if group_arn.is_some_and(|arn| !is_group_arn(arn)) {
+            return Err(GroupLookupError::InvalidArn);
+        }
         if let Some(record) = group_name
             .map(|name| Self::key(region, name))
             .and_then(|key| self.groups.get(&key))
@@ -3127,10 +3196,15 @@ impl ComAmazonawsXrayAwsxrayState {
     /// stored traces, which is an answer over less data and never a refusal.
     ///
     /// `Err` carries the refusal message, which each caller lifts into its own
-    /// modelled client-input error: a selector that resolves no single group
-    /// ([`GroupLookupError::message`]), or an expression the evaluator cannot
-    /// answer — refused naming it, because answering a filtered request with the
-    /// UNFILTERED derivation would be a wrong answer rather than a missing one.
+    /// modelled client-input error: a selector that resolves no single group, or
+    /// an expression the evaluator cannot answer — refused naming it, because
+    /// answering a filtered request with the UNFILTERED derivation would be a
+    /// wrong answer rather than a missing one.
+    ///
+    /// A selector naming no group is worded [`GROUP_NOT_FOUND_MESSAGE`] here,
+    /// which is how X-Ray words it on the reads that SCOPE a derivation to a
+    /// group — a different sentence from the one the group resource's own reads
+    /// answer ([`GroupLookupError::message`]), down to its closing full stop.
     pub fn group_filter(
         &self,
         region: &str,
@@ -3142,7 +3216,10 @@ impl ComAmazonawsXrayAwsxrayState {
         }
         let group = self
             .find_group(region, group_name, group_arn)
-            .map_err(|failure| failure.message().to_string())?;
+            .map_err(|failure| match failure {
+                GroupLookupError::NotFound => GROUP_NOT_FOUND_MESSAGE.to_string(),
+                other => other.message().to_string(),
+            })?;
         let Some(source) = group
             .filter_expression
             .as_deref()
@@ -3663,7 +3740,15 @@ pub mod filter_expression {
     /// The input a tokenizer reports when it cannot read a token at `rest`: the
     /// longest run there that could still have become one
     /// ([`could_begin_a_token`]), plus the character that could not belong to
-    /// it.
+    /// it — which is what X-Ray reports for a word that begins a keyword and
+    /// then leaves it (`met` for an expression addressing `metadata.<key>`, `si`
+    /// for one beginning a word `si…`).
+    ///
+    /// A word that begins NO keyword of the language has no such run, and is
+    /// reported by its first [`MAX_REPORTED_WORD_CHARACTERS`] characters, or by
+    /// the whole word when it is shorter (`lat` for a word beginning `lat`),
+    /// rather than by its first character alone. A character no token can begin
+    /// with is reported on its own.
     fn unreadable_symbol(rest: &[char]) -> String {
         let mut read = 0;
         for take in 1..=rest.len() {
@@ -3673,7 +3758,27 @@ pub mod filter_expression {
             }
             read = take;
         }
+        if read == 0 {
+            let word = rest
+                .iter()
+                .take_while(|character| is_word_character(**character))
+                .count();
+            if word > 0 {
+                return rest[..word.min(MAX_REPORTED_WORD_CHARACTERS)]
+                    .iter()
+                    .collect();
+            }
+        }
         rest[..(read + 1).min(rest.len())].iter().collect()
+    }
+
+    /// How many characters of a word that begins no keyword a refusal reports.
+    const MAX_REPORTED_WORD_CHARACTERS: usize = 3;
+
+    /// The characters a keyword path is written with, which is also what decides
+    /// where a word a refusal reports ends.
+    fn is_word_character(character: char) -> bool {
+        character.is_alphanumeric() || "_.-".contains(character)
     }
 
     /// One lexical item.
@@ -3876,6 +3981,29 @@ pub mod filter_expression {
                 '=' => {
                     at += 1;
                     push!(start, Token::Comparison(Operator::Equal));
+                }
+                // The boolean operators, written as the DOUBLED symbols: a
+                // filter expression may join its terms with `&&` and `||`
+                // exactly as with `AND` and `OR`, so an expression written that
+                // way is read rather than refused. A single `&` or `|` joins
+                // nothing and is not of the language.
+                conjunction @ ('&' | '|') => {
+                    if characters.get(at + 1) != Some(&conjunction) {
+                        return Err(invalid_symbol(
+                            characters,
+                            start,
+                            unreadable_symbol(&characters[start..]),
+                        ));
+                    }
+                    at += 2;
+                    push!(
+                        start,
+                        if conjunction == '&' {
+                            Token::And
+                        } else {
+                            Token::Or
+                        }
+                    );
                 }
                 '<' | '>' => {
                     let inclusive = characters.get(at + 1) == Some(&'=');
@@ -4595,341 +4723,6 @@ impl Default for RateLimiter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Trace retrievals
-// ---------------------------------------------------------------------------
-
-/// One started trace retrieval: what `StartTraceRetrieval` was asked for, under
-/// the `RetrievalToken` it minted for it, plus the instants the clock owes its
-/// `RetrievalStatus` transitions at.
-#[derive(Debug, Clone, Default)]
-pub struct TraceRetrievalRecord {
-    /// The minted, opaque `RetrievalToken`.
-    pub retrieval_token: String,
-    /// The trace ids the retrieval was started for.
-    pub trace_ids: Vec<String>,
-    /// The requested window's start, in seconds of epoch time.
-    pub start_time: f64,
-    /// The requested window's end, in seconds of epoch time.
-    pub end_time: f64,
-    /// When the retrieval was started, in seconds of epoch time.
-    pub started_at: f64,
-    /// When the retrieval stops reporting `SCHEDULED` and starts reporting
-    /// `RUNNING`, in seconds of epoch time.
-    pub running_at: f64,
-    /// When the retrieval's results become readable and it starts reporting
-    /// `COMPLETE`, in seconds of epoch time.
-    pub complete_at: f64,
-    /// When `CancelTraceRetrieval` stopped this retrieval, in seconds of epoch
-    /// time; `None` while it was never cancelled.
-    pub cancelled_at: Option<f64>,
-    /// When the retrieval times out, [`TRACE_RETRIEVAL_TIMEOUT_SECONDS`] after
-    /// it started.
-    pub expires_at: f64,
-}
-
-impl TraceRetrievalRecord {
-    /// This retrieval's `RetrievalStatus` at `now`, computed from the instants
-    /// stored on it — never from a status written at the time of some earlier
-    /// call, so two readers at the same instant always agree.
-    ///
-    /// `FAILED` and `TIMEOUT` are never reported: no retrieval here can fail
-    /// (the results are derived from traces already stored), and every one
-    /// becomes readable within [`TRACE_RETRIEVAL_RUNNING_SPAN_SECONDS`] of
-    /// running — far inside the documented 60-minute timeout, so nothing ever
-    /// runs out of it.
-    pub fn status(&self, now: f64) -> &'static str {
-        if self.cancelled_at.is_some() {
-            RETRIEVAL_STATUS_CANCELLED
-        } else if now >= self.complete_at {
-            RETRIEVAL_STATUS_COMPLETE
-        } else if now >= self.running_at {
-            RETRIEVAL_STATUS_RUNNING
-        } else {
-            RETRIEVAL_STATUS_SCHEDULED
-        }
-    }
-
-    /// Whether this retrieval is still the "ongoing trace retrieval job"
-    /// `CancelTraceRetrieval` cancels: one that has not reached a status it can
-    /// no longer leave.
-    pub fn is_ongoing(&self, now: f64) -> bool {
-        matches!(
-            self.status(now),
-            RETRIEVAL_STATUS_SCHEDULED | RETRIEVAL_STATUS_RUNNING
-        )
-    }
-}
-
-impl ComAmazonawsXrayAwsxrayState {
-    /// Start a trace retrieval and return the stored record, whose
-    /// `retrieval_token` is what the caller gets back.
-    ///
-    /// Bounded: retrievals the clock has already timed out are dropped first,
-    /// and if the store is still at [`MAX_TRACE_RETRIEVALS`] the one that started
-    /// longest ago makes room.
-    pub fn start_trace_retrieval(
-        &mut self,
-        trace_ids: Vec<String>,
-        start_time: f64,
-        end_time: f64,
-        now: f64,
-    ) -> &TraceRetrievalRecord {
-        self.expire_trace_retrievals(now);
-        if self.retrievals.len() >= MAX_TRACE_RETRIEVALS {
-            let oldest = self
-                .retrievals
-                .iter()
-                .min_by(|(_, left), (_, right)| left.started_at.total_cmp(&right.started_at))
-                .map(|(token, _)| token.clone());
-            if let Some(token) = oldest {
-                self.retrievals.remove(&token);
-            }
-        }
-        self.retrieval_seq += 1;
-        let retrieval_token = self.mint_retrieval_token(&trace_ids, start_time, end_time);
-        let running_at = now + TRACE_RETRIEVAL_SCHEDULED_SPAN_SECONDS;
-        self.retrievals.insert(
-            retrieval_token.clone(),
-            TraceRetrievalRecord {
-                retrieval_token: retrieval_token.clone(),
-                trace_ids,
-                start_time,
-                end_time,
-                started_at: now,
-                running_at,
-                complete_at: running_at + TRACE_RETRIEVAL_RUNNING_SPAN_SECONDS,
-                cancelled_at: None,
-                expires_at: now + TRACE_RETRIEVAL_TIMEOUT_SECONDS,
-            },
-        );
-        &self.retrievals[&retrieval_token]
-    }
-
-    /// The retrieval `retrieval_token` names, once the retrievals the clock has
-    /// already timed out are gone.
-    ///
-    /// `None` is a token this service never issued, or one whose retrieval has
-    /// timed out — which is what a reader answers `ResourceNotFoundException`
-    /// for. The expiry it materialises was owed at `now` whether or not anybody
-    /// called, so a reader may do it too.
-    pub fn trace_retrieval(
-        &mut self,
-        retrieval_token: &str,
-        now: f64,
-    ) -> Option<&TraceRetrievalRecord> {
-        self.expire_trace_retrievals(now);
-        self.retrievals.get(retrieval_token)
-    }
-
-    /// Stop the retrieval a token names, so every later read of that token
-    /// reports `RETRIEVAL_STATUS_CANCELLED`.
-    ///
-    /// IDEMPOTENT in the statuses a retrieval can no longer leave: a retrieval
-    /// that already reached a terminal status is left exactly as it stands —
-    /// cancelling asks for a state it is already in or past, so there is nothing
-    /// to do and nothing to refuse. `Some` is the stored retrieval as it stands
-    /// after the call; `None` is a token that names no retrieval at all, which is
-    /// the one thing a caller is refused for.
-    pub fn cancel_trace_retrieval(
-        &mut self,
-        retrieval_token: &str,
-        now: f64,
-    ) -> Option<&TraceRetrievalRecord> {
-        self.expire_trace_retrievals(now);
-        let retrieval = self.retrievals.get_mut(retrieval_token)?;
-        if retrieval.is_ongoing(now) {
-            retrieval.cancelled_at = Some(now);
-        }
-        Some(retrieval)
-    }
-
-    /// The traces one retrieval holds: every requested trace id that names a
-    /// stored trace, each trimmed to the segments whose `start_time` falls
-    /// inside the retrieval's window, in the order the retrieval asked for them.
-    ///
-    /// The window is INCLUSIVE at both ends — "The range is inclusive, so the
-    /// specified start time is included in the query" /"the specified end time
-    /// is included", `StartTraceRetrieval`'s own documentation for `StartTime`
-    /// and `EndTime` — unlike the half-open interval `GetTraceSummaries`
-    /// selects on.
-    ///
-    /// A requested id that names nothing stored, a repeat of one already
-    /// answered, and a trace whose every segment started outside the window each
-    /// contribute no trace: a retrieval reports the traffic that was recorded,
-    /// never the ids that were asked about.
-    pub fn retrieved_traces(&self, retrieval: &TraceRetrievalRecord) -> Vec<TraceRecord> {
-        let mut answered: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        let mut traces = Vec::new();
-        for trace_id in &retrieval.trace_ids {
-            if !answered.insert(trace_id.as_str()) {
-                continue;
-            }
-            let Some(trace) = self.traces.get(trace_id) else {
-                continue;
-            };
-            let trimmed = trace.within(retrieval.start_time, retrieval.end_time);
-            if !trimmed.segments.is_empty() {
-                traces.push(trimmed);
-            }
-        }
-        traces
-    }
-
-    /// Drop every retrieval the clock has already timed out.
-    ///
-    /// This is work the clock owed at `now` whether or not anybody called, which
-    /// is why a reader may materialise it too.
-    pub fn expire_trace_retrievals(&mut self, now: f64) {
-        self.retrievals
-            .retain(|_, retrieval| retrieval.expires_at > now);
-    }
-
-    /// Mint an opaque `RetrievalToken`: [`RETRIEVAL_TOKEN_HEX_DIGITS`]
-    /// hexadecimal digits, of which the first half identifies the retrieval and
-    /// the second half is a CHECK over that first half
-    /// ([`retrieval_token_check`]), so a token that was damaged in transit can be
-    /// told from one this service never issued.
-    ///
-    /// The identifying half mixes the never-reset
-    /// [`retrieval_seq`](Self::retrieval_seq) with what the retrieval asked for,
-    /// so no two retrievals share a token even when they ask for the same traces
-    /// and no clock enters the value; a mixing that happened to land on a token
-    /// already held is re-mixed rather than returned, so the token a caller gets
-    /// names its own retrieval and no other.
-    fn mint_retrieval_token(&self, trace_ids: &[String], start_time: f64, end_time: f64) -> String {
-        let mut token = String::new();
-        for attempt in 0..=MAX_TRACE_RETRIEVALS {
-            let identity = ::service_common::stable_hex_id(&[
-                &self.retrieval_seq.to_string(),
-                &attempt.to_string(),
-                &trace_ids.join(","),
-                &start_time.to_bits().to_string(),
-                &end_time.to_bits().to_string(),
-            ]);
-            token = format!("{identity}{}", retrieval_token_check(&identity));
-            if !self.retrievals.contains_key(&token) {
-                break;
-            }
-        }
-        token
-    }
-}
-
-/// The CHECK half of a `RetrievalToken` whose identifying half is `identity`:
-/// the same deterministic mixing every derived id of this crate uses, so the
-/// check can be recomputed from the token alone
-/// ([`retrieval_token_defect`]).
-///
-/// This makes the token integrity-checked, not unguessable: it tells a damaged
-/// token from an intact one, and nothing authenticates on it.
-pub fn retrieval_token_check(identity: &str) -> String {
-    ::service_common::stable_hex_id(&["retrieval-token", identity])
-}
-
-/// How many hexadecimal digits a `RetrievalToken` this service mints carries
-/// ([`ComAmazonawsXrayAwsxrayState::mint_retrieval_token`]).
-pub const RETRIEVAL_TOKEN_HEX_DIGITS: usize = 32;
-
-/// Why a submitted `RetrievalToken` is not a value this service ISSUED.
-///
-/// Both classes are a malformed parameter — `InvalidRequestException` at HTTP
-/// 400, decided BEFORE any lookup — and they differ only in what the
-/// execution-id decoder the value was handed can say about it
-/// ([`malformed_retrieval_token_message`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RetrievalTokenDefect {
-    /// The value is not of the form a `RetrievalToken` has at all: a width other
-    /// than [`RETRIEVAL_TOKEN_HEX_DIGITS`], or a digit outside the hexadecimal
-    /// alphabet. The decoder was handed something that is not an execution id,
-    /// so it can say only that the execution id was invalid.
-    NotTokenForm,
-    /// The value has the minted width and the minted alphabet, but its check
-    /// half does not derive from its identifying half
-    /// ([`retrieval_token_check`]) — a token damaged after it was issued, by one
-    /// character or by many, the case of a digit included. The decoder read an
-    /// execution id of the right shape and could not decode it, so it names the
-    /// value it could not decode.
-    UndecodableExecutionId,
-}
-
-/// How `token` misses the `RetrievalToken` values this service mints, or `None`
-/// when it is one this service could have ISSUED: the right number of
-/// hexadecimal digits, and a check half that matches its identifying half
-/// ([`retrieval_token_check`]).
-///
-/// The only retrieval tokens that exist are the ones `StartTraceRetrieval`
-/// minted, and every one of them carries that check, so a value whose check does
-/// not match could never have named a retrieval however much it looks like one:
-/// it is a malformed parameter rather than a retrieval that is gone — which is
-/// what a token damaged in transit, by one character or by many, is. That
-/// distinction is what lets the retrieval readers answer such a token with
-/// `InvalidRequestException` (HTTP 400) BEFORE any existence lookup, and reserve
-/// `ResourceNotFoundException` (HTTP 404) for an intact token whose retrieval was
-/// never started, has been evicted, or has timed out.
-///
-/// The check is recomputed over the EXACT characters the request submitted, and
-/// nothing about them is folded: a retrieval token is an opaque string whose
-/// characters are each significant, so a value that differs from an issued one in
-/// the CASE of a digit is a value this service never issued — damaged in transit
-/// exactly like one whose digit changed to another value — and it is refused as a
-/// malformed parameter rather than resolved. Folding case here would also let a
-/// value pass this gate and then miss the store that resolves it, which is keyed
-/// by the exact string the mint emitted, so the caller would be told its
-/// retrieval is gone when what is wrong is the value it submitted.
-pub fn retrieval_token_defect(token: &str) -> Option<RetrievalTokenDefect> {
-    if token.len() != RETRIEVAL_TOKEN_HEX_DIGITS
-        || !token.chars().all(|digit| digit.is_ascii_hexdigit())
-    {
-        return Some(RetrievalTokenDefect::NotTokenForm);
-    }
-    let (identity, check) = token.split_at(RETRIEVAL_TOKEN_HEX_DIGITS / 2);
-    if retrieval_token_check(identity) == check {
-        None
-    } else {
-        Some(RetrievalTokenDefect::UndecodableExecutionId)
-    }
-}
-
-/// What a `RetrievalToken` carrying `defect` ([`retrieval_token_defect`]) is
-/// refused with, before any lookup: the name the operation gives the member, the
-/// value the request submitted, and what the execution-id decoder made of it.
-///
-/// X-Ray words this refusal as TWO clauses: an outer one naming the parameter and
-/// the value the request submitted — "Invalid <member> <value> passed: " — and
-/// then the clause of the execution-id decoder the value was handed to. The
-/// request's value is the sentence's ONLY variable; how often it appears is what
-/// the decoder's clause decides:
-///
-/// * a value that is not of the token form at all got no further than the
-///   decoder's own entry check, which states that the execution id was invalid
-///   and names nothing ([`MALFORMED_RETRIEVAL_TOKEN_CAUSE`]) — so the value
-///   appears once, in the outer clause; and
-/// * a value of the token form whose check does not verify was DECODED and
-///   rejected, and the decoder names the value it could not decode
-///   ([`UNDECODABLE_EXECUTION_ID_CAUSE`]) — so the value appears twice, once per
-///   clause.
-///
-/// The sentence is built here once and each reader passes the member name it uses
-/// (`retrieval token`, `execution id`), so the two readers of one class never
-/// disagree about its wording.
-pub fn malformed_retrieval_token_message(
-    member: &str,
-    token: &str,
-    defect: RetrievalTokenDefect,
-) -> String {
-    match defect {
-        RetrievalTokenDefect::NotTokenForm => {
-            format!("Invalid {member} {token} passed: {MALFORMED_RETRIEVAL_TOKEN_CAUSE}")
-        }
-        RetrievalTokenDefect::UndecodableExecutionId => {
-            format!(
-                "Invalid {member} {token} passed: {UNDECODABLE_EXECUTION_ID_CAUSE}{token}"
-            )
-        }
-    }
-}
-
 /// The decoder clause a value that is not of the token form at all is refused
 /// with ([`malformed_retrieval_token_message`]): fixed text, capitalised exactly
 /// this way, naming no value, whatever the operation and whatever the value.
@@ -4941,1361 +4734,8 @@ pub const MALFORMED_RETRIEVAL_TOKEN_CAUSE: &str = "Invalid Execution Id";
 pub const UNDECODABLE_EXECUTION_ID_CAUSE: &str = "Invalid execution id provided: ";
 
 // ---------------------------------------------------------------------------
-// Sampling rules
+// Timestamps
 // ---------------------------------------------------------------------------
-
-/// A stored sampling rule: the rule as it was accepted — its `RuleName` and the
-/// `RuleARN` minted for it filled in — plus when it was created and last
-/// modified. `CreateSamplingRule` and `GetSamplingRules` both answer from this.
-#[derive(Debug, Clone)]
-pub struct StoredSamplingRule {
-    /// The accepted rule, with `RuleName` and `RuleARN` as stored.
-    pub rule: SamplingRule,
-    /// When the rule was created, in seconds of epoch time.
-    pub created_at: f64,
-    /// When the rule was last modified, in seconds of epoch time.
-    pub modified_at: f64,
-    /// The tags the rule carries, keyed by tag key — what `TagResource` and
-    /// `ListTagsForResource` reach through
-    /// [`tags_for_resource`](ComAmazonawsXrayAwsxrayState::tags_for_resource).
-    pub tags: BTreeMap<String, String>,
-}
-
-impl StoredSamplingRule {
-    /// This record as the modelled `SamplingRuleRecord`.
-    ///
-    /// The ONE place a stored rule becomes a wire record, so every operation
-    /// that answers a `SamplingRuleRecord` — `CreateSamplingRule`,
-    /// `GetSamplingRules`, `UpdateSamplingRule`, `DeleteSamplingRule` — answers
-    /// the same shape for the same rule.
-    pub fn to_record(&self) -> SamplingRuleRecord {
-        let mut rule = self.rule.clone();
-        // `SamplingRule$Attributes` targets `AttributeMap`, modelled
-        // `@length(min: 0, max: 5)`
-        // (`smithy_query(query="shape",shape="AttributeMap")`): a map whose
-        // minimum length is zero, so the EMPTY map is a legal value of the
-        // member rather than an absent member. A rule that matches on no
-        // attribute therefore serializes `Attributes` as `{}`, which is what an
-        // attribute-matching client iterates, instead of omitting it.
-        let attributes = rule.attributes.take().unwrap_or_default();
-        rule.attributes = Some(attributes);
-        SamplingRuleRecord {
-            sampling_rule: Some(rule),
-            created_at: Some(::aws_smithy_types::DateTime::from_secs_f64(self.created_at)),
-            modified_at: Some(::aws_smithy_types::DateTime::from_secs_f64(self.modified_at)),
-        }
-    }
-}
-
-/// Why a submitted `SamplingRule` cannot be created.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SamplingRuleRejection {
-    /// The rule is refused for what it says: a bad selector, or a member value
-    /// the service does not accept. A client-input refusal.
-    Invalid(String),
-    /// The store already holds [`MAX_SAMPLING_RULES`] rules. This is the one
-    /// rejection `RuleLimitExceededException` reports.
-    LimitExceeded(String),
-}
-
-impl SamplingRuleRejection {
-    /// What to tell the caller.
-    pub fn message(&self) -> &str {
-        match self {
-            Self::Invalid(message) | Self::LimitExceeded(message) => message,
-        }
-    }
-}
-
-/// The `RuleName` a submitted rule is to be stored under, refusing a rule whose
-/// members cannot describe one.
-///
-/// The rules come from the member documentation
-/// (`smithy_query(query="shape",shape="SamplingRule")`): a rule is specified
-/// "by either name or ARN, but not both", `Version` is "the version of the
-/// sampling rule format (`1`)", and `ResourceARN` "matches the ARN of the Amazon
-/// Web Services resource on which the service runs" — an ARN, or `*` for any.
-/// Every modelled `@length` / `@range` bound is refused at the boundary before a
-/// handler sees the request, so none of them is re-checked here.
-pub fn sampling_rule_name(rule: &SamplingRule) -> Result<&str, SamplingRuleRejection> {
-    let invalid =
-        |message: String| -> SamplingRuleRejection { SamplingRuleRejection::Invalid(message) };
-    let name = match (rule.rule_name.as_deref(), rule.rule_arn.as_deref()) {
-        (Some(_), Some(_)) => {
-            return Err(invalid(
-                "SamplingRule must specify a rule by either RuleName or RuleARN, but not both"
-                    .to_string(),
-            ))
-        }
-        (None, _) => {
-            return Err(invalid(
-                "SamplingRule.RuleName is required to create a sampling rule; its RuleARN is minted by X-Ray".to_string(),
-            ))
-        }
-        (Some(name), None) => name,
-    };
-    if rule.version != SAMPLING_RULE_FORMAT_VERSION {
-        return Err(invalid(format!(
-            "SamplingRule.Version must be {SAMPLING_RULE_FORMAT_VERSION}, the version of the sampling rule format, not {}",
-            rule.version
-        )));
-    }
-    validate_resource_arn(&rule.resource_arn)?;
-    Ok(name)
-}
-
-/// Check a submitted `ResourceARN`: "matches the ARN of the Amazon Web Services
-/// resource on which the service runs"
-/// (`smithy_query(query="shape",shape="SamplingRule")`) — so what is judged is
-/// ARN SYNTAX, and the one syntax rule a value can break here is the prefix
-/// every ARN starts with. [`ANY_RESOURCE_ARN`] matches any resource, and a value
-/// that names no resource at all (the empty string) constrains nothing, so
-/// neither is an ARN that has to parse. Written once, because a rule may not
-/// reach a value through `UpdateSamplingRule` that `CreateSamplingRule` refuses.
-pub fn validate_resource_arn(resource_arn: &str) -> Result<(), SamplingRuleRejection> {
-    if resource_arn.is_empty() || resource_arn == ANY_RESOURCE_ARN {
-        return Ok(());
-    }
-    if !resource_arn.starts_with(ARN_PREFIX) {
-        return Err(SamplingRuleRejection::Invalid(format!(
-            "Invalid resource ARN: {resource_arn}. Malformed ARN - doesn't start with '{ARN_PREFIX}'"
-        )));
-    }
-    Ok(())
-}
-
-/// The bounds the modelled `SamplingRule` members carry, as
-/// `smithy_query(query="shape",shape="Priority,FixedRate,ReservoirSize")` states
-/// them: `Priority` `@range(min: 1, max: 9999)`, `FixedRate` `@range(min: 0,
-/// max: 1)`, `ReservoirSize` `@range(min: 0)`.
-///
-/// They are re-checked HERE for `UpdateSamplingRule`, whose own members target
-/// the unconstrained `NullableInteger` / `NullableDouble`, so the boundary
-/// refuses none of them: a rule may not reach through an update a value it could
-/// not have been created with.
-pub const SAMPLING_RULE_PRIORITY_MIN: i32 = 1;
-/// The modelled maximum of `SamplingRule$Priority`.
-pub const SAMPLING_RULE_PRIORITY_MAX: i32 = 9999;
-/// The modelled minimum of `SamplingRule$FixedRate`.
-pub const SAMPLING_RULE_FIXED_RATE_MIN: f64 = 0.0;
-/// The modelled maximum of `SamplingRule$FixedRate`.
-pub const SAMPLING_RULE_FIXED_RATE_MAX: f64 = 1.0;
-/// The modelled minimum of `SamplingRule$ReservoirSize`.
-pub const SAMPLING_RULE_RESERVOIR_SIZE_MIN: i32 = 0;
-
-/// Check an update's values against those bounds, before anything is written.
-pub fn validate_sampling_rule_update(
-    update: &SamplingRuleUpdateDraft,
-) -> Result<(), SamplingRuleRejection> {
-    let invalid =
-        |message: String| -> SamplingRuleRejection { SamplingRuleRejection::Invalid(message) };
-    if let Some(resource_arn) = update.resource_arn.as_deref() {
-        validate_resource_arn(resource_arn)?;
-    }
-    if let Some(priority) = update.priority {
-        if !(SAMPLING_RULE_PRIORITY_MIN..=SAMPLING_RULE_PRIORITY_MAX).contains(&priority) {
-            return Err(invalid(format!(
-                "Priority must be between {SAMPLING_RULE_PRIORITY_MIN} and {SAMPLING_RULE_PRIORITY_MAX}, not {priority}"
-            )));
-        }
-    }
-    if let Some(fixed_rate) = update.fixed_rate {
-        if !(SAMPLING_RULE_FIXED_RATE_MIN..=SAMPLING_RULE_FIXED_RATE_MAX).contains(&fixed_rate) {
-            return Err(invalid(format!(
-                "FixedRate must be between {SAMPLING_RULE_FIXED_RATE_MIN} and {SAMPLING_RULE_FIXED_RATE_MAX}, not {fixed_rate}"
-            )));
-        }
-    }
-    if let Some(reservoir_size) = update.reservoir_size {
-        if reservoir_size < SAMPLING_RULE_RESERVOIR_SIZE_MIN {
-            return Err(invalid(format!(
-                "ReservoirSize must be at least {SAMPLING_RULE_RESERVOIR_SIZE_MIN}, not {reservoir_size}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// The only `SamplingRule$Version` X-Ray accepts: "the version of the sampling
-/// rule format (`1`)".
-pub const SAMPLING_RULE_FORMAT_VERSION: i32 = 1;
-
-/// The `SamplingRule$ResourceARN` that matches any resource.
-pub const ANY_RESOURCE_ARN: &str = "*";
-
-/// What every Amazon Resource Name begins with — the one piece of ARN syntax a
-/// submitted `ResourceARN` is judged against ([`validate_resource_arn`]).
-pub const ARN_PREFIX: &str = "arn:";
-
-/// The `SamplingRule` matcher value that matches anything: the wildcard every
-/// matcher of the service-managed catch-all rule carries.
-pub const ANY_MATCHER: &str = "*";
-
-/// The name of the sampling rule every X-Ray account holds without anyone
-/// creating it.
-///
-/// X-Ray seeds each account with one service-managed catch-all rule, which
-/// `GetSamplingRules` always lists and which no `DeleteSamplingRule` removes;
-/// every X-Ray SDK reads it at startup as its fallback sampling policy. The
-/// model does not describe it — `GetSamplingRulesResult$SamplingRuleRecords` is
-/// just "rule definitions and metadata" — so the rule is recorded service
-/// behaviour, written down here once.
-pub const DEFAULT_SAMPLING_RULE_NAME: &str = "Default";
-
-/// The service-managed rule's `Priority`, deliberately PAST the `@range(min: 1,
-/// max: 9999)` a caller may set on a rule of its own
-/// (`smithy_query(query="shape",shape="Priority")`), so no created rule can ever
-/// sort behind the account's catch-all.
-pub const DEFAULT_SAMPLING_RULE_PRIORITY: i32 = 10_000;
-
-/// The service-managed rule's `FixedRate`: it instruments 5% of the requests
-/// that reach it once its reservoir is spent.
-pub const DEFAULT_SAMPLING_RULE_FIXED_RATE: f64 = 0.05;
-
-/// The service-managed rule's `ReservoirSize`: one request per second is
-/// instrumented before the fixed rate applies.
-pub const DEFAULT_SAMPLING_RULE_RESERVOIR_SIZE: i32 = 1;
-
-/// The account's service-managed [`DEFAULT_SAMPLING_RULE_NAME`] rule, as a
-/// caller in `region` reads it.
-///
-/// DERIVED, never seeded into the store: the rule exists in every account
-/// without being created, so there is no record to insert and no request can
-/// remove it. Its ARN is a pure function of the reserved name and the region —
-/// `sampling-rule/Default`, with none of the suffixes a minted id carries — so
-/// two reads answer the same ARN while a caller signing for another region reads
-/// that region's. Its `CreatedAt`/`ModifiedAt` are the epoch rather than a
-/// reading of the clock, because nothing created it and nothing has modified it:
-/// a derived rule that reported "now" would change on every read.
-pub fn default_sampling_rule(region: &str) -> StoredSamplingRule {
-    StoredSamplingRule {
-        rule: SamplingRule {
-            rule_name: Some(DEFAULT_SAMPLING_RULE_NAME.to_string()),
-            rule_arn: Some(sampling_rule_arn(region, DEFAULT_SAMPLING_RULE_NAME)),
-            resource_arn: ANY_RESOURCE_ARN.to_string(),
-            priority: DEFAULT_SAMPLING_RULE_PRIORITY,
-            fixed_rate: DEFAULT_SAMPLING_RULE_FIXED_RATE,
-            reservoir_size: DEFAULT_SAMPLING_RULE_RESERVOIR_SIZE,
-            service_name: ANY_MATCHER.to_string(),
-            service_type: ANY_MATCHER.to_string(),
-            host: ANY_MATCHER.to_string(),
-            http_method: ANY_MATCHER.to_string(),
-            url_path: ANY_MATCHER.to_string(),
-            version: SAMPLING_RULE_FORMAT_VERSION,
-            // The catch-all matches on no attribute; the empty map is what a
-            // reader sees ([`StoredSamplingRule::to_record`]).
-            attributes: None,
-            sampling_rate_boost: None,
-        },
-        created_at: 0.0,
-        modified_at: 0.0,
-        tags: BTreeMap::new(),
-    }
-}
-
-/// What `UpdateSamplingRule` supplies: the members of a sampling rule a caller
-/// may change.
-///
-/// A `None` member is one the request OMITTED and so leaves alone — "a document
-/// specifying CHANGES to a sampling rule's configuration"
-/// (`smithy_query(query="shape",shape="SamplingRuleUpdate")`). The rule's
-/// identity (`RuleName`, `RuleARN`) and its `Version` are not here: the update
-/// shape carries no `Version` and its two selectors NAME the rule rather than
-/// re-point it.
-#[derive(Debug, Clone, Default)]
-pub struct SamplingRuleUpdateDraft {
-    /// The updated `ResourceARN`, when the request carried one.
-    pub resource_arn: Option<String>,
-    /// The updated `Priority`, when the request carried one.
-    pub priority: Option<i32>,
-    /// The updated `FixedRate`, when the request carried one.
-    pub fixed_rate: Option<f64>,
-    /// The updated `ReservoirSize`, when the request carried one.
-    pub reservoir_size: Option<i32>,
-    /// The updated `ServiceName`, when the request carried one.
-    pub service_name: Option<String>,
-    /// The updated `ServiceType`, when the request carried one.
-    pub service_type: Option<String>,
-    /// The updated `Host`, when the request carried one.
-    pub host: Option<String>,
-    /// The updated `HTTPMethod`, when the request carried one.
-    pub http_method: Option<String>,
-    /// The updated `URLPath`, when the request carried one.
-    pub url_path: Option<String>,
-    /// The updated `Attributes`, when the request carried them.
-    pub attributes: Option<std::collections::HashMap<String, String>>,
-    /// The updated `SamplingRateBoost`, when the request carried one.
-    pub sampling_rate_boost: Option<SamplingRateBoost>,
-}
-
-impl ComAmazonawsXrayAwsxrayState {
-    /// Create one sampling rule, keyed by its `RuleName`.
-    ///
-    /// The collision check and the insert are ONE step on the locked store, so N
-    /// concurrent calls for one name have exactly one winner: every loser sees
-    /// the winner's record already present.
-    pub fn insert_sampling_rule(
-        &mut self,
-        region: &str,
-        mut rule: SamplingRule,
-        tags: BTreeMap<String, String>,
-        now: f64,
-    ) -> Result<&StoredSamplingRule, SamplingRuleRejection> {
-        let name = sampling_rule_name(&rule)?.to_string();
-        if self.sampling_rule_name_is_taken(&name) {
-            return Err(SamplingRuleRejection::Invalid(
-                SAMPLING_RULE_EXISTS_MESSAGE.to_string(),
-            ));
-        }
-        if self.created_sampling_rule_count() >= MAX_SAMPLING_RULES {
-            return Err(SamplingRuleRejection::LimitExceeded(format!(
-                "this emulator holds the maximum of {MAX_SAMPLING_RULES} sampling rules"
-            )));
-        }
-        rule.rule_arn = Some(sampling_rule_arn(region, &name));
-        rule.rule_name = Some(name.clone());
-        self.sampling_rules.insert(
-            name.clone(),
-            StoredSamplingRule {
-                rule,
-                created_at: now,
-                modified_at: now,
-                tags,
-            },
-        );
-        // The account's sampling-rule configuration just changed, which is what
-        // `GetSamplingTargets` reports as `LastRuleModification` so a service
-        // knows to re-read the rules.
-        self.sampling.rules_modified_at = now;
-        Ok(&self.sampling_rules[&name])
-    }
-
-    /// The stored `RuleName` a `(RuleName, RuleARN)` pair selects, for a request
-    /// addressed to `region`.
-    ///
-    /// `RuleName` and `RuleARN` are documented as "either name or ARN, but not
-    /// both", so supplying neither or both is a refusal rather than a lookup. An
-    /// ARN selects the rule whose ARN under THIS request's region it equals — an
-    /// ARN naming another region names another region's rule — and it is matched
-    /// by walking the stored rules, bounded by [`MAX_SAMPLING_RULES`], rather
-    /// than through a second index, so there is only ever one copy of a rule.
-    pub fn resolve_sampling_rule_name(
-        &self,
-        rule_name: Option<&str>,
-        rule_arn: Option<&str>,
-        region: &str,
-    ) -> Result<String, SamplingRuleLookupError> {
-        match (rule_name, rule_arn) {
-            (None, None) => return Err(SamplingRuleLookupError::NoSelector),
-            (Some(_), Some(_)) => return Err(SamplingRuleLookupError::BothSelectors),
-            _ => {}
-        }
-        if let Some(name) = rule_name {
-            if self.sampling_rules.contains_key(name) {
-                return Ok(name.to_string());
-            }
-        }
-        if let Some(arn) = rule_arn {
-            if let Some(name) = self
-                .sampling_rules
-                .keys()
-                .find(|name| sampling_rule_arn(region, name) == arn)
-            {
-                return Ok(name.clone());
-            }
-        }
-        // Last the account's service-managed rule, which is derived rather than
-        // stored ([`default_sampling_rule`]) and so is resolvable by name and by
-        // its region's ARN without ever appearing in `sampling_rules`.
-        if rule_name == Some(DEFAULT_SAMPLING_RULE_NAME)
-            || rule_arn
-                .is_some_and(|arn| arn == sampling_rule_arn(region, DEFAULT_SAMPLING_RULE_NAME))
-        {
-            return Ok(DEFAULT_SAMPLING_RULE_NAME.to_string());
-        }
-        Err(SamplingRuleLookupError::NotFound)
-    }
-
-    /// Whether `rule_name` already names a rule in the account, the
-    /// service-managed [`DEFAULT_SAMPLING_RULE_NAME`] one included —
-    /// `CreateSamplingRule`'s uniqueness check.
-    pub fn sampling_rule_name_is_taken(&self, rule_name: &str) -> bool {
-        rule_name == DEFAULT_SAMPLING_RULE_NAME || self.sampling_rules.contains_key(rule_name)
-    }
-
-    /// How many of the account's [`MAX_SAMPLING_RULES`] are spent: the rules it
-    /// CREATED.
-    ///
-    /// A materialised record for the service-managed
-    /// [`DEFAULT_SAMPLING_RULE_NAME`] rule is not one of them — nobody created
-    /// it — so writing to that rule does not cost the account a rule it could
-    /// otherwise create.
-    pub fn created_sampling_rule_count(&self) -> usize {
-        self.sampling_rules.len()
-            - usize::from(self.sampling_rules.contains_key(DEFAULT_SAMPLING_RULE_NAME))
-    }
-
-    /// The account's [`DEFAULT_SAMPLING_RULE_NAME`] rule as a caller in `region`
-    /// reads it: the configuration the stored record holds once a write has
-    /// materialised one, else the derived rule — and in both cases the ARN
-    /// DERIVED for `region`.
-    ///
-    /// The rule exists in every region without being created, so its ARN stays a
-    /// pure function of the reserved name and the reader's region even after a
-    /// write: the ARN a reader is answered is exactly the one that selects the
-    /// rule for that reader
-    /// ([`resolve_sampling_rule_name`](Self::resolve_sampling_rule_name)), which
-    /// a stored ARN from whichever region wrote first would not be.
-    pub fn default_sampling_rule_record(&self, region: &str) -> StoredSamplingRule {
-        let mut record = self
-            .sampling_rules
-            .get(DEFAULT_SAMPLING_RULE_NAME)
-            .cloned()
-            .unwrap_or_else(|| default_sampling_rule(region));
-        record.rule.rule_arn = Some(sampling_rule_arn(region, DEFAULT_SAMPLING_RULE_NAME));
-        record
-    }
-
-    /// Every sampling rule a caller in `region` sees: the rules the account
-    /// created, in `RuleName` order, and then the service-managed
-    /// [`DEFAULT_SAMPLING_RULE_NAME`] rule.
-    ///
-    /// This is what `GetSamplingRules` lists, so the catch-all is visible on a
-    /// fresh emulator exactly as it is in a fresh account, and an SDK reading
-    /// the listing always finds a rule that matches every request. It is listed
-    /// LAST, after the created rules, whether or not an update has materialised
-    /// a record for it — which is also the order of its `Priority`, past every
-    /// priority a created rule may carry. Bounded by [`MAX_SAMPLING_RULES`] + 1.
-    pub fn visible_sampling_rules(&self, region: &str) -> Vec<StoredSamplingRule> {
-        let mut visible: Vec<StoredSamplingRule> = self
-            .sampling_rules
-            .iter()
-            .filter(|(name, _)| name.as_str() != DEFAULT_SAMPLING_RULE_NAME)
-            .map(|(_, stored)| stored.clone())
-            .collect();
-        visible.push(self.default_sampling_rule_record(region));
-        visible
-    }
-
-    /// The stored record for the rule named `rule_name`, for an operation that
-    /// MUTATES it.
-    ///
-    /// The service-managed [`DEFAULT_SAMPLING_RULE_NAME`] rule is derived rather
-    /// than stored, so the first write to it is what gives it a stored record —
-    /// carrying the SAME derived members, so every selector that resolved it
-    /// before still does. It is not a rule the account created, so materialising
-    /// it takes none of the [`MAX_SAMPLING_RULES`] the account may create: the
-    /// limit a caller observes is the same before and after that write. `None`
-    /// means there is no record under that name to write to.
-    fn sampling_rule_mut(
-        &mut self,
-        region: &str,
-        rule_name: &str,
-    ) -> Option<&mut StoredSamplingRule> {
-        if !self.sampling_rules.contains_key(rule_name) {
-            if rule_name != DEFAULT_SAMPLING_RULE_NAME {
-                return None;
-            }
-            self.sampling_rules.insert(
-                DEFAULT_SAMPLING_RULE_NAME.to_string(),
-                default_sampling_rule(region),
-            );
-        }
-        self.sampling_rules.get_mut(rule_name)
-    }
-
-    /// Apply an `UpdateSamplingRule` to the rule `rule_name` names, answering
-    /// the record as it now stands, or `None` when there is no record to write
-    /// (see [`sampling_rule_mut`](Self::sampling_rule_mut)).
-    ///
-    /// Each member the update SUPPLIES replaces the stored one; each member it
-    /// OMITS leaves the stored one as it is. The write lands in the STORE, so
-    /// every later read of the rule — `GetSamplingRules`, `DeleteSamplingRule`,
-    /// another update — reports the updated values rather than the ones it was
-    /// created with, and `ModifiedAt` moves to `now` while `CreatedAt` does not.
-    /// A rule's identity (its name and the ARN derived from it) and its tags are
-    /// never touched, so no index needs maintenance here.
-    pub fn apply_sampling_rule_update(
-        &mut self,
-        region: &str,
-        rule_name: &str,
-        update: SamplingRuleUpdateDraft,
-        now: f64,
-    ) -> Option<&StoredSamplingRule> {
-        // The write is scoped, so the record can be answered by a fresh lookup
-        // once the account's configuration instant has been stamped below.
-        {
-            let stored = self.sampling_rule_mut(region, rule_name)?;
-            let rule = &mut stored.rule;
-            if let Some(resource_arn) = update.resource_arn {
-                rule.resource_arn = resource_arn;
-            }
-            if let Some(priority) = update.priority {
-                rule.priority = priority;
-            }
-            if let Some(fixed_rate) = update.fixed_rate {
-                rule.fixed_rate = fixed_rate;
-            }
-            if let Some(reservoir_size) = update.reservoir_size {
-                rule.reservoir_size = reservoir_size;
-            }
-            if let Some(service_name) = update.service_name {
-                rule.service_name = service_name;
-            }
-            if let Some(service_type) = update.service_type {
-                rule.service_type = service_type;
-            }
-            if let Some(host) = update.host {
-                rule.host = host;
-            }
-            if let Some(http_method) = update.http_method {
-                rule.http_method = http_method;
-            }
-            if let Some(url_path) = update.url_path {
-                rule.url_path = url_path;
-            }
-            if let Some(attributes) = update.attributes {
-                rule.attributes = Some(attributes);
-            }
-            if let Some(sampling_rate_boost) = update.sampling_rate_boost {
-                rule.sampling_rate_boost = Some(sampling_rate_boost);
-            }
-            stored.modified_at = now;
-        }
-        // The configuration a service reads changed, so every later
-        // `GetSamplingTargets` tells it to re-read the rules.
-        self.sampling.rules_modified_at = now;
-        self.sampling_rules.get(rule_name)
-    }
-
-    /// Remove one sampling rule, answering the record that was removed.
-    ///
-    /// "Deletes a sampling rule" is the whole of the operation: the rule is gone
-    /// from the store, so no later listing carries it and no later selector
-    /// resolves it. The service-managed [`DEFAULT_SAMPLING_RULE_NAME`] rule is
-    /// not removable — `DeleteSamplingRule` refuses it before reaching here —
-    /// and removing its materialised record would only put the derived rule back
-    /// in the listing.
-    /// `now` is the instant the removal happened, supplied by the caller the
-    /// same way the create and the update supply theirs, so every write to a
-    /// rule stamps the account's configuration instant from ONE reading of the
-    /// clock per request.
-    pub fn remove_sampling_rule(
-        &mut self,
-        rule_name: &str,
-        now: f64,
-    ) -> Option<StoredSamplingRule> {
-        let removed = self.sampling_rules.remove(rule_name)?;
-        // A rule leaving the account is a change to the configuration a service
-        // reads, exactly as creating or updating one is.
-        self.sampling.rules_modified_at = now;
-        Some(removed)
-    }
-
-    /// The rule `rule_name` names, as a READER in `region` sees it: the stored
-    /// record, or the account's service-managed catch-all rule, which is derived
-    /// rather than stored ([`default_sampling_rule`]).
-    ///
-    /// `None` means the account holds no rule under that name, which is what
-    /// `GetSamplingTargets` reports as unprocessed statistics rather than
-    /// serving an allocation for a rule nobody configured.
-    pub fn visible_sampling_rule(
-        &self,
-        region: &str,
-        rule_name: &str,
-    ) -> Option<StoredSamplingRule> {
-        if rule_name == DEFAULT_SAMPLING_RULE_NAME {
-            return Some(self.default_sampling_rule_record(region));
-        }
-        self.sampling_rules.get(rule_name).cloned()
-    }
-}
-
-/// A sampling rule's ARN, `arn:aws:xray:<region>:<account>:sampling-rule/<RuleName>`.
-///
-/// Derived from the name rather than minted with a unique suffix, because a
-/// rule's name is unique in the account for as long as the rule exists — so an
-/// ARN resolves back to a name without a second index.
-pub fn sampling_rule_arn(region: &str, rule_name: &str) -> String {
-    ::emulator_server::emulator_arn(
-        ARN_NAMESPACE,
-        region,
-        &format!("sampling-rule/{rule_name}"),
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Sampling statistics, reservoir shares and boosts
-// ---------------------------------------------------------------------------
-
-/// How long one sampling reporting window is, in seconds.
-///
-/// The model documents the span twice: a `SamplingStatisticsDocument` carries
-/// results "for the last 10 seconds unless the service has been assigned a
-/// longer reporting interval after a previous call to GetSamplingTargets", and a
-/// `SamplingStatisticSummary` is "aggregated request sampling data for a
-/// sampling rule across all services for a 10-second window"
-/// (`smithy_query(query="shape",shape="SamplingStatisticsDocument")`). Reported
-/// results are therefore accumulated per rule into windows of this length, and
-/// a summary reports one of them.
-pub const SAMPLING_WINDOW_SECONDS: i64 = 10;
-
-/// `SamplingTargetDocument$Interval`: "the number of seconds for the service to
-/// wait before getting sampling targets again".
-///
-/// Served only on a document that GRANTS a share of a rule's reservoir, which
-/// is what the member is for: the service is told to come back for its next
-/// share when the one it was just granted expires
-/// ([`SAMPLING_ALLOCATION_TTL_SECONDS`]), one reporting window
-/// ([`SAMPLING_WINDOW_SECONDS`]) later. A document that grants no share assigns
-/// no cadence either, so it carries no interval at all and the reporting
-/// service keeps the one it came with — the case a `SamplingStatisticsDocument`
-/// describes as its default, "the last 10 seconds unless the service has been
-/// assigned a longer reporting interval after a previous call".
-pub const SAMPLING_TARGET_INTERVAL_SECONDS: i32 = 10;
-
-/// How long an allocated reservoir quota and a granted sampling boost stay
-/// live, in seconds.
-///
-/// CHOSEN, not documented: the allocation is granted for the interval the same
-/// document assigns the service ([`SAMPLING_TARGET_INTERVAL_SECONDS`]), which is
-/// the reporting window it reports over ([`SAMPLING_WINDOW_SECONDS`]), so a
-/// service that comes back when it was told to is answered the share the cycle
-/// it just took part in computed, and one that goes quiet falls back to the
-/// rule's `FixedRate` instead of holding a share of the pool forever.
-pub const SAMPLING_ALLOCATION_TTL_SECONDS: f64 = 10.0;
-
-/// How long a computed allocation stays live after the cycle that computed it,
-/// in seconds.
-///
-/// CHOSEN: an allocation outlives the cycle that produced it, because it is
-/// what a service is told at its NEXT report — including when the rule itself
-/// has left the account in between, which does not cancel the share the service
-/// was already granted. Once it has aged past this, a service reporting for a
-/// rule the account no longer holds is answered as unprocessed.
-pub const SAMPLING_ALLOCATION_CACHE_SECONDS: f64 = 60.0;
-
-/// How long a service's report keeps it in the pool sharing a rule's reservoir,
-/// in seconds.
-///
-/// CHOSEN: several missed reporting intervals, after which a service is no
-/// longer counted when the reservoir is shared out, so a service that stops
-/// calling stops diluting the share of the ones still reporting.
-pub const SAMPLING_CLIENT_REPORT_TTL_SECONDS: f64 = 60.0;
-
-/// The most reporting windows one rule keeps — about half an hour of them.
-/// Reaching it drops the oldest window, so a service reporting forever cannot
-/// grow the store without bound.
-pub const MAX_SAMPLING_WINDOWS_PER_RULE: usize = 180;
-
-/// The most services one rule's reservoir is shared between. Reaching it drops
-/// the least recently reporting service.
-pub const MAX_SAMPLING_CLIENTS_PER_RULE: usize = 100;
-
-/// The most services one rule records a boost grant for. Reaching it drops the
-/// least recently granted service, so a caller naming a fresh `ServiceName` on
-/// every call cannot grow the store without bound.
-pub const MAX_SAMPLING_BOOST_SERVICES_PER_RULE: usize = 100;
-
-/// The most rules the statistics store tracks: the rules an account may hold
-/// ([`MAX_SAMPLING_RULES`]) plus the service-managed catch-all. Reaching it
-/// drops the rule whose last report is the oldest, so a create/delete cycle
-/// through many names cannot grow the store without bound.
-pub const MAX_SAMPLING_STATISTIC_RULES: usize = MAX_SAMPLING_RULES + 1;
-
-/// The start of the [`SAMPLING_WINDOW_SECONDS`] window the instant `seconds`
-/// falls in, in whole seconds of epoch time.
-///
-/// Windows are aligned to the epoch rather than to whichever instant reported
-/// first, so two services reporting the same ten seconds accumulate into ONE
-/// window and the summary of it is one row. Bounded exactly as
-/// [`timestamp_of`] is, so no reported instant can produce a window start a
-/// reader cannot answer.
-pub fn sampling_window_start(seconds: f64) -> i64 {
-    let bounded = if seconds.is_nan() {
-        0.0
-    } else {
-        seconds.clamp(-MAX_SEGMENT_EPOCH_SECONDS, MAX_SEGMENT_EPOCH_SECONDS)
-    };
-    #[allow(clippy::cast_possible_truncation)]
-    let whole = bounded.floor() as i64;
-    whole - whole.rem_euclid(SAMPLING_WINDOW_SECONDS)
-}
-
-/// A summed counter as the modelled `Integer` member of a
-/// `SamplingStatisticSummary` carries it.
-///
-/// Counters are summed as `i64` so no sequence of reports overflows a total,
-/// and the wire member is a 32-bit `Integer`: a total past what it can carry is
-/// reported at its maximum rather than wrapping to a count nobody reported.
-fn wire_count(total: i64) -> i32 {
-    i32::try_from(total).unwrap_or(i32::MAX)
-}
-
-/// One service's reported results for one rule: what a
-/// `SamplingStatisticsDocument` carries, in this module's units.
-#[derive(Debug, Clone, Copy)]
-pub struct ReportedSamplingCounts {
-    /// The document's `Timestamp` ("the current time"), in seconds of epoch
-    /// time — which window the results are accumulated into.
-    pub timestamp: f64,
-    /// `RequestCount`: "the number of requests that matched the rule".
-    pub request_count: i64,
-    /// `SampledCount`: "the number of requests recorded".
-    pub sampled_count: i64,
-    /// `BorrowCount`: "the number of requests recorded with borrowed reservoir
-    /// quota".
-    pub borrow_count: i64,
-}
-
-/// A set of sampling counters for one rule and one reporting window: either
-/// what ONE service states for that window, or — once every reporting service's
-/// is added up — what a `SamplingStatisticSummary` is ("aggregated request
-/// sampling data for a sampling rule across all services for a 10-second
-/// window").
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SamplingStatisticsWindow {
-    /// The `RequestCount` of the window.
-    pub request_count: i64,
-    /// The `SampledCount` of the window.
-    pub sampled_count: i64,
-    /// The `BorrowCount` of the window.
-    pub borrow_count: i64,
-}
-
-impl SamplingStatisticsWindow {
-    /// The counters one reported `SamplingStatisticsDocument` states.
-    fn of(report: ReportedSamplingCounts) -> Self {
-        Self {
-            request_count: report.request_count,
-            sampled_count: report.sampled_count,
-            borrow_count: report.borrow_count,
-        }
-    }
-
-    /// Add another service's counters for the same window, saturatingly, so no
-    /// number of reporting services can overflow a total.
-    fn add(&mut self, other: Self) {
-        self.request_count = self.request_count.saturating_add(other.request_count);
-        self.sampled_count = self.sampled_count.saturating_add(other.sampled_count);
-        self.borrow_count = self.borrow_count.saturating_add(other.borrow_count);
-    }
-}
-
-/// One row of the account's reported sampling results: which rule and which
-/// window, and the counters every service reporting that window stated.
-///
-/// `GetSamplingStatisticSummaries` reports these, so the rows a reader walks
-/// are recomputed from what services reported rather than echoed from any one
-/// request.
-#[derive(Debug, Clone)]
-pub struct SamplingStatisticsEntry {
-    /// The rule the results were reported for.
-    pub rule_name: String,
-    /// The start of the window, in whole seconds of epoch time — the summary's
-    /// `Timestamp`, "the start time of the reporting window".
-    pub window_start: i64,
-    /// The counters of the window, added up across its reporting services.
-    pub counts: SamplingStatisticsWindow,
-}
-
-impl SamplingStatisticsEntry {
-    /// This row as the modelled `SamplingStatisticSummary`.
-    pub fn to_summary(&self) -> SamplingStatisticSummary {
-        #[allow(clippy::cast_precision_loss)]
-        let window_start = self.window_start as f64;
-        SamplingStatisticSummary {
-            rule_name: Some(self.rule_name.clone()),
-            timestamp: Some(timestamp_of(window_start)),
-            request_count: wire_count(self.counts.request_count),
-            borrow_count: wire_count(self.counts.borrow_count),
-            sampled_count: wire_count(self.counts.sampled_count),
-        }
-    }
-
-    /// The pagination token that resumes a listing AT this row.
-    ///
-    /// It NAMES the row — its rule and its window — so a token for a row the
-    /// store no longer holds is refused rather than answered with an arbitrary
-    /// page, exactly as `GetSamplingRules`' token is.
-    pub fn token(&self) -> String {
-        format!("{}|{}", self.rule_name, self.window_start)
-    }
-}
-
-/// What one service last reported for one rule, and the allocation the service
-/// HOLDS for it.
-#[derive(Debug, Clone, Copy)]
-pub struct SamplingClientReport {
-    /// When the report was accepted, in seconds of epoch time — what
-    /// [`SAMPLING_CLIENT_REPORT_TTL_SECONDS`] is measured from.
-    pub reported_at: f64,
-    /// The `RequestCount` it reported: this service's share of the traffic the
-    /// rule matched.
-    pub request_count: i64,
-    /// The allocation computed for this service at the END of a reporting cycle
-    /// it took part in, which is what its NEXT report is answered with. `None`
-    /// until a cycle has run for it.
-    pub allocation: Option<SamplingAllocation>,
-}
-
-/// The allocation one reporting cycle computed for one service and one rule.
-///
-/// A service is told the allocation of the cycle it already took part in, never
-/// one computed out of the report it is making right now: before its first
-/// report there is no cycle it was part of, so it holds no reservoir share at
-/// all and samples at the rule's fixed rate until the next cycle has run.
-#[derive(Debug, Clone, Copy)]
-pub struct SamplingAllocation {
-    /// The share of the rule's reservoir the cycle gave this service.
-    pub reservoir_quota: i32,
-    /// When the cycle ran, in seconds of epoch time.
-    pub allocated_at: f64,
-}
-
-/// The pool one allocation cycle divided, as that cycle found the rule it is
-/// for configured.
-///
-/// Held per rule NAME, because that is what a `SamplingTargetDocument`
-/// identifies what it allocates by: the target computation answers a report out
-/// of the division it last made for that name, so it keeps the rate and the
-/// pool size that division was made under rather than re-reading the rule
-/// store. A name no cycle has divided a pool for has none of this, which is the
-/// only case a reported document is answered as unprocessed.
-#[derive(Debug, Clone, Copy)]
-pub struct SamplingPool {
-    /// The rule's `FixedRate` as the cycle found it.
-    pub fixed_rate: f64,
-    /// The rule's `ReservoirSize` as the cycle found it — the size of the pool
-    /// the cycle divided.
-    pub reservoir_size: i32,
-    /// When the cycle divided it, in seconds of epoch time.
-    pub divided_at: f64,
-}
-
-/// The account's sampling results and the allocations computed from them.
-///
-/// `GetSamplingTargets` writes here — recording what each service reported and
-/// reading back the share of each rule's reservoir that report entitles it to —
-/// and `GetSamplingStatisticSummaries` reports the accumulated windows. Nothing
-/// in a response is echoed from the request that stored it: a target document's
-/// `FixedRate` comes from the stored rule and its `ReservoirQuota` from the
-/// reports of every service using that rule.
-#[derive(Debug)]
-pub struct SamplingStatisticsStore {
-    /// When the account's sampling-rule configuration last changed, in seconds
-    /// of epoch time — `GetSamplingTargetsResult$LastRuleModification`, "the
-    /// last time a user changed the sampling rule configuration", which a
-    /// service compares against to decide whether to re-read the rules.
-    ///
-    /// Stamped by every create, update and delete of a rule. Until one happens
-    /// it is when this account's configuration came into being, which is a
-    /// FIXED instant rather than a reading of the clock that would move on
-    /// every read.
-    pub rules_modified_at: f64,
-    /// Reported results per rule, per [`SAMPLING_WINDOW_SECONDS`] window keyed
-    /// by the window's start, and within a window per reporting service's
-    /// `ClientID` — at most [`MAX_SAMPLING_WINDOWS_PER_RULE`] windows per rule
-    /// and [`MAX_SAMPLING_CLIENTS_PER_RULE`] services per window.
-    ///
-    /// Per SERVICE rather than one running total, because a summary aggregates
-    /// "across all services" for a window: what a service states for a window
-    /// is that service's whole contribution to it, so a service restating the
-    /// window replaces its own figures instead of being counted twice.
-    windows: BTreeMap<String, BTreeMap<i64, BTreeMap<String, SamplingStatisticsWindow>>>,
-    /// The latest report each service made for a rule, keyed by rule and then
-    /// by the reporting service's `ClientID`, at most
-    /// [`MAX_SAMPLING_CLIENTS_PER_RULE`] of them per rule.
-    clients: BTreeMap<String, BTreeMap<String, SamplingClientReport>>,
-    /// The pool the latest allocation cycle divided for a rule, keyed by rule
-    /// NAME ([`SamplingPool`]) — the state the target computation answers a
-    /// report out of, which is why it survives the rule leaving the store.
-    pools: BTreeMap<String, SamplingPool>,
-    /// When a rule's sampling boost was last granted to a service, keyed by
-    /// rule and then by the reporting `ServiceName` — what the configured
-    /// cooldown window is measured from.
-    boosts: BTreeMap<String, BTreeMap<String, f64>>,
-}
-
-impl Default for SamplingStatisticsStore {
-    fn default() -> Self {
-        Self {
-            rules_modified_at: now_epoch_seconds(),
-            windows: BTreeMap::new(),
-            clients: BTreeMap::new(),
-            pools: BTreeMap::new(),
-            boosts: BTreeMap::new(),
-        }
-    }
-}
-
-impl SamplingStatisticsStore {
-    /// Record one reported `SamplingStatisticsDocument`: store its counters as
-    /// the reporting service's figures for the window its `Timestamp` falls in,
-    /// and remember the report as this service's claim on the rule's reservoir.
-    ///
-    /// A document states the results of a reporting window, so a service that
-    /// reports the same window again — a client polling for its reservoir
-    /// share restates the window it is in — RESTATES its own figures rather
-    /// than adding to them; a summary of the window adds up what each service
-    /// stated for it.
-    ///
-    /// The share the reporting service is answered is the one it already HOLDS
-    /// ([`Self::held_allocation`]), computed at the end of a cycle it took part
-    /// in, so recording a report never hands out a share of its own: the first
-    /// report a service makes precedes the first allocation cycle for it.
-    pub fn record(
-        &mut self,
-        rule_name: &str,
-        client_id: &str,
-        report: ReportedSamplingCounts,
-        now: f64,
-    ) {
-        let windows = self.windows.entry(rule_name.to_string()).or_default();
-        let window = windows
-            .entry(sampling_window_start(report.timestamp))
-            .or_default();
-        window.insert(
-            client_id.to_string(),
-            SamplingStatisticsWindow::of(report),
-        );
-        while window.len() > MAX_SAMPLING_CLIENTS_PER_RULE {
-            // Which service's figures make room is arbitrary — the window holds
-            // no order over them — so the first by `ClientID` goes, and the
-            // window stays bounded.
-            let Some(crowded) = window.keys().next().cloned() else {
-                break;
-            };
-            window.remove(&crowded);
-        }
-        while windows.len() > MAX_SAMPLING_WINDOWS_PER_RULE {
-            let Some(oldest) = windows.keys().next().copied() else {
-                break;
-            };
-            windows.remove(&oldest);
-        }
-
-        let clients = self.clients.entry(rule_name.to_string()).or_default();
-        let held = clients
-            .get(client_id)
-            .and_then(|report| report.allocation)
-            .filter(|allocation| {
-                now - allocation.allocated_at <= SAMPLING_ALLOCATION_CACHE_SECONDS
-            });
-        clients.insert(
-            client_id.to_string(),
-            SamplingClientReport {
-                reported_at: now,
-                request_count: report.request_count,
-                allocation: held,
-            },
-        );
-        // A service that has gone quiet for longer than a report stays live no
-        // longer shares the pool.
-        clients.retain(|_, report| now - report.reported_at <= SAMPLING_CLIENT_REPORT_TTL_SECONDS);
-        while clients.len() > MAX_SAMPLING_CLIENTS_PER_RULE {
-            let Some(stale) = clients
-                .iter()
-                .min_by(|left, right| left.1.reported_at.total_cmp(&right.1.reported_at))
-                .map(|(client, _)| client.clone())
-            else {
-                break;
-            };
-            clients.remove(&stale);
-        }
-        self.clients.retain(|_, clients| !clients.is_empty());
-        self.prune_rules();
-    }
-
-    /// The pool the latest allocation cycle divided for `rule_name`, while that
-    /// division is still live — the state the target computation answers a
-    /// report for that rule NAME out of.
-    ///
-    /// `None` means no cycle has divided a pool for the name, or the last one
-    /// has aged past [`SAMPLING_ALLOCATION_CACHE_SECONDS`]: there is no division
-    /// to tell a reporting service its share of. Whether the account still
-    /// holds a rule under the name does not enter into it — the division stands
-    /// on its own, exactly as the share granted out of it does.
-    pub fn divided_pool(&self, rule_name: &str, now: f64) -> Option<SamplingPool> {
-        self.pools
-            .get(rule_name)
-            .copied()
-            .filter(|pool| now - pool.divided_at <= SAMPLING_ALLOCATION_CACHE_SECONDS)
-    }
-
-    /// What is left UNCLAIMED of a divided pool of `reservoir_size`: the size
-    /// of the pool less every share the services still live hold out of it.
-    ///
-    /// This is what a service that was not in the division is told, because the
-    /// pool "applies to all services using the rule collectively" and is
-    /// zero-sum: a newcomer may have what the division did not give away, which
-    /// is nothing once the pool is fully claimed. Never negative, and never more
-    /// than the pool.
-    pub fn unclaimed(&self, rule_name: &str, reservoir_size: i32, now: f64) -> i32 {
-        if reservoir_size <= 0 {
-            return 0;
-        }
-        let claimed = self.clients.get(rule_name).map_or(0_i64, |clients| {
-            clients
-                .values()
-                .filter(|report| now - report.reported_at <= SAMPLING_CLIENT_REPORT_TTL_SECONDS)
-                .filter_map(|report| report.allocation)
-                .filter(|allocation| {
-                    now - allocation.allocated_at <= SAMPLING_ALLOCATION_CACHE_SECONDS
-                })
-                .map(|allocation| i64::from(allocation.reservoir_quota))
-                .fold(0_i64, i64::saturating_add)
-        });
-        i32::try_from(i64::from(reservoir_size).saturating_sub(claimed))
-            .unwrap_or(0)
-            .clamp(0, reservoir_size)
-    }
-
-    /// The allocation the service `client_id` still HOLDS for `rule_name`,
-    /// without reporting anything new.
-    ///
-    /// This is the share a cycle already granted it, which stands until it ages
-    /// past [`SAMPLING_ALLOCATION_CACHE_SECONDS`] — including when the rule has
-    /// left the account in between, because deleting a rule does not reach into
-    /// an allocation the service was already told about.
-    pub fn held_allocation(
-        &self,
-        rule_name: &str,
-        client_id: &str,
-        now: f64,
-    ) -> Option<SamplingAllocation> {
-        self.clients
-            .get(rule_name)?
-            .get(client_id)?
-            .allocation
-            .filter(|allocation| {
-                now - allocation.allocated_at <= SAMPLING_ALLOCATION_CACHE_SECONDS
-            })
-    }
-
-    /// Run the allocation cycle for one service and one rule: compute the share
-    /// of the pool every live report entitles it to and store it as the
-    /// allocation that service HOLDS, which its next report is answered with.
-    pub fn allocate(
-        &mut self,
-        rule_name: &str,
-        client_id: &str,
-        reservoir_size: i32,
-        fixed_rate: f64,
-        now: f64,
-    ) {
-        // The cycle divides the pool as it finds the rule configured NOW, and
-        // records what it divided under the rule's name, so the target
-        // computation keeps answering out of that division without re-reading
-        // the rule store.
-        self.pools.insert(
-            rule_name.to_string(),
-            SamplingPool {
-                fixed_rate,
-                reservoir_size,
-                divided_at: now,
-            },
-        );
-        // A division that has aged past the span a share of it stays live can
-        // no longer be answered out of, so it is dropped rather than kept.
-        self.pools
-            .retain(|_, pool| now - pool.divided_at <= SAMPLING_ALLOCATION_CACHE_SECONDS);
-        let allocation = SamplingAllocation {
-            reservoir_quota: self.reservoir_quota(rule_name, client_id, reservoir_size, now),
-            allocated_at: now,
-        };
-        if let Some(report) = self
-            .clients
-            .get_mut(rule_name)
-            .and_then(|clients| clients.get_mut(client_id))
-        {
-            report.allocation = Some(allocation);
-        }
-    }
-
-    /// Keep the store to [`MAX_SAMPLING_STATISTIC_RULES`] rules, dropping the
-    /// rule whose most recent window is the oldest.
-    fn prune_rules(&mut self) {
-        while self.windows.len() > MAX_SAMPLING_STATISTIC_RULES {
-            let Some(stale) = self
-                .windows
-                .iter()
-                .min_by_key(|(_, windows)| windows.keys().next_back().copied().unwrap_or(i64::MIN))
-                .map(|(rule_name, _)| rule_name.clone())
-            else {
-                break;
-            };
-            self.windows.remove(&stale);
-            self.clients.remove(&stale);
-            self.pools.remove(&stale);
-            self.boosts.remove(&stale);
-        }
-    }
-
-    /// The share of `rule_name`'s reservoir the service `client_id` is
-    /// allocated, from what every service using the rule reported.
-    ///
-    /// A rule's `ReservoirSize` is "a fixed number of matching requests to
-    /// instrument per second, prior to applying the fixed rate ... not used
-    /// directly by services, but applies to all services using the rule
-    /// collectively" (`smithy_query(query="shape",shape="SamplingRule")`), so
-    /// the pool is SHARED: each reporting service is allocated the fraction of
-    /// it that its own reported `RequestCount` is of everything reported for the
-    /// rule by services still live, and services that report no requests at all
-    /// split it evenly. The share is floored, so the pool is never
-    /// over-allocated and a service whose share rounds to nothing instruments at
-    /// the rule's fixed rate instead.
-    pub fn reservoir_quota(
-        &self,
-        rule_name: &str,
-        client_id: &str,
-        reservoir_size: i32,
-        now: f64,
-    ) -> i32 {
-        if reservoir_size <= 0 {
-            return 0;
-        }
-        let Some(clients) = self.clients.get(rule_name) else {
-            return 0;
-        };
-        let live = || {
-            clients
-                .values()
-                .filter(|report| now - report.reported_at <= SAMPLING_CLIENT_REPORT_TTL_SECONDS)
-        };
-        let Some(mine) = clients
-            .get(client_id)
-            .filter(|report| now - report.reported_at <= SAMPLING_CLIENT_REPORT_TTL_SECONDS)
-        else {
-            return 0;
-        };
-        let reported: i64 = live()
-            .map(|report| report.request_count)
-            .fold(0_i64, i64::saturating_add);
-        let sharing = live().count();
-        #[allow(clippy::cast_precision_loss)]
-        let share = if reported > 0 {
-            mine.request_count as f64 / reported as f64
-        } else if sharing > 0 {
-            1.0 / sharing as f64
-        } else {
-            return 0;
-        };
-        let pool = f64::from(reservoir_size);
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            (pool * share).floor().clamp(0.0, pool) as i32
-        }
-    }
-
-    /// The boost rate to grant the service `service_name` for `rule_name`, or
-    /// `None` when no boost is due.
-    ///
-    /// A rule carries a boost configuration only when a caller asked for one:
-    /// `MaxRate` "defines max temporary sampling rate to apply when a boost is
-    /// triggered. Calculated boost rate by X-Ray will be less than or equal to
-    /// this max rate", and `CooldownWindowMinutes` "sets the time window in
-    /// which only one sampling rate boost can be triggered. After a boost
-    /// occurs, no further boosts are allowed until the next window"
-    /// (`smithy_query(query="shape",shape="SamplingRateBoost")`). So a boost is
-    /// triggered by the ANOMALIES a service reported — at the rate it reported
-    /// them, capped by the configured maximum — and only once per cooldown
-    /// window. A service that reported no anomaly is not boosted at all.
-    pub fn grant_boost(
-        &mut self,
-        rule_name: &str,
-        service_name: &str,
-        anomaly_rate: f64,
-        configured: &SamplingRateBoost,
-        now: f64,
-    ) -> Option<f64> {
-        if !anomaly_rate.is_finite() || anomaly_rate <= 0.0 || configured.max_rate <= 0.0 {
-            return None;
-        }
-        let cooldown = f64::from(configured.cooldown_window_minutes) * 60.0;
-        let granted = self
-            .boosts
-            .get(rule_name)
-            .and_then(|services| services.get(service_name).copied());
-        if granted.is_some_and(|at| now - at < cooldown) {
-            return None;
-        }
-        self.boosts
-            .entry(rule_name.to_string())
-            .or_default()
-            .insert(service_name.to_string(), now);
-        self.prune_boosts(rule_name, cooldown, now);
-        Some(anomaly_rate.min(configured.max_rate))
-    }
-
-    /// Keep one rule's boost grants to what they are for: a grant older than the
-    /// cooldown window can no longer suppress a boost, so it carries no
-    /// information and is dropped, and the rule records at most
-    /// [`MAX_SAMPLING_BOOST_SERVICES_PER_RULE`] services, the least recently
-    /// granted one going first.
-    fn prune_boosts(&mut self, rule_name: &str, cooldown: f64, now: f64) {
-        if let Some(services) = self.boosts.get_mut(rule_name) {
-            // A grant that has aged past the cooldown window can no longer
-            // suppress a boost, so it is dropped rather than kept; a rule with
-            // no cooldown window suppresses nothing and so records nothing.
-            services.retain(|_, granted| now - *granted < cooldown);
-            while services.len() > MAX_SAMPLING_BOOST_SERVICES_PER_RULE {
-                let Some(stale) = services
-                    .iter()
-                    .min_by(|left, right| left.1.total_cmp(right.1))
-                    .map(|(service, _)| service.clone())
-                else {
-                    break;
-                };
-                services.remove(&stale);
-            }
-        }
-        self.boosts.retain(|_, services| !services.is_empty());
-    }
-
-    /// Every reported window the account holds, in rule-name order and then in
-    /// window order — what `GetSamplingStatisticSummaries` pages over.
-    ///
-    /// Each row adds up what every service reporting that window stated for it,
-    /// which is what the summary aggregates "across all services".
-    ///
-    /// Bounded by [`MAX_SAMPLING_STATISTIC_RULES`] *
-    /// [`MAX_SAMPLING_WINDOWS_PER_RULE`].
-    pub fn entries(&self) -> Vec<SamplingStatisticsEntry> {
-        self.windows
-            .iter()
-            .flat_map(|(rule_name, windows)| {
-                windows.iter().map(move |(window_start, reporters)| {
-                    let mut counts = SamplingStatisticsWindow::default();
-                    for stated in reporters.values() {
-                        counts.add(*stated);
-                    }
-                    SamplingStatisticsEntry {
-                        rule_name: rule_name.clone(),
-                        window_start: *window_start,
-                        counts,
-                    }
-                })
-            })
-            .collect()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Service graphs
-// ---------------------------------------------------------------------------
-
-/// `Service$State` for a node that has at least one completed segment in the
-/// graph's window: the service answered.
-pub const SERVICE_STATE_ACTIVE: &str = "active";
-
-/// `Service$State` for a node whose every segment in the graph's window is still
-/// in progress: the service reported, but nothing is known yet about how it
-/// answered.
-pub const SERVICE_STATE_UNKNOWN: &str = "unknown";
-
-/// `Service$State` for a node the graph knows only through another service's
-/// downstream subsegment — a service that submitted no segment of its own, so
-/// X-Ray knows it passively, by being called.
-pub const SERVICE_STATE_PASSIVE: &str = "passive";
-
-/// `Service$Type` for the node that "represents the clients that sent requests
-/// to a root service".
-///
-/// The clients report no segment of their own, so the node carries the root
-/// service's name and the requests that service received.
-pub const SERVICE_TYPE_CLIENT: &str = "client";
-
-/// `Service$Type` for "a downstream service of indeterminate type", which is
-/// what a `remote`-namespace subsegment records.
-pub const SERVICE_TYPE_REMOTE: &str = "remote";
-
-/// The most inline subsegments one derivation walks, across every trace and
-/// segment it covers.
-///
-/// A trace holds at most [`MAX_SEGMENTS_PER_TRACE`] segments and a segment at
-/// most [`MAX_SUBSEGMENTS_PER_SEGMENT`] subsegments, so capping each factor
-/// still leaves their product to grow; this caps the product. Past it a graph
-/// reports the services its segments named, which is the whole topology a trace
-/// whose services are instrumented has.
-pub const MAX_GRAPH_SUBSEGMENT_VISITS: usize = 50_000;
-
-/// One recorded call, as a graph counts it: a segment the service reported, or
-/// a subsegment it recorded inside that segment. The two carry the same timing
-/// and the same outcome flags, so the accumulators below take this rather than
-/// one shape of document.
-#[derive(Debug, Clone, Copy)]
-struct Call {
-    start_time: f64,
-    end_time: Option<f64>,
-    error: bool,
-    fault: bool,
-    throttle: bool,
-}
-
-impl Call {
-    /// The call a stored segment records.
-    fn of_segment(segment: &SegmentRecord) -> Self {
-        Self {
-            start_time: segment.start_time,
-            end_time: segment.end_time,
-            error: segment.is_error(),
-            fault: segment.is_fault(),
-            throttle: segment.is_throttle(),
-        }
-    }
-
-    /// The call an inline subsegment records. A subsegment that carries no
-    /// `start_time` is timed from its segment, which is the only instant known
-    /// for it.
-    fn of_subsegment(subsegment: &SubsegmentRecord, segment: &SegmentRecord) -> Self {
-        Self {
-            start_time: subsegment.start_time.unwrap_or(segment.start_time),
-            end_time: subsegment.end_time,
-            error: subsegment.is_error(),
-            fault: subsegment.is_fault(),
-            throttle: subsegment.is_throttle(),
-        }
-    }
-
-    /// How long the call took, in seconds; `None` while it is in progress.
-    fn duration(&self) -> Option<f64> {
-        self.end_time.map(|end| end - self.start_time)
-    }
-
-    /// The latest instant this call is known to have reached.
-    fn latest(&self) -> f64 {
-        self.end_time.unwrap_or(self.start_time)
-    }
-}
-
-/// The time span a node or an edge covers, widened call by call.
-#[derive(Debug, Default)]
-struct Span {
-    start: Option<f64>,
-    end: Option<f64>,
-}
-
-impl Span {
-    /// Widen this span to include one call.
-    fn widen(&mut self, call: Call) {
-        self.start = Some(
-            self.start
-                .map_or(call.start_time, |start| start.min(call.start_time)),
-        );
-        self.end = Some(self.end.map_or(call.latest(), |end| end.max(call.latest())));
-    }
-
-    /// The span's start as a modelled timestamp.
-    fn start_time(&self) -> Option<::aws_smithy_types::DateTime> {
-        self.start.map(timestamp_of)
-    }
-
-    /// The span's end as a modelled timestamp.
-    fn end_time(&self) -> Option<::aws_smithy_types::DateTime> {
-        self.end.map(timestamp_of)
-    }
-}
 
 /// One stored instant as the modelled `Timestamp`.
 ///
@@ -6310,545 +4750,6 @@ pub fn timestamp_of(seconds: f64) -> ::aws_smithy_types::DateTime {
         seconds.clamp(-MAX_SEGMENT_EPOCH_SECONDS, MAX_SEGMENT_EPOCH_SECONDS)
     };
     ::aws_smithy_types::DateTime::from_secs_f64(bounded)
-}
-
-/// The counts `ServiceStatistics` and `EdgeStatistics` both carry, accumulated
-/// over the segments a node or an edge covers.
-#[derive(Debug, Default)]
-struct CallStatistics {
-    ok_count: i64,
-    throttle_count: i64,
-    error_other_count: i64,
-    fault_count: i64,
-    total_count: i64,
-    total_response_time: f64,
-}
-
-impl CallStatistics {
-    /// Count one call. A fault outranks an error (a 500-series answer is not
-    /// also a 400-series one), a throttled error is counted as a throttle rather
-    /// than as "other", and a call that recorded neither is OK — which is
-    /// exactly the exclusive [`Classification`] every other reader of this
-    /// state uses, read here rather than recomputed.
-    fn record(&mut self, call: Call) {
-        self.total_count += 1;
-        // The call's flags are the ones its document declared
-        // ([`Call::of_segment`] / [`Call::of_subsegment`] read them through
-        // `is_fault`/`is_throttle`/`is_error`), and a recorded status is not one
-        // of them, so nothing here consults it.
-        match classify(call.fault, call.error, call.throttle) {
-            Classification::Fault => self.fault_count += 1,
-            Classification::Throttle => self.throttle_count += 1,
-            Classification::Error => self.error_other_count += 1,
-            Classification::Ok => self.ok_count += 1,
-        }
-        self.total_response_time += call.duration().unwrap_or(0.0);
-    }
-
-    /// The 400-series counts.
-    fn error_statistics(&self) -> ErrorStatistics {
-        ErrorStatistics {
-            throttle_count: Some(self.throttle_count),
-            other_count: Some(self.error_other_count),
-            total_count: Some(self.throttle_count + self.error_other_count),
-        }
-    }
-
-    /// The 500-series counts.
-    fn fault_statistics(&self) -> FaultStatistics {
-        FaultStatistics {
-            other_count: Some(self.fault_count),
-            total_count: Some(self.fault_count),
-        }
-    }
-
-    /// These counts as a node's `SummaryStatistics`.
-    fn service_statistics(&self) -> ServiceStatistics {
-        ServiceStatistics {
-            ok_count: Some(self.ok_count),
-            error_statistics: Some(self.error_statistics()),
-            fault_statistics: Some(self.fault_statistics()),
-            total_count: Some(self.total_count),
-            total_response_time: Some(self.total_response_time),
-        }
-    }
-
-    /// These counts as an edge's `SummaryStatistics`.
-    fn edge_statistics(&self) -> EdgeStatistics {
-        EdgeStatistics {
-            ok_count: Some(self.ok_count),
-            error_statistics: Some(self.error_statistics()),
-            fault_statistics: Some(self.fault_statistics()),
-            total_count: Some(self.total_count),
-            total_response_time: Some(self.total_response_time),
-        }
-    }
-}
-
-/// One connection from a node to a downstream node, under construction.
-#[derive(Debug, Default)]
-struct EdgeAccumulator {
-    span: Span,
-    statistics: CallStatistics,
-    response_times: Vec<f64>,
-}
-
-impl EdgeAccumulator {
-    /// Count one downstream call on this edge.
-    fn record(&mut self, call: Call) {
-        self.span.widen(call);
-        self.statistics.record(call);
-        if let Some(duration) = call.duration() {
-            self.response_times.push(duration);
-        }
-    }
-
-    /// This edge as the modelled `Edge`, naming the downstream node by its
-    /// `ReferenceId`.
-    fn to_edge(&self, downstream: i32) -> Edge {
-        Edge {
-            reference_id: Some(downstream),
-            start_time: self.span.start_time(),
-            end_time: self.span.end_time(),
-            summary_statistics: Some(self.statistics.edge_statistics()),
-            response_time_histogram: histogram(&self.response_times),
-            aliases: None,
-            // `link` describes an asynchronous connection, which a stored
-            // segment document does not say it is; an edge derived from a
-            // parent/child pair is the synchronous default.
-            edge_type: None,
-            received_event_age_histogram: None,
-        }
-    }
-}
-
-/// What distinguishes one node of a service graph from another.
-///
-/// A node the stored segments REPORTED is the service of that `name`. Beside it
-/// a graph carries the node `Service$Type` documents as `client` — "represents
-/// the clients that sent requests to a root service" — which carries the root
-/// service's own name, so the name alone does not identify a node.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct NodeKey {
-    /// The canonical service name, which is what `Service$Name` reports.
-    name: String,
-    /// `Service$Type` for a node no segment reported — `client`, `remote`, or
-    /// `AWS::<Service>` — and `None` for one a segment did report, whose type is
-    /// that segment's `origin`.
-    inferred_type: Option<String>,
-}
-
-impl NodeKey {
-    /// The node of the service whose segments report `name`.
-    fn reported(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            inferred_type: None,
-        }
-    }
-
-    /// The `client` node of the root service called `name`.
-    fn client(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            inferred_type: Some(SERVICE_TYPE_CLIENT.to_string()),
-        }
-    }
-}
-
-/// The downstream node a SUBSEGMENT names, or `None` when it names none.
-///
-/// The X-Ray segment-document schema gives a subsegment a `namespace` only when
-/// the work left the process: `aws` for an AWS SDK call, `remote` for any other
-/// downstream call. `Service$Type` names the matching node types: `remote` is
-/// "a downstream service of indeterminate type", and `AWS::<Service>` is what
-/// "downstream calls to Amazon Web Services ... that didn't target a specific
-/// table" report. A subsegment with neither namespace recorded in-process work
-/// and so names no service at all.
-fn downstream_node(name: &str, namespace: Option<&str>) -> Option<NodeKey> {
-    let inferred_type = inferred_service_type(name, namespace)?;
-    Some(NodeKey {
-        name: name.to_string(),
-        inferred_type: Some(inferred_type),
-    })
-}
-
-/// One node of a service graph, under construction.
-#[derive(Debug, Default)]
-struct NodeAccumulator {
-    account_id: Option<String>,
-    service_type: Option<String>,
-    root: bool,
-    complete: bool,
-    span: Span,
-    statistics: CallStatistics,
-    durations: Vec<f64>,
-    response_times: Vec<f64>,
-    /// Downstream node -> the edge that reaches it.
-    edges: BTreeMap<NodeKey, EdgeAccumulator>,
-}
-
-impl NodeAccumulator {
-    /// Fold one request this node's service RECEIVED into it, without claiming
-    /// the request's own identity: what an INFERRED node — a `client`, or a
-    /// downstream service a subsegment named — knows about a call is its timing
-    /// and its outcome, because it reported no segment of its own.
-    fn record_call(&mut self, call: Call) {
-        self.span.widen(call);
-        self.statistics.record(call);
-        if let Some(duration) = call.duration() {
-            self.durations.push(duration);
-            self.response_times.push(duration);
-        }
-    }
-
-    /// Fold one of this service's segments into the node.
-    fn record(&mut self, segment: &SegmentRecord) {
-        let call = Call::of_segment(segment);
-        self.span.widen(call);
-        self.statistics.record(call);
-        if segment.parent_id.is_none() {
-            // "Indicates that the service was the first service to process a
-            // request" — a segment with no parent is the entry point of its
-            // trace.
-            self.root = true;
-        }
-        if let Some(duration) = segment.duration() {
-            self.complete = true;
-            self.durations.push(duration);
-            if segment.parent_id.is_none() {
-                self.response_times.push(duration);
-            }
-        }
-        if self.service_type.is_none() {
-            self.service_type = segment.origin.clone();
-        }
-        if self.account_id.is_none() {
-            self.account_id = segment.account_id.clone();
-        }
-    }
-
-    /// This node as the modelled `Service`.
-    fn to_service(&self, key: &NodeKey, reference_ids: &BTreeMap<NodeKey, i32>) -> Service {
-        Service {
-            reference_id: reference_ids.get(key).copied(),
-            name: Some(key.name.clone()),
-            names: Some(vec![key.name.clone()]),
-            root: Some(self.root),
-            account_id: self.account_id.clone(),
-            // An inferred node's type is what makes it that node; a reported
-            // one's is the `origin` its segments carried.
-            r#type: key
-                .inferred_type
-                .clone()
-                .or_else(|| self.service_type.clone()),
-            state: Some(
-                // A node the graph DISCOVERED downstream reported no segment of
-                // its own: it is known passively, by having been called, which
-                // is what distinguishes it from a service that reports. A node
-                // whose own segments are all still in progress has reported
-                // nothing to judge yet, and the `client` node is the stand-in
-                // for the callers of a root service rather than a service the
-                // graph discovered, so neither is passive.
-                match key.inferred_type.as_deref() {
-                    Some(SERVICE_TYPE_CLIENT) | None if self.complete => SERVICE_STATE_ACTIVE,
-                    Some(SERVICE_TYPE_CLIENT) | None => SERVICE_STATE_UNKNOWN,
-                    Some(_) => SERVICE_STATE_PASSIVE,
-                }
-                .to_string(),
-            ),
-            start_time: self.span.start_time(),
-            end_time: self.span.end_time(),
-            edges: Some(
-                self.edges
-                    .iter()
-                    .filter_map(|(downstream, edge)| {
-                        Some(edge.to_edge(reference_ids.get(downstream).copied()?))
-                    })
-                    .collect(),
-            ),
-            summary_statistics: Some(self.statistics.service_statistics()),
-            duration_histogram: histogram(&self.durations),
-            response_time_histogram: histogram(&self.response_times),
-        }
-    }
-}
-
-/// The spread of `values` as the modelled `Histogram`: one entry per distinct
-/// millisecond-rounded value with how many samples landed on it, ascending, at
-/// most [`MAX_HISTOGRAM_ENTRIES`] of them. `None` when nothing was sampled.
-fn histogram(values: &[f64]) -> Option<Vec<HistogramEntry>> {
-    if values.is_empty() {
-        return None;
-    }
-    let mut buckets: BTreeMap<i64, i32> = BTreeMap::new();
-    for value in values {
-        #[allow(clippy::cast_possible_truncation)]
-        let millis = (value * 1_000.0).round() as i64;
-        *buckets.entry(millis).or_default() += 1;
-    }
-    Some(
-        buckets
-            .into_iter()
-            .take(MAX_HISTOGRAM_ENTRIES)
-            .map(|(millis, count)| {
-                #[allow(clippy::cast_precision_loss)]
-                let value = millis as f64 / 1_000.0;
-                HistogramEntry { value, count }
-            })
-            .collect(),
-    )
-}
-
-/// Derive the `Service` list a service graph reports from stored traces.
-///
-/// This is the one derivation behind both graph readers — `GetServiceGraph` over
-/// a time window and `GetTraceGraph` over named traces — so the two can never
-/// describe the same stored segments differently.
-///
-/// A node is one distinct segment `name` (the canonical name of the service that
-/// handled the request), plus the `client` node `Service$Type` documents for
-/// every root service — "represents the clients that sent requests to a root
-/// service" — which carries that service's own name and one edge into it, plus
-/// one node per SUBSEGMENT whose `namespace` says the call left the process
-/// (`remote`, "a downstream service of indeterminate type", or `aws` for an AWS
-/// service). A subsegment reports no service of its own otherwise: one with no
-/// such namespace records in-process work, so it adds neither a node nor an
-/// edge, and the work it did is already counted on the service that recorded it.
-///
-/// An edge is a stored `parent_id` link between two segments of DIFFERENT
-/// services, counted on the upstream node and naming the downstream one by
-/// `ReferenceId`; a `parent_id` that names a subsegment resolves to the service
-/// that reported it. Every count, time and histogram comes from the stored
-/// segment documents; nothing is echoed from the request.
-///
-/// `window` selects which segments take part: `Some((start, end))` keeps the
-/// segments whose `start_time` falls in the half-open interval [start, end) —
-/// the same selection `GetTraceSummaries` makes — and `None` keeps every segment
-/// of every trace handed in, which is what a per-trace graph is.
-pub fn service_graph<'a>(
-    traces: impl IntoIterator<Item = &'a TraceRecord>,
-    window: Option<(f64, f64)>,
-) -> Vec<Service> {
-    let selects = |segment: &SegmentRecord| match window {
-        Some((start, end)) => segment.start_time >= start && segment.start_time < end,
-        None => true,
-    };
-
-    let mut nodes: BTreeMap<NodeKey, NodeAccumulator> = BTreeMap::new();
-    // Inline subsegments are walked under one budget across the whole
-    // derivation, so a graph over many traces of many segments, each carrying
-    // many subsegments, cannot multiply into unbounded work: past the budget a
-    // graph reports the services its SEGMENTS named.
-    let mut subsegment_budget = MAX_GRAPH_SUBSEGMENT_VISITS;
-    for trace in traces {
-        for segment in &trace.segments {
-            // An inferred segment is not one a service REPORTED: it is this
-            // service's own projection of a remote subsegment
-            // ([`inferred_segments`]), and the downstream node that subsegment
-            // names is derived from the subsegment itself below — so counting
-            // the projection too would report one downstream call as two nodes.
-            if !selects(segment) || segment.is_subsegment() || segment.inferred {
-                continue;
-            }
-            let call = Call::of_segment(segment);
-            nodes
-                .entry(NodeKey::reported(&segment.name))
-                .or_default()
-                .record(segment);
-            if segment.parent_id.is_none() {
-                // The entry point of a trace was reached by a client the stored
-                // data names nowhere, which is exactly the node the model
-                // documents as `client`: it carries the root service's name,
-                // reports the requests it sent, and reaches that service by one
-                // edge.
-                let client = nodes.entry(NodeKey::client(&segment.name)).or_default();
-                client.record_call(call);
-                client
-                    .edges
-                    .entry(NodeKey::reported(&segment.name))
-                    .or_default()
-                    .record(call);
-            }
-            // The downstream services this segment's subsegments named: each is
-            // one inferred node, reached by one edge from this service.
-            let mut pending: Vec<&SubsegmentRecord> = segment.subsegments.iter().rev().collect();
-            while let Some(subsegment) = pending.pop() {
-                if subsegment_budget == 0 {
-                    break;
-                }
-                subsegment_budget -= 1;
-                pending.extend(subsegment.subsegments.iter().rev());
-                let Some(downstream) = downstream_node(&subsegment.name, subsegment.namespace.as_deref())
-                else {
-                    continue;
-                };
-                if downstream == NodeKey::reported(&segment.name) {
-                    continue;
-                }
-                let subsegment_call = Call::of_subsegment(subsegment, segment);
-                nodes
-                    .entry(NodeKey::reported(&segment.name))
-                    .or_default()
-                    .edges
-                    .entry(downstream.clone())
-                    .or_default()
-                    .record(subsegment_call);
-                nodes
-                    .entry(downstream)
-                    .or_default()
-                    .record_call(subsegment_call);
-            }
-        }
-        // Edges need both ends, so they are walked once this trace's nodes are
-        // known: a segment whose `parent_id` names nothing stored, or whose
-        // parent is outside the window, is on no edge. Which service reported
-        // each stored id is resolved ONCE for the whole trace, so this pass is
-        // linear in the trace's segments however long a chain of subsegment
-        // documents is.
-        let reporting = reporting_segments(trace);
-        for segment in &trace.segments {
-            if !selects(segment) || segment.inferred {
-                continue;
-            }
-            // The service that recorded this segment's parent: a `parent_id`
-            // naming a subsegment belongs to the service that reported it.
-            let Some(parent) = segment
-                .parent_id
-                .as_deref()
-                .and_then(|parent_id| reporting.get(parent_id).copied())
-            else {
-                continue;
-            };
-            if !selects(parent) {
-                continue;
-            }
-            let Some(upstream) = nodes.get_mut(&NodeKey::reported(&parent.name)) else {
-                continue;
-            };
-            // A subsegment names a downstream service only through its
-            // `namespace`; a segment names the service that handled it.
-            let downstream = if segment.is_subsegment() {
-                match downstream_node(&segment.name, segment.namespace.as_deref()) {
-                    Some(key) => key,
-                    None => continue,
-                }
-            } else {
-                NodeKey::reported(&segment.name)
-            };
-            if downstream == NodeKey::reported(&parent.name) {
-                continue;
-            }
-            let call = Call::of_segment(segment);
-            upstream.edges.entry(downstream.clone()).or_default().record(call);
-            // A downstream service a subsegment named reported nothing itself,
-            // so the call is what the node knows about it.
-            if segment.is_subsegment() {
-                nodes.entry(downstream).or_default().record_call(call);
-            }
-        }
-    }
-
-    // "Identifier for the service. Unique within the service map": assigned over
-    // the nodes in key order — name, then the inferred type that distinguishes a
-    // `client` node from the service it calls — so one stored graph always
-    // answers with the same ids, across pages of one walk and across calls.
-    let reference_ids: BTreeMap<NodeKey, i32> = nodes
-        .keys()
-        .enumerate()
-        .map(|(at, key)| (key.clone(), i32::try_from(at).unwrap_or(i32::MAX)))
-        .collect();
-
-    nodes
-        .iter()
-        .map(|(key, node)| node.to_service(key, &reference_ids))
-        .collect()
-}
-
-/// Every stored id of one trace mapped to the segment that REPORTED the service
-/// it belongs to.
-///
-/// A `type: "subsegment"` document records work inside its parent's service, so
-/// it belongs to whichever segment its `parent_id` chain reaches. Resolving that
-/// by walking the chain per segment would be quadratic in the trace's segments,
-/// so the map is built ONCE: the segments a service reported seed it, and the
-/// subsegment documents are attached by walking OUT from the ids already
-/// resolved, which visits each document at most twice and ends by itself on a
-/// chain that names itself (each parent's children are consumed once).
-fn reporting_segments(trace: &TraceRecord) -> BTreeMap<&str, &SegmentRecord> {
-    let mut reporting: BTreeMap<&str, &SegmentRecord> = BTreeMap::new();
-    let mut attached: BTreeMap<&str, Vec<&SegmentRecord>> = BTreeMap::new();
-    for segment in &trace.segments {
-        if segment.is_subsegment() {
-            if let Some(parent) = segment.parent_id.as_deref() {
-                attached.entry(parent).or_default().push(segment);
-            }
-        } else {
-            reporting.insert(segment.id.as_str(), segment);
-        }
-    }
-    let mut frontier: Vec<&str> = reporting.keys().copied().collect();
-    while let Some(id) = frontier.pop() {
-        let Some(children) = attached.remove(id) else {
-            continue;
-        };
-        let Some(owner) = reporting.get(id).copied() else {
-            continue;
-        };
-        for child in children {
-            reporting.insert(child.id.as_str(), owner);
-            frontier.push(child.id.as_str());
-        }
-    }
-    reporting
-}
-
-/// One page of a service graph: the `Service` values to answer with, and the
-/// `NextToken` that resumes after them when the graph was truncated.
-///
-/// Lives beside [`service_graph`] so the two graph readers cannot drift in their
-/// pagination contract.
-#[derive(Debug, Clone)]
-pub struct ServiceGraphPage {
-    /// The page's services, at most `page_size` of them.
-    pub services: Vec<Service>,
-    /// The token that resumes after this page, or `None` when it is the last.
-    pub next_token: Option<String>,
-}
-
-/// Cut one page out of a WHOLE derived graph, resuming at `resume`.
-///
-/// The page is cut after the graph is derived, so every page of one walk reports
-/// the same `ReferenceId` for the same service and an edge's `ReferenceId` names
-/// a node whichever page that node lands on. The token is the `ReferenceId` the
-/// next page starts at, which is what identifies a node: a `client` node carries
-/// the same `Name` as the root service it calls, so a name would not. `Err` is
-/// the one refusal this makes possible: a token that is not a `ReferenceId` of
-/// this graph, which is a token this service never issued.
-pub fn page_service_graph(
-    services: &[Service],
-    resume: Option<&str>,
-    page_size: usize,
-) -> Result<ServiceGraphPage, String> {
-    let unissued = |token: &str| format!("NextToken `{token}` was not issued by this service");
-    let from = match resume {
-        Some(token) => {
-            let reference: i32 = token.parse().map_err(|_| unissued(token))?;
-            services
-                .iter()
-                .position(|service| service.reference_id.is_some_and(|id| id >= reference))
-                .ok_or_else(|| unissued(token))?
-        }
-        None => 0,
-    };
-    let remaining = &services[from..];
-    Ok(ServiceGraphPage {
-        services: remaining.iter().take(page_size).cloned().collect(),
-        next_token: remaining
-            .get(page_size)
-            .and_then(|service| service.reference_id)
-            .map(|reference| reference.to_string()),
-    })
 }
 
 /// The region this request's SigV4 credential scope names, else [`DEFAULT_REGION`].

@@ -210,16 +210,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // `Period` is "aggregation period in seconds", so a period of zero or
-        // fewer seconds describes no period at all. The model declares no
-        // default, so an omitted one falls back to [`DEFAULT_PERIOD_SECONDS`].
+        // `Period` is "aggregation period in seconds", and WHICH periods this
+        // read aggregates over is the service's own set rather than a modelled
+        // range ([`crate::state::SERVED_PERIOD_SECONDS`]): a period outside it is
+        // refused naming the set that is served, instead of being answered with
+        // a series at a granularity nothing aggregates. The model declares no
+        // default, so an omitted one falls back to [`DEFAULT_PERIOD_SECONDS`],
+        // which is one of the served periods.
         let period = match input.period {
             None => DEFAULT_PERIOD_SECONDS,
-            Some(seconds) if seconds > 0 => i64::from(seconds),
             Some(seconds) => {
-                return Err(unsupported(format!(
-                    "Period must be a positive number of seconds, not {seconds}"
-                )))
+                crate::state::validate_period(seconds).map_err(unsupported)?;
+                i64::from(seconds)
             }
         };
 
@@ -375,7 +377,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The aggregation period an omitted `Period` means, in seconds.
 ///
 /// The model documents `Period` only as "Aggregation period in seconds" and
-/// publishes no default, so this one-minute period is this emulator's.
+/// publishes no default, so this one-minute period is this emulator's; it is the
+/// shorter of the two periods the read serves
+/// ([`crate::state::SERVED_PERIOD_SECONDS`]).
 pub const DEFAULT_PERIOD_SECONDS: i64 = 60;
 
 /// How many `TimeSeriesServiceStatistics` entries one page carries.

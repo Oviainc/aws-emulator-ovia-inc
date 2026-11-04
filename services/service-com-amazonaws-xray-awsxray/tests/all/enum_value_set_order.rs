@@ -3,14 +3,16 @@
 //! The ORDER a refusal lists an enumerated type's admitted values in.
 //!
 //! The rule asserted here: a value outside a modelled enum is refused in AWS's
-//! validation envelope whose requirement clause states the admitted set SORTED,
-//! which is a property of the enumerated TYPE rather than of the member, the
-//! operation or the request that carried the value — so every member targeting
-//! one enum reports the same bracketed list, in the same order, whatever request
-//! carried it, and whatever order the model happens to declare its members in.
-//! The envelope, the echoed value, the lowerCamel member path and the
-//! requirement's wording are the framework's; only the order inside the brackets
-//! is this service's.
+//! validation envelope whose requirement clause states the admitted set in the
+//! order THIS SERVICE states that set in, which is a property of the enumerated
+//! TYPE rather than of the member, the operation or the request that carried the
+//! value — so every member targeting one enum reports the same bracketed list,
+//! in the same order, whatever request carried it, and whatever order the model
+//! happens to declare its members in. The service states most of its types
+//! sorted, and the ones its own refusals are recorded stating otherwise in that
+//! recorded order. The envelope, the echoed value, the lowerCamel member path
+//! and the requirement's wording are the framework's; only the order inside the
+//! brackets is this service's.
 //!
 //! The rows differ along what the rule generalises over: which enumerated type
 //! the value belongs to (five of this model's, each declared in an order that is
@@ -18,14 +20,17 @@
 //! (a top-level member, a member nested inside a structure), the value refused (a
 //! name no enum carries, an admitted value in the wrong case, the empty string),
 //! and the order the model declares the type in relative to the one the refusal
-//! states. A second test holds ONE type's set to the order the service states it
-//! in over every spelling of a refused value a caller can send, with the set read
-//! off the service's own message rather than compared against a literal.
+//! states — including the one type this service states in neither its declared
+//! nor its sorted order. A second test holds ONE type's set to the order the
+//! service states it in over every spelling of a refused value a caller can
+//! send, with the set read off the service's own message rather than compared
+//! against a literal.
 //!
-//! Each value set below is read off the model, not off the service — the comment
-//! on each constant names the `smithy_query` that gives the declaration order —
-//! so the test pins the order rather than restating whatever the service
-//! produced.
+//! Each value set below names where its order comes from — the `smithy_query`
+//! that gives the model's declaration order, and for the one type stated in
+//! neither that nor the sorted order, the order this service's own refusals
+//! state it in — so the test pins the order rather than restating whatever the
+//! service produced.
 
 use serde_json::{json, Value};
 
@@ -48,8 +53,10 @@ const ENCRYPTION_TYPE_SET: &str = "[KMS, NONE]";
 /// `com.amazonaws.xray#TraceSegmentDestination`, declared `XRay, CloudWatchLogs`.
 const TRACE_SEGMENT_DESTINATION_SET: &str = "[CloudWatchLogs, XRay]";
 
-/// `com.amazonaws.xray#TimeRangeType`, declared `TraceId, Event, Service`.
-const TIME_RANGE_TYPE_SET: &str = "[Event, Service, TraceId]";
+/// `com.amazonaws.xray#TimeRangeType`, declared `TraceId, Event, Service`
+/// (`smithy_query(query="shape",shape="TimeRangeType")`) and stated by this
+/// service's own refusals in neither that order nor the sorted one.
+const TIME_RANGE_TYPE_SET: &str = "[TraceId, Service, Event]";
 
 /// `com.amazonaws.xray#SamplingStrategyName`, declared `PartialScan, FixedRate`.
 const SAMPLING_STRATEGY_NAME_SET: &str = "[FixedRate, PartialScan]";
@@ -200,9 +207,10 @@ async fn the_stated_order_is_the_enums_own_whatever_request_carries_it() {
              spelled, got {stated:?}"
         );
         // And the values the service listed are in sorted order — which for this
-        // type is NOT the order the model declares them in (`NONE, KMS`), so a
-        // client reading the admitted values off the message sees one stable order
-        // whatever a model revision happens to list first.
+        // type is NOT the order the model declares them in (`NONE, KMS`), and is
+        // the order this service's own refusals state it in, so a client reading
+        // the admitted values off the message sees one stable order whatever a
+        // model revision happens to list first.
         let listed = values_of(&stated);
         let mut sorted = listed.clone();
         sorted.sort_unstable();

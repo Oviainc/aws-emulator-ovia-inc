@@ -197,8 +197,11 @@ fn window_cases() -> Vec<WindowCase> {
             accepted: true,
         },
         WindowCase {
+            // Kept a minute wide, so the row is about where the window ENDS and
+            // not about how wide it is: each reader also publishes the widest
+            // window it serves, which is a different rule and a different row.
             case: "a window ending just inside the clock-skew allowance",
-            start: now - 60.0,
+            start: now + MAX_WINDOW_FUTURE_SKEW_SECONDS - 120.0,
             end: now + MAX_WINDOW_FUTURE_SKEW_SECONDS - 60.0,
             accepted: true,
         },

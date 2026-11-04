@@ -10,10 +10,21 @@
 //! counts the traces the REQUESTED WINDOW holds — the ones this query took
 //! through the filter, matching or not — so it stays consistent with the
 //! summaries served for that window, is the same on every page of one query,
-//! and reports none for a window holding nothing. A request asking for
-//! behaviour this slice does not implement — sampling —
-//! is REFUSED with `InvalidRequestException` naming what is unsupported, rather
-//! than answered with an unfiltered 200, and so is an inverted time range.
+//! and reports none for a window holding nothing. A query may also scope itself
+//! to a stored GROUP, which is resolved against the stored groups before the
+//! expression is parsed ([`crate::state::group_scope`]) and narrows the query by
+//! the expression that group carries, and it may ask for "only a subset of
+//! available traces", which takes a deterministic sample of what the window, the
+//! group and the expression selected, at the rate the request states.
+//!
+//! A request outside what this read serves is REFUSED with
+//! `InvalidRequestException` rather than answered over part of it: an inverted
+//! time range, a window wider than the longest one this read serves
+//! ([`crate::state::MAX_TRACE_SUMMARIES_WINDOW_HOURS`]) or ending further ahead
+//! of the clock than it reaches
+//! ([`crate::state::MAX_TRACE_SUMMARIES_FUTURE_MINUTES`]), a sampling strategy
+//! named beside a time-range type that does not admit one, and a sampled query
+//! stating no usable rate.
 //!
 //! ## Shape of an operation
 //!
@@ -176,7 +187,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetTraceSummariesErrorModeled::ThrottledException(ThrottledException {
                 message: Some(
@@ -202,6 +212,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_request(window.message(start, end)));
         }
 
+        // How WIDE a window this read serves is the read's own published bound
+        // ([`crate::state::MAX_TRACE_SUMMARIES_WINDOW_HOURS`]), and a request for
+        // a wider one is refused rather than answered over part of it: a client
+        // that has to cut a long range into slices learns the bound from the
+        // refusal, which it cannot do from a 200 over a window the service would
+        // never serve. Checked before any projection work, because nothing about
+        // the stored traces changes the answer.
+        if let Err(window) = crate::state::validate_window_span(
+            start,
+            end,
+            crate::state::MAX_TRACE_SUMMARIES_WINDOW_HOURS,
+        ) {
+            return Err(invalid_request(window));
+        }
+
+        // And how far AHEAD of the clock the window may reach: a window may end
+        // a little past now — a client's clock runs slightly ahead, and a
+        // dashboard asks for "up to now" — but a bound further ahead than the
+        // allowance this read publishes
+        // ([`crate::state::MAX_TRACE_SUMMARIES_FUTURE_MINUTES`]) names a time no
+        // recorded trace can carry.
+        if let Err(window) = crate::state::validate_window_end_ahead(
+            end,
+            crate::state::now_epoch_seconds(),
+            crate::state::MAX_TRACE_SUMMARIES_FUTURE_MINUTES,
+        ) {
+            return Err(invalid_request(window));
+        }
+
         // Which instant the window is applied to is the request's to choose:
         // `TimeRangeType` selects "TraceId (trace start time), Event (trace
         // update time), or Service (trace segment end time)", so the member
@@ -225,11 +264,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )))
             }
         };
-        if input.sampling == Some(true) || input.sampling_strategy.is_some() {
-            return Err(invalid_request(
-                "sampling is not supported by this emulator yet; omit Sampling and SamplingStrategy to select every matching trace",
-            ));
+        // A `SamplingStrategy` asks for summaries "for only a subset of
+        // available traces", and X-Ray serves a strategy only where the window
+        // is applied to each trace's UPDATE time: the strategy picks its subset
+        // as traces are updated, so a strategy named beside any other
+        // `TimeRangeType` is refused naming the range type the request asks for
+        // and the one that admits a strategy. Decided from the request alone,
+        // before anything about the store is read.
+        if let Some(name) = input
+            .sampling_strategy
+            .as_ref()
+            .and_then(|strategy| strategy.name.as_deref())
+            .filter(|_| range != TIME_RANGE_TYPE_EVENT)
+        {
+            return Err(invalid_request(format!(
+                "Cannot use {name} with input time range type: {range}. Please try using time \
+                 range type: {TIME_RANGE_TYPE_EVENT}"
+            )));
         }
+        // The RATE a sampled query selects at. A `SamplingStrategy` STATES that
+        // rate in its `Value`, and a strategy stating none — or one outside the
+        // closed unit interval — names no subset at all, so it is refused in the
+        // one sentence that says what a rate has to be. `Sampling` on its own
+        // asks for "summaries for only a subset of available traces" without
+        // naming a strategy to draw that subset by, so the read draws it at its
+        // own rate ([`SAMPLED_QUERY_DEFAULT_RATE`]). `None` is a query over every
+        // matching trace, which is what an unsampled query is.
+        let sampled_at_rate = match (input.sampling, input.sampling_strategy.as_ref()) {
+            (_, Some(strategy)) => Some(
+                strategy
+                    .value
+                    .filter(|rate| (SAMPLING_RATE_MIN..=SAMPLING_RATE_MAX).contains(rate))
+                    .ok_or_else(|| invalid_request(SAMPLING_RATE_MESSAGE))?,
+            ),
+            (Some(true), None) => Some(SAMPLED_QUERY_DEFAULT_RATE),
+            _ => None,
+        };
 
         // The filter expression selects a subset of the traces in the window, so
         // it is parsed here — by the one parser every surface reads this
@@ -240,14 +310,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an absent or blank one selects every trace in the window. The
         // expression is parsed AS SUBMITTED, so the place a refusal names is an
         // offset into what the caller sent.
-        let filter = match input.filter_expression.as_deref() {
-            None => None,
-            Some(source) if source.trim().is_empty() => None,
-            Some(source) => Some(
-                crate::state::filter::parse(source)
-                    .map_err(|error| invalid_request(error.message))?,
-            ),
-        };
+        //
+        // What the query carries BESIDE that expression is the group it is
+        // scoped to, which is a stored resource rather than a field a trace has
+        // a value for: it is split out and resolved against the stored groups
+        // first ([`crate::state::group_scope`]), through the crate's ONE group
+        // resolution, so a group that does not exist is refused as the unknown
+        // group it is instead of being reported as a mistake in the expression,
+        // and a group that DOES exist narrows the query by the expression it
+        // carries. Each resolved group and what is left of the expression are
+        // evaluated as one conjunction below, so a query scoped to a group
+        // selects the traces that group selects and nothing else.
+        let scoped = input
+            .filter_expression
+            .as_deref()
+            .map(crate::state::group_scope::split)
+            .unwrap_or_default();
+        let mut filters: Vec<crate::state::filter::FilterExpression> = Vec::new();
+        {
+            let store = state.lock();
+            let region = crate::state::request_region(ctx.parts());
+            for group in &scoped.groups {
+                if let Some(filter) = store
+                    .group_filter(&region, group.group_name(), group.group_arn())
+                    .map_err(invalid_request)?
+                {
+                    filters.push(filter);
+                }
+            }
+        }
+        if let Some(source) = scoped.filter_expression.as_deref() {
+            if !source.trim().is_empty() {
+                filters.push(
+                    crate::state::filter::parse(source)
+                        .map_err(|error| invalid_request(error.message))?,
+                );
+            }
+        }
 
         let resume = input.next_token.as_deref();
 
@@ -322,6 +421,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is for a paginator resuming after an eviction.
         let mut budget = crate::state::filter::QueryBudget::new();
         let mut selected: Vec<TraceSummary> = Vec::new();
+        // The earliest windowed instant the page carries, which is what
+        // `ApproximateTime` reports ("the start time of this page of results").
+        let mut page_start: Option<f64> = None;
         let mut next_token = None;
         for (position, trace_id) in candidates.iter().enumerate() {
             // Checked FIRST, and before the non-match path can `continue` past
@@ -341,16 +443,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(trace) = store.traces.get(trace_id) else {
                     continue;
                 };
-                if let Some(filter) = &filter {
-                    if !filter.matches(trace, &mut budget) {
-                        continue;
-                    }
+                if !filters
+                    .iter()
+                    .all(|filter| filter.matches(trace, &mut budget))
+                {
+                    continue;
+                }
+                // A sampled query takes a subset of what the window and the
+                // expression selected, so the sample is drawn LAST — over the
+                // traces that matched, which is what "summaries for only a
+                // subset of available traces" is a subset of.
+                if sampled_at_rate.is_some_and(|rate| !sampled(&trace.id, rate)) {
+                    continue;
                 }
                 if selected.len() == TRACE_SUMMARIES_PAGE_SIZE {
                     // One past the page: the token names where the next page
                     // starts, and nothing after it needs evaluating.
                     next_token = Some(trace.id.clone());
                 } else {
+                    let instant = window_instant(trace);
+                    page_start = Some(page_start.map_or(instant, |earliest: f64| earliest.min(instant)));
                     selected.push(summary_of(trace));
                 }
             }
@@ -367,7 +479,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetTraceSummariesOutput {
             trace_summaries: Some(selected),
-            approximate_time: Some(now()),
+            // "The start time of this page of results": the earliest instant
+            // this page's own summaries were windowed on, and the start of the
+            // REQUESTED window for a page that carries none — a query that
+            // matched nothing is an accepted query over that window, so the
+            // instant it reports is inside it. Never the clock: when this
+            // response was built is not a time any result was recorded at, and
+            // for a window in the past it is not even inside the window asked
+            // about.
+            approximate_time: Some(crate::state::timestamp_of(page_start.unwrap_or(start))),
             traces_processed_count: Some(traces_processed),
             next_token,
         })
@@ -398,6 +518,62 @@ pub const TIME_RANGE_TYPE_EVENT: &str = "Event";
 /// the traces that FINISHED inside the window.
 pub const TIME_RANGE_TYPE_SERVICE: &str = "Service";
 
+/// The least a sampling rate may be: a rate of none selects no trace.
+pub const SAMPLING_RATE_MIN: f64 = 0.0;
+
+/// The most a sampling rate may be: a rate of one selects every matching trace.
+pub const SAMPLING_RATE_MAX: f64 = 1.0;
+
+/// What a sampled query that states no usable rate is refused with: fixed text
+/// naming what a rate has to be, and nothing from the request.
+///
+/// `SamplingStrategy$Value` carries no modelled range
+/// (`smithy_query(query="shape",shape="SamplingStrategy")`), so the interval is
+/// the service's own, and the sentence states it as the closed interval it is.
+pub const SAMPLING_RATE_MESSAGE: &str =
+    "sampling rate must be specified and its value must be between [0, 1]";
+
+/// The rate a query that asks for a sampled subset without naming a strategy
+/// draws it at.
+///
+/// CHOSEN: `Sampling` is documented only as "set to true to get summaries for
+/// only a subset of available traces" and names no rate, and no rate is
+/// published for it — so the read draws a tenth of the matching traces, which is
+/// a subset as the member asks for and the same subset on every read
+/// ([`sampled`]). A request that cares which fraction it gets states it, through
+/// a `SamplingStrategy`.
+pub const SAMPLED_QUERY_DEFAULT_RATE: f64 = 0.1;
+
+/// Whether the trace `trace_id` falls in the subset a query sampled at `rate`
+/// selects.
+///
+/// The subset is a deterministic function of the TRACE's own id and the rate:
+/// two reads of one store at one rate answer the same subset, no clock and no
+/// random source enters the selection, and the share of ids admitted is `rate`
+/// because the mixing spreads an id uniformly over the unit interval. It is the
+/// same deterministic mixing every derived id of this crate uses.
+fn sampled(trace_id: &str, rate: f64) -> bool {
+    if rate >= SAMPLING_RATE_MAX {
+        return true;
+    }
+    if rate <= SAMPLING_RATE_MIN {
+        return false;
+    }
+    let mixed = ::service_common::stable_hex_id(&["trace-sample", trace_id]);
+    let Some(bucket) = mixed
+        .get(..SAMPLE_HEX_DIGITS)
+        .and_then(|digits| u32::from_str_radix(digits, 16).ok())
+    else {
+        return false;
+    };
+    f64::from(bucket) / f64::from(u32::MAX) < rate
+}
+
+/// How many hexadecimal digits of a trace's mixed id place it in the unit
+/// interval: 32 bits, which divides the interval finely enough that the share
+/// admitted follows the requested rate.
+const SAMPLE_HEX_DIGITS: usize = 8;
+
 /// Refuse a request this operation cannot serve as asked — an inverted time
 /// range, an unreadable filter expression, a token this service never issued, or
 /// behaviour this slice does not implement — with the error it models for an
@@ -423,11 +599,6 @@ fn budget_spent() -> GetTraceSummariesError {
         message: Some(crate::state::FILTER_BUDGET_SPENT_MESSAGE.to_string()),
     })
     .into()
-}
-
-/// `ApproximateTime`: when this response was built, off the crate's one clock.
-fn now() -> ::aws_smithy_types::DateTime {
-    ::aws_smithy_types::DateTime::from_secs_f64(crate::state::now_epoch_seconds())
 }
 
 /// Build one `TraceSummary` from a stored trace's segments.

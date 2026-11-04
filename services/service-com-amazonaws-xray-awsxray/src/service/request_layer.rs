@@ -8,12 +8,15 @@
 //!
 //! * a value the codec cannot read into the modelled type of the member it is
 //!   bound to — a JSON string where the model declares an `integer`, an object
-//!   where it declares a `list` — never becomes a value at all. AWS answers that
+//!   where it declares a `list`, or a value bound to a TIME member that no
+//!   instant can be read from — never becomes a value at all. AWS answers that
 //!   at the deserialization layer with the protocol-level
 //!   [`SERIALIZATION_EXCEPTION`] (HTTP 400), whose message states the two facts
-//!   the caller has to reconcile: the CLASS of JSON value it sent and the
-//!   modelled type that value could not become ("STRING_VALUE can not be
-//!   converted to an Integer");
+//!   the caller has to reconcile: the CLASS of JSON value it sent and what that
+//!   value could not become — the modelled type ("STRING_VALUE can not be
+//!   converted to an Integer"), or, for a time member, the FORM the protocol
+//!   reads an instant in ("STRING_VALUE can not be converted to milliseconds
+//!   since epoch");
 //! * a value that WAS read and then failed a rule the model declares (an absent
 //!   `@required` member, a `@length`/`@range`/`@pattern`/enum violation) is a
 //!   constraint refusal, which AWS answers with `ValidationException`.
@@ -93,6 +96,9 @@ pub enum PreDispatchRefusal {
     /// A value whose JSON type the modelled member it is bound to cannot be read
     /// from, described by [`coercion_message`].
     Unreadable(String),
+    /// A value bound to a TIMESTAMP member that the codec read and could not
+    /// convert to an instant at all, described by [`unconvertible_time_message`].
+    UnconvertibleTime(String),
     /// Every value of the request the model's own constraints refuse, each with
     /// its clause's value echo restored to the bytes the caller submitted.
     Invalid(Vec<Violation>),
@@ -170,6 +176,110 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for UnreadableBody<Eng> {
 /// restJson1 resolves an error shape from.
 fn serialization_exception(message: &str) -> RtResponse {
     let body = serde_json::json!({ "__type": SERIALIZATION_EXCEPTION, "message": message });
+    let mut response = RtResponse::new(
+        StatusCode::try_from(SERIALIZATION_EXCEPTION_STATUS)
+            .expect("the status is a constant of this module"),
+        SdkBody::from(body.to_string()),
+    );
+    response
+        .headers_mut()
+        .insert("content-type", JSON_CONTENT_TYPE);
+    response
+        .headers_mut()
+        .insert("x-amzn-errortype", SERIALIZATION_EXCEPTION);
+    response
+}
+
+/// The member of the error envelope a protocol-level refusal of a TIME value
+/// states its reason in.
+///
+/// The recorded X-Ray answer for this refusal carries it under the capital
+/// `Message`, which is the member AWS states a protocol-level refusal in on the
+/// services whose request layers answer the same sentence (see
+/// `services/service-com-amazonaws-kinesisanalyticsv2-kinesisanalytics-20180523`).
+const MESSAGE_MEMBER: &str = "Message";
+
+/// What a value of the wrong class could not be read into, as AWS words it for a
+/// time member: the form the protocol reads a timestamp in, stated as the UNIT
+/// the instant is counted in rather than as the modelled shape type.
+const EPOCH_FORM: &str = "milliseconds since epoch";
+
+/// What a time member whose value cannot become an instant is refused with: the
+/// CLASS of value the request sent, and the form it could not be read into.
+///
+/// Both halves are `service_common::json_wire_values`, the tree's one statement
+/// of them, so this sentence is the one every other request layer answers for a
+/// value bound to an epoch-form timestamp. The refusal names the class and never
+/// the value: that is what the service states, and it keeps a caller from
+/// amplifying a long value into a long response.
+#[must_use]
+pub fn unconvertible_time_message(value: &serde_json::Value) -> String {
+    service_common::json_wire_values::unreadable_message(
+        service_common::json_wire_values::json_value_class(value),
+        EPOCH_FORM,
+    )
+}
+
+/// The operation this service serves for a request carrying a time member it
+/// cannot convert to an instant.
+///
+/// An [`ErasedOperation`] for the same reason [`UnreadableBody`] is one, and it
+/// holds no state: the refusal is re-derived from the request the router passes
+/// back in.
+pub struct UnconvertibleTime<Eng> {
+    engine: PhantomData<Eng>,
+}
+
+impl<Eng> UnconvertibleTime<Eng> {
+    /// The one refusal value a service holds.
+    pub const fn new() -> Self {
+        Self {
+            engine: PhantomData,
+        }
+    }
+}
+
+impl<Eng> Default for UnconvertibleTime<Eng> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for UnconvertibleTime<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        _ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
+            // The same decision `override_operation` made, re-derived from the
+            // same request: this operation is reached only when it answered
+            // `Some` with this arm, so the value is found again.
+            let message = match protocol
+                .routing_key(req)
+                .ok()
+                .and_then(|key| refusal_for::<Eng>(key, protocol, req))
+            {
+                Some(PreDispatchRefusal::UnconvertibleTime(message)) => message,
+                _ => "the request body can not be deserialized".to_string(),
+            };
+            unconvertible_time_exception(&message)
+        })
+    }
+}
+
+/// The wire answer to a value bound to a time member that this service read and
+/// could not convert: `400 SerializationException` — the protocol's own code,
+/// because the value never became the instant the member is — with the reason
+/// under the capital-`Message` member the recorded X-Ray refusal states it in,
+/// and the `x-amzn-errortype` header restJson1 resolves an error shape from.
+fn unconvertible_time_exception(message: &str) -> RtResponse {
+    let body = serde_json::json!({
+        "__type": SERIALIZATION_EXCEPTION,
+        MESSAGE_MEMBER: message,
+    });
     let mut response = RtResponse::new(
         StatusCode::try_from(SERIALIZATION_EXCEPTION_STATUS)
             .expect("the status is a constant of this module"),
@@ -285,14 +395,25 @@ fn probe<O: Operation>(
 ) -> Option<PreDispatchRefusal> {
     let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
     let found: RefCell<Option<String>> = RefCell::new(None);
+    let unconvertible: RefCell<Option<String>> = RefCell::new(None);
     let read = {
         let mut probe = Probe {
             inner: &mut *deserializer,
             found: &found,
+            unconvertible: &unconvertible,
         };
         <O::Input as DeserializableStruct>::deserialize(&mut probe)
     };
     let Ok(input) = read else {
+        // A time member the codec read and could not convert is refused with the
+        // CLASS of value that was sent and the form it could not be read into,
+        // which the error itself carries neither of: the class is read off the
+        // submitted body, under the member whose read failed.
+        if let Some(member) = unconvertible.into_inner() {
+            if let Some(message) = unconvertible_time(req, &member) {
+                return Some(PreDispatchRefusal::UnconvertibleTime(message));
+            }
+        }
         return found.into_inner().map(PreDispatchRefusal::Unreadable);
     };
     let violations = constraints::validate(&input, O::INPUT_SCHEMA);
@@ -302,6 +423,50 @@ fn probe<O: Operation>(
     Some(PreDispatchRefusal::Invalid(
         service_common::validation::with_submitted_values(violations, &input, O::INPUT_SCHEMA),
     ))
+}
+
+/// The refusal for the value the submitted body carries under `member`, when it
+/// is a value no instant can be read from.
+///
+/// Searched by member name rather than by a path, because the failing read
+/// reports the member it was reading and not where in the body it stood; the
+/// first value found under that name is the one it read, since a read stops at
+/// its first failure. `None` for a body that is not JSON, one that carries no
+/// such member, or a value whose class IS one an instant is read from (a number)
+/// — in which case this layer has nothing to state and leaves the framework's
+/// own rendering alone.
+fn unconvertible_time(req: &RtRequest, member: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_slice(req.body().bytes()?).ok()?;
+    let value = value_under(&body, member)?;
+    if matches!(
+        value,
+        serde_json::Value::Number(_) | serde_json::Value::Null
+    ) {
+        return None;
+    }
+    Some(unconvertible_time_message(value))
+}
+
+/// The first value `body` carries under the key `member`, at any depth.
+///
+/// The walk's depth is the body's own nesting, which the JSON reader bounds
+/// before this is called: a body nested deeper than it admits never becomes a
+/// value at all.
+fn value_under<'b>(body: &'b serde_json::Value, member: &str) -> Option<&'b serde_json::Value> {
+    match body {
+        serde_json::Value::Object(members) => {
+            if let Some(value) = members.get(member) {
+                return Some(value);
+            }
+            members
+                .values()
+                .find_map(|value| value_under(value, member))
+        }
+        serde_json::Value::Array(elements) => elements
+            .iter()
+            .find_map(|element| value_under(element, member)),
+        _ => None,
+    }
 }
 
 /// The operation this service serves for a request whose values the model's own
@@ -380,6 +545,11 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for ConstraintRefusal<Eng> {
 struct Probe<'d, 'f> {
     inner: &'d mut (dyn ShapeDeserializer + 'd),
     found: &'f RefCell<Option<String>>,
+    /// The member whose TIMESTAMP read failed for a reason that is not a JSON
+    /// type mismatch — a value the codec read and could not convert to an
+    /// instant. The first such read wins, for the same reason the first
+    /// coercion failure does.
+    unconvertible: &'f RefCell<Option<String>>,
 }
 
 /// Record `error` as a coercion failure of `schema`'s modelled type, when that
@@ -484,8 +654,13 @@ impl ShapeDeserializer for Probe<'_, '_> {
         consumer: &mut dyn FnMut(&Schema, &mut dyn ShapeDeserializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
         let found = self.found;
+        let unconvertible = self.unconvertible;
         let mut watched = |member: &Schema, inner: &mut dyn ShapeDeserializer| {
-            let mut probe = Probe { inner, found };
+            let mut probe = Probe {
+                inner,
+                found,
+                unconvertible,
+            };
             consumer(member, &mut probe)
         };
         self.inner
@@ -499,8 +674,13 @@ impl ShapeDeserializer for Probe<'_, '_> {
         consumer: &mut dyn FnMut(&mut dyn ShapeDeserializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
         let found = self.found;
+        let unconvertible = self.unconvertible;
         let mut watched = |inner: &mut dyn ShapeDeserializer| {
-            let mut probe = Probe { inner, found };
+            let mut probe = Probe {
+                inner,
+                found,
+                unconvertible,
+            };
             consumer(&mut probe)
         };
         self.inner
@@ -514,13 +694,39 @@ impl ShapeDeserializer for Probe<'_, '_> {
         consumer: &mut dyn FnMut(String, &mut dyn ShapeDeserializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
         let found = self.found;
+        let unconvertible = self.unconvertible;
         let mut watched = |key: String, inner: &mut dyn ShapeDeserializer| {
-            let mut probe = Probe { inner, found };
+            let mut probe = Probe {
+                inner,
+                found,
+                unconvertible,
+            };
             consumer(key, &mut probe)
         };
         self.inner
             .read_map(schema, &mut watched)
             .map_err(|error| note_in(found, schema, error))
+    }
+
+    /// A timestamp read is watched like every other scalar one, and records one
+    /// thing more: a failure that is NOT about the JSON type is a value the codec
+    /// read and could not convert to an instant, which carries its own refusal.
+    /// It is the member that is recorded, because the error carries neither the
+    /// member nor the value; and only for a member read in the protocol's
+    /// default form, since a member declaring its own `@timestampFormat` is read
+    /// in THAT form and what it could not be converted to is not the epoch form.
+    fn read_timestamp(&mut self, schema: &Schema) -> Result<DateTime, SerdeError> {
+        let found = self.found;
+        let unconvertible = self.unconvertible;
+        self.inner.read_timestamp(schema).map_err(|error| {
+            if value_class(&error).is_none() && schema.timestamp_format().is_none() {
+                let mut held = unconvertible.borrow_mut();
+                if held.is_none() {
+                    *held = schema.member_name().map(str::to_string);
+                }
+            }
+            note_in(found, schema, error)
+        })
     }
 
     // Every value read, forwarded and watched. The list is the trait's own
@@ -537,7 +743,6 @@ impl ShapeDeserializer for Probe<'_, '_> {
         read_big_decimal -> BigDecimal,
         read_string -> String,
         read_blob -> Blob,
-        read_timestamp -> DateTime,
         read_document -> Document,
     }
 
@@ -567,10 +772,12 @@ mod tests {
         let codec = JsonCodec::rest_json();
         let mut deserializer = codec.create_deserializer(body.as_bytes());
         let found: RefCell<Option<String>> = RefCell::new(None);
+        let unconvertible: RefCell<Option<String>> = RefCell::new(None);
         {
             let mut probe = Probe {
                 inner: &mut deserializer,
                 found: &found,
+                unconvertible: &unconvertible,
             };
             if T::deserialize(&mut probe).is_ok() {
                 return None;

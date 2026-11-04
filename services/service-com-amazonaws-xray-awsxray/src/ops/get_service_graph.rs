@@ -18,7 +18,9 @@
 //! Two refusals, both `InvalidRequestException` (400):
 //!
 //! * a `[StartTime, EndTime]` window that names no interval of recorded traffic,
-//!   through the one window check in [`crate::state::validate_window`]; and
+//!   through the one window check in [`crate::state::validate_window`], or one
+//!   WIDER than the longest window this read serves
+//!   ([`crate::state::MAX_SERVICE_GRAPH_WINDOW_HOURS`]); and
 //! * a `GroupName` / `GroupARN` that names no stored group — and a group whose
 //!   `FilterExpression` the compiler cannot evaluate, because answering a
 //!   filtered request with the UNFILTERED graph under HTTP 200 would be a wrong
@@ -188,6 +190,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(refuse(window.message(start, end)));
         }
 
+        // How WIDE a window this read serves is the read's own published bound,
+        // and it is not the bound of the trace-summaries read: the service map
+        // is derived over a narrower window than the summaries are
+        // ([`crate::state::MAX_SERVICE_GRAPH_WINDOW_HOURS`]). A request for a
+        // wider one is refused rather than answered over part of it, so a client
+        // that has to cut a long range into slices learns the bound from the
+        // refusal.
+        //
+        // Checked AFTER the group is resolved: a request that names a group that
+        // does not exist is refused for the group whatever window it asks about,
+        // because the group is WHAT the graph would be derived for, so a caller
+        // fixing its window would only reach the same refusal again.
         let store = state.lock();
 
         // A graph "based on which group" is the group's filter expression applied
@@ -206,6 +220,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.group_arn.as_deref(),
             )
             .map_err(refuse)?;
+
+        if let Err(window) = crate::state::validate_window_span(
+            start,
+            end,
+            crate::state::MAX_SERVICE_GRAPH_WINDOW_HOURS,
+        ) {
+            return Err(refuse(window));
+        }
 
         // The traces the graph is derived from: every stored one when no group
         // was named, and the ones the named group's expression selects when one

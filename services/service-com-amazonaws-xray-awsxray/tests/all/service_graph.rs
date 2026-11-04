@@ -650,29 +650,32 @@ async fn an_instant_no_timestamp_can_carry_is_refused_at_ingest_and_the_far_edge
             "case {label:?}: an instant inside the range must be stored, got {put:?}"
         );
         // And a read of it answers rather than failing on the conversion.
-        // `GetTraceSummaries` is the reader that converts a stored instant
-        // without a window check of its own, so it is the one that can be asked
+        // `BatchGetTraces` is the reader that converts a stored instant with no
+        // window of its own — the trace-query reads publish how far ahead of the
+        // clock their window may reach — so it is the one that can be asked
         // about an instant this far out.
-        let answer = xray
-            .call(
-                "/TraceSummaries",
-                &json!({"StartTime": start - 60.0, "EndTime": start + 60.0}),
-            )
-            .await;
+        let answer = xray.batch_get(std::slice::from_ref(&trace), None).await;
         assert_eq!(
             answer.status, 200,
             "case {label:?}: a read of a stored extreme instant must be served, got {answer:?}"
         );
-        let summaries = array(&answer.body, "TraceSummaries");
+        let traces = array(&answer.body, "Traces");
         assert_eq!(
-            summaries.len(),
+            traces.len(),
             1,
             "case {label:?}: the stored trace must be reported, got {answer:?}"
         );
-        let reported = summaries[0].get("StartTime").and_then(Value::as_f64);
+        let segments = array(&traces[0], "Segments");
+        let reported = segments
+            .first()
+            .and_then(|segment| segment.get("Document"))
+            .and_then(Value::as_str)
+            .and_then(|document| serde_json::from_str::<Value>(document).ok())
+            .and_then(|document| document.get("start_time").and_then(Value::as_f64));
         assert!(
             reported.is_some_and(|value| close(value, *start)),
-            "case {label:?}: StartTime must report the stored instant {start}, got {summaries:?}"
+            "case {label:?}: the served segment must report the stored instant {start}, got \
+             {traces:?}"
         );
     }
 }

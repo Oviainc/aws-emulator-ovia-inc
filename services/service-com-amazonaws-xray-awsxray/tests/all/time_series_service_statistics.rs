@@ -299,7 +299,13 @@ fn aggregation_cases() -> Vec<Case> {
             }],
         },
         Case {
-            case: "a one-second Period reports each request under its own second",
+            // The periods a statistics read serves are the one-minute and the
+            // five-minute aggregation, so the five-minute one separates as well
+            // as it merges: two requests in two different 300-second periods
+            // occupy two datapoints, each aligned to a multiple of 300 since the
+            // epoch (1_699_999_800 == 300 * 5_666_666, and the next one 300
+            // seconds later).
+            case: "the five-minute Period reports requests in two of its periods apart",
             requests: vec![
                 Request {
                     start: ALIGNED + 10.25,
@@ -307,16 +313,16 @@ fn aggregation_cases() -> Vec<Case> {
                     status: Some(200),
                 },
                 Request {
-                    start: ALIGNED + 11.75,
+                    start: ALIGNED + 320.0,
                     duration: Some(0.2),
                     status: Some(200),
                 },
             ],
-            window: (ALIGNED, ALIGNED + 60.0),
-            period: Some(1),
+            window: (ALIGNED, ALIGNED + 400.0),
+            period: Some(300),
             expected: vec![
                 ExpectedPeriod {
-                    timestamp: ALIGNED + 10.0,
+                    timestamp: 1_699_999_800.0,
                     ok: 1,
                     throttle: 0,
                     error_other: 0,
@@ -325,7 +331,7 @@ fn aggregation_cases() -> Vec<Case> {
                     histogram: vec![(0.1, 1)],
                 },
                 ExpectedPeriod {
-                    timestamp: ALIGNED + 11.0,
+                    timestamp: 1_700_000_100.0,
                     ok: 1,
                     throttle: 0,
                     error_other: 0,

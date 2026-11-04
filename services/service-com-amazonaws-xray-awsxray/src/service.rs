@@ -59,6 +59,7 @@
 
 pub mod request_layer;
 
+use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
@@ -67,12 +68,17 @@ use std::sync::Arc;
 /// requirement — untouched.
 ///
 /// A refusal of a value outside an enumerated type names the values that type admits,
-/// and the order it names them in is the service's rather than the model's: the order a
+/// and the order it names them in is the SERVICE's rather than the model's: the order a
 /// model happens to declare an enum's members in is an artefact of how the model was
-/// written, while this service states such a set sorted. The re-ordering itself is
-/// `service_common`'s one statement of that rule, applied to the violations as they
-/// arrive, so it answers for every enum of this model and every member targeting one, in
-/// any operation, rather than for a table of enums written out here.
+/// written, and this service's own refusals state two of its types in orders the model
+/// does not carry — the encryption type as `[KMS, NONE]` where the model declares
+/// `NONE, KMS`, and the time-range type as `[TraceId, Service, Event]` where the model
+/// declares `TraceId, Event, Service`. No one order over the declared values produces
+/// both, so the sets this service is known to state in an order the sort does not give
+/// are listed in [`STATED_VALUE_SET_ORDERS`], and every other set of this model takes
+/// the sorted order — `service_common`'s one statement of that rule, applied to the
+/// violations as they arrive, so it answers for every enum and every member targeting
+/// one, in any operation.
 ///
 /// Both of this service's refusal seams word their message through it — the framework's
 /// own ([`EmulatedService::override_refusal`]) and the pre-dispatch one
@@ -81,12 +87,53 @@ pub(crate) fn in_stated_value_order(refusal: &Refusal) -> Refusal {
     let Refusal::Invalid(violations) = refusal else {
         return refusal.clone();
     };
-    Refusal::Invalid(
-        violations
-            .iter()
-            .map(service_common::validation_message::in_sorted_enum_order)
-            .collect(),
-    )
+    Refusal::Invalid(violations.iter().map(in_this_services_order).collect())
+}
+
+/// The enumerated value sets this service states in an order the sort does not
+/// give, each written in the order its own refusals state it.
+///
+/// Source: the refusals recorded for this service. The order belongs to the
+/// TYPE — one set, one order, whatever member or operation carried the value —
+/// so a set is recognised by the values it admits and by nothing about the
+/// request.
+const STATED_VALUE_SET_ORDERS: &[&[&str]] = &[
+    // `com.amazonaws.xray#TimeRangeType`, which the model declares `TraceId,
+    // Event, Service`.
+    &["TraceId", "Service", "Event"],
+];
+
+/// One violation with its enumerated value set in the order this service states
+/// it: the order recorded for that set when there is one, else the sorted order.
+fn in_this_services_order(violation: &Violation) -> Violation {
+    let sorted = service_common::validation_message::in_sorted_enum_order(violation);
+    let ViolationKind::EnumValue(declared) = &sorted.kind else {
+        return sorted;
+    };
+    match stated_order(declared) {
+        Some(stated) => Violation {
+            path: sorted.path.clone(),
+            kind: ViolationKind::EnumValue(stated),
+            value: sorted.value.clone(),
+            sensitive: sorted.sensitive,
+        },
+        None => sorted,
+    }
+}
+
+/// The order [`STATED_VALUE_SET_ORDERS`] states the set `declared` in, or `None`
+/// for a set it does not name — which is every set this service's refusals are
+/// not recorded stating out of sorted order.
+fn stated_order(declared: &[String]) -> Option<Vec<String>> {
+    STATED_VALUE_SET_ORDERS
+        .iter()
+        .find(|stated| {
+            stated.len() == declared.len()
+                && stated
+                    .iter()
+                    .all(|value| declared.iter().any(|admitted| admitted == value))
+        })
+        .map(|stated| stated.iter().map(|value| (*value).to_string()).collect())
 }
 
 /// The `com-amazonaws-xray-awsxray` emulated service: the generated [`ServiceDefinition`] plus
@@ -102,11 +149,17 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// [`Service::override_operation`] hands back a borrow of one of its own
     /// operations.
     unreadable_body: request_layer::UnreadableBody<Eng>,
-    /// Answers a request the model's own constraints refuse, with each clause
-    /// echoing the value the CALLER submitted — including a collection-valued
-    /// member, which the framework's walk can only summarise as `<n> items`
-    /// (see [`request_layer`]). Held on the service for the same reason.
+    /// Answers a request whose values the model's own constraints refuse, with
+    /// each clause echoing the value the CALLER submitted — including a
+    /// collection-valued member, which the framework's walk can only summarise
+    /// as `<n> items` (see [`request_layer`]). Held on the service for the same
+    /// reason.
     constraint_refusal: request_layer::ConstraintRefusal<Eng>,
+    /// Answers a request carrying a time member this service read and could not
+    /// convert to an instant, naming the class of value that was sent and the
+    /// form an instant is read in (see [`request_layer`]). Held on the service
+    /// for the same reason.
+    unconvertible_time: request_layer::UnconvertibleTime<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -118,6 +171,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(engine),
             unreadable_body: request_layer::UnreadableBody::new(),
             constraint_refusal: request_layer::ConstraintRefusal::new(),
+            unconvertible_time: request_layer::UnconvertibleTime::new(),
         }
     }
 }
@@ -170,6 +224,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             match request_layer::refusal_for::<Eng>(key, protocol, req) {
                 Some(request_layer::PreDispatchRefusal::Unreadable(_)) => {
                     return Some(&self.unreadable_body);
+                }
+                Some(request_layer::PreDispatchRefusal::UnconvertibleTime(_)) => {
+                    return Some(&self.unconvertible_time);
                 }
                 Some(request_layer::PreDispatchRefusal::Invalid(_)) => {
                     return Some(&self.constraint_refusal);

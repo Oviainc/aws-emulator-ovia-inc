@@ -310,10 +310,13 @@ fn bucketing_cases() -> Vec<Case> {
             expected: vec![(0.0, 2)],
         },
         Case {
-            case: "a one-second period separates requests a second apart",
-            period: 1,
-            starts: vec![0.0, 1.0],
-            expected: vec![(0.0, 1), (1.0, 1)],
+            // The periods a statistics read serves are the one-minute and
+            // five-minute aggregations, so separation is shown at the wider of
+            // the two as well as at the narrower one above.
+            case: "the five-minute period separates requests five minutes apart",
+            period: 300,
+            starts: vec![0.0, 300.0],
+            expected: vec![(0.0, 1), (300.0, 1)],
         },
         Case {
             case: "three requests in three periods, two of them in the same one",

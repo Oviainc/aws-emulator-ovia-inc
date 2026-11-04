@@ -615,7 +615,9 @@ async fn an_unreadable_document_is_reported_and_the_rest_of_the_batch_still_land
             1,
             "case {label:?}: the well-formed document in the same batch must still be stored, got {traces:?}"
         );
-        let summaries = xray.summaries(0.0, 1_000_000.0, None).await;
+        // A window inside the widest one this read serves, holding the stored
+        // document's own instant.
+        let summaries = xray.summaries(0.0, 86_400.0, None).await;
         assert_eq!(
             array(&summaries.body, "TraceSummaries").len(),
             1,
@@ -1354,13 +1356,10 @@ async fn a_request_the_service_cannot_satisfy_is_refused_as_invalid() {
             "ValidationException",
         ),
         (
-            "Sampling requested",
-            "/TraceSummaries",
-            json!({"StartTime": 0.0_f64, "EndTime": 1.0_f64, "Sampling": true}),
-            "InvalidRequestException",
-        ),
-        (
-            "a SamplingStrategy requested",
+            // `Sampling` on its own is SERVED (a subset of the matching traces,
+            // at the read's own rate), so it is not a row here; a sampling
+            // STRATEGY is admitted only under the range type that takes one.
+            "a SamplingStrategy under a time-range type that does not take one",
             "/TraceSummaries",
             json!({
                 "StartTime": 0.0_f64,

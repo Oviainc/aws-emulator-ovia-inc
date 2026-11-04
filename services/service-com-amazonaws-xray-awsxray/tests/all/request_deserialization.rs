@@ -197,11 +197,10 @@ fn still_validation_rows() -> Vec<(&'static str, &'static str, Value)> {
             "/CreateGroup",
             json!({ "GroupName": "g".repeat(33) }),
         ),
-        (
-            "text that is the modelled type but not a timestamp",
-            "/TelemetryRecords",
-            json!({ "TelemetryRecords": [{ "Timestamp": "half past four" }] }),
-        ),
+        // Text that is a string but not a time is NOT one of these rows: the
+        // value is of the member's JSON form and what is wrong with it is what
+        // it MEANS, which this service refuses with its own modelled error
+        // naming the value (see `tests/all/unconvertible_time_member.rs`).
     ]
 }
 

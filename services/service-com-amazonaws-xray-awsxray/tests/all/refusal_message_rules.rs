@@ -233,11 +233,31 @@ fn filter_cases() -> Vec<FilterCase> {
             symbol: ")",
         },
         FilterCase {
+            // A word the language does not admit is reported by its first three
+            // characters, whether or not it begins one of the keywords: `wha`
+            // here, `met` for the `metadata.<key>` rows.
             case: "a word that shares no prefix with any keyword",
             expression: "whatever = 1",
             line: 1,
             position: 1,
-            symbol: "w",
+            symbol: "wha",
+        },
+        FilterCase {
+            // Shorter than that, so the whole word is what there is to report.
+            case: "a two-character word that shares no prefix with any keyword",
+            expression: "zz = 1",
+            line: 1,
+            position: 1,
+            symbol: "zz",
+        },
+        FilterCase {
+            // A word that BEGINS a keyword and then leaves it is reported up to
+            // the character that left it: `si` begins `service`, `sim` does not.
+            case: "a word that begins a keyword and then leaves it",
+            expression: "fault AND simulated = 1",
+            line: 1,
+            position: 11,
+            symbol: "si",
         },
         FilterCase {
             case: "a fault on the second line",
