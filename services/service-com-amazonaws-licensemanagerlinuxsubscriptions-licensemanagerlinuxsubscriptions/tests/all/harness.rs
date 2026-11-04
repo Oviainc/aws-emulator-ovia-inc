@@ -50,6 +50,56 @@ pub const PENDING: &str = PROVIDER_STATUS_PENDING;
 /// `SubscriptionProviderStatus` of a registration whose access token the service rejected.
 pub const INVALID: &str = PROVIDER_STATUS_INVALID;
 
+/// The message `RegisterSubscriptionProvider` refuses a credential it cannot use with:
+/// recorded behaviour, held here as the literal a suite compares against so no suite reads
+/// it back out of the handler it is testing.
+pub const TOKEN_REFUSAL_MESSAGE: &str = "The subscription provider token is invalid or expired";
+
+/// Base64url-encode `bytes` the way a JWT segment is encoded; `pad` selects whether the
+/// segment carries the `=` padding, which a token may be encoded with or without.
+///
+/// The codec is `aws_smithy_types::base64` — the standard-alphabet one this crate already
+/// uses — plus the two alphabet substitutions (`+` -> `-`, `/` -> `_`) that turn RFC 4648
+/// §4 into the §5 base64url a compact JWS carries, which is the same translation the
+/// handler side reverses in `service_common::jwt`.
+pub fn base64url(bytes: &[u8], pad: bool) -> String {
+    let standard = aws_smithy_types::base64::encode(bytes);
+    let encoded = standard.replace('+', "-").replace('/', "_");
+    if pad {
+        encoded
+    } else {
+        encoded.trim_end_matches('=').to_string()
+    }
+}
+
+/// The signature segment a test token carries. A JWT's third segment is the signature over
+/// the first two; nothing in this emulator can verify one (that needs the provider's keys),
+/// so a case only has to carry a segment that is there.
+pub const SIGNATURE_SEGMENT: &str = "c2lnbmF0dXJl";
+
+/// A JSON Web Token carrying `header` and `payload`, encoded as the three `.`-separated
+/// base64url segments a token issued by an OIDC single sign-on is.
+pub fn jwt(header: &Value, payload: &Value, pad: bool) -> String {
+    let segment = |value: &Value| {
+        base64url(
+            &serde_json::to_vec(value).expect("a test token's JSON serializes"),
+            pad,
+        )
+    };
+    format!(
+        "{}.{}.{SIGNATURE_SEGMENT}",
+        segment(header),
+        segment(payload)
+    )
+}
+
+/// The header of a well-formed token: a JOSE header names the signing algorithm
+/// (RFC 7515 §4.1.1). Any algorithm will do for a test token — what a service reading one
+/// checks is that the header names one, not which.
+pub fn token_header() -> Value {
+    json!({ "alg": "RS256", "typ": "JWT" })
+}
+
 /// Wait out the span the clock owes a fresh registration before its terminal
 /// `SubscriptionProviderStatus` is due, so the next call materializes it.
 ///

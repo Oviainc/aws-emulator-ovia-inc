@@ -39,9 +39,13 @@
 //! the secret was deleted or rotated to a value that is not an access token no longer names
 //! a credential this service can use, and is refused like any other such call.
 //!
-//! The refusal's TEXT is this emulator's own wording: the recorded evidence for this
-//! behaviour carries the HTTP status and the error code only, so there is no AWS sentence to
-//! reproduce here, and a later recording that captures one should correct it. The status
+//! The refusal's TEXT is the service's own, and it is ONE fixed sentence for the whole
+//! credential verdict (`PROVIDER_TOKEN_REFUSAL_MESSAGE`): the recorded behaviour states
+//! the provider token as invalid or expired and interpolates nothing — not the secret, not
+//! the source, not which part of the check failed — so a client reads the credential class
+//! off that sentence and the request-shape refusals (the `SubscriptionProviderSource` enum
+//! domain, the `SecretArn` pattern) keep their own distinct wording. Which part of the
+//! check failed is an operator's concern, so it is traced rather than answered. The status
 //! (400) and the code (`ValidationException`) are the model's.
 //!
 //! This is the ONLY file to touch for this operation.
@@ -179,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     type Output = RegisterSubscriptionProviderOutput;
     type Error = RegisterSubscriptionProviderError;
 
-    const NAME: &'static str = "RegisterSubscriptionProvider";
+    const NAME: &'static str = OPERATION_NAME;
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::REGISTER_SUBSCRIPTION_PROVIDER_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::REGISTER_SUBSCRIPTION_PROVIDER_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
@@ -199,17 +203,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a registration is only worth creating for a credential this service can use. The
         // credential is resolved and checked FIRST, so a refusal happens before the store
         // is touched at all.
-        if let CredentialLookup::Unusable(refusal) = resolve_credential(
+        let credential = resolve_credential(
             ctx,
             &region,
             &input.subscription_provider_source,
             &input.secret_arn,
         )
-        .await
-        {
+        .await;
+        if matches!(credential, CredentialLookup::Unusable) {
             return Err(RegisterSubscriptionProviderErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(refusal),
+                    message: Some(PROVIDER_TOKEN_REFUSAL_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -268,6 +272,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 // pointed at the secret the call named — and becomes usable on the clock, rather than being
 // answered with a refusal that erased the resource.
 
+/// This operation's name, stated once: the framework reads it as `Operation::NAME` and the
+/// trace records of what this call decided carry the same string.
+const OPERATION_NAME: &str = "RegisterSubscriptionProvider";
+
 /// What the secret a registration named holds, as far as this call can establish it.
 #[derive(Debug, PartialEq, Eq)]
 enum CredentialLookup {
@@ -275,8 +283,10 @@ enum CredentialLookup {
     /// `SubscriptionProviderSource` issues, so the registration can be taken.
     Usable,
     /// A definite negative about the credential: the secret cannot be read at all, or its
-    /// value is not an access token of that form. Carries the refusal's text.
-    Unusable(String),
+    /// value is not an access token of that form. Every such verdict is the one refusal
+    /// [`PROVIDER_TOKEN_REFUSAL_MESSAGE`] states, so the variant carries no text of its
+    /// own.
+    Unusable,
     /// Nothing was established about the secret — Secrets Manager answered about itself
     /// (a fault, a throttle) or did not answer at all. Not a negative, so not a refusal:
     /// a registration is never refused on a credential nobody reported anything about.
@@ -347,18 +357,36 @@ async fn resolve_credential(
         .await
     {
         Ok(value) => value,
-        Err(err) => return unreadable_secret(&err),
+        Err(err) => return unreadable_secret(source, &err),
     };
     // The access token is text, so a secret that holds only a binary value holds no token
     // (`GetSecretValue` reports one of `SecretString` / `SecretBinary`, whichever the
     // version carries).
     let Some(credential) = value.secret_string() else {
-        return CredentialLookup::Unusable(NO_SECRET_STRING_MESSAGE.to_string());
+        return unusable_credential(source, "it holds no string value");
     };
     match credential_defect(source, credential) {
-        Some(refusal) => CredentialLookup::Unusable(refusal),
+        Some(defect) => unusable_credential(source, &defect),
         None => CredentialLookup::Usable,
     }
+}
+
+/// A definite negative about the credential, with `defect` — why this service cannot use
+/// it — recorded for an OPERATOR rather than answered to the caller: the refusal the caller
+/// gets states the token as invalid or expired and nothing else, so the diagnosis has to be
+/// traced or it is lost. `defect` names what is wrong with the value, never the value
+/// itself: a refusal is reached by a caller whose own authorization to read that secret
+/// this service never established.
+fn unusable_credential(source: &str, defect: &str) -> CredentialLookup {
+    ::tracing::info!(
+        operation = OPERATION_NAME,
+        subscription_provider_source = %source,
+        defect = %defect,
+        outcome = "refused",
+        "the secret a registration named does not hold an access token this subscription \
+         provider issues"
+    );
+    CredentialLookup::Unusable
 }
 
 /// Classify a failed `GetSecretValue`.
@@ -373,6 +401,7 @@ async fn resolve_credential(
 /// [`CredentialLookup::Indeterminate`] and the registration proceeds rather than being
 /// refused on a credential nobody reported anything about.
 fn unreadable_secret(
+    source: &str,
     err: &::aws_sdk_secretsmanager::error::SdkError<
         ::aws_sdk_secretsmanager::operation::get_secret_value::GetSecretValueError,
     >,
@@ -387,7 +416,7 @@ fn unreadable_secret(
         .iter()
         .any(|known| known.eq_ignore_ascii_case(code));
     if client_error && about_the_secret {
-        return CredentialLookup::Unusable(UNREADABLE_SECRET_MESSAGE.to_string());
+        return unusable_credential(source, &format!("its value cannot be read ({code})"));
     }
     // Visible to an operator: an indeterminate lookup admits the registration, so without
     // this line it would be indistinguishable from a credential that was read and checked.
@@ -416,18 +445,19 @@ const SECRET_NEGATIVE_ERROR_CODES: &[&str] = &[
     "ResourceNotFoundException",
 ];
 
-/// The refusal for a secret whose value this service could not read.
-const UNREADABLE_SECRET_MESSAGE: &str =
-    "The secret referenced by SecretArn could not be read, so the subscription provider's \
-     access token is not available. Store the access token in a secret this account can \
-     read and try your request again.";
-
-/// The refusal for a secret that carries no text value: an access token is text, so a
-/// secret holding only a binary value holds no token.
-const NO_SECRET_STRING_MESSAGE: &str =
-    "The secret referenced by SecretArn holds no SecretString, so it does not contain the \
-     subscription provider's access token. Store the access token as the secret's string \
-     value and try your request again.";
+/// The refusal this operation answers for EVERY credential it cannot use: the secret that
+/// cannot be read, the secret holding no text value, and the value that is not an access
+/// token the named provider issues.
+///
+/// Recorded behaviour, not modelled text (the model states this operation's
+/// `ValidationException` and its 400 and nothing about the credential check): the service
+/// states the provider token as invalid or expired, as ONE sentence of fixed text with no
+/// variable part — the secret, the source and the reason the check failed are all absent
+/// from it — so the credential verdict is one refusal class a client can read off the
+/// message, distinct from the request-shape refusals the boundary words for the
+/// `SubscriptionProviderSource` enum domain and the `SecretArn` pattern.
+pub(crate) const PROVIDER_TOKEN_REFUSAL_MESSAGE: &str =
+    "The subscription provider token is invalid or expired";
 
 /// The `SubscriptionProviderSource` whose access token is a Red Hat Subscription Manager
 /// OFFLINE TOKEN (model: `SubscriptionProviderSource`, one of: `RedHat`; `SecretArn`:
@@ -436,7 +466,8 @@ const NO_SECRET_STRING_MESSAGE: &str =
 const SOURCE_RED_HAT: &str = "RedHat";
 
 /// Why `credential` is not an access token the provider `source` issues, or `None` when it
-/// has that token's form.
+/// has that token's form. The reason is for an operator's trace only — what the CALLER is
+/// answered is [`PROVIDER_TOKEN_REFUSAL_MESSAGE`], whichever reason it is.
 ///
 /// One arm per modelled `SubscriptionProviderSource`: the credential a registration needs
 /// is whatever the named provider issues, so the check belongs to the source rather than
@@ -459,7 +490,7 @@ const TOKEN_TYPE_CLAIM: &str = "typ";
 const OFFLINE_TOKEN_TYPE: &str = "Offline";
 
 /// Why `credential` is not a Red Hat offline token, or `None` when it has that token's
-/// form.
+/// form. The reason is traced, never answered: see [`PROVIDER_TOKEN_REFUSAL_MESSAGE`].
 ///
 /// An RHSM offline token is the offline refresh token Red Hat's single sign-on issues, so
 /// it is a JSON Web Token whose claim set declares the OFFLINE token type. The token's form
@@ -472,24 +503,16 @@ const OFFLINE_TOKEN_TYPE: &str = "Offline";
 /// and lands on the resource's `SubscriptionProviderStatus`. What is decided here is
 /// whether the stored credential is an offline token at all.
 fn offline_token_defect(credential: &str) -> Option<String> {
-    let defect = |reason: &dyn ::std::fmt::Display| {
-        Some(format!(
-            "The secret referenced by SecretArn does not contain a Red Hat offline token: \
-             {reason}. Store your Red Hat offline token in that secret and try your \
-             request again."
-        ))
-    };
     let token = match ::service_common::jwt::read(credential) {
         Ok(token) => token,
-        Err(form) => return defect(&form),
+        Err(form) => return Some(form.to_string()),
     };
     match token.claim_str(TOKEN_TYPE_CLAIM) {
         Some(token_type) if token_type.eq_ignore_ascii_case(OFFLINE_TOKEN_TYPE) => None,
         // The reason names the claim that is wrong, never the VALUE read out of the
-        // secret: a refusal is answered to a caller whose own authorization to read that
-        // secret this service never established, so no part of the stored credential
-        // travels in it.
-        _ => defect(&format!(
+        // secret: it is traced where an operator reads it, and no part of the stored
+        // credential may travel even there.
+        _ => Some(format!(
             "its payload does not declare the {OFFLINE_TOKEN_TYPE:?} token type"
         )),
     }

@@ -35,6 +35,8 @@ mod paged_walk_under_writes;
 mod provider_credential_validation;
 #[path = "all/provider_status_transition.rs"]
 mod provider_status_transition;
+#[path = "all/provider_token_refusal_message.rs"]
+mod provider_token_refusal_message;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/service_settings_status.rs"]

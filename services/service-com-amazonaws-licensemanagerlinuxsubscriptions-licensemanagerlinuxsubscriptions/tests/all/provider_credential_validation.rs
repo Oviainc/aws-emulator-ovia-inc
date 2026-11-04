@@ -14,8 +14,9 @@
 //! 1. the credential decides the call: a secret holding an access token of the provider's
 //!    form registers the provider (HTTP 200, `PENDING`, readable back through
 //!    `GetRegisteredSubscriptionProvider`), and a secret that cannot be read or does not
-//!    hold such a token is refused with `ValidationException` and leaves the provider store
-//!    and `ListRegisteredSubscriptionProviders` exactly as they were;
+//!    hold such a token is refused with `ValidationException` carrying the service's one
+//!    sentence about the provider token, and leaves the provider store and
+//!    `ListRegisteredSubscriptionProviders` exactly as they were;
 //! 2. the refusal does not depend on concurrency: simultaneous registrations for the same
 //!    source, each naming its own secret holding a value that is not an access token, are
 //!    ALL refused, so no race admits one and the store is unchanged;
@@ -32,23 +33,15 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    create_secret, get_provider, harness, harness_with_secrets_manager, list_providers, member,
-    provider_arn, register, stored_provider_count, Harness, PENDING, RED_HAT,
+    base64url, create_secret, get_provider, harness, harness_with_secrets_manager, jwt,
+    list_providers, member, provider_arn, register, stored_provider_count, token_header, Harness,
+    PENDING, RED_HAT, SIGNATURE_SEGMENT, TOKEN_REFUSAL_MESSAGE,
 };
 
 /// The issuer an offline token names: the provider's single sign-on realm. Part of the
 /// token's payload, not of what makes it well formed, so a case carries it the way a real
 /// token does.
 const SSO_ISSUER: &str = "https://sso.example-provider.com/auth/realms/external";
-
-/// The `alg` a token's header names. Any algorithm will do here: what the registration
-/// checks is that the header names one, not which.
-const ALGORITHM: &str = "RS256";
-
-/// The signature segment a test token carries. A JWT's third segment is the signature over
-/// the first two; nothing in this emulator can verify one (that needs the provider's keys),
-/// so a case only has to carry a segment that is there.
-const SIGNATURE_SEGMENT: &str = "c2lnbmF0dXJl";
 
 /// One row: what the registration's secret holds, and whether a registration naming that
 /// secret is one the service can take.
@@ -80,44 +73,6 @@ impl Case {
             accepted: false,
         }
     }
-}
-
-/// Base64url-encode `bytes` the way a JWT segment is encoded; `pad` selects whether the
-/// segment carries the `=` padding, which a token may be encoded with or without.
-///
-/// The codec is `aws_smithy_types::base64` — the standard-alphabet one this crate already
-/// uses — plus the two alphabet substitutions (`+` -> `-`, `/` -> `_`) that turn RFC 4648
-/// §4 into the §5 base64url a compact JWS carries, which is the same translation the
-/// handler side reverses in `service_common::jwt`.
-fn base64url(bytes: &[u8], pad: bool) -> String {
-    let standard = aws_smithy_types::base64::encode(bytes);
-    let encoded = standard.replace('+', "-").replace('/', "_");
-    if pad {
-        encoded
-    } else {
-        encoded.trim_end_matches('=').to_string()
-    }
-}
-
-/// A JSON Web Token carrying `header` and `payload`, encoded as the three `.`-separated
-/// base64url segments a token issued by an OIDC single sign-on is.
-fn jwt(header: &Value, payload: &Value, pad: bool) -> String {
-    let segment = |value: &Value| {
-        base64url(
-            &serde_json::to_vec(value).expect("a test token's JSON serializes"),
-            pad,
-        )
-    };
-    format!(
-        "{}.{}.{SIGNATURE_SEGMENT}",
-        segment(header),
-        segment(payload)
-    )
-}
-
-/// The header of a well-formed token.
-fn token_header() -> Value {
-    json!({ "alg": ALGORITHM, "typ": "JWT" })
 }
 
 /// The payload of a well-formed OFFLINE token: it declares the offline token type, which
@@ -180,7 +135,7 @@ fn credential_cases() -> Vec<Case> {
         ),
         Case::refused(
             "a token whose header decodes to a JSON array",
-            jwt(&json!([ALGORITHM]), &offline_payload(), false),
+            jwt(&json!([token_header()]), &offline_payload(), false),
         ),
         Case::refused(
             "a token whose payload is not JSON",
@@ -297,9 +252,13 @@ async fn the_stored_credential_decides_whether_a_registration_is_taken() {
             );
         } else {
             reply.error(label, 400, "ValidationException");
-            assert!(
-                reply.message().contains("SecretArn"),
-                "case {label:?}: the refusal must name the member at fault, got {:?}",
+            // Whichever part of the credential check failed, the refusal is the service's
+            // one fixed sentence about the provider token — the class
+            // `tests/all/provider_token_refusal_message.rs` states the rule for.
+            assert_eq!(
+                reply.message(),
+                TOKEN_REFUSAL_MESSAGE,
+                "case {label:?}: expected {TOKEN_REFUSAL_MESSAGE:?}, got {:?}",
                 reply.message()
             );
             // The refusal is answered to a caller whose authorization to read that secret
