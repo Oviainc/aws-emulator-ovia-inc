@@ -19,10 +19,17 @@
 //! [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::materialise_due_transitions`],
 //! so every reader of the flow observes the same progression.
 //!
-//! A flow's numbered versions (`ListFlowVersions`) are backed by the
+//! A flow's versions (`CreateFlowVersion`, `ListFlowVersions`) are the flow's
+//! own DRAFT version plus the numbered versions cut from it. The DRAFT version
+//! IS the stored flow — its status and definition are the ones a later
+//! `UpdateFlow`/`PrepareFlow` moves — so it is projected straight off the flow
+//! record ([`FlowRecord::to_draft_version_summary`]) rather than copied; each
+//! numbered version is a snapshot of that DRAFT at the instant it was cut, held
+//! in the
 //! [`flow_versions`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::flow_versions)
 //! map, keyed by the flow and the version number it was cut as, with
-//! [`FlowVersionRecord::to_summary`] as its single projection and
+//! [`FlowVersionRecord::to_summary`] / [`FlowVersionRecord::to_create_output`]
+//! as its only projections and
 //! [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::page_of_flow_versions`]
 //! as the one place the listing's order and paging live.
 //!
@@ -94,12 +101,12 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::Document;
 
 use crate::ops::types::{
-    Agent, AgentSummary, CreateFlowOutput, CustomDocumentIdentifier, CustomOrchestration,
-    DataSource, DataSourceConfiguration, DocumentContent, DocumentIdentifier, DocumentMetadata,
-    FlowDefinition, FlowValidation, FlowVersionSummary, GetFlowOutput, GuardrailConfiguration,
-    ImageExtractionConfiguration, IngestionJob, IngestionJobStatistics, KnowledgeBase,
-    KnowledgeBaseConfiguration, KnowledgeBaseDocumentDetail, MediaExtractionConfiguration,
-    MemoryConfiguration, PromptOverrideConfiguration, S3Location,
+    Agent, AgentSummary, CreateFlowOutput, CreateFlowVersionOutput, CustomDocumentIdentifier,
+    CustomOrchestration, DataSource, DataSourceConfiguration, DocumentContent, DocumentIdentifier,
+    DocumentMetadata, FlowDefinition, FlowValidation, FlowVersionSummary, GetFlowOutput,
+    GuardrailConfiguration, ImageExtractionConfiguration, IngestionJob, IngestionJobStatistics,
+    KnowledgeBase, KnowledgeBaseConfiguration, KnowledgeBaseDocumentDetail,
+    MediaExtractionConfiguration, MemoryConfiguration, PromptOverrideConfiguration, S3Location,
     ServerSideEncryptionConfiguration, StorageConfiguration, UpdateFlowOutput,
     VectorIngestionConfiguration,
 };
@@ -373,6 +380,12 @@ pub struct FlowRecord {
     /// reporting operation may materialise it once its instant has passed; it
     /// never invents a transition of its own.
     pub pending_preparation: Option<PendingPreparation>,
+    /// The highest version number this flow has ever been cut at, `0` before the
+    /// first `CreateFlowVersion`. It is a HIGH-WATER MARK, not a count of the
+    /// versions still stored: `CreateFlowVersion$version` is documented
+    /// "Versions are numbered incrementally, starting from 1", so deleting a
+    /// version does not hand its number out a second time.
+    pub versions_cut: u32,
     pub tags: HashMap<String, String>,
     pub client_token: Option<String>,
     pub created_at: SystemTime,
@@ -434,6 +447,24 @@ impl FlowRecord {
             version: self.version.clone(),
             definition: with_definition.then(|| self.definition.clone()).flatten(),
             validations: (!self.validations.is_empty()).then(|| self.validations.clone()),
+        }
+    }
+
+    /// This flow's DRAFT version as a `ListFlowVersions` item.
+    ///
+    /// The DRAFT version is not a record of its own: it IS the stored flow —
+    /// `CreateFlow` is documented "When you create a flow, the version created is
+    /// the DRAFT version", and every later `UpdateFlow`/`PrepareFlow` moves that
+    /// same DRAFT — so the summary is projected off the flow record and reports
+    /// the flow's own version member, status and creation instant. A copy would
+    /// go stale the moment the flow was prepared again.
+    pub fn to_draft_version_summary(&self) -> FlowVersionSummary {
+        FlowVersionSummary {
+            id: self.flow_id.clone(),
+            arn: self.arn.clone(),
+            status: self.status.as_wire().to_string(),
+            created_at: to_date_time(self.created_at),
+            version: self.version.clone(),
         }
     }
 }
@@ -514,8 +545,30 @@ pub const MAX_FLOW_VERSIONS_PER_PAGE: usize = 10;
 /// `NumericalVersion` is `pattern ^[0-9]{1,5}$`.
 const NUMERICAL_VERSION_DIGITS: usize = 5;
 
-/// One stored version of a flow: the single source of truth for every
-/// flow-version operation.
+/// The widest version number the modelled `NumericalVersion`
+/// (`pattern ^[0-9]{1,5}$`) can carry: past it the next version could not be
+/// rendered on the wire at all.
+pub const MAX_NUMERICAL_VERSION: u32 = 99_999;
+
+/// The most numbered versions this store holds for one flow; past it
+/// `CreateFlowVersion` answers the modelled `ServiceQuotaExceededException`
+/// instead of growing.
+///
+/// Amazon Bedrock publishes an adjustable quota on versions per flow, and this
+/// emulator models neither Service Quotas nor an account's adjustments — so this
+/// is the emulator's OWN bound on the store, set far above any workflow an
+/// emulator serves, and it is what stops one flow's version state growing
+/// without end.
+pub const FLOW_VERSION_QUOTA: usize = 1_000;
+
+/// One stored numbered version of a flow: the single source of truth for every
+/// operation that reports a version the flow was cut into.
+///
+/// A numbered version is a SNAPSHOT of the flow's DRAFT version at the instant
+/// `CreateFlowVersion` cut it — `GetFlowVersion` reports the name, role,
+/// encryption key and definition the version carries, none of which a later
+/// change to the DRAFT may move — so the members that make up that snapshot are
+/// stored here rather than read back off the flow.
 ///
 /// The version number is held as the integer it counts rather than as the wire
 /// string, so one flow's versions order by the sequence they were cut in
@@ -530,10 +583,59 @@ pub struct FlowVersionRecord {
     pub arn: String,
     pub version: u32,
     pub status: FlowStatus,
+    /// The name the flow carried when this version was cut.
+    pub name: String,
+    /// The description of the version: the one the request gave, or the flow's
+    /// own when it gave none.
+    pub description: Option<String>,
+    pub execution_role_arn: String,
+    pub customer_encryption_key_arn: Option<String>,
+    /// The definition this version packages, as the DRAFT held it when the
+    /// version was cut.
+    pub definition: Option<FlowDefinition>,
+    /// The status this version settles to, and when — set only for a version cut
+    /// from a DRAFT whose preparation was still in flight, so the version
+    /// reports the outcome of the very preparation it packages instead of
+    /// standing in a transient status for ever.
+    pub pending_status: Option<(SystemTime, FlowStatus)>,
     pub created_at: SystemTime,
 }
 
 impl FlowVersionRecord {
+    /// A version cut from `flow` as version `version` at `now`: the snapshot
+    /// `CreateFlowVersion` stores.
+    ///
+    /// `description` is the request's, which the operation documents as "A
+    /// description of the version of the flow"; a request that gives none leaves
+    /// the version carrying the flow's own description, as the rest of the
+    /// snapshot does.
+    pub fn snapshot_of(
+        flow: &FlowRecord,
+        version: u32,
+        description: Option<String>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            flow_id: flow.flow_id.clone(),
+            arn: flow.arn.clone(),
+            version,
+            status: flow.status,
+            name: flow.name.clone(),
+            description: description.or_else(|| flow.description.clone()),
+            execution_role_arn: flow.execution_role_arn.clone(),
+            customer_encryption_key_arn: flow.customer_encryption_key_arn.clone(),
+            definition: flow.definition.clone(),
+            // The preparation of the DRAFT this version packages is the
+            // version's own: whatever that preparation reaches, it reaches at
+            // the same instant.
+            pending_status: flow
+                .pending_preparation
+                .as_ref()
+                .map(|pending| (pending.due, pending.status)),
+            created_at: now,
+        }
+    }
+
     /// This record projected onto the modelled `FlowVersionSummary` shape, the
     /// `ListFlowVersions` item: every member comes from the stored record,
     /// never from the request being served.
@@ -546,18 +648,71 @@ impl FlowVersionRecord {
             version: self.version.to_string(),
         }
     }
+
+    /// This record as the `CreateFlowVersion` response: every member comes from
+    /// the snapshot just stored, never from the request being served.
+    pub fn to_create_output(&self) -> CreateFlowVersionOutput {
+        CreateFlowVersionOutput {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            execution_role_arn: self.execution_role_arn.clone(),
+            customer_encryption_key_arn: self.customer_encryption_key_arn.clone(),
+            id: self.flow_id.clone(),
+            arn: self.arn.clone(),
+            status: self.status.as_wire().to_string(),
+            created_at: to_date_time(self.created_at),
+            version: self.version.to_string(),
+            definition: self.definition.clone(),
+        }
+    }
 }
 
-/// The version a `ListFlowVersions` page resumes after, or `None` when the
-/// token is not one this listing handed out.
+/// One position in the `ListFlowVersions` ordering: the flow's DRAFT version,
+/// which the listing reports first, or one of its numbered versions.
 ///
-/// A page's `nextToken` is the version number the page stopped at, so the next
-/// page starts at the first version of the same flow above it — stable even if
-/// the version the token names has since been deleted.
-pub fn flow_version_after_token(token: &str) -> Option<u32> {
-    let numeric = (1..=NUMERICAL_VERSION_DIGITS).contains(&token.len())
-        && token.bytes().all(|byte| byte.is_ascii_digit());
-    numeric.then(|| token.parse::<u32>().ok()).flatten()
+/// The derived ordering IS the listing's order — `Draft` is declared first, so
+/// it precedes every numbered version, and numbered versions compare by the
+/// sequence they were cut in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FlowVersionCursor {
+    /// The flow's own DRAFT version.
+    Draft,
+    /// The numbered version this many versions into the flow's history.
+    Numbered(u32),
+}
+
+impl FlowVersionCursor {
+    /// The position a `ListFlowVersions` page resumes after, or `None` when the
+    /// token is not one this listing handed out.
+    ///
+    /// A page's `nextToken` is the version the page stopped at, so the next page
+    /// starts at the first version of the same flow above it — stable even if
+    /// the version the token names has since been deleted.
+    ///
+    /// Versions are numbered from 1, so a page never hands out a token that
+    /// starts with `0`: neither `0` itself nor a zero-padded number names a
+    /// position in this listing.
+    pub fn parse(token: &str) -> Option<Self> {
+        if token == DRAFT_VERSION {
+            return Some(Self::Draft);
+        }
+        let numeric = (1..=NUMERICAL_VERSION_DIGITS).contains(&token.len())
+            && !token.starts_with('0')
+            && token.bytes().all(|byte| byte.is_ascii_digit());
+        numeric
+            .then(|| token.parse::<u32>().ok())
+            .flatten()
+            .map(Self::Numbered)
+    }
+
+    /// This position as the `nextToken` a page hands out: the `version` member
+    /// of the summary the page stopped at.
+    pub fn token(self) -> String {
+        match self {
+            Self::Draft => DRAFT_VERSION.to_string(),
+            Self::Numbered(version) => version.to_string(),
+        }
+    }
 }
 
 /// The most knowledge bases this store holds; past it `CreateKnowledgeBase`
@@ -1858,8 +2013,15 @@ pub struct ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     pub flow_client_tokens: HashMap<String, String>,
     /// Every numbered flow version that exists, keyed by the `flowId` it was cut
     /// from and its version number. The pair is the version's identity, so one
-    /// flow never reports another flow's versions.
+    /// flow never reports another flow's versions. The flow's DRAFT version is
+    /// NOT here: it is the flow record itself.
     pub flow_versions: HashMap<(String, u32), FlowVersionRecord>,
+    /// `(flowId, clientToken)` -> the version number that request cut, so a
+    /// retried `CreateFlowVersion` carrying the same `@idempotencyToken`
+    /// returns the version it already cut rather than cutting a second one. The
+    /// key carries the flow the replay is read at, so one token reused for
+    /// another flow cannot displace the version it already names.
+    pub flow_version_client_tokens: HashMap<(String, String), u32>,
     /// Every knowledge base that exists, keyed by its 10-character
     /// `knowledgeBaseId`.
     pub knowledge_bases: HashMap<String, KnowledgeBaseRecord>,
@@ -2188,6 +2350,17 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             // was noticed.
             flow.updated_at = pending.due;
         }
+        // A numbered version cut from a DRAFT whose preparation was still in
+        // flight settles with that preparation: the version packages the very
+        // definition being prepared, so its outcome is due at the same instant.
+        for version in self.flow_versions.values_mut() {
+            if let Some((due, next)) = version.pending_status {
+                if now >= due {
+                    version.status = next;
+                    version.pending_status = None;
+                }
+            }
+        }
         for knowledge_base in self.knowledge_bases.values_mut() {
             if let Some((due, next)) = knowledge_base.pending_status {
                 if now >= due {
@@ -2361,6 +2534,8 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
         let record = self.flows.remove(flow_id)?;
         self.flow_versions
             .retain(|(versioned_flow_id, _), _| versioned_flow_id != flow_id);
+        self.flow_version_client_tokens
+            .retain(|(versioned_flow_id, _), _| versioned_flow_id != flow_id);
         self.flow_client_tokens.retain(|_, id| id != flow_id);
         Some(record)
     }
@@ -2386,31 +2561,69 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
         (page.iter().map(|record| record.to_summary()).collect(), next_token)
     }
 
-    /// One `ListFlowVersions` page: this flow's versions above `after_version`
-    /// in version order, at most `page_size` of them, plus the token to resume
-    /// from when more remain.
+    /// One `ListFlowVersions` page: this flow's versions after `after` in
+    /// listing order, at most `page_size` of them, plus the token to resume from
+    /// when more remain.
+    ///
+    /// A flow that exists always has a version to report: its DRAFT version,
+    /// which the listing reports first, followed by the numbered versions cut
+    /// from it in the order they were cut. An unknown flow has nothing to
+    /// enumerate — the caller refuses it as a missing resource before asking.
     pub fn page_of_flow_versions(
         &self,
         flow_id: &str,
-        after_version: Option<u32>,
+        after: Option<FlowVersionCursor>,
         page_size: usize,
     ) -> (Vec<FlowVersionSummary>, Option<String>) {
-        let mut ordered: Vec<&FlowVersionRecord> = self
+        let Some(flow) = self.flows.get(flow_id) else {
+            return (Vec::new(), None);
+        };
+
+        let mut numbered: Vec<&FlowVersionRecord> = self
             .flow_versions
             .values()
             .filter(|record| record.flow_id == flow_id)
-            .filter(|record| after_version.is_none_or(|after| record.version > after))
             .collect();
-        ordered.sort_by_key(|record| record.version);
+        numbered.sort_by_key(|record| record.version);
 
-        let page: Vec<&FlowVersionRecord> = ordered.iter().take(page_size).copied().collect();
+        let ordered: Vec<(FlowVersionCursor, FlowVersionSummary)> =
+            ::std::iter::once((FlowVersionCursor::Draft, flow.to_draft_version_summary()))
+                .chain(numbered.into_iter().map(|record| {
+                    (
+                        FlowVersionCursor::Numbered(record.version),
+                        record.to_summary(),
+                    )
+                }))
+                .filter(|(cursor, _)| after.is_none_or(|after| *cursor > after))
+                .collect();
+
+        let page: Vec<&(FlowVersionCursor, FlowVersionSummary)> =
+            ordered.iter().take(page_size).collect();
         let next_token = (ordered.len() > page.len())
-            .then(|| page.last().map(|record| record.version.to_string()))
+            .then(|| page.last().map(|(cursor, _)| cursor.token()))
             .flatten();
         (
-            page.iter().map(|record| record.to_summary()).collect(),
+            page.iter().map(|(_, summary)| summary.clone()).collect(),
             next_token,
         )
+    }
+
+    /// The numbered versions this flow has been cut into.
+    pub fn flow_version_count(&self, flow_id: &str) -> usize {
+        self.flow_versions
+            .values()
+            .filter(|record| record.flow_id == flow_id)
+            .count()
+    }
+
+    /// The number `CreateFlowVersion` cuts this flow's next version as: one past
+    /// the highest number the flow has ever reached
+    /// ([`FlowRecord::versions_cut`]), so a number a deleted version held is
+    /// never handed out again.
+    pub fn next_flow_version(&self, flow_id: &str) -> u32 {
+        self.flows
+            .get(flow_id)
+            .map_or(1, |flow| flow.versions_cut.saturating_add(1))
     }
 
     /// Forget an agent and every index that pointed at it.

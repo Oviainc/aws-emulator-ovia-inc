@@ -262,6 +262,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // No preparation has been asked for, so the clock owes this flow
             // nothing.
             pending_preparation: None,
+            // No version has been cut from this flow yet.
+            versions_cut: 0,
             tags: input.tags.unwrap_or_default(),
             client_token: input.client_token.clone(),
             created_at: now,

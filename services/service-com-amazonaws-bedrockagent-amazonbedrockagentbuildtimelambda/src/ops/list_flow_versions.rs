@@ -2,9 +2,9 @@
 
 //! @op ListFlowVersions
 //!
-//! Reports the numbered versions stored for one flow, read from
-//! [`crate::state`], in version order and in pages. A pure read: it writes
-//! nothing.
+//! Reports every version of one flow — its DRAFT version, then the numbered
+//! versions cut from it — read from [`crate::state`], in version order and in
+//! pages. A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -184,10 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A token this service did not hand out names no position in the listing.
-        let after_version = match input.next_token.as_deref() {
+        let after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::flow_version_after_token(token) {
-                Some(version) => Some(version),
+            Some(token) => match crate::state::FlowVersionCursor::parse(token) {
+                Some(cursor) => Some(cursor),
                 None => {
                     return Err(ListFlowVersionsErrorModeled::ValidationException(
                         ValidationException {
@@ -216,9 +216,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .min(crate::state::MAX_FLOW_VERSIONS_PER_PAGE);
 
-        // A read: the stored versions are reported as they stand, and nothing
+        // A read: the flow's versions are reported as they stand, and nothing
         // about the flow or its versions changes because somebody asked for them.
-        let state = state.lock();
+        // The one write is the materialising of a status change the CLOCK had
+        // already made due — the DRAFT version reports the flow's own status, so
+        // a preparation whose outcome was owed before this call is reported here
+        // exactly as every other reader of the flow reports it.
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+        // A flow that exists always enumerates at least its DRAFT version, so an
+        // empty listing can only mean the flow itself is missing — which is the
+        // modelled refusal, not a 200 with nothing in it.
         if !state.flows.contains_key(flow_id) {
             return Err(ListFlowVersionsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -229,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let (flow_version_summaries, next_token) =
-            state.page_of_flow_versions(flow_id, after_version, page_size);
+            state.page_of_flow_versions(flow_id, after, page_size);
 
         Ok(ListFlowVersionsOutput {
             flow_version_summaries,

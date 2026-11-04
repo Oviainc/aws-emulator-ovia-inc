@@ -25,6 +25,8 @@ mod flow_lifecycle;
 mod flow_preparation;
 #[path = "all/flow_version_listing.rs"]
 mod flow_version_listing;
+#[path = "all/flow_version_minting.rs"]
+mod flow_version_minting;
 #[path = "all/immutable_configuration_members.rs"]
 mod immutable_configuration_members;
 #[path = "all/ingestion_job_lifecycle.rs"]

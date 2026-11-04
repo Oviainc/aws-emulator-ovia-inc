@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `ListFlowVersions`, end to end over HTTP: the numbered versions stored for
-//! one flow, reported in version order and in pages.
+//! `ListFlowVersions`, end to end over HTTP: every version of one flow — its
+//! DRAFT version first, then the numbered versions cut from it — reported in
+//! version order and in pages.
 //!
 //! Every assertion here goes through the router, so it exercises the real wire
 //! path (route matching, model constraint validation, serialization) rather than
 //! calling a handler directly.
 //!
-//! The versions themselves are placed in the store directly, because
-//! `CreateFlowVersion` is still a scaffold stub in this crate
-//! (`services/.../src/ops/create_flow_version.rs`), so no implemented operation
-//! cuts a version yet. The listing under test still reads what the store holds,
-//! through the same `crate::state` seam the handler uses.
+//! The numbered versions are placed in the store directly, through the same
+//! `crate::state` snapshot the `CreateFlowVersion` handler stores, because the
+//! listing's ordering and paging have to be exercised over version sets that
+//! incremental minting cannot produce (gaps, and numbers at the widest the
+//! modelled `NumericalVersion` admits). `flow_version_minting.rs` drives the
+//! same listing over versions cut by `CreateFlowVersion` itself.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -19,7 +21,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::state::{
-    service_state, FlowStatus, FlowVersionRecord, MAX_FLOW_VERSIONS_PER_PAGE,
+    service_state, FlowStatus, FlowVersionRecord, DRAFT_VERSION, MAX_FLOW_VERSIONS_PER_PAGE,
 };
 use service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -196,40 +198,58 @@ impl Emulator {
             .await
     }
 
-    /// Place versions in the store for `flow_id`, in the order given — which is
-    /// deliberately NOT version order, so the listing's ordering is the
-    /// handler's work and not an artefact of insertion.
-    fn store_versions(&self, flow_id: &str, flow_arn: &str, versions: &[u32]) {
+    /// Place numbered versions in the store for `flow_id`, in the order given —
+    /// which is deliberately NOT version order, so the listing's ordering is the
+    /// handler's work and not an artefact of insertion. Each is the same
+    /// snapshot of the flow that `CreateFlowVersion` stores, reported as
+    /// `Prepared` so a numbered version is distinguishable from the DRAFT the
+    /// flow was created with.
+    fn store_versions(&self, flow_id: &str, versions: &[u32]) {
         let state = service_state(&*self.engine).expect("the bedrock-agent store");
         let mut state = state.lock();
         let base = SystemTime::now();
         for &version in versions {
-            state.flow_versions.insert(
-                (flow_id.to_string(), version),
-                FlowVersionRecord {
-                    flow_id: flow_id.to_string(),
-                    arn: flow_arn.to_string(),
-                    version,
-                    status: FlowStatus::Prepared,
-                    created_at: base + Duration::from_secs(u64::from(version)),
-                },
+            let flow = state
+                .flows
+                .get(flow_id)
+                .unwrap_or_else(|| panic!("case setup: the store holds flow {flow_id}"))
+                .clone();
+            let mut record = FlowVersionRecord::snapshot_of(
+                &flow,
+                version,
+                None,
+                base + Duration::from_secs(u64::from(version)),
             );
+            record.status = FlowStatus::Prepared;
+            state
+                .flow_versions
+                .insert((flow_id.to_string(), version), record);
+        }
+        // The flow records the highest version it has been cut at, exactly as a
+        // sequence of `CreateFlowVersion` calls would have left it.
+        if let Some(highest) = versions.iter().copied().max() {
+            let flow = state.flows.get_mut(flow_id).expect("the stored flow");
+            flow.versions_cut = flow.versions_cut.max(highest);
         }
     }
 }
 
-/// The versions `expected` names, as the modelled `NumericalVersion` renders
-/// them.
-fn wire_versions(expected: &[u32]) -> Vec<String> {
-    expected.iter().map(u32::to_string).collect()
+/// The listing a flow with these numbered versions reports: its DRAFT version
+/// first, then each numbered version as the modelled `NumericalVersion` renders
+/// it.
+fn expected_listing(numbered: &[u32]) -> Vec<String> {
+    ::std::iter::once(DRAFT_VERSION.to_string())
+        .chain(numbered.iter().map(u32::to_string))
+        .collect()
 }
 
-/// Every stored version of the flow is reported, in version order, over a table
-/// of version sets that differ in COUNT and in numbering: a single version,
-/// contiguous runs, a set with gaps, and sets spanning the one-digit to
-/// two-digit boundary where lexical order and version order disagree.
+/// Every version of the flow is reported, DRAFT first and then the numbered
+/// versions in version order, over a table of version sets that differ in COUNT
+/// and in numbering: none cut yet, a single version, contiguous runs, a set with
+/// gaps, and sets spanning the one-digit to two-digit boundary where lexical
+/// order and version order disagree.
 #[tokio::test]
-async fn list_flow_versions_reports_every_stored_version_in_version_order() {
+async fn list_flow_versions_reports_the_draft_and_every_stored_version_in_version_order() {
     // Rows: (case, the versions stored, in the order they are stored).
     let cases: Vec<(&str, Vec<u32>)> = vec![
         ("no version cut yet", vec![]),
@@ -245,7 +265,7 @@ async fn list_flow_versions_reports_every_stored_version_in_version_order() {
             "the widest version the modelled pattern admits",
             vec![99999, 5, 100],
         ),
-        ("a full page: ten versions", vec![10, 9, 8, 7, 6, 5, 4, 3, 2, 1]),
+        ("a full page: nine versions beside the DRAFT", vec![9, 8, 7, 6, 5, 4, 3, 2, 1]),
     ];
 
     for (case, stored) in cases {
@@ -253,7 +273,7 @@ async fn list_flow_versions_reports_every_stored_version_in_version_order() {
         let flow = emulator.create_flow("version-listing-flow").await;
         let flow_id = flow.string(&["id"]);
         let flow_arn = flow.string(&["arn"]);
-        emulator.store_versions(&flow_id, &flow_arn, &stored);
+        emulator.store_versions(&flow_id, &stored);
 
         let listed = emulator.list_flow_versions(&flow_id, None, None).await;
         assert_eq!(
@@ -265,8 +285,9 @@ async fn list_flow_versions_reports_every_stored_version_in_version_order() {
         expected.sort_unstable();
         assert_eq!(
             listed.listed_versions(),
-            wire_versions(&expected),
-            "case {case}: expected the stored versions in version order, got {:?}",
+            expected_listing(&expected),
+            "case {case}: expected the DRAFT version then the stored versions in version \
+             order, got {:?}",
             listed.listed_versions()
         );
         assert_eq!(
@@ -276,8 +297,9 @@ async fn list_flow_versions_reports_every_stored_version_in_version_order() {
             listed.next_token()
         );
 
-        // Every summary names the flow the version belongs to, and reports the
-        // version's own stored status and creation instant.
+        // Every summary names the flow the version belongs to, and reports that
+        // version's own status and creation instant: the flow's own for the
+        // DRAFT, the snapshot's for a numbered version.
         for summary in listed.summaries() {
             assert_eq!(
                 summary["id"].as_str(),
@@ -289,10 +311,12 @@ async fn list_flow_versions_reports_every_stored_version_in_version_order() {
                 Some(flow_arn.as_str()),
                 "case {case}: a summary carries the ARN of its flow, got {summary:?}"
             );
+            let is_draft = summary["version"].as_str() == Some("DRAFT");
+            let expected_status = if is_draft { "NotPrepared" } else { "Prepared" };
             assert_eq!(
                 summary["status"].as_str(),
-                Some("Prepared"),
-                "case {case}: a summary reports the version's stored status, got {summary:?}"
+                Some(expected_status),
+                "case {case}: a summary reports that version's own status, got {summary:?}"
             );
             let created_at = summary["createdAt"].as_str().unwrap_or_else(|| {
                 panic!("case {case}: expected createdAt to be a date-time string, got {summary:?}")
@@ -320,8 +344,8 @@ async fn list_flow_versions_resolves_every_identifier_form_and_isolates_each_flo
     let second_id = second.string(&["id"]);
     let second_arn = second.string(&["arn"]);
 
-    emulator.store_versions(&first_id, &first_arn, &[2, 1]);
-    emulator.store_versions(&second_id, &second_arn, &[1, 2, 3]);
+    emulator.store_versions(&first_id, &[2, 1]);
+    emulator.store_versions(&second_id, &[1, 2, 3]);
 
     // Rows: each flow x each identifier form.
     for (case, identifier, expected) in [
@@ -337,7 +361,7 @@ async fn list_flow_versions_resolves_every_identifier_form_and_isolates_each_flo
         );
         assert_eq!(
             listed.listed_versions(),
-            wire_versions(&expected),
+            expected_listing(&expected),
             "case {case}: a flow reports its own versions and no other flow's, got {:?}",
             listed.listed_versions()
         );
@@ -355,7 +379,7 @@ async fn list_flow_versions_resolves_every_identifier_form_and_isolates_each_flo
     );
     assert_eq!(
         again.listed_versions(),
-        wire_versions(&[1, 2]),
+        expected_listing(&[1, 2]),
         "case repeated read: the stored versions are still reported, got {:?}",
         again.listed_versions()
     );
@@ -363,15 +387,16 @@ async fn list_flow_versions_resolves_every_identifier_form_and_isolates_each_flo
 
 /// `maxResults` truncates a page and `nextToken` resumes exactly after it, with
 /// the modelled `flowVersionSummaries` length bound (..10) capping a page
-/// however large `maxResults` is. Walking the pages yields every stored
-/// version, in version order, once.
+/// however large `maxResults` is. Walking the pages yields every version of the
+/// flow — the DRAFT and each numbered version — in version order, once.
 #[tokio::test]
 async fn list_flow_versions_pages_by_max_results_up_to_the_modelled_page_cap() {
-    // Twelve versions: more than one page at every `maxResults` worth testing,
-    // and more than the modelled page cap.
+    // Twelve numbered versions beside the DRAFT: more than one page at every
+    // `maxResults` worth testing, and more than the modelled page cap.
     let stored: Vec<u32> = (1..=12).rev().collect();
-    let mut all = stored.clone();
-    all.sort_unstable();
+    let mut numbered = stored.clone();
+    numbered.sort_unstable();
+    let all = expected_listing(&numbered);
 
     // Rows: the published bounds of the modelled `maxResults` range (1..1000),
     // values between them on either side of the page cap, and the member
@@ -387,8 +412,7 @@ async fn list_flow_versions_pages_by_max_results_up_to_the_modelled_page_cap() {
         let emulator = Emulator::new();
         let flow = emulator.create_flow("paged-versions-flow").await;
         let flow_id = flow.string(&["id"]);
-        let flow_arn = flow.string(&["arn"]);
-        emulator.store_versions(&flow_id, &flow_arn, &stored);
+        emulator.store_versions(&flow_id, &stored);
 
         let page_cap = max_results
             .map_or(MAX_FLOW_VERSIONS_PER_PAGE, |requested: i64| {
@@ -433,9 +457,8 @@ async fn list_flow_versions_pages_by_max_results_up_to_the_modelled_page_cap() {
         }
 
         assert_eq!(
-            walked,
-            wire_versions(&all),
-            "case {case}: walking the pages must yield every stored version once, \
+            walked, all,
+            "case {case}: walking the pages must yield every version of the flow once, \
              in version order, got {walked:?}"
         );
         assert_eq!(
@@ -456,7 +479,7 @@ async fn list_flow_versions_refuses_an_unknown_flow_a_bad_identifier_and_a_forei
     let flow = emulator.create_flow("the-only-flow").await;
     let flow_id = flow.string(&["id"]);
     let flow_arn = flow.string(&["arn"]);
-    emulator.store_versions(&flow_id, &flow_arn, &[1, 2]);
+    emulator.store_versions(&flow_id, &[1, 2]);
 
     // Rows: both identifier forms, over well-formed ids the store does not hold.
     let mut nearly = flow_id.clone();
@@ -535,12 +558,15 @@ async fn list_flow_versions_refuses_an_unknown_flow_a_bad_identifier_and_a_forei
     }
 
     // Rows: tokens no page of this listing handed out — including one that is
-    // numeric but wider than the modelled `NumericalVersion`.
+    // numeric but wider than the modelled `NumericalVersion`, and numbers no
+    // version is ever cut as, since versions are numbered from 1.
     for (case, token) in [
         ("a token from somewhere else", "not-a-pagination-token"),
         ("a token wider than a version number", "999999"),
         ("a signed number", "+1"),
         ("an empty-looking token", "0x1"),
+        ("version zero", "0"),
+        ("a zero-padded version number", "01"),
     ] {
         let listed = emulator
             .list_flow_versions(&flow_id, None, Some(token))
@@ -576,8 +602,8 @@ async fn list_flow_versions_refuses_an_unknown_flow_a_bad_identifier_and_a_forei
     let listed = emulator.list_flow_versions(&flow_id, None, None).await;
     assert_eq!(
         listed.listed_versions(),
-        wire_versions(&[1, 2]),
-        "case after the refusals: the stored versions are still reported, got {:?}",
+        expected_listing(&[1, 2]),
+        "case after the refusals: the flow's versions are still reported, got {:?}",
         listed.listed_versions()
     );
 }

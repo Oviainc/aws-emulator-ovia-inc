@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFlowVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFlowVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFlowVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cuts a numbered version of one flow: a snapshot of the flow's DRAFT version
+//! as it stands, stored in [`crate::state`] so `ListFlowVersions` enumerates it
+//! beside the DRAFT it was cut from.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +177,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFlowVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFlowVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFlowVersion"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFlowVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The modelled `FlowIdentifier` admits a flow ARN or a bare flow id and
+        // nothing else. The boundary validator lets other values through — the
+        // pattern's top-level alternation leaves the second branch anchored only
+        // at its end — so an identifier of neither form is refused here as the
+        // bad request it is, rather than reported as a missing flow.
+        let Some(flow_id) = crate::state::flow_id_from_identifier(&input.flow_identifier) else {
+            return Err(CreateFlowVersionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::flow_identifier_pattern_message(
+                        &input.flow_identifier,
+                    )),
+                    field_list: None,
+                },
+            )
+            .into());
+        };
+        let flow_id = flow_id.to_string();
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        // `clientToken` is an @idempotencyToken: a repeat of the same request
+        // reports the version it already cut rather than cutting a second one.
+        if let Some(existing) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| {
+                state
+                    .flow_version_client_tokens
+                    .get(&(flow_id.clone(), token.to_string()))
+                    .copied()
+            })
+            .and_then(|version| state.flow_versions.get(&(flow_id.clone(), version)))
+        {
+            return Ok(existing.to_create_output());
+        }
+
+        // The version number is the flow's next, and the quota is this flow's:
+        // both are read before the snapshot so the refusals below name the flow
+        // the request addressed.
+        let version = state.next_flow_version(&flow_id);
+        let version_count = state.flow_version_count(&flow_id);
+
+        let Some(flow) = state.flows.get(&flow_id) else {
+            return Err(CreateFlowVersionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::flow_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        };
+
+        // Two bounds stop a flow's version state growing without end, and
+        // `ServiceQuotaExceededException` is the modelled refusal for either: the
+        // store's own bound on the versions one flow holds, and the model's — a
+        // version past the widest `NumericalVersion` could not be reported on the
+        // wire at all. Each names the bound it hit. Both are checked AFTER the
+        // idempotency replay above, so a retry of an accepted create is still
+        // served.
+        let exceeded = if version_count >= crate::state::FLOW_VERSION_QUOTA {
+            Some(format!(
+                "this flow already holds the maximum of {} versions",
+                crate::state::FLOW_VERSION_QUOTA
+            ))
+        } else if version > crate::state::MAX_NUMERICAL_VERSION {
+            Some(format!(
+                "this flow has already been cut at version {}, the highest a flow version \
+                 can be numbered",
+                crate::state::MAX_NUMERICAL_VERSION
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = exceeded {
+            return Err(
+                CreateFlowVersionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A version is a SNAPSHOT of the DRAFT it is cut from, taken now: the
+        // name, role, encryption key, definition and status the flow holds at
+        // this instant, under the next version number. A later change to the
+        // DRAFT moves the DRAFT alone.
+        let record =
+            crate::state::FlowVersionRecord::snapshot_of(flow, version, input.description, now);
+        let output = record.to_create_output();
+        if let Some(token) = input.client_token {
+            state
+                .flow_version_client_tokens
+                .insert((flow_id.clone(), token), version);
+        }
+        state
+            .flow_versions
+            .insert((flow_id.clone(), version), record);
+        // The flow has now been cut at this version, and numbering never goes
+        // back: the next cut takes the next number even if this version is
+        // deleted.
+        if let Some(flow) = state.flows.get_mut(&flow_id) {
+            flow.versions_cut = version;
+        }
+
+        Ok(output)
     }
 }
