@@ -4,7 +4,8 @@
 //! IMPLEMENTED: stops a deployment of this environment — rolling back one the service is
 //! still working on, or reverting a completed one the request allows a revert of — and
 //! answers the stored deployment record, which it resolves whether or not the environment
-//! the deployment was started into still exists.
+//! the deployment was started into still exists. The stop SETTLES what it did: the
+//! deployment it answers is already in the terminal state the stop left it in.
 //!
 //! ## Shape of an operation
 //!
@@ -323,7 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `Deployment::materialize_without_environment`.
             deployment.materialize_without_environment(now);
             let state_before = deployment.state.clone();
-            if let Err(refusal) = deployment.stop_without_environment(allow_revert, now) {
+            if let Err(refusal) = deployment.stop(allow_revert, now) {
                 return Err(refused(&input, &state_before, refusal));
             }
             // Answered from the stored record, after the stop was written to it.
@@ -355,8 +356,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answered from the stored record, after the stop was written to it.
         let output = document(deployment);
 
-        // The environment follows the deployment a caller just stopped: it is rolling
-        // back for as long as that deployment is.
+        // The environment follows the deployment a caller just stopped: a stopped
+        // deployment is rolled back when the stop answers, so the environment reports that
+        // and takes a new deployment again.
         environment.materialize(now);
 
         Ok(output)

@@ -952,10 +952,17 @@ const DESCRIPTION_DEPLOYMENT_COMPLETED: &str = "Deployment completed";
 /// See [`DESCRIPTION_DEPLOYMENT_STARTED`]. A deployment whose completion falls due at the
 /// instant it was asked for took no time at all, which is what its event says.
 const DESCRIPTION_DEPLOYMENT_COMPLETED_INSTANTLY: &str = "Deployment completed instantly";
-/// See [`DESCRIPTION_DEPLOYMENT_STARTED`]: the event a caller's stop records.
+/// See [`DESCRIPTION_DEPLOYMENT_STARTED`]: the event the rollback AppConfig itself starts
+/// records when it begins.
 const DESCRIPTION_ROLLBACK_STARTED: &str = "Deployment rollback started";
 /// See [`DESCRIPTION_DEPLOYMENT_STARTED`].
 const DESCRIPTION_ROLLBACK_COMPLETED: &str = "Deployment rollback completed";
+/// See [`DESCRIPTION_DEPLOYMENT_STARTED`]: the completion of the rollback a CALLER asked
+/// for, which reports what initiated it — "the Amazon Web Services account or the Amazon
+/// CloudWatch alarm ARN that initiated a rollback"
+/// (`smithy_query(query="doc",shape="DeploymentEvent",member="Description")`) — the
+/// recorded service's own wording for a rollback a request initiated.
+const DESCRIPTION_ROLLED_BACK_BY_USER: &str = "Deployment rolled back by user request";
 /// See [`DESCRIPTION_DEPLOYMENT_STARTED`].
 const DESCRIPTION_REVERT_COMPLETED: &str = "Deployment reverted";
 
@@ -986,12 +993,14 @@ pub const REVERT_WINDOW_HOURS: u64 = 72;
 /// See [`REVERT_WINDOW_HOURS`].
 pub const REVERT_WINDOW: Duration = Duration::from_secs(REVERT_WINDOW_HOURS * 60 * 60);
 
-/// How long the rollback a caller's stop starts takes to finish.
+/// How long a rollback AppConfig itself starts takes to finish.
 ///
-/// The EMULATOR's span, not a documented one: AppConfig answers the stop while the
-/// deployment is still `ROLLING_BACK` and the clock owes the `ROLLED_BACK` it ends in,
-/// so the span is short but never zero — a caller reading the deployment straight after
-/// stopping it sees the rollback in progress, exactly as it would against AppConfig.
+/// The EMULATOR's span, not a documented one: such a rollback is reported `ROLLING_BACK`
+/// while it runs and the clock owes the `ROLLED_BACK` it ends in, so the span is short but
+/// never zero — a caller reading the deployment straight after an extension aborted it
+/// sees the rollback in progress. A rollback a caller's own `StopDeployment` asked for is
+/// NOT paced by this: it is already finished when that call answers
+/// ([`Deployment::stop`]).
 const ROLLBACK_DURATION: Duration = Duration::from_millis(500);
 
 /// The percentage of targets a finished rollout has reached, and the ceiling every growth
@@ -2536,9 +2545,9 @@ impl Deployment {
         )
     }
 
-    /// Whether the deployment is rolling back after a caller stopped it — the one
-    /// non-terminal state nothing but a stop puts it in, and which the clock then
-    /// finishes.
+    /// Whether the deployment is rolling back after AppConfig aborted it — the one
+    /// non-terminal state nothing but [`Self::begin_rollback`] puts it in, and which the
+    /// clock then finishes.
     pub fn is_rolling_back(&self) -> bool {
         self.state == DEPLOYMENT_ROLLING_BACK
     }
@@ -2567,12 +2576,15 @@ impl Deployment {
 
     /// Stop this deployment at `now`, as `StopDeployment` asks.
     ///
-    /// A deployment the service is still working on is rolled back: it moves to
-    /// `ROLLING_BACK` straight away and the clock owes the `ROLLED_BACK` it ends in. A
-    /// deployment that already completed is reverted instead — but only when the caller
-    /// supplied `allow_revert` and only inside [`REVERT_WINDOW`] of its completion — and
-    /// a revert has no intermediate state, so it is `REVERTED` at once. A deployment in
-    /// any other state is refused and left exactly as it was.
+    /// A deployment the service is still working on is rolled back, and that rollback is
+    /// SETTLED by the time the stop answers: the record is `ROLLED_BACK`, the terminal
+    /// state of a stopped deployment, with the rollback's completion on its event log — so
+    /// the stop's own response and every later read of the deployment report the same
+    /// outcome, and nothing is left for a reader to finish. A deployment that already
+    /// completed is reverted instead — but only when the caller supplied `allow_revert` and
+    /// only inside [`REVERT_WINDOW`] of its completion — and a revert is terminal too, so
+    /// it is `REVERTED` at once. A deployment in any other state is refused and left
+    /// exactly as it was.
     ///
     /// "Still working on it" is read as the deployment being IN PROGRESS — rolling out
     /// or baking — rather than as the single state `DEPLOYING`: the model's own sentence
@@ -2582,12 +2594,16 @@ impl Deployment {
     /// one would refuse a stop of a `BAKING` deployment that carried no `AllowRevert`.
     pub fn stop(&mut self, allow_revert: bool, now: SystemTime) -> Result<(), StopRefusal> {
         if self.is_in_flight() {
-            self.state = DEPLOYMENT_ROLLING_BACK.to_string();
-            self.rollback_completion_due = Some(now + ROLLBACK_DURATION);
+            self.state = DEPLOYMENT_ROLLED_BACK.to_string();
+            // Nothing is due: the rollback is over when the stop answers, so no reader is
+            // owed a transition and the deployment has no stage left to tick through.
+            self.rollback_completion_due = None;
+            self.completed_at = Some(now);
+            self.next_tick_due = None;
             self.event_log.push(deployment_event(
-                EVENT_ROLLBACK_STARTED,
+                EVENT_ROLLBACK_COMPLETED,
                 TRIGGERED_BY_USER,
-                DESCRIPTION_ROLLBACK_STARTED.to_string(),
+                DESCRIPTION_ROLLED_BACK_BY_USER.to_string(),
                 now,
             ));
             return Ok(());
@@ -2617,42 +2633,24 @@ impl Deployment {
         Ok(())
     }
 
-    /// Stop this deployment at `now` once the environment it was rolling into has been
-    /// deleted.
+    /// Roll this deployment back at `now` on AppConfig's OWN initiative, the way an
+    /// extension's abort directive asks for.
     ///
-    /// The same acceptance rule as [`Self::stop`] — a deployment the service was still
-    /// working on is rolled back, a completed one is reverted only when the caller allows
-    /// it and only inside [`REVERT_WINDOW`], anything else is refused and left as it was —
-    /// with one difference: the rollback is already FINISHED when this answers, so the
-    /// deployment is `ROLLED_BACK` rather than `ROLLING_BACK`. A rollback walks the
-    /// configuration back out of the environment the deployment was rolling into, and that
-    /// environment no longer exists, so there is no interval of work left for the clock to
-    /// owe and both of the rollback's events fall at this instant.
-    pub fn stop_without_environment(
-        &mut self,
-        allow_revert: bool,
-        now: SystemTime,
-    ) -> Result<(), StopRefusal> {
+    /// Not a caller's stop: the service starts a rollback it then works through, so the
+    /// deployment reports `ROLLING_BACK` and the clock owes the `ROLLED_BACK` it ends in
+    /// ([`ROLLBACK_DURATION`]), with the rollback's start on its event log. Only a
+    /// deployment that is still rolling out or baking has anything to abort; one the
+    /// service has already finished with is refused and left exactly as it was.
+    pub fn begin_rollback(&mut self, now: SystemTime) -> Result<(), StopRefusal> {
         if !self.is_in_flight() {
-            // Every other state is judged exactly as it is for a deployment whose
-            // environment is still there.
-            return self.stop(allow_revert, now);
+            return Err(StopRefusal::NotStoppable);
         }
-        self.state = DEPLOYMENT_ROLLED_BACK.to_string();
-        // Nothing is due: the rollback is over, so no reader is owed a transition.
-        self.rollback_completion_due = None;
-        self.completed_at = Some(now);
-        self.next_tick_due = None;
+        self.state = DEPLOYMENT_ROLLING_BACK.to_string();
+        self.rollback_completion_due = Some(now + ROLLBACK_DURATION);
         self.event_log.push(deployment_event(
             EVENT_ROLLBACK_STARTED,
-            TRIGGERED_BY_USER,
-            DESCRIPTION_ROLLBACK_STARTED.to_string(),
-            now,
-        ));
-        self.event_log.push(deployment_event(
-            EVENT_ROLLBACK_COMPLETED,
             TRIGGERED_BY_APPCONFIG,
-            DESCRIPTION_ROLLBACK_COMPLETED.to_string(),
+            DESCRIPTION_ROLLBACK_STARTED.to_string(),
             now,
         ));
         Ok(())
@@ -2661,7 +2659,7 @@ impl Deployment {
     /// Bring a deployment whose environment has been deleted up to what the clock still
     /// owes it at `now`.
     ///
-    /// Only a rollback a caller had already started is still due: it was owed at an instant
+    /// Only a rollback already under way is still due: it was owed at an instant
     /// that has passed whether or not any environment still held the deployment. The
     /// strategy's remaining growth steps, its bake time and the completion they lead to are
     /// NOT owed any more — they are the rollout of a configuration into an environment that
@@ -2757,13 +2755,12 @@ impl Deployment {
     /// not anybody asked, so a reporting operation may call it: it cannot make a later
     /// caller see anything other than what the clock had already made true.
     pub fn materialize(&mut self, now: SystemTime) {
-        // A rollback is the one transition here a CALLER started, so it is finished on
-        // its own: a deployment that was stopped mid-rollout is owed nothing further by
-        // the strategy's schedule.
+        // A rollback supersedes the rollout it aborted, so it is finished on its own: a
+        // deployment rolling back is owed nothing further by the strategy's schedule.
         if self.is_rolling_back() {
             let Some(due) = self.rollback_completion_due else {
-                // Unreachable: `stop` is the only thing that puts a deployment in this
-                // state and it always records when the rollback falls due. Asserted
+                // Unreachable: `begin_rollback` is the only thing that puts a deployment
+                // in this state and it always records when the rollback falls due. Asserted
                 // rather than silently absorbed, so a future path that forgets it shows
                 // up in a debug build instead of leaving a record stuck here.
                 debug_assert!(

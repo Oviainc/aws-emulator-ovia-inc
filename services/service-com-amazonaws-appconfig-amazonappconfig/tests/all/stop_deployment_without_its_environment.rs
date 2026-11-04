@@ -9,10 +9,8 @@
 //! addresses the deployment itself, still settles one by the application id, environment id
 //! and deployment number its own path carries. A stop of such a record is judged by the
 //! state the record is in exactly as a stop of a deployment whose environment is still
-//! there, with one difference: a rollback walks the configuration back out of the
-//! environment the deployment was rolling into, and that environment is gone, so the
-//! rollback is already finished when the stop answers — `ROLLED_BACK`, with the rollback's
-//! completion in the deployment's own event log.
+//! there: the stop settles the rollback it performs, so the record is `ROLLED_BACK` when the
+//! stop answers, with the rollback's completion in the deployment's own event log.
 //!
 //! The tables span what that rule generalises over: the pacing of the deployment at the
 //! instant its environment is deleted (both published bounds of
@@ -66,8 +64,9 @@ async fn get_environment(
     .await
 }
 
-/// `ListDeployments`, which reports against the ENVIRONMENT it lists under.
-async fn list_deployments(
+/// `ListDeployments`, which reports against the ENVIRONMENT it lists under. `pub(crate)`
+/// because more than one suite lists an environment's deployments this way.
+pub(crate) async fn list_deployments(
     router: &MultiServiceRouter,
     application: &str,
     environment: &str,
@@ -304,8 +303,8 @@ async fn a_stop_settles_a_deployment_whose_environment_was_deleted() {
         assert_eq!(
             member(&stop_body, "State").as_str(),
             Some("ROLLED_BACK"),
-            "case {case:?}: with the environment gone there is nothing left to roll the \
-             configuration back out of, so the rollback is finished when the stop answers, got {}",
+            "case {case:?}: a stop settles the rollback it performs, so the deployment is \
+             rolled back when the stop answers, got {}",
             member(&stop_body, "State")
         );
         assert!(
@@ -320,10 +319,6 @@ async fn a_stop_settles_a_deployment_whose_environment_was_deleted() {
             Some("ROLLBACK_COMPLETED"),
             "case {case:?}: the newest event of a rolled-back deployment is its rollback \
              finishing, got {log:?}"
-        );
-        assert!(
-            log.iter().any(|event| event == "ROLLBACK_STARTED"),
-            "case {case:?}: the log keeps the rollback's start, got {log:?}"
         );
         assert_eq!(
             log.last().map(String::as_str),
@@ -712,15 +707,15 @@ fn a_deployment_without_its_environment_is_owed_nothing_by_the_clock_and_rolls_b
         // The stop rolls it back, and the rollback is over when the stop answers.
         let stopped_at = deleted_at + Duration::from_secs(5);
         assert_eq!(
-            deployment.stop_without_environment(false, stopped_at),
+            deployment.stop(false, stopped_at),
             Ok(()),
             "case {case:?}: a deployment in flight can be stopped once its environment is gone"
         );
         assert_eq!(
             deployment.state,
             state::DEPLOYMENT_ROLLED_BACK,
-            "case {case:?}: with no environment to walk the configuration back out of, the \
-             rollback is finished, got {:?}",
+            "case {case:?}: a stop settles the rollback it performs, so the record is rolled \
+             back, got {:?}",
             deployment.state
         );
         assert_eq!(
@@ -744,11 +739,6 @@ fn a_deployment_without_its_environment_is_owed_nothing_by_the_clock_and_rolls_b
             Some(state::EVENT_ROLLBACK_COMPLETED),
             "case {case:?}: the newest event is the rollback finishing, got {log:?}"
         );
-        assert!(
-            log.iter()
-                .any(|event| event == state::EVENT_ROLLBACK_STARTED),
-            "case {case:?}: the log keeps the rollback's start, got {log:?}"
-        );
         assert_eq!(
             log.last().map(String::as_str),
             Some(state::EVENT_DEPLOYMENT_STARTED),
@@ -759,7 +749,7 @@ fn a_deployment_without_its_environment_is_owed_nothing_by_the_clock_and_rolls_b
         let settled = deployment.clone();
         for allow_revert in [false, true] {
             assert_eq!(
-                deployment.stop_without_environment(allow_revert, stopped_at + Duration::from_secs(1)),
+                deployment.stop(allow_revert, stopped_at + Duration::from_secs(1)),
                 Err(StopRefusal::NotStoppable),
                 "case {case:?}: a rolled-back deployment cannot be stopped again (AllowRevert \
                  {allow_revert})"
@@ -778,7 +768,7 @@ fn a_deployment_without_its_environment_is_owed_nothing_by_the_clock_and_rolls_b
     }
 }
 
-/// A rollback a caller had ALREADY started before the environment was deleted is the one
+/// A rollback AppConfig had ALREADY started before the environment was deleted is the one
 /// transition such a record is still owed: it was due at an instant that has passed whether
 /// or not any environment still held the deployment, so the clock finishes it then — and
 /// not before.
@@ -807,12 +797,12 @@ fn the_clock_still_finishes_a_rollback_started_before_the_environment_was_delete
                 })
                 .unwrap_or_else(|| panic!("case {case:?}: the recorded deployment is readable"));
             assert_eq!(
-                deployment.stop(false, started_at),
+                deployment.begin_rollback(started_at),
                 Ok(()),
-                "case {case:?}: a deployment in flight can be stopped"
+                "case {case:?}: a deployment in flight can be rolled back"
             );
             deployment.rollback_completion_due.unwrap_or_else(|| {
-                panic!("case {case:?}: a stopped deployment records when its rollback falls due")
+                panic!("case {case:?}: a rolling-back deployment records when its rollback falls due")
             })
         };
 
@@ -910,7 +900,7 @@ fn the_documented_revert_window_governs_a_record_without_its_environment() {
         // A stop that does not ask for a revert never applies to a completed deployment,
         // whenever it arrives and whether or not its environment is still there.
         assert_eq!(
-            deployment.stop_without_environment(false, at),
+            deployment.stop(false, at),
             Err(StopRefusal::NotStoppable),
             "case {case:?}: a completed deployment can only be reverted, not stopped"
         );
@@ -921,7 +911,7 @@ fn the_documented_revert_window_governs_a_record_without_its_environment() {
             deployment.state
         );
 
-        let outcome = deployment.stop_without_environment(true, at);
+        let outcome = deployment.stop(true, at);
         if inside_window {
             assert_eq!(
                 outcome,

@@ -129,6 +129,8 @@ mod stop_deployment;
 mod stop_deployment_without_its_environment;
 #[path = "all/stop_experiment_run.rs"]
 mod stop_experiment_run;
+#[path = "all/stop_operations_settle_terminal_outcomes.rs"]
+mod stop_operations_settle_terminal_outcomes;
 #[path = "all/update_application.rs"]
 mod update_application;
 #[path = "all/update_configuration_profile.rs"]

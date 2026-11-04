@@ -6,10 +6,11 @@
 //! one rolling out or baking — which it rolls back, and, only when the request allows a
 //! revert, to one that completed inside the window AppConfig documents for a revert,
 //! which it reverts; a deployment in any other state is refused with the operation's
-//! modelled `BadRequestException` and left exactly as it was. The rollback itself is owed
-//! by the CLOCK: the stop answers the deployment while it is still `ROLLING_BACK`, and the
-//! record reaches `ROLLED_BACK` at the instant that was due, without any reader finishing
-//! it early. The environment follows the deployment it holds.
+//! modelled `BadRequestException` and left exactly as it was. Either outcome is SETTLED by
+//! the call: the deployment the stop answers is already in the terminal state the stop left
+//! it in — `ROLLED_BACK` with the rollback's completion on its event log, or `REVERTED` —
+//! so a reader of that deployment, and the environment that holds it, report the same
+//! outcome with nothing left in flight.
 //!
 //! The tables below span what that rule generalises over: the pacing of the deployment
 //! being stopped (a rollout window, none at all with a bake time to follow, both growth
@@ -174,18 +175,20 @@ fn read_deployment_state(case: &str, body: &Value) -> String {
         .to_string()
 }
 
-/// Where a stopped deployment can be: rolling back, or rolled back once the clock has
-/// finished the rollback. A reader over HTTP cannot know which side of that due instant it
-/// is on, so it asserts what holds on both.
-const ROLLBACK_DEPLOYMENT_STATES: &[&str] = &[ROLLING_BACK, ROLLED_BACK];
-
-/// The `EnvironmentState` wire values matching [`ROLLBACK_DEPLOYMENT_STATES`].
-const ROLLBACK_ENVIRONMENT_STATES: &[&str] = &["RollingBack", "RolledBack"];
-
-/// The two `DeploymentState` values a stop puts a deployment in progress through.
-const ROLLING_BACK: &str = "ROLLING_BACK";
-/// See [`ROLLING_BACK`].
+/// The terminal `DeploymentState` a stop of a deployment in progress leaves behind: the
+/// stop settles the rollback it performs, so there is no transitional state for a reader
+/// to catch.
 const ROLLED_BACK: &str = "ROLLED_BACK";
+
+/// The `EnvironmentState` wire value matching [`ROLLED_BACK`].
+const ROLLED_BACK_ENVIRONMENT: &str = "RolledBack";
+
+/// The `DeploymentEventType` a settled rollback records.
+const ROLLBACK_COMPLETED: &str = "ROLLBACK_COMPLETED";
+
+/// The `Description` AppConfig gives the rollback a request initiated, as the recorded
+/// stop reports it.
+const ROLLED_BACK_BY_USER: &str = "Deployment rolled back by user request";
 
 /// A lookup that must miss, with the modelled `ResourceNotFoundException`.
 fn assert_not_found(case: &str, answer: &Answer) {
@@ -224,10 +227,10 @@ pub(crate) const IDENTITY_MEMBERS: &[&str] = &[
     "Type",
 ];
 
-/// A stop of a deployment the service is still working on rolls it back: the 202 reports
-/// the deployment `ROLLING_BACK` with the rollback's own event, the implemented reader
-/// answers the same record, the environment follows it, and a second stop has nothing left
-/// to stop.
+/// A stop of a deployment the service is still working on rolls it back, and the rollback
+/// is FINISHED when the stop answers: the 202 reports the deployment `ROLLED_BACK` with the
+/// rollback's completion newest on its event log, the implemented reader answers the same
+/// record, the environment reports it, and a second stop has nothing left to stop.
 #[tokio::test]
 async fn stopping_a_deployment_in_progress_rolls_it_back_whatever_paced_it() {
     let router = router();
@@ -286,21 +289,35 @@ async fn stopping_a_deployment_in_progress_rolls_it_back_whatever_paced_it() {
         let stop_body = stopped.json();
         assert_eq!(
             member(&stop_body, "State").as_str(),
-            Some("ROLLING_BACK"),
-            "case {case:?}: a deployment stopped in progress is rolling back, got {}",
+            Some(ROLLED_BACK),
+            "case {case:?}: a deployment stopped in progress is rolled back when the stop \
+             answers, got {}",
             member(&stop_body, "State")
         );
         assert!(
-            member(&stop_body, "CompletedAt").is_null(),
-            "case {case:?}: the rollback has not finished, so there is no CompletedAt yet, got {}",
+            !member(&stop_body, "CompletedAt").is_null(),
+            "case {case:?}: a rolled-back deployment carries the instant its rollback \
+             finished, got {}",
             member(&stop_body, "CompletedAt")
         );
-        let log = event_types(&event_log(case, "StopDeployment", &stop_body));
+        let stop_events = event_log(case, "StopDeployment", &stop_body);
+        let log = event_types(&stop_events);
         assert_eq!(
             log.first().map(String::as_str),
-            Some("ROLLBACK_STARTED"),
-            "case {case:?}: the newest event of a stopped deployment is its rollback starting, \
-             got {log:?}"
+            Some(ROLLBACK_COMPLETED),
+            "case {case:?}: the newest event of a stopped deployment is its rollback \
+             finishing, got {log:?}"
+        );
+        let newest = stop_events.first().cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            member(&newest, "Description").as_str(),
+            Some(ROLLED_BACK_BY_USER),
+            "case {case:?}: the rollback's event reports what initiated it, got {newest}"
+        );
+        assert_eq!(
+            member(&newest, "TriggeredBy").as_str(),
+            Some("USER"),
+            "case {case:?}: the request initiated the rollback, got {newest}"
         );
         assert_eq!(
             log.last().map(String::as_str),
@@ -319,11 +336,9 @@ async fn stopping_a_deployment_in_progress_rolls_it_back_whatever_paced_it() {
             );
         }
 
-        // The round trip: the stop was persisted, so the implemented reader answers it.
-        // Which of the two rollback states it reports depends on whether the rollback has
-        // fallen due by the time this call runs — the clock owes that transition and no
-        // test may pin wall-clock timing — so what is asserted here is what holds on BOTH
-        // sides of the due instant. The deterministic half is in the clock suites below.
+        // The round trip: the stop was persisted, and it settled the deployment, so the
+        // implemented reader answers exactly the record the stop answered — no later read
+        // moves a deployment nothing is working on any more.
         let fetched = get_deployment(&router, &application, &environment, 1).await;
         assert_eq!(
             fetched.status,
@@ -333,12 +348,15 @@ async fn stopping_a_deployment_in_progress_rolls_it_back_whatever_paced_it() {
             String::from_utf8_lossy(&fetched.body)
         );
         let read_body = fetched.json();
+        assert_eq!(
+            read_body, stop_body,
+            "case {case:?}: GetDeployment must report the settled record the stop answered"
+        );
         let read_state = read_deployment_state(case, &read_body);
         let read_log = event_types(&event_log(case, "GetDeployment", &read_body));
-        assert!(
-            read_log.iter().any(|event| event == "ROLLBACK_STARTED"),
-            "case {case:?}: GetDeployment must report the stored log, which carries the \
-             rollback the stop started, got {read_log:?}"
+        assert_eq!(
+            read_state, ROLLED_BACK,
+            "case {case:?}: the stored deployment is rolled back, got {read_state:?}"
         );
         assert_eq!(
             read_log.last().map(String::as_str),
@@ -346,39 +364,15 @@ async fn stopping_a_deployment_in_progress_rolls_it_back_whatever_paced_it() {
             "case {case:?}: the oldest entry of the stored log is the deployment's start, got \
              {read_log:?}"
         );
-        if read_state == ROLLED_BACK {
-            // Once the rollback has finished, the deployment is over: it carries the
-            // instant it finished and the event that finished it.
-            assert!(
-                !member(&read_body, "CompletedAt").is_null(),
-                "case {case:?}: a rolled-back deployment carries the instant its rollback \
-                 finished, got {}",
-                member(&read_body, "CompletedAt")
-            );
-            assert_eq!(
-                read_log.first().map(String::as_str),
-                Some("ROLLBACK_COMPLETED"),
-                "case {case:?}: the newest event of a rolled-back deployment is its rollback \
-                 finishing, got {read_log:?}"
-            );
-        } else {
-            assert_eq!(
-                read_log, log,
-                "case {case:?}: while the rollback is still due, GetDeployment must report \
-                 exactly the log the stop answered"
-            );
-        }
-
         // The environment reports the deployment it holds, in `EnvironmentState`'s own
-        // CamelCase wire form — one of the two the rollback puts it in, for the same
-        // reason the deployment's own state is read as a pair.
+        // CamelCase wire form: the rollback is over, so the environment reports the state
+        // it left behind.
         let environment_now = environment_state(&router, &application, &environment).await;
-        assert!(
-            environment_now
-                .as_deref()
-                .is_some_and(|state| ROLLBACK_ENVIRONMENT_STATES.contains(&state)),
-            "case {case:?}: an environment whose deployment was stopped reports one of \
-             {ROLLBACK_ENVIRONMENT_STATES:?}, got {environment_now:?}"
+        assert_eq!(
+            environment_now.as_deref(),
+            Some(ROLLED_BACK_ENVIRONMENT),
+            "case {case:?}: an environment whose deployment was stopped reports \
+             {ROLLED_BACK_ENVIRONMENT:?}, got {environment_now:?}"
         );
 
         // A second stop has nothing left to stop, and says which state it refused.
@@ -387,12 +381,12 @@ async fn stopping_a_deployment_in_progress_rolls_it_back_whatever_paced_it() {
             case,
             &again,
             &["Deployment 1", application.as_str(), environment.as_str()],
-            ROLLBACK_DEPLOYMENT_STATES,
+            &[ROLLED_BACK],
         );
         let after_refusal = get_deployment(&router, &application, &environment, 1).await;
-        assert!(
-            ROLLBACK_DEPLOYMENT_STATES
-                .contains(&read_deployment_state(case, &after_refusal.json()).as_str()),
+        assert_eq!(
+            read_deployment_state(case, &after_refusal.json()),
+            ROLLED_BACK,
             "case {case:?}: a refused stop must leave the record where the stop put it, got {}",
             member(&after_refusal.json(), "State")
         );
@@ -613,11 +607,11 @@ fn stored_event_types(deployment: &Deployment) -> Vec<String> {
         .collect()
 }
 
-/// The rollback a stop starts is owed by the CLOCK: the record is `ROLLING_BACK` when the
-/// stop answers, nothing finishes it early, and it reaches `ROLLED_BACK` at the instant
-/// that was due — once, however often it is read.
+/// A caller's stop SETTLES the rollback it performs: the record is `ROLLED_BACK` the moment
+/// the stop returns, carrying the instant it finished and the rollback's completion event,
+/// and no later read moves it or appends anything.
 #[test]
-fn the_clock_finishes_the_rollback_a_stop_started() {
+fn a_stop_settles_the_rollback_it_performs() {
     let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
 
     // Rows differ along the pacing of the deployment stopped — both published bounds of
@@ -650,8 +644,121 @@ fn the_clock_finishes_the_rollback_a_stop_started() {
         );
         assert_eq!(
             deployment.state,
+            state::DEPLOYMENT_ROLLED_BACK,
+            "case {case:?}: a stop leaves the deployment rolled back, got {:?}",
+            deployment.state
+        );
+        assert!(
+            !deployment.is_active(),
+            "case {case:?}: a stopped deployment is one nothing is working on any more, got {:?}",
+            deployment.state
+        );
+        assert_eq!(
+            deployment.completed_at,
+            Some(stopped_at),
+            "case {case:?}: the record finished when its rollback did, got {:?}",
+            deployment.completed_at
+        );
+        assert_eq!(
+            deployment.rollback_completion_due, None,
+            "case {case:?}: nothing is due on a rollback that is already over, got {:?}",
+            deployment.rollback_completion_due
+        );
+
+        let log = stored_event_types(&deployment);
+        assert_eq!(
+            log.first().map(String::as_str),
+            Some(state::EVENT_ROLLBACK_COMPLETED),
+            "case {case:?}: the newest event is the rollback finishing, got {log:?}"
+        );
+        assert_eq!(
+            log.last().map(String::as_str),
+            Some(state::EVENT_DEPLOYMENT_STARTED),
+            "case {case:?}: the oldest event is the deployment's start, got {log:?}"
+        );
+        let newest = deployment
+            .event_log_newest_first()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: the stop records an event"));
+        assert_eq!(
+            newest.description.as_deref(),
+            Some(ROLLED_BACK_BY_USER),
+            "case {case:?}: the rollback's event reports what initiated it, got {:?}",
+            newest.description
+        );
+        assert_eq!(
+            newest.triggered_by.as_deref(),
+            Some(state::TRIGGERED_BY_USER),
+            "case {case:?}: the request initiated the rollback, got {:?}",
+            newest.triggered_by
+        );
+
+        // Reading it again owes nothing: the stop left nothing for the clock to finish.
+        let settled = deployment.clone();
+        deployment.materialize(stopped_at + Duration::from_secs(3600));
+        assert_eq!(
+            deployment.state, settled.state,
+            "case {case:?}: a later read must not move a rolled-back deployment"
+        );
+        assert_eq!(
+            deployment.event_log.len(),
+            settled.event_log.len(),
+            "case {case:?}: a later read must not append an event the clock did not owe"
+        );
+
+        // And a deployment the service has finished with cannot be stopped again, whatever
+        // the request allows.
+        for allow_revert in [false, true] {
+            assert_eq!(
+                deployment.stop(allow_revert, stopped_at + Duration::from_secs(1)),
+                Err(StopRefusal::NotStoppable),
+                "case {case:?}: a rolled-back deployment cannot be stopped again (AllowRevert \
+                 {allow_revert})"
+            );
+            assert_eq!(
+                deployment.state,
+                state::DEPLOYMENT_ROLLED_BACK,
+                "case {case:?}: a refused stop leaves the record exactly as it was, got {:?}",
+                deployment.state
+            );
+        }
+    }
+}
+
+/// The rollback AppConfig starts on its OWN initiative — an extension's abort directive,
+/// not a caller's stop — is the one owed by the CLOCK: the record is `ROLLING_BACK` while it
+/// runs, nothing finishes it early, and it reaches `ROLLED_BACK` at the instant that was
+/// due, once however often it is read.
+#[test]
+fn the_clock_finishes_the_rollback_appconfig_starts() {
+    let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+    // The same span of pacings and stop instants as the suite above: what differs is WHO
+    // started the rollback, not the deployment it aborts.
+    let rows: [(&str, i32, &str, f32, i32, u64); 5] = [
+        ("aborted a minute into the longest rollout", 1440, state::GROWTH_LINEAR, 100.0, 0, 60),
+        ("aborted at the instant it started", 60, state::GROWTH_EXPONENTIAL, 1.0, 10, 0),
+        ("aborted while baking", 0, state::GROWTH_LINEAR, 100.0, 1440, 60),
+        ("aborted mid-rollout with the longest bake", 1440, state::GROWTH_LINEAR, 50.0, 1440, 3600),
+        ("aborted a second before a short rollout ends", 5, state::GROWTH_LINEAR, 10.0, 0, 299),
+    ];
+
+    for (case, duration, growth_type, growth_factor, bake, elapsed_secs) in rows {
+        let strategy = strategy_of(duration, growth_type, growth_factor, bake);
+        let mut deployment = Deployment::start(new_deployment(), &strategy, started_at);
+        let aborted_at = started_at + Duration::from_secs(elapsed_secs);
+        deployment.materialize(aborted_at);
+
+        assert_eq!(
+            deployment.begin_rollback(aborted_at),
+            Ok(()),
+            "case {case:?}: a deployment in progress can be rolled back"
+        );
+        assert_eq!(
+            deployment.state,
             state::DEPLOYMENT_ROLLING_BACK,
-            "case {case:?}: a stop starts the rollback, got {:?}",
+            "case {case:?}: the rollback has started, got {:?}",
             deployment.state
         );
         assert!(
@@ -666,16 +773,16 @@ fn the_clock_finishes_the_rollback_a_stop_started() {
             deployment.completed_at
         );
         let due = deployment.rollback_completion_due.unwrap_or_else(|| {
-            panic!("case {case:?}: a stopped deployment records when its rollback falls due")
+            panic!("case {case:?}: a rolling-back deployment records when its rollback falls due")
         });
         assert!(
-            due > stopped_at,
-            "case {case:?}: the rollback is never already over when the stop answers, got \
-             {due:?} due at the stop instant {stopped_at:?}"
+            due > aborted_at,
+            "case {case:?}: the rollback is never already over when it starts, got {due:?} due \
+             at the abort instant {aborted_at:?}"
         );
 
         // Nothing before the due instant finishes it: a read is not a transition.
-        let events_at_stop = deployment.event_log.len();
+        let events_at_abort = deployment.event_log.len();
         deployment.materialize(due - Duration::from_millis(1));
         assert_eq!(
             deployment.state,
@@ -685,7 +792,7 @@ fn the_clock_finishes_the_rollback_a_stop_started() {
         );
         assert_eq!(
             deployment.event_log.len(),
-            events_at_stop,
+            events_at_abort,
             "case {case:?}: a read before the rollback falls due appends no event"
         );
 
@@ -702,10 +809,6 @@ fn the_clock_finishes_the_rollback_a_stop_started() {
             Some(due),
             "case {case:?}: a rolled-back deployment finished when its rollback did, got {:?}",
             deployment.completed_at
-        );
-        assert!(
-            !deployment.is_active(),
-            "case {case:?}: a rolled-back deployment is one nothing is working on any more"
         );
         let log = stored_event_types(&deployment);
         assert_eq!(
@@ -737,22 +840,12 @@ fn the_clock_finishes_the_rollback_a_stop_started() {
             "case {case:?}: a later read must not append an event the clock did not owe"
         );
 
-        // And a deployment the service has finished with cannot be stopped again, whatever
-        // the request allows.
-        for allow_revert in [false, true] {
-            assert_eq!(
-                deployment.stop(allow_revert, due + Duration::from_secs(1)),
-                Err(StopRefusal::NotStoppable),
-                "case {case:?}: a rolled-back deployment cannot be stopped again (AllowRevert \
-                 {allow_revert})"
-            );
-            assert_eq!(
-                deployment.state,
-                state::DEPLOYMENT_ROLLED_BACK,
-                "case {case:?}: a refused stop leaves the record exactly as it was, got {:?}",
-                deployment.state
-            );
-        }
+        // And a rollback already finished cannot be started again.
+        assert_eq!(
+            deployment.begin_rollback(due + Duration::from_secs(1)),
+            Err(StopRefusal::NotStoppable),
+            "case {case:?}: a rolled-back deployment has nothing left to roll back"
+        );
     }
 }
 
@@ -886,9 +979,10 @@ fn empty_environment() -> Environment {
 
 /// An environment's reported state, and whether it is still working on a deployment,
 /// follow the deployment it holds through the whole life of a stop: `DEPLOYING` while the
-/// deployment rolls out or bakes, `ROLLING_BACK` once a caller stops it, and `ROLLED_BACK`
-/// when the clock finishes that rollback — at which point the environment has nothing in
-/// flight and takes a new deployment again.
+/// deployment rolls out or bakes, and `ROLLED_BACK` once a caller's stop has settled the
+/// rollback — at which point the environment has nothing in flight and takes a new
+/// deployment again. A rollback AppConfig starts on its own initiative is the one the
+/// environment reports as `ROLLING_BACK`, until the clock finishes it.
 ///
 /// Asserted against the record, at instants this test chooses, so the clock-owed half is
 /// deterministic rather than a wall-clock race.
@@ -898,14 +992,18 @@ fn an_environments_state_and_readiness_follow_the_deployment_it_holds() {
 
     // Rows differ along the pacing of the deployment the environment holds, which is what
     // decides the state it is in when the stop arrives — none of which the environment's
-    // own progression depends on.
-    let rows: [(&str, i32, i32); 3] = [
-        ("the longest rollout the model allows", 1440, 0),
-        ("no rollout window, so it is baking", 0, 1440),
-        ("a short rollout with a bake time", 5, 10),
+    // own progression depends on — and along WHO ends the deployment: a caller's stop,
+    // which settles it, or AppConfig's own rollback, which the clock finishes.
+    let rows: [(&str, i32, i32, bool); 6] = [
+        ("the longest rollout the model allows, stopped", 1440, 0, true),
+        ("no rollout window, so it is baking, stopped", 0, 1440, true),
+        ("a short rollout with a bake time, stopped", 5, 10, true),
+        ("the longest rollout the model allows, aborted", 1440, 0, false),
+        ("no rollout window, so it is baking, aborted", 0, 1440, false),
+        ("a short rollout with a bake time, aborted", 5, 10, false),
     ];
 
-    for (case, duration, bake) in rows {
+    for (case, duration, bake, by_stop) in rows {
         let strategy = strategy_of(duration, state::GROWTH_LINEAR, 100.0, bake);
         let mut environment = empty_environment();
         assert_eq!(
@@ -930,33 +1028,45 @@ fn an_environments_state_and_readiness_follow_the_deployment_it_holds() {
         );
 
         let number = new_deployment().deployment_number;
-        let stopped = environment
+        let ended = environment
             .deployments
             .get_mut(&number)
             .unwrap_or_else(|| panic!("case {case:?}: the recorded deployment is readable back"));
-        assert_eq!(
-            stopped.stop(false, started_at),
-            Ok(()),
-            "case {case:?}: a deployment in progress can be stopped"
-        );
-        let due = stopped.rollback_completion_due.unwrap_or_else(|| {
-            panic!("case {case:?}: a stopped deployment records when its rollback falls due")
-        });
+        let due = if by_stop {
+            assert_eq!(
+                ended.stop(false, started_at),
+                Ok(()),
+                "case {case:?}: a deployment in progress can be stopped"
+            );
+            None
+        } else {
+            assert_eq!(
+                ended.begin_rollback(started_at),
+                Ok(()),
+                "case {case:?}: a deployment in progress can be rolled back"
+            );
+            Some(ended.rollback_completion_due.unwrap_or_else(|| {
+                panic!("case {case:?}: a rolling-back deployment records when it falls due")
+            }))
+        };
 
         environment.materialize(started_at);
-        assert_eq!(
-            environment.state,
-            state::ENVIRONMENT_ROLLING_BACK,
-            "case {case:?}: an environment whose deployment was stopped is rolling back, got {:?}",
-            environment.state
-        );
-        assert!(
-            environment.active_deployment().is_some(),
-            "case {case:?}: the environment is still working on that rollback, so it takes no \
-             new deployment yet"
-        );
+        if let Some(due) = due {
+            assert_eq!(
+                environment.state,
+                state::ENVIRONMENT_ROLLING_BACK,
+                "case {case:?}: an environment whose deployment AppConfig is rolling back \
+                 reports it, got {:?}",
+                environment.state
+            );
+            assert!(
+                environment.active_deployment().is_some(),
+                "case {case:?}: the environment is still working on that rollback, so it takes \
+                 no new deployment yet"
+            );
+            environment.materialize(due);
+        }
 
-        environment.materialize(due);
         assert_eq!(
             environment.state,
             state::ENVIRONMENT_ROLLED_BACK,

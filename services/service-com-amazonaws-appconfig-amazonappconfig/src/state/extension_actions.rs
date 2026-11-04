@@ -875,17 +875,18 @@ pub async fn drive_deployment<Eng: Send + Sync + 'static>(
 /// was invoked for, and answer whether the deployment was rolled back.
 ///
 /// The directive is the extension's abort of a deployment that is still in flight, which
-/// is the same rollback a caller's stop starts — so it is performed by the same
-/// transition, and the event it logs records the invocations that asked for it and the
-/// description the extension gave as its reason. A deployment the service has already
-/// finished with is left exactly as it was: there is nothing in flight to abort.
+/// AppConfig itself then works through ([`Deployment::begin_rollback`]) rather than
+/// settling in one call the way a caller's own stop does — so the deployment reports the
+/// rollback in progress, and the event it logs records the invocations that asked for it
+/// and the description the extension gave as its reason. A deployment the service has
+/// already finished with is left exactly as it was: there is nothing in flight to abort.
 fn apply_roll_back(
     deployment: &mut Deployment,
     description: Option<String>,
     records: Vec<ActionInvocation>,
     now: SystemTime,
 ) -> bool {
-    if deployment.stop(false, now).is_err() {
+    if deployment.begin_rollback(now).is_err() {
         return false;
     }
     if let Some(event) = deployment.event_log.last_mut() {

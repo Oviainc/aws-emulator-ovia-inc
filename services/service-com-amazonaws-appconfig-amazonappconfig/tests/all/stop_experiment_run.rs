@@ -403,12 +403,12 @@ async fn a_second_stop_of_a_finished_run_is_refused_and_changes_nothing() {
         } else {
             (scope.application.clone(), definition_id.clone())
         };
-        let refused = stop_run(&router, &application, &addressed, 1, &body).await;
-        assert_refused(case, &refused, 400, "BadRequestException");
         // The sentence names the run and the definition exactly as the request addressed
         // them, so a row that addressed the definition by name reads back that name.
         let expected_message =
             format!("Experiment run 1 for experiment definition {addressed} is not running.");
+        let refused = stop_run(&router, &application, &addressed, 1, &body).await;
+        assert_refused(case, &refused, 400, "BadRequestException");
         assert_eq!(
             refused.string("Message").as_deref(),
             Some(expected_message.as_str()),
