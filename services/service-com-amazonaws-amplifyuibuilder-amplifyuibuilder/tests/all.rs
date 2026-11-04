@@ -101,5 +101,8 @@ mod theme_update;
 #[path = "all/theme_updates.rs"]
 mod theme_updates;
 
+#[path = "all/update_absent_id_refusal_class.rs"]
+mod update_absent_id_refusal_class;
+
 #[path = "all/wrong_scope_sentence.rs"]
 mod wrong_scope_sentence;

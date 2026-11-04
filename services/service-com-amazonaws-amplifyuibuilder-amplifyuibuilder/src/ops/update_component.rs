@@ -3,9 +3,12 @@
 //! @op UpdateComponent
 //! Merges the members `updatedComponent` carries onto the stored component, leaves every
 //! other member as the create (or the previous update) left it, and reports the merged
-//! record. `UpdateComponent` declares no `ResourceNotFoundException`, so an `id` that
-//! names no component in that app environment is refused with the modelled
-//! `InvalidParameterException` (HTTP 400).
+//! record. An `id` that names no component ANYWHERE is refused with
+//! `ResourceNotFoundException` (HTTP 404) — the shape this operation's own `errors` list
+//! omits and which is widened in through `extra_errors` (see below), the same miss
+//! `GetComponent` and `DeleteComponent` report — and an `id` a DIFFERENT app environment
+//! owns with the modelled `InvalidParameterException` (HTTP 400). An update is never an
+//! upsert.
 //!
 //! `clientToken` needs no replay record here: a merge is idempotent in the members it
 //! writes, so repeating one leaves the same record (only `modifiedAt`, which reports the
