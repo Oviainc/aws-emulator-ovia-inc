@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWebhooks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWebhooks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWebhooks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -86,17 +77,26 @@ use super::types::*;
 // `ListWebhooksError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-amplify-amplify.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ListWebhooksError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.amplify#ListWebhooks")]
+// The operation's MODELED errors, widened by `NotFoundException`.
+//
+// `extra_errors` is deliberate, and the same widening `ListBranches` and
+// `ListDomainAssociations` take: this operation reads ONE app's collection and takes
+// that `appId` as an @httpLabel, so a request can name an app that does not exist,
+// and the only honest answer is the same 404 every other app-scoped operation gives.
+// The model's error union for THIS operation omits the shape (the service declares
+// it, and `CreateWebhook`, `GetWebhook`, `GetApp` and `DeleteApp` all list it), so
+// the widening keeps one rule across the resource instead of inventing a second one
+// here.
+#[smithy_macros::operation_error(
+    "com.amazonaws.amplify#ListWebhooks",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ListWebhooksErrorModeled {
     BadRequestException(BadRequestException),
     InternalFailureException(InternalFailureException),
     LimitExceededException(LimitExceededException),
+    NotFoundException(NotFoundException),
     UnauthorizedException(UnauthorizedException),
 }
 
@@ -149,20 +149,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWebhooks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWebhooksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWebhooks"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListWebhooksErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the Amplify emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // Every `nextToken` this operation issues is a `webhookId`, so a token that
+        // could not be one was never issued by this service: refuse it instead of
+        // serving an arbitrary suffix of the collection for it.
+        if let Some(token) = input.next_token.as_deref() {
+            if !is_webhook_id(token) {
+                return Err(ListWebhooksErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some("Invalid nextToken".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A pure read, scoped to ONE app: the webhooks are read out of that app's own
+        // map, so no other app's webhook can appear in the page. Each element is the
+        // stored record cloned — the very record `GetWebhook` answers — so a listed
+        // webhook and a read of the same webhook agree member for member.
+        let store = state.lock();
+        let app = store.apps.get(&input.app_id).ok_or_else(|| {
+            ListWebhooksErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::APP_ENTITY,
+                    &input.app_id,
+                )),
+            })
+        })?;
+
+        let (webhooks, next_token) = crate::state::page(
+            app.webhooks
+                .iter()
+                .map(|(webhook_id, stored)| (webhook_id.clone(), stored.clone())),
+            input.next_token.as_deref(),
+            crate::state::page_size(input.max_results, MAX_RESULTS),
+        );
+
+        Ok(ListWebhooksOutput {
+            webhooks,
+            next_token,
+        })
     }
+}
+
+/// The largest page `ListWebhooks` serves, and the page it serves a caller that set no
+/// bound: `maxResults` is modelled `range 0..50`
+/// (`smithy_query(query="operation",operation="ListWebhooks")`).
+const MAX_RESULTS: usize = 50;
+
+/// Could `value` be a `webhookId`? `WebhookId` is modelled `length 0..255,
+/// pattern ^(?s)` (`smithy_query(query="shape",shape="Webhook")`), which admits any
+/// text up to 255 characters, while `NextToken` admits up to 2000 — so a longer token
+/// is one this service cannot have issued.
+///
+/// A token naming a webhook that has since been DELETED still satisfies this and is
+/// still honoured — the scan resumes at the next id — so a page boundary survives a
+/// concurrent delete, which is the behaviour a paging client depends on.
+fn is_webhook_id(value: &str) -> bool {
+    value.chars().count() <= 255
 }

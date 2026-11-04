@@ -222,6 +222,14 @@ impl Emulator {
             .await
     }
 
+    /// One page of `app_id`'s webhooks; `query` is the raw query string (`""` for
+    /// none), so a suite can drive `maxResults` and `nextToken` exactly as a client
+    /// would.
+    pub(crate) async fn list_webhooks(&self, app_id: &str, query: &str) -> Reply {
+        self.call("GET", &format!("/apps/{app_id}/webhooks{query}"), None)
+            .await
+    }
+
     /// Create an app and return its minted `appId`.
     pub(crate) async fn app_id_of_new_app(&self, name: &str) -> String {
         let reply = self.create_app(&json!({ "name": name })).await;
