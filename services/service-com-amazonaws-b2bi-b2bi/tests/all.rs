@@ -53,6 +53,8 @@ mod transformer_lifecycle;
 mod untag_resource;
 #[path = "all/update_partnership.rs"]
 mod update_partnership;
+#[path = "all/update_partnership_refusal_status.rs"]
+mod update_partnership_refusal_status;
 #[path = "all/update_transformer.rs"]
 mod update_transformer;
 #[path = "all/wire_response_text.rs"]
