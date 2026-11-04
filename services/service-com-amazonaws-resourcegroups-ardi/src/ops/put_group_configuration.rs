@@ -76,6 +76,13 @@
 //!   …) — The name or Amazon resource name (ARN) of the resource group with the configuration
 //!   that you want to update.
 //!
+//! ## Output
+//!
+//! * `GroupIdentifier` (GroupIdentifier) — The identifiers of the group the accepted
+//!   configuration was attached to.
+//! * `GroupConfiguration` (GroupConfiguration) — The service configuration now reported
+//!   for the group, the accepted update included.
+//!
 //! ## Errors
 //!
 //! * `BadRequestException` (HTTP 400) — The request includes one or more parameters that
@@ -260,6 +267,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // due a span later, so a caller reading straight after this call still sees the
         // update in flight.
         record.put_configuration(input.configuration, now);
+        // Reported from the record that was just written, so the answer and the
+        // store cannot disagree: which group took the configuration, and the
+        // configuration now reported for it — the one still in effect beside the
+        // update this call accepted, exactly as `GetGroupConfiguration` reports
+        // it at this instant.
+        let output = PutGroupConfigurationOutput {
+            group_identifier: Some(record.to_identifier()),
+            group_configuration: record.to_group_configuration(),
+        };
         let items_proposed = record
             .configuration_update_in_flight(now)
             .map(|pending| pending.configuration.iter().flatten().count())
@@ -280,9 +296,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             outcome = "configuration update accepted",
             "resource group configuration update accepted",
         );
-        // The model gives this operation no output members at all: the 202 is the whole
-        // answer, and a caller reads the result through `GetGroupConfiguration`.
-        Ok(PutGroupConfigurationOutput {})
+        // The 202 says the update was accepted rather than applied, and the
+        // document it carries is what is now reported for the group.
+        Ok(output)
     }
 }
 

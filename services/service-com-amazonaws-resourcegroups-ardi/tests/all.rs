@@ -29,6 +29,8 @@ mod filters_bound_single_source;
 mod get_tag_sync_task;
 #[path = "all/get_tags_identity_forms.rs"]
 mod get_tags_identity_forms;
+#[path = "all/group_configuration_projection.rs"]
+mod group_configuration_projection;
 #[path = "all/group_owner_configuration_and_update.rs"]
 mod group_owner_configuration_and_update;
 #[path = "all/group_query.rs"]

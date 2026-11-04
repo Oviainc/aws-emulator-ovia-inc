@@ -87,6 +87,11 @@ pub struct Group {
 #[smithy_macros::smithy(shape = "com.amazonaws.resourcegroups#GroupConfiguration")]
 #[derive(Debug, Clone, Default)]
 pub struct GroupConfiguration {
+    /// The parameters the reported configuration sets, flattened across its
+    /// items in configuration order. Every `GroupConfiguration` AWS puts on the
+    /// wire carries them beside the items that declare them (`CreateGroup`,
+    /// `GetGroupConfiguration` and `PutGroupConfiguration` alike).
+    pub group_parameters: Option<Vec<GroupConfigurationParameter>>,
     pub configuration: Option<Vec<GroupConfigurationItem>>,
     pub proposed_configuration: Option<Vec<GroupConfigurationItem>>,
     pub status: Option<String>,

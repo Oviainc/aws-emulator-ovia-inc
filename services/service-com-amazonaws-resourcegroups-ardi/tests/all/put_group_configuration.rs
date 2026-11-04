@@ -9,8 +9,9 @@
 //!
 //! The rules under test, each asserted over a TABLE of inputs rather than one row:
 //!
-//! * a put is ACCEPTED rather than applied: it answers 202 with no body, and the
-//!   configuration it carries is reported as the group's proposed one, under the
+//! * a put is ACCEPTED rather than applied: it answers 202 reporting which group took
+//!   the configuration and the configuration document now reported for that group, and
+//!   the configuration it carries is reported as the group's proposed one, under the
 //!   `UPDATING` status and beside the configuration still in effect, until the span the
 //!   put started has elapsed — the span is never zero, so a caller reading straight
 //!   afterwards still sees the update in flight;
@@ -55,15 +56,37 @@ async fn put(emulator: &Emulator, body: &Value) -> (u16, Value) {
     put_in(emulator, HOME, body).await
 }
 
-/// A put the caller expects to be accepted: a 202 whose body carries no member,
-/// since the operation models no output member at all.
+/// A put the caller expects to be accepted: a 202 that reports which group took the
+/// configuration and the configuration now reported for it — the document the request
+/// carried is the PROPOSED one, under the `UPDATING` status, because the span a put
+/// starts is never zero.
 async fn accepted(emulator: &Emulator, case: &str, body: &Value) {
     let (status, answered) = put(emulator, body).await;
     assert_eq!(
-        (status, &answered),
-        (202, &json!({})),
-        "case {case:?}: expected an accepted put to answer 202 with an empty document, got \
-         {status} {answered}",
+        status, 202,
+        "case {case:?}: expected an accepted put to answer 202, got {status} {answered}",
+    );
+    let group = body["Group"].as_str().expect("the request names a group");
+    assert_eq!(
+        answered["GroupIdentifier"],
+        json!({
+            "GroupName": group,
+            "GroupArn": format!("arn:aws:resource-groups:{HOME}:{ACCOUNT}:group/{group}"),
+        }),
+        "case {case:?}: expected the accepted put to report the group it configured, got \
+         {answered}",
+    );
+    let (_in_effect, proposed, status_reported) = members_of(&answered["GroupConfiguration"]);
+    assert_eq!(
+        proposed,
+        body.get("Configuration").cloned().unwrap_or_else(|| json!([])),
+        "case {case:?}: expected the accepted put to report the configuration it accepted as \
+         the proposed one, got {answered}",
+    );
+    assert_eq!(
+        status_reported, CONFIGURATION_UPDATING,
+        "case {case:?}: expected the accepted put to report the update as in flight, got \
+         {answered}",
     );
 }
 
