@@ -150,7 +150,7 @@ pub(crate) fn expected_image_arn(name: &str) -> String {
 
 /// The ARN this service mints for a MicroVM — the other form `MicrovmIdentifier`
 /// accepts ("The ARN or ID of the MicroVm").
-fn expected_microvm_arn(microvm_id: &str) -> String {
+pub(crate) fn expected_microvm_arn(microvm_id: &str) -> String {
     format!("arn:aws:lambda:{REGION}:{ACCOUNT}:microvm:{microvm_id}")
 }
 

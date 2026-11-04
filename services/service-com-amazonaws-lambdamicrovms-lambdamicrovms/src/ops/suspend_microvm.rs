@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SuspendMicrovm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SuspendMicrovm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SuspendMicrovm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the persisted [`crate::state::Microvm`] to `SUSPENDING`; the `SUSPENDING` ->
+//! `SUSPENDED` move becomes due on the clock. `@idempotent`: suspending a MicroVM that
+//! is already suspending or suspended succeeds without changing the record, and a
+//! MicroVM whose state no suspend leads out of is refused with the modelled 400.
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +141,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SuspendMicrovm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SuspendMicrovmErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SuspendMicrovm"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SuspendMicrovmErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MicroVM store is unavailable".to_string()),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::Instant::now();
+
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        let Some(vm) = store.microvm_mut(&input.microvm_identifier) else {
+            // The not-found envelope this service puts on the wire: a
+            // request-derived `message`, with `resourceType` and `resourceId` unset.
+            return Err(SuspendMicrovmErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::microvm_not_found_message(&input.microvm_identifier),
+                    resource_type: None,
+                    resource_id: None,
+                },
+            )
+            .into());
+        };
+
+        // The one run-state rule this operation and `ResumeMicrovm` are both decided by:
+        // the suspend starts from a running MicroVM, is a no-op once the MicroVM already
+        // rests — or is coming to rest — suspended, and is refused from every other
+        // state.
+        match crate::state::microvm_transition_verdict(TRANSITION, &vm.state) {
+            crate::state::MicrovmTransitionVerdict::Start => {
+                crate::state::start_microvm_transition(vm, TRANSITION, now);
+            }
+            crate::state::MicrovmTransitionVerdict::NoOp => {}
+            crate::state::MicrovmTransitionVerdict::Terminated => {
+                return Err(refused(crate::state::microvm_terminated_message(
+                    &vm.microvm_id,
+                )));
+            }
+            crate::state::MicrovmTransitionVerdict::Refused => {
+                return Err(refused(crate::state::microvm_not_transitionable_message(
+                    TRANSITION.verb(),
+                    &vm.microvm_arn,
+                )));
+            }
+        }
+
+        Ok(SuspendMicrovmOutput {})
     }
 }
+
+/// 400: the state the MicroVM is in does not admit the transition asked of it.
+///
+/// Every refusal this service states from the current state of a record is this one
+/// error class — the image path's own state refusal included (recorded AWS behaviour).
+fn refused(message: String) -> SuspendMicrovmError {
+    SuspendMicrovmErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The run-state transition this operation asks of the MicroVM it addresses.
+const TRANSITION: crate::state::MicrovmTransition = crate::state::MicrovmTransition::Suspend;

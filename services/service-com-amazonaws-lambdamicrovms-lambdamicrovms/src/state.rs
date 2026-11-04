@@ -58,6 +58,12 @@ pub const MICROVM_PROVISION_SPAN: Duration = Duration::from_millis(500);
 /// transition becomes due. Chosen for the same reason as [`IMAGE_BUILD_SPAN`].
 pub const MICROVM_TERMINATE_SPAN: Duration = Duration::from_millis(500);
 
+/// How long after `SuspendMicrovm` the `SUSPENDING` -> `SUSPENDED` transition becomes
+/// due. Chosen for the same reason as [`IMAGE_BUILD_SPAN`]: the model documents the
+/// MicroVM as transitioning "through SUSPENDING to SUSPENDED" but publishes no
+/// duration for it.
+pub const MICROVM_SUSPEND_SPAN: Duration = Duration::from_millis(500);
+
 /// How long after `DeleteMicrovmImage` the image's removal becomes due.
 ///
 /// The deletion is asynchronous — the call reports the image `DELETING` and a client
@@ -653,6 +659,36 @@ pub fn microvm_not_found_message(identifier: &str) -> String {
     format!("MicroVM not found: {identifier}")
 }
 
+/// The `message` of the 400 a caller-requested run-state transition answers for a
+/// MicroVM whose current state has no such transition
+/// ([`MicrovmTransitionVerdict::Refused`]).
+///
+/// The sentence states the condition — the transition cannot be made from the state the
+/// record is in — and names the MicroVM by the ARN this service minted for it, the one
+/// identity of the record whichever form `MicrovmIdentifier` the request addressed it
+/// by. That is the same template, in the same error class, as the image path's own state
+/// refusal ([`image_not_updatable_message`]), with the transition's own verb
+/// ([`MicrovmTransition::verb`]).
+pub fn microvm_not_transitionable_message(verb: &str, microvm_arn: &str) -> String {
+    format!("Cannot {verb} MicroVM in its current state: {microvm_arn}")
+}
+
+/// The `message` of the 400 a caller-requested run-state transition answers for a
+/// MicroVM that has entered its terminal lifecycle
+/// ([`MicrovmTransitionVerdict::Terminated`]).
+///
+/// Terminating is the one move no other leads out of, so the refusal states that rather
+/// than the transition that was asked for, and names the MicroVM by the `microvmId` of
+/// the record (recorded AWS behaviour).
+///
+/// A MicroVM whose termination is still in flight is answered the same sentence as one
+/// that has reached `TERMINATED`: the termination is what took the record out of the
+/// run-state machine, and it is one-way, so the state cannot be changed whether or not
+/// that move has settled yet.
+pub fn microvm_terminated_message(microvm_id: &str) -> String {
+    format!("The MicroVM {microvm_id} has been terminated and its state cannot be changed.")
+}
+
 /// The `message` of the 404 `RunMicrovm` answers when it can resolve no ACTIVE
 /// version for the image the request names — a different condition from a missing
 /// image, and the one whose remediation is to publish or wait for a version.
@@ -807,10 +843,116 @@ pub fn snapshot_build_of(resources: &[Resources]) -> Option<SnapshotBuild> {
 pub const MICROVM_STATE_PENDING: &str = "PENDING";
 /// A `MicrovmState` value (`MICROVM_STATE_VALUES`).
 pub const MICROVM_STATE_RUNNING: &str = "RUNNING";
+/// A `MicrovmState` value (`MICROVM_STATE_VALUES`): the state a MicroVM carries while
+/// the suspend it was asked for is in flight.
+pub const MICROVM_STATE_SUSPENDING: &str = "SUSPENDING";
+/// A `MicrovmState` value (`MICROVM_STATE_VALUES`): the state a suspended MicroVM
+/// rests in, with its memory and disk state preserved.
+pub const MICROVM_STATE_SUSPENDED: &str = "SUSPENDED";
 /// A `MicrovmState` value (`MICROVM_STATE_VALUES`).
 pub const MICROVM_STATE_TERMINATING: &str = "TERMINATING";
 /// A `MicrovmState` value (`MICROVM_STATE_VALUES`).
 pub const MICROVM_STATE_TERMINATED: &str = "TERMINATED";
+
+/// A run-state transition a caller can ask one MicroVM to make.
+///
+/// The two are each other's inverse — `SuspendMicrovm` "Suspends a running MicroVM,
+/// preserving its full memory and disk state" and `ResumeMicrovm` "Resumes a suspended
+/// MicroVM, restoring it to RUNNING state" — so both are decided by the one rule in
+/// [`microvm_transition_verdict`] and applied by [`start_microvm_transition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicrovmTransition {
+    /// `SuspendMicrovm`: the MicroVM comes to rest in [`MICROVM_STATE_SUSPENDED`].
+    Suspend,
+    /// `ResumeMicrovm`: the MicroVM runs again, in [`MICROVM_STATE_RUNNING`].
+    Resume,
+}
+
+impl MicrovmTransition {
+    /// The verb a refusal of this transition names it by — see
+    /// [`microvm_not_transitionable_message`].
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Suspend => "suspend",
+            Self::Resume => "resume",
+        }
+    }
+}
+
+/// What the service does with a caller-requested [`MicrovmTransition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicrovmTransitionVerdict {
+    /// The MicroVM moves: [`start_microvm_transition`] applies it.
+    Start,
+    /// The MicroVM already has the run state the transition asks for, so the
+    /// `@idempotent` call succeeds and leaves the record exactly as it is.
+    NoOp,
+    /// The MicroVM has entered its terminal lifecycle, so its run state can be changed
+    /// no further at all: the call is refused with [`microvm_terminated_message`].
+    Terminated,
+    /// The MicroVM's current state has no such transition, so the call is refused —
+    /// like every other refusal this service states from the current state of a record,
+    /// with the 400 `ValidationException`
+    /// ([`microvm_not_transitionable_message`]) rather than a 409.
+    Refused,
+}
+
+/// What a caller-requested `transition` does to a MicroVM currently in `state`.
+///
+/// A MicroVM's run state is reached from the run state the transition starts in, so a
+/// transition is served only where that start state holds: `SuspendMicrovm` from a
+/// running MicroVM and `ResumeMicrovm` from a suspended one. Both operations are
+/// `@idempotent`, so a MicroVM that already has — or is already on its way to — the run
+/// state asked for is left alone and the call still succeeds; `ResumeMicrovm` therefore
+/// takes a MicroVM whose suspend has not finished settling, because the state it is
+/// settling into is the one resume starts from. A MicroVM that has entered its terminal
+/// lifecycle has no run state left to change — terminating is the one move no other
+/// leads out of — and every remaining state is one no run-state transition starts from:
+/// a MicroVM still provisioning has no preserved state to suspend and none to restore.
+pub fn microvm_transition_verdict(
+    transition: MicrovmTransition,
+    state: &str,
+) -> MicrovmTransitionVerdict {
+    match (transition, state) {
+        (_, MICROVM_STATE_TERMINATING | MICROVM_STATE_TERMINATED) => {
+            MicrovmTransitionVerdict::Terminated
+        }
+        (MicrovmTransition::Suspend, MICROVM_STATE_RUNNING) => MicrovmTransitionVerdict::Start,
+        (MicrovmTransition::Suspend, MICROVM_STATE_SUSPENDING | MICROVM_STATE_SUSPENDED) => {
+            MicrovmTransitionVerdict::NoOp
+        }
+        (MicrovmTransition::Resume, MICROVM_STATE_SUSPENDING | MICROVM_STATE_SUSPENDED) => {
+            MicrovmTransitionVerdict::Start
+        }
+        (MicrovmTransition::Resume, MICROVM_STATE_RUNNING) => MicrovmTransitionVerdict::NoOp,
+        _ => MicrovmTransitionVerdict::Refused,
+    }
+}
+
+/// Apply the `transition` [`microvm_transition_verdict`] said STARTS to `vm`, at `now`.
+///
+/// A suspend is reported in flight and the rest it settles into is owed by the clock
+/// ([`MICROVM_SUSPEND_SPAN`]), so a caller reading straight after the call still
+/// observes `SUSPENDING`. `MicrovmState` names no transient state on the way back, and
+/// resume "restor[es] it to RUNNING state with all state intact", so a resume is
+/// complete when it answers and it drops the suspend the clock still owed.
+///
+/// Neither direction touches [`Microvm::expiry_due_at`]: `maximumDurationInSeconds` is
+/// "the maximum duration in seconds that the MicroVM can EXIST before being terminated by
+/// the platform", and a suspended MicroVM still exists, so that clock runs through a
+/// suspend and can terminate the MicroVM while it rests.
+pub fn start_microvm_transition(vm: &mut Microvm, transition: MicrovmTransition, now: Instant) {
+    match transition {
+        MicrovmTransition::Suspend => {
+            vm.state = MICROVM_STATE_SUSPENDING.to_string();
+            vm.suspend_due_at = Some(now + MICROVM_SUSPEND_SPAN);
+        }
+        MicrovmTransition::Resume => {
+            vm.state = MICROVM_STATE_RUNNING.to_string();
+            vm.suspend_due_at = None;
+        }
+    }
+}
 
 /// One build of one MicroVM image version: the target it was built for and the state
 /// of that build. Held in [`MicrovmImageVersion::builds`], keyed by its `buildId`.
@@ -992,6 +1134,9 @@ pub struct Microvm {
     pub egress_network_connectors: Vec<String>,
     /// When `PENDING` -> `RUNNING` becomes due; `None` once it has.
     pub provision_due_at: Option<Instant>,
+    /// When `SUSPENDING` -> `SUSPENDED` becomes due; `None` once it has, and once a
+    /// resume or a termination has overtaken the suspend.
+    pub suspend_due_at: Option<Instant>,
     /// When `TERMINATING` -> `TERMINATED` becomes due; `None` once it has.
     pub terminate_due_at: Option<Instant>,
     /// When `maximumDurationInSeconds` runs out and the platform terminates this
@@ -1230,6 +1375,13 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
                     vm.state = MICROVM_STATE_RUNNING.to_string();
                 }
             }
+            // "The MicroVM transitions through SUSPENDING to SUSPENDED."
+            if vm.suspend_due_at.is_some_and(|at| at <= now) {
+                vm.suspend_due_at = None;
+                if vm.state == MICROVM_STATE_SUSPENDING {
+                    vm.state = MICROVM_STATE_SUSPENDED.to_string();
+                }
+            }
             if let Some(due) = vm.terminate_due_at.filter(|at| *at <= now) {
                 vm.terminate_due_at = None;
                 if vm.state == MICROVM_STATE_TERMINATING {
@@ -1250,6 +1402,7 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
                 if vm.state != MICROVM_STATE_TERMINATING && vm.state != MICROVM_STATE_TERMINATED {
                     vm.state = MICROVM_STATE_TERMINATED.to_string();
                     vm.provision_due_at = None;
+                    vm.suspend_due_at = None;
                     vm.terminated_at = Some(now_datetime());
                     vm.state_reason = Some(EXPIRY_REASON.to_string());
                     vm.reclaim_due_at = Some(due + TERMINATED_MICROVM_RETENTION);

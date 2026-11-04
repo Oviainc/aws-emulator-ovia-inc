@@ -180,6 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vm.state = crate::state::MICROVM_STATE_TERMINATING.to_string();
             vm.state_reason = Some(crate::state::TERMINATION_REASON.to_string());
             vm.provision_due_at = None;
+            // A MicroVM on its way out never comes to rest suspended, so the suspend
+            // the clock still owed is dropped with the rest of its run-state work.
+            vm.suspend_due_at = None;
             // `terminatedAt` is stamped when the MicroVM REACHES TERMINATED, which
             // this records as due.
             vm.terminate_due_at = Some(now + crate::state::MICROVM_TERMINATE_SPAN);

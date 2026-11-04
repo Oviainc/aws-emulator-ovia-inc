@@ -51,6 +51,8 @@ mod microvm_image_and_instance_paths;
 mod microvm_lifecycle;
 #[path = "all/microvm_runtime_path.rs"]
 mod microvm_runtime_path;
+#[path = "all/microvm_suspend_resume.rs"]
+mod microvm_suspend_resume;
 #[path = "all/recorded_image_identity.rs"]
 mod recorded_image_identity;
 #[path = "all/resource_tag_removal.rs"]

@@ -362,6 +362,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "The MicroVM starts in PENDING state and transitions to RUNNING
                 // once provisioning completes."
                 provision_due_at: Some(now + crate::state::MICROVM_PROVISION_SPAN),
+                suspend_due_at: None,
                 terminate_due_at: None,
                 expiry_due_at: Some(now + ::std::time::Duration::from_secs(maximum_duration)),
                 reclaim_due_at: None,
