@@ -9,7 +9,10 @@
 //! `AccessDeniedException` when it grants this caller nothing.
 //! A put also RE-VALIDATES the filter's destination: a filter whose destination refused its
 //! last delivery ([`crate::state::subscription_delivery`]) is attempted again from the next
-//! ingested batch on, with no replay of the batches it missed.
+//! ingested batch on, with no replay of the batches it missed. The put WRITES to the
+//! destination as it validates it: one health-check record
+//! ([`crate::state::subscription_delivery::health_check`]), which is what tells a client at
+//! wiring time that the destination it named is reachable.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -223,10 +226,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata: a subscription filter is identified by the
-        // log group it is associated with and its own name, both of which are in `input`.
-        let _ = ctx;
+        // `ctx` carries request metadata: the Region the credential scope names, which is
+        // where the configured destination is reached when its own ARN names no Region.
+        let region = crate::state::request_region(ctx.parts());
+        // Configuring the filter holds the store's guard, so it is done in a SYNCHRONOUS
+        // step ([`PutSubscriptionFilter::configure`]) and the guard is gone by the time the
+        // health check it resolved is handed over below: a lock guard must not be held
+        // across an in-process call into another service.
+        let health_check = self.configure(input)?;
+        // The put VALIDATES the destination: CloudWatch Logs writes one health-check record
+        // to it, before any log event of this filter exists
+        // ([`crate::state::subscription_delivery::health_check`]).
+        if let Some(health_check) = health_check {
+            crate::state::subscription_delivery::deliver_health_check(ctx, &region, health_check)
+                .await;
+        }
+        Ok(PutSubscriptionFilterOutput)
+    }
+}
 
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutSubscriptionFilter<Eng> {
+    /// Create or update the filter this request names, answering the health check its
+    /// destination is owed.
+    ///
+    /// SYNCHRONOUS on purpose: every read and write of the log store happens here, so the
+    /// store's guard cannot outlive this call and no in-process call to another service is
+    /// made while it is held.
+    fn configure(
+        &self,
+        input: PutSubscriptionFilterInput,
+    ) -> Result<Option<crate::state::subscription_delivery::Delivery>, PutSubscriptionFilterError>
+    {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutSubscriptionFilterError::from(
                 PutSubscriptionFilterErrorModeled::ServiceUnavailableException(
@@ -377,6 +407,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every other member is replaced by what this put names, so a member the request
         // omits is absent afterwards rather than inherited from the previous put.
+        let log_group_name = input.log_group_name.clone();
+        let filter_name = input.filter_name.clone();
+        let destination_arn = input.destination_arn.clone();
         group.subscription_filters.insert(
             input.filter_name.clone(),
             crate::state::SubscriptionFilterRecord {
@@ -401,6 +434,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         );
 
-        Ok(PutSubscriptionFilterOutput)
+        // The destination the stored filter now names is the one the health check is
+        // written to, resolved through the store the same way an ingested batch's
+        // deliveries are.
+        Ok(crate::state::subscription_delivery::health_check(
+            &store,
+            &log_group_name,
+            &filter_name,
+            &destination_arn,
+        ))
     }
 }

@@ -44,6 +44,13 @@
 //! ([`smithy_server_runtime::OperationContext::callback`]), so nothing here opens a socket
 //! or leaves the host and this crate names no other service crate.
 //!
+//! A filter's destination is also written to when the filter is CONFIGURED rather than when
+//! anything is ingested: `PutSubscriptionFilter` validates a STREAM destination it was
+//! handed by putting one health-check record on it ([`health_check`]), which is the one
+//! signal a client has at wiring time that the destination it named is reachable. A Lambda
+//! destination is validated by its own resource policy instead and is never invoked by the
+//! configuration call ([`CONTROL_MESSAGE_DESTINATIONS`]).
+//!
 //! Delivery is best effort, as it is for the real service: `PutLogEvents` "always
 //! accepted" the batch, and whether a destination took the envelope is not part of its
 //! answer, so a destination that refuses or does not exist leaves the ingestion standing.
@@ -72,9 +79,42 @@ use super::filter_pattern::FilterPattern;
 use super::{ComAmazonawsCloudwatchlogsLogs20140328State, StoredEvent};
 
 /// `messageType` of an envelope carrying ingested log events, as the subscription payload
-/// spells it. The other value a destination sees is a health check CloudWatch Logs sends
-/// the destination itself, which no ingestion produces, so this is the only one here.
+/// spells it.
 pub const MESSAGE_TYPE_DATA: &str = "DATA_MESSAGE";
+
+/// `messageType` of the HEALTH CHECK envelope CloudWatch Logs itself writes to a
+/// destination when a subscription filter is configured against it ([`health_check`]): it
+/// carries no ingested log event, so it is marked as a message of the control plane rather
+/// than one of data.
+pub const MESSAGE_TYPE_CONTROL: &str = "CONTROL_MESSAGE";
+
+/// The `owner` a health-check envelope carries. The envelope was written by the SERVICE
+/// validating the destination rather than by the ingestion of any account's log events, so
+/// it names CloudWatch Logs itself instead of the account that holds the filter — and, for
+/// the same reason, the envelope names no log group, no log stream and no subscription
+/// filter ([`control_envelope`]).
+pub const CONTROL_MESSAGE_OWNER: &str = "CloudwatchLogs";
+
+/// The fixed text a health check's one log event opens with, which is what tells a consumer
+/// the record it just read is the service checking the destination rather than log data.
+/// The sentence then names the destination being checked
+/// ([`CONTROL_MESSAGE_DESTINATIONS`]).
+pub const CONTROL_MESSAGE_PREFIX: &str = "CWL CONTROL MESSAGE: Checking health of destination";
+
+/// How the health-check sentence names each kind of destination it is written to, keyed by
+/// the kind as [`DESTINATION_TYPE_DIMENSION`] names it: the resource CloudWatch Logs is
+/// checking.
+///
+/// The two STREAM-like kinds only. A Lambda destination is not written to by the put: a
+/// function is reached by invoking it, and an invocation of caller code is not something a
+/// configuration call performs — what authorizes that destination is the function's own
+/// resource policy, which `PutSubscriptionFilter` documents by requiring no `roleArn` for
+/// it. So a filter on a Lambda function owes no record here and receives only the envelopes
+/// its log group's ingestion delivers.
+const CONTROL_MESSAGE_DESTINATIONS: [(&str, &str); 2] = [
+    (KINESIS_DESTINATION_TYPE, "Kinesis stream"),
+    (FIREHOSE_DESTINATION_TYPE, "Firehose"),
+];
 
 /// The digits a delivered event's `id` carries. CloudWatch Logs identifies a log event by
 /// an opaque 56-character decimal string; it is minted from the store's own ingestion
@@ -246,6 +286,69 @@ fn gzip(body: &str) -> Vec<u8> {
     // Writing to a `Vec` cannot fail, and neither can finishing the frame over one.
     let _ = encoder.write_all(body.as_bytes());
     encoder.finish().unwrap_or_default()
+}
+
+/// The HEALTH-CHECK envelope, as the receiving service reads it: the same envelope shape a
+/// delivery carries, marked [`MESSAGE_TYPE_CONTROL`] and owned by the service
+/// ([`CONTROL_MESSAGE_OWNER`]). It reports no log group, no log stream and no subscription
+/// filter, because it is not a reading of any group's log events — it is the service
+/// checking that the destination takes a record at all — and its one log event carries the
+/// check's own sentence, stamped with the instant the check was made and identifying no
+/// stored event.
+fn control_envelope(message: &str, at_ms: i64) -> String {
+    ::serde_json::json!({
+        "messageType": MESSAGE_TYPE_CONTROL,
+        "owner": CONTROL_MESSAGE_OWNER,
+        "logGroup": "",
+        "logStream": "",
+        "subscriptionFilters": ::serde_json::Value::Array(Vec::new()),
+        "logEvents": [{
+            "id": "",
+            "timestamp": at_ms,
+            "message": message,
+        }],
+    })
+    .to_string()
+}
+
+/// The health check a `PutSubscriptionFilter` owes the destination it configures the filter
+/// against: ONE record on that destination, written when the filter is configured and
+/// before any log event exists, which is how a client confirms at wiring time that the
+/// destination it named is reachable.
+///
+/// Resolved exactly like an ingested batch's deliveries ([`deliveries`]): a logical
+/// destination is followed to the physical resource it names, and a destination of no kind
+/// a put writes a check to — one that is not a stream, or not a resource a subscription
+/// filter delivers to at all — owes no check ([`CONTROL_MESSAGE_DESTINATIONS`]).
+pub fn health_check(
+    store: &ComAmazonawsCloudwatchlogsLogs20140328State,
+    log_group_name: &str,
+    filter_name: &str,
+    destination_arn: &str,
+) -> Option<Delivery> {
+    let destination_arn = physical_destination(store, destination_arn)?;
+    let destination_type = destination_type(&destination_arn)?;
+    let named = CONTROL_MESSAGE_DESTINATIONS
+        .iter()
+        .find(|(kind, _)| *kind == destination_type)
+        .map(|(_, named)| *named)?;
+    let body = control_envelope(
+        &format!("{CONTROL_MESSAGE_PREFIX} {named}."),
+        super::now_ms(),
+    );
+    Some(Delivery {
+        log_group_name: log_group_name.to_string(),
+        filter_name: filter_name.to_string(),
+        destination_arn,
+        destination_type: destination_type.to_string(),
+        // The check carries the service's own sentence, not a log event the filter
+        // forwarded, so it forwards nothing.
+        forwarded_log_events: 0,
+        // The check belongs to no log stream, so the group whose filter is being validated
+        // is what it is keyed on.
+        partition_key: log_group_name.to_string(),
+        payload: gzip(&body),
+    })
 }
 
 /// Every envelope the events `PutLogEvents` just stored on `log_stream_name` owe the
@@ -424,16 +527,11 @@ fn destination_type(arn: &str) -> Option<&'static str> {
     .map(|(_, kind)| kind)
 }
 
-/// Hand every envelope of `deliveries` to its destination, and publish what each delivery
-/// did.
+/// Hand every envelope of `deliveries` to its destination ([`hand_over`]), and publish what
+/// each delivery did.
 ///
 /// `fallback_region` is the Region the ingesting request was signed for, used only for a
 /// destination ARN that names no Region of its own.
-///
-/// Every delivery goes to a service of THIS emulator: the vendor chooses which of the
-/// clients below is used, and the Region label is held to the grammar a Region is written
-/// in ([`service_common::arn::region_label`]) before it is put in an endpoint, so no value
-/// a request carried can name a host. The transport is the in-process callback either way.
 ///
 /// The ingestion stands whatever the destinations answer — `PutLogEvents` already answered
 /// the batch — so the outcome is reported as the service's own telemetry instead: the events
@@ -448,34 +546,13 @@ pub async fn deliver<Eng: Send + Sync + 'static>(
     fallback_region: &str,
     deliveries: Vec<Delivery>,
 ) {
-    let fallback_region = ::service_common::arn::region_label(fallback_region)
-        .unwrap_or(super::DEFAULT_REGION)
-        .to_string();
     let mut datapoints: Vec<ExtractedDatapoint> = Vec::with_capacity(deliveries.len());
     let mut refused: Vec<(String, String)> = Vec::new();
     for delivery in deliveries {
-        let Some(parsed) = ::service_common::arn::parse(&delivery.destination_arn) else {
+        if ::service_common::arn::parse(&delivery.destination_arn).is_none() {
             continue;
-        };
-        let vendor = parsed.vendor.to_string();
-        // The Region the destination is addressed in comes from the destination's own ARN,
-        // which a request carried, so it is held to the grammar a Region is written in before
-        // it reaches an endpoint — the same reading the fallback went through above. A value
-        // that is not a Region label addresses nothing, so the Region the ingesting request
-        // was signed for stands instead.
-        let region = ::service_common::arn::region_of(&delivery.destination_arn, &vendor)
-            .and_then(::service_common::arn::region_label)
-            .unwrap_or(&fallback_region)
-            .to_string();
-        let failure = if vendor == KINESIS_STREAM.0 {
-            deliver_to_kinesis(ctx, &region, &delivery).await
-        } else if vendor == FIREHOSE_DELIVERY_STREAM.0 {
-            deliver_to_firehose(ctx, &region, &delivery).await
-        } else if vendor == LAMBDA_FUNCTION.0 {
-            deliver_to_lambda(ctx, &region, &delivery).await
-        } else {
-            Some("the destination names no kind a subscription filter delivers to".to_string())
-        };
+        }
+        let failure = hand_over(ctx, fallback_region, &delivery).await;
         let at_ms = super::now_ms();
         match failure {
             None => datapoints.push(delivery.datapoint(
@@ -506,6 +583,66 @@ pub async fn deliver<Eng: Send + Sync + 'static>(
     }
     super::emf::publish(engine, &datapoints);
     mark_destinations_unhealthy(engine, &refused);
+}
+
+/// Hand one health check ([`health_check`]) to the destination a `PutSubscriptionFilter`
+/// just configured a filter against.
+///
+/// The check is the service validating the destination, not a forwarding of any log event,
+/// so it publishes neither delivery metric and marks nothing: a destination that would not
+/// take the check has forwarded no event and lost none, and the next ingested batch is
+/// attempted against it exactly as it would have been. What a destination that refuses
+/// leaves behind is the warning below, and the absence of the record a client polls for.
+pub async fn deliver_health_check(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    fallback_region: &str,
+    health_check: Delivery,
+) {
+    if let Some(failure) = hand_over(ctx, fallback_region, &health_check).await {
+        ::tracing::warn!(
+            filter_name = %health_check.filter_name,
+            destination_arn = %health_check.destination_arn,
+            error = %failure,
+            "a subscription filter's destination did not take the health check"
+        );
+    }
+}
+
+/// Hand one envelope to the destination its ARN names, answering why the destination would
+/// not take it and `None` when it took it.
+///
+/// Every delivery goes to a service of THIS emulator: the vendor chooses which of the
+/// clients below is used, and the Region label is held to the grammar a Region is written
+/// in ([`service_common::arn::region_label`]) before it is put in an endpoint, so no value
+/// a request carried can name a host. `fallback_region` is the Region the calling request
+/// was signed for, used only for a destination ARN that names no Region of its own.
+async fn hand_over(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    fallback_region: &str,
+    delivery: &Delivery,
+) -> Option<String> {
+    let fallback_region =
+        ::service_common::arn::region_label(fallback_region).unwrap_or(super::DEFAULT_REGION);
+    let parsed = ::service_common::arn::parse(&delivery.destination_arn)?;
+    let vendor = parsed.vendor.to_string();
+    // The Region the destination is addressed in comes from the destination's own ARN,
+    // which a request carried, so it is held to the grammar a Region is written in before
+    // it reaches an endpoint — the same reading the fallback went through above. A value
+    // that is not a Region label addresses nothing, so the Region the calling request was
+    // signed for stands instead.
+    let region = ::service_common::arn::region_of(&delivery.destination_arn, &vendor)
+        .and_then(::service_common::arn::region_label)
+        .unwrap_or(fallback_region)
+        .to_string();
+    if vendor == KINESIS_STREAM.0 {
+        deliver_to_kinesis(ctx, &region, delivery).await
+    } else if vendor == FIREHOSE_DELIVERY_STREAM.0 {
+        deliver_to_firehose(ctx, &region, delivery).await
+    } else if vendor == LAMBDA_FUNCTION.0 {
+        deliver_to_lambda(ctx, &region, delivery).await
+    } else {
+        Some("the destination names no kind a subscription filter delivers to".to_string())
+    }
 }
 
 /// Mark each named filter's destination as one that refused its last delivery, so

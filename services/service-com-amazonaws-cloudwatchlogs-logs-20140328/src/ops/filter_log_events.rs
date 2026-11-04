@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op FilterLogEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `FilterLogEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`FilterLogEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: answers the stored events of one log group that a `filterPattern`, a time
+//! range and a log-stream selector all admit, interleaved across the group's streams in the
+//! store's own event order, each one carrying the SAME `eventId` a subscription filter
+//! delivers it under ([`crate::state::subscription_delivery::event_id`]).
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,12 +153,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatchlogs-logs-201
 // here — hence the `FilterLogEventsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatchlogs#FilterLogEvents")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatchlogs#FilterLogEvents",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum FilterLogEventsErrorModeled {
     InvalidParameterException(InvalidParameterException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
+    // Widened in through `extra_errors`: the SERVICE models `ValidationException` and
+    // answers it for the cross-member log-group-selector check, which this operation's own
+    // `errors` list omits. See `crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`.
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -177,6 +180,167 @@ pub type FilterLogEventsError = crate::scaffolded::Scaffolded<FilterLogEventsErr
 impl From<FilterLogEventsErrorModeled> for FilterLogEventsError {
     fn from(modeled: FilterLogEventsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The kind tag this operation's pagination cursors carry, so a token minted by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "FilterLogEvents";
+
+/// The largest page this operation answers, in bytes of the matched messages: "Each page
+/// returned can contain up to 1 MB of log events or up to 10,000 log events" — the event
+/// count being the other bound, which `limit` narrows. Accounted from the messages
+/// themselves: a page's reported events are the log data, and the member names and
+/// separators the wire form adds around them belong to no event.
+const MAX_PAGE_BYTES: usize = 1_048_576;
+
+/// The instant a descending scan is supported from: "Setting startFromHead to false is
+/// supported only when startTime is on or after Jan 1, 2024 00:00:00 UTC", which is that
+/// instant in the milliseconds every timestamp member here is expressed in.
+const DESCENDING_SCAN_EPOCH_MS: i64 = 1_704_067_200_000;
+
+/// The refusal for a request that names both log-stream selectors: "If you specify a value
+/// for both logStreamNames and logStreamNamePrefix, the action returns an
+/// InvalidParameterException error" (`FilterLogEventsRequest$logStreamNames`). Worded like
+/// the service's other exclusive-pair sentence
+/// ([`crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`]), naming the two members the request
+/// spells.
+const STREAM_SELECTORS_EXCLUSIVE: &str =
+    "logStreamNames and logStreamNamePrefix are mutually exclusive parameters.";
+
+/// The refusal for a descending scan started before [`DESCENDING_SCAN_EPOCH_MS`], as
+/// `FilterLogEventsRequest$startFromHead` states the rule.
+const DESCENDING_SCAN_UNSUPPORTED: &str = "Setting startFromHead to false is supported only \
+     when startTime is on or after Jan 1, 2024 00:00:00 UTC.";
+
+/// The SCAN a page belongs to: the log group, the streams it covers, the time range, the
+/// pattern and the direction. Every page of one pagination walks the same scan, so a
+/// continuation token carries it and a request that contradicts it is refused rather than
+/// answered over a different set of events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Scan {
+    log_group_name: String,
+    /// The streams named by `logStreamNames`; empty when the request named none, which
+    /// covers every stream of the group.
+    log_stream_names: Vec<String>,
+    /// The `logStreamNamePrefix`; empty when the request named none.
+    log_stream_name_prefix: String,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+    filter_pattern: String,
+    /// Whether the scan runs oldest-first. "If the value is true, the earliest log events
+    /// are returned first. If the value is false, the latest log events are returned first.
+    /// The default value is true."
+    forward: bool,
+}
+
+impl Scan {
+    /// The scan this request names, taking each member a continuation omits from the scan
+    /// its token carries.
+    fn of(input: &FilterLogEventsInput, log_group_name: String, resumed: Option<&Self>) -> Self {
+        Self {
+            log_group_name,
+            log_stream_names: input
+                .log_stream_names
+                .clone()
+                .unwrap_or_else(|| resumed.map(|scan| scan.log_stream_names.clone()).unwrap_or_default()),
+            log_stream_name_prefix: input
+                .log_stream_name_prefix
+                .clone()
+                .unwrap_or_else(|| {
+                    resumed
+                        .map(|scan| scan.log_stream_name_prefix.clone())
+                        .unwrap_or_default()
+                }),
+            start_time: input
+                .start_time
+                .or_else(|| resumed.and_then(|scan| scan.start_time)),
+            end_time: input
+                .end_time
+                .or_else(|| resumed.and_then(|scan| scan.end_time)),
+            filter_pattern: input
+                .filter_pattern
+                .clone()
+                .unwrap_or_else(|| resumed.map(|scan| scan.filter_pattern.clone()).unwrap_or_default()),
+            forward: input
+                .start_from_head
+                .unwrap_or_else(|| resumed.is_none_or(|scan| scan.forward)),
+        }
+    }
+
+    /// Whether this scan covers the stream `name`: the named set when the request named
+    /// one, the prefixed set when it named a prefix, and every stream of the group when it
+    /// named neither. Both selectors FILTER the results ("Filters the results to only logs
+    /// from the log streams in this list"), so a name the group does not hold simply
+    /// selects nothing.
+    fn covers(&self, name: &str) -> bool {
+        if !self.log_stream_names.is_empty() {
+            return self.log_stream_names.iter().any(|named| named == name);
+        }
+        name.starts_with(&self.log_stream_name_prefix)
+    }
+
+    /// Whether this scan's time range admits an event at `timestamp`. `startTime` is the
+    /// start of the range ("Events with a timestamp before this time are not returned") and
+    /// `endTime` its end ("Events with a timestamp later than this time are not returned").
+    fn admits(&self, timestamp: i64) -> bool {
+        self.start_time.is_none_or(|start| timestamp >= start)
+            && self.end_time.is_none_or(|end| timestamp <= end)
+    }
+}
+
+/// Where a page resumes from: the scan it belongs to, and the position in that scan's
+/// event order the previous page stopped at.
+#[derive(Debug, Clone)]
+struct Cursor {
+    scan: Scan,
+    at: crate::state::EventKey,
+}
+
+impl Cursor {
+    /// Render this cursor as the opaque `nextToken` a client hands back.
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "logGroupName": self.scan.log_group_name,
+            "logStreamNames": self.scan.log_stream_names,
+            "logStreamNamePrefix": self.scan.log_stream_name_prefix,
+            "startTime": self.scan.start_time,
+            "endTime": self.scan.end_time,
+            "filterPattern": self.scan.filter_pattern,
+            "forward": self.scan.forward,
+            "timestamp": self.at.timestamp,
+            "seq": self.at.seq,
+        }))
+    }
+
+    /// Read back a token this operation minted. `None` for anything else, which is refused
+    /// as an invalid `nextToken`.
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        Some(Self {
+            scan: Scan {
+                log_group_name: value.get("logGroupName")?.as_str()?.to_string(),
+                log_stream_names: value
+                    .get("logStreamNames")?
+                    .as_array()?
+                    .iter()
+                    .map(|name| name.as_str().unwrap_or_default().to_string())
+                    .collect(),
+                log_stream_name_prefix: value.get("logStreamNamePrefix")?.as_str()?.to_string(),
+                start_time: value.get("startTime").and_then(::serde_json::Value::as_i64),
+                end_time: value.get("endTime").and_then(::serde_json::Value::as_i64),
+                filter_pattern: value.get("filterPattern")?.as_str()?.to_string(),
+                forward: value.get("forward")?.as_bool()?,
+            },
+            at: crate::state::EventKey {
+                timestamp: value.get("timestamp")?.as_i64()?,
+                seq: value.get("seq")?.as_u64()?,
+            },
+        })
     }
 }
 
@@ -216,18 +380,195 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `FilterLogEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(FilterLogEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("FilterLogEvents"))
+        // `ctx` carries only request metadata; `unmask` concerns data-protection masking,
+        // which no policy in this store applies; and `interleaved` is documented as ignored
+        // ("this parameter is ignored and the value is assumed to be true"), which is what a
+        // single pass over every selected stream in one event order already answers.
+        let _ = (ctx, input.unmask, input.interleaved);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            FilterLogEventsError::from(FilterLogEventsErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let store = state.lock();
+
+        let invalid = |message: String| {
+            FilterLogEventsError::from(FilterLogEventsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            ))
+        };
+
+        // Naming both log-group selectors, or neither, is the cross-member check the
+        // service answers with `ValidationException` rather than with this operation's
+        // `InvalidParameterException` (see `crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`).
+        let log_group_name = crate::state::resolve_log_group_target(
+            input.log_group_name.as_deref(),
+            input.log_group_identifier.as_deref(),
+        )
+        .map_err(|message| {
+            FilterLogEventsError::from(FilterLogEventsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            ))
+        })?;
+
+        // "If you specify a value for both logStreamNames and logStreamNamePrefix, the
+        // action returns an InvalidParameterException error."
+        if input.log_stream_names.is_some() && input.log_stream_name_prefix.is_some() {
+            return Err(invalid(STREAM_SELECTORS_EXCLUSIVE.to_string()));
+        }
+
+        // "You can return these additional log events by providing the nextToken in a
+        // subsequent FilterLogEvents operation": the token carries the scan it belongs to,
+        // so a continuation that contradicts it is refused rather than answered over a
+        // different set of events, and anything that is not a token of this operation is
+        // refused with the service's one fixed sentence for the class.
+        let resumed = match input.next_token.as_deref() {
+            Some(token) => match Cursor::decode(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(invalid(
+                        crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                    ))
+                }
+            },
+            None => None,
+        };
+        let scan = Scan::of(&input, log_group_name, resumed.as_ref().map(|c| &c.scan));
+        if resumed.as_ref().is_some_and(|cursor| scan != cursor.scan) {
+            return Err(invalid(
+                crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+            ));
+        }
+        // "A request with startFromHead set to false and a startTime before this date
+        // returns an InvalidParameterException": the refusal is of the `startTime` the
+        // request CARRIES, so a descending scan that bounds its start at or after that
+        // instant is supported and one that names no `startTime` at all carries no value to
+        // refuse — the sentence names a startTime before the date, not the absence of one.
+        if !scan.forward
+            && scan
+                .start_time
+                .is_some_and(|start| start < DESCENDING_SCAN_EPOCH_MS)
+        {
+            return Err(invalid(DESCENDING_SCAN_UNSUPPORTED.to_string()));
+        }
+
+        // The pattern is parsed before anything is looked up: a `filterPattern` that does
+        // not parse is a bad request, not a search that matches nothing.
+        let pattern =
+            crate::state::filter_pattern::FilterPattern::parse(&scan.filter_pattern)
+                .map_err(invalid)?;
+
+        // "Lists log events from the specified log group": there is nothing to list until
+        // that group exists.
+        let Some(group) = store.log_groups.get(&scan.log_group_name) else {
+            return Err(FilterLogEventsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message("log group")),
+                },
+            )
+            .into());
+        };
+
+        // "The returned log events are sorted by event timestamp, the timestamp when the
+        // event was ingested by CloudWatch Logs, and the ID of the PutLogEvents request":
+        // the store's own event key is that order — the timestamp, then the ingestion
+        // sequence, which rises with every ingested event — so events of DIFFERENT streams
+        // interleave in it, which is what this operation answers ("The response from this
+        // operation always interleaves events from multiple log streams within a log
+        // group").
+        let mut matched: Vec<(
+            crate::state::EventKey,
+            &str,
+            &crate::state::StoredEvent,
+        )> = Vec::new();
+        for (log_stream_name, stream) in &group.streams {
+            if !scan.covers(log_stream_name) {
+                continue;
+            }
+            for event in &stream.events {
+                if !scan.admits(event.timestamp) {
+                    continue;
+                }
+                // A continuation starts past the position its token carries, in the
+                // direction the scan runs.
+                let before_cursor = resumed.as_ref().is_some_and(|cursor| {
+                    if scan.forward {
+                        event.key() <= cursor.at
+                    } else {
+                        event.key() >= cursor.at
+                    }
+                });
+                if before_cursor {
+                    continue;
+                }
+                if pattern.match_message(&event.message).is_none() {
+                    continue;
+                }
+                matched.push((event.key(), log_stream_name.as_str(), event));
+            }
+        }
+        matched.sort_by_key(|(key, _, _)| *key);
+        if !scan.forward {
+            matched.reverse();
+        }
+
+        // "Specifying the limit parameter only guarantees that a single page doesn't return
+        // more log events than the specified limit", and a page is bounded by its bytes too
+        // ([`MAX_PAGE_BYTES`]). `limit` is modelled `range 1..10000`, so the boundary
+        // validator has already refused a value outside it.
+        let limit = usize::try_from(input.limit.unwrap_or(crate::state::DEFAULT_EVENTS_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let mut events: Vec<FilteredLogEvent> = Vec::new();
+        let mut page_bytes = 0usize;
+        for (_, log_stream_name, event) in &matched {
+            if events.len() >= limit {
+                break;
+            }
+            let cost = event.message.len();
+            if !events.is_empty() && page_bytes.saturating_add(cost) > MAX_PAGE_BYTES {
+                break;
+            }
+            page_bytes = page_bytes.saturating_add(cost);
+            events.push(FilteredLogEvent {
+                log_stream_name: Some((*log_stream_name).to_string()),
+                timestamp: Some(event.timestamp),
+                message: Some(event.message.clone()),
+                ingestion_time: Some(event.ingestion_time),
+                // The id of the event, which is the id the same stored event is DELIVERED
+                // under to a subscription destination: one event has one id, whichever way
+                // a client reads it.
+                event_id: Some(crate::state::subscription_delivery::event_id(event)),
+            });
+        }
+
+        // "If the results include a nextToken, there might be more log events available
+        // [...] If the results don't include a nextToken, then pagination is finished": the
+        // token resumes at the last event this page carried.
+        let next_token = matched
+            .get(events.len())
+            .and(matched.get(events.len().saturating_sub(1)))
+            .map(|(at, _, _)| {
+                Cursor {
+                    scan: scan.clone(),
+                    at: *at,
+                }
+                .encode()
+            });
+
+        Ok(FilterLogEventsOutput {
+            events: Some(events),
+            // "As of May 15, 2020, this parameter is no longer supported. This parameter
+            // returns an empty list."
+            searched_log_streams: Some(Vec::new()),
+            next_token,
+        })
     }
 }

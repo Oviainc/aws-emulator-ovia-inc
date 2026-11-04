@@ -91,6 +91,8 @@ mod export_tasks;
 mod export_time_windows;
 #[path = "all/field_indexes.rs"]
 mod field_indexes;
+#[path = "all/filter_log_events.rs"]
+mod filter_log_events;
 #[path = "all/fixed_text_refusals.rs"]
 mod fixed_text_refusals;
 #[path = "all/harness.rs"]
@@ -207,6 +209,8 @@ mod state_roundtrip;
 mod storage_tier_policy;
 #[path = "all/subscription_delivery_telemetry.rs"]
 mod subscription_delivery_telemetry;
+#[path = "all/subscription_destination_health_check.rs"]
+mod subscription_destination_health_check;
 #[path = "all/subscription_destination_plumbing.rs"]
 mod subscription_destination_plumbing;
 #[path = "all/subscription_fan_out.rs"]

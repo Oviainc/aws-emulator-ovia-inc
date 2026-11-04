@@ -63,6 +63,10 @@ pub(crate) const JSON_1_0: &str = "application/x-amz-json-1.0";
 /// The `messageType` of an envelope that carries ingested log events.
 pub(crate) const DATA_MESSAGE: &str = "DATA_MESSAGE";
 
+/// The `messageType` of the health-check envelope a `PutSubscriptionFilter` writes to the
+/// destination it configures.
+pub(crate) const CONTROL_MESSAGE: &str = "CONTROL_MESSAGE";
+
 /// The digits a delivered log event's `id` carries.
 const EVENT_ID_DIGITS: usize = 56;
 
@@ -206,23 +210,70 @@ impl Emulator {
         parsed
     }
 
-    /// Everything the one-shard stream `stream` holds, from its oldest retained record:
-    /// each record's partition key and the envelope its gzip-framed data decodes to.
+    /// The DATA records the one-shard stream `stream` holds, from its oldest retained
+    /// record: each record's partition key and the envelope its gzip-framed data decodes to.
+    ///
+    /// A `PutSubscriptionFilter` writes a health check to the same stream
+    /// ([`Emulator::health_checks`]); that record carries no ingested log event, so it is
+    /// not one of the deliveries a suite about forwarding reads.
     pub(crate) async fn delivered(&self, case: &str, stream: &str) -> Vec<(String, Value)> {
-        self.delivered_frames(case, stream)
+        self.envelopes(case, stream, DATA_MESSAGE).await
+    }
+
+    /// The HEALTH-CHECK records the stream holds: what `PutSubscriptionFilter` wrote to
+    /// validate the destination it was handed.
+    pub(crate) async fn health_checks(&self, case: &str, stream: &str) -> Vec<(String, Value)> {
+        self.envelopes(case, stream, CONTROL_MESSAGE).await
+    }
+
+    /// Every envelope on the stream whose `messageType` is `message_type`.
+    async fn envelopes(
+        &self,
+        case: &str,
+        stream: &str,
+        message_type: &str,
+    ) -> Vec<(String, Value)> {
+        self.shard_records(case, stream)
             .await
             .into_iter()
             .map(|(key, framed)| (key, gunzip_json(case, &framed)))
+            .filter(|(_, envelope)| envelope["messageType"] == json!(message_type))
             .collect()
     }
 
-    /// The same records, as the BYTES each one's `Data` carries — what a consumer reads
+    /// The same data records, as the BYTES each one's `Data` carries — what a consumer reads
     /// before it decompresses anything, which is where the framing itself is observable.
     pub(crate) async fn delivered_frames(
         &self,
         case: &str,
         stream: &str,
     ) -> Vec<(String, Vec<u8>)> {
+        self.shard_records(case, stream)
+            .await
+            .into_iter()
+            .filter(|(_, framed)| {
+                gunzip_json(case, framed)["messageType"] == json!(DATA_MESSAGE)
+            })
+            .collect()
+    }
+
+    /// EVERY record the one-shard stream holds, from its oldest retained one: each record's
+    /// partition key and the bytes its `Data` carries, whatever the envelope says it is.
+    pub(crate) async fn shard_records(&self, case: &str, stream: &str) -> Vec<(String, Vec<u8>)> {
+        self.sequenced_shard_records(case, stream)
+            .await
+            .into_iter()
+            .map(|(_, key, framed)| (key, framed))
+            .collect()
+    }
+
+    /// The same records, each with the SEQUENCE NUMBER the shard gave it — the shard's own
+    /// ordering, which is where the order of two records is observable at all.
+    pub(crate) async fn sequenced_shard_records(
+        &self,
+        case: &str,
+        stream: &str,
+    ) -> Vec<(String, String, Vec<u8>)> {
         let iterator = self
             .kinesis(
                 case,
@@ -262,7 +313,13 @@ impl Emulator {
                         panic!("case {case}: a record carries a PartitionKey, got {record}")
                     })
                     .to_string();
-                (key, framed)
+                let sequence_number = record["SequenceNumber"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("case {case}: a record carries a SequenceNumber, got {record}")
+                    })
+                    .to_string();
+                (sequence_number, key, framed)
             })
             .collect()
     }
