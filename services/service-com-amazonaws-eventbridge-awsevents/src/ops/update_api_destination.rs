@@ -240,6 +240,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The authorization the connection this update points the destination
+        // at settles on, read BEFORE the destination is written: a repointed
+        // destination takes the new connection's authorization, exactly as the
+        // create takes the one it was created on.
+        let repointed_state = input
+            .connection_arn
+            .as_deref()
+            .map(|arn| store.api_destination_state_on(arn));
+
         let Some(destination) = store.api_destination_mut(&input.name) else {
             return Err(UpdateApiDestinationErrorModeled::InternalException(
                 InternalException {
@@ -260,6 +269,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(arn) = input.connection_arn {
             destination.connection_arn = arn;
+        }
+        if let Some(state) = repointed_state {
+            destination.state = state;
         }
         if let Some(endpoint) = input.invocation_endpoint {
             destination.invocation_endpoint = endpoint;

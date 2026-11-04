@@ -747,8 +747,13 @@ async fn update_connection_writes_the_members_it_is_given() {
             json!("new-client"),
         ),
         (
+            // The type the parameters belong to is named even where it is the
+            // one the connection already has: `AuthorizationType` is what
+            // selects the block that carries the credentials, so an update that
+            // supplies one without it is refused (see the refusal table below).
             "new credentials of the type the connection already has",
             json!({
+                "AuthorizationType": "API_KEY",
                 "AuthParameters": {
                     "ApiKeyAuthParameters": { "ApiKeyName": "x-other-key", "ApiKeyValue": "sekrit-new" },
                 },
@@ -871,8 +876,31 @@ async fn update_connection_refuses_what_the_resource_rules_forbid() {
             "parameters of a type the connection will not have",
             json!({
                 "Name": "live",
+                "AuthorizationType": "API_KEY",
                 "AuthParameters": {
                     "BasicAuthParameters": { "Username": "u", "Password": "p" },
+                },
+            }),
+            400,
+            "ValidationException",
+        ),
+        (
+            "credentials with no authorization type to select them",
+            json!({
+                "Name": "live",
+                "AuthParameters": {
+                    "BasicAuthParameters": { "Username": "u", "Password": "p" },
+                },
+            }),
+            400,
+            "ValidationException",
+        ),
+        (
+            "credentials of the type the connection already has, with no type named",
+            json!({
+                "Name": "live",
+                "AuthParameters": {
+                    "ApiKeyAuthParameters": { "ApiKeyName": "x-api-key", "ApiKeyValue": "p" },
                 },
             }),
             400,

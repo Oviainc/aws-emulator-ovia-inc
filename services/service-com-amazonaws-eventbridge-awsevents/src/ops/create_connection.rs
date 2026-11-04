@@ -267,6 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 description: input.description,
                 authorization_type: input.authorization_type,
                 auth_parameters,
+                // The credential half, which no read reports and every
+                // invocation through this connection carries.
+                secret: connection_secret(&input.auth_parameters),
                 invocation_resource_configuration_arn: input
                     .invocation_connectivity_parameters
                     .as_ref()
@@ -473,5 +476,37 @@ fn reported_auth_parameters(
         // (`ConnectionRecord::invocation_resource_configuration_arn`) for when
         // the private-connectivity path is implemented.
         connectivity_parameters: None,
+    }
+}
+
+/// The credential half of the submitted parameters — the half the response
+/// shapes above withhold.
+///
+/// It is what the secret `SecretArn` names holds, and what every invocation
+/// through this connection carries
+/// ([`crate::state::invocation::ConnectionSecret`]): the api key under the
+/// header name the request chose, the basic credentials the `Authorization`
+/// header is built from, and the `InvocationHttpParameters` with the values the
+/// request flagged secret still in them, because the endpoint is sent those
+/// values and not their keys alone. An `OAUTH_CLIENT_CREDENTIALS` connection's
+/// client credentials are NOT an authorization the invocation can carry — they
+/// are exchanged for a token first — so none is kept here for one.
+fn connection_secret(
+    parameters: &CreateConnectionAuthRequestParameters,
+) -> crate::state::invocation::ConnectionSecret {
+    crate::state::invocation::ConnectionSecret {
+        api_key: parameters.api_key_auth_parameters.as_ref().map(|key| {
+            crate::state::invocation::ApiKeyCredential {
+                name: key.api_key_name.clone(),
+                value: key.api_key_value.clone(),
+            }
+        }),
+        basic: parameters.basic_auth_parameters.as_ref().map(|basic| {
+            crate::state::invocation::BasicCredential {
+                username: basic.username.clone(),
+                password: basic.password.clone(),
+            }
+        }),
+        invocation_http_parameters: parameters.invocation_http_parameters.clone(),
     }
 }

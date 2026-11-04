@@ -142,7 +142,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ValidationException` channel.
         if input.name_prefix.is_some() && input.connection_state.is_some() {
             return Err(crate::scaffolded::Scaffolded::validation(
-                COMBINED_FILTER_REFUSAL,
+                combined_filter_refusal(),
             ));
         }
 
@@ -222,10 +222,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// What a listing of this service refuses a combination of filters with.
+/// The verb of THIS call, as the clause every refusal of it names it
+/// ([`crate::state::connection_refusal`]).
+const VERB: &str = "list";
+
+/// What this listing refuses a combination of filters with.
 ///
-/// EventBridge's list operations take at most ONE filter, and the refusal is a
-/// CONSTANT of that condition — the verdict is on how many filters were given,
-/// not on any value in them — so it carries none of the request's values.
-const COMBINED_FILTER_REFUSAL: &str =
-    "At most one filter is allowed for this request. Please use only one filter.";
+/// EventBridge's list operations take at most ONE filter, and the refusal NAMES
+/// the mutually exclusive members of the operation's own filter set — here
+/// `ConnectionState` and `NamePrefix`, the two members that narrow this listing
+/// (`smithy_query(query="operation",operation="ListConnections")`) — after the
+/// clause every refusal of a connection call opens with
+/// ([`crate::state::connection_refusal`]). So a caller is told WHICH parameters
+/// conflicted rather than that some pair of them did. The verdict is on how many
+/// filters were given and not on any value in them, so the sentence carries none
+/// of the request's values.
+fn combined_filter_refusal() -> String {
+    crate::state::connection_refusal(
+        VERB,
+        "Request failed because only one filter is supported per request, either \
+         ConnectionState or NamePrefix.",
+    )
+}

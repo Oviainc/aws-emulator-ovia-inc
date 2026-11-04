@@ -97,3 +97,44 @@ Expected message rule: `Failed to list the connection(s). Request failed because
 6. Cause 5: create_api_destination(ConnectionArn=<ARN of a connection that does not exist>, ...) -> inspect Error.Message.
 7. Cause 6: list_connections(NamePrefix='x', ConnectionState='AUTHORIZED') -> inspect Error.Message.
 Replay the ten check ids in trace_ids to confirm.
+
+## Resolution
+Causes 2, 3, 5 and 6 are fixed and their checks pass: the
+InvocationRateLimitPerSecond maximum is the documented 300 on both the create and
+the update path, deleting a connection no longer revokes the api destinations
+that name it (their ApiDestinationState is taken from the connection's
+authorization when the destination is written or repointed and carried forward
+when that connection's own transition settles), CreateApiDestination's
+ResourceNotFoundException echoes the submitted ConnectionArn after the
+`Failed to create the api-destination(s).` clause, and ListConnections' combined
+filter refusal names ConnectionState and NamePrefix.
+
+Cause 4 is refused as AWS refuses it — HTTP 400 ValidationException, nothing
+written, the connection left in the state it had — with the sentence
+`Failed to update the connection(s). Parameter AuthParameters is not valid.
+Reason: AuthorizationType must be provided when AuthParameters is provided.` No
+recorded sentence for this refusal is quoted above, so if the recording words it
+differently that wording is the only part of this cause still outstanding.
+
+Cause 1 is served in part: an api-destination target IS invoked — the
+destination's HttpMethod request to its InvocationEndpoint, through the
+in-process emulator transport, carrying the connection's authorization (an API
+key under the header the connection names, or the RFC 7617
+`Authorization: Basic` header), the connection's InvocationHttpParameters merged
+with the target's HttpParameters (the connection's value winning on a collision,
+path wildcards filled from PathParameterValues), the content type and user agent
+AWS sends, a 4xx taken as non-retryable and a 5xx retried within the target's
+MaximumRetryAttempts before the event is dead-lettered. Its five delivery checks
+still cannot pass here, and what each of them waits for is tracked where it
+belongs rather than in this record:
+
+* the receiving endpoint of all five is a Lambda function URL whose function has
+  to execute to record the request and answer 400/500 —
+  `20261103T165236Z-lambda-invoke-does-not-execute-the-deployment-package.md`;
+* the OAuth client-credentials token exchange and the `Bearer` header —
+  `20261027T200000Z-events-eventbridge-an-oauth-client-credentials-connection-never-fetches-a-token-so-its-api-destination-never-delivers.md`;
+* the dead-letter ERROR_CODE/ERROR_MESSAGE wording and the 4xx-vs-5xx retry
+  accounting AWS stamps on the DLQ message —
+  `20261029T092208Z-events-eventbridge-api-destination-targets-never-deliver-so-the.md`;
+* the per-destination InvocationRateLimitPerSecond deferral of a burst, which no
+  other open record names yet.

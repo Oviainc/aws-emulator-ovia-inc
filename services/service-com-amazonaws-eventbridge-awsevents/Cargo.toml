@@ -29,6 +29,14 @@ http = { workspace = true }
 # bound is read without the stack a recursive read of it would need.
 serde_json = { workspace = true, features = ["unbounded_depth", "raw_value"] }
 tracing = { workspace = true }
+# `base64`: a BASIC connection's `Authorization` header is the base64 of
+# `<user>:<password>` (RFC 7617), encoded by this crate rather than by hand
+# (`state::invocation`).
+base64 = "0.22"
+# `percent-encoding`: the query-string parameters an api-destination invocation
+# carries are percent-encoded with the crate's own query set, so a value holding
+# a space or an `&` travels as one value (`state::invocation`).
+percent-encoding = "2"
 # Opaque list page tokens are hex-encoded so they are URL- and header-safe.
 hex = { workspace = true }
 # `arn`: the ONE parse of a caller-supplied resource ARN, shared with every other
@@ -82,6 +90,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The `Authorization: Basic` header the invocation test computes the way
+# RFC 7617 defines it, rather than asserting one encoded literal.
+base64 = "0.22"
 # `tokio::time` drives the tests' wait past a connection transition's due instant.
 tokio = { workspace = true, features = ["time"] }
 # The services a rule's targets live in are mounted beside EventBridge on one

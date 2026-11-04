@@ -232,6 +232,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name.clone(),
             arn: crate::state::api_destination_arn(&region, &input.name, &id),
             description: input.description,
+            // The state the destination is written with is the authorization its
+            // connection settles on, taken ONCE here: the reference it holds can
+            // outlive the connection, so what it reports later is this value as
+            // that connection's own transitions move it
+            // (`crate::state::ComAmazonawsEventbridgeAwseventsState::settle_connections`).
+            state: store.api_destination_state_on(&input.connection_arn),
             connection_arn: input.connection_arn,
             invocation_endpoint: input.invocation_endpoint,
             http_method: input.http_method,

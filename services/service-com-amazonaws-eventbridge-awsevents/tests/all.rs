@@ -13,10 +13,14 @@
 // points it into `tests/all/`.
 #[path = "all/api_destination_delivery.rs"]
 mod api_destination_delivery;
+#[path = "all/api_destination_invocation_parameters.rs"]
+mod api_destination_invocation_parameters;
 #[path = "all/api_destination_rate_limit_refusal.rs"]
 mod api_destination_rate_limit_refusal;
 #[path = "all/api_destination_state_settles_with_its_connection.rs"]
 mod api_destination_state_settles_with_its_connection;
+#[path = "all/api_destination_survives_its_connections_deletion.rs"]
+mod api_destination_survives_its_connections_deletion;
 #[path = "all/api_destination_update.rs"]
 mod api_destination_update;
 #[path = "all/archive_and_api_destination.rs"]
@@ -35,6 +39,8 @@ mod bus_policy_publication_authorization;
 mod client_error_wording;
 #[path = "all/connection_authorization.rs"]
 mod connection_authorization;
+#[path = "all/connection_filter_exclusivity_and_update_completeness.rs"]
+mod connection_filter_exclusivity_and_update_completeness;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
 #[path = "all/connection_refusal_wording.rs"]

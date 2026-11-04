@@ -1365,6 +1365,12 @@ pub(crate) struct CompiledTarget {
     /// rule was compiled — `None` for a target that is not one, and for an ARN
     /// naming a destination this account does not hold.
     api_destination: Option<ApiDestination>,
+    /// `Target$HttpParameters`: "the parameters needed for you to contribute to
+    /// the HTTP request" an api-destination target is invoked with — the path
+    /// wildcards, header and query-string parameters the TARGET contributes,
+    /// merged with the connection's own (see
+    /// [`crate::state::invocation::api_destination_invocation`]).
+    http_parameters: Option<HttpParameters>,
     /// `KinesisParameters$PartitionKeyPath`: "the JSON path to be extracted from
     /// the event and used as the partition key" of the record a Kinesis data
     /// stream target is written as — `None` for a target carrying no
@@ -1428,6 +1434,12 @@ struct ApiDestination {
     /// Whether the destination's `ApiDestinationState` is `ACTIVE`: one whose
     /// connection is not authorized is not invoked.
     active: bool,
+    /// The credential half of the connection the destination invokes through,
+    /// which every request to it carries
+    /// ([`crate::state::invocation::ConnectionSecret`]) — the default (no
+    /// credential, no parameters) for a destination whose connection this
+    /// account no longer holds.
+    secret: crate::state::invocation::ConnectionSecret,
 }
 
 impl CompiledRule {
@@ -1475,6 +1487,7 @@ impl CompiledRule {
                         .as_ref()
                         .and_then(|policy| policy.maximum_retry_attempts),
                     api_destination: api_destination(store, &target.arn),
+                    http_parameters: target.raw.http_parameters.clone(),
                     partition_key_path: target
                         .raw
                         .kinesis_parameters
@@ -1504,6 +1517,10 @@ fn api_destination(
         endpoint: record.invocation_endpoint.clone(),
         method: record.http_method.clone(),
         active: store.api_destination_state(record) == crate::state::API_DESTINATION_STATE_ACTIVE,
+        secret: store
+            .connection_by_arn(&record.connection_arn)
+            .map(|connection| connection.secret.clone())
+            .unwrap_or_default(),
     })
 }
 
@@ -2662,8 +2679,8 @@ const API_DESTINATION_NOT_DELIVERED: &str = "ApiDestinationInvocationFailed";
 /// endpoint rather than an answer from one — the retryable class, exactly as an
 /// endpoint that never answers is.
 ///
-/// The connection's authorization material and `InvocationHttpParameters` are
-/// NOT merged into the request here; that merge is its own change.
+/// The connection's authorization material and both sides' HTTP parameters ARE
+/// merged into the request ([`attempt_api_destination`]).
 async fn invoke_api_destination(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     target: &CompiledTarget,
@@ -2736,7 +2753,7 @@ async fn invoke_api_destination(
         }
         made += 1;
         let started = ::std::time::Instant::now();
-        let attempt = attempt_api_destination(&transport, destination, body).await;
+        let attempt = attempt_api_destination(&transport, destination, target, body).await;
         budget.charge_endpoint_wait(started.elapsed());
         match attempt {
             Attempt::Delivered => return crate::state::InvocationOutcome::Invoked,
@@ -2796,6 +2813,12 @@ enum Attempt {
 
 /// Make one attempt, bounded by [`API_DESTINATION_TIMEOUT`], and classify it.
 ///
+/// What the request CARRIES is what EventBridge sends an API destination: the
+/// event as the body, the content type and user agent AWS sends it with, the
+/// connection's authorization, and the connection's and the target's header,
+/// query-string, path and body parameters merged with the connection's value
+/// winning ([`crate::state::invocation::api_destination_invocation`]).
+///
 /// `transport` is the in-process emulator connector and the ONLY thing this
 /// request is handed to: the endpoint text decides which emulated service
 /// receives it, and a URL naming anything this emulator does not serve is
@@ -2803,6 +2826,7 @@ enum Attempt {
 async fn attempt_api_destination(
     transport: &::aws_smithy_runtime_api::client::http::SharedHttpConnector,
     destination: &ApiDestination,
+    target: &CompiledTarget,
     body: &str,
 ) -> Attempt {
     use ::aws_smithy_runtime_api::client::http::HttpConnector;
@@ -2816,15 +2840,28 @@ async fn attempt_api_destination(
             ))
         }
     };
-    // Every value here comes from the stored destination, so an endpoint that is
-    // not a URI fails HERE rather than panicking.
-    let request = ::http::Request::builder()
+    let invocation = crate::state::invocation::api_destination_invocation(
+        &destination.endpoint,
+        &destination.secret,
+        target.http_parameters.as_ref(),
+        body,
+        API_DESTINATION_CONTENT_TYPE,
+        API_DESTINATION_USER_AGENT,
+    );
+    // Every value here comes from the stored destination, its connection and
+    // the stored target, so an endpoint or a parameter that is not a URI or a
+    // header fails HERE rather than panicking. Each header is written ONCE:
+    // the content type and user agent AWS sends are part of the merge above, so
+    // a parameter naming one of them replaces it rather than adding a second.
+    let mut builder = ::http::Request::builder()
         .method(method)
-        .uri(&destination.endpoint)
-        .header(::http::header::CONTENT_TYPE, API_DESTINATION_CONTENT_TYPE)
-        .header(::http::header::USER_AGENT, API_DESTINATION_USER_AGENT)
+        .uri(&invocation.uri);
+    for (name, value) in &invocation.headers {
+        builder = builder.header(name, value);
+    }
+    let request = builder
         .body(::aws_smithy_types::body::SdkBody::from(
-            ::bytes::Bytes::from(body.to_owned()),
+            ::bytes::Bytes::from(invocation.body.clone()),
         ))
         .map_err(|error| error.to_string())
         .and_then(|request| {

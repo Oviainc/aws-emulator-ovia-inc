@@ -11,7 +11,11 @@
 //! (`CreateConnection$AuthParameters`) holds here too, against the type the
 //! connection will have after the update, and a type CHANGE has to bring the
 //! credentials of the new type with it — otherwise the stored connection could
-//! authorize nothing. No credential the request carried is kept on the record:
+//! authorize nothing. `AuthorizationType` is what SELECTS which member of
+//! `AuthParameters` carries those credentials, so an update supplying
+//! `AuthParameters` has to name it ([`AUTHORIZATION_TYPE_REQUIRED`]) rather than
+//! leaving the service to guess which block it meant. No credential the request
+//! carried is kept on the record:
 //! only the non-secret half of each parameter block is, exactly as
 //! `CreateConnection` stores it.
 //!
@@ -240,6 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let changes_type = authorization_type != stored.authorization_type;
             if let Some(reason) = auth_parameters_violation(
                 &authorization_type,
+                input.authorization_type.as_deref(),
                 input.auth_parameters.as_ref(),
                 changes_type,
             ) {
@@ -270,6 +275,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             connection.authorization_type = authorization_type.clone();
             if let Some(parameters) = input.auth_parameters.as_ref() {
                 connection.auth_parameters = reported_auth_parameters(parameters);
+                // The credential half the invocation carries is replaced
+                // together with the half a read reports, so the two cannot
+                // describe different credentials.
+                connection.secret = connection_secret(parameters);
             }
             connection.last_modified = now;
             // "OAUTH tokens are refreshed when a 401 or 407 response is
@@ -348,6 +357,24 @@ fn refused(reason: &str) -> String {
     crate::state::connection_refusal(VERB, reason)
 }
 
+/// What this call states about `AuthParameters` supplied without the
+/// `AuthorizationType` that selects them.
+///
+/// Each authorization type has exactly one member of
+/// `UpdateConnectionAuthRequestParameters` that carries its credentials, and
+/// `AuthorizationType` is "the type of authorization to use for the connection"
+/// (`UpdateConnection$AuthorizationType`) — the member that says WHICH of those
+/// blocks is the one in force. An update that supplies credentials without it is
+/// therefore incomplete whatever block it carried, including the block of the
+/// type the connection already has: the service is not told which type the new
+/// credentials are for, so it stores none of them and the connection keeps the
+/// authorization it had. The sentence states that rule, in the form this
+/// service's parameter refusals take; the failing call's own clause
+/// ([`refused`]) is stated before it.
+const AUTHORIZATION_TYPE_REQUIRED: &str =
+    "Parameter AuthParameters is not valid. Reason: AuthorizationType must be provided when \
+     AuthParameters is provided.";
+
 /// Why the submitted authorization parameters do not match the authorization type
 /// the connection will have, or `None` when they do.
 ///
@@ -360,8 +387,14 @@ fn refused(reason: &str) -> String {
 /// charges. `changes_type` is what makes those credentials REQUIRED when the
 /// request carries none: an update that only renames the type would leave the
 /// connection holding the credentials of the old one, which authorize nothing.
+///
+/// `named_type` is the `AuthorizationType` the REQUEST carried, as opposed to
+/// the type the connection ends up with: credentials supplied without it are
+/// refused ([`AUTHORIZATION_TYPE_REQUIRED`]), because that member is what says
+/// which of the blocks is in force.
 fn auth_parameters_violation(
     authorization_type: &str,
+    named_type: Option<&str>,
     parameters: Option<&UpdateConnectionAuthRequestParameters>,
     changes_type: bool,
 ) -> Option<String> {
@@ -386,6 +419,11 @@ fn auth_parameters_violation(
     let named = supplied.iter().filter(|(_, _, present)| *present).count();
     if parameters.is_some() && named != 1 {
         return Some(crate::state::ONE_AUTHORIZATION_TYPE.to_string());
+    }
+    // Exactly one block IS named, and the request still has to say which type
+    // that block is for.
+    if parameters.is_some() && named_type.is_none() {
+        return Some(AUTHORIZATION_TYPE_REQUIRED.to_string());
     }
     for (kind, member, present) in supplied {
         if kind == authorization_type && changes_type && !present {
@@ -469,5 +507,30 @@ fn reported_oauth_parameters(
             .o_auth_http_parameters
             .as_ref()
             .map(crate::state::reported_http_parameters),
+    }
+}
+
+/// The credential half of the submitted parameters, which the response shapes
+/// above withhold: `CreateConnection`'s own projection
+/// ([`crate::ops::create_connection`]) over this call's shapes, for the reason
+/// recorded there — the invocation this connection authorizes has to carry the
+/// credentials themselves.
+fn connection_secret(
+    parameters: &UpdateConnectionAuthRequestParameters,
+) -> crate::state::invocation::ConnectionSecret {
+    crate::state::invocation::ConnectionSecret {
+        api_key: parameters.api_key_auth_parameters.as_ref().and_then(|key| {
+            Some(crate::state::invocation::ApiKeyCredential {
+                name: key.api_key_name.clone()?,
+                value: key.api_key_value.clone()?,
+            })
+        }),
+        basic: parameters.basic_auth_parameters.as_ref().and_then(|basic| {
+            Some(crate::state::invocation::BasicCredential {
+                username: basic.username.clone()?,
+                password: basic.password.clone()?,
+            })
+        }),
+        invocation_http_parameters: parameters.invocation_http_parameters.clone(),
     }
 }
