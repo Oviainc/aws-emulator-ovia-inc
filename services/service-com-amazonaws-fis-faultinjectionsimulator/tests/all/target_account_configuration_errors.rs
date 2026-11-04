@@ -17,14 +17,16 @@
 //!   configuration also has to BELONG to the account it configures, which is the rule
 //!   `target_account_role_ownership.rs` asserts; every row here carries a role of its own
 //!   account, so what it refuses can only be the ARN form;
-//! * a target account configuration the named experiment TEMPLATE does not hold is
-//!   refused 404 `ResourceNotFoundException` with the service's constant message, which
-//!   names neither the template nor the account;
-//! * an operation addressing a configuration of an EXPERIMENT resolves the PARENT first:
-//!   an `experimentId` that names no record is refused 404 `ResourceNotFoundException`
-//!   reporting the EXPERIMENT as missing, with a constant that echoes no name, and only an
-//!   experiment that resolves reports its missing CHILD configuration — that one with a
-//!   message BUILT FROM THE REQUEST: the experiment id first, then the target account id;
+//! * a target account configuration a template that RESOLVES does not hold is refused 404
+//!   `ResourceNotFoundException` with the service's constant message, which names neither
+//!   the template nor the account, while a call whose TEMPLATE does not resolve is refused
+//!   with the template-level message instead: the parent is resolved before the child;
+//! * an operation addressing a configuration of an EXPERIMENT resolves the PARENT first
+//!   the same way: an `experimentId` that names no record is refused 404
+//!   `ResourceNotFoundException` reporting the EXPERIMENT as missing, with a constant that
+//!   echoes no name, and only an experiment that resolves reports its missing CHILD
+//!   configuration — that one with a message BUILT FROM THE REQUEST: the experiment id
+//!   first, then the target account id;
 //! * a `nextToken` a paginated list never issued is refused 400 `ValidationException`
 //!   with one constant message, whatever the token and whichever list it is offered to.
 //!
@@ -43,10 +45,15 @@ use smithy_server_runtime::MultiServiceRouter;
 /// from the crate so a wrong bound in the model or the handler fails this suite.
 const ROLE_ARN_CEILING: usize = 2048;
 
-/// The message FIS answers for a target account configuration the named experiment
-/// template does not hold — a constant, so neither half of the resource's name appears
+/// The message FIS answers for a target account configuration an experiment template that
+/// RESOLVES does not hold — a constant, so neither half of the resource's name appears
 /// in it.
 const TEMPLATE_SCOPED_NOT_FOUND: &str = "TargetAccountConfiguration not found.";
+
+/// The message FIS answers when the experiment template a sub-resource call names does not
+/// resolve at all: the parent is resolved before the child, so the refusal names the
+/// TEMPLATE and not the configuration.
+const PARENT_TEMPLATE_NOT_FOUND: &str = "ExperimentTemplate not found.";
 
 /// The message FIS answers for a target account configuration an EXPERIMENT that resolves
 /// does not hold: built from the request, naming the experiment and then the account.
@@ -602,16 +609,43 @@ async fn a_template_scoped_configuration_miss_answers_the_services_constant_mess
     let unknown_template = "EXT000000000099";
 
     // The rows differ along WHICH half of the name misses — the template, the account, or
-    // both — and along the template and account the request named, which the message must
-    // NOT vary with.
-    let cases: [(&str, &str, &str); 5] = [
-        ("unknown-template", unknown_template, account_id),
-        ("unknown-account", &configured, "616161616161"),
-        ("another-unknown-account", &configured, "626262626262"),
-        ("unknown-both", unknown_template, "616161616161"),
-        ("configured-on-another-template", &other, account_id),
+    // both — and along the template and account the request named, which neither message
+    // varies with. A row whose TEMPLATE does not resolve is refused as the template
+    // missing (the parent is resolved first); a row whose template resolves and holds no
+    // configuration for the account is refused as the configuration missing.
+    let cases: [(&str, &str, &str, &str); 5] = [
+        (
+            "unknown-template",
+            unknown_template,
+            account_id,
+            PARENT_TEMPLATE_NOT_FOUND,
+        ),
+        (
+            "unknown-account",
+            &configured,
+            "616161616161",
+            TEMPLATE_SCOPED_NOT_FOUND,
+        ),
+        (
+            "another-unknown-account",
+            &configured,
+            "626262626262",
+            TEMPLATE_SCOPED_NOT_FOUND,
+        ),
+        (
+            "unknown-both",
+            unknown_template,
+            "616161616161",
+            PARENT_TEMPLATE_NOT_FOUND,
+        ),
+        (
+            "configured-on-another-template",
+            &other,
+            account_id,
+            TEMPLATE_SCOPED_NOT_FOUND,
+        ),
     ];
-    for (case, template_id, account) in cases {
+    for (case, template_id, account, expected) in cases {
         let fetched = get_configuration(&router, template_id, account).await;
         assert_eq!(
             fetched.status, 404,
@@ -626,8 +660,8 @@ async fn a_template_scoped_configuration_miss_answers_the_services_constant_mess
         );
         assert_eq!(
             fetched.message(),
-            TEMPLATE_SCOPED_NOT_FOUND,
-            "case get/{case:?}: expected message {TEMPLATE_SCOPED_NOT_FOUND:?}, got {:?}",
+            expected,
+            "case get/{case:?}: expected message {expected:?}, got {:?}",
             fetched.message()
         );
 
@@ -646,8 +680,8 @@ async fn a_template_scoped_configuration_miss_answers_the_services_constant_mess
         );
         assert_eq!(
             updated.message(),
-            TEMPLATE_SCOPED_NOT_FOUND,
-            "case update/{case:?}: expected message {TEMPLATE_SCOPED_NOT_FOUND:?}, got {:?}",
+            expected,
+            "case update/{case:?}: expected message {expected:?}, got {:?}",
             updated.message()
         );
     }

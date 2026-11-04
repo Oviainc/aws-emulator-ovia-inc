@@ -604,10 +604,22 @@ async fn a_target_account_configuration_attaches_only_to_a_multi_account_templat
             answer.body
         );
         let message = answer.message().to_string();
-        assert!(
-            message.contains("accountTargeting") && message.contains("multi-account"),
-            "case {:?}: expected the refusal to name the option and the targeting it \
-             requires, got {message:?}",
+        // The refusal carries FIS's diagnostic payload: WHICH template was rejected, the
+        // account that owns it (the account segment of the template's own ARN), and the
+        // `accountTargeting` that template currently carries — read back from the
+        // template itself, so a row that named none is judged by the default a read
+        // reports.
+        let template = get_template(&router, &template_id).await;
+        let stored = &template.member("experimentTemplate")["experimentOptions"];
+        let targeting = stored["accountTargeting"].as_str().unwrap_or_default();
+        let owner = engine::emulator_account_id();
+        let expected = format!(
+            "ExperimentTemplate {template_id} in AWS account {owner} is not configured as \
+             multi account. Account targeting value is: {targeting}."
+        );
+        assert_eq!(
+            message, expected,
+            "case {:?}: expected message {expected:?}, got {message:?}",
             row.case
         );
         // Nothing was persisted: neither the read of that name nor the template's own
@@ -618,7 +630,6 @@ async fn a_target_account_configuration_attaches_only_to_a_multi_account_templat
             "case {:?}: a refused create must persist nothing, got {} with {:?}",
             row.case, fetched.status, fetched.body
         );
-        let template = get_template(&router, &template_id).await;
         assert_eq!(
             template.member("experimentTemplate")["targetAccountConfigurationsCount"],
             json!(0),
@@ -637,15 +648,21 @@ async fn a_target_account_configuration_attaches_only_to_a_multi_account_templat
         refusals.push((row.case, message));
     }
 
-    let (first_case, first_message) = refusals
-        .first()
-        .cloned()
-        .expect("the table carries rows a configuration cannot be created on");
+    assert!(
+        !refusals.is_empty(),
+        "the table carries rows a configuration cannot be created on"
+    );
+    // The message is built from the template it refuses, so no two rows share one: what
+    // differs between the rows is exactly what the message interpolates.
     for (case, message) in &refusals {
         assert_eq!(
-            message, &first_message,
-            "case {case:?}: expected the same refusal as {first_case:?} \
-             ({first_message:?}), got {message:?}"
+            refusals
+                .iter()
+                .filter(|(_, other)| other == message)
+                .count(),
+            1,
+            "case {case:?}: expected a refusal naming only its own template, got \
+             {message:?} from more than one row"
         );
     }
 }

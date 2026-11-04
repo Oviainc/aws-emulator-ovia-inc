@@ -13,6 +13,10 @@
 //! the same answer a configuration that never had one gives
 //! ([`crate::state::stored_description`]).
 //!
+//! A name neither half of which resolves answers `ResourceNotFoundException`: the
+//! TEMPLATE when the template itself does not resolve, and the configuration when the
+//! template resolves and holds none for that account.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -175,21 +179,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // The configuration lives on the template that owns it, so one lookup resolves
-        // both halves of its name. There are no upsert semantics: this operation changes
-        // a configuration that EXISTS and refuses when none does.
-        let configuration = store
-            .experiment_templates
-            .get_mut(&input.experiment_template_id)
-            .and_then(|template| {
-                template
-                    .target_account_configurations
-                    .get_mut(&input.account_id)
-            });
-        let Some(record) = configuration else {
-            // One refusal for both misses, exactly as the read of the same name gives:
-            // whether the template is absent or the template holds no configuration for
-            // this account, the resource the request named does not exist.
+        // The configuration lives on the template that owns it, and the PARENT is resolved
+        // first: a template id that names no record is reported as the TEMPLATE missing,
+        // whatever the account half of the name says. There are no upsert semantics: this
+        // operation changes a configuration that EXISTS and refuses when none does.
+        let template = store
+            .experiment_template_mut(&input.experiment_template_id)
+            .map_err(UpdateTargetAccountConfigurationErrorModeled::ResourceNotFoundException)?;
+        let Some(record) = template
+            .target_account_configurations
+            .get_mut(&input.account_id)
+        else {
+            // The template resolved and holds no configuration for this account, exactly
+            // as the read of the same name reports it: what is missing is the
+            // configuration itself.
             return Err(
                 UpdateTargetAccountConfigurationErrorModeled::ResourceNotFoundException(
                     crate::state::target_account_configuration_not_found(),

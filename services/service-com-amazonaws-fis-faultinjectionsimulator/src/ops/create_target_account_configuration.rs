@@ -190,20 +190,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The configuration belongs to an experiment template: with no such template
-        // there is nothing to configure. Read through a SHARED borrow, because the token
-        // resolution below reads the store too; the write takes the mutable borrow once
-        // every refusal is behind us.
-        let Some(template) = store
-            .experiment_templates
-            .get(&input.experiment_template_id)
-        else {
-            return Err(
-                CreateTargetAccountConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::template_not_found(),
-                )
-                .into(),
-            );
-        };
+        // there is nothing to configure, and the PARENT is what the refusal names. Read
+        // through a SHARED borrow, because the token resolution below reads the store too;
+        // the write takes the mutable borrow once every refusal is behind us.
+        let template = store
+            .experiment_template(&input.experiment_template_id)
+            .map_err(CreateTargetAccountConfigurationErrorModeled::ResourceNotFoundException)?;
 
         // A target account configuration says which role FIS assumes in ANOTHER account,
         // which is what a template targeting multiple accounts does, so one offered to a
@@ -253,17 +245,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The same template, now borrowed for the write: the store lock has been held
         // throughout, so this resolves the record the refusals above were judged over.
-        let Some(template) = store
-            .experiment_templates
-            .get_mut(&input.experiment_template_id)
-        else {
-            return Err(
-                CreateTargetAccountConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::template_not_found(),
-                )
-                .into(),
-            );
-        };
+        let template = store
+            .experiment_template_mut(&input.experiment_template_id)
+            .map_err(CreateTargetAccountConfigurationErrorModeled::ResourceNotFoundException)?;
 
         // Anything naming an account the template is already configured for is a conflict:
         // a create does not overwrite a configuration, and a request that got this far is

@@ -6,7 +6,8 @@
 //! [`crate::state::ExperimentTemplateRecord::target_account_configurations`]. Reporting
 //! only: it writes nothing, so two reads at the same instant report the same record. A
 //! (template, account) pair the store holds no configuration for — including an account
-//! configured on a DIFFERENT template — answers `ResourceNotFoundException`.
+//! configured on a DIFFERENT template — answers `ResourceNotFoundException`, naming the
+//! TEMPLATE when the template itself does not resolve and the configuration when it does.
 //!
 //! ## Shape of an operation
 //!
@@ -149,16 +150,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting only: the guard is taken immutably, so this read cannot change what
         // a later caller sees.
         let store = state.lock();
-        let configuration = store
-            .experiment_templates
-            .get(&input.experiment_template_id)
-            .and_then(|template| {
-                template.target_account_configurations.get(&input.account_id)
-            });
-        let Some(record) = configuration else {
-            // One refusal for both misses: whether the template is absent or the
-            // template holds no configuration for this account, the resource the request
-            // named does not exist.
+        // A target account configuration is a SUB-RESOURCE of an experiment template, so
+        // the PARENT is resolved first ([`crate::state::ComAmazonawsFisFaultinjectionsimulatorState::experiment_template`]):
+        // a template id that names no record is reported as the TEMPLATE missing,
+        // whatever the account half of the name says.
+        let template = store
+            .experiment_template(&input.experiment_template_id)
+            .map_err(GetTargetAccountConfigurationErrorModeled::ResourceNotFoundException)?;
+        let Some(record) = template.target_account_configurations.get(&input.account_id) else {
+            // The template resolved and holds no configuration for this account, so what
+            // is missing is the configuration itself.
             return Err(
                 GetTargetAccountConfigurationErrorModeled::ResourceNotFoundException(
                     crate::state::target_account_configuration_not_found(),

@@ -515,10 +515,10 @@ async fn a_second_create_under_a_fresh_token_conflicts_on_the_account() {
         assert_eq!(
             second.message(),
             format!(
-                "Experiment template {template_id} already has a target account \
-                 configuration for account {account_id}"
+                "TargetAccountConfiguration for {template_id} \
+                 and target account {account_id} already exists."
             ),
-            "case {case:?}: expected the already-configured message, got {:?}",
+            "case {case:?}: expected the already-exists message, got {:?}",
             second.body
         );
     }

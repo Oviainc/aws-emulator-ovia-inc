@@ -95,6 +95,8 @@ mod target_account_configuration_errors;
 mod target_account_configuration_idempotency;
 #[path = "all/target_account_configuration_page_walk.rs"]
 mod target_account_configuration_page_walk;
+#[path = "all/target_account_configuration_refusal_wording.rs"]
+mod target_account_configuration_refusal_wording;
 #[path = "all/target_account_configurations.rs"]
 mod target_account_configurations;
 #[path = "all/target_account_role_ownership.rs"]

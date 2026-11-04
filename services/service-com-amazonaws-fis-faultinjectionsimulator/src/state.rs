@@ -368,12 +368,16 @@ pub const EXPERIMENT_TEMPLATE_NOT_FOUND: &str = "ExperimentTemplate not found.";
 /// the identical refusal.
 pub const ACTION_NOT_FOUND: &str = "Invalid actionId.";
 
-/// The message FIS answers for a target account configuration the named experiment
-/// TEMPLATE — or the named EXPERIMENT's snapshot of them — does not hold.
+/// The message FIS answers for a target account configuration it reports as the missing
+/// resource — one the named experiment TEMPLATE does not hold.
 ///
 /// A constant rather than a request-derived string: the identical text is recorded for
 /// different template/account pairs, so neither half of the resource's name appears in
-/// it.
+/// it. WHICH resource is reported as missing is per-operation: `GetTargetAccountConfiguration`
+/// and `UpdateTargetAccountConfiguration` resolve the parent template first, so they
+/// answer this only for a template that RESOLVES and holds no configuration for the
+/// account (a template that does not resolve draws [`EXPERIMENT_TEMPLATE_NOT_FOUND`]),
+/// while `DeleteTargetAccountConfiguration` answers this for either miss.
 pub const TARGET_ACCOUNT_CONFIGURATION_NOT_FOUND: &str = "TargetAccountConfiguration not found.";
 
 /// The message FIS answers for an `experimentId` that resolves to no experiment, on the
@@ -2404,6 +2408,35 @@ impl ComAmazonawsFisFaultinjectionsimulatorState {
             .retain(|(kind, _), created| *kind != resource || created.id != id);
     }
 
+    /// The experiment template `id` names, or the `ResourceNotFoundException` FIS answers
+    /// for a template reference that resolves to no record ([`template_not_found`]).
+    ///
+    /// The calls that name a SUB-RESOURCE of a template and resolve the PARENT through
+    /// here do so before they look at the child half of the name: a reference that
+    /// resolves to no template is reported as the TEMPLATE missing, whatever the child
+    /// half says, and only a template that EXISTS and does not hold the child is reported
+    /// as the child missing.
+    pub fn experiment_template(
+        &self,
+        id: &str,
+    ) -> Result<&ExperimentTemplateRecord, ResourceNotFoundException> {
+        self.experiment_templates
+            .get(id)
+            .ok_or_else(template_not_found)
+    }
+
+    /// The experiment template `id` names, for a call that CHANGES it or one of its
+    /// sub-resources; resolved exactly as [`Self::experiment_template`] resolves it, so a
+    /// write path and a read path refuse an unresolvable template identically.
+    pub fn experiment_template_mut(
+        &mut self,
+        id: &str,
+    ) -> Result<&mut ExperimentTemplateRecord, ResourceNotFoundException> {
+        self.experiment_templates
+            .get_mut(id)
+            .ok_or_else(template_not_found)
+    }
+
     /// The target account configuration one [`target_account_configuration_name`] names,
     /// or `None` when this store holds no such sub-resource.
     ///
@@ -3469,16 +3502,38 @@ pub fn multi_account_configuration_refusal(
 /// (`UpdateExperimentTemplateExperimentOptionsInput` declares no member for it), so a
 /// configuration that EXISTS was created on a template this rule admitted and every later
 /// call on it — a read, an update, a delete — is judged by nothing here.
+///
+/// The refusal is the diagnostic FIS puts in the message: WHICH template was rejected,
+/// the account that owns it, and the `accountTargeting` that template currently carries —
+/// the stored value, or the documented default ([`DEFAULT_ACCOUNT_TARGETING`]) for a
+/// template that named none, which is the value a read of the template reports.
 pub fn target_account_targeting_refusal(
     template: &ExperimentTemplateRecord,
 ) -> Option<ValidationException> {
     if targets_multiple_accounts(&template.experiment_options) {
         return None;
     }
+    let id = &template.id;
+    let owner = template_owner_account(template);
+    let targeting = template
+        .experiment_options
+        .account_targeting
+        .as_deref()
+        .unwrap_or(DEFAULT_ACCOUNT_TARGETING);
     Some(invalid_input(format!(
-        "a target account configuration requires experimentOptions.accountTargeting of the \
-         experiment template to be {MULTI_ACCOUNT_TARGETING}."
+        "ExperimentTemplate {id} in AWS account {owner} is not configured as multi \
+         account. Account targeting value is: {targeting}."
     )))
+}
+
+/// The account that owns `template` — the account field of the template's own ARN, which
+/// is the account this emulator serves ([`::engine::emulator_account_id`]) for a record
+/// this store minted.
+fn template_owner_account(template: &ExperimentTemplateRecord) -> &str {
+    match ::service_common::arn::parse(&template.arn) {
+        Some(arn) => arn.account,
+        None => ::engine::emulator_account_id(),
+    }
 }
 
 /// The `actionsMode` an experiment runs under, or the `ValidationException` that refuses
@@ -3627,10 +3682,12 @@ pub fn invalid_next_token() -> ValidationException {
 /// FIS answers the CONSTANT [`EXPERIMENT_TEMPLATE_NOT_FOUND`] here, so this takes NO
 /// argument: the message neither names nor echoes the identifier the request asked for,
 /// whether that id was never minted, is malformed-but-well-typed, or named a template
-/// that has since been deleted. Every operation of this service that resolves an
-/// `experimentTemplateId` (`GetExperimentTemplate`, `DeleteExperimentTemplate`,
-/// `StartExperiment`, `CreateTargetAccountConfiguration`,
-/// `ListTargetAccountConfigurations`) refuses the miss through here, so they cannot
+/// that has since been deleted. Every operation of this service that reports an
+/// unresolvable `experimentTemplateId` — `GetExperimentTemplate`,
+/// `DeleteExperimentTemplate`, `StartExperiment`, `ListTargetAccountConfigurations`, and
+/// the sub-resource calls that resolve the parent template first
+/// (`CreateTargetAccountConfiguration`, `GetTargetAccountConfiguration`,
+/// `UpdateTargetAccountConfiguration`) — refuses the miss through here, so they cannot
 /// disagree.
 pub fn template_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
@@ -3782,14 +3839,18 @@ pub fn invalid_action_reference(action_name: &str) -> ResourceNotFoundException 
 /// The `ConflictException` payload for a create that names an account the template
 /// already has a target account configuration for — "the request could not be processed
 /// because of a conflict".
+///
+/// Built from the request: FIS names the resource that already exists the way it names
+/// the same sub-resource elsewhere ([`experiment_target_account_configuration_not_found`])
+/// — the owning resource first, then the target account.
 pub fn target_account_configuration_exists(
     experiment_template_id: &str,
     account_id: &str,
 ) -> ConflictException {
     ConflictException {
         message: Some(format!(
-            "Experiment template {experiment_template_id} already has a target account \
-             configuration for account {account_id}"
+            "TargetAccountConfiguration for {experiment_template_id} \
+             and target account {account_id} already exists."
         )),
     }
 }
@@ -4567,11 +4628,9 @@ pub fn run_span(modelled: Duration) -> Duration {
 ///
 /// Walked ONCE per action, with each action's finish offset memoised and its own span
 /// parsed exactly once up front, so the whole computation costs O(actions + `startAfter`
-/// entries) — linear in the request, never in its square. The number of actions is capped
-/// at [`MAX_ACTIONS_PER_TEMPLATE`] when the template is created, which also bounds the
-/// recursion depth here; a `startAfter` cycle, which no stored template carries because
-/// [`actions_cycle_refusal`] refuses one, is still broken at the back edge rather than
-/// recursing forever, so this walk terminates on any action map it is handed.
+/// entries) — linear in the request, never in its square. A `startAfter` cycle, which no
+/// stored template carries because [`actions_cycle_refusal`] refuses one, is broken at the
+/// back edge rather than walked forever, so this terminates on any action map it is handed.
 fn critical_path(actions: &HashMap<String, ExperimentTemplateAction>) -> Duration {
     // Parsed once per action, outside the walk.
     let spans: HashMap<&str, Duration> = actions
@@ -4581,51 +4640,84 @@ fn critical_path(actions: &HashMap<String, ExperimentTemplateAction>) -> Duratio
     let mut finish: HashMap<&str, Duration> = HashMap::with_capacity(actions.len());
     let mut longest = Duration::ZERO;
     for name in actions.keys() {
-        let mut walking: Vec<&str> = Vec::new();
-        let offset = finish_offset(name.as_str(), actions, &spans, &mut finish, &mut walking);
+        let offset = finish_offset(name.as_str(), actions, &spans, &mut finish);
         longest = longest.max(offset);
     }
     longest
 }
 
-/// When `name` finishes, measured from the start of the run: the latest finish of the
+/// When `root` finishes, measured from the start of the run: the latest finish of the
 /// actions its `startAfter` names, plus its own span.
 ///
-/// `finish` memoises the answer for every action already resolved, and `walking` holds the
-/// chain currently being resolved so a cycle is answered as "no dependency" instead of
-/// recursing. See [`critical_path`] for the cost this keeps.
+/// Resolved over an EXPLICIT stack rather than by recursion, so a long chain of
+/// `startAfter` links costs heap entries and not call frames: the walk uses a constant
+/// amount of stack whatever dependency chain the request declares. `finish` memoises the
+/// answer for every action already resolved — across roots, so no action is totalled twice
+/// — and `walking` holds the chain currently being resolved, so a back edge is answered as
+/// "no dependency" instead of being followed. See [`critical_path`] for the cost this
+/// keeps.
 fn finish_offset<'a>(
-    name: &'a str,
+    root: &'a str,
     actions: &'a HashMap<String, ExperimentTemplateAction>,
     spans: &HashMap<&'a str, Duration>,
     finish: &mut HashMap<&'a str, Duration>,
-    walking: &mut Vec<&'a str>,
 ) -> Duration {
-    if let Some(known) = finish.get(name) {
-        return *known;
-    }
-    if walking.contains(&name) {
-        return Duration::ZERO;
-    }
-    walking.push(name);
-    let mut start = Duration::ZERO;
-    if let Some(action) = actions.get(name) {
-        for earlier in action.start_after.iter().flatten() {
-            // `startAfter` names an action the template declares (`actions_refusal`); a
-            // name the map does not hold contributes nothing rather than a guess.
-            if let Some((key, _)) = actions.get_key_value(earlier.as_str()) {
-                start = start.max(finish_offset(key.as_str(), actions, spans, finish, walking));
+    // Each entry is an action and whether the actions it waits for have been pushed yet:
+    // the SECOND visit of an action is the one that can total it, which is what taking the
+    // latest finish of its dependencies needs.
+    let mut stack: Vec<(&'a str, bool)> = vec![(root, false)];
+    let mut walking: Vec<&'a str> = Vec::new();
+    while let Some((name, dependencies_pushed)) = stack.pop() {
+        if finish.contains_key(name) {
+            continue;
+        }
+        if !dependencies_pushed {
+            if walking.contains(&name) {
+                continue;
             }
+            walking.push(name);
+            stack.push((name, true));
+            for earlier in waits_for(name, actions) {
+                stack.push((earlier, false));
+            }
+            continue;
+        }
+        let mut start = Duration::ZERO;
+        for earlier in waits_for(name, actions) {
+            // An action still unresolved here is one the walk broke a back edge at, which
+            // contributes nothing.
+            start = start.max(finish.get(earlier).copied().unwrap_or(Duration::ZERO));
+        }
+        // SATURATING: a template may name a `duration` of its own choosing for any action
+        // other than `aws:fis:wait` (whose range `actions_refusal` checks), so a chain of
+        // them can add up past what a `Duration` holds. The sum is capped there rather
+        // than overflowing — a run that long is clamped to [`MAX_RUN_SPAN`] either way.
+        let total = start.saturating_add(spans.get(name).copied().unwrap_or(Duration::ZERO));
+        finish.insert(name, total);
+        if walking.last() == Some(&name) {
+            walking.pop();
         }
     }
-    walking.pop();
-    // SATURATING: a template may name a `duration` of its own choosing for any action
-    // other than `aws:fis:wait` (whose range `actions_refusal` checks), so a chain of them
-    // can add up past what a `Duration` holds. The sum is capped there rather than
-    // overflowing — a run that long is clamped to [`MAX_RUN_SPAN`] either way.
-    let total = start.saturating_add(spans.get(name).copied().unwrap_or(Duration::ZERO));
-    finish.insert(name, total);
-    total
+    finish.get(root).copied().unwrap_or(Duration::ZERO)
+}
+
+/// The actions `name` waits for: the entries of its `startAfter` the action map holds.
+///
+/// `startAfter` names an action the template declares (`actions_refusal`); a name the map
+/// does not hold contributes nothing rather than a guess.
+fn waits_for<'a>(
+    name: &str,
+    actions: &'a HashMap<String, ExperimentTemplateAction>,
+) -> impl Iterator<Item = &'a str> {
+    actions
+        .get(name)
+        .into_iter()
+        .flat_map(|action| action.start_after.iter().flatten())
+        .filter_map(|earlier| {
+            actions
+                .get_key_value(earlier.as_str())
+                .map(|(key, _)| key.as_str())
+        })
 }
 
 /// How long one action takes: the span its `duration` parameter names, and nothing at all
