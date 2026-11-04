@@ -194,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .catalogs
             .get_mut(&catalog_id)
             .and_then(|catalog| catalog.databases.remove(&folded));
-        if removed.is_none() {
+        let Some(removed) = removed else {
             return Err(DeleteDatabaseErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
                     message: Some(crate::state::messages::database_not_found(&input.name)),
@@ -202,6 +202,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        };
+        // The PARTITION INDEXES of the tables that cascade with the database go with them:
+        // an index is a resource OF its table (`crate::service::partition_indexes`), so a
+        // table the catalog no longer holds leaves no records behind. Written while the
+        // catalog's guard is still held, which is the order every path takes the two stores
+        // in.
+        if let Some(records) =
+            crate::service::partition_indexes::partition_index_store(&*self.engine)
+        {
+            records.lock().forget_tables(removed.tables.values());
         }
         ::tracing::info!(
             operation = "DeleteDatabase",

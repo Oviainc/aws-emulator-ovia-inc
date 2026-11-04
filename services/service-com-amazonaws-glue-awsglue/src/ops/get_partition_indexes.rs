@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPartitionIndexes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPartitionIndexes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPartitionIndexes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the partition indexes of ONE stored table: "the partition indexes associated
+//! with a table". An index is a resource OF its table, so this read resolves the table
+//! first — a database or a table the catalog does not hold is the modelled
+//! `EntityNotFoundException`, exactly as it is for every other read addressed through a
+//! table — and then answers the records that table holds
+//! ([`crate::service::partition_indexes`]), with each index's status taken from the due
+//! instant its registration recorded. A table nothing has registered an index on holds none,
+//! which is an EMPTY list and not an absent one.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +153,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPartitionIndexes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPartitionIndexesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPartitionIndexes"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetPartitionIndexesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+        let Some(index_records) =
+            crate::service::partition_indexes::partition_index_store(&*self.engine)
+        else {
+            return Err(GetPartitionIndexesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // Which TABLE the request addressed. The indexes are a resource of that table, so the
+        // table is resolved under the catalog's guard and the guard released before its index
+        // records are read: the records are keyed by the stored table itself
+        // (`crate::service::partition_indexes::TableIndexKey`), which is what keeps a table
+        // created under a recycled name from reading an earlier table's indexes.
+        let indexed_table = {
+            let store = state.lock();
+            let Some(database) = store.database(&catalog_id, &input.database_name) else {
+                return Err(GetPartitionIndexesErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::database_not_found(
+                            &input.database_name,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            let Some(table) = database
+                .tables
+                .get(&crate::state::fold_name(&input.table_name))
+            else {
+                return Err(GetPartitionIndexesErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            crate::service::partition_indexes::TableIndexKey::of(table)
+        };
+
+        // Each index's `IndexStatus` is a function of the due instant its registration
+        // recorded and the instant of THIS call, so reading one index never moves it and
+        // never moves another.
+        let descriptors = index_records
+            .lock()
+            .descriptors(&indexed_table, ::std::time::SystemTime::now());
+
+        // The whole of a table's index list fits one page: a table holds at most
+        // `MAX_INDEXES_PER_TABLE` indexes and this operation models no page size to ask for a
+        // smaller one, so no call of it hands back a `NextToken`. A token a caller does bring
+        // is the `IndexName` the page it names ended at, so the answer resumes at the first
+        // index strictly after that name — the order descriptors are reported in.
+        let resume_at = match input.next_token.as_deref() {
+            Some(cursor) => {
+                descriptors.partition_point(|index| index.index_name.as_str() <= cursor)
+            }
+            None => 0,
+        };
+
+        Ok(GetPartitionIndexesOutput {
+            partition_index_descriptor_list: Some(descriptors[resume_at..].to_vec()),
+            next_token: None,
+        })
     }
 }

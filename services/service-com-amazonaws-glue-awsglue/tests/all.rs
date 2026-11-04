@@ -227,6 +227,8 @@ mod ml_transform_updates;
 mod ml_transforms;
 #[path = "all/owed_status_materialisation.rs"]
 mod owed_status_materialisation;
+#[path = "all/partition_indexes.rs"]
+mod partition_indexes;
 #[path = "all/partitions.rs"]
 mod partitions;
 #[path = "all/registries.rs"]

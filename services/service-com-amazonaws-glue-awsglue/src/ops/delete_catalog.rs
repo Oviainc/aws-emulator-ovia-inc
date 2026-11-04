@@ -230,6 +230,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let databases = removed.databases.len();
+        // The PARTITION INDEXES of every table under this catalog go with it: an index is a
+        // resource OF its table (`crate::service::partition_indexes`), so a table the catalog
+        // no longer holds leaves no records behind. Written while the catalog store's guard is
+        // still held, which is the order every path takes the two stores in.
+        if let Some(records) =
+            crate::service::partition_indexes::partition_index_store(&*self.engine)
+        {
+            records.lock().forget_tables(
+                removed
+                    .databases
+                    .values()
+                    .flat_map(|database| database.tables.values()),
+            );
+        }
         drop(store);
         ::tracing::info!(
             operation = "DeleteCatalog",

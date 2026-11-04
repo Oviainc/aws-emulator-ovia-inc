@@ -216,10 +216,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // belongs, rather than failing the whole batch or claiming a clean delete.
         let mut errors: Vec<TableError> = Vec::new();
         let mut deleted = 0usize;
+        // The tables this batch dropped, whose partition indexes go with them below.
+        let mut dropped: Vec<crate::state::TableEntry> = Vec::new();
         for requested in &input.tables_to_delete {
             let folded = crate::state::fold_name(requested);
-            if database.tables.remove(&folded).is_some() {
+            if let Some(removed) = database.tables.remove(&folded) {
                 deleted += 1;
+                dropped.push(removed);
             } else {
                 errors.push(TableError {
                     // `TableError$TableName`: "For Hive compatibility, this must be
@@ -236,6 +239,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         format!("Table {folded} not found"),
                     )),
                 });
+            }
+        }
+        // A table's PARTITION INDEXES are a resource OF the table
+        // (`crate::service::partition_indexes`), so every table this batch dropped loses its
+        // indexes with it, exactly as the single-table `DeleteTable` does. Written while the
+        // catalog's guard is still held, which is the order every path takes the two stores
+        // in.
+        if !dropped.is_empty() {
+            if let Some(records) =
+                crate::service::partition_indexes::partition_index_store(&*self.engine)
+            {
+                records.lock().forget_tables(dropped.iter());
             }
         }
         ::tracing::info!(

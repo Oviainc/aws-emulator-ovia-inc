@@ -20,6 +20,13 @@
 //! carrying a `ViewDefinition` still answers 501: a Glue view's dialect representations
 //! are a layer this slice does not keep.
 //!
+//! `PartitionIndexes` registers the table's partition indexes with it: each one is resolved
+//! against the partition keys of the definition being stored and recorded beside the table
+//! ([`crate::service::partition_indexes`]), so `GetPartitionIndexes` reports the indexes this
+//! create registered. An index naming a key the table does not partition by is
+//! `InvalidInputException`, and more indexes than a table holds is
+//! `ResourceNumberLimitExceededException`.
+//!
 //! A create that supplies no name at all — a `DatabaseName` or a `TableInput$Name` absent
 //! or empty — is refused with this operation's own `InvalidInputException` and the
 //! catalog's sentence for that member, stated before any handler runs by
@@ -212,19 +219,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        // Partition indexes are a separate stored resource (GetPartitionIndexes) this
-        // slice does not keep, and a transactional create needs a transaction log it
-        // does not keep either. Accepting either member and dropping it would answer
-        // 200 for work nothing did, so both are refused.
-        if input
-            .partition_indexes
-            .as_ref()
-            .is_some_and(|indexes| !indexes.is_empty())
-        {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "CreateTable with PartitionIndexes",
-            ));
-        }
+        // A transactional create needs a transaction log this slice does not keep, so
+        // accepting the member and dropping it would answer 200 for work nothing did.
         if input.transaction_id.is_some() {
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "CreateTable with TransactionId",
@@ -302,6 +298,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let table_input = &definition;
 
+        // The instant this create is served, which the stored table records as its
+        // `CreateTime` and the indexes it registers date their build from.
+        let created_at = ::std::time::SystemTime::now();
+
+        // The PARTITION INDEXES this create registers on the table: "a list of partition
+        // indexes, `PartitionIndex` structures, to create in the table"
+        // (`CreateTableRequest$PartitionIndexes`). They index the table's PARTITION KEYS, so
+        // they are resolved against the definition about to be stored, and resolved BEFORE
+        // anything is stored: a create the catalog refuses registers no index
+        // (`crate::service::partition_indexes`).
+        let submitted_indexes = input.partition_indexes.as_deref().unwrap_or_default();
+        let partition_indexes = match crate::service::partition_indexes::resolve_indexes(
+            &table_input.name,
+            submitted_indexes,
+            table_input.partition_keys.as_deref().unwrap_or_default(),
+            created_at,
+        ) {
+            Ok(indexes) => indexes,
+            Err(crate::service::partition_indexes::IndexRefusal::Invalid(message)) => {
+                return Err(CreateTableErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(message),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
+            Err(crate::service::partition_indexes::IndexRefusal::TooMany(message)) => {
+                return Err(
+                    CreateTableErrorModeled::ResourceNumberLimitExceededException(
+                        ResourceNumberLimitExceededException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateTableErrorModeled::InternalServiceException(
                 InternalServiceException {
@@ -309,6 +344,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        };
+        // The records the table's indexes are written to, resolved before the table itself is
+        // stored: a create that could not record the indexes it was given must store no table
+        // either, or a later read would report a table carrying none of them.
+        let index_records = if partition_indexes.is_empty() {
+            None
+        } else {
+            match crate::service::partition_indexes::partition_index_store(&*self.engine) {
+                Some(records) => Some(records),
+                None => {
+                    return Err(CreateTableErrorModeled::InternalServiceException(
+                        InternalServiceException {
+                            message: Some("the Glue Data Catalog store is unavailable".into()),
+                        },
+                    )
+                    .into())
+                }
+            }
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
@@ -414,17 +467,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &database_name,
             &catalog_id,
             Some(created_by),
-            ::std::time::SystemTime::now(),
+            created_at,
         );
         // The key material this write was encrypted under, which every later read of the
         // table has to recover before it can answer the definition.
         entry.encryption = encryption;
+        // The indexes belong to the table this create stores, so their records are keyed by
+        // that stored table — and written while the catalog's guard is still held, so no
+        // reader can resolve the new table before the indexes it was registered with are
+        // there. The lock order is the catalog's store and then the records', which is the
+        // order the read path takes them in too.
+        let indexed_table = crate::service::partition_indexes::TableIndexKey::of(&entry);
         database.tables.insert(folded_table.clone(), entry);
+        let registered_indexes = partition_indexes.len();
+        if let Some(records) = index_records {
+            records.lock().record(indexed_table, partition_indexes);
+        }
+        drop(store);
         ::tracing::info!(
             operation = "CreateTable",
             catalog_id = %catalog_id,
             database = %database_name,
             table = %folded_table,
+            partition_indexes = registered_indexes,
             "created a Data Catalog table"
         );
 

@@ -54,6 +54,17 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+/// The PARTITION INDEX records of the Data Catalog's tables: state this service keeps beside
+/// the catalog itself, whose source file lives with the rest of this service's state
+/// (`src/state/partition_indexes.rs`, beside [`crate::state::catalog_encryption`]).
+///
+/// It is DECLARED from this file because this is the file the service owns and which is never
+/// regenerated: `src/ops/` holds one file per operation, so a module declared by a file there
+/// is read as an operation this service's model does not have, and `src/state.rs` — the state
+/// module root — is already at the length this project keeps a source file to.
+#[path = "state/partition_indexes.rs"]
+pub mod partition_indexes;
+
 /// The `com-amazonaws-glue-awsglue` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///

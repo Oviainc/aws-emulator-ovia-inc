@@ -253,6 +253,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read back through the key this write used.
         entry.encryption = encryption;
         catalog.databases.insert(submitted.clone(), entry);
+        // A rename rewrites the database each of those tables records, and a table's
+        // PARTITION INDEX records are keyed by the table as it is stored
+        // (`crate::service::partition_indexes`), so they move to the new name with the tables
+        // they belong to: renaming a database around a table changes neither the table nor
+        // the indexes registered on it. Written while the catalog's guard is still held,
+        // which is the order every path takes the two stores in.
+        if renaming {
+            if let Some(records) =
+                crate::service::partition_indexes::partition_index_store(&*self.engine)
+            {
+                records
+                    .lock()
+                    .rename_database(&catalog_id, &addressed, &submitted);
+            }
+        }
         ::tracing::info!(
             operation = "UpdateDatabase",
             catalog_id = %catalog_id,

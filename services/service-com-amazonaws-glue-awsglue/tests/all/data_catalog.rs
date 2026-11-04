@@ -1032,8 +1032,8 @@ async fn catalog_id_selects_the_one_catalog_this_emulator_holds() {
 /// test misleading.
 ///
 /// The rows span every such member of the slice. Governed/transactional and
-/// point-in-time reads (`TransactionId`, `QueryAsOfTime`), a transactional write and
-/// partition indexes all answer 501 `NotImplemented` — "nobody
+/// point-in-time reads (`TransactionId`, `QueryAsOfTime`) and a transactional write
+/// answer 501 `NotImplemented` — "nobody
 /// has written it yet" — while the one combination the model forbids outright
 /// (`QueryAsOfTime` together with `TransactionId`) answers `InvalidInputException`,
 /// because that is a client error whatever else is supported.
@@ -1044,18 +1044,6 @@ async fn unsupported_members_are_refused_not_silently_dropped() {
     create_table(&router, "guarded_db", "events").await;
 
     let unimplemented: Vec<(&str, &str, Value)> = vec![
-        (
-            "CreateTable with PartitionIndexes",
-            "CreateTable",
-            json!({
-                "DatabaseName": "guarded_db",
-                "TableInput": {
-                    "Name": "indexed_table",
-                    "PartitionKeys": [ { "Name": "dt", "Type": "string" } ]
-                },
-                "PartitionIndexes": [ { "IndexName": "dt_idx", "Keys": [ "dt" ] } ]
-            }),
-        ),
         (
             "CreateTable with a ViewDefinition",
             "CreateTable",

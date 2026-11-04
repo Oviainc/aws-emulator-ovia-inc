@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        if database.tables.remove(&folded_table).is_none() {
+        let Some(removed) = database.tables.remove(&folded_table) else {
             return Err(DeleteTableErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
                     message: Some(crate::state::messages::table_not_found(&input.name)),
@@ -220,6 +220,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        };
+        // A table's PARTITION INDEXES are a resource OF the table
+        // (`crate::service::partition_indexes`), so they go when it does, exactly as the
+        // partitions stored inside it do. Written while the catalog's guard is still held,
+        // which is the order every path takes the two stores in.
+        if let Some(records) =
+            crate::service::partition_indexes::partition_index_store(&*self.engine)
+        {
+            records.lock().forget_tables([&removed]);
         }
         ::tracing::info!(
             operation = "DeleteTable",
