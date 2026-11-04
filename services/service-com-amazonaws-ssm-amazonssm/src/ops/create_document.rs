@@ -315,7 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "You can have at most {} active SSM documents",
                 crate::state::MAX_DOCUMENTS
             ))
-        } else if store.documents.len() >= crate::state::MAX_DOCUMENTS_TOTAL {
+        } else if !store.can_hold_another_document() {
             Some(format!(
                 "This emulator holds at most {} documents across every Region",
                 crate::state::MAX_DOCUMENTS_TOTAL

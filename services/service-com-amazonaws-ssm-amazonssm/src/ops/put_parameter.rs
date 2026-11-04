@@ -580,7 +580,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the store already holds, read under the guard and then released: a
         // `SecureString` is sealed under its KMS key below, and no state of this service
         // is held while KMS seals it.
-        let (parameters_in_region, parameters_total, existing) = {
+        let (parameters_in_region, parameters_total, room_for_another, existing) = {
             let store = state.lock();
             let existing = store.parameter(&region, name).map(|record| Existing {
                 type_: record.latest().map(|latest| latest.type_.clone()),
@@ -593,6 +593,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (
                 store.parameters_in_region(&region),
                 store.parameters.len(),
+                store.can_hold_another_parameter(),
                 existing,
             )
         };
@@ -713,7 +714,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let full = (parameters_in_region >= crate::state::MAX_PARAMETERS_PER_REGION)
                 .then_some(("Region", parameters_in_region, crate::state::MAX_PARAMETERS_PER_REGION))
                 .or_else(|| {
-                    (parameters_total >= crate::state::MAX_PARAMETERS_TOTAL).then_some((
+                    (!room_for_another).then_some((
                         "store",
                         parameters_total,
                         crate::state::MAX_PARAMETERS_TOTAL,

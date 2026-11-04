@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-ssm-amazonssm service.
 //!
-//! Three slices are modelled here. The first is **Parameter Store**: `PutParameter`
+//! Four slices are modelled here. The first is **Parameter Store**: `PutParameter`
 //! creates or updates a parameter, `GetParameter` reads one back,
 //! `GetParametersByPath` reads the parameters stored under one level of a hierarchy
 //! ([`parameter_path`], [`is_under_path`]) and `DescribeParameters` reports the metadata
@@ -48,6 +48,13 @@
 //! so an account that has registered none is reported as holding none. The filter keys a
 //! describe accepts are [`is_node_filter_key`] (the property describe) and
 //! [`is_instance_information_filter_key`] (the string-filter describe).
+//!
+//! The fourth is the **hybrid activations** ([`ActivationRecord`]), keyed by
+//! `(region, activation id)`: `CreateActivation` mints one, `DescribeActivations`
+//! reports what it persisted through [`ActivationRecord::to_activation`], narrowed by
+//! the filter keys [`is_activation_filter_key`] accepts, and `DeleteActivation` drops it
+//! again. The code a create mints is the activation's password and is handed to its
+//! creator once; no read reports it.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,11 +65,12 @@ use std::time::{Duration, SystemTime};
 pub mod secure_string;
 
 use crate::ops::types::{
-    AttachmentInformation, DocumentDescription, DocumentParameter, DocumentRequires,
+    Activation, AttachmentInformation, DocumentDescription, DocumentParameter, DocumentRequires,
     InstanceInformation, InstanceProperty, Parameter, ParameterHistory, ParameterInlinePolicy,
-    ParameterMetadata, Tag, ASSOCIATION_STATUS_NAME_VALUES, INSTANCE_INFORMATION_FILTER_KEY_VALUES,
-    INSTANCE_PROPERTY_FILTER_KEY_VALUES, PARAMETER_TIER_VALUES, PARAMETER_TYPE_VALUES,
-    PING_STATUS_VALUES, PLATFORM_TYPE_VALUES, RESOURCE_TYPE_VALUES, SOURCE_TYPE_VALUES,
+    ParameterMetadata, Tag, ASSOCIATION_STATUS_NAME_VALUES, DESCRIBE_ACTIVATIONS_FILTER_KEYS_VALUES,
+    INSTANCE_INFORMATION_FILTER_KEY_VALUES, INSTANCE_PROPERTY_FILTER_KEY_VALUES,
+    PARAMETER_TIER_VALUES, PARAMETER_TYPE_VALUES, PING_STATUS_VALUES, PLATFORM_TYPE_VALUES,
+    RESOURCE_TYPE_VALUES, SOURCE_TYPE_VALUES,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service, all three
@@ -2423,11 +2431,19 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// from the id it stopped at rather than from an offset.
     ///
     /// Nothing registers a node yet: registration is the SSM Agent's own call, which
-    /// this service's model does not expose, and every operation that would admit one
-    /// another way (`CreateActivation`, `CreateAssociation`, `PutInventory`) is still a
-    /// scaffold. A describe therefore reports the empty set for a fresh emulator — what
-    /// the store holds — rather than nodes nobody registered.
+    /// this service's model does not expose — `CreateActivation` mints the activation an
+    /// agent registers WITH, not the node — and the operations that would admit one
+    /// another way (`CreateAssociation`, `PutInventory`) are still scaffolds. A describe
+    /// therefore reports the empty set for a fresh emulator — what the store holds —
+    /// rather than nodes nobody registered.
     pub managed_nodes: BTreeMap<(String, String), ManagedNodeRecord>,
+
+    /// Every hybrid activation, keyed by `(region, activation id)`: an activation is
+    /// created at one Region's endpoint and is identified there by the id the create
+    /// minted. A `BTreeMap` so a report walks a stable, total order — ascending by
+    /// activation id within one Region — and can resume a page from the id it stopped at
+    /// rather than from an offset.
+    pub activations: BTreeMap<(String, String), ActivationRecord>,
 
     /// When this store came into being, and so how old the documents Systems Manager
     /// publishes ([`PUBLISHED_DOCUMENTS`]) are here: they exist for as long as the
@@ -2442,6 +2458,7 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             parameters: BTreeMap::new(),
             documents: BTreeMap::new(),
             managed_nodes: BTreeMap::new(),
+            activations: BTreeMap::new(),
             created_at: SystemTime::now(),
         }
     }
@@ -2518,6 +2535,18 @@ impl ComAmazonawsSsmAmazonssmState {
             .count()
     }
 
+    /// Whether this store can take another document: the emulator's own total guard
+    /// ([`MAX_DOCUMENTS_TOTAL`]), measured across EVERY Region.
+    ///
+    /// The Region a document is stored under comes from the request's own credential
+    /// scope ([`request_region`]), so the published per-Region quota alone would be one
+    /// quota per caller-chosen partition of the key space and the store could grow
+    /// without bound. `CreateDocument` refuses a create past this total rather than
+    /// persisting it.
+    pub fn can_hold_another_document(&self) -> bool {
+        self.documents.len() < MAX_DOCUMENTS_TOTAL
+    }
+
     /// The parameter `name` names in `region`, or `None` when that Region holds none.
     pub fn parameter(&self, region: &str, name: &str) -> Option<&ParameterRecord> {
         self.parameters
@@ -2548,6 +2577,14 @@ impl ComAmazonawsSsmAmazonssmState {
             .count()
     }
 
+    /// Whether this store can take another parameter: the emulator's own total guard
+    /// ([`MAX_PARAMETERS_TOTAL`]), measured across EVERY Region for the same reason
+    /// [`ComAmazonawsSsmAmazonssmState::can_hold_another_document`] is. `PutParameter`
+    /// refuses a create past it rather than persisting it.
+    pub fn can_hold_another_parameter(&self) -> bool {
+        self.parameters.len() < MAX_PARAMETERS_TOTAL
+    }
+
     /// Every parameter `region` holds, in ascending canonical-name order, as
     /// `(canonical name, record)`. The order is what makes a hierarchy read's resume
     /// cursor total: it is a parameter name, not an offset into a list that may have
@@ -2573,6 +2610,48 @@ impl ComAmazonawsSsmAmazonssmState {
             .iter()
             .filter(move |((held, _), _)| held == region)
             .map(|((_, id), node)| (id.as_str(), node))
+    }
+
+    /// Whether this store can take another activation: the emulator's own total guard
+    /// ([`MAX_ACTIVATIONS_TOTAL`]), measured across EVERY Region for the same reason
+    /// [`ComAmazonawsSsmAmazonssmState::can_hold_another_document`] is.
+    /// `CreateActivation` refuses a create past it rather than persisting it.
+    pub fn can_hold_another_activation(&self) -> bool {
+        self.activations.len() < MAX_ACTIVATIONS_TOTAL
+    }
+
+    /// Store `record` as `region`'s activation of that id.
+    pub fn insert_activation(&mut self, record: ActivationRecord) {
+        let key = (record.region.clone(), record.id.clone());
+        self.activations.insert(key, record);
+    }
+
+    /// The activation `id` names in `region`, or `None` when that Region holds none.
+    pub fn activation(&self, region: &str, id: &str) -> Option<&ActivationRecord> {
+        self.activations.get(&(region.to_string(), id.to_string()))
+    }
+
+    /// Drop `region`'s activation of that id, answering whether it held one. The nodes it
+    /// registered are untouched: "Deleting an activation doesn't de-register managed
+    /// nodes" (`DeleteActivation`).
+    pub fn remove_activation(&mut self, region: &str, id: &str) -> bool {
+        self.activations
+            .remove(&(region.to_string(), id.to_string()))
+            .is_some()
+    }
+
+    /// Every activation `region` holds, in ascending activation-id order, as
+    /// `(activation id, record)`. The order is what makes a report's resume cursor total:
+    /// it is an activation id, not an offset into a list that may have changed between
+    /// two pages.
+    pub fn activations_in_region<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = (&'a str, &'a ActivationRecord)> + 'a {
+        self.activations
+            .iter()
+            .filter(move |((held, _), _)| held == region)
+            .map(|((_, id), record)| (id.as_str(), record))
     }
 
     /// Store `node` as a managed node of `region`, keyed by the node id it reports.
@@ -2952,6 +3031,213 @@ impl ManagedNodeRecord {
             source_type: held.source_type.clone(),
             source_location: held.source_location.clone(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid activations
+// ---------------------------------------------------------------------------
+
+/// How long an activation lasts when the request names no expiry: "If you don't provide
+/// an expiration date, the activation code expires in 24 hours"
+/// (`CreateActivationRequest$ExpirationDate`).
+pub const DEFAULT_ACTIVATION_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How many nodes an activation may register when the request names no limit: "The
+/// default value is 1" (`CreateActivationRequest$RegistrationLimit`).
+pub const DEFAULT_REGISTRATION_LIMIT: i32 = 1;
+
+/// How many nodes have registered with an activation that has just been created: none
+/// has used it yet, and `RegistrationsCount` is "the number of managed nodes already
+/// registered with this activation".
+pub const INITIAL_REGISTRATIONS_COUNT: i32 = 0;
+
+/// The bounds the modelled `MaxResults` of an activation report carries (range 1..50).
+pub const MIN_ACTIVATION_PAGE_SIZE: i32 = 1;
+
+/// See [`MIN_ACTIVATION_PAGE_SIZE`]. It is also the page size a request that names no
+/// `MaxResults` gets, the way every other read of this service serves one (see
+/// [`page_size`]).
+pub const MAX_ACTIVATION_PAGE_SIZE: i32 = 50;
+
+/// The page size an activation report serves (see [`page_size`]).
+pub fn activation_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    page_size(
+        max_results,
+        MIN_ACTIVATION_PAGE_SIZE,
+        MAX_ACTIVATION_PAGE_SIZE,
+    )
+}
+
+/// How many activations this store holds in TOTAL, across every Region.
+///
+/// Emulator resource guard, NOT a published AWS quota, and the bound that keeps this
+/// process finite: the Region an activation is stored under comes from the request's own
+/// credential scope ([`request_region`]), so a per-Region bound would be one bound per
+/// caller-chosen partition of the key space and the store could grow without bound. A
+/// create past it is refused rather than persisted.
+pub const MAX_ACTIVATIONS_TOTAL: usize = 10_000;
+
+/// How many characters an activation code carries, which is the form Systems Manager
+/// mints one in: 20 characters of the base64 alphabet.
+pub const ACTIVATION_CODE_LEN: usize = 20;
+
+/// How many bytes an activation code renders as its [`ACTIVATION_CODE_LEN`] characters:
+/// base64 carries three bytes in every four characters.
+pub const ACTIVATION_CODE_BYTES: usize = ACTIVATION_CODE_LEN / 4 * 3;
+
+/// A fresh activation id: "The ID number generated by the system when it processed the
+/// activation", in the hyphenated form the modelled `ActivationId` pattern is — which
+/// [`is_activation_id`] is the one reading of.
+///
+/// The draw is the tree's own v4 identifier
+/// ([`::emulator_telemetry`]'s uuid-backed id newtype), so this crate names no second
+/// random source.
+pub fn new_activation_id() -> String {
+    ::emulator_telemetry::BatchId::random().as_str().to_string()
+}
+
+/// A fresh activation code: "The code the system generates when it processes the
+/// activation. The activation code functions like a password to validate the activation
+/// ID" (`CreateActivationResult$ActivationCode`).
+///
+/// It is a SECRET the caller installs on the machine it registers, so it is opaque
+/// entropy and nothing about the request or the activation can be read back out of it.
+/// Systems Manager hands it out as [`ACTIVATION_CODE_LEN`] characters of the base64
+/// alphabet, which is [`ACTIVATION_CODE_BYTES`] bytes rendered base64 without padding —
+/// inside the modelled `ActivationCode` length of 20..250.
+///
+/// The bytes are the leading ones of a digest over two freshly drawn v4 identifiers: the
+/// digest is what makes every bit of the code uniform, rather than carrying the version
+/// and variant bits a v4 identifier fixes, and the draws are the same random source
+/// [`new_activation_id`] uses.
+pub fn new_activation_code() -> String {
+    use ::sha2::Digest;
+
+    let mut entropy = ::sha2::Sha256::new();
+    entropy.update(::emulator_telemetry::BatchId::random().as_str());
+    entropy.update(::emulator_telemetry::BatchId::random().as_str());
+    let digest = entropy.finalize();
+    ::aws_smithy_types::base64::encode(&digest[..ACTIVATION_CODE_BYTES])
+}
+
+/// Whether `key` is a filter key an activation report knows (the modelled
+/// `DescribeActivationsFilterKeys` enum), which is what tells an accepted filter from a
+/// refused one. The comparison is exact: a filter key is a name, not a prose label.
+pub fn is_activation_filter_key(key: &str) -> bool {
+    DESCRIBE_ACTIVATIONS_FILTER_KEYS_VALUES.contains(&key)
+}
+
+/// How this service states a filter an activation report cannot serve. `InvalidFilter`'s
+/// own documentation is "The filter name isn't valid. Verify that you entered the correct
+/// name and try again."
+pub const INVALID_ACTIVATION_FILTER: &str =
+    "The filter name isn't valid. Verify that you entered the correct name and try again.";
+
+/// One hybrid activation, as `CreateActivation` persisted it and `DescribeActivations`
+/// reports it.
+///
+/// Everything a read reports is held here, so the report is the activation that was
+/// created rather than a second copy of the request. [`ActivationRecord::code`] is the
+/// one field no read reports: the code is the activation's password, handed to its
+/// creator once.
+#[derive(Debug, Clone)]
+pub struct ActivationRecord {
+    /// The id the create minted; part of the store key and what a read reports.
+    pub id: String,
+    /// The Region the activation was created in, which is the other half of its key: an
+    /// activation registers nodes with the endpoint it was created at.
+    pub region: String,
+    /// The activation's password, returned once by the create. No read reports it.
+    pub code: String,
+    pub description: Option<String>,
+    pub default_instance_name: Option<String>,
+    /// "The Identity and Access Management (IAM) role to assign to the managed node"
+    /// (`Activation$IamRole`) — the role name the create required.
+    pub iam_role: String,
+    /// "The maximum number of managed nodes that can be registered using this
+    /// activation".
+    pub registration_limit: i32,
+    /// "The number of managed nodes already registered with this activation": a count of
+    /// the registrations this store holds for it, which starts at none.
+    pub registrations_count: i32,
+    /// "The date when this activation can no longer be used to register managed nodes",
+    /// which is what makes it expired once the clock passes it.
+    pub expiration_date: SystemTime,
+    pub created_date: SystemTime,
+    pub tags: BTreeMap<String, String>,
+    /// `RegistrationMetadata`, which the model documents as "Reserved for internal use":
+    /// persisted as supplied, and reported by no member of any response.
+    pub registration_metadata: BTreeMap<String, String>,
+}
+
+impl ActivationRecord {
+    /// Whether this activation can no longer register a node at `now`, which is
+    /// `Expired`: the clock has reached the date the activation ends at.
+    pub fn is_expired(&self, now: SystemTime) -> bool {
+        now >= self.expiration_date
+    }
+
+    /// The modelled `Activation` for this record, as of `now`.
+    ///
+    /// Every member is what was persisted; `Expired` is derived from the stored
+    /// expiration date and the clock, so a read reports the activation as expired once
+    /// its date has passed whether or not anybody called in between.
+    pub fn to_activation(&self, now: SystemTime) -> Activation {
+        Activation {
+            activation_id: Some(self.id.clone()),
+            description: self.description.clone(),
+            default_instance_name: self.default_instance_name.clone(),
+            iam_role: Some(self.iam_role.clone()),
+            registration_limit: Some(self.registration_limit),
+            registrations_count: Some(self.registrations_count),
+            expiration_date: Some(::aws_smithy_types::DateTime::from(self.expiration_date)),
+            expired: self.is_expired(now),
+            created_date: Some(::aws_smithy_types::DateTime::from(self.created_date)),
+            tags: (!self.tags.is_empty()).then(|| {
+                self.tags
+                    .iter()
+                    .map(|(key, value)| Tag {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    /// The values of this activation that a filter on `key` is matched against, or `None`
+    /// when `key` is not a filter key of an activation report
+    /// ([`is_activation_filter_key`]).
+    ///
+    /// An activation the store holds no value of that property for answers with an EMPTY
+    /// list and so is reported by no filter on it: a filter selects the activations whose
+    /// property satisfies it, and one without the property has nothing to satisfy it with.
+    pub fn filter_values(&self, key: &str) -> Option<Vec<&str>> {
+        match key {
+            "ActivationIds" => Some(vec![self.id.as_str()]),
+            "DefaultInstanceName" => {
+                Some(self.default_instance_name.as_deref().into_iter().collect())
+            }
+            "IamRole" => Some(vec![self.iam_role.as_str()]),
+            _ => None,
+        }
+    }
+
+    /// Whether this activation satisfies one filter: any value it holds for `key` equals
+    /// any of the filter's `values`.
+    ///
+    /// A `DescribeActivationsFilter` carries no operator, so every filter compares whole
+    /// values for equality ([`OPERATOR_EQUAL`]).
+    pub fn matches_filter(&self, key: &str, values: &[String]) -> bool {
+        let Some(held) = self.filter_values(key) else {
+            return false;
+        };
+        held.iter().any(|held| {
+            values
+                .iter()
+                .any(|wanted| operator_matches(OPERATOR_EQUAL, held, wanted))
+        })
     }
 }
 

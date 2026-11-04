@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/documents.rs"]
 mod documents;
+#[path = "all/hybrid_activations.rs"]
+mod hybrid_activations;
 #[path = "all/instance_properties.rs"]
 mod instance_properties;
 #[path = "all/managed_node_filter_validation.rs"]

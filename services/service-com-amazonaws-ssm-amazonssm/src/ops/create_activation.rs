@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateActivation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateActivation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateActivation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a hybrid activation: the id and the code a machine outside EC2 registers with
+//! Systems Manager by. The activation is persisted in this service's store
+//! ([`crate::state::ActivationRecord`]), keyed by the Region the request was signed for
+//! and the id this call minted, so `DescribeActivations` reports the activation that was
+//! created rather than the request that created it.
+//!
+//! The code is the activation's password (`ActivationCode`: it "functions like a
+//! password to validate the activation ID"), so it is returned to this caller once and
+//! reported by no read.
+//!
+//! The `ExpirationDate` a request names is stored as it was asked for, including one
+//! already past (the activation then reports `Expired`) and one beyond the documented
+//! "up to 30 days in advance": this operation models no error for either bound, so there
+//! is no refusal of them to reproduce, and storing the date the caller asked for is
+//! preferred over inventing one.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +190,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateActivation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateActivationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateActivation"))
+        // `IamRole`'s presence and length, `DefaultInstanceName`'s pattern and length,
+        // `Description`'s length and `RegistrationLimit`'s 1..1000 range are MODELLED
+        // constraints, so the centralized walk has already refused anything outside
+        // them: reaching here means the input satisfies every one of them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateActivationErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // "The date by which this activation request should expire … If you don't
+        // provide an expiration date, the activation code expires in 24 hours."
+        let expiration_date = match input.expiration_date {
+            Some(requested) => ::std::time::SystemTime::try_from(requested).map_err(|_| {
+                crate::scaffolded::Scaffolded::validation(
+                    "Value at 'expirationDate' failed to satisfy constraint: Member must be a \
+                     representable date",
+                )
+            })?,
+            None => now + crate::state::DEFAULT_ACTIVATION_LIFETIME,
+        };
+
+        let record = crate::state::ActivationRecord {
+            id: crate::state::new_activation_id(),
+            region: crate::state::request_region(ctx.parts()),
+            code: crate::state::new_activation_code(),
+            description: input.description,
+            default_instance_name: input.default_instance_name,
+            iam_role: input.iam_role,
+            // "Specify the maximum number of managed nodes you want to register. The
+            // default value is 1."
+            registration_limit: input
+                .registration_limit
+                .unwrap_or(crate::state::DEFAULT_REGISTRATION_LIMIT),
+            // No node has registered with an activation this call has only just minted.
+            registrations_count: crate::state::INITIAL_REGISTRATIONS_COUNT,
+            expiration_date,
+            created_date: now,
+            tags: crate::state::to_btree_map(input.tags),
+            // "Reserved for internal use": persisted as supplied, reported by nothing.
+            registration_metadata: input
+                .registration_metadata
+                .unwrap_or_default()
+                .into_iter()
+                .map(|item| (item.key, item.value))
+                .collect(),
+        };
+
+        // The id and the code are what this call answers with, and this is the only time
+        // the code leaves the store: a read reports the activation without it.
+        let activation_id = record.id.clone();
+        let activation_code = record.code.clone();
+        let mut store = state.lock();
+        // What keeps this process finite: nothing in the model bounds how many
+        // activations an account holds, so the store's own total guard does
+        // (`ComAmazonawsSsmAmazonssmState::can_hold_another_activation`).
+        if !store.can_hold_another_activation() {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "This emulator holds at most {} activations across every Region",
+                crate::state::MAX_ACTIVATIONS_TOTAL
+            )));
+        }
+        store.insert_activation(record);
+
+        Ok(CreateActivationOutput {
+            activation_id: Some(activation_id),
+            activation_code: Some(activation_code),
+        })
     }
 }

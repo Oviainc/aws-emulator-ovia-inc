@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeActivations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeActivations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeActivations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the hybrid activations the Region this request was signed for holds
+//! ([`crate::state::ActivationRecord`]) — what `CreateActivation` persisted, projected
+//! through [`crate::state::ActivationRecord::to_activation`], narrowed by the filter keys
+//! the model declares and paged by activation id.
+//!
+//! A read, so it writes nothing: `Expired` is DERIVED from each activation's stored
+//! expiration date and the clock, so an activation whose date has passed reports as
+//! expired without this call moving anything.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +151,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeActivations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeActivationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeActivations"))
+        use crate::state::{
+            activation_page_size, is_activation_filter_key, is_activation_id, request_region,
+            INVALID_ACTIVATION_FILTER, INVALID_NEXT_TOKEN,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeActivationsErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let filters = input.filters.as_deref().unwrap_or_default();
+        // A filter has to name one of the keys the model declares: a key outside that
+        // set, and a filter that names no key at all, names no property of an activation,
+        // so the filter cannot be served and the request is refused before anything is
+        // asked about the activations.
+        if !filters.iter().all(|filter| {
+            filter
+                .filter_key
+                .as_deref()
+                .is_some_and(is_activation_filter_key)
+        }) {
+            return Err(DescribeActivationsErrorModeled::InvalidFilter(InvalidFilter {
+                message: Some(INVALID_ACTIVATION_FILTER.to_string()),
+            })
+            .into());
+        }
+
+        let page_size = activation_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token this operation hands out is the id of the activation the next page
+        // starts at, so a token that is not shaped like an activation id was not one of
+        // ours.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if is_activation_id(token) => Some(token),
+            Some(_) => {
+                return Err(DescribeActivationsErrorModeled::InvalidNextToken(
+                    InvalidNextToken {
+                        message: Some(INVALID_NEXT_TOKEN.to_string()),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Systems Manager is regional: an activation is reported through the endpoint it
+        // was created at, which is the Region this request was signed for. The store
+        // yields that Region's activations in ascending activation-id order, which is
+        // what makes the resume cursor total.
+        let region = request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        let mut activation_list = Vec::new();
+        let mut next_token = None;
+        for (id, activation) in store.activations_in_region(&region) {
+            if resume_from.is_some_and(|from| id < from) {
+                continue;
+            }
+            // Two filters narrow together, and the values of one filter are alternatives
+            // for the property it names.
+            if !filters.iter().all(|filter| {
+                let key = filter.filter_key.as_deref().unwrap_or_default();
+                let values = filter.filter_values.as_deref().unwrap_or_default();
+                activation.matches_filter(key, values)
+            }) {
+                continue;
+            }
+            if activation_list.len() == page_size {
+                // The page is full and an activation is still waiting: hand the caller
+                // the id it resumes at, so the next request continues where this one
+                // stopped.
+                next_token = Some(id.to_string());
+                break;
+            }
+            activation_list.push(activation.to_activation(now));
+        }
+
+        Ok(DescribeActivationsOutput {
+            activation_list: Some(activation_list),
+            next_token,
+        })
     }
 }
