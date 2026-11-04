@@ -253,7 +253,13 @@ async fn the_published_endpoint_serves_the_rest_surface_out_of_the_domain_record
     );
     assert_eq!(
         banner.body["version"]["number"].as_str(),
-        Some("2.11.0"),
+        Some(
+            format!(
+                "{}.0",
+                super::domain_lifecycle::default_engine_release()
+            )
+            .as_str()
+        ),
         "case \"GET /\": expected the version the domain's EngineVersion names, got {:?}",
         banner.body
     );

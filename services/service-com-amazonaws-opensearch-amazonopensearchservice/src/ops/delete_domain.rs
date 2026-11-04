@@ -69,6 +69,15 @@ use super::types::*;
 
 use crate::state::PROCESSING_STATUS_DELETING;
 
+/// The status the service is recorded answering a `DeleteDomain` for a domain this
+/// account does not hold with: the resource named is not there.
+///
+/// This model annotates `ResourceNotFoundException` with `@httpError(409)`, which is
+/// not the status the wire answer carries, so the error is answered with the recorded
+/// status (`crate::scaffolded::Scaffolded::ModeledWithStatus`) and the model's own
+/// error code and body.
+const DOMAIN_NOT_FOUND_STATUS: u16 = 404;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -147,10 +156,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
 
         let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
         let mut domain = store.domains.remove(&input.domain_name).ok_or_else(|| {
-            DeleteDomainErrorModeled::ResourceNotFoundException(crate::state::domain_not_found(
-                &input.domain_name,
-            ))
+            // The modelled status for this error is 409, and the status the service is
+            // recorded answering a delete of a domain it does not hold with is 404:
+            // the resource named is not there, which no `@httpError` annotation of
+            // this model expresses.
+            crate::scaffolded::Scaffolded::modeled_with_status(
+                DeleteDomainErrorModeled::ResourceNotFoundException(
+                    crate::state::domain_not_found(&input.domain_name),
+                ),
+                DOMAIN_NOT_FOUND_STATUS,
+            )
         })?;
 
         // The record is gone from the store, so the two read paths no longer find it.
@@ -160,9 +177,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         domain.processing = true;
         domain.processing_status = PROCESSING_STATUS_DELETING.to_string();
         domain.processing_until = None;
+        // Tearing the domain down is itself a change being applied to it — the one this
+        // answer reports the progress of — so it is recorded as one. It names no option:
+        // the delete changes no part of the configuration, it takes the whole domain
+        // away.
+        domain.begin_change(PROCESSING_STATUS_DELETING, &[], now);
+        domain.processing_until = None;
 
         Ok(DeleteDomainOutput {
-            domain_status: Some(domain.to_status(local_endpoint.as_deref())),
+            domain_status: Some(crate::service::domain_configuration::reported_status(
+                &domain,
+                local_endpoint.as_deref(),
+            )),
         })
     }
 }

@@ -157,6 +157,33 @@ use crate::state::{
     TAG_QUOTA,
 };
 
+/// How many revisions of each option a create leaves behind.
+///
+/// A create writes the domain's configuration TWICE: the configuration the request
+/// asked for, and then the one the service provisions the domain with — the request's
+/// own values plus the option blocks the service defaulted for it
+/// ([`crate::service::domain_configuration::apply_server_defaults`]). Both are
+/// revisions of every option, so `DescribeDomainConfig` reports update version 2 for
+/// each option of a domain that has just been created, and a later update bumps it
+/// from there.
+const CREATE_REVISIONS: usize = 2;
+
+/// The engine release a domain runs when `CreateDomain` names none:
+/// `CreateDomainRequest$EngineVersion` documents "Defaults to the latest version of
+/// OpenSearch", so it is the newest OpenSearch release of the catalog the service
+/// publishes (`crate::state::published_engine_versions`, newest first) rather than a
+/// release named here, which would go stale as the catalog grows.
+fn latest_opensearch_version() -> &'static str {
+    crate::state::published_engine_versions()
+        .into_iter()
+        .find(|version| {
+            crate::state::engine_type_of(version) == Some(crate::state::ENGINE_TYPE_OPENSEARCH)
+        })
+        // A catalog that publishes no OpenSearch release at all leaves the engine the
+        // emulator's own default names.
+        .unwrap_or(DEFAULT_ENGINE_VERSION)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -241,13 +268,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // "Defaults to the latest version of OpenSearch" — a domain runs ONE engine
-        // release, the one the request named or the current one the service picks when
-        // it named none, and that release is what the rest of the create is judged
-        // against.
+        // release, the one the request named or, when it named none, the LATEST
+        // OpenSearch release the service publishes ([`latest_opensearch_version`]), and
+        // that release is what the rest of the create is judged against.
         let engine_version = input
             .engine_version
             .clone()
-            .unwrap_or_else(|| DEFAULT_ENGINE_VERSION.to_string());
+            .unwrap_or_else(|| latest_opensearch_version().to_string());
 
         // Every node of the cluster runs on the domain's engine release, so an
         // instance type that release does not offer describes a cluster the service
@@ -294,6 +321,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(refusal) = [
             crate::state::master_user_password_refusal(input.advanced_security_options.as_ref()),
             crate::state::warm_storage_refusal(input.cluster_config.as_ref()),
+            // A performance figure the volume type does not provision describes a
+            // volume the service cannot attach
+            // ([`crate::service::domain_configuration::ebs_performance_refusal`]).
+            crate::service::domain_configuration::ebs_performance_refusal(
+                input.ebs_options.as_ref(),
+            ),
             crate::state::log_publishing_refusal(input.log_publishing_options.iter().flatten()),
             crate::state::off_peak_window_refusal(input.off_peak_window_options.as_ref()),
             crate::state::cognito_authentication::cognito_options_refusal(
@@ -397,7 +430,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             processing_until: None,
             cluster_config: input.cluster_config.unwrap_or_default(),
             ebs_options: input.ebs_options,
-            access_policies: input.access_policies,
+            access_policies: crate::service::domain_configuration::stored_access_policies(
+                input.access_policies,
+            ),
             ip_address_type: input.ip_address_type,
             snapshot_options: input.snapshot_options,
             vpc_options: input.vpc_options.map(stored_vpc_options),
@@ -482,15 +517,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             insights: BTreeMap::new(),
         };
 
+        // The domain is provisioned with a WHOLE configuration, not with the handful
+        // of options the request named: every block the request left out is filled in
+        // with the value the service itself sets for it, BEFORE the revisions below, so
+        // each defaulted block is part of the stored record — and so of every
+        // descriptor of it — and carries a revision of its own.
+        crate::service::domain_configuration::apply_server_defaults(&mut domain);
+
         // Every option the new domain holds a value for starts at revision 1, so
         // `DescribeDomainConfig` reports a real `OptionStatus` for it and a later
         // update bumps it from there. An option the request carried no value for gets
         // no revision, and no `DomainConfig` container either.
         //
-        // The six unconditional ones always have a value: the engine version, the use
+        // The seven unconditional ones always have a value: the engine version, the use
         // case and the engine mode default when omitted, the cluster configuration is
-        // `DomainStatus`'s required container, and the advanced options and the
-        // log-publishing options are maps that are empty rather than absent.
+        // `DomainStatus`'s required container, the advanced options and the
+        // log-publishing options are maps that are empty rather than absent, and every
+        // domain has a VPC configuration — empty for one reached on a public endpoint.
         let mut touched: Vec<&str> = vec![
             OPT_ENGINE_VERSION,
             OPT_CLUSTER_CONFIG,
@@ -498,13 +541,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             OPT_LOG_PUBLISHING_OPTIONS,
             OPT_USE_CASE,
             OPT_ENGINE_MODE,
+            OPT_VPC_OPTIONS,
         ];
         for (option, supplied) in [
             (OPT_EBS_OPTIONS, domain.ebs_options.is_some()),
             (OPT_ACCESS_POLICIES, domain.access_policies.is_some()),
             (OPT_IP_ADDRESS_TYPE, domain.ip_address_type.is_some()),
             (OPT_SNAPSHOT_OPTIONS, domain.snapshot_options.is_some()),
-            (OPT_VPC_OPTIONS, domain.vpc_options.is_some()),
             (OPT_COGNITO_OPTIONS, domain.cognito_options.is_some()),
             (
                 OPT_ENCRYPTION_AT_REST_OPTIONS,
@@ -549,8 +592,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 touched.push(option);
             }
         }
-        for option in &touched {
-            domain.touch(option, now);
+        // A create leaves every option at its SECOND revision: the service records the
+        // configuration the request asked for, and then the configuration it is
+        // provisioning the domain with — the request's own values plus the blocks it
+        // defaulted above — which is the revision `DescribeDomainConfig` reports for
+        // every option of a domain that has just been created.
+        for _ in 0..CREATE_REVISIONS {
+            for option in &touched {
+                domain.touch(option, now);
+            }
         }
 
         // A domain created with `VPCOptions` is reached through a VPC endpoint rather
@@ -575,9 +625,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&name)
             .ok_or_else(crate::state::state_unavailable)?;
         Ok(CreateDomainOutput {
-            domain_status: Some(
-                stored.to_status(crate::state::local_endpoint_host(ctx.parts()).as_deref()),
-            ),
+            domain_status: Some(crate::service::domain_configuration::reported_status(
+                stored,
+                crate::state::local_endpoint_host(ctx.parts()).as_deref(),
+            )),
         })
     }
 }

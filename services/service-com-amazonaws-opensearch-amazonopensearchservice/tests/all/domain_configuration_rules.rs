@@ -303,8 +303,11 @@ async fn each_storage_tier_rests_on_the_one_below_it() {
                 );
                 let reported = described(&emulator, &name).await["ClusterConfig"].clone();
                 assert_eq!(
-                    reported["ColdStorageOptions"], cluster["ColdStorageOptions"],
-                    "case DescribeDomain({case}): the stored tiering must be the one created, got \
+                    reported["ColdStorageOptions"],
+                    super::domain_lifecycle::completed("ClusterConfig", &cluster)
+                        ["ColdStorageOptions"],
+                    "case DescribeDomain({case}): the stored tiering must be the one created, \
+                     completed with the service's own default where the create named none, got \
                      {reported:?}"
                 );
             }
@@ -638,11 +641,21 @@ async fn a_domain_that_publishes_no_logs_omits_the_member_and_keeps_the_containe
             "case DescribeDomainConfig({case}): expected the container to report the stored map, \
              got {container:?}"
         );
+        // The option's own status comes with it: a created option is at the revision a
+        // create leaves every option at, and the log-publishing configuration of a
+        // domain that publishes no log type is `Active` — nothing is being applied for
+        // it — while one that holds a log type is applied with the rest of the
+        // configuration the create is provisioning.
+        let publishes = options
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_some_and(|types| !types.is_empty());
+        let expected_state = if publishes { "Processing" } else { "Active" };
         assert!(
-            container["Status"]["UpdateVersion"].as_i64() == Some(1)
-                && container["Status"]["State"].as_str() == Some("Processing"),
+            container["Status"]["UpdateVersion"].as_i64() == Some(2)
+                && container["Status"]["State"].as_str() == Some(expected_state),
             "case DescribeDomainConfig({case}): expected the container to carry the option's \
-             status at its first revision, got {container:?}"
+             status at revision 2 in state {expected_state}, got {container:?}"
         );
     }
 

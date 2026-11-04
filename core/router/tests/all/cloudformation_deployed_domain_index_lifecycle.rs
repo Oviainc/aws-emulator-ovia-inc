@@ -450,9 +450,13 @@ async fn a_deployed_domain_serves_the_index_control_plane() {
         // object reaches the domain as that document's text, with its intrinsics resolved.
         let carried = reported.get("AccessPolicies");
         match &row.expected_policy {
-            None => assert!(
-                carried.is_none_or(Value::is_null),
-                "case {case:?}: a domain declaring no policy must hold none, got {carried:?}"
+            // A declaration carrying no policy leaves the domain with the one the SERVICE
+            // sets for a create that named none, which is the empty document.
+            None => assert_eq!(
+                carried.and_then(Value::as_str),
+                Some(""),
+                "case {case:?}: a domain declaring no policy holds the empty document, got \
+                 {carried:?}"
             ),
             Some(expected) => {
                 let text = carried.and_then(Value::as_str).unwrap_or_else(|| {

@@ -193,7 +193,7 @@ impl Emulator {
         .await
     }
 
-    async fn delete(&self, name: &str) -> Answer {
+    pub(crate) async fn delete(&self, name: &str) -> Answer {
         self.call(
             "DELETE",
             &format!("{PREFIX}/opensearch/domain/{name}"),
@@ -347,6 +347,75 @@ pub(crate) fn change_rows() -> Vec<(&'static str, Value, &'static str)> {
     ]
 }
 
+/// The engine release a `CreateDomain` that names no `EngineVersion` runs:
+/// `CreateDomainRequest$EngineVersion` documents "Defaults to the latest version of
+/// OpenSearch", so it is the newest OpenSearch release of the catalog the service
+/// publishes. Read off that catalog, so an expectation follows the catalog rather than
+/// naming a release that goes stale as it grows.
+pub(crate) fn default_engine_version() -> &'static str {
+    service_com_amazonaws_opensearch_amazonopensearchservice::state::published_engine_versions()
+        .into_iter()
+        .find(|candidate| {
+            service_com_amazonaws_opensearch_amazonopensearchservice::state::engine_type_of(
+                candidate,
+            ) == Some("OpenSearch")
+        })
+        .expect("the published catalog carries an OpenSearch release")
+}
+
+/// The release NUMBER of that version — the `3.7` of `OpenSearch_3.7` — which is what
+/// the cluster's own APIs report as the engine they run.
+pub(crate) fn default_engine_release() -> &'static str {
+    default_engine_version()
+        .split_once('_')
+        .map(|(_, release)| release)
+        .expect("a published version is <engine>_<release>")
+}
+
+/// The container the service HOLDS for `option` once a request has named `sent`: the
+/// members the caller sent, completed with the value the service fills in for a member
+/// the request did not name.
+///
+/// The service provisions a domain with a WHOLE configuration, so a request that names
+/// part of an option block is stored with the rest of that block filled in; the rows
+/// below are the blocks the tables in this suite send, with the defaults the service
+/// documents or is recorded setting for them.
+pub(crate) fn completed(option: &str, sent: &Value) -> Value {
+    let defaults: Value = match option {
+        "ClusterConfig" => json!({
+            "ColdStorageOptions": { "Enabled": false },
+            "DedicatedMasterEnabled": false,
+            "MultiAZWithStandbyEnabled": false,
+            "WarmEnabled": false,
+            "ZoneAwarenessEnabled": false,
+        }),
+        "AdvancedOptions" => json!({
+            "override_main_response_version": "false",
+            "rest.action.multi.allow_explicit_index": "true",
+        }),
+        "SoftwareUpdateOptions" => json!({
+            "AutoSoftwareUpdateEnabled": false,
+            "UseLatestServiceSoftwareForBlueGreen": true,
+        }),
+        // `gp3` is the one volume type whose performance is provisioned per volume, so
+        // it is the one whose baseline IOPS and throughput the service fills in.
+        "EBSOptions" if sent["VolumeType"] == json!("gp3") => {
+            json!({ "Iops": 3000, "Throughput": 125 })
+        }
+        _ => json!({}),
+    };
+    let mut completed = sent.clone();
+    for (member, value) in defaults
+        .as_object()
+        .expect("every row above is a JSON object")
+    {
+        if completed.get(member).is_none() {
+            completed[member] = value.clone();
+        }
+    }
+    completed
+}
+
 /// A `CreateDomain` body for `name` carrying every [`baseline_options`] container.
 pub(crate) fn baseline_create(name: &str) -> Value {
     let mut body = json!({ "DomainName": name, "EngineVersion": "OpenSearch_2.11" });
@@ -487,14 +556,18 @@ async fn a_created_domain_is_persisted_and_read_back_member_for_member() {
     let config = &config.body["DomainConfig"];
     for (option, value) in baseline_options() {
         assert_eq!(
-            config[option]["Options"], value,
-            "case DescribeDomainConfig({option}): expected the persisted {value:?}, got {:?}",
+            config[option]["Options"],
+            completed(option, &value),
+            "case DescribeDomainConfig({option}): expected the persisted {value:?} completed with \
+             the service's own defaults, got {:?}",
             config[option]["Options"]
         );
         assert_eq!(
             option_version(config, option, option),
-            1,
-            "case DescribeDomainConfig({option}): a created option is at revision 1, got {:?}",
+            2,
+            "case DescribeDomainConfig({option}): a create records the configuration it was \
+             asked for and then the one it provisions the domain with, so a created option is \
+             at revision 2, got {:?}",
             config[option]["Status"]
         );
         assert!(
@@ -505,12 +578,18 @@ async fn a_created_domain_is_persisted_and_read_back_member_for_member() {
             config[option]["Status"]
         );
     }
-    // An option the request named no value for has no container at all, rather than
-    // an invented one.
-    for option in ["VPCOptions", "CognitoOptions", "EncryptionAtRestOptions"] {
-        assert!(
-            config[option].is_null(),
-            "case DescribeDomainConfig({option}): an unset option is absent, got {:?}",
+    // An option the request named no value for is reported with the value the SERVICE
+    // sets for it: the domain is provisioned with a whole configuration, so a caller
+    // diffing desired configuration against actual reads a container for every option.
+    for (option, options) in [
+        ("VPCOptions", json!({})),
+        ("CognitoOptions", json!({ "Enabled": false })),
+        ("EncryptionAtRestOptions", json!({ "Enabled": false })),
+    ] {
+        assert_eq!(
+            config[option]["Options"], options,
+            "case DescribeDomainConfig({option}): an option the create named no value for is \
+             reported with the service's own default {options:?}, got {:?}",
             config[option]
         );
     }
@@ -611,12 +690,14 @@ async fn engine_type_is_derived_from_the_engine_version_prefix() {
             "case CreateDomain({name:?}, {version:?}): expected 200, got {} with {:?}",
             answer.status, answer.body
         );
-        // A request that names no version gets the one the emulator creates domains
-        // at, and that stored value is what the engine type is derived from.
+        // A request that names no version gets the LATEST OpenSearch release the
+        // service publishes — `EngineVersion` documents "Defaults to the latest version
+        // of OpenSearch" — and that stored value is what the engine type is derived
+        // from.
         let stored = answer.body["DomainStatus"]["EngineVersion"].clone();
         assert_eq!(
             stored.as_str(),
-            Some(version.unwrap_or("OpenSearch_2.11")),
+            Some(version.unwrap_or_else(default_engine_version)),
             "case CreateDomain({name:?}, {version:?}): expected the stored EngineVersion, got {stored:?}"
         );
     }
@@ -745,15 +826,17 @@ async fn an_updated_option_replaces_only_itself_and_bumps_only_its_own_revision(
 
         for (label, config) in [("answered", answered), ("stored", stored)] {
             assert_eq!(
-                config[option]["Options"], value,
+                config[option]["Options"],
+                completed(option, &value),
                 "case {case} ({label}): a supplied container replaces the stored value: \
                  expected {value:?}, got {:?}",
                 config[option]["Options"]
             );
             assert_eq!(
                 option_version(config, option, &case),
-                2,
-                "case {case} ({label}): the changed option moves to revision 2, got {:?}",
+                3,
+                "case {case} ({label}): the changed option moves past the two revisions the \
+                 create left it at, got {:?}",
                 config[option]["Status"]
             );
             assert_eq!(
@@ -768,15 +851,17 @@ async fn an_updated_option_replaces_only_itself_and_bumps_only_its_own_revision(
                     continue;
                 }
                 assert_eq!(
-                    config[other]["Options"], baseline,
+                    config[other]["Options"],
+                    completed(other, &baseline),
                     "case {case} ({label}): {other} was not named and must keep {baseline:?}, \
                      got {:?}",
                     config[other]["Options"]
                 );
                 assert_eq!(
                     option_version(config, other, &case),
-                    1,
-                    "case {case} ({label}): {other} was not named and stays at revision 1, got {:?}",
+                    2,
+                    "case {case} ({label}): {other} was not named and stays at the revision the \
+                     create left it at, got {:?}",
                     config[other]["Status"]
                 );
                 assert_eq!(
@@ -789,7 +874,8 @@ async fn an_updated_option_replaces_only_itself_and_bumps_only_its_own_revision(
         }
 
         assert_eq!(
-            status[option], value,
+            status[option],
+            completed(option, &value),
             "case {case}: DescribeDomain reports the merged {option}: expected {value:?}, got {:?}",
             status[option]
         );
@@ -830,7 +916,8 @@ async fn a_dry_run_reports_the_change_it_would_make_and_stores_nothing() {
             answer.status, answer.body
         );
         assert_eq!(
-            answer.body["DomainConfig"][option]["Options"], value,
+            answer.body["DomainConfig"][option]["Options"],
+            completed(option, &value),
             "case {case}: a dry run reports the change it would make: expected {value:?}, got {:?}",
             answer.body["DomainConfig"][option]["Options"]
         );
@@ -850,13 +937,14 @@ async fn a_dry_run_reports_the_change_it_would_make_and_stores_nothing() {
             .map(|(_, baseline)| baseline)
             .unwrap_or(Value::Null);
         assert_eq!(
-            config[option]["Options"], baseline,
+            config[option]["Options"],
+            completed(option, &baseline),
             "case {case}: a dry run must not mutate: expected the baseline {baseline:?}, got {:?}",
             config[option]["Options"]
         );
         assert_eq!(
             option_version(config, option, &case),
-            1,
+            2,
             "case {case}: a dry run must not bump a revision, got {:?}",
             config[option]["Status"]
         );
@@ -935,13 +1023,14 @@ async fn a_configuration_change_settles_from_processing_to_active_on_the_clock()
         );
         // Settling moves the state, nothing else: the values and revisions stand.
         assert_eq!(
-            after[option]["Options"], value,
+            after[option]["Options"],
+            completed(option, &value),
             "case after settling({option}): expected the persisted {value:?}, got {:?}",
             after[option]["Options"]
         );
         assert_eq!(
             option_version(after, option, "after settling"),
-            1,
+            2,
             "case after settling({option}): settling must not bump a revision, got {:?}",
             after[option]["Status"]
         );
@@ -1000,17 +1089,21 @@ async fn a_deleted_domain_is_gone_from_every_read_path() {
         "case DeleteDomain(to-delete): expected the final status Deleted true, got {status:?}"
     );
 
-    for (label, answer) in [
-        ("DescribeDomain", emulator.describe("to-delete").await),
+    for (label, answer, status) in [
+        ("DescribeDomain", emulator.describe("to-delete").await, 409),
         (
             "DescribeDomainConfig",
             emulator.describe_config("to-delete").await,
+            409,
         ),
-        ("DeleteDomain again", emulator.delete("to-delete").await),
+        // A delete of a domain this account does not hold answers with the status the
+        // service is recorded answering it with, which is not the one this model
+        // annotates the error with.
+        ("DeleteDomain again", emulator.delete("to-delete").await, 404),
     ] {
         assert_eq!(
-            answer.status, 409,
-            "case {label}(deleted): expected 409, got {} with {:?}",
+            answer.status, status,
+            "case {label}(deleted): expected {status}, got {} with {:?}",
             answer.status, answer.body
         );
         assert_eq!(
@@ -1041,20 +1134,26 @@ async fn an_unknown_domain_name_is_not_found_on_every_path_that_resolves_one() {
     create_baseline(&emulator, "present-domain").await;
 
     for name in ["never-created", "also-missing", "gone-domain"] {
-        for (label, answer) in [
-            ("DescribeDomain", emulator.describe(name).await),
-            ("DescribeDomainConfig", emulator.describe_config(name).await),
+        for (label, answer, status) in [
+            ("DescribeDomain", emulator.describe(name).await, 409),
+            (
+                "DescribeDomainConfig",
+                emulator.describe_config(name).await,
+                409,
+            ),
             (
                 "UpdateDomainConfig",
                 emulator
                     .update_config(name, json!({ "ClusterConfig": { "InstanceCount": 2 } }))
                     .await,
+                409,
             ),
-            ("DeleteDomain", emulator.delete(name).await),
+            // See the delete row in `a_deleted_domain_is_gone_from_every_read_path`.
+            ("DeleteDomain", emulator.delete(name).await, 404),
         ] {
             assert_eq!(
-                answer.status, 409,
-                "case {label}({name:?}): expected 409, got {} with {:?}",
+                answer.status, status,
+                "case {label}({name:?}): expected {status}, got {} with {:?}",
                 answer.status, answer.body
             );
             assert_eq!(

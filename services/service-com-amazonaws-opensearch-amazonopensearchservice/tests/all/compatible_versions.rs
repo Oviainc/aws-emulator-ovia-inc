@@ -34,7 +34,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    DEFAULT_ENGINE_VERSION, SUPPORTED_ENGINE_VERSIONS,
+    SUPPORTED_ENGINE_VERSIONS,
 };
 
 use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX, SETTLE_WAIT};
@@ -401,7 +401,11 @@ async fn domain_filter_reports_the_version_that_domain_runs() {
         ),
         ("filter-os-one", Some("OpenSearch_1.3"), "OpenSearch_1.3"),
         ("filter-os-newest", Some(newest), newest),
-        ("filter-default", None, DEFAULT_ENGINE_VERSION),
+        (
+            "filter-default",
+            None,
+            super::domain_lifecycle::default_engine_version(),
+        ),
         (
             "filter-unpublished",
             Some("OpenSearch_2.12"),

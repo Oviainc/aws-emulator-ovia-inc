@@ -330,7 +330,8 @@ const ROWS: &[Row] = &[
     },
     Row {
         // And a declaration that carries no such property: nothing is sent for it, so the
-        // domain holds no access policy rather than an empty document.
+        // domain holds the access policy the SERVICE sets for a create that named none,
+        // which is the empty document.
         case: "a domain declaring no access policy at all",
         stack: "sim-osap-none",
         domain: "sim-osap-none",
@@ -440,9 +441,11 @@ async fn a_declared_policy_document_reaches_the_domain_as_the_text_of_that_docum
         );
         let carried = reported.get("AccessPolicies");
         match row.expected {
-            None => assert!(
-                carried.is_none_or(Value::is_null),
-                "case {case:?}: a domain declaring no policy must hold none, got {carried:?}"
+            None => assert_eq!(
+                carried.and_then(Value::as_str),
+                Some(""),
+                "case {case:?}: a domain declaring no policy holds the empty document the \
+                 service sets for one, got {carried:?}"
             ),
             Some(expected) => {
                 let text = carried.and_then(Value::as_str).unwrap_or_else(|| {

@@ -266,14 +266,26 @@ fn domain_health(domain: &Domain) -> DescribeDomainHealthOutput {
             .to_string(),
         ),
         availability_zone_count: Some(count(configured_zones)),
-        active_availability_zone_count: Some(count(if up { active_zones } else { None })),
+        // "The number of active Availability Zones configured for the domain. If the
+        // service is unable to fetch this information, it will return NotAvailable":
+        // which of the domain's zones serve traffic follows from its CONFIGURATION —
+        // every zone it is placed in that is not held in standby — so it is reported
+        // whatever state the domain itself is in, and `NotAvailable` is kept for a
+        // configuration that names no number of zones at all.
+        active_availability_zone_count: Some(count(active_zones)),
         stand_by_availability_zone_count: Some(count(Some(standby_zones))),
         data_node_count: Some(count(data_nodes)),
         dedicated_master: Some(dedicated_master),
         master_eligible_node_count: Some(count(master_eligible_nodes)),
         warm_node_count: Some(count(warm_nodes)),
         master_node: Some(
-            if up {
+            // "Indicates whether the domain has an elected master node": a cluster that
+            // is up has one, and so does one still being provisioned whose
+            // configuration places master-eligible nodes — which is what this member
+            // reports. `UnAvailable` is "the master node hasn't yet been elected, and a
+            // quorum to elect a new master node hasn't been reached", the state of a
+            // cluster that is not up and names no node to elect one from.
+            if up || master_eligible_nodes.unwrap_or(0) > 0 {
                 MASTER_NODE_AVAILABLE
             } else {
                 MASTER_NODE_UNAVAILABLE
@@ -297,9 +309,11 @@ fn domain_health(domain: &Domain) -> DescribeDomainHealthOutput {
         ),
         total_shards: Some(count(up.then_some(total_shards))),
         total_un_assigned_shards: Some(count(up.then_some(unassigned_shards))),
-        environment_information: if zones.is_empty() {
-            // The configuration names no number of zones, so the domain has no zone
-            // information to report.
+        environment_information: if zones.is_empty() || !up {
+            // Zone information is an OBSERVATION of the running cluster — how many of
+            // each zone's nodes are available, and how its shards are allocated — so a
+            // domain whose cluster is not up yet, and one whose configuration names no
+            // number of zones, has none to report.
             None
         } else {
             Some(vec![EnvironmentInfo {

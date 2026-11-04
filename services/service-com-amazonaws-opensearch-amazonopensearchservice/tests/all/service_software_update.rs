@@ -86,6 +86,12 @@ async fn reported_software(emulator: &Emulator, name: &str) -> Value {
     reported_status(emulator, name).await["ServiceSoftwareOptions"].clone()
 }
 
+/// `ServiceSoftwareOptions$NewVersion` for a domain with no release to move onto:
+/// "the new service software version, if one is available" is the empty version rather
+/// than no member at all, so a caller reading it always has a version string to
+/// compare.
+const NO_NEW_VERSION: &str = "";
+
 /// The four members every assertion below reads off a `ServiceSoftwareOptions`.
 fn software_summary(options: &Value) -> (Option<&str>, Option<&str>, Option<&str>, Option<bool>) {
     (
@@ -247,7 +253,12 @@ async fn the_available_release_is_deployed_and_the_clock_lands_it() {
         let landed = status["ServiceSoftwareOptions"].clone();
         assert_eq!(
             software_summary(&landed),
-            (Some(available), None, Some("COMPLETED"), Some(false)),
+            (
+                Some(available),
+                Some(NO_NEW_VERSION),
+                Some("COMPLETED"),
+                Some(false),
+            ),
             "case DescribeDomain({name:?}, landed): expected the domain to run the release it \
              was moving onto, got {landed:?}"
         );
@@ -381,7 +392,12 @@ async fn an_update_scheduled_for_later_waits_for_its_instant_and_then_runs() {
         assert_eq!(
             (software_summary(&landed), cancellable(&landed)),
             (
-                (Some("R20250601"), None, Some("COMPLETED"), Some(false)),
+                (
+                    Some("R20250601"),
+                    Some(NO_NEW_VERSION),
+                    Some("COMPLETED"),
+                    Some(false),
+                ),
                 Some(false)
             ),
             "case DescribeDomain({name:?}, {ahead:?} ahead): expected the scheduled update to \
@@ -527,7 +543,7 @@ async fn a_domain_with_nothing_to_deploy_is_refused_and_keeps_its_record() {
         software_summary(&fresh),
         (
             Some(DEFAULT_SERVICE_SOFTWARE_VERSION),
-            None,
+            Some(NO_NEW_VERSION),
             Some("COMPLETED"),
             Some(false)
         ),
@@ -640,7 +656,12 @@ async fn the_release_a_rollback_left_available_is_what_a_start_deploys() {
     let landed = reported_software(&emulator, name).await;
     assert_eq!(
         software_summary(&landed),
-        (Some("R20250101"), None, Some("COMPLETED"), Some(false)),
+        (
+            Some("R20250101"),
+            Some(NO_NEW_VERSION),
+            Some("COMPLETED"),
+            Some(false),
+        ),
         "case DescribeDomain({name:?}, landed): expected the domain back on the release the \
          rollback had left, got {landed:?}"
     );

@@ -185,9 +185,11 @@ async fn the_requested_cluster_topology_round_trips_through_every_reader() {
                     reported[member]
                 );
                 assert!(
-                    requested.contains_key(other) || reported[other].is_null(),
-                    "case {case:?} ({reader}): {other} was never set, so {member} must not be \
-                     answered under it, got {:?}",
+                    requested.contains_key(other)
+                        || reported[other] == ::serde_json::json!(false),
+                    "case {case:?} ({reader}): {other} was never set, so it carries the value \
+                     the service defaults it to rather than the one written for {member}, got \
+                     {:?}",
                     reported[other]
                 );
             }

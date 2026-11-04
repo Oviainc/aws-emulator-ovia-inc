@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         Ok(DescribeDomainConfigOutput {
-            domain_config: domain.to_config(),
+            domain_config: crate::service::domain_configuration::reported_config(domain),
         })
     }
 }

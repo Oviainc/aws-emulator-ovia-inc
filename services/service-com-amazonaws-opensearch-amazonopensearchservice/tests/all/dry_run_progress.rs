@@ -202,7 +202,8 @@ async fn a_verbose_dry_run_is_reported_from_the_record_the_update_minted() {
         let loaded = progress_body(&emulator, &name, None, Some(true)).await;
         let planned = &loaded["DryRunConfig"];
         assert_eq!(
-            planned[option], value,
+            planned[option],
+            super::domain_lifecycle::completed(option, &value),
             "case {case}: expected the planned {option} to be {value:?}, got {planned:?}"
         );
         assert_eq!(
@@ -310,7 +311,7 @@ async fn every_dry_run_keeps_its_own_id_and_the_latest_is_the_implicit_one() {
             let expected = change_rows()
                 .into_iter()
                 .find(|(candidate, _, _)| candidate == option)
-                .map(|(_, value, _)| value)
+                .map(|(_, value, _)| super::domain_lifecycle::completed(option, &value))
                 .unwrap_or(Value::Null);
             assert_eq!(
                 body["DryRunConfig"][option], expected,

@@ -200,7 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         Ok(DescribeDomainChangeProgressOutput {
-            change_progress_status: Some(change.to_progress_status()),
+            change_progress_status: Some(
+                crate::service::domain_configuration::reported_change_progress(domain, change),
+            ),
         })
     }
 }

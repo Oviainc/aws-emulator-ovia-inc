@@ -170,17 +170,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the record, so outside that state there is no update to call off and the call
         // is REFUSED with the operation's modelled `ValidationException`, leaving the
         // record exactly as it was.
-        let options = domain.service_software.cancel_update().ok_or_else(|| {
-            CancelServiceSoftwareUpdateErrorModeled::ValidationException(
+        let cancelled = domain.service_software.cancel_update().is_some();
+        if !cancelled {
+            return Err(CancelServiceSoftwareUpdateErrorModeled::ValidationException(
                 no_software_update_to_cancel(),
             )
-        })?;
+            .into());
+        }
 
         // Answered from the STORED record, through the one `ServiceSoftwareOptions`
-        // projection every operation that reports a domain's service software uses, so
-        // this answer and a later `DescribeDomain` cannot disagree.
+        // projection every operation that reports a domain's service software uses
+        // ([`crate::service::domain_configuration::reported_service_software`]), so this
+        // answer and a later `DescribeDomain` cannot disagree.
         Ok(CancelServiceSoftwareUpdateOutput {
-            service_software_options: Some(options),
+            service_software_options: Some(
+                crate::service::domain_configuration::reported_service_software(domain),
+            ),
         })
     }
 }

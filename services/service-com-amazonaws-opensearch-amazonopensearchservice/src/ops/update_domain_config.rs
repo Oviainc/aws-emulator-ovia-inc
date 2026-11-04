@@ -247,7 +247,8 @@ fn merge(domain: &mut Domain, input: UpdateDomainConfigInput, now: SystemTime) -
         touched.push(OPT_ADVANCED_OPTIONS);
     }
     if let Some(access_policies) = input.access_policies {
-        domain.access_policies = Some(access_policies);
+        domain.access_policies =
+            crate::service::domain_configuration::stored_access_policies(Some(access_policies));
         touched.push(OPT_ACCESS_POLICIES);
     }
     if let Some(ip_address_type) = input.ip_address_type {
@@ -493,6 +494,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let touched = merge(&mut merged, input, now);
+        // A block the update INTRODUCES is completed the same way the create completes
+        // one: a volume switched to `gp3` gets the baseline performance the service
+        // provisions it at, so the merged configuration is a whole one whichever call
+        // put it together.
+        crate::service::domain_configuration::apply_server_defaults(&mut merged);
         let deployment = deployment_type(&merged, &touched);
 
         // Every node of the cluster runs on the domain's engine release, which this
@@ -535,6 +541,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::warm_storage_refusal(Some(&merged.cluster_config)),
             crate::state::log_publishing_refusal(merged.log_publishing_options.iter()),
             crate::state::off_peak_window_refusal(merged.off_peak_window_options.as_ref()),
+            // A performance figure the volume type does not provision is refused on the
+            // merged record too: a request that changes the volume TYPE is judged
+            // against the figures the domain keeps, and one that sets a figure against
+            // the type it keeps
+            // ([`crate::service::domain_configuration::ebs_performance_refusal`]).
+            crate::service::domain_configuration::ebs_performance_refusal(
+                merged.ebs_options.as_ref(),
+            ),
         ]
         .into_iter()
         .flatten()
@@ -597,7 +611,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 store.settled_mut(&name, now).map(|domain| {
                     domain
                         .begin_dry_run(
-                            merged.to_status(local_endpoint.as_deref()),
+                            crate::service::domain_configuration::reported_status(
+                                &merged,
+                                local_endpoint.as_deref(),
+                            ),
                             deployment,
                             accepted_warnings,
                             now,
@@ -608,7 +625,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None
             };
             return Ok(UpdateDomainConfigOutput {
-                domain_config: merged.to_config(),
+                domain_config: crate::service::domain_configuration::reported_config(&merged),
                 dry_run_results: Some(DryRunResults {
                     deployment_type: Some(deployment.to_string()),
                     message: None,
@@ -637,7 +654,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // return above: a dry run stores nothing and so provisions nothing.
         store.provision_vpc_access_host(&mut merged);
 
-        let domain_config = merged.to_config();
+        let domain_config = crate::service::domain_configuration::reported_config(&merged);
         store.domains.insert(name, merged);
         Ok(UpdateDomainConfigOutput {
             domain_config,

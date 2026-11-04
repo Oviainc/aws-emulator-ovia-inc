@@ -206,7 +206,12 @@ async fn the_nodes_api_reports_the_configured_topology_and_redacts_the_internals
                 "case {case:?} ({id}): expected the node to be named by its id, got {node:?}"
             );
             assert!(
-                node["version"].as_str().is_some_and(|v| v.starts_with("2.")),
+                node["version"].as_str().is_some_and(|version| {
+                    version.starts_with(&format!(
+                        "{}.",
+                        super::domain_lifecycle::default_engine_release()
+                    ))
+                }),
                 "case {case:?} ({id}): expected the engine release the domain runs, got {node:?}"
             );
             for member in REDACTED_NODE_MEMBERS {

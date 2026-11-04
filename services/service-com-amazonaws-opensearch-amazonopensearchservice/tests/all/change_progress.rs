@@ -27,11 +27,6 @@ use super::domain_lifecycle::{
 /// store mints v4 UUIDs, so the nil-shaped id below is never one of them.
 const ABSENT_CHANGE_ID: &str = "00000000-0000-4000-8000-000000000000";
 
-/// The two `DomainConfig` members `CreateDomain` always sets even when the request
-/// names neither: "If you don't specify a use case, `MIXED` is used" and "If you
-/// don't specify an engine mode, `GENERAL` is used".
-const CREATE_DEFAULTED_OPTIONS: [&str; 2] = ["EngineMode", "UseCase"];
-
 /// `GET /2021-01-01/opensearch/domain/{DomainName}/progress`, with the `changeid`
 /// query parameter when `change_id` is given.
 async fn progress(emulator: &Emulator, name: &str, change_id: Option<&str>) -> Answer {
@@ -94,23 +89,98 @@ fn assert_guid(value: &str, case: &str) {
     );
 }
 
-/// The `DomainConfig` member names a [`baseline_create`] body sets: the containers it
-/// carries, plus the two members that default when omitted. Derived from the body the
+/// The leaf option containers EVERY domain's configuration is made of, whatever the
+/// create named: the service provisions a domain with a whole configuration, filling
+/// in the blocks the request left out, so the change a create starts applies all of
+/// them. One entry per machine learning feature, because a container whose every
+/// member is itself a container is applied member by member.
+const PROVISIONED_PROPERTIES: [&str; 22] = [
+    "AIMLOptions.NaturalLanguageQueryGenerationOptions",
+    "AIMLOptions.S3VectorsEngine",
+    "AIMLOptions.ServerlessVectorAcceleration",
+    "AccessPolicies",
+    "AdvancedOptions",
+    "AdvancedSecurityOptions",
+    "AutoTuneOptions",
+    "AutomatedSnapshotPauseOptions",
+    "ClusterConfig",
+    "CognitoOptions",
+    "DeploymentStrategyOptions",
+    "DomainEndpointOptions",
+    "EncryptionAtRestOptions",
+    "EngineMode",
+    "EngineVersion",
+    "IPAddressType",
+    "IdentityCenterOptions",
+    "NodeToNodeEncryptionOptions",
+    "OffPeakWindowOptions",
+    "SnapshotOptions",
+    "SoftwareUpdateOptions",
+    "UseCase",
+];
+
+/// The leaf property names setting `value` on `option` amounts to: a container whose
+/// every member is itself a container is applied member by member (a log-publishing
+/// configuration is applied per log type), and anything else is applied whole.
+fn leaf_names(option: &str, value: &Value) -> Vec<String> {
+    match value.as_object() {
+        Some(members) if !members.is_empty() && members.values().all(Value::is_object) => {
+            let mut names: Vec<String> = members
+                .keys()
+                .map(|member| format!("{option}.{member}"))
+                .collect();
+            names.sort();
+            names
+        }
+        _ => vec![option.to_string()],
+    }
+}
+
+/// The names of the properties a change reports, from the `<Member> : <value>` entries
+/// it reports them as: the value each property is being set to is asserted by
+/// [`super::domain_server_defaults`], and what this suite is about is WHICH properties
+/// a change names.
+fn property_names(properties: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = properties
+        .iter()
+        .map(|property| {
+            property
+                .split_once(" : ")
+                .map_or(property.clone(), |(name, _)| name.to_owned())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Every property the configuration a `CreateDomain` body provisions is made of: the
+/// blocks the service fills in for every domain, plus the two whose presence follows
+/// from the request — the EBS volume, which a domain created without one does not have,
+/// and the log-publishing configuration, reported per log type it holds and whole while
+/// it is empty.
+fn provisioned_properties(body: &Value) -> Vec<String> {
+    let mut names: Vec<String> = PROVISIONED_PROPERTIES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    if body.get("EBSOptions").is_some() {
+        names.push("EBSOptions".to_string());
+    }
+    match body.get("LogPublishingOptions").and_then(Value::as_object) {
+        Some(types) if !types.is_empty() => {
+            names.extend(types.keys().map(|log_type| format!("LogPublishingOptions.{log_type}")));
+        }
+        _ => names.push("LogPublishingOptions".to_string()),
+    }
+    names.sort();
+    names
+}
+
+/// The `DomainConfig` member names a [`baseline_create`] body sets: every property the
+/// configuration the service provisions it with is made of. Derived from the body the
 /// harness sends, so it cannot drift from it.
 fn created_properties(name: &str) -> Vec<String> {
-    let body = baseline_create(name);
-    let mut properties: Vec<String> = body
-        .as_object()
-        .expect("the baseline create body is an object")
-        .keys()
-        // `DomainName` is the domain's identity, not one of its options.
-        .filter(|member| *member != "DomainName")
-        .map(|member| member.to_owned())
-        .chain(CREATE_DEFAULTED_OPTIONS.iter().map(|opt| opt.to_string()))
-        .collect();
-    properties.sort();
-    properties.dedup();
-    properties
+    provisioned_properties(&baseline_create(name))
 }
 
 #[tokio::test]
@@ -154,8 +224,8 @@ async fn a_change_reports_the_option_it_sets_pending_then_completed() {
              CUSTOMER, got {in_flight:?}"
         );
         assert_eq!(
-            string_list(&in_flight, "PendingProperties", &case),
-            vec![option.to_string()],
+            property_names(&string_list(&in_flight, "PendingProperties", &case)),
+            leaf_names(option, &value),
             "case {case}: the option this change set is its one pending property, got {in_flight:?}"
         );
         assert!(
@@ -193,8 +263,8 @@ async fn a_change_reports_the_option_it_sets_pending_then_completed() {
             "case {case}: the same change is now COMPLETED/Completed, got {settled:?}"
         );
         assert_eq!(
-            string_list(&settled, "CompletedProperties", &case),
-            vec![option.to_string()],
+            property_names(&string_list(&settled, "CompletedProperties", &case)),
+            leaf_names(option, &value),
             "case {case}: the option this change set has completed, got {settled:?}"
         );
         assert!(
@@ -223,18 +293,10 @@ async fn the_change_a_create_starts_reports_every_option_the_create_set() {
         (
             "bare-create",
             json!({ "DomainName": "bare-create" }),
-            // Nothing but the members every domain holds: the engine version and
-            // cluster configuration a domain always has, the advanced options and
-            // log-publishing options maps that are empty rather than absent, and the
-            // two defaulted members.
-            vec![
-                "AdvancedOptions".to_string(),
-                "ClusterConfig".to_string(),
-                "EngineMode".to_string(),
-                "EngineVersion".to_string(),
-                "LogPublishingOptions".to_string(),
-                "UseCase".to_string(),
-            ],
+            // A create that names nothing still provisions a whole configuration: every
+            // block the service fills in, with no EBS volume and an empty
+            // log-publishing configuration.
+            provisioned_properties(&json!({ "DomainName": "bare-create" })),
         ),
         (
             "one-option-create",
@@ -243,15 +305,11 @@ async fn the_change_a_create_starts_reports_every_option_the_create_set() {
                 "EngineVersion": "Elasticsearch_7.10",
                 "AccessPolicies": "{\"Version\":\"2012-10-17\"}",
             }),
-            vec![
-                "AccessPolicies".to_string(),
-                "AdvancedOptions".to_string(),
-                "ClusterConfig".to_string(),
-                "EngineMode".to_string(),
-                "EngineVersion".to_string(),
-                "LogPublishingOptions".to_string(),
-                "UseCase".to_string(),
-            ],
+            provisioned_properties(&json!({
+                "DomainName": "one-option-create",
+                "EngineVersion": "Elasticsearch_7.10",
+                "AccessPolicies": "{\"Version\":\"2012-10-17\"}",
+            })),
         ),
     ];
 
@@ -266,14 +324,15 @@ async fn the_change_a_create_starts_reports_every_option_the_create_set() {
         let status = progress_status(&emulator, name, None).await;
         let case = format!("DescribeDomainChangeProgress({name:?}, create)");
         assert_eq!(
-            string_list(&status, "PendingProperties", &case),
+            property_names(&string_list(&status, "PendingProperties", &case)),
             expected,
             "case {case}: expected the options the create set, got {status:?}"
         );
         assert_eq!(
             status["Status"].as_str(),
-            Some("PROCESSING"),
-            "case {case}: a domain being created has a change in flight, got {status:?}"
+            Some("PENDING"),
+            "case {case}: the change a create starts waits for the cluster to be provisioned, \
+             got {status:?}"
         );
     }
 }
@@ -303,7 +362,7 @@ async fn every_change_keeps_its_own_id_and_the_latest_is_the_implicit_one() {
 
         for (option, value, _) in change_rows().into_iter().take(updates) {
             let answer = emulator
-                .update_config(&name, json!({ option: value }))
+                .update_config(&name, json!({ option: value.clone() }))
                 .await;
             assert_eq!(
                 answer.status, 200,
@@ -313,7 +372,7 @@ async fn every_change_keeps_its_own_id_and_the_latest_is_the_implicit_one() {
             let status = progress_status(&emulator, &name, None).await;
             history.push((
                 string_member(&status, "ChangeId", &format!("{name}: {option}")),
-                vec![option.to_string()],
+                leaf_names(option, &value),
             ));
             tokio::time::sleep(SETTLE_WAIT).await;
         }
@@ -338,10 +397,12 @@ async fn every_change_keeps_its_own_id_and_the_latest_is_the_implicit_one() {
                 Some(change_id.as_str()),
                 "case {case}: expected the change that was asked for, got {status:?}"
             );
-            let reported: Vec<String> = string_list(&status, "PendingProperties", &case)
-                .into_iter()
-                .chain(string_list(&status, "CompletedProperties", &case))
-                .collect();
+            let reported: Vec<String> = property_names(
+                &string_list(&status, "PendingProperties", &case)
+                    .into_iter()
+                    .chain(string_list(&status, "CompletedProperties", &case))
+                    .collect::<Vec<String>>(),
+            );
             assert_eq!(
                 reported, *properties,
                 "case {case}: expected the properties this change set, got {status:?}"

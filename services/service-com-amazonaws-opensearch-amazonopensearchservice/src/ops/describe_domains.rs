@@ -165,7 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // already owed it at `now` — the same write the single-domain read makes,
             // and one that was due whether or not anybody called.
             if let Some(domain) = store.settled_mut(name, now) {
-                domain_status_list.push(domain.to_status(local_endpoint.as_deref()));
+                domain_status_list.push(crate::service::domain_configuration::reported_status(
+                    domain,
+                    local_endpoint.as_deref(),
+                ));
             }
         }
 

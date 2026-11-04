@@ -160,7 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         Ok(DescribeDomainOutput {
-            domain_status: domain.to_status(local_endpoint.as_deref()),
+            domain_status: crate::service::domain_configuration::reported_status(
+                domain,
+                local_endpoint.as_deref(),
+            ),
         })
     }
 }

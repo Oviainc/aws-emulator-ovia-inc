@@ -515,9 +515,12 @@ async fn a_single_domain_template_deploys_and_the_domain_reads_back() {
                 .get(member)
                 .and_then(|options| options.get("Enabled"))
                 .and_then(Value::as_bool);
+            // A declaration that turns encryption on is followed; one that declares none
+            // leaves the domain with the value the SERVICE sets for it, which is off —
+            // the owning service provisions a domain with a whole configuration.
             assert_eq!(
                 enabled,
-                declared.then_some(true),
+                Some(declared),
                 "case {case:?}: expected {member} to follow the declaration, got {reported}"
             );
         }
@@ -526,7 +529,7 @@ async fn a_single_domain_template_deploys_and_the_domain_reads_back() {
                 .get("DomainEndpointOptions")
                 .and_then(|options| options.get("EnforceHTTPS"))
                 .and_then(Value::as_bool),
-            held.enforce_https.then_some(true),
+            Some(held.enforce_https),
             "case {case:?}: expected EnforceHTTPS to follow the declaration, got {reported}"
         );
 
@@ -557,10 +560,13 @@ async fn a_single_domain_template_deploys_and_the_domain_reads_back() {
         // in.
         let carried = reported.get("AccessPolicies");
         if !held.access_policy {
-            assert!(
-                carried.is_none_or(Value::is_null),
-                "case {case:?}: a domain declaring no access policy must hold none, got \
-                 {carried:?}"
+            // A declaration carrying no policy leaves the domain with the one the SERVICE
+            // sets for a create that named none, which is the empty document.
+            assert_eq!(
+                carried.and_then(Value::as_str),
+                Some(""),
+                "case {case:?}: a domain declaring no access policy holds the empty document, \
+                 got {carried:?}"
             );
             continue;
         }

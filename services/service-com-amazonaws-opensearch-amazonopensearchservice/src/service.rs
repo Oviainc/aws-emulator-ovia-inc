@@ -59,6 +59,13 @@ use std::sync::Arc;
 pub mod domain_rest;
 pub(crate) mod validation;
 
+/// What the SERVICE, rather than the caller, puts in a domain's configuration: the
+/// storage performance members it refuses, the option blocks it defaults for a request
+/// that named none, and the members a descriptor derives at the moment of the read.
+/// Reached by every operation that creates, updates or reports a domain, so no two of
+/// them can report one stored record differently.
+pub mod domain_configuration;
+
 /// Whether the request these `parts` came from resolves to this service's signing name
 /// AND addresses a first URI path segment this model publishes
 /// (`crate::ROUTE_PATH_SEGMENTS`).

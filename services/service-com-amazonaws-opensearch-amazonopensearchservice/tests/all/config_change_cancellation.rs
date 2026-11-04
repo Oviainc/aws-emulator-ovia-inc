@@ -285,7 +285,7 @@ async fn a_dry_run_reports_the_same_cancellation_and_changes_nothing() {
     tokio::time::sleep(SETTLE_WAIT).await;
     assert_eq!(
         stored_option(&emulator, name, option).await,
-        value,
+        super::domain_lifecycle::completed(option, &value),
         "case a dry run: the change the dry run did not cancel lands, leaving {value:?} rather \
          than {before:?}"
     );

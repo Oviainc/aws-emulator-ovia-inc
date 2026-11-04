@@ -243,17 +243,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let software = &mut domain.service_software;
-        let options = software.begin_update(now, starts_at).ok_or_else(|| {
-            StartServiceSoftwareUpdateErrorModeled::ValidationException(
+        if software.begin_update(now, starts_at).is_none() {
+            return Err(StartServiceSoftwareUpdateErrorModeled::ValidationException(
                 domain_not_available_for_update(),
             )
-        })?;
+            .into());
+        }
 
         // Answered from the STORED record, through the one `ServiceSoftwareOptions`
-        // projection every operation that reports a domain's service software uses, so
-        // this answer and a later `DescribeDomain` cannot disagree.
+        // projection every operation that reports a domain's service software uses
+        // ([`crate::service::domain_configuration::reported_service_software`]), so this
+        // answer and a later `DescribeDomain` cannot disagree.
         Ok(StartServiceSoftwareUpdateOutput {
-            service_software_options: Some(options),
+            service_software_options: Some(
+                crate::service::domain_configuration::reported_service_software(domain),
+            ),
         })
     }
 }

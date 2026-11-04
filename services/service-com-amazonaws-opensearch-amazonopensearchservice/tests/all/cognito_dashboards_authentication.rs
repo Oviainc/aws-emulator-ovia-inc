@@ -363,6 +363,18 @@ fn rows(
     ]
 }
 
+/// The `CognitoOptions` container the service HOLDS once a request has sent `options`:
+/// the members as sent, with `Enabled` filled in where the request left it out — the
+/// service provisions a domain with a whole configuration, and Cognito authentication
+/// for OpenSearch Dashboards is off unless a request turns it on.
+fn held(options: &Value) -> Value {
+    let mut held = options.clone();
+    if held.get("Enabled").is_none() {
+        held["Enabled"] = json!(false);
+    }
+    held
+}
+
 /// The `CognitoOptions` container `DescribeDomainConfig` reports for `name`, which is
 /// `Value::Null` for a domain that carries none.
 async fn stored_options(emulator: &Emulator, name: &str, case: &str) -> Value {
@@ -395,19 +407,21 @@ async fn create_domain_judges_the_cognito_authentication_it_is_handed() {
             // The accepted container is stored and reported back member for member,
             // through both readers of the record.
             assert_eq!(
-                answer.body["DomainStatus"]["CognitoOptions"], row.options,
+                answer.body["DomainStatus"]["CognitoOptions"],
+                held(&row.options),
                 "case {case}: expected the sent container, got {:?}",
                 answer.body["DomainStatus"]["CognitoOptions"]
             );
             let described = fixture.emulator.describe(&name).await;
             assert_eq!(
-                described.body["DomainStatus"]["CognitoOptions"], row.options,
+                described.body["DomainStatus"]["CognitoOptions"],
+                held(&row.options),
                 "case {case}: DescribeDomain expected the sent container, got {:?}",
                 described.body["DomainStatus"]["CognitoOptions"]
             );
             assert_eq!(
                 stored_options(&fixture.emulator, &name, &case).await,
-                row.options,
+                held(&row.options),
                 "case {case}: DescribeDomainConfig expected the sent container"
             );
             continue;
@@ -448,13 +462,14 @@ async fn update_domain_config_judges_the_cognito_authentication_it_is_handed() {
                 answer.status, answer.body
             );
             assert_eq!(
-                answer.body["DomainConfig"]["CognitoOptions"]["Options"], row.options,
+                answer.body["DomainConfig"]["CognitoOptions"]["Options"],
+                held(&row.options),
                 "case {case}: expected the sent container, got {:?}",
                 answer.body["DomainConfig"]["CognitoOptions"]["Options"]
             );
             assert_eq!(
                 stored_options(&fixture.emulator, name, &case).await,
-                row.options,
+                held(&row.options),
                 "case {case}: DescribeDomainConfig expected the sent container"
             );
             // And this row's change lands before the next row starts another.

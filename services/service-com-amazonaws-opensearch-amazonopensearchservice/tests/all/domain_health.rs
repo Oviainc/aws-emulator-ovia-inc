@@ -502,15 +502,20 @@ async fn health_of_a_domain_still_creating_withholds_what_the_cluster_has_not_re
         ),
         (
             "Processing".to_string(),
-            // `MasterNodeStatus` models no `NotAvailable`: a master that has not been
-            // elected is `UnAvailable`.
-            "UnAvailable".to_string(),
+            // The master is elected from the master-eligible nodes the configuration
+            // places, which is known from the moment the create is accepted.
+            "Available".to_string(),
+            // The shard allocation is an OBSERVATION of the running cluster, and there
+            // is none to read yet.
             NOT_AVAILABLE.to_string(),
-            NOT_AVAILABLE.to_string(),
+            // Which zones serve traffic follows from the configuration too: the zones
+            // the domain is placed in, less the ones held in standby.
+            "2".to_string(),
             NOT_AVAILABLE.to_string(),
             NOT_AVAILABLE.to_string(),
         ),
-        "case {case}: expected a creating domain to report no observed value, got {body:?}"
+        "case {case}: expected a creating domain to report its configured cluster and no \
+         observation of the running one, got {body:?}"
     );
     // What was CONFIGURED is known from the moment the create is accepted.
     assert_eq!(
@@ -528,22 +533,14 @@ async fn health_of_a_domain_still_creating_withholds_what_the_cluster_has_not_re
         ),
         "case {case}: expected the configured counts of a creating domain, got {body:?}"
     );
-    for zone in zone_information(&body) {
-        assert_eq!(
-            (
-                string_member(&zone, "ZoneStatus", case),
-                string_member(&zone, "ConfiguredDataNodeCount", case),
-                string_member(&zone, "AvailableDataNodeCount", case),
-            ),
-            (
-                NOT_AVAILABLE.to_string(),
-                "2".to_string(),
-                NOT_AVAILABLE.to_string()
-            ),
-            "case {case}: expected a creating domain's zone to report its configured \
-             nodes and no available ones, got {zone:?}"
-        );
-    }
+    // Per-zone information is an observation of the running cluster — how many of each
+    // zone's nodes are available, and how its shards are allocated — so a domain whose
+    // cluster is not up reports none at all.
+    assert!(
+        body["EnvironmentInformation"].is_null(),
+        "case {case}: expected no zone information before the cluster is up, got {:?}",
+        body["EnvironmentInformation"]
+    );
 
     // Once the provisioning the clock owed it falls due, the same read reports the
     // cluster.
