@@ -914,6 +914,12 @@ impl ExecutionGuard {
         // statement is interrupted on the callback that exhausts it rather than
         // on the one after — and a `saturating_sub` that lands past zero is
         // caught rather than missed.
+        //
+        // The comparison reads the value from BEFORE the update, which is what
+        // the long-standing atomic method below returns; a newer toolchain
+        // renames it and so reports it as deprecated here, and it is kept rather
+        // than swapped for the new name, which an older toolchain does not have.
+        #[allow(deprecated)]
         let previous = self
             .steps_left
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {

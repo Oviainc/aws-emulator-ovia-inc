@@ -690,6 +690,12 @@ struct DeliveryPermit;
 impl DeliveryPermit {
     /// Claim a permit, or `None` when [`MAX_IN_FLIGHT_DELIVERY_TASKS`] are already in
     /// flight.
+    //
+    // The compare-and-update this bound needs is the long-standing atomic method,
+    // which a newer toolchain renames and so reports as deprecated here. It is kept
+    // rather than swapped for the new name, which an older toolchain does not have:
+    // the name says nothing about the bound, and only the old one compiles on both.
+    #[allow(deprecated)]
     fn claim() -> Option<Self> {
         IN_FLIGHT_DELIVERY_TASKS
             .try_update(

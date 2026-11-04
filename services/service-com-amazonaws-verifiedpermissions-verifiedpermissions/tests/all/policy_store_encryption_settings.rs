@@ -216,9 +216,9 @@ async fn an_encryption_settings_value_the_model_refuses_creates_no_store() {
         ),
     ];
 
-    // The store count comes from state because `ListPolicyStores` is still a
-    // stub in this crate, and the point of the assertion is that the refused
-    // create left NOTHING behind.
+    // The store count comes from state rather than from a list response: the
+    // point of the assertion is that the refused create left NOTHING behind, so
+    // it is read where a store would have been written.
     let (router, engine) = router_with_engine();
     let stored_count = || {
         let state =

@@ -71,6 +71,8 @@ mod list_pagination_rule;
 mod list_policies_template_reference_filter;
 #[path = "all/list_policy_store_aliases.rs"]
 mod list_policy_store_aliases;
+#[path = "all/list_policy_stores.rs"]
+mod list_policy_stores;
 #[path = "all/list_policy_templates.rs"]
 mod list_policy_templates;
 #[path = "all/name_conflict_precedes_capacity.rs"]

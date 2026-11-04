@@ -14,9 +14,9 @@
 //! position in one enumeration and means nothing in another.
 //!
 //! The suites next door assert what each operation reports about ONE kind of
-//! resource; this one asserts that all four page the SAME way, so the rule they
-//! share cannot drift apart. Every assertion goes over the wire through the
-//! shared [`super::harness`], so a listed resource is only listed if it really
+//! resource; this one asserts that every one of them pages the SAME way, so the
+//! rule they share cannot drift apart. Every assertion goes over the wire through
+//! the shared [`super::harness`], so a listed resource is only listed if it really
 //! reached state.
 
 use serde_json::{json, Value};
@@ -27,10 +27,10 @@ use super::harness::{
     SIGNING_REGION,
 };
 
-/// The page size `ListPolicies`, `ListIdentitySources` and `ListPolicyTemplates`
-/// use when the caller names no `maxResults`, from each one's own `maxResults`
-/// documentation: "If you do not specify this parameter, the operation defaults
-/// to 10 ... per response."
+/// The page size `ListPolicies`, `ListIdentitySources`, `ListPolicyTemplates`
+/// and `ListPolicyStores` use when the caller names no `maxResults`, from each
+/// one's own `maxResults` documentation: "If you do not specify this parameter,
+/// the operation defaults to 10 ... per response."
 const DEFAULT_PAGE_SIZE: usize = 10;
 
 /// The page size `ListPolicyStoreAliases` uses when the caller names no
@@ -167,9 +167,6 @@ async fn seed_store(router: &MultiServiceRouter, label: &str, count: usize) -> V
 
 /// Every `@paginated` list operation this service implements, each with
 /// [`SEEDED`] resources of its kind already persisted.
-///
-/// `ListPolicyStores` is not here: it is still the scaffold, and it joins this
-/// table when its own issue implements it.
 async fn seeded_listings(router: &MultiServiceRouter) -> Vec<Listing> {
     let mut listings = seed_store(router, "paged", SEEDED).await;
     // `ListPolicyStoreAliases` enumerates the ACCOUNT's aliases rather than one
@@ -180,6 +177,19 @@ async fn seeded_listings(router: &MultiServiceRouter) -> Vec<Listing> {
         items_member: "policyStoreAliases",
         id_member: "aliasName",
         default_page_size: ALIAS_DEFAULT_PAGE_SIZE,
+        request: json!({}),
+    });
+    // `ListPolicyStores` enumerates the ACCOUNT's policy stores, so its seeded
+    // resources are the stores themselves: the one `seed_store` created above,
+    // plus enough more to reach [`SEEDED`] of them.
+    for _ in 1..SEEDED {
+        store(router).await;
+    }
+    listings.push(Listing {
+        operation: "ListPolicyStores",
+        items_member: "policyStores",
+        id_member: "policyStoreId",
+        default_page_size: DEFAULT_PAGE_SIZE,
         request: json!({}),
     });
     listings

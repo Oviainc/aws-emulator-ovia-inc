@@ -980,9 +980,14 @@ async fn the_report_pages_by_max_results_and_its_token() {
     }
     seed(&engine, &blocks);
 
+    // ONE search, built once and reused for every page: a `FirstSlotStartTimeRange`
+    // derived per call moves with the clock, and the token names a position inside the
+    // search that minted it — so re-deriving the window between two pages of one walk
+    // would present the token back against a different search.
+    let searched = search(Vec::new());
     let whole = reported_blocks(
         "the whole report",
-        &served(&router, "the whole report", REGION, &search(Vec::new())).await,
+        &served(&router, "the whole report", REGION, &searched).await,
     );
     assert_eq!(
         whole.len(),
@@ -996,7 +1001,8 @@ async fn the_report_pages_by_max_results_and_its_token() {
         let mut next: Option<String> = None;
         let mut pages = 0;
         loop {
-            let mut params = search(vec![p("MaxResults", page_size.to_string())]);
+            let mut params = searched.clone();
+            params.push(p("MaxResults", page_size.to_string()));
             if let Some(token) = &next {
                 params.push(p("NextToken", token.clone()));
             }
