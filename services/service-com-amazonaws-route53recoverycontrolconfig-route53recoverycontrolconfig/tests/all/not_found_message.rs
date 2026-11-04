@@ -2,17 +2,24 @@
 
 //! The sentence this service refuses an ARN that resolves to nothing with.
 //!
-//! Every request that resolves a recovery-control ARN and finds no such resource is
+//! Most requests that resolve a recovery-control ARN and find no such resource are
 //! refused with `ResourceNotFoundException` (404) whose `message` is one fixed sentence:
 //! `No record corresponding to <resource noun> Arn(<the request's ARN>)`. Only the noun
 //! of the resource kind that was looked up and the ARN the request asked for vary; the
 //! ARN is echoed back exactly as it was sent.
 //!
+//! TWO operations are the exception, because their own recorded refusals carry another
+//! sentence: `DescribeRoutingControl` and `UpdateRoutingControl` name the routing control
+//! and its control panel by the ids the ARN nests, each in its own words. They are
+//! therefore not rows of the table below; `tests/all/update_routing_control.rs` pins both
+//! sentences, and `DeleteRoutingControl` — which does state the sentence above — stays
+//! here, so the routing-control rows of this table are the ones that still answer it.
+//!
 //! The tables span what that rule generalises over: every implemented operation that
-//! ADDRESSES a resource by ARN (read, delete, update, list), every resource level
-//! (cluster, control panel, routing control, safety rule) and several fillings of the
-//! ARN's own variable parts — a lowercase UUID, an upper-case-hex UUID and a non-UUID
-//! tail.
+//! ADDRESSES a resource by ARN and states this sentence (read, delete, update, list),
+//! every resource level (cluster, control panel, routing control, safety rule) and several
+//! fillings of the ARN's own variable parts — a lowercase UUID, an upper-case-hex UUID and
+//! a non-UUID tail.
 //!
 //! Every ARN here names the CALLER's account, because that is the only kind of ARN this
 //! sentence answers: one naming another account is refused by the authorization check
@@ -190,26 +197,20 @@ fn safety_rule_cases(rule_arn: &str) -> Vec<Case> {
     ]
 }
 
-/// Every routing-control-resolving request for one routing control ARN.
+/// Every routing-control-resolving request that states the sentence above, for one routing
+/// control ARN.
+///
+/// `DescribeRoutingControl` and `UpdateRoutingControl` are not among them: each states its
+/// own recorded sentence, pinned in `tests/all/update_routing_control.rs`.
 fn routing_control_cases(control_arn: &str) -> Vec<Case> {
-    vec![
-        Case {
-            label: format!("DescribeRoutingControl({control_arn})"),
-            method: "GET",
-            path: format!("/routingcontrol/{}", enc(control_arn)),
-            body: None,
-            noun: "routing control",
-            requested_arn: control_arn.to_string(),
-        },
-        Case {
-            label: format!("DeleteRoutingControl({control_arn})"),
-            method: "DELETE",
-            path: format!("/routingcontrol/{}", enc(control_arn)),
-            body: None,
-            noun: "routing control",
-            requested_arn: control_arn.to_string(),
-        },
-    ]
+    vec![Case {
+        label: format!("DeleteRoutingControl({control_arn})"),
+        method: "DELETE",
+        path: format!("/routingcontrol/{}", enc(control_arn)),
+        body: None,
+        noun: "routing control",
+        requested_arn: control_arn.to_string(),
+    }]
 }
 
 /// Every operation that resolves an ARN answers the one fixed sentence, naming the kind
@@ -226,11 +227,12 @@ async fn an_unresolvable_arn_is_refused_with_the_no_record_sentence() {
     for id in RESOURCE_IDS {
         let cluster_arn = arn(ACCOUNT, &format!("cluster/{id}"));
         let panel_arn = arn(ACCOUNT, &format!("controlpanel/{id}"));
-        let control_arn = format!("{panel_arn}/routingcontrol/{id}");
         let rule_arn = format!("{panel_arn}/safetyrule/{id}");
         cases.extend(cluster_cases(&cluster_arn));
         cases.extend(control_panel_cases(&panel_arn));
-        cases.extend(routing_control_cases(&control_arn));
+        cases.extend(routing_control_cases(&format!(
+            "{panel_arn}/routingcontrol/{id}"
+        )));
         cases.extend(safety_rule_cases(&rule_arn));
     }
 

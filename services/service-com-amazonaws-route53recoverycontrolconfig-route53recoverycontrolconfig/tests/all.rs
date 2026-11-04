@@ -37,3 +37,5 @@ mod state_roundtrip;
 mod update_cluster;
 #[path = "all/update_control_panel.rs"]
 mod update_control_panel;
+#[path = "all/update_routing_control.rs"]
+mod update_routing_control;

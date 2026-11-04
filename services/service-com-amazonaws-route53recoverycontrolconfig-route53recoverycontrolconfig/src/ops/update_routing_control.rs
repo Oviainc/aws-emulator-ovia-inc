@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRoutingControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRoutingControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: writes the name the request carries onto the stored routing control the
+//! ARN identifies, then answers with the SAME stored record `DescribeRoutingControl`
+//! projects.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRoutingControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Everything else about the routing control (its ARN, its control panel, its owner and
+//! its tags) is untouched: the model's `UpdateRoutingControlRequest` carries no other
+//! member, and the operation's own documentation says you can only update the name — the
+//! routing control's STATE is a data-plane concern of the recovery cluster API, not this
+//! control-plane operation.
+//!
+//! A name identifies a routing control within its control panel, so a rename onto a name
+//! another control of that panel already holds is refused the way the create states it.
+//! A rename re-deploys the control, so its deployment becomes due again and the control
+//! reads `PENDING` right after this call and `DEPLOYED` once that instant has passed.
+//!
+//! An ARN that addresses no stored routing control is refused with
+//! `ResourceNotFoundException` (404), worded as THIS operation words it — around the ids
+//! the ARN nests rather than the sentence the reads answer; see [`control_not_found`].
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +130,17 @@ impl From<UpdateRoutingControlErrorModeled> for UpdateRoutingControlError {
     }
 }
 
+/// This operation's refusal of an ARN that addresses no stored routing control:
+/// `ResourceNotFoundException` (404) with the sentence the update's own recorded refusal
+/// states ([`crate::state::routing_control_update_not_found_message`]), which is neither
+/// the read's nor the shared one the delete answers.
+fn control_not_found(arn: &str) -> UpdateRoutingControlError {
+    UpdateRoutingControlErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::routing_control_update_not_found_message(arn),
+    })
+    .into()
+}
+
 /// The `UpdateRoutingControl` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -157,18 +177,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRoutingControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRoutingControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRoutingControl"))
+        let _ = ctx;
+        // The authorization check this service's ARN-addressed operations share: decided
+        // from the request alone, so it runs before the ARN is looked up.
+        crate::state::authorize_resource_arn(Self::NAME, &input.routing_control_arn)
+            .map_err(UpdateRoutingControlErrorModeled::AccessDeniedException)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateRoutingControlErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the route53-recovery-control-config store is unavailable on this \
+                              engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        // One read of the addressed control, for the control panel its name is scoped to.
+        // Read before the record is borrowed mutably.
+        let Some(panel_arn) = guard
+            .routing_controls
+            .get(&input.routing_control_arn)
+            .map(|record| record.control_panel_arn.clone())
+        else {
+            return Err(control_not_found(&input.routing_control_arn));
+        };
+
+        // The name is scoped to the control's control panel, so a rename onto a name
+        // another control of that panel already holds is refused the way the create
+        // states it.
+        if guard.routing_control_name_taken(
+            &panel_arn,
+            &input.routing_control_name,
+            Some(&input.routing_control_arn),
+        ) {
+            return Err(UpdateRoutingControlErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::already_exists_message(
+                        crate::state::ROUTING_CONTROL_RESOURCE,
+                        &input.routing_control_name,
+                        crate::state::CONTROL_PANEL_RESOURCE,
+                        &panel_arn,
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let Some(record) = guard.routing_controls.get_mut(&input.routing_control_arn) else {
+            return Err(control_not_found(&input.routing_control_arn));
+        };
+
+        // The name is the only thing an update changes; a request naming the name the
+        // control already carries changes nothing, so it does not restart a deployment
+        // either.
+        record.set_name(input.routing_control_name);
+
+        // Answer from the STORED record, so this body is what `DescribeRoutingControl`
+        // answers with afterwards.
+        Ok(UpdateRoutingControlOutput {
+            routing_control: Some(record.to_routing_control()),
+        })
     }
 }

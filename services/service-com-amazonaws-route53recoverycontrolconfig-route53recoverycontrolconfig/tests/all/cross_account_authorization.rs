@@ -194,6 +194,17 @@ fn cases_for(cluster_arn: &str, own_cluster_arn: &str) -> Vec<Case> {
             path: format!("/routingcontrol/{}", enc(&control_arn)),
             body: None,
             action: "DeleteRoutingControl",
+            resource: control_arn.clone(),
+        },
+        Case {
+            label: format!("UpdateRoutingControl({control_arn})"),
+            method: "PUT",
+            path: "/routingcontrol".to_string(),
+            body: Some(json!({
+                "RoutingControlArn": control_arn,
+                "RoutingControlName": "renamed"
+            })),
+            action: "UpdateRoutingControl",
             resource: control_arn,
         },
     ]

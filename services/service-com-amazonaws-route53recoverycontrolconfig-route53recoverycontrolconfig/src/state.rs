@@ -283,6 +283,19 @@ pub struct RoutingControlRecord {
 }
 
 impl RoutingControlRecord {
+    /// Move the routing control onto `name` — the only thing an update changes — making
+    /// the deployment of the changed configuration due again.
+    ///
+    /// A request naming the name the control already carries writes NOTHING, so it does
+    /// not restart a deployment either.
+    pub fn set_name(&mut self, name: String) {
+        if self.name == name {
+            return;
+        }
+        self.name = name;
+        self.deploy_due = deploy_due();
+    }
+
     /// This record as the modelled `RoutingControl` shape.
     pub fn to_routing_control(&self) -> RoutingControl {
         RoutingControl {
@@ -642,6 +655,25 @@ impl ComAmazonawsRoute53recoverycontrolconfigRoute53recoverycontrolconfigState {
             .unwrap_or(i32::MAX)
     }
 
+    /// Whether `control_panel_arn` already holds a routing control called `name`, other
+    /// than the control `except_arn` names.
+    ///
+    /// A routing control's name identifies it within its control panel, so this is what
+    /// the create and the update both ask before taking a name. Scanned in place: no
+    /// ordering is needed to answer it.
+    pub fn routing_control_name_taken(
+        &self,
+        control_panel_arn: &str,
+        name: &str,
+        except_arn: Option<&str>,
+    ) -> bool {
+        self.routing_controls.values().any(|rc| {
+            rc.control_panel_arn == control_panel_arn
+                && rc.name == name
+                && except_arn.is_none_or(|arn| rc.arn != arn)
+        })
+    }
+
     /// `control_panel_arn`'s routing controls in creation order.
     pub fn ordered_routing_controls(&self, control_panel_arn: &str) -> Vec<&RoutingControlRecord> {
         let mut found: Vec<&RoutingControlRecord> = self
@@ -863,6 +895,76 @@ pub const RESOURCE_NOUN: &str = "resource";
 /// own.
 pub fn not_found_message(noun: &str, arn: &str) -> String {
     format!("No record corresponding to {noun} Arn({arn})")
+}
+
+/// The `ResourceNotFoundException$Message` `DescribeRoutingControl` answers an ARN
+/// resolving to no stored routing control with.
+///
+/// This one read does not state the [`not_found_message`] sentence the cluster, the control
+/// panel and the safety rule lookups answer. Its recorded refusal is
+/// `Routing control <id> does not exist in control panel <control panel id>`, where the
+/// control is named by the id path its ARN nests — its control panel's id immediately
+/// followed by its own, with no separator between them — and the panel by its id. Both ids
+/// come from the ARN the REQUEST carried, so the sentence is a template: two replays of the
+/// same recorded call, against freshly minted ids, are answered with each run's own ids.
+///
+/// `DeleteRoutingControl` is NOT worded this way: it states the shared sentence, which is
+/// what its own recorded refusal carries. Each operation of this resource kind words its
+/// own, so neither is derived from the other, and the two differ in which ids they name as
+/// well as in their fixed text — confirmed by replaying the recorded refusals one handler
+/// at a time.
+///
+/// The run-together ids are the service's own wording, NOT a typo to tidy up: separating
+/// them makes the recorded refusal diverge.
+///
+/// An ARN that nests no routing control inside a control panel leaves the sentence no
+/// control panel to name, so it falls back to [`not_found_message`] — the sentence every
+/// other unresolvable ARN of this service is refused with.
+pub fn routing_control_describe_not_found_message(arn: &str) -> String {
+    let Some((control_panel_id, routing_control_id)) = nested_routing_control_ids(arn) else {
+        return not_found_message(ROUTING_CONTROL_NOUN, arn);
+    };
+    format!(
+        "Routing control {control_panel_id}{routing_control_id} does not exist in control panel \
+         {control_panel_id}"
+    )
+}
+
+/// The `ResourceNotFoundException$Message` `UpdateRoutingControl` answers an ARN resolving
+/// to no stored routing control with.
+///
+/// The update's recorded refusal states its own sentence rather than the read's: the fixed
+/// text `not found in`, with the routing control's own id before it — and only its own, not
+/// the id path the read names — and its control panel's id after it. Both ids come from the
+/// ARN the REQUEST carried, never from any one answer.
+///
+/// The missing space between the control's id and `not found in` is the service's own
+/// wording, NOT a typo to tidy up: adding one, or naming the control by the read's id path,
+/// makes the recorded refusal diverge. Each was checked against the recording on its own.
+///
+/// An ARN that nests no routing control falls back to [`not_found_message`], for the same
+/// reason as the read's sentence: there is then no control panel to name.
+pub fn routing_control_update_not_found_message(arn: &str) -> String {
+    let Some((control_panel_id, routing_control_id)) = nested_routing_control_ids(arn) else {
+        return not_found_message(ROUTING_CONTROL_NOUN, arn);
+    };
+    format!("{routing_control_id}not found in {control_panel_id}")
+}
+
+/// The `(control panel id, routing control id)` an ARN nesting a routing control inside a
+/// control panel carries, or `None` for an ARN that nests no routing control.
+fn nested_routing_control_ids(arn: &str) -> Option<(&str, &str)> {
+    let parsed = ::service_common::arn::parse(arn)?;
+    // A nested resource is appended to its parent's resource field, so the segments
+    // alternate `<type>/<id>`: a routing control's ARN carries its control panel's type
+    // and id, then its own.
+    let segments: Vec<&str> = parsed.resource.split('/').collect();
+    let ["controlpanel", control_panel_id, "routingcontrol", routing_control_id] =
+        segments.as_slice()
+    else {
+        return None;
+    };
+    Some((control_panel_id, routing_control_id))
 }
 
 /// The name a cluster is named by where a request REFERENCES one it must attach to
