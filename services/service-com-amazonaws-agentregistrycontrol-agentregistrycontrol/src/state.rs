@@ -73,6 +73,15 @@ pub const REGISTRY_DELETING: &str = "DELETING";
 pub const RECORD_CREATING: &str = "CREATING";
 /// `RegistryRecordStatus` of a created record before it is submitted for approval.
 pub const RECORD_DRAFT: &str = "DRAFT";
+/// `RegistryRecordStatus` of a submitted record waiting for a curator's manual review.
+pub const RECORD_PENDING_APPROVAL: &str = "PENDING_APPROVAL";
+/// `RegistryRecordStatus` of a record the approval workflow has approved.
+pub const RECORD_APPROVED: &str = "APPROVED";
+
+/// The one `AutoApprovalRule` the model declares — the catalogue it comes from is
+/// `crate::ops::types::AUTO_APPROVAL_RULE_VALUES`. It selects every submitted record,
+/// so a registry configured with it approves a submission without manual review.
+pub const AUTO_APPROVAL_RULE_APPROVE_ALL: &str = "APPROVE_ALL";
 
 /// A status change the clock owes a resource: what it becomes, when that is due on
 /// the monotonic clock, and the wall-clock instant to stamp on `updatedAt` when it
@@ -136,6 +145,29 @@ pub struct Registry {
     /// `nextToken` names a well-defined resume point.
     pub records: BTreeMap<String, RegistryRecord>,
     pub pending: Option<DueTransition<RegistryTransition>>,
+}
+
+impl Registry {
+    /// Whether this registry's approval configuration approves a record on submission
+    /// instead of sending it to manual review.
+    ///
+    /// `ApprovalConfiguration.autoApprovalRules` are "the rules that determine which
+    /// registry records are automatically approved on submission. When omitted or
+    /// empty, submitted records require manual review." A rule covers a submission when
+    /// its selector holds for the record; [`AUTO_APPROVAL_RULE_APPROVE_ALL`], the only
+    /// rule the model declares, selects every record. A rule outside that catalogue
+    /// covers nothing, so an unrecognised one leaves the submission for manual review
+    /// rather than approving it unseen.
+    pub fn auto_approves_submissions(&self) -> bool {
+        self.approval_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.auto_approval_rules.as_ref())
+            .is_some_and(|rules| {
+                rules
+                    .iter()
+                    .any(|rule| rule == AUTO_APPROVAL_RULE_APPROVE_ALL)
+            })
+    }
 }
 
 /// A registry record, exactly as `CreateRegistryRecord` stored it.

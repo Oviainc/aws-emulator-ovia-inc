@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SubmitRegistryRecordForApproval
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SubmitRegistryRecordForApproval`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SubmitRegistryRecordForApproval::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +159,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SubmitRegistryRecordForApproval` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SubmitRegistryRecordForApprovalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SubmitRegistryRecordForApproval"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                SubmitRegistryRecordForApprovalErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the agent registry store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        state.materialise_due_transitions();
+
+        // Both labels accept the resource's ARN or its bare id.
+        let registry_id = crate::state::identifier_to_id(&input.registry_id).to_string();
+        let record_id = crate::state::identifier_to_id(&input.record_id).to_string();
+
+        let Some(registry) = state.registries.get(&registry_id) else {
+            return Err(
+                SubmitRegistryRecordForApprovalErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("registry {registry_id} was not found")),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(record) = registry.records.get(&record_id) else {
+            return Err(
+                SubmitRegistryRecordForApprovalErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "record {record_id} was not found in registry {registry_id}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A registry is usable once it reaches READY, so a record cannot enter the
+        // approval workflow of one that is still being created or is being deleted.
+        if registry.status != crate::state::REGISTRY_READY {
+            return Err(SubmitRegistryRecordForApprovalErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "registry {registry_id} is in status {}; records can be submitted for \
+                         approval once it is {}",
+                        registry.status,
+                        crate::state::REGISTRY_READY
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Only a DRAFT record enters the approval workflow: one that is still being
+        // created has nothing to review yet, and one that has already been through the
+        // workflow is moved on with `UpdateRegistryRecordStatus` instead.
+        if record.status != crate::state::RECORD_DRAFT {
+            return Err(SubmitRegistryRecordForApprovalErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "record {record_id} is in status {}; only a {} record can be submitted \
+                         for approval",
+                        record.status,
+                        crate::state::RECORD_DRAFT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The registry's approval configuration AS IT STANDS NOW decides this
+        // submission: an auto-approval rule that covers the record approves it on
+        // submission, and without one the record waits for a curator.
+        let submitted_status = if registry.auto_approves_submissions() {
+            crate::state::RECORD_APPROVED
+        } else {
+            crate::state::RECORD_PENDING_APPROVAL
+        };
+        let updated_at = crate::state::now();
+
+        // Resolved under this same lock above, so both are still there; a lookup that
+        // somehow fails is a server error rather than a success for a record whose
+        // status was never written.
+        let record = state
+            .registries
+            .get_mut(&registry_id)
+            .and_then(|registry| registry.records.get_mut(&record_id));
+        let Some(record) = record else {
+            return Err(
+                SubmitRegistryRecordForApprovalErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!(
+                            "record {record_id} disappeared while it was being submitted for \
+                             approval"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        record.status = submitted_status.to_string();
+        // The reason belonged to the status the record has just left, and nothing is
+        // claimed about the new one that the workflow did not decide.
+        record.status_reason = None;
+        record.updated_at = updated_at;
+
+        Ok(SubmitRegistryRecordForApprovalOutput {
+            registry_arn: record.registry_arn.clone(),
+            record_arn: record.record_arn.clone(),
+            record_id: record.record_id.clone(),
+            status: record.status.clone(),
+            updated_at,
+        })
     }
 }
