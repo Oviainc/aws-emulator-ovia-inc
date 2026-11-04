@@ -29,6 +29,8 @@ mod code_interpreter_lifecycle;
 mod configuration_bundle_lifecycle;
 #[path = "all/control_plane_preconditions.rs"]
 mod control_plane_preconditions;
+#[path = "all/gateway_dependent_children.rs"]
+mod gateway_dependent_children;
 #[path = "all/gateway_endpoint_url.rs"]
 mod gateway_endpoint_url;
 #[path = "all/gateway_lifecycle.rs"]

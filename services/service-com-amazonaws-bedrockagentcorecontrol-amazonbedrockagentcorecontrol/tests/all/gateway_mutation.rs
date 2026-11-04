@@ -22,7 +22,9 @@
 //!    a further delete — is the modelled `ResourceNotFoundException` (404, with the
 //!    `x-amzn-errortype` header restJson1 puts the error code in), its targets are gone with
 //!    it, and the name it held is free for a new gateway. The rows differ along what the
-//!    deleted gateway carried.
+//!    deleted gateway carried. A gateway that still has a TARGET attached serves no
+//!    deletion at all until that target is deleted (the dependent-children precondition
+//!    `tests/all/gateway_dependent_children.rs` covers over a table of its own).
 //! 3. A gateway serves a mutation only in the terminal status it settles into: while the
 //!    clock still owes it a transition — `CREATING` after a create, `UPDATING` after an
 //!    update, `DELETING` after a delete — both mutations are refused `400`
@@ -526,6 +528,33 @@ async fn a_deleted_gateway_reports_deleting_and_then_resolves_to_the_modelled_40
                 answer.status, answer.body
             );
             target_id = text(&answer.body, "targetId");
+
+            // A target is addressed only through its gateway, so the gateway serves no
+            // deletion while one is still attached: the target goes first, and the
+            // gateway's own delete below is the identical call, accepted once nothing
+            // hangs off it.
+            let refused = delete_gateway(&router, &id).await;
+            assert_eq!(
+                (refused.status, error_code(&refused.body).as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: a gateway with a target attached refuses the delete, got {} {} \
+                 ({})",
+                refused.status,
+                error_code(&refused.body),
+                refused.body
+            );
+            let dropped = send(
+                &router,
+                "DELETE",
+                &format!("/gateways/{id}/targets/{target_id}/"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                dropped.status, 202,
+                "case {case:?}: the target is deleted before the gateway, got {} with {}",
+                dropped.status, dropped.body
+            );
         }
 
         let deleted = delete_gateway(&router, &id).await;

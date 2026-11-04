@@ -597,6 +597,20 @@ async fn a_gateway_that_cannot_serve_the_change_refuses_the_deletion() {
         );
         let target_id = text(&created.body, "targetId");
 
+        // A gateway with a target still ATTACHED serves no deletion of its own, so the row
+        // that needs a `DELETING` gateway asks for the target to go first. The target
+        // record is still there — on its way out on the clock, which the removal span has
+        // not reached — so the refusal below is the gateway's status and not a missing
+        // target.
+        if method == "DELETE" {
+            let dropped = delete_target(&router, &gateway_id, &target_id).await;
+            assert_eq!(
+                dropped.status, 202,
+                "case {case:?}: the target must go before the gateway's own delete, got {} ({})",
+                dropped.status, dropped.body
+            );
+        }
+
         let body = (method == "PUT").then(|| {
             json!({
                 "name": "gatewaygatedelete",

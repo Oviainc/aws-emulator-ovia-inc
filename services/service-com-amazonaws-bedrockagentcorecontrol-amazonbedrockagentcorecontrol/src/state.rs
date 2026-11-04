@@ -260,6 +260,26 @@ pub fn gateway_status_conflict(operation: &str, status: &str) -> ValidationExcep
     }
 }
 
+/// How this service words the refusal of a `DeleteGateway` for a gateway that
+/// still holds at least one target: the gateway, by the id the request named it
+/// with, and what the caller has to delete before the gateway can go.
+///
+/// A target is addressed only THROUGH the gateway that serves it
+/// (`/gateways/{gatewayIdentifier}/targets/{targetId}/`), so the gateway is not
+/// destroyed while any target is still attached: the delete is refused and the
+/// caller deletes the targets first, rather than the targets being silently
+/// cascaded away with the gateway that fronts them. The sentence around the id
+/// is fixed; the id itself is the one the request's path carried.
+///
+/// Shared by the handlers rather than written per operation, so the one refusal
+/// cannot be worded two ways.
+pub fn gateway_has_targets(gateway_id: &str) -> String {
+    format!(
+        "Gateway with ID: {gateway_id} has targets associated with it. Delete all targets \
+         before deleting the gateway."
+    )
+}
+
 /// How this service words the refusal of a `DeleteHarness` for a harness that
 /// still holds endpoints: the harness, by the name it was created with, and what
 /// the caller has to delete before the harness can go.
@@ -785,6 +805,16 @@ impl GatewayRecord {
     /// `DELETING` and the clock owes its removal.
     pub fn is_deleting(&self) -> bool {
         self.removal_due_at.is_some()
+    }
+
+    /// Whether any target is still ATTACHED to this gateway — a child the
+    /// gateway cannot be destroyed out from under.
+    ///
+    /// A target whose own deletion has already been accepted is on its way out
+    /// on the clock and is no longer attached: the caller has already asked for
+    /// it to go, so it does not hold the gateway back.
+    pub fn has_attached_targets(&self) -> bool {
+        self.targets.values().any(|target| !target.is_deleting())
     }
 
     /// The status this gateway reports at `now`: the transient one until the
@@ -2315,10 +2345,12 @@ impl WorkloadIdentityRecord {
     }
 }
 
-/// The modelled validation error for a create whose `name` is already held by a
-/// resource of this account, and for one this emulator's own ceiling refuses.
+/// The modelled validation error for a request the stored state of this account
+/// REFUSES rather than one whose members are malformed: a create whose `name` is
+/// already held by a resource of this account, one this emulator's own ceiling
+/// refuses, and a delete the resource's own dependents hold back.
 ///
-/// Nothing is wrong with the request member's own form, so `reason` is
+/// Nothing is wrong with the request's own form, so `reason` is
 /// [`VALIDATION_REASON_RESOURCE_CONFLICT`] and there is no `fieldList` — the
 /// same reason a request the stored state refuses carries everywhere else here.
 pub fn resource_conflict(why: String) -> ValidationException {

@@ -8,6 +8,10 @@
 //! of it, `GetGateway` above all, resolves to the modelled `ResourceNotFoundException`.
 //! That is how a client that deletes a gateway and polls for it to disappear finishes.
 //!
+//! A gateway that still has a target attached serves no deletion at all: a target is
+//! addressed only through its gateway, so the delete is refused `ValidationException`
+//! (400) naming the gateway and the targets to delete first, and nothing is written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -193,6 +197,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if status != crate::state::STATUS_READY {
                 return Err(DeleteGatewayErrorModeled::ValidationException(
                     crate::state::gateway_status_conflict(Self::NAME, &status),
+                )
+                .into());
+            }
+            // A target is addressed only THROUGH the gateway that serves it, so a
+            // gateway that still has one attached is not destroyed: the delete is
+            // refused as the conflict with the gateway's own dependents that it is,
+            // and the caller deletes the targets first, rather than the targets
+            // being silently cascaded away with the gateway they hang off. Nothing
+            // is written before the refusal, so the gateway and every target on it
+            // keep the status they had.
+            if record.has_attached_targets() {
+                return Err(DeleteGatewayErrorModeled::ValidationException(
+                    crate::state::resource_conflict(crate::state::gateway_has_targets(
+                        &record.gateway_id,
+                    )),
                 )
                 .into());
             }

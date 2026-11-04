@@ -29,9 +29,11 @@
 //!    and a target id naming no target of that gateway, are each the modelled
 //!    `ResourceNotFoundException` (404), and nothing is written.
 //! 4. A target is served BY its gateway, so the gateway has to be in the terminal status it
-//!    settles into: while the clock still owes it a transition (`UPDATING` after an update,
-//!    `DELETING` after a delete), the change is refused 400 `ValidationException` naming the
-//!    operation and the status it found.
+//!    settles into: while the clock still owes it a transition (`UPDATING` after an update),
+//!    the change is refused 400 `ValidationException` naming the operation and the status it
+//!    found. (A gateway cannot be `DELETING` while a live target hangs off it: its own
+//!    deletion is refused until every target has been asked to go, and a target whose
+//!    deletion was accepted is the 404 of rule 3.)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -711,10 +713,14 @@ async fn an_update_of_something_that_is_not_there_is_the_modelled_404() {
 async fn a_gateway_that_cannot_serve_the_change_refuses_the_update() {
     // (case, the request that moves the gateway out of READY, the status it then reports,
     // that status as the refusal's prose spells it)
-    let rows: [(&str, &str, &str, &str); 2] = [
-        ("an update in flight on the gateway", "PUT", "UPDATING", "Updating"),
-        ("a deletion accepted for the gateway", "DELETE", "DELETING", "Deleting"),
-    ];
+    //
+    // `DELETING` is not a row here: a gateway that still has a target ATTACHED serves no
+    // deletion of its own, so a gateway can only reach `DELETING` once every target on it
+    // has been asked to go — and a target whose own deletion was accepted is the modelled
+    // 404 to an update, which rule 5's test covers. `UPDATING` is the one transient status
+    // a gateway carrying a live target can be in.
+    let rows: [(&str, &str, &str, &str); 1] =
+        [("an update in flight on the gateway", "PUT", "UPDATING", "Updating")];
 
     for (case, method, status_name, status_prose) in rows {
         let router = router();
