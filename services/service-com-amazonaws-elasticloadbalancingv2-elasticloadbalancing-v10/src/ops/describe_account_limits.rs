@@ -136,15 +136,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Account quotas are the service's own configuration, not a resource this
-        // store holds, so nothing is read from the engine or the request metadata
-        // here. Both are bound so the signature stays the one every operation in this
-        // crate carries.
-        let _ = (ctx, &self.engine);
+        // store holds, so nothing is read from the request metadata here; `ctx` is bound
+        // so the signature stays the one every operation in this crate carries. The
+        // store is reached for ONE thing: the secret this read's page markers are
+        // authenticated under, which belongs to the store so that no two reads of it
+        // disagree about which markers the service issued. An engine carrying no store is
+        // one this service implements nothing on, so the answer there is the same refusal
+        // every other read of it gives, not a page under a marker key no later call would
+        // recognise.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented("DescribeAccountLimits")
+        })?;
+        let page_key = state.lock().page_token_key();
 
         let (page, next_marker) = crate::state::paginate(
             account_limits(),
             input.marker.as_deref(),
             input.page_size,
+            &page_key,
+            crate::state::PagedCollection::AccountLimits,
         )
         .map_err(|_| {
             crate::scaffolded::Scaffolded::validation(

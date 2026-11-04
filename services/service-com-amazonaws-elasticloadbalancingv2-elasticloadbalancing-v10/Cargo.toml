@@ -39,13 +39,15 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 # The ONE reading of an IPv4/IPv6 CIDR block and of whether an address is inside it, which
 # is how an `ip` target is matched against the subnets and the VPC of its target group.
 ipnet = "2"
+# The rendering of an authenticated page marker's bytes as the opaque string a paginated
+# read hands back in `NextMarker` (`src/state/pagination.rs`).
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
 # The Classic Elastic Load Balancing service, which owns the shared `elasticloadbalancing`
 # routing key both APIs are published on: `tests/all/shared_endpoint_routing.rs` drives
 # this model through that front door, the way an AWS SDK ELBv2 client reaches it.

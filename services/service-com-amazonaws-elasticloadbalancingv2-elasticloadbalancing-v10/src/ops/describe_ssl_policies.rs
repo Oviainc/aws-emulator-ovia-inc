@@ -141,10 +141,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The predefined security policies are the service's own published catalogue,
-        // not a resource this store holds, so nothing is read from the engine or the
-        // request metadata here. Both are bound so the signature stays the one every
-        // operation in this crate carries.
-        let _ = (ctx, &self.engine);
+        // not a resource this store holds, so nothing is read from the request metadata
+        // here; `ctx` is bound so the signature stays the one every operation in this
+        // crate carries. The store is reached for ONE thing: the secret this read's page
+        // markers are authenticated under, which belongs to the store so that no two
+        // reads of it disagree about which markers the service issued. An engine carrying
+        // no store is one this service implements nothing on, so the answer there is the
+        // same refusal every other read of it gives, not a page under a marker key no
+        // later call would recognise.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented("DescribeSSLPolicies")
+        })?;
+        let page_key = state.lock().page_token_key();
 
         // `Names` selects by name, in the order the request listed them and without
         // repeating a name listed twice; a name the catalogue does not carry is the
@@ -175,14 +184,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             selected.retain(|entry| entry.load_balancer_types.contains(&load_balancer_type));
         }
 
-        let (page, next_marker) =
-            crate::state::paginate(selected, input.marker.as_deref(), input.page_size).map_err(
-                |_| {
-                    crate::scaffolded::Scaffolded::validation(
-                        "The marker is not valid: it must be a NextMarker from a previous page of this collection",
-                    )
-                },
-            )?;
+        let (page, next_marker) = crate::state::paginate(
+            selected,
+            input.marker.as_deref(),
+            input.page_size,
+            &page_key,
+            crate::state::PagedCollection::SslPolicies,
+        )
+        .map_err(|_| {
+            crate::scaffolded::Scaffolded::validation(
+                "The marker is not valid: it must be a NextMarker from a previous page of this collection",
+            )
+        })?;
 
         Ok(DescribeSSLPoliciesOutput {
             ssl_policies: Some(page.iter().map(|entry| entry.to_shape()).collect()),

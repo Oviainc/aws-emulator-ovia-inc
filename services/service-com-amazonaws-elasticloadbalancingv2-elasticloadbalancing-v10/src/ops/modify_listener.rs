@@ -301,6 +301,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Each component of a redirect's target URI holds its documented form, judged on
+        // the default actions this call LEAVES the listener with.
+        crate::state::check_redirect_actions(&updated.default_actions).map_err(|message| {
+            ModifyListenerErrorModeled::InvalidLoadBalancerActionException(
+                InvalidLoadBalancerActionException {
+                    message: Some(message),
+                },
+            )
+        })?;
+
+        // "You must modify at least one of the following components to avoid a redirect
+        // loop: protocol, hostname, port, or path" — judged on the default actions this
+        // call LEAVES the listener with, so a modification cannot turn an accepted redirect
+        // into one that sends the client back to where it already is.
+        if crate::state::redirects_to_itself(&updated.default_actions) {
+            return Err(
+                ModifyListenerErrorModeled::InvalidLoadBalancerActionException(
+                    InvalidLoadBalancerActionException {
+                        message: Some(crate::state::REDIRECT_LOOP_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // One listener per port on a load balancer: moving this one onto a port another
         // of its load balancer's listeners holds is the modelled duplicate.
         if updated.port != stored.port {

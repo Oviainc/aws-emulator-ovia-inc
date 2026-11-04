@@ -61,6 +61,8 @@ mod resource_tags;
 mod rule_deletion_and_condition_value_spellings;
 #[path = "all/rule_modification.rs"]
 mod rule_modification;
+#[path = "all/rule_page_markers_and_redirect_validation.rs"]
+mod rule_page_markers_and_redirect_validation;
 #[path = "all/rule_priorities.rs"]
 mod rule_priorities;
 #[path = "all/rule_transforms_and_fixed_response_content_type.rs"]

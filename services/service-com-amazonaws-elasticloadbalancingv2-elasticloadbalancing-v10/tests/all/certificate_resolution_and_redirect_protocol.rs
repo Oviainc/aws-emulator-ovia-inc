@@ -677,12 +677,15 @@ const COMPONENT_CASES: &[ComponentCase] = &[
         expected: ("#{protocol}", "#{host}", "8443", "/#{path}", "#{query}"),
     },
     ComponentCase {
+        // The query is NOT one of the four components whose modification avoids a
+        // redirect loop ("protocol, hostname, port, or path"), so this row modifies the
+        // port beside it: a redirect that changed only the query would be refused.
         case: "a query that reuses the original",
-        modified: &[("Query", "#{query}&value=xyz")],
+        modified: &[("Port", "8080"), ("Query", "#{query}&value=xyz")],
         expected: (
             "#{protocol}",
             "#{host}",
-            "#{port}",
+            "8080",
             "/#{path}",
             "#{query}&value=xyz",
         ),

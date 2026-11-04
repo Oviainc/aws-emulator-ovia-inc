@@ -36,6 +36,21 @@ pub use certificate_consumers::{certificate_association_directory, record_certif
 #[cfg(test)]
 mod vpc_topology;
 
+/// The page walk every paginated read of this service shares, and the opaque `NextMarker`
+/// it hands back.
+pub mod pagination;
+
+pub use pagination::{paginate, PageError, PageTokenKey, PagedCollection};
+
+/// What a redirect action's target URI is read as, and what makes one an action this
+/// service refuses.
+///
+/// Public because the data plane that RENDERS a redirect reads the same reserved keywords
+/// (`crate::service::data_plane`).
+pub mod rule_actions;
+
+pub use rule_actions::{check_redirect_actions, redirects_to_itself, REDIRECT_LOOP_MESSAGE};
+
 use crate::ops::types::{
     Action, AvailabilityZone, Certificate, ForwardActionConfig, IpamPools, Listener,
     ListenerAttribute, LoadBalancer, LoadBalancerAddress, LoadBalancerAttribute, LoadBalancerState,
@@ -3158,10 +3173,32 @@ pub const SINGLE_USE_CONDITION_FIELDS: &[&str] = &[
     "source-ip",
 ];
 
+/// The condition fields the model says to specify the top-level `Values` member for:
+/// "The condition value. Specify only when `Field` is `host-header` or `path-pattern`.
+/// Alternatively, to specify multiple host names or multiple path patterns, use
+/// `HostHeaderConfig` or `PathPatternConfig`." A field outside this list has no top-level
+/// spelling for its values, so naming the member for one states a value the condition has
+/// nowhere to carry.
+pub const FIELDS_WITH_TOP_LEVEL_VALUES: &[&str] = &["host-header", "path-pattern"];
+
+/// The condition fields the model says to specify the top-level `RegexValues` member for:
+/// "The regular expressions to match against the condition field. … Specify only when
+/// `Field` is `http-header`, `host-header`, or `path-pattern`."
+pub const FIELDS_WITH_TOP_LEVEL_REGEX_VALUES: &[&str] =
+    &["host-header", "http-header", "path-pattern"];
+
+/// The refusal a condition naming a top-level member its field has no spelling for earns:
+/// the MEMBER the request carried and the field it carried it on, which together are all
+/// the caller has to fix the request from.
+pub fn unsupported_condition_member_message(member: &str, field: &str) -> String {
+    format!("'{member}' is not supported for a condition of type '{field}'")
+}
+
 /// Enforce what the model states about a rule's CONDITIONS in prose and declares no
 /// error shape for: every condition names a field this service matches on, a field that
-/// may appear only once appears at most once, and the values the whole rule carries stay
-/// inside the published bound ([`CONDITION_VALUES_PER_RULE`]). Each refusal names the
+/// may appear only once appears at most once, a condition names only the members its
+/// field has a spelling for, and the values the whole rule carries stay inside the
+/// published bound ([`CONDITION_VALUES_PER_RULE`]). Each refusal names the
 /// value and the rule it broke, because that text is all the caller has to fix the
 /// request from.
 ///
@@ -3186,6 +3223,18 @@ pub fn check_rule_conditions(conditions: &[RuleCondition]) -> Result<(), String>
                 return Err(format!("A rule can only have one '{field}' condition"));
             }
             single_use_seen.push(field);
+        }
+        // The two members the model gives only SOME fields a top-level spelling for. A
+        // condition that names one on a field without it is refused rather than silently
+        // matching on nothing, because the values it carries would be reported — and
+        // evaluated — under no spelling of that field at all.
+        if condition.values.is_some() && !FIELDS_WITH_TOP_LEVEL_VALUES.contains(&field) {
+            return Err(unsupported_condition_member_message("Values", field));
+        }
+        if condition.regex_values.is_some()
+            && !FIELDS_WITH_TOP_LEVEL_REGEX_VALUES.contains(&field)
+        {
+            return Err(unsupported_condition_member_message("RegexValues", field));
         }
         values += condition_values(condition);
     }
@@ -3513,24 +3562,6 @@ fn action_summary(actions: &[Action]) -> Vec<(String, Option<i32>, Vec<String>)>
         .collect()
 }
 
-/// The reserved keyword each component of a redirect action's target URI is REPORTED as
-/// when the request did not modify that component, from `RedirectActionConfig`'s own
-/// documentation: "A URI consists of the following components:
-/// protocol://hostname:port/path?query. … Any components that you do not modify retain
-/// their original values. You can reuse URI components using the following reserved
-/// keywords: #{protocol}, #{host}, #{port}, #{path} (the leading "/" is removed),
-/// #{query}."
-///
-/// So a component left out keeps the request's own value, and the keyword for it is what
-/// says so. `Path` is the one with a form of its own: the keyword drops the leading "/",
-/// which the member itself must carry ("The absolute path, starting with the leading
-/// "/""), so the path that retains its original value is `/#{path}`.
-const KEEP_PROTOCOL: &str = "#{protocol}";
-const KEEP_HOST: &str = "#{host}";
-const KEEP_PORT: &str = "#{port}";
-const KEEP_PATH: &str = "/#{path}";
-const KEEP_QUERY: &str = "#{query}";
-
 /// The value `FixedResponseActionConfig$ContentType` takes when a fixed-response action
 /// names none: "The content type. … If the value is not specified, the default value is
 /// `text/plain`." One of that member's own documented valid values, so an action created
@@ -3594,7 +3625,7 @@ fn reported_forward_config(action: &Action) -> Option<ForwardActionConfig> {
 /// One action as a read reports it: a forward's distribution answered under BOTH spellings
 /// the model gives it, with the weight and the stickiness the service carries it at
 /// ([`reported_forward_config`]), a redirect's unmodified components answered as the
-/// keywords that retain them ([`KEEP_PROTOCOL`] and the rest), a fixed response's content
+/// keywords that retain them ([`rule_actions`]), a fixed response's content
 /// type answered as the one the service defaults when the action named none
 /// ([`DEFAULT_FIXED_RESPONSE_CONTENT_TYPE`]), every other action exactly as it was given.
 ///
@@ -3629,11 +3660,11 @@ fn reported_action(action: &Action) -> Action {
                 *value = Some(keyword.to_string());
             }
         };
-        kept(&mut config.protocol, KEEP_PROTOCOL);
-        kept(&mut config.host, KEEP_HOST);
-        kept(&mut config.port, KEEP_PORT);
-        kept(&mut config.path, KEEP_PATH);
-        kept(&mut config.query, KEEP_QUERY);
+        kept(&mut config.protocol, rule_actions::KEEP_PROTOCOL);
+        kept(&mut config.host, rule_actions::KEEP_HOST);
+        kept(&mut config.port, rule_actions::KEEP_PORT);
+        kept(&mut config.path, rule_actions::KEEP_PATH);
+        kept(&mut config.query, rule_actions::KEEP_QUERY);
     }
     reported
 }
@@ -3769,9 +3800,21 @@ pub struct ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     /// within a run. A counter and a seed, not a store: nothing accumulates here.
     next_id: u64,
     id_seed: std::collections::hash_map::RandomState,
+    /// The secret this store's page markers are authenticated under, drawn from the
+    /// system's randomness when the store is created ([`PageTokenKey`]). A key, not a
+    /// store: nothing accumulates here either, because a marker carries the position it
+    /// names rather than pointing at a page kept on the side.
+    page_token_key: PageTokenKey,
 }
 
 impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
+    /// The key this store's page markers are minted and recognised under. `Copy`, so a
+    /// read takes it off the store and goes on to borrow the records it is about to
+    /// report in the same call.
+    pub fn page_token_key(&self) -> PageTokenKey {
+        self.page_token_key
+    }
+
     /// A fresh 16-hex resource id, carried by no resource this store holds. AWS
     /// resource ids are opaque, so this mixes a per-store seed with a counter rather
     /// than exposing the counter itself.
@@ -4127,42 +4170,6 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
 pub fn rule_listener_arn(arn: &str) -> Option<String> {
     let (listener_part, _rule_id) = arn.rsplit_once('/')?;
     Some(listener_part.replacen(":listener-rule/", ":listener/", 1))
-}
-
-/// Why a page request could not be served.
-#[derive(Debug)]
-pub enum PageError {
-    /// The `Marker` did not come from a previous page of this collection.
-    InvalidMarker,
-}
-
-/// One page of `items`, plus the marker that resumes after it.
-///
-/// The marker is the index the next page starts at, which is why every paginated
-/// read here walks its collection in a stable order. A marker that is not a
-/// position in the collection — not a number, or past its end — is refused;
-/// nothing in it binds it to the page that issued it.
-pub fn paginate<T>(
-    items: Vec<T>,
-    marker: Option<&str>,
-    page_size: Option<i32>,
-) -> Result<(Vec<T>, Option<String>), PageError> {
-    let start = match marker {
-        None => 0usize,
-        Some(marker) => marker.parse::<usize>().map_err(|_| PageError::InvalidMarker)?,
-    };
-    if start > items.len() {
-        return Err(PageError::InvalidMarker);
-    }
-    let mut page: Vec<T> = items.into_iter().skip(start).collect();
-    let next = match page_size.and_then(|size| usize::try_from(size).ok()) {
-        Some(size) if page.len() > size => {
-            page.truncate(size);
-            Some((start + size).to_string())
-        }
-        _ => None,
-    };
-    Ok((page, next))
 }
 
 /// The RULES a caller added to one listener, in the order they are evaluated in: "rules

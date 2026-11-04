@@ -176,6 +176,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             listener.certificate_shapes(),
             input.marker.as_deref(),
             input.page_size,
+            &guard.page_token_key(),
+            crate::state::PagedCollection::Certificates,
         )
         .map_err(|_| {
             crate::scaffolded::Scaffolded::validation(

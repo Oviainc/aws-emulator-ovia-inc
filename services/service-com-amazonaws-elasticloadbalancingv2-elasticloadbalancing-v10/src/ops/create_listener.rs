@@ -280,6 +280,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Each component of a redirect's target URI holds its documented form, here for
+        // the default actions this listener is created with.
+        crate::state::check_redirect_actions(&input.default_actions).map_err(|message| {
+            CreateListenerErrorModeled::InvalidLoadBalancerActionException(
+                InvalidLoadBalancerActionException {
+                    message: Some(message),
+                },
+            )
+        })?;
+
+        // "You must modify at least one of the following components to avoid a redirect
+        // loop: protocol, hostname, port, or path" — a default action redirecting to the
+        // request's own protocol, host, port and path sends the client back to where it
+        // already is, which is the modelled refusal for an action that is not valid.
+        if crate::state::redirects_to_itself(&input.default_actions) {
+            return Err(
+                CreateListenerErrorModeled::InvalidLoadBalancerActionException(
+                    InvalidLoadBalancerActionException {
+                        message: Some(crate::state::REDIRECT_LOOP_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let candidate = ListenerRecord {
             arn: String::new(),
             load_balancer_arn: input.load_balancer_arn.clone(),

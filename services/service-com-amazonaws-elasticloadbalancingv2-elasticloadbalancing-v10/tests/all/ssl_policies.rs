@@ -179,12 +179,18 @@ async fn a_marker_that_is_not_a_position_in_the_catalogue_is_refused() {
     let (router, _engine) = emulator();
     let whole = policies(&router, "the whole catalogue", &[]).await;
 
+    // A `Marker` is the service's own opaque token: the position it names travels inside
+    // it, authenticated, so every value a caller could write rather than round-trip names
+    // no position at all — an ordinal included.
     for (case, marker) in [
         ("a marker that is not a number", "not-a-marker".to_string()),
+        ("an ordinal", "1".to_string()),
+        ("the ordinal of the first position", "0".to_string()),
         ("a negative marker", "-1".to_string()),
         ("a fractional marker", "1.5".to_string()),
-        ("a marker past the end", (whole.len() + 1).to_string()),
-        ("a marker far past the end", "9999".to_string()),
+        ("the ordinal at the end", whole.len().to_string()),
+        ("an ordinal past the end", (whole.len() + 1).to_string()),
+        ("an ordinal far past the end", "9999".to_string()),
     ] {
         let refused = describe(&router, "DescribeSSLPolicies", &[p("Marker", &marker)]).await;
         assert_eq!(
@@ -201,24 +207,40 @@ async fn a_marker_that_is_not_a_position_in_the_catalogue_is_refused() {
         );
     }
 
-    // The marker that ends the collection is a position in it, so it is served — with
-    // the empty tail after the last policy.
-    let at_the_end = describe(
+    // The marker this read ISSUED is served, and it resumes exactly after the page it
+    // came with.
+    let first = describe(&router, "DescribeSSLPolicies", &[p("PageSize", "1")]).await;
+    let issued = first
+        .text("NextMarker")
+        .expect("the first page of the catalogue leaves a marker to resume from");
+    let resumed = describe(
         &router,
         "DescribeSSLPolicies",
-        &[p("Marker", &whole.len().to_string())],
+        &[p("Marker", &issued), p("PageSize", "1")],
     )
     .await;
     assert_eq!(
-        at_the_end.status, 200,
-        "case the marker at the end: expected 200, got {} body {}",
-        at_the_end.status, at_the_end.body
+        (resumed.status, reported_policy_names(&resumed)),
+        (200, vec![whole[1].clone()]),
+        "case the marker this read issued: expected the policy after the first, got {} body {}",
+        resumed.status,
+        resumed.body
     );
+
+    // A marker another emulator's store issued names no position here: the position
+    // travels authenticated under the key of the store that minted it.
+    let (other_store, _other_engine) = emulator();
+    let elsewhere = describe(&other_store, "DescribeSSLPolicies", &[p("PageSize", "1")]).await;
+    let foreign = elsewhere
+        .text("NextMarker")
+        .expect("the other store's first page leaves a marker too");
+    let refused = describe(&router, "DescribeSSLPolicies", &[p("Marker", &foreign)]).await;
     assert_eq!(
-        reported_policy_names(&at_the_end),
-        Vec::<String>::new(),
-        "case the marker at the end: nothing follows the last policy, got {}",
-        at_the_end.body
+        (refused.status, refused.error_code().as_str()),
+        (400, "ValidationException"),
+        "case another store's marker: expected 400 ValidationException, got {} body {}",
+        refused.status,
+        refused.body
     );
 }
 
@@ -229,12 +251,16 @@ async fn the_catalogue_is_the_services_own_and_a_read_never_changes_it() {
 
     // Reads of every shape — unfiltered, by name, by type, paged — and then the whole
     // catalogue again: a report may not change what a later caller sees.
+    let first = describe(&router, "DescribeSSLPolicies", &[p("PageSize", "1")]).await;
+    let issued = first
+        .text("NextMarker")
+        .expect("the first page of the catalogue leaves a marker to resume from");
     let probes: Vec<(&str, Vec<(String, String)>)> = vec![
         ("unfiltered", vec![]),
         ("by name", vec![p("Names.member.1", &whole[0])]),
         ("by type", vec![p("LoadBalancerType", "network")]),
         ("paged", vec![p("PageSize", "1")]),
-        ("at a marker", vec![p("Marker", "1")]),
+        ("at a marker", vec![p("Marker", &issued)]),
     ];
     for (case, fields) in &probes {
         let _ = policies(&router, case, fields).await;

@@ -212,6 +212,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         crate::state::check_rule_transforms(input.transforms.as_deref().unwrap_or_default())
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // Each component of a redirect's target URI holds its documented form, and a
+        // redirect modifies at least one of them: both are read off the request alone.
+        crate::state::check_redirect_actions(&input.actions).map_err(|message| {
+            CreateRuleErrorModeled::InvalidLoadBalancerActionException(
+                InvalidLoadBalancerActionException {
+                    message: Some(message),
+                },
+            )
+        })?;
+        // "You must modify at least one of the following components to avoid a redirect
+        // loop: protocol, hostname, port, or path" — a redirect that leaves all four as the
+        // request's own sends the client back to where it already is, which is the
+        // modelled refusal for an action that is not valid.
+        if crate::state::redirects_to_itself(&input.actions) {
+            return Err(
+                CreateRuleErrorModeled::InvalidLoadBalancerActionException(
+                    InvalidLoadBalancerActionException {
+                        message: Some(crate::state::REDIRECT_LOOP_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
 
         let mut guard = state.lock();
 

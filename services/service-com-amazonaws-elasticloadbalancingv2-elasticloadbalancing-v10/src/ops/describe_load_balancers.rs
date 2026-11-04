@@ -210,14 +210,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             guard.load_balancers_in_order()
         };
 
-        let (page, next_marker) =
-            crate::state::paginate(selected, input.marker.as_deref(), input.page_size).map_err(
-                |_| {
-                    crate::scaffolded::Scaffolded::validation(
-                        "The marker is not valid: it must be a NextMarker from a previous page of this collection",
-                    )
-                },
-            )?;
+        let (page, next_marker) = crate::state::paginate(
+            selected,
+            input.marker.as_deref(),
+            input.page_size,
+            &guard.page_token_key(),
+            crate::state::PagedCollection::LoadBalancers,
+        )
+        .map_err(|_| {
+            crate::scaffolded::Scaffolded::validation(
+                "The marker is not valid: it must be a NextMarker from a previous page of this collection",
+            )
+        })?;
 
         Ok(DescribeLoadBalancersOutput {
             load_balancers: Some(page.iter().map(|record| record.to_shape()).collect()),

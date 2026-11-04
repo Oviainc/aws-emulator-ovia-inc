@@ -6,6 +6,11 @@
 //! — "You must specify either a listener or rules", so a request naming neither is
 //! refused — in one page walked by `Marker`/`PageSize`.
 //!
+//! A request that names no `PageSize` is answered with the WHOLE selection in one page and
+//! no `NextMarker`, so a client that does not paginate sees every rule; a `PageSize` caps
+//! the page and the `NextMarker` beside it is this store's own opaque token
+//! ([`crate::state::pagination`]), never a position a caller could compute.
+//!
 //! Every listener has a DEFAULT rule, minted with the listener: the rule that carries
 //! the listener's default actions, matches on no condition and reports the priority
 //! `default`. Beside it a listener carries the rules `CreateRule` added, and the rule
@@ -253,14 +258,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let (page, next_marker) =
-            crate::state::paginate(selected, input.marker.as_deref(), input.page_size).map_err(
-                |_| {
-                    crate::scaffolded::Scaffolded::validation(
-                        "The marker is not valid: it must be a NextMarker from a previous page of this collection",
-                    )
-                },
-            )?;
+        // "The maximum number of results to return with this call": a read handed no
+        // `PageSize` reports the whole selection in one page, so a client that does not
+        // paginate sees every rule the selection names and no `NextMarker` comes back
+        // with it. The marker that resumes a walk is this store's own opaque token
+        // ([`crate::state::pagination`]), never a position a caller could compute.
+        let (page, next_marker) = crate::state::paginate(
+            selected,
+            input.marker.as_deref(),
+            input.page_size,
+            &guard.page_token_key(),
+            crate::state::PagedCollection::Rules,
+        )
+        .map_err(|_| {
+            crate::scaffolded::Scaffolded::validation(
+                "The marker is not valid: it must be a NextMarker from a previous page of this collection",
+            )
+        })?;
 
         Ok(DescribeRulesOutput {
             rules: Some(page),

@@ -199,11 +199,17 @@ const SIGV4_SCHEME: &str = "AWS4-HMAC-SHA256";
 /// `RedirectActionConfig`: "You can reuse URI components using the following reserved
 /// keywords: #{protocol}, #{host}, #{port}, #{path} (the leading "/" is not included) and
 /// #{query} (the leading "?" is not included)."
-const PROTOCOL_PLACEHOLDER: &str = "#{protocol}";
-const HOST_PLACEHOLDER: &str = "#{host}";
-const PORT_PLACEHOLDER: &str = "#{port}";
-const PATH_PLACEHOLDER: &str = "#{path}";
-const QUERY_PLACEHOLDER: &str = "#{query}";
+///
+/// Named through the ONE reading of those keywords
+/// ([`crate::state::rule_actions`]), so the plane that RESOLVES a component, the read that
+/// REPORTS an unmodified one and the validation that judges a redirect cannot drift on how
+/// a reserved keyword is spelled. The path's is the bare keyword, which this plane
+/// substitutes without the leading "/" the member itself carries.
+use crate::state::rule_actions::{
+    KEEP_HOST as HOST_PLACEHOLDER, KEEP_PATH_KEYWORD as PATH_PLACEHOLDER,
+    KEEP_PORT as PORT_PLACEHOLDER, KEEP_PROTOCOL as PROTOCOL_PLACEHOLDER,
+    KEEP_QUERY as QUERY_PLACEHOLDER,
+};
 
 /// What a data-plane request ADDRESSES, as the wire carries it: the host it was sent to —
 /// absent on a request that carries neither a `Host` header nor an absolute URI — its

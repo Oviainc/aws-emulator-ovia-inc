@@ -252,6 +252,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Each component of a redirect's target URI holds its documented form, judged on
+        // the actions this call LEAVES the rule with.
+        crate::state::check_redirect_actions(&updated.actions).map_err(|message| {
+            ModifyRuleErrorModeled::InvalidLoadBalancerActionException(
+                InvalidLoadBalancerActionException {
+                    message: Some(message),
+                },
+            )
+        })?;
+
+        // "You must modify at least one of the following components to avoid a redirect
+        // loop: protocol, hostname, port, or path" — judged on the actions this call LEAVES
+        // the rule with, since a request may replace them, so a modification cannot turn an
+        // accepted redirect into one that sends the client back to where it already is.
+        if crate::state::redirects_to_itself(&updated.actions) {
+            return Err(
+                ModifyRuleErrorModeled::InvalidLoadBalancerActionException(
+                    InvalidLoadBalancerActionException {
+                        message: Some(crate::state::REDIRECT_LOOP_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // An action may forward only to a target group that exists, exactly as the
         // actions a rule is created with may.
         let forwarded = crate::state::action_target_group_arns(&updated.actions);

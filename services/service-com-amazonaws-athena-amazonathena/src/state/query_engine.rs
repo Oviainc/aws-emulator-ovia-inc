@@ -339,6 +339,13 @@ impl RunGuard {
         let spent = u64::try_from(PROGRESS_HANDLER_OPS).unwrap_or(1);
         // Compared AFTER this callback's own spend, so the run is interrupted on the
         // callback that exhausts the budget rather than on the one after it.
+        //
+        // `try_update` is the current name of the atomic read-modify-write this budget has
+        // always used: the standard library renamed `fetch_update` to it and deprecates the
+        // old name, which this workspace's deny-on-warnings build turns into an error. Same
+        // signature and orderings, and it answers the PREVIOUS value — which is what
+        // `previous` is read as here, so the budget still trips on exactly the callback that
+        // spends the last of it.
         let previous = self
             .steps_left
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
@@ -1005,5 +1012,59 @@ fn statement_type_of(statement: &::sqlparser::ast::Statement) -> &'static str {
         | Statement::Drop { .. }
         | Statement::Truncate { .. } => STATEMENT_TYPE_DDL,
         _ => STATEMENT_TYPE_UTILITY,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The STEP budget is the backstop for a run the wall clock cannot stop, so the
+    /// progress handler must answer "interrupt" on exactly the callback that spends the
+    /// last of it — not before it, and not one callback late.
+    ///
+    /// Armed with a deadline far in the future, so the only bound under test is the budget.
+    #[test]
+    fn the_step_budget_interrupts_the_run_on_the_callback_that_spends_it() {
+        let spend = u64::try_from(PROGRESS_HANDLER_OPS).expect("the callback's own spend");
+        // Each row: the budget one run gets, and which callback must be the interrupting
+        // one — a budget of exactly one callback's spend, of several, and one that is not a
+        // whole multiple of it.
+        for (budget, interrupting_call) in [
+            (spend, 1usize),
+            (spend * 2, 2),
+            (spend * 3, 3),
+            (spend * 5 / 2, 3),
+        ] {
+            let guard = RunGuard::default();
+            guard.arm(Duration::from_secs(3_600), budget);
+            for call in 1..=interrupting_call {
+                let interrupted = guard.should_interrupt();
+                assert_eq!(
+                    interrupted,
+                    call == interrupting_call,
+                    "case budget {budget}: callback {call} of {interrupting_call} answered \
+                     interrupt={interrupted}"
+                );
+            }
+            // Past the budget the answer stays "interrupt": the counter saturates rather
+            // than wrapping back into a fresh budget.
+            assert!(
+                guard.should_interrupt(),
+                "case budget {budget}: a spent budget stays spent"
+            );
+        }
+    }
+
+    /// A disarmed guard interrupts nothing, so an idle connection is never stopped.
+    #[test]
+    fn a_disarmed_guard_interrupts_nothing() {
+        let guard = RunGuard::default();
+        guard.arm(Duration::from_secs(3_600), 0);
+        guard.disarm();
+        assert!(
+            !guard.should_interrupt(),
+            "case disarmed: a guard with no run in flight must not interrupt"
+        );
     }
 }
