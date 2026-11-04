@@ -27,7 +27,10 @@ use crate::supported_instance_types::BAD_RELEASE_LABELS;
 
 /// The sentence the LEGACY job-flow surface answers an id it resolves no cluster for:
 /// constant, with no id in it.
-const JOB_FLOW_SENTENCE: &str = "Specified job flow ID not valid.";
+///
+/// `pub(crate)` so a sibling suite asserts the same sentence through one constant rather
+/// than its own copy.
+pub(crate) const JOB_FLOW_SENTENCE: &str = "Specified job flow ID not valid.";
 
 /// Ids no cluster is held under. Rows differ along the form of the id: the shape a real
 /// id has, a short and a long body, a bare prefix, the empty string (`ClusterId` is

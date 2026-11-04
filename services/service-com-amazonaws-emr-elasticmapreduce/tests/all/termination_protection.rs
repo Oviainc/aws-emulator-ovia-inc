@@ -23,7 +23,10 @@ use crate::job_flow_lifecycle::{assert_refused, at, kept_alive_request, minimal_
 
 /// Longer than the service's clock-owed transition span (500 ms), so a cluster that was
 /// `TERMINATING` has reached `TERMINATED` by the time we look.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+///
+/// `pub(crate)` so a sibling suite waits out the same span through one constant rather than
+/// its own copy.
+pub(crate) const PAST_TRANSITION: Duration = Duration::from_millis(900);
 
 /// The states a cluster that nothing terminated can be reported in: it was launched
 /// `STARTING` and the clock owes it `WAITING` (it is kept alive with no steps) or

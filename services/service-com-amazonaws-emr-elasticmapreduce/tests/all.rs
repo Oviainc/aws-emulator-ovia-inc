@@ -31,6 +31,8 @@ mod instance_fleets;
 mod instance_groups;
 #[path = "all/instance_store_catalog.rs"]
 mod instance_store_catalog;
+#[path = "all/job_flow_id_refusal_sentence.rs"]
+mod job_flow_id_refusal_sentence;
 #[path = "all/job_flow_lifecycle.rs"]
 mod job_flow_lifecycle;
 #[path = "all/job_flow_role.rs"]
