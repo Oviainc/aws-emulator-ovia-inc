@@ -223,6 +223,28 @@ pub(crate) async fn published_rule_ids(router: &Router) -> Vec<String> {
     ids
 }
 
+/// Designate the account this emulator serves as the GuardDuty delegated
+/// administrator of the organization `region`'s endpoint serves, through
+/// `EnableOrganizationAdminAccount`.
+///
+/// The `*CustomDetectionRuleOrgConfiguration` operations are available only to that
+/// delegated administrator, so a suite that expects one of them to be SERVED
+/// establishes the standing first. Designating the account a Region already holds is
+/// the same designation and answers success, so this may be called as often as a
+/// suite needs. Lives beside [`call`] because several suites need it.
+pub(crate) async fn as_delegated_admin(router: &Router, region: &str) {
+    let (status, body) = crate::organization_admin_accounts::enable_admin(
+        router,
+        region,
+        &service_com_amazonaws_guardduty_guarddutyapiservice::state::administrator_account_id(),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "enable-organization-admin-account in {region}: expected 200, got {status} {body:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Rule 1 + 2: create -> read -> update -> read -> delete -> read.
 // ---------------------------------------------------------------------------

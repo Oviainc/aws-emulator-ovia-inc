@@ -203,6 +203,8 @@ mod no_op_batch_clock;
 mod no_op_mutation_clock;
 #[path = "all/object_malware_scan.rs"]
 mod object_malware_scan;
+#[path = "all/org_configuration_authorization.rs"]
+mod org_configuration_authorization;
 #[path = "all/organization_admin_accounts.rs"]
 mod organization_admin_accounts;
 #[path = "all/organization_admin_no_op_clock.rs"]

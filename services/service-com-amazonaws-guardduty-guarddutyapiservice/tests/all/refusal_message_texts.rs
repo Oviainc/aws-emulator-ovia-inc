@@ -31,7 +31,8 @@
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{
-    call, call_in, enabled_detector, error_code, error_shape, new_router, published_rule_ids,
+    as_delegated_admin, call, call_in, enabled_detector, error_code, error_shape, new_router,
+    published_rule_ids,
 };
 
 /// The only client error GuardDuty's model binds to an operation, and the shape
@@ -493,6 +494,10 @@ async fn a_malformed_account_id_is_refused_in_terms_of_its_parameter() {
     let router = new_router();
     let detector_id = enabled_detector(&router).await;
     let rule_id = published_rule_ids(&router).await[0].clone();
+    // The organization-configuration row below is available only to the
+    // organization's delegated administrator, so the standing is established first:
+    // what is under test here is the account-id refusal, not the authorization gate.
+    as_delegated_admin(&router, "us-east-1").await;
 
     // `AccountId` is `len 12..12` and constrains no characters
     // (`smithy_query(shape="AccountId")`), so a 12-character non-numeric value
@@ -737,28 +742,66 @@ async fn an_association_refusal_identifies_the_rule_it_is_about() {
         ("9".repeat(64), "64 characters: the high end"),
     ];
     for (association_id, why) in association_ids {
-        for operation in ["GET", "DELETE"] {
-            let case = format!("{operation} the unminted association {association_id:?} ({why})");
-            let (status, refused) = call(
-                &router,
-                operation,
-                &format!("{RULES_PATH}/{published_rule}/association/{association_id}"),
-                None,
-            )
-            .await;
-            assert_refusal(
-                &case,
-                status,
-                &refused,
-                404,
-                &format!("Association not found: {association_id}"),
-            );
-            assert_eq!(
-                error_code(&refused),
-                "ResourceNotFoundException",
-                "case {case}: expected the modelled not-found class, got {refused:?}"
-            );
-        }
+        let case = format!("GET the unminted association {association_id:?} ({why})");
+        let (status, refused) = call(
+            &router,
+            "GET",
+            &format!("{RULES_PATH}/{published_rule}/association/{association_id}"),
+            None,
+        )
+        .await;
+        assert_refusal(
+            &case,
+            status,
+            &refused,
+            404,
+            &format!("Association not found: {association_id}"),
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ResourceNotFoundException",
+            "case {case}: expected the modelled not-found class, got {refused:?}"
+        );
+
+        // The UPDATE of the same absent association is the same refusal, worded the
+        // same way: both name the association the request asked about.
+        let case = format!("PUT the unminted association {association_id:?} ({why})");
+        let (status, refused) = call(
+            &router,
+            "PUT",
+            &format!("{RULES_PATH}/{published_rule}/association/{association_id}"),
+            Some(json!({"mode": MODES[0]})),
+        )
+        .await;
+        assert_refusal(
+            &case,
+            status,
+            &refused,
+            404,
+            &format!("Association not found: {association_id}"),
+        );
+
+        // The DELETE is not a refusal at all: it is `@idempotent`
+        // (`smithy_query(operation="DeleteCustomDetectionRuleAssociation")`), so an
+        // association that is already absent is the state it asks for and it answers
+        // the empty success with no message to word.
+        let case = format!("DELETE the unminted association {association_id:?} ({why})");
+        let (status, deleted) = call(
+            &router,
+            "DELETE",
+            &format!("{RULES_PATH}/{published_rule}/association/{association_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: an idempotent delete of an absent association expected 200, got {status} {deleted:?}"
+        );
+        assert_eq!(
+            deleted["message"],
+            Value::Null,
+            "case {case}: a success words no refusal, got {deleted:?}"
+        );
     }
 }
 

@@ -38,8 +38,8 @@ use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
 
 use super::client_rejections::UNUSABLE_INPUT_VALUE;
 use super::detector_lifecycle::{
-    all_finding_ids, call, enabled_detector, error_code, error_shape, new_router, router_over,
-    Router,
+    all_finding_ids, as_delegated_admin, call, enabled_detector, error_code, error_shape,
+    new_router, router_over, Router,
 };
 
 /// The error CLASS every 400 on this service carries in the body's `__type` and in
@@ -1287,6 +1287,7 @@ async fn reading_an_absent_org_configuration_is_refused_with_the_modelled_404() 
 /// `POST /custom-detection-rule/org-configuration`
 /// (`smithy_query(operation="GetCustomDetectionRuleOrgConfiguration,CreateCustomDetectionRuleOrgConfiguration")`).
 async fn get_org_configuration(router: &Router, rule_id: &str, mode: &str) -> (u16, Value) {
+    as_delegated_admin(router, REGION).await;
     call(
         router,
         "GET",
@@ -1297,6 +1298,7 @@ async fn get_org_configuration(router: &Router, rule_id: &str, mode: &str) -> (u
 }
 
 async fn create_org_configuration(router: &Router, body: Value) -> (u16, Value) {
+    as_delegated_admin(router, REGION).await;
     call(
         router,
         "POST",

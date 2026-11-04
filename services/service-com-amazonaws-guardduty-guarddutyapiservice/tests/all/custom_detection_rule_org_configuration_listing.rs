@@ -35,13 +35,18 @@
 //!    outside `range 1..100` and a `status` outside
 //!    `DetectionRuleConfigurationStatus` are refused with HTTP 400 by the modelled
 //!    constraint, and no refusal changes the list.
+//!
+//! Every org-configuration request below is made by the organization's delegated
+//! administrator, which the operation is available only to
+//! (`crate::detector_lifecycle::as_delegated_admin`); the refusal of a caller without
+//! that standing is the subject of the `org_configuration_authorization` suite.
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::ORG_CONFIGURATION_TRANSITION_MILLIS;
 
 use crate::client_rejections::page_token_refusal;
-use crate::detector_lifecycle::{call, call_in, error_code, new_router, Router};
+use crate::detector_lifecycle::{as_delegated_admin, call, call_in, error_code, new_router, Router};
 
 /// `ListCustomDetectionRuleOrgConfigurations` is
 /// `GET /custom-detection-rule/org-configuration` and the create that feeds it is
@@ -91,13 +96,17 @@ fn listing_uri(params: &[(&str, String)]) -> String {
 
 /// One listing call through `region`'s endpoint.
 async fn list_in(router: &Router, region: &str, params: &[(&str, String)]) -> (u16, Value) {
+    as_delegated_admin(router, region).await;
     call_in(router, region, "GET", &listing_uri(params), None).await
 }
 
 /// One listing call through the default Region's endpoint.
 async fn list(router: &Router, params: &[(&str, String)]) -> (u16, Value) {
-    call(router, "GET", &listing_uri(params), None).await
+    list_in(router, DEFAULT_REGION, params).await
 }
+
+/// The Region the harness signs for unless a case names another.
+const DEFAULT_REGION: &str = "us-east-1";
 
 /// The `configurations` of one page through `region`, with its `nextToken`, failing the
 /// test if the listing did not succeed.
@@ -124,7 +133,7 @@ async fn page_in(
 
 /// [`page_in`] through the default Region.
 async fn page(router: &Router, params: &[(&str, String)], case: &str) -> (Vec<Value>, Option<String>) {
-    page_in(router, "us-east-1", params, case).await
+    page_in(router, DEFAULT_REGION, params, case).await
 }
 
 /// Every configuration `region`'s endpoint holds, in one page.
@@ -179,6 +188,7 @@ async fn published_rule_ids(router: &Router) -> Vec<String> {
 /// Record one organization configuration through `region`'s endpoint, failing the test
 /// if the create did not succeed.
 async fn create_in(router: &Router, region: &str, body: Value) {
+    as_delegated_admin(router, region).await;
     let (status, created) = call_in(
         router,
         region,
@@ -197,6 +207,7 @@ async fn create_in(router: &Router, region: &str, body: Value) {
 /// `GET /custom-detection-rule/org-configuration/{RuleId}?mode=`
 /// (`smithy_query(operation="GetCustomDetectionRuleOrgConfiguration")`).
 async fn get_in(router: &Router, region: &str, rule_id: &str, mode: &str) -> (u16, Value) {
+    as_delegated_admin(router, region).await;
     call_in(
         router,
         region,

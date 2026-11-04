@@ -36,10 +36,17 @@
 //!    that is not an account id, are refused with HTTP 400 under the service's
 //!    `InvalidInputException` class without echoing the caller's value, and change
 //!    nothing.
+//!
+//! Every org-configuration request below is made by the organization's delegated
+//! administrator, which the operation is available only to
+//! (`crate::detector_lifecycle::as_delegated_admin`); the refusal of a caller without
+//! that standing is the subject of the `org_configuration_authorization` suite.
 
 use serde_json::{json, Value};
 
-use crate::detector_lifecycle::{call, call_in, error_code, error_shape, new_router, Router};
+use crate::detector_lifecycle::{
+    as_delegated_admin, call, call_in, error_code, error_shape, new_router, Router,
+};
 
 /// `ListCustomDetectionRules` is `POST /custom-detection-rule/rule`
 /// (`smithy_query(operation="ListCustomDetectionRules")`).
@@ -104,6 +111,7 @@ async fn published_rule_ids(router: &Router) -> Vec<String> {
 }
 
 pub(crate) async fn create_org_configuration(router: &Router, body: Value) -> (u16, Value) {
+    as_delegated_admin(router, HOME_REGION).await;
     call(router, "POST", ORG_CONFIGURATION_PATH, Some(body)).await
 }
 
@@ -112,6 +120,7 @@ pub(crate) async fn get_org_configuration(
     rule_id: &str,
     mode: &str,
 ) -> (u16, Value) {
+    as_delegated_admin(router, HOME_REGION).await;
     call_in(
         router,
         HOME_REGION,
@@ -136,6 +145,7 @@ async fn update_org_configuration_in(
     rule_id: &str,
     body: Value,
 ) -> (u16, Value) {
+    as_delegated_admin(router, region).await;
     call_in(
         router,
         region,

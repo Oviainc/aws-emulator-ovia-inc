@@ -3,7 +3,9 @@
 //! @op CreateCustomDetectionRuleOrgConfiguration
 //! IMPLEMENTED: records the organization-level configuration of a PUBLISHED custom
 //! detection rule for `(RuleId, Mode)`, which `GetCustomDetectionRuleOrgConfiguration`
-//! then reports. A `RuleId` the catalogue does not publish is refused with the modelled
+//! then reports. The operation is the delegated administrator's, so a caller without
+//! that standing is refused before anything is resolved. A `RuleId` the catalogue does
+//! not publish is refused with the modelled
 //! `ResourceNotFoundException`, a second create for a pair already configured with the
 //! modelled `ConflictException`, and an account list that is not an account id — or
 //! both `IncludeAccountIds` and `ExcludeAccountIds`, which are mutually exclusive —
@@ -157,6 +159,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = crate::state::request_region(ctx);
+
+        // "This operation is available only to the delegated administrator account"
+        // (`smithy_query(query="doc",shape="CreateCustomDetectionRuleOrgConfiguration")`):
+        // the organization's configuration of a published rule is the delegated
+        // administrator's to make, so a caller without that standing
+        // ([`crate::scaffolded::caller_is_delegated_administrator`]) is refused here
+        // — before the request is examined and before any rule or configuration is
+        // resolved, so the answer says nothing about what the organization holds.
+        let authorized = {
+            let state = state.lock();
+            crate::scaffolded::caller_is_delegated_administrator(&state, &region)
+        };
+        if !authorized {
+            return Err(crate::scaffolded::Scaffolded::not_authorized());
+        }
 
         // "Mutually exclusive with ExcludeAccountIds"
         // (`smithy_query(query="doc",shape="DetectionRuleOrgConfiguration",member="IncludeAccountIds")`):

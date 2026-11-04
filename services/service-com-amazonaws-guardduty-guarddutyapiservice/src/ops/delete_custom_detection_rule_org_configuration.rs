@@ -8,6 +8,8 @@
 //! The delete selects by that pair and removes nothing else: the rule's
 //! configuration in the OTHER `AssociationMode`, another rule's configuration,
 //! another Region's, and the rule's own ASSOCIATIONS all stay exactly as they were.
+//! The organization's configuration is the delegated administrator's, so a caller
+//! without that standing is refused before anything is resolved.
 //! A pair this Region's endpoint holds no configuration for is refused with the
 //! modelled HTTP 404 `ResourceNotFoundException` and removes nothing — which is also
 //! what a replayed delete answers once the first one has taken effect.
@@ -160,6 +162,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
 
         let mut state = state.lock();
+
+        // The organization-level configuration of a custom detection rule is the
+        // delegated administrator's — the resource's own create is "available only
+        // to the delegated administrator account"
+        // (`smithy_query(query="doc",shape="CreateCustomDetectionRuleOrgConfiguration")`)
+        // — so a caller without that standing
+        // ([`crate::scaffolded::caller_is_delegated_administrator`]) is refused
+        // here, before the pair selects anything: an unauthorized removal is never
+        // reported as a missing resource, and it removes nothing.
+        if !crate::scaffolded::caller_is_delegated_administrator(&state, &region) {
+            return Err(crate::scaffolded::Scaffolded::not_authorized());
+        }
 
         // The configuration is selected by `(RuleId, Mode)` — `RuleId` is the URI
         // label and `Mode` the query parameter `mode`, exactly the binding the read

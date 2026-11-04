@@ -23,8 +23,9 @@
 //! 3. An `(AssociationId, RuleId)` pair this account holds no association for — an id
 //!    never minted, a real id under another published rule, an association held only by
 //!    another Region's endpoint, a rule the catalogue does not publish, and a replayed
-//!    delete — is refused with the modelled 404 `ResourceNotFoundException`, never a
-//!    hollow success, and the refusal removes nothing.
+//!    delete — is the state this `@idempotent` delete asks for
+//!    (`smithy_query(operation="DeleteCustomDetectionRuleAssociation")`), so it answers
+//!    HTTP 200 with the empty response and removes nothing.
 //! 4. A label outside the length or pattern its member carries
 //!    (`smithy_query(operation="DeleteCustomDetectionRuleAssociation")`) is refused at
 //!    the request boundary with HTTP 400 — never a 501, never a hollow success — and
@@ -36,7 +37,7 @@
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{
-    call_in, error_code, error_shape, new_router, published_rule_ids, Router,
+    as_delegated_admin, call_in, error_code, error_shape, new_router, published_rule_ids, Router,
 };
 
 /// `CreateCustomDetectionRuleAssociation` and `ListCustomDetectionRuleAssociations`
@@ -244,8 +245,8 @@ fn assert_modelled_error(case: &str, status: u16, body: &Value, expected: &str, 
     );
 }
 
-/// Assert the association resolves to nothing: the read, a replayed delete and the
-/// list all say it is gone.
+/// Assert the association resolves to nothing: the read says it is gone, a replayed
+/// delete succeeds without removing anything more, and the list no longer reports it.
 async fn assert_gone(router: &Router, rule_id: &str, association_id: &str, case: &str) {
     let (status, body) = get_association_in(router, HOME_REGION, rule_id, association_id).await;
     assert_modelled_error(
@@ -256,13 +257,7 @@ async fn assert_gone(router: &Router, rule_id: &str, association_id: &str, case:
         404,
     );
     let (status, body) = delete_association(router, rule_id, association_id).await;
-    assert_modelled_error(
-        &format!("{case}: the replayed delete"),
-        status,
-        &body,
-        NOT_FOUND,
-        404,
-    );
+    assert_empty_success(&format!("{case}: the replayed delete"), status, &body);
     let listed = listed_ids(router, HOME_REGION, case).await;
     assert!(
         !listed.contains(&association_id.to_string()),
@@ -286,8 +281,9 @@ struct Removal {
 }
 
 /// A delete removes the association the two URI labels identify: the read afterwards
-/// is the modelled 404, the list no longer reports it, a replayed delete is the 404
-/// too, and the freed `(RuleId, Mode)` pair can be associated again — over rows
+/// is the modelled 404, the list no longer reports it, a replayed delete succeeds
+/// without removing anything more, and the freed `(RuleId, Mode)` pair can be
+/// associated again — over rows
 /// differing in the published rule, in the mode, in whether the association carried
 /// tags, and in how many tags it carried.
 #[tokio::test]
@@ -392,7 +388,9 @@ async fn a_delete_removes_only_the_association_it_names() {
             let elsewhere =
                 associate_in(&router, OTHER_REGION, target_rule, target_mode, None).await;
             // And the account's ORGANIZATION configuration for the same pair, which is
-            // a different resource in a store of its own.
+            // a different resource in a store of its own — made as the organization's
+            // delegated administrator, the standing that operation is available to.
+            as_delegated_admin(&router, HOME_REGION).await;
             let (status, body) = call_in(
                 &router,
                 HOME_REGION,
@@ -490,20 +488,22 @@ async fn a_delete_removes_only_the_association_it_names() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 3: a pair with no association behind it is the modelled 404.
+// Rule 3: a pair with no association behind it is the empty success.
 // ---------------------------------------------------------------------------
 
 /// There is nothing to disable for an `(AssociationId, RuleId)` pair the account
-/// holds no association for: the answer is the modelled 404 and nothing is removed,
-/// over rows differing in WHY the pair resolves to nothing.
+/// holds no association for — which is the state this `@idempotent` delete asks for
+/// (`smithy_query(operation="DeleteCustomDetectionRuleAssociation")`), so the answer
+/// is HTTP 200 with the empty response and nothing is removed, over rows differing in
+/// WHY the pair resolves to nothing.
 #[tokio::test]
-async fn deleting_a_pair_with_no_association_is_the_modelled_404() {
+async fn deleting_a_pair_with_no_association_is_the_empty_success() {
     let router = new_router();
     let catalogue = published_rule_ids(&router).await;
     let rule_id = catalogue[0].clone();
     let other_rule = catalogue[1].clone();
 
-    // One association this Region's endpoint holds, so every refusal below can be
+    // One association this Region's endpoint holds, so every delete below can be
     // shown to have left it alone.
     let association_id = associate(&router, &rule_id, MODES[0], Some(json!({"tags": {"k": "v"}}))).await;
     let before = read_association(&router, &rule_id, &association_id, "the baseline").await;
@@ -552,15 +552,15 @@ async fn deleting_a_pair_with_no_association_is_the_modelled_404() {
         ),
     ] {
         let (status, body) = delete_association(&router, path_rule_id, path_association_id).await;
-        assert_modelled_error(case, status, &body, NOT_FOUND, 404);
+        assert_empty_success(case, status, &body);
     }
 
     // Nothing above removed anything: this Region's association and the other
     // Region's are both still readable.
-    let after = read_association(&router, &rule_id, &association_id, "after the refusals").await;
+    let after = read_association(&router, &rule_id, &association_id, "after the empty deletes").await;
     assert_eq!(
         after, before,
-        "a refused delete must change nothing, got {after:?}"
+        "a delete of a pair that resolves to nothing must change nothing, got {after:?}"
     );
     let (status, body) = get_association_in(&router, OTHER_REGION, &other_rule, &elsewhere).await;
     assert_eq!(
@@ -569,8 +569,8 @@ async fn deleting_a_pair_with_no_association_is_the_modelled_404() {
     );
 
     // And the well-formed delete against the association that IS there succeeds, so
-    // the refusals above are about the pair and nothing else — after which a replay
-    // of that same delete is the 404 too.
+    // the empty answers above removed nothing — after which a replay of that same
+    // delete is the empty success too.
     let (status, body) = delete_association(&router, &rule_id, &association_id).await;
     assert_empty_success("the association this Region holds", status, &body);
     assert_gone(

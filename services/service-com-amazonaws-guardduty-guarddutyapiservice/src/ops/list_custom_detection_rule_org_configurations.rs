@@ -9,7 +9,9 @@
 //! and no number of lists or pages changes what a later caller sees. Paginated over
 //! that same total order with the shared `crate::state::paginate_window`, so a
 //! `nextToken` this service never issued is refused under the service's 400 class
-//! rather than answered with a silent empty page.
+//! rather than answered with a silent empty page. The organization's configurations
+//! are the delegated administrator's, so a caller without that standing is refused
+//! rather than handed the listing.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -163,6 +165,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // immutably. `now` is the WALL clock rather than the mutation clock, which
         // a report must not advance.
         let state = state.lock();
+
+        // The organization-level configurations of the custom detection rules are
+        // the delegated administrator's — the resource's own create is "available
+        // only to the delegated administrator account"
+        // (`smithy_query(query="doc",shape="CreateCustomDetectionRuleOrgConfiguration")`)
+        // — so a caller without that standing
+        // ([`crate::scaffolded::caller_is_delegated_administrator`]) is refused
+        // instead of being handed the organization's configuration data, which a
+        // success would disclose whatever the page held.
+        if !crate::scaffolded::caller_is_delegated_administrator(&state, &region) {
+            return Err(crate::scaffolded::Scaffolded::not_authorized());
+        }
+
         let now = crate::state::now_millis();
 
         // "You can filter the results by status"

@@ -6,9 +6,9 @@
 //! (`smithy_query(query="doc",shape="DeleteCustomDetectionRuleAssociation")`) — so a
 //! later `GetCustomDetectionRuleAssociation` answers the modelled
 //! `ResourceNotFoundException`, the list no longer reports it and the `(RuleId, Mode)`
-//! pair it held is free to associate again. An `(AssociationId, RuleId)` pair this
-//! account holds no association for is refused with that same modelled 404, the class
-//! the read and the update bound at this URI answer for the same absence.
+//! pair it held is free to associate again. The delete is `@idempotent`, so an
+//! `(AssociationId, RuleId)` pair this account holds no association for is already in
+//! the state the request asks for: it answers the empty success and removes nothing.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -162,17 +162,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .detection_rule_association_by_id(&region, &input.rule_id, &input.association_id)
             .is_none()
         {
-            // The pair resolves to nothing, so there is nothing to disable: the
-            // modelled 404, the same class and message a read of that pair answers,
-            // so "never associated", "associated through another Region's endpoint"
-            // and "already deleted" are one refusal and no caller can tell them
-            // apart. This is what `@idempotent` on this DELETE
-            // (`smithy_query(operation="DeleteCustomDetectionRuleAssociation")`)
-            // means observably — a replay removes nothing more and leaves the same
-            // store — and never a hollow success for a resource the account does not
-            // hold, which the modelled `ResourceNotFoundException` is there to
-            // report.
-            return Err(not_found(&input.association_id));
+            // The pair resolves to nothing, which is the very state this delete
+            // asks for: it is `@idempotent`
+            // (`smithy_query(operation="DeleteCustomDetectionRuleAssociation")`), so
+            // the request's post-condition already holds and there is nothing left
+            // to do — the empty success, removing nothing. "Never associated",
+            // "already deleted", "associated through another Region's endpoint" and
+            // "a rule the catalogue does not publish" are one answer, so a teardown
+            // or a reconciliation that deletes an association twice is not turned
+            // into a failure by the second call.
+            return Ok(DeleteCustomDetectionRuleAssociationOutput {});
         }
 
         // Dropping the one entry the rule's key names is the whole delete: an
@@ -184,19 +183,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // published rule itself is GuardDuty's catalogue entry rather than this
         // account's, so it stands too.
         //
-        // The `else` is DEFENSIVE and not a refusal path a caller can reach: the
-        // lookup above already resolved this very entry.
-        if state
+        // The assertion is DEFENSIVE and not a path a caller can reach: the lookup
+        // above already resolved this very entry, so the removal takes exactly one
+        // record out and the store is left as the request asked whatever it answers.
+        let removed = state
             .custom_detection_rule_associations
-            .remove(&(region, input.rule_id))
-            .is_none()
-        {
-            debug_assert!(
-                false,
-                "an association resolved by id must be held under its own (region, rule) key"
-            );
-            return Err(not_found(&input.association_id));
-        }
+            .remove(&(region, input.rule_id));
+        debug_assert!(
+            removed.is_some(),
+            "an association resolved by id must be held under its own (region, rule) key"
+        );
 
         // `DeleteCustomDetectionRuleAssociationResponse` declares no members
         // (`smithy_query(operation="DeleteCustomDetectionRuleAssociation")`): the
@@ -206,27 +202,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The error CLASS a delete of an association this account does not hold is named by
-/// on the wire — the modelled 404
-/// (`smithy_query(operation="DeleteCustomDetectionRuleAssociation")`), so it is
-/// answered as the modelled shape rather than under the `BadRequestException`
-/// envelope this service's 400s use.
-const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
-
-/// Refuse an `(AssociationId, RuleId)` pair this account holds no association for
-/// with the modelled 404, carrying the message a read of the same absence answers
-/// with: the two name the same missing resource, so they cannot describe it
-/// differently.
-fn not_found(association_id: &str) -> DeleteCustomDetectionRuleAssociationError {
-    DeleteCustomDetectionRuleAssociationErrorModeled::ResourceNotFoundException(
-        ResourceNotFoundException {
-            message: Some(crate::state::detection_rule_association_not_found_message(
-                association_id,
-            )),
-            // "The error type" (`smithy_query(shape="ResourceNotFoundException")`):
-            // the class, the same value the body's `__type` carries.
-            r#type: Some(RESOURCE_NOT_FOUND_EXCEPTION.to_string()),
-        },
-    )
-    .into()
-}
+// The modelled `ResourceNotFoundException` this operation declares has no reachable
+// case: an association the endpoint does not hold is the state this `@idempotent`
+// delete asks for, so the absence is answered with the empty success above rather
+// than with a refusal. The `ResourceNotFoundException` a caller sees for the same
+// absence comes from the read and the update bound at this same URI.

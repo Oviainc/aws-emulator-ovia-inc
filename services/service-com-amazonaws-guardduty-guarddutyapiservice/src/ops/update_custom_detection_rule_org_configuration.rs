@@ -6,7 +6,9 @@
 //! `GetCustomDetectionRuleOrgConfiguration` then reports. The configuration is
 //! identified by `RuleId` alone — the URI label — and `Mode` is one of the values
 //! the update SETS, so a configuration held in the other mode MOVES to the mode the
-//! request names. A rule the account holds no organization configuration for is
+//! request names. The organization's configuration is the delegated administrator's,
+//! so a caller without that standing is refused before anything is resolved. A rule
+//! the account holds no organization configuration for is
 //! refused with the modelled `ResourceNotFoundException`, and an account list that is
 //! not an account id — or both `IncludeAccountIds` and `ExcludeAccountIds`, which are
 //! mutually exclusive — with the `BadRequestException` envelope. This is the ONLY file
@@ -162,6 +164,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = crate::state::request_region(ctx);
+
+        // The organization-level configuration of a custom detection rule is the
+        // delegated administrator's — the resource's own create is "available only
+        // to the delegated administrator account"
+        // (`smithy_query(query="doc",shape="CreateCustomDetectionRuleOrgConfiguration")`)
+        // — so a caller without that standing
+        // ([`crate::scaffolded::caller_is_delegated_administrator`]) is refused
+        // here, before the request is examined and before any configuration is
+        // resolved: an unauthorized change is never reported as a missing resource.
+        let authorized = {
+            let state = state.lock();
+            crate::scaffolded::caller_is_delegated_administrator(&state, &region)
+        };
+        if !authorized {
+            return Err(crate::scaffolded::Scaffolded::not_authorized());
+        }
 
         // The two account lists describe ONE scope — "mutually exclusive"
         // (`smithy_query(query="doc",shape="DetectionRuleOrgConfiguration",member="IncludeAccountIds")`)

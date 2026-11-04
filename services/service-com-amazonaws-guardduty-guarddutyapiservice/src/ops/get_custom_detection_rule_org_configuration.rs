@@ -4,7 +4,9 @@
 //! IMPLEMENTED: reports the organization configuration
 //! `CreateCustomDetectionRuleOrgConfiguration` recorded for `(RuleId, Mode)`. A pure
 //! report: the `Status` is DERIVED from the instant the create stored, so nothing is
-//! written. A pair this account has no configuration for — a rule the catalogue does not
+//! written. The organization's configuration is the delegated administrator's, so a
+//! caller without that standing is refused before the pair is looked up. A pair this
+//! account has no configuration for — a rule the catalogue does not
 //! publish, or a published one nothing configured — is refused with the modelled
 //! `ResourceNotFoundException`, never a fabricated `Configuration`.
 //! This is the ONLY file to touch for this operation.
@@ -159,6 +161,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // chose. `now` is the wall clock rather than the mutation clock, which a
         // report must not advance.
         let state = state.lock();
+
+        // The organization-level configuration of a custom detection rule is the
+        // delegated administrator's — the resource's own create is "available only
+        // to the delegated administrator account"
+        // (`smithy_query(query="doc",shape="CreateCustomDetectionRuleOrgConfiguration")`)
+        // — so a caller without that standing
+        // ([`crate::scaffolded::caller_is_delegated_administrator`]) is refused
+        // ahead of the lookup below, and cannot learn from the answer whether the
+        // pair is configured at all.
+        if !crate::scaffolded::caller_is_delegated_administrator(&state, &region) {
+            return Err(crate::scaffolded::Scaffolded::not_authorized());
+        }
+
         let now = crate::state::now_millis();
         let Some(record) =
             state.detection_rule_org_configuration(&region, &input.rule_id, &input.mode)

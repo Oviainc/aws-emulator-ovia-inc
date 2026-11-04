@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 
 use crate::client_rejections::{account_ids_format, ACCOUNT_ID_FORMAT};
 use crate::detector_lifecycle::{
-    call, enabled_detector, error_code, error_shape, new_router, Router,
+    as_delegated_admin, call, enabled_detector, error_code, error_shape, new_router, Router,
 };
 // The malformed, non-member and member tables the member suites share, so no suite
 // can drift from another on what a malformed account id is.
@@ -88,6 +88,11 @@ const ORG_CONFIGURATION_PATH: &str = "/custom-detection-rule/org-configuration";
 /// One `AssociationMode` member, which both organization-configuration operations
 /// require (`smithy_query(shape="AssociationMode")`).
 const MODE: &str = "LIVE";
+
+/// The Region the harness signs every request below for, and so the Region the
+/// organization-configuration operations judge the delegated-administrator standing
+/// they require against.
+const HOME_REGION: &str = "us-east-1";
 
 /// One `UsageStatisticType` member, which `GetUsageStatistics` requires
 /// (`smithy_query(shape="UsageStatisticType")`); the usage suite asserts the rule
@@ -251,6 +256,10 @@ async fn send(
             .await
         }
         "CreateCustomDetectionRuleOrgConfiguration" => {
+            // The operation is available only to the organization's delegated
+            // administrator, so the standing is established first: the account-id
+            // rule is what is under test here, not the authorization gate.
+            as_delegated_admin(router, HOME_REGION).await;
             call(
                 router,
                 "POST",
@@ -260,6 +269,7 @@ async fn send(
             .await
         }
         "UpdateCustomDetectionRuleOrgConfiguration" => {
+            as_delegated_admin(router, HOME_REGION).await;
             call(
                 router,
                 "PUT",
@@ -392,6 +402,7 @@ async fn malformed_account_id_refuses_every_operation_that_takes_one() {
 
     // Neither refused organization-configuration call left a configuration behind:
     // the read still answers the modelled 404.
+    as_delegated_admin(&router, HOME_REGION).await;
     let (status, body) = call(
         &router,
         "GET",
@@ -432,6 +443,7 @@ async fn well_formed_account_ids_are_not_refused_by_any_of_them() {
             if operation == "UpdateCustomDetectionRuleOrgConfiguration" {
                 // The update addresses a configuration that exists; the account-id
                 // rule is what is under test here, not the modelled 404.
+                as_delegated_admin(&router, HOME_REGION).await;
                 let (status, body) = call(
                     &router,
                     "POST",

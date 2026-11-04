@@ -252,6 +252,27 @@ pub const INVALID_INPUT_EXCEPTION: &str = "InvalidInputException";
 /// unmarshal the response into, and the client needs the class to switch on.
 pub const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
 
+/// The modeled error SHAPE an authorization refusal is enveloped in: the client
+/// error every operation restricted to a standing declares beside
+/// [`BAD_REQUEST_EXCEPTION`] (`smithy_query(operation="CreateCustomDetectionRuleOrgConfiguration")`).
+///
+/// restJson1 resolves the error shape from `x-amzn-errortype`, so this is the name
+/// that header carries for a caller the operation is not available to, while the
+/// body's `__type` and `type` carry the [`INVALID_INPUT_EXCEPTION`] class — the
+/// same split [`Scaffolded::invalid_input`] makes between the shape an SDK
+/// unmarshals into and the class a client switches on.
+pub const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
+
+/// The message a caller that does not hold the standing an operation requires is
+/// refused with.
+///
+/// Entirely FIXED text: it names neither the operation, nor the account, nor the
+/// standing that is missing, because the one fact it reports is that the caller may
+/// not make this call at all — telling it anything more about the organization
+/// would answer a question it is not authorized to ask.
+pub const NOT_AUTHORIZED_MESSAGE: &str =
+    "The request is rejected because the caller is not authorized to call this API.";
+
 /// The error CLASS GuardDuty names a request it refuses because work it collides
 /// with is already running.
 ///
@@ -522,6 +543,28 @@ impl<E> Scaffolded<E> {
         ))
     }
 
+    /// Refuse the request because the caller does not hold the standing the
+    /// operation requires: HTTP 400 under the [`INVALID_INPUT_EXCEPTION`] class in
+    /// both the body's `__type` and its `type` member, enveloped in the
+    /// [`ACCESS_DENIED_EXCEPTION`] shape the `x-amzn-errortype` header carries.
+    ///
+    /// Answer it BEFORE resolving anything the request names, so a caller that may
+    /// not make the call learns nothing about which resources exist — and never
+    /// INSTEAD of a resource error, which is a different claim about a request that
+    /// was allowed to be made.
+    pub fn not_authorized() -> Self {
+        Self::Classified(ClassifiedError::new(
+            INVALID_INPUT_EXCEPTION,
+            ACCESS_DENIED_EXCEPTION,
+            // The status the recorded refusals carry: the request is refused as one
+            // the caller may not make, under the class this service's 400s use,
+            // while `x-amzn-errortype` names the modelled shape an SDK unmarshals
+            // the response into.
+            400,
+            NOT_AUTHORIZED_MESSAGE,
+        ))
+    }
+
     /// Refuse the request as GuardDuty refuses a change to a resource whose own
     /// delete is already running: the status of a request the service will not
     /// perform (400), under the [`INTERNAL_SERVER_ERROR_EXCEPTION`] class.
@@ -641,4 +684,34 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => None,
         }
     }
+}
+
+/// Is the account this emulator serves the GuardDuty delegated administrator of the
+/// organization `region`'s endpoint serves?
+///
+/// An operation "available only to the delegated administrator account"
+/// (`smithy_query(query="doc",shape="CreateCustomDetectionRuleOrgConfiguration")`)
+/// is open to a caller holding that standing and to no other, so it asks this
+/// FIRST and answers [`Scaffolded::not_authorized`] when it is `false`. The
+/// standing lives beside the refusal it decides, so the operations restricted to it
+/// cannot judge it differently from one another.
+///
+/// What makes it true: the designation `EnableOrganizationAdminAccount` recorded for
+/// this Region names the account every request this emulator answers is signed for
+/// ([`crate::state::administrator_account_id`]) — the Region's endpoint holds at
+/// most one designation, so a designation of any other account leaves the caller
+/// without the standing. A designation whose removal the clock has already made due
+/// no longer holds it: that removal was owed at its own instant whether or not
+/// anybody called, so this READS it as gone rather than writing the record away,
+/// which is not a reporting operation's to do.
+pub fn caller_is_delegated_administrator(
+    state: &crate::state::ComAmazonawsGuarddutyGuarddutyapiserviceState,
+    region: &str,
+) -> bool {
+    state
+        .organization_admin_account_in(region)
+        .is_some_and(|record| {
+            record.admin_account_id == crate::state::administrator_account_id()
+                && !record.disable_settled(crate::state::now_millis())
+        })
 }
