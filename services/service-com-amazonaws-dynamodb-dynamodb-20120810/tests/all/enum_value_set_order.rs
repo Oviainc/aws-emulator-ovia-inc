@@ -1,0 +1,360 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! What a constraint clause states when a value falls outside an enumerated member's
+//! admissible set — and that a refused request changed nothing.
+//!
+//! The rule pinned here: a refusal of a value outside an enumerated member's set states
+//! that set in the order THIS SERVICE states it in, which is a property of the enum and
+//! not of the model's declaration order, with the rest of the clause unchanged — the
+//! `<N> validation error(s) detected:` envelope, the member's lowerCamel path and the
+//! rejected value echoed from the request.
+//!
+//! Each suite is a TABLE spanning what the rule generalises over rather than one recorded
+//! request: which enumerated member is broken (and so which set is stated), which
+//! operation carries it, how deep in the request the member sits (top level, a member of a
+//! nested structure, a member of a structure inside a list), and the FORM of the rejected
+//! value (a misspelling, the right value in the wrong case, an empty string, a value
+//! belonging to another enum). Everything is driven over the wire, so nothing is asserted
+//! that a client could not observe.
+
+use serde_json::{json, Value};
+
+use crate::emulator::{
+    call, call_streams, describe_when_active, emulator_with_streams, error_code, message, ok,
+};
+
+/// The order DynamoDB states `StreamSpecification$StreamViewType`'s admissible set in.
+///
+/// It is the SERVICE's order, not the model's: the model declares the same four values as
+/// `NEW_IMAGE OLD_IMAGE NEW_AND_OLD_IMAGES KEYS_ONLY`
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#StreamViewType")`), while
+/// the service's refusals state them in this one.
+const STREAM_VIEW_TYPE_SET: &[&str] =
+    &["OLD_IMAGE", "KEYS_ONLY", "NEW_AND_OLD_IMAGES", "NEW_IMAGE"];
+
+/// Every value the stream view type accepts, in the model's declaration order
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#StreamViewType")`) — the
+/// values a corrected request may name, each of which must enable a stream capturing it.
+const VIEW_TYPES: &[&str] = &["NEW_IMAGE", "OLD_IMAGE", "NEW_AND_OLD_IMAGES", "KEYS_ONLY"];
+
+/// The whole message a refusal of ONE value outside ONE enumerated member's set carries.
+fn expected_clause(value: &str, path: &str, set: &[&str]) -> String {
+    format!(
+        "1 validation error detected: Value '{value}' at '{path}' failed to satisfy constraint: \
+         Member must satisfy enum value set: [{}]",
+        set.join(", ")
+    )
+}
+
+/// A `CreateTable` body for a table keyed on `Pk` alone, with `extra` merged in.
+fn create_body(name: &str, extra: Value) -> Value {
+    let mut body = json!({
+        "TableName": name,
+        "KeySchema": [{"AttributeName": "Pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "Pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+    });
+    if let Some(members) = extra.as_object() {
+        for (name, value) in members {
+            body[name] = value.clone();
+        }
+    }
+    body
+}
+
+/// One row of the refusal table.
+struct Row {
+    case: &'static str,
+    operation: &'static str,
+    request: fn() -> Value,
+    /// The rejected value, as the clause must echo it.
+    value: &'static str,
+    /// The member path the clause must name.
+    path: &'static str,
+    /// The admissible set the clause must state, in the order it must state it.
+    set: &'static [&'static str],
+}
+
+/// The sets stated for the members below, each named where it comes from.
+/// `ReturnConsumedCapacity` (`INDEXES TOTAL NONE`), `Select` (`ALL_ATTRIBUTES
+/// ALL_PROJECTED_ATTRIBUTES SPECIFIC_ATTRIBUTES COUNT`), `ProjectionType` (`ALL KEYS_ONLY
+/// INCLUDE`) and `TableClass` (`STANDARD STANDARD_INFREQUENT_ACCESS`) are stated in their
+/// model-declared order (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#…")`);
+/// `StreamViewType` is stated in [`STREAM_VIEW_TYPE_SET`].
+const CONSUMED_CAPACITY_SET: &[&str] = &["INDEXES", "TOTAL", "NONE"];
+const SELECT_SET: &[&str] = &[
+    "ALL_ATTRIBUTES",
+    "ALL_PROJECTED_ATTRIBUTES",
+    "SPECIFIC_ATTRIBUTES",
+    "COUNT",
+];
+const PROJECTION_TYPE_SET: &[&str] = &["ALL", "KEYS_ONLY", "INCLUDE"];
+const TABLE_CLASS_SET: &[&str] = &["STANDARD", "STANDARD_INFREQUENT_ACCESS"];
+
+/// The table of refusals. The `Music` table exists and is active before any row runs, so
+/// no row is answered by a missing table instead of by the constraint.
+const ROWS: &[Row] = &[
+    Row {
+        case: "a misspelled stream view type, on an update",
+        operation: "UpdateTable",
+        request: || {
+            json!({
+                "TableName": "Music",
+                "StreamSpecification": {"StreamEnabled": true,
+                                        "StreamViewType": "NEW_AND_OLD_IMAGE"},
+            })
+        },
+        value: "NEW_AND_OLD_IMAGE",
+        path: "streamSpecification.streamViewType",
+        set: STREAM_VIEW_TYPE_SET,
+    },
+    Row {
+        case: "a declared stream view type in the wrong case",
+        operation: "UpdateTable",
+        request: || {
+            json!({
+                "TableName": "Music",
+                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "keys_only"},
+            })
+        },
+        value: "keys_only",
+        path: "streamSpecification.streamViewType",
+        set: STREAM_VIEW_TYPE_SET,
+    },
+    Row {
+        case: "an empty stream view type",
+        operation: "UpdateTable",
+        request: || {
+            json!({
+                "TableName": "Music",
+                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": ""},
+            })
+        },
+        value: "",
+        path: "streamSpecification.streamViewType",
+        set: STREAM_VIEW_TYPE_SET,
+    },
+    Row {
+        case: "a stream view type taken from another enum",
+        operation: "UpdateTable",
+        request: || {
+            json!({
+                "TableName": "Music",
+                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "TOTAL"},
+            })
+        },
+        value: "TOTAL",
+        path: "streamSpecification.streamViewType",
+        set: STREAM_VIEW_TYPE_SET,
+    },
+    Row {
+        case: "the same member on a create, where the stream is turned off anyway",
+        operation: "CreateTable",
+        request: || {
+            create_body(
+                "another",
+                json!({"StreamSpecification": {"StreamEnabled": false,
+                                               "StreamViewType": "NEW_IMAGES"}}),
+            )
+        },
+        value: "NEW_IMAGES",
+        path: "streamSpecification.streamViewType",
+        set: STREAM_VIEW_TYPE_SET,
+    },
+    Row {
+        case: "a top-level enumerated member on a read",
+        operation: "GetItem",
+        request: || {
+            json!({"TableName": "Music", "Key": {"Pk": {"S": "a"}},
+                   "ReturnConsumedCapacity": "EVERYTHING"})
+        },
+        value: "EVERYTHING",
+        path: "returnConsumedCapacity",
+        set: CONSUMED_CAPACITY_SET,
+    },
+    Row {
+        case: "another top-level enumerated member, on a query",
+        operation: "Query",
+        request: || {
+            json!({"TableName": "Music", "Select": "ALL",
+                   "KeyConditionExpression": "Pk = :p",
+                   "ExpressionAttributeValues": {":p": {"S": "a"}}})
+        },
+        value: "ALL",
+        path: "select",
+        set: SELECT_SET,
+    },
+    Row {
+        case: "an enumerated member of a table class",
+        operation: "UpdateTable",
+        request: || json!({"TableName": "Music", "TableClass": "STANDARD_IA"}),
+        value: "STANDARD_IA",
+        path: "tableClass",
+        set: TABLE_CLASS_SET,
+    },
+    Row {
+        case: "an enumerated member inside a structure inside a list",
+        operation: "CreateTable",
+        request: || {
+            create_body(
+                "indexed",
+                json!({
+                    "GlobalSecondaryIndexes": [{
+                        "IndexName": "by-payload",
+                        "KeySchema": [{"AttributeName": "Pk", "KeyType": "HASH"}],
+                        "Projection": {"ProjectionType": "EVERY_ATTRIBUTE"},
+                    }],
+                }),
+            )
+        },
+        value: "EVERY_ATTRIBUTE",
+        path: "globalSecondaryIndexes.1.member.projection.projectionType",
+        set: PROJECTION_TYPE_SET,
+    },
+];
+
+#[tokio::test]
+async fn an_enum_refusal_states_the_admissible_set_in_the_order_the_service_states_it() {
+    let router = emulator_with_streams();
+    ok(&router, "CreateTable", create_body("Music", json!({}))).await;
+    describe_when_active(&router, "the subject table", "Music").await;
+
+    for row in ROWS {
+        let case = row.case;
+        let (status, refused) = call(&router, row.operation, (row.request)()).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?} ({}): expected HTTP 400, got {status} with {refused}",
+            row.operation
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ValidationException",
+            "case {case:?} ({}): expected ValidationException, got {refused}",
+            row.operation
+        );
+        let expected = expected_clause(row.value, row.path, row.set);
+        let stated = message(&refused);
+        assert_eq!(
+            stated, expected,
+            "case {case:?} ({}): expected the message {expected:?}, got {stated:?}",
+            row.operation
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refused_stream_specification_enables_nothing_and_the_corrected_one_enables_one() {
+    // One row per view type the model declares: each is first asked for by a misspelling
+    // of itself, which must be refused and must enable nothing, and then by the value
+    // itself, which must enable exactly one stream capturing it.
+    for view_type in VIEW_TYPES {
+        let case = format!("asking for {view_type}");
+        let router = emulator_with_streams();
+        ok(&router, "CreateTable", create_body("Music", json!({}))).await;
+        describe_when_active(&router, &case, "Music").await;
+
+        // A misspelling: the published value with its last character dropped, which is
+        // outside the set whatever the value was.
+        let misspelled: String = view_type[..view_type.len() - 1].to_string();
+        let (status, refused) = call(
+            &router,
+            "UpdateTable",
+            json!({
+                "TableName": "Music",
+                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": misspelled},
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a misspelled view type must be refused, got {status} with {refused}"
+        );
+        let expected = expected_clause(&misspelled, "streamSpecification.streamViewType",
+                                       STREAM_VIEW_TYPE_SET);
+        let stated = message(&refused);
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected the message {expected:?}, got {stated:?}"
+        );
+
+        // Nothing was enabled: the table reports no stream at all, and the streams
+        // service reports none for it.
+        let described = ok(&router, "DescribeTable", json!({"TableName": "Music"})).await;
+        assert!(
+            described["Table"].get("StreamSpecification").is_none()
+                && described["Table"].get("LatestStreamArn").is_none(),
+            "case {case:?}: a refused update enables no stream, got {described}"
+        );
+        let listed = streams_of(&router, &case, "Music").await;
+        assert_eq!(
+            listed,
+            Vec::<Value>::new(),
+            "case {case:?}: a refused update leaves the table with no stream, got {listed:?}"
+        );
+
+        // The corrected request enables exactly one stream, capturing what it asked for.
+        ok(
+            &router,
+            "UpdateTable",
+            json!({
+                "TableName": "Music",
+                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": view_type},
+            }),
+        )
+        .await;
+        let described = describe_when_active(&router, &case, "Music").await;
+        assert_eq!(
+            described["StreamSpecification"],
+            json!({"StreamEnabled": true, "StreamViewType": view_type}),
+            "case {case:?}: the table must report the stream it was asked for, got {described}"
+        );
+        let arn = described["LatestStreamArn"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !arn.is_empty(),
+            "case {case:?}: an enabled stream must be reported by ARN, got {described}"
+        );
+
+        let listed = streams_of(&router, &case, "Music").await;
+        assert_eq!(
+            listed.len(),
+            1,
+            "case {case:?}: exactly one stream must exist for the table, got {listed:?}"
+        );
+        assert_eq!(
+            listed[0]["StreamArn"],
+            json!(arn),
+            "case {case:?}: the listed stream must be the one the table reports, got {listed:?}"
+        );
+        let (status, described_stream) =
+            call_streams(&router, "DescribeStream", json!({"StreamArn": arn})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeStream answered {status} with {described_stream}"
+        );
+        assert_eq!(
+            described_stream["StreamDescription"]["StreamViewType"],
+            json!(view_type),
+            "case {case:?}: the stream must capture what the update asked for, got \
+             {described_stream}"
+        );
+    }
+}
+
+/// Every stream the STREAMS service reports for `table`.
+async fn streams_of(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    table: &str,
+) -> Vec<Value> {
+    let (status, listed) =
+        call_streams(router, "ListStreams", json!({"TableName": table})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: ListStreams answered {status} with {listed}"
+    );
+    listed["Streams"].as_array().cloned().unwrap_or_default()
+}

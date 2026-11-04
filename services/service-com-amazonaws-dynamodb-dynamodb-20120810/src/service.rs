@@ -213,6 +213,50 @@ const SERVICE_CHECKED_ENUM_MEMBER: &str = "returnValues";
 const SERVICE_CHECKED_ENUM_SET: [&str; 5] =
     ["ALL_OLD", "UPDATED_OLD", "ALL_NEW", "UPDATE_NEW", "NONE"];
 
+/// The enum value sets this service STATES in an order of its own, each written in the
+/// order it states them.
+///
+/// The bracketed set a constraint clause ends with is the admissible set as the SERVICE
+/// words it, which is a property of the enum and not of the model: the generic renderer
+/// iterates the model's declaration order, and for the enums below the service is
+/// observed to state the same values in a different one. An enum this list does not name
+/// keeps the model's order, because that is the order the service is observed to state it
+/// in (`ReturnConsumedCapacity` as `INDEXES, TOTAL, NONE` and `Select` as
+/// `ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES, SPECIFIC_ATTRIBUTES, COUNT`, both the
+/// declared order — `tests/all/validation_message_wording.rs` pins them).
+///
+/// Nothing about the model distinguishes the two groups — the same values, a different
+/// sentence — so this is the only place the difference is recorded, and an enum later
+/// found to be stated in an order of its own needs its own entry here.
+/// `tests/all/enum_value_set_order.rs` reads both groups back over the operations and
+/// members that carry them, so the difference is visible rather than silent.
+const PUBLISHED_ENUM_ORDERS: &[&[&str]] = &[
+    // `StreamSpecification$StreamViewType`, which the model declares as
+    // `NEW_IMAGE OLD_IMAGE NEW_AND_OLD_IMAGES KEYS_ONLY`
+    // (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#StreamViewType")`).
+    &["OLD_IMAGE", "KEYS_ONLY", "NEW_AND_OLD_IMAGES", "NEW_IMAGE"],
+];
+
+/// The admissible set `allowed` is STATED in: the order this service publishes for that
+/// enum ([`PUBLISHED_ENUM_ORDERS`]) where it publishes one, and otherwise the order the
+/// model declared and the walk reported.
+///
+/// An entry is matched on MEMBERSHIP and size, never on position, so a model that
+/// reordered its own declaration of the same enum would still be stated in the published
+/// order rather than silently falling back.
+fn stated_enum_order(allowed: &[String]) -> Vec<String> {
+    PUBLISHED_ENUM_ORDERS
+        .iter()
+        .find(|published| {
+            published.len() == allowed.len()
+                && published
+                    .iter()
+                    .all(|value| allowed.iter().any(|declared| declared == value))
+        })
+        .map(|published| published.iter().map(|value| (*value).to_string()).collect())
+        .unwrap_or_else(|| allowed.to_vec())
+}
+
 // =============================================================================
 // WHICH FORM A CONSTRAINT CLAUSE TAKES
 //
@@ -362,8 +406,9 @@ impl ErasedOperation for OperationScopedClauseForm {
 ///   echoed, so a caller can read out of the message which value of which member
 ///   was refused. That is exactly the framework's own rendering, so the framework
 ///   renders it (`Violation::message`) rather than this service restating the
-///   sentence. [`SERVICE_CHECKED_ENUM_MEMBER`] is the one member that is not
-///   reported that way, because the service checks it itself;
+///   sentence; the one thing this service decides is the ORDER the admissible set
+///   is stated in ([`stated_enum_order`]). [`SERVICE_CHECKED_ENUM_MEMBER`] is the
+///   one member that is not reported that way, because the service checks it itself;
 /// * an absent member states the `null` it was, which is a fact of the request's
 ///   shape — the framework's rendering again, over the member path spelled as the
 ///   model spells it.
@@ -403,6 +448,16 @@ fn violation_clause(violation: &Violation, form: ClauseForm) -> Option<String> {
                     // the recorded refusals for this service state.
                     ViolationKind::MissingRequiredMember => wire_member_path(&violation.path),
                     _ => violation.path.clone(),
+                },
+                kind: match &violation.kind {
+                    // The admissible set is stated in the order this service states it
+                    // ([`stated_enum_order`]), which the framework cannot know because
+                    // it reads the model. Nothing else about the clause changes: the
+                    // envelope, the path and the echoed value stay the renderer's own.
+                    ViolationKind::EnumValue(allowed) => {
+                        ViolationKind::EnumValue(stated_enum_order(allowed))
+                    }
+                    other => other.clone(),
                 },
                 ..violation.clone()
             }
@@ -585,7 +640,72 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clause_form, ClauseForm, ITEM_REQUEST_FORM_OPERATIONS};
+    use super::{
+        clause_form, stated_enum_order, ClauseForm, ITEM_REQUEST_FORM_OPERATIONS,
+        PUBLISHED_ENUM_ORDERS,
+    };
+
+    /// The admissible sets as the walk hands them over.
+    fn owned(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn a_published_order_is_matched_on_membership_not_position() {
+        for published in PUBLISHED_ENUM_ORDERS {
+            // Whatever order the model declared the same values in — here the
+            // published order reversed, and the published order itself — the set is
+            // stated in the one this service publishes.
+            let mut reversed = owned(published);
+            reversed.reverse();
+            for declared in [owned(published), reversed] {
+                let stated = stated_enum_order(&declared);
+                assert_eq!(
+                    stated,
+                    owned(published),
+                    "case {declared:?}: expected the published order {published:?}, got {stated:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_set_with_no_published_order_keeps_the_order_it_arrived_in() {
+        // `ReturnConsumedCapacity` and `Select`, whose recorded refusals state the
+        // model's own declaration order, plus a subset of a published set (same values,
+        // one missing), which is a different set and not that enum.
+        for declared in [
+            owned(&["INDEXES", "TOTAL", "NONE"]),
+            owned(&[
+                "ALL_ATTRIBUTES",
+                "ALL_PROJECTED_ATTRIBUTES",
+                "SPECIFIC_ATTRIBUTES",
+                "COUNT",
+            ]),
+            owned(&["OLD_IMAGE", "KEYS_ONLY", "NEW_IMAGE"]),
+        ] {
+            let stated = stated_enum_order(&declared);
+            assert_eq!(
+                stated, declared,
+                "case {declared:?}: expected the order it arrived in, got {stated:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_published_order_states_each_value_once() {
+        for published in PUBLISHED_ENUM_ORDERS {
+            let mut sorted = published.to_vec();
+            sorted.sort_unstable();
+            let before = sorted.len();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                before,
+                "case {published:?}: expected each value stated once, got {sorted:?}"
+            );
+        }
+    }
 
     #[test]
     fn item_request_form_operations_are_sorted() {

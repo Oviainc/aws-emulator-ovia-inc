@@ -49,6 +49,8 @@ mod disable_kinesis_streaming_destination;
 mod emulator;
 #[path = "all/enable_kinesis_streaming_destination.rs"]
 mod enable_kinesis_streaming_destination;
+#[path = "all/enum_value_set_order.rs"]
+mod enum_value_set_order;
 #[path = "all/endpoint_discovery.rs"]
 mod endpoint_discovery;
 #[path = "all/expression_rules_and_write_admission.rs"]
