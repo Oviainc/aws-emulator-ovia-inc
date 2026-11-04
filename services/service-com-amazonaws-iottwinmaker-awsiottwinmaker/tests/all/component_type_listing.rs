@@ -22,6 +22,10 @@
 //!   `ValidationException`;
 //! * a single filter object selects exactly the component types it names, and
 //!   more than one is refused;
+//! * the `extendsFrom` filter selects every component type whose inheritance
+//!   chain REACHES the id it names — the same relation `GetComponentType`
+//!   resolves when it reports an inherited declaration — so a grandchild is
+//!   selected by its grandparent's id;
 //! * listing writes nothing beyond the lifecycle transition the CLOCK already
 //!   made due.
 
@@ -581,19 +585,18 @@ async fn only_a_token_this_listing_minted_resumes_it() {
 }
 
 /// RULE: ONE filter object selects exactly the stored component types it names —
-/// `extendsFrom` those whose own declared parents name the id it names,
+/// `extendsFrom` those whose inheritance chain reaches the id it names,
 /// `namespace` those whose id lies in the namespace it names, `isAbstract` those
 /// whose abstractness matches — and more than one object is refused, because
 /// "only one object is accepted as a valid input".
 ///
 /// The rows span every member of the filter union, each on a value the stored
-/// set both matches and misses: a parent with two children, one with two, one
-/// with none, and a GRANDparent (whose grandchild is not selected, since a
-/// component type's stored parents are the ones its create declared); a
-/// namespace at three depths, the namespace the service's own built-ins lie in,
-/// a whole id and one no id lies in; and both booleans, which split the stored
-/// set into the concrete component types a caller created and the abstract
-/// built-ins the workspace was provisioned with.
+/// set both matches and misses: a GRANDparent (whose grandchild IS selected,
+/// extension being transitive), a parent with two direct children, one with
+/// none; a namespace at three depths, the namespace the service's own built-ins
+/// lie in, a whole id and one no id lies in; and both booleans, which split the
+/// stored set into the concrete component types a caller created and the
+/// abstract built-ins the workspace was provisioned with.
 #[tokio::test]
 async fn one_filter_object_selects_the_component_types_it_names() {
     let emulator = Emulator::new();
@@ -657,11 +660,16 @@ async fn one_filter_object_selects_the_component_types_it_names() {
     let ids = |list: &[&str]| -> Vec<String> { list.iter().map(|id| id.to_string()).collect() };
     let rows: Vec<(&str, Value, Vec<String>)> = vec![
         (
-            "extendsFromWithTwoChildren",
+            "extendsFromAGrandparent",
             json!({"extendsFrom": "com.example.base"}),
-            // The grandchild is NOT here: this service resolves no inheritance
-            // chain beyond the parents a create declared.
-            ids(&["com.example.sensors.pump", "com.example.sensors.valve"]),
+            // The grandchild IS here: its chain reaches the base type through
+            // the pump, which is the relation every reader of this service
+            // resolves.
+            ids(&[
+                "com.example.sensors.deep",
+                "com.example.sensors.pump",
+                "com.example.sensors.valve",
+            ]),
         ),
         (
             "extendsFromWithTwoDirectChildren",
@@ -935,5 +943,174 @@ async fn listing_writes_only_the_transition_the_clock_owed() {
                  {component_type_id:?}, got {read:?}"
             );
         }
+    }
+}
+
+/// A built-in component type this emulator STORES in every workspace, taken from
+/// the catalogue the service provisions a workspace with
+/// (`state::built_in_component_types`, asserted id by id in
+/// `workspace_built_in_component_types`).
+const STORED_BUILT_IN: &str = "com.amazon.iotsitewise.connector";
+
+/// An id in the namespace the service reserves for its own built-ins
+/// (`state::BUILT_IN_COMPONENT_TYPE_ID_PREFIX`) that this emulator does NOT
+/// model, so a declaration naming it resolves as a reference without the
+/// workspace holding a record behind it.
+const UNSTORED_BUILT_IN: &str = "com.amazon.iottwinmaker.unmodelled.sample";
+
+/// The property the root of the chain below declares, so the inheritance the
+/// single-resource read resolves can be compared with what the filter selects.
+const ROOT_PROPERTY: &str = "temperature";
+
+/// RULE: the `extendsFrom` filter selects every stored component type whose
+/// inheritance chain REACHES the id it names — the one "X extends Y" relation
+/// this service resolves, the same one `GetComponentType` resolves when it
+/// reports a declaration as inherited — so extension is transitive (a grandchild
+/// is selected by its grandparent's id) and the named id itself, which extends
+/// nothing of its own, is never selected.
+///
+/// The rows span the chain shapes a workspace can hold: a root with a child, a
+/// grandchild and a great-grandchild; a diamond whose join reaches the root
+/// through two different parents; a leaf and a component type that extends
+/// nothing, which select nobody; a built-in the emulator stores; a
+/// reserved-namespace id it does not store, named directly and reached through
+/// one more component type; and an id the workspace holds nothing under. The
+/// last assertion pins the two readers together: a component type inherits the
+/// root's property definition exactly when the filter on the root selects it.
+#[tokio::test]
+async fn extends_from_filter_selects_every_component_type_whose_chain_reaches_the_id() {
+    let emulator = Emulator::new();
+    create_workspace(&emulator, WORKSPACE).await;
+
+    // Parents before children, which is the only order a create accepts: an
+    // `extendsFrom` naming an id the workspace does not resolve is refused.
+    let stored: Vec<(&str, Value)> = vec![
+        (
+            "chain.a",
+            json!({"propertyDefinitions": {ROOT_PROPERTY: {"dataType": {"type": "STRING"}}}}),
+        ),
+        ("chain.b", json!({"extendsFrom": ["chain.a"]})),
+        ("chain.c", json!({"extendsFrom": ["chain.b"]})),
+        ("chain.d", json!({"extendsFrom": ["chain.c"]})),
+        ("diamond.left", json!({"extendsFrom": ["chain.a"]})),
+        ("diamond.right", json!({"extendsFrom": ["chain.b"]})),
+        (
+            "diamond.join",
+            json!({"extendsFrom": ["diamond.left", "diamond.right"]}),
+        ),
+        ("lone.type", json!({})),
+        ("ext.builtIn", json!({"extendsFrom": [STORED_BUILT_IN]})),
+        ("ext.unstored", json!({"extendsFrom": [UNSTORED_BUILT_IN]})),
+        (
+            "ext.unstored.child",
+            json!({"extendsFrom": ["ext.unstored"]}),
+        ),
+    ];
+    for (component_type_id, body) in &stored {
+        create(&emulator, WORKSPACE, component_type_id, body.clone()).await;
+    }
+
+    // (case, the id the filter names, the ids it must select in id order)
+    let ids = |list: &[&str]| -> Vec<String> { list.iter().map(|id| id.to_string()).collect() };
+    let rows: Vec<(&str, &str, Vec<String>)> = vec![
+        (
+            // Child, grandchild, great-grandchild and both diamond branches.
+            "theRootOfTheChain",
+            "chain.a",
+            ids(&[
+                "chain.b",
+                "chain.c",
+                "chain.d",
+                "diamond.join",
+                "diamond.left",
+                "diamond.right",
+            ]),
+        ),
+        (
+            "oneLinkDownTheChain",
+            "chain.b",
+            ids(&["chain.c", "chain.d", "diamond.join", "diamond.right"]),
+        ),
+        ("twoLinksDownTheChain", "chain.c", ids(&["chain.d"])),
+        // A leaf is extended by nothing, and neither is a component type that
+        // stands on its own.
+        ("aLeafOfTheChain", "chain.d", ids(&[])),
+        ("aComponentTypeNothingExtends", "lone.type", ids(&[])),
+        // Either branch of the diamond reaches the join.
+        ("oneBranchOfTheDiamond", "diamond.left", ids(&["diamond.join"])),
+        (
+            "theOtherBranchOfTheDiamond",
+            "diamond.right",
+            ids(&["diamond.join"]),
+        ),
+        // The built-in the workspace was provisioned with: the component type
+        // created on top of it extends it, the built-in itself extends nothing.
+        ("aStoredBuiltIn", STORED_BUILT_IN, ids(&["ext.builtIn"])),
+        // An id no record stands behind is still the id a stored chain names,
+        // directly and one link further down.
+        (
+            "anUnstoredBuiltIn",
+            UNSTORED_BUILT_IN,
+            ids(&["ext.unstored", "ext.unstored.child"]),
+        ),
+        (
+            "aChildOfTheUnstoredBuiltIn",
+            "ext.unstored",
+            ids(&["ext.unstored.child"]),
+        ),
+        // An id the workspace holds nothing under and no chain names.
+        ("anIdNothingNames", "no.such.type", ids(&[])),
+    ];
+
+    for (case, parent, expected) in &rows {
+        let listed = emulator
+            .list_component_types(
+                WORKSPACE,
+                json!({"maxResults": MAX_PAGE_SIZE, "filters": [{"extendsFrom": parent}]}),
+            )
+            .await;
+        assert_eq!(
+            listed.status, 200,
+            "case {case:?}: expected 200 from a filtered listing, got {listed:?}"
+        );
+        let selected = page_ids(case, &listed);
+        assert_eq!(
+            selected, *expected,
+            "case {case:?}: the extendsFrom filter on {parent:?} must select exactly \
+             {expected:?}, got {listed:?}"
+        );
+        assert!(
+            !selected.contains(&(*parent).to_string()),
+            "case {case:?}: a component type does not extend itself, so {parent:?} must not be \
+             selected by its own id, got {selected:?}"
+        );
+    }
+
+    // The filter and the single-resource read answer ONE relation: a component
+    // type inherits the root's property definition exactly when the filter on
+    // the root selects it.
+    let selected_by_the_root = emulator
+        .list_component_types(
+            WORKSPACE,
+            json!({"maxResults": MAX_PAGE_SIZE, "filters": [{"extendsFrom": "chain.a"}]}),
+        )
+        .await;
+    let selected_by_the_root = page_ids("rootForTheRead", &selected_by_the_root);
+    for (component_type_id, _) in &stored {
+        let read = emulator
+            .get_component_type(WORKSPACE, component_type_id)
+            .await;
+        assert_eq!(
+            read.status, 200,
+            "case {component_type_id:?}: a created component type must read back, got {read:?}"
+        );
+        let inherits_the_root_property =
+            read.member("propertyDefinitions")[ROOT_PROPERTY]["isInherited"].as_bool() == Some(true);
+        assert_eq!(
+            inherits_the_root_property,
+            selected_by_the_root.contains(&(*component_type_id).to_string()),
+            "case {component_type_id:?}: a component type inherits {ROOT_PROPERTY:?} exactly when \
+             the extendsFrom filter on the root selects it, got {read:?}"
+        );
     }
 }

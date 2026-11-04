@@ -16,14 +16,22 @@
 //! input" — the filter union's own documentation), and each of its three members
 //! selects on what this service STORES:
 //!
-//! * `extendsFrom` — the component types whose reported `extendsFrom` names that
-//!   id. Membership is tested against the parents the create declared, which are
-//!   exactly what `GetComponentType` reports, so the filter and the read agree on
-//!   what one component type extends. DIRECT extension only, for that reason: a
-//!   component type's stored parents are the ones its create named, and this
-//!   service resolves no inheritance chain beyond them (`GetComponentType`
-//!   reports every member `isInherited: false` for the same reason), so a
-//!   grandchild is not selected by its grandparent's id.
+//! * `extendsFrom` — the component types that EXTEND the id it names: the ones
+//!   whose inheritance chain REACHES it, whether their own create declared it or
+//!   a component type between them declared it. Extension is transitive in this
+//!   service, so a grandchild is selected by its grandparent's id: the chain is
+//!   resolved by the one walk every reader of inherited structure shares
+//!   ([`crate::state::Workspace::ancestor_component_type_ids`]), which is the
+//!   same relation that decides the property definitions and `definedIn`
+//!   `GetComponentType` reports (each marked `isInherited` when the chain
+//!   declares it), the abstractness both that read and the `isAbstract` filter
+//!   below report, and the component types a component-type-addressed query
+//!   scans. Asking which component types extend a base type therefore answers
+//!   the set every other reader of this crate treats as extending it. An id this
+//!   workspace stores no component type under — a built-in of the real service
+//!   this emulator does not model — still selects the component types whose
+//!   chain names it, since a chain is resolved over the ids it reaches and not
+//!   only over the records stored for them.
 //! * `namespace` — the component types that BELONG to that namespace. A
 //!   `componentTypeId` is a dotted name (`^[a-zA-Z_\.\-0-9:]+$`) whose namespace
 //!   is its dotted prefix, so a type is in the namespace when its id starts with
@@ -305,12 +313,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `component_types` is keyed by `componentTypeId`, so iterating the map
         // IS id order and resuming is a `range` from the token's key: the page
         // starts at the first id at or past it without walking what came before.
+        // Nothing below writes, and testing the `extendsFrom` filter reads the
+        // workspace's other component types (an inheritance chain runs through
+        // them), so the page is built from a shared view of the workspace the
+        // settling pass above has already brought up to date.
+        let workspace = &*workspace;
         let mut matching = match &resume_at {
             Some(from) => workspace.component_types.range(from.clone()..),
             None => workspace.component_types.range::<String, _>(..),
         }
         .map(|(_, component_type)| component_type)
-        .filter(|component_type| matches_filter(component_type, filter));
+        .filter(|component_type| matches_filter(workspace, component_type, filter));
 
         let mut component_type_summaries = Vec::new();
         for component_type in matching.by_ref().take(page_size) {
@@ -361,19 +374,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// Whether `component_type` is in the list the single accepted filter selects.
 /// With no filter every component type of the workspace is.
+///
+/// The whole `workspace` is the input, not the one component type, because what
+/// a component type extends is a relation over the OTHER component types stored
+/// beside it: the chain behind its declared parents runs through them.
 fn matches_filter(
+    workspace: &crate::state::Workspace,
     component_type: &crate::state::ComponentType,
     filter: Option<&ListComponentTypesFilter>,
 ) -> bool {
     match filter {
         None => true,
         // "The component type that the component types in the list extend":
-        // the parents the create declared, which are exactly the ones
-        // `GetComponentType` reports for this component type.
-        Some(ListComponentTypesFilter::extendsFrom(parent)) => component_type
-            .extends_from
-            .iter()
-            .any(|declared| declared == parent),
+        // every component type whose inheritance chain reaches that id —
+        // resolved by the walk every reader of inherited structure shares, so
+        // the filter selects exactly the component types the rest of this
+        // service treats as extending it, a grandchild included. Resolved per
+        // component type TESTED rather than once for the workspace, so a page
+        // costs the chains behind the rows it scanned and not the whole stored
+        // set; the chain itself is walked once per test and is bounded by
+        // `crate::state::MAX_COMPONENT_TYPES_PER_WORKSPACE`.
+        Some(ListComponentTypesFilter::extendsFrom(parent)) => {
+            let (ancestors, _) =
+                workspace.ancestor_component_type_ids(&component_type.extends_from);
+            ancestors.contains(parent.as_str())
+        }
         // "The namespace to which the component types in the list belong": a
         // `componentTypeId` is a dotted name whose namespace is its dotted
         // prefix, so the type belongs to the namespace when its id continues it
