@@ -120,6 +120,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// What this operation answers when a request names NEITHER selector.
+///
+/// RECORDED text. `stateMachineArn` and `mapRunArn` are both optional in the model,
+/// so the one-of rule is the service's own, and the refusal states it in the
+/// service's words — the two resources a listing can be scoped to — rather than in
+/// the member names the request spells them with.
+const MISSING_EXECUTION_FILTER: &str = "Must provide a StateMachine ARN or MapRun ARN";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -277,9 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (None, None) => {
                 return Err(ListExecutionsErrorModeled::ValidationException(
                     ValidationException {
-                        message: Some(
-                            "one of stateMachineArn or mapRunArn must be supplied".to_string(),
-                        ),
+                        message: Some(MISSING_EXECUTION_FILTER.to_string()),
                         reason: Some(
                             crate::state::VALIDATION_REASON_MISSING_PARAMETER.to_string(),
                         ),

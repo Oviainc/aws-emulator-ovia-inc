@@ -238,12 +238,28 @@ async fn a_run_a_job_task_is_resolved_by_the_job_it_started() {
                 Some(TASK_FAILED),
                 "case {case:?}: expected {TASK_FAILED}, got {settled:?}"
             );
-            // The cause is the reason the INVOKED service gave for its job ending as
-            // it did, which for a nested execution is that execution's own `cause`.
+            // The cause is the invoked service's own report of the job, as the JSON
+            // text of the document a job that DID its work reports as the task's
+            // result: for a nested execution that is the child's description, so the
+            // error and the reason the child ended on are read out of it.
+            let cause: Value = serde_json::from_str(
+                settled.get("cause").and_then(Value::as_str).unwrap_or(""),
+            )
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: expected a JSON cause, got {error} in {settled:?}")
+            });
             assert_eq!(
-                settled.get("cause").and_then(Value::as_str),
-                Some("the child state machine failed"),
-                "case {case:?}: expected the job's own reason, got {settled:?}"
+                (
+                    cause.get("Status").and_then(Value::as_str),
+                    cause.get("Error").and_then(Value::as_str),
+                    cause.get("Cause").and_then(Value::as_str),
+                ),
+                (
+                    Some("FAILED"),
+                    Some("ChildBoom"),
+                    Some("the child state machine failed"),
+                ),
+                "case {case:?}: expected the job's own report as the cause, got {cause:?}"
             );
             assert!(
                 event(&emulator, &execution_arn, EVENT_TASK_FAILED)

@@ -1105,9 +1105,6 @@ pub struct RunAJob {
     /// ended without finishing it. A status in neither list is the job still running.
     pub succeeded: &'static [&'static str],
     pub failed: &'static [&'static str],
-    /// Where the reporting call's response says WHY a job that ended without
-    /// finishing did so; empty where that service reports no such member.
-    pub failure_cause_at: &'static [&'static str],
     /// Where the reporting call's response carries a document of the job's own as a
     /// JSON-encoded STRING — its input, its output — each of which the pattern's
     /// second revision reports as the parsed document; empty where that service
@@ -1188,13 +1185,23 @@ impl RunAJob {
     }
 
     /// Whether the job `answer` reports has ENDED, and with what: `Ok(answer)` for
-    /// one that did its work, `Err(the reason it did not)` for one that did not, and
-    /// `None` while it is still running.
+    /// one that did its work, `Err(the cause its task fails with)` for one that did
+    /// not, and `None` while it is still running.
+    ///
+    /// ONE document answers for the job whichever way it ended: the invoked service's
+    /// own report of it. A job that did its work makes the task succeed WITH that
+    /// report, and a job that ended without doing its work makes the task fail with
+    /// that same report as the failure's `cause` — the JSON text of it, in the
+    /// integration's own convention ([`task_result`]), because `cause` is a string.
+    /// So a `Catch` reading why a job failed reads the whole of what the service said
+    /// about it — its status, its identity and the error and reason it ended on —
+    /// rather than one member of it picked out here.
     pub fn outcome_of(&self, answer: &Value, parsed_output: bool) -> Option<Result<Value, String>> {
         let status = self.status_of(answer)?;
+        let reported = self.reported(answer, parsed_output);
         match self.finished(&status)? {
-            true => Some(Ok(self.reported(answer, parsed_output))),
-            false => Some(Err(self.why_it_failed(answer, &status))),
+            true => Some(Ok(reported)),
+            false => Some(Err(task_result(&reported).to_string())),
         }
     }
 
@@ -1210,18 +1217,6 @@ impl RunAJob {
             parse_in_place(&mut reported, path);
         }
         reported
-    }
-
-    /// Why a job that ended without doing its work did so: the reason the reporting
-    /// call names, else the status it ended in.
-    fn why_it_failed(&self, answer: &Value, status: &str) -> String {
-        match Self::text_at(answer, self.failure_cause_at) {
-            Some(reason) if !reason.is_empty() => reason,
-            _ => format!(
-                "the '{}' job this task started ended in status {status}",
-                self.starts
-            ),
-        }
     }
 }
 
@@ -1272,7 +1267,6 @@ pub const RUN_A_JOB: &[RunAJob] = &[
             super::EXECUTION_STATUS_TIMED_OUT,
             super::EXECUTION_STATUS_ABORTED,
         ],
-        failure_cause_at: &["cause"],
         // `DescribeExecution` carries both the execution's `input` and its `output`
         // as "the string that contains the JSON input data" and the JSON output of
         // the execution.
@@ -1300,7 +1294,6 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         status_at: &["QueryExecution", "Status", "State"],
         succeeded: &["SUCCEEDED"],
         failed: &["FAILED", "CANCELLED"],
-        failure_cause_at: &["QueryExecution", "Status", "StateChangeReason"],
         json_text_at: &[],
         stop: "StopQueryExecution",
         stop_member: "QueryExecutionId",
@@ -1329,7 +1322,6 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         // The `JobRunState` values a run never moves out of again; `STARTING`,
         // `RUNNING`, `STOPPING` and `WAITING` each still owe a further state.
         failed: &["STOPPED", "FAILED", "TIMEOUT", "ERROR", "EXPIRED"],
-        failure_cause_at: &["JobRun", "ErrorMessage"],
         json_text_at: &[],
         stop: "BatchStopJobRun",
         stop_member: "JobRunIds",

@@ -21,8 +21,8 @@
 //!
 //! Nothing here asserts a value this emulator invented: the job run id comes off the
 //! submission event, every expectation about the run is read through `GetJobRun`, and
-//! the cause the task fails with is compared with the `ErrorMessage` Glue itself
-//! reports for that run.
+//! the cause the task fails with is Glue's own report of that run, whose
+//! `ErrorMessage` and `JobRunState` are compared with what `GetJobRun` reports.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -451,7 +451,9 @@ async fn a_sync_task_over_glue_is_resolved_by_the_job_run_it_started() {
         }
 
         // The run ends, and what it ended as is the task's own outcome: the cause is
-        // the reason GLUE gave, compared with what Glue reports for that very run.
+        // GLUE's own report of that very run, carried as the JSON text of it, so the
+        // reason Glue gave is read out of the document rather than being the whole of
+        // it.
         let settled_run = settled_job_run(&router, row.case, &job_name, &run_id).await;
         let reported_reason = settled_run
             .get("ErrorMessage")
@@ -472,10 +474,30 @@ async fn a_sync_task_over_glue_is_resolved_by_the_job_run_it_started() {
             "case {:?}: expected {TASK_FAILED}, got {settled:?}",
             row.case
         );
+        let cause: Value =
+            serde_json::from_str(settled.get("cause").and_then(Value::as_str).unwrap_or(""))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "case {:?}: expected a JSON cause, got {error} in {settled:?}",
+                        row.case
+                    )
+                });
         assert_eq!(
-            settled.get("cause").and_then(Value::as_str),
+            cause
+                .get("JobRun")
+                .and_then(|run| run.get("ErrorMessage"))
+                .and_then(Value::as_str),
             Some(reported_reason.as_str()),
-            "case {:?}: expected the reason Glue gave for the run, got {settled:?}",
+            "case {:?}: expected Glue's own report of the run as the cause, got {cause:?}",
+            row.case
+        );
+        assert_eq!(
+            cause
+                .get("JobRun")
+                .and_then(|run| run.get("JobRunState"))
+                .and_then(Value::as_str),
+            settled_run.get("JobRunState").and_then(Value::as_str),
+            "case {:?}: expected the state Glue reports for the run in the cause, got {cause:?}",
             row.case
         );
         let types = history_types(&router, &execution_arn).await;

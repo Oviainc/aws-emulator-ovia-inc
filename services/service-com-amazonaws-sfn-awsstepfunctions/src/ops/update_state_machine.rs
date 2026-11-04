@@ -256,18 +256,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "A qualified state machine ARN can either refer to a Distributed Map state
-        // defined within a state machine, a version ARN, or an alias ARN." None of
-        // those is a state machine this call can modify — a version is an immutable
-        // snapshot and an alias only routes to them — so a qualified ARN is refused
-        // rather than silently updating the state machine behind it.
+        // defined within a state machine, a version ARN, or an alias ARN." The
+        // Distributed Map case is the documented `ValidationException` above; the
+        // other two name no state machine this operation can address at all — a
+        // version is an immutable snapshot and an alias only routes to them, and
+        // neither is a record this call could update — so the request is refused as
+        // naming a state machine that does not exist, the error this operation models
+        // for an ARN it resolves nothing for.
+        //
+        // The VERSION class is recorded; the ALIAS class follows the same reasoning
+        // rather than a recording of its own, because what the two have in common is
+        // what decides the refusal: neither ARN names a state machine record, and the
+        // doc sentence that distinguishes them ("the request starts execution for
+        // that version or alias", quoted in this module's header) describes
+        // `StartExecution` rather than an update.
         if parsed.qualifier.is_some() {
-            return Err(UpdateStateMachineErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "a qualified state machine ARN cannot be updated: '{}'",
-                        input.state_machine_arn
+            return Err(UpdateStateMachineErrorModeled::StateMachineDoesNotExist(
+                StateMachineDoesNotExist {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                        &input.state_machine_arn,
                     )),
-                    reason: None,
                 },
             )
             .into());

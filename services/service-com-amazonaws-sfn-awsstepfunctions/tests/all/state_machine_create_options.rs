@@ -943,9 +943,13 @@ async fn idempotency_follows_the_updated_configuration() {
             "ValidationException",
         ),
         (
+            // A version ARN names the immutable snapshot rather than the state
+            // machine record this call updates, so it names no state machine to
+            // update at all — the same classification an ARN nothing answers for
+            // gets (`tests/all/control_plane_refusal_classes.rs` is the rule).
             "a version ARN, which is an immutable snapshot",
             json!({ "stateMachineArn": format!("{arn}:1"), "definition": HELLO_DEFINITION }),
-            "ValidationException",
+            "StateMachineDoesNotExist",
         ),
         (
             "a state machine that does not exist",
