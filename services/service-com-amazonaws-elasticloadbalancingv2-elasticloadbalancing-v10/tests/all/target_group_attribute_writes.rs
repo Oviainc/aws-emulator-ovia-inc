@@ -5,23 +5,24 @@
 //!
 //! The rule these tables pin: a write persists exactly the attributes the request names
 //! onto the target group the ARN names, leaving every attribute it does not name at the
-//! value it already had — or at its documented default — and answers with the attributes
-//! it wrote, each carrying the value it stored, in the order the request named them; a
-//! later `DescribeTargetGroupAttributes` reports the merged set, so the last write of a
-//! key is what a read sees and re-sending a write changes nothing.
+//! value it already had — or at the value its key is carried at — and answers with the
+//! group's WHOLE attribute collection: the same list, in the same order, a later
+//! `DescribeTargetGroupAttributes` reports, so the last write of a key is what both see
+//! and re-sending a write changes nothing.
 //!
 //! The rows span what the rule generalises over: how many attributes one request
 //! carries and in which order, which load balancer family's attributes a group carries
 //! (`smithy_query(query="doc",shape="TargetGroupAttribute",member="Key")` is the only
 //! catalog of them), and how repeated writes of one key compose.
 //!
-//! The domain of each attribute, the refusals a bad write answers and the defaults a
-//! fresh group reports are pinned by `all/target_group_attributes_and_modification.rs`;
-//! nothing here restates them. The wire harness (`emulator`, `call`, `action`, `p`,
-//! `members`, `first_text`) and the group creator and attribute reader come from there
-//! and from `all/provisioning_loop.rs`.
+//! The domain of each attribute, the refusals a bad write answers and the collection a
+//! fresh group reports are pinned by
+//! `all/target_group_attributes_and_modification.rs`; nothing here restates them. The
+//! wire harness (`emulator`, `call`, `action`, `p`, `members`, `first_text`) and the
+//! group creator and attribute reader come from there and from
+//! `all/provisioning_loop.rs`.
 
-use crate::provisioning_loop::{action, call, emulator, first_text, members, p, Reply};
+use crate::provisioning_loop::{action, attribute_sequence, call, emulator, p, Reply};
 use crate::target_group_attributes_and_modification::{create_target_group, described_attributes};
 use smithy_server_runtime::MultiServiceRouter;
 use std::collections::BTreeMap;
@@ -56,26 +57,17 @@ async fn write_attributes(
     call(router, &form).await
 }
 
-/// The `Attributes` list of `body` IN ORDER — unlike the map the sibling suite compares,
-/// because the order a write answers in is part of what is asserted here.
-fn attribute_sequence(body: &str) -> Vec<(String, String)> {
-    members(body, "Attributes")
-        .iter()
-        .map(|member| {
-            (
-                first_text(member, "Key").unwrap_or_default(),
-                first_text(member, "Value").unwrap_or_default(),
-            )
-        })
-        .collect()
-}
-
-/// The pairs `writes` names, as the reply's list of them should read.
-fn expected_sequence(writes: &[(&str, &str)]) -> Vec<(String, String)> {
-    writes
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect()
+/// What `DescribeTargetGroupAttributes` reports for `arn`, in the order it reports it.
+async fn described_sequence(router: &MultiServiceRouter, arn: &str) -> Vec<(String, String)> {
+    let mut form = action("DescribeTargetGroupAttributes");
+    form.push(p("TargetGroupArn", arn));
+    let reply = call(router, &form).await;
+    assert_eq!(
+        reply.status, 200,
+        "case describe attributes of {arn}: expected 200, got {} body {}",
+        reply.status, reply.body
+    );
+    attribute_sequence(&reply.body)
 }
 
 /// `before` with `writes` applied, which is the whole set a later read must report.
@@ -87,15 +79,15 @@ fn merged(before: &BTreeMap<String, String>, writes: &[(&str, &str)]) -> BTreeMa
     expected
 }
 
-/// A write answers with exactly the attributes the request named, in the request's own
-/// order, and a later read reports those values beside every attribute the request left
-/// alone.
+/// A write answers with the group's whole attribute collection — the same list, in the
+/// same order, a read then reports — carrying the values the request wrote beside every
+/// attribute it left alone.
 ///
 /// The rows differ in how many attributes one request carries and in which order it
 /// names them — including the same three attributes in both orders, so the answer
-/// follows the request rather than any order the store happens to hold.
+/// follows the collection rather than the request.
 #[tokio::test]
-async fn a_write_answers_the_attributes_it_stored_in_the_order_the_request_named_them() {
+async fn a_write_answers_the_whole_collection_in_the_order_a_read_reports_it() {
     let three: Vec<(&str, &str)> = vec![
         ("deregistration_delay.timeout_seconds", "45"),
         ("load_balancing.algorithm.type", "weighted_random"),
@@ -144,19 +136,18 @@ async fn a_write_answers_the_attributes_it_stored_in_the_order_the_request_named
             reply.status, reply.body
         );
         let answered = attribute_sequence(&reply.body);
-        assert_eq!(
-            answered,
-            expected_sequence(writes),
-            "case {case:?}: expected the written attributes answered in request order, got \
-             {answered:?}"
-        );
-
         let after = described_attributes(&router, &arn).await;
         assert_eq!(
             after,
             merged(&before, writes),
             "case {case:?}: expected the written values beside every untouched attribute, got \
              {after:?}"
+        );
+        assert_eq!(
+            answered,
+            described_sequence(&router, &arn).await,
+            "case {case:?}: expected the write to answer the collection a read reports, got \
+             {answered:?}"
         );
     }
 }
@@ -176,8 +167,8 @@ async fn a_write_lands_on_the_attributes_of_every_load_balancer_family() {
             vec![("Protocol", "HTTP"), ("Port", "80"), ("VpcId", "vpc-1")],
             vec![
                 ("load_balancing.algorithm.anomaly_mitigation", "on"),
-                // The model documents no default for this one: a write is what makes a
-                // read report it at all.
+                // The documentation states no value for this one: the collection carries
+                // it at the empty string until a write names a cookie.
                 ("stickiness.app_cookie.cookie_name", "session-id"),
             ],
         ),
@@ -233,17 +224,17 @@ async fn a_write_lands_on_the_attributes_of_every_load_balancer_family() {
             reply.status, reply.body
         );
         let answered = attribute_sequence(&reply.body);
-        assert_eq!(
-            answered,
-            expected_sequence(writes),
-            "case {case:?}: expected the written attributes answered, got {answered:?}"
-        );
-
         let after = described_attributes(&router, &arn).await;
         assert_eq!(
             after,
             merged(&before, writes),
             "case {case:?}: expected the written values read back, got {after:?}"
+        );
+        assert_eq!(
+            answered,
+            described_sequence(&router, &arn).await,
+            "case {case:?}: expected the write to answer the collection a read reports, got \
+             {answered:?}"
         );
     }
 }

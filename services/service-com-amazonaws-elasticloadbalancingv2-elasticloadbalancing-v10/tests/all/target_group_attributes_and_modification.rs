@@ -322,6 +322,9 @@ async fn attribute_defaults_follow_the_documented_catalog_of_the_load_balancer_f
         ("load_balancing.algorithm.anomaly_mitigation", "off"),
         ("load_balancing.algorithm.type", "round_robin"),
         ("slow_start.duration_seconds", "0"),
+        // A cookie name the documentation states no value for: the collection carries it
+        // at the empty string.
+        ("stickiness.app_cookie.cookie_name", ""),
         ("stickiness.app_cookie.duration_seconds", "86400"),
         ("stickiness.lb_cookie.duration_seconds", "86400"),
     ];
@@ -572,11 +575,12 @@ async fn an_attribute_write_is_accepted_on_its_documented_bounds_and_refused_pas
                 "case {case:?}: a value on its documented bound must be stored, got {} body {}",
                 reply.status, reply.body
             );
-            // AWS answers with the attributes the call modified, not the whole set.
+            // AWS answers with the group's whole collection, which is the set a read
+            // reports: the modified attribute is in it, at the value just stored.
             assert_eq!(
                 attribute_pairs(&reply.body),
-                BTreeMap::from([((*key).to_string(), (*value).to_string())]),
-                "case {case:?}: expected the modified attribute echoed, got {}",
+                after,
+                "case {case:?}: expected the whole collection answered, got {}",
                 reply.body
             );
             assert_eq!(

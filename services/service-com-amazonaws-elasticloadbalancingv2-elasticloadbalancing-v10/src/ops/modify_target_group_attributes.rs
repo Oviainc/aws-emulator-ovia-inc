@@ -2,10 +2,10 @@
 
 //! @op ModifyTargetGroupAttributes
 //!
-//! Writes the named attributes onto a persisted target group and answers with what it
-//! stored for each one. Only the attributes the request names are touched; every other
-//! attribute keeps the value — or the documented default — it had, and a later
-//! `DescribeTargetGroupAttributes` reports the whole set.
+//! Writes the named attributes onto a persisted target group and answers with that
+//! group's WHOLE attribute collection — the same one `DescribeTargetGroupAttributes`
+//! reports. Only the attributes the request names are touched; every other attribute
+//! keeps the value — or the default it is carried at — that it had.
 //!
 //! ## Shape of an operation
 //!
@@ -197,19 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             group.attributes.insert(key.clone(), value.clone());
         }
 
-        // AWS answers with the attributes the call modified, in the order the request
-        // named them — not the whole set, which is what `DescribeTargetGroupAttributes`
-        // reports.
+        // The target group's WHOLE attribute collection, as
+        // `DescribeTargetGroupAttributes` reports it: a write answers with the resource's
+        // new state, not with the keys the request happened to name.
         Ok(ModifyTargetGroupAttributesOutput {
-            attributes: Some(
-                writes
-                    .into_iter()
-                    .map(|(key, value)| TargetGroupAttribute {
-                        key: Some(key),
-                        value: Some(value),
-                    })
-                    .collect(),
-            ),
+            attributes: Some(group.attribute_shapes()),
         })
     }
 }

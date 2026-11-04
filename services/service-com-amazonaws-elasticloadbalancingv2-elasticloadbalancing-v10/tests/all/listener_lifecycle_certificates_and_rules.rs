@@ -116,7 +116,11 @@ async fn create_load_balancer(router: &MultiServiceRouter, name: &str, lb_type: 
 
 /// Create a listener carrying `extra` beside the load balancer and a forwarding default
 /// action, and answer its ARN.
-async fn create_listener(
+///
+/// `pub(crate)` because `all/attribute_collections.rs` makes listeners of every load
+/// balancer family the same way: ONE creator for the crate, so the two suites cannot
+/// drift on how a listener is made.
+pub(crate) async fn create_listener(
     router: &MultiServiceRouter,
     case: &str,
     lb_arn: &str,
@@ -1105,9 +1109,38 @@ async fn listener_attributes_default_and_accept_only_their_documented_domain() {
         Family {
             lb_type: "application",
             listener: vec![p("Protocol", "HTTP"), p("Port", "80")],
-            // No Application Load Balancer listener attribute has a documented default,
-            // so a fresh one reports none.
-            defaults: &[],
+            // An Application Load Balancer listener's attribute collection is the
+            // response-header set: the server header, which the listener allows until a
+            // caller removes it, and the ten header values, which the collection carries
+            // at the empty string. The mutual-TLS request header NAMES are not in it.
+            defaults: &[
+                ("routing.http.response.server.enabled", "true"),
+                ("routing.http.response.strict_transport_security.header_value", ""),
+                (
+                    "routing.http.response.access_control_allow_origin.header_value",
+                    "",
+                ),
+                (
+                    "routing.http.response.access_control_allow_methods.header_value",
+                    "",
+                ),
+                (
+                    "routing.http.response.access_control_allow_headers.header_value",
+                    "",
+                ),
+                (
+                    "routing.http.response.access_control_allow_credentials.header_value",
+                    "",
+                ),
+                (
+                    "routing.http.response.access_control_expose_headers.header_value",
+                    "",
+                ),
+                ("routing.http.response.access_control_max_age.header_value", ""),
+                ("routing.http.response.content_security_policy.header_value", ""),
+                ("routing.http.response.x_content_type_options.header_value", ""),
+                ("routing.http.response.x_frame_options.header_value", ""),
+            ],
         },
         Family {
             lb_type: "network",

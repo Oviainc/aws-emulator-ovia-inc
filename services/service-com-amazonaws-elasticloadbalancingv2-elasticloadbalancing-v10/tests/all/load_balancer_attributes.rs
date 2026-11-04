@@ -7,13 +7,15 @@
 //! The rules these tables pin:
 //!
 //! * A load balancer reports every attribute the model documents for a load balancer of
-//!   its family, carrying the documented default until a write changes it
+//!   its family, carrying the value it is held at until a write changes it
 //!   (`smithy_query(query="doc",shape="LoadBalancerAttribute",member="Key")` is the only
-//!   catalog of them, since the Smithy shape itself is an unconstrained key/value pair).
+//!   catalog of them, since the Smithy shape itself is an unconstrained key/value pair) —
+//!   including the string-valued log destinations, which the collection carries at the
+//!   empty string.
 //! * `ModifyLoadBalancerAttributes` persists exactly the attributes the request names,
-//!   leaves every attribute it does not name as it was, and answers the ones it wrote in
-//!   the order the request named them; a later `DescribeLoadBalancerAttributes` reports
-//!   the merged set.
+//!   leaves every attribute it does not name as it was, and answers with the load
+//!   balancer's WHOLE attribute collection: the same list, in the same order,
+//!   `DescribeLoadBalancerAttributes` then reports.
 //! * A key the model does not document, a key another family's load balancers carry, a
 //!   value outside an attribute's documented domain, and a change to an attribute that
 //!   documentation fixes are each refused with the operation's own
@@ -22,7 +24,9 @@
 //! The wire harness (`emulator`, `call`, `action`, `p`, `members`, `first_text`) is the
 //! one `provisioning_loop` already owns; nothing here restates it.
 
-use crate::provisioning_loop::{action, call, emulator, first_text, members, p, Reply};
+use crate::provisioning_loop::{
+    action, attribute_sequence, call, emulator, first_text, members, p, Reply,
+};
 use crate::target_group_attributes_and_modification::unescaped;
 use smithy_server_runtime::MultiServiceRouter;
 use std::collections::BTreeMap;
@@ -108,20 +112,6 @@ fn attribute_pairs(body: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The `Attributes` list of `body` IN ORDER, which is what a write's answer is asserted
-/// against — unlike the map a read is compared as.
-fn attribute_sequence(body: &str) -> Vec<(String, String)> {
-    members(body, "Attributes")
-        .iter()
-        .map(|member| {
-            (
-                first_text(member, "Key").unwrap_or_default(),
-                first_text(member, "Value").unwrap_or_default(),
-            )
-        })
-        .collect()
-}
-
 /// What `DescribeLoadBalancerAttributes` reports for `arn`.
 pub(crate) async fn described_attributes(
     router: &MultiServiceRouter,
@@ -136,6 +126,19 @@ pub(crate) async fn described_attributes(
         reply.status, reply.body
     );
     attribute_pairs(&reply.body)
+}
+
+/// What `DescribeLoadBalancerAttributes` reports for `arn`, in the order it reports it.
+async fn described_sequence(router: &MultiServiceRouter, arn: &str) -> Vec<(String, String)> {
+    let mut form = action("DescribeLoadBalancerAttributes");
+    form.push(p("LoadBalancerArn", arn));
+    let reply = call(router, &form).await;
+    assert_eq!(
+        reply.status, 200,
+        "case describe attributes of {arn}: expected 200, got {} body {}",
+        reply.status, reply.body
+    );
+    attribute_sequence(&reply.body)
 }
 
 /// Write `writes` onto the load balancer `arn` names and answer the reply, whatever it
@@ -153,6 +156,13 @@ pub(crate) async fn write_attributes(
         form.push(p(&format!("Attributes.member.{position}.Key"), key));
         form.push(p(&format!("Attributes.member.{position}.Value"), value));
     }
+    call(router, &form).await
+}
+
+/// `DeleteLoadBalancer` for one ARN, and the reply whatever it is.
+async fn delete_load_balancer(router: &MultiServiceRouter, arn: &str) -> Reply {
+    let mut form = action("DeleteLoadBalancer");
+    form.push(p("LoadBalancerArn", arn));
     call(router, &form).await
 }
 
@@ -185,86 +195,73 @@ fn merged(before: &BTreeMap<String, String>, writes: &[(&str, &str)]) -> BTreeMa
 // Defaults, per load balancer family and scheme.
 // ---------------------------------------------------------------------------
 
-/// Every attribute a load balancer reports before anything writes one, and the default
-/// each carries, follow the model's own `LoadBalancerAttribute$Key` documentation — which
-/// groups them by the family that carries them, and gives two of them a default that
-/// follows the load balancer itself.
+/// The WHOLE attribute collection a load balancer reports before anything writes one,
+/// and the value each key is carried at, follow the model's own
+/// `LoadBalancerAttribute$Key` documentation — which groups the keys by the family that
+/// carries them, gives `load_balancing.cross_zone.enabled` a value that follows the
+/// family, and states no value for the string-valued log destinations, which the
+/// collection carries at the empty string.
 ///
-/// One row per family the catalog names, plus an INTERNAL load balancer: the
-/// documentation makes `ipv6.deny_all_igw_traffic` follow the scheme ("set to false for
-/// internet-facing load balancers and true for internal load balancers") and
-/// `load_balancing.cross_zone.enabled` follow the family, so neither default is a single
-/// constant.
+/// One row per family the catalog names, plus an INTERNAL load balancer, whose scheme
+/// changes no key of the collection.
 #[tokio::test]
 async fn a_load_balancer_reports_the_documented_default_of_every_attribute_its_family_carries() {
-    // "The following attributes are supported by all load balancers", so these two are
-    // in every row below — with the value the family gives them.
+    // "The following attributes are supported by only Application Load Balancers",
+    // beside the two every family carries and the three "supported by both Application
+    // Load Balancers and Network Load Balancers".
+    let application: Vec<(&str, &str)> = vec![
+        ("access_logs.s3.enabled", "false"),
+        ("access_logs.s3.bucket", ""),
+        ("access_logs.s3.prefix", ""),
+        ("health_check_logs.s3.enabled", "false"),
+        ("health_check_logs.s3.bucket", ""),
+        ("health_check_logs.s3.prefix", ""),
+        ("idle_timeout.timeout_seconds", "60"),
+        ("deletion_protection.enabled", "false"),
+        ("routing.http2.enabled", "true"),
+        ("routing.http.drop_invalid_header_fields.enabled", "false"),
+        ("routing.http.xff_client_port.enabled", "false"),
+        ("routing.http.xff_header_processing.mode", "append"),
+        ("routing.http.preserve_host_header.enabled", "false"),
+        (
+            "routing.http.x_amzn_tls_version_and_cipher_suite.enabled",
+            "false",
+        ),
+        ("routing.http.desync_mitigation_mode", "defensive"),
+        ("load_balancing.cross_zone.enabled", "true"),
+        ("client_keep_alive.seconds", "3600"),
+        ("waf.fail_open.enabled", "false"),
+        ("zonal_shift.config.enabled", "false"),
+        ("connection_logs.s3.enabled", "false"),
+        ("connection_logs.s3.bucket", ""),
+        ("connection_logs.s3.prefix", ""),
+    ];
+
     let cases: Vec<DefaultCase> = vec![
         (
             "an internet-facing application load balancer",
             vec![],
-            vec![
-                ("access_logs.s3.enabled", "false"),
-                ("client_keep_alive.seconds", "3600"),
-                ("connection_logs.s3.enabled", "false"),
-                ("deletion_protection.enabled", "false"),
-                ("health_check_logs.s3.enabled", "false"),
-                ("idle_timeout.timeout_seconds", "60"),
-                ("ipv6.deny_all_igw_traffic", "false"),
-                ("load_balancing.cross_zone.enabled", "true"),
-                ("routing.http.desync_mitigation_mode", "defensive"),
-                ("routing.http.drop_invalid_header_fields.enabled", "false"),
-                ("routing.http.preserve_host_header.enabled", "false"),
-                (
-                    "routing.http.x_amzn_tls_version_and_cipher_suite.enabled",
-                    "false",
-                ),
-                ("routing.http.xff_client_port.enabled", "false"),
-                ("routing.http.xff_header_processing.mode", "append"),
-                ("routing.http2.enabled", "true"),
-                ("waf.fail_open.enabled", "false"),
-                ("zonal_shift.config.enabled", "false"),
-            ],
+            application.clone(),
         ),
         (
+            // The scheme decides no key of the collection: the same set comes back.
             "an internal application load balancer",
             vec![("Scheme", "internal")],
-            vec![
-                ("access_logs.s3.enabled", "false"),
-                ("client_keep_alive.seconds", "3600"),
-                ("connection_logs.s3.enabled", "false"),
-                ("deletion_protection.enabled", "false"),
-                ("health_check_logs.s3.enabled", "false"),
-                ("idle_timeout.timeout_seconds", "60"),
-                // The one difference the scheme makes.
-                ("ipv6.deny_all_igw_traffic", "true"),
-                ("load_balancing.cross_zone.enabled", "true"),
-                ("routing.http.desync_mitigation_mode", "defensive"),
-                ("routing.http.drop_invalid_header_fields.enabled", "false"),
-                ("routing.http.preserve_host_header.enabled", "false"),
-                (
-                    "routing.http.x_amzn_tls_version_and_cipher_suite.enabled",
-                    "false",
-                ),
-                ("routing.http.xff_client_port.enabled", "false"),
-                ("routing.http.xff_header_processing.mode", "append"),
-                ("routing.http2.enabled", "true"),
-                ("waf.fail_open.enabled", "false"),
-                ("zonal_shift.config.enabled", "false"),
-            ],
+            application.clone(),
         ),
         (
             "a network load balancer",
             vec![("Type", "network")],
             vec![
                 ("access_logs.s3.enabled", "false"),
+                ("access_logs.s3.bucket", ""),
+                ("access_logs.s3.prefix", ""),
                 ("deletion_protection.enabled", "false"),
-                ("ipv6.deny_all_igw_traffic", "false"),
                 // "The default for Network Load Balancers and Gateway Load Balancers is
                 // false."
                 ("load_balancing.cross_zone.enabled", "false"),
-                ("secondary_ips.auto_assigned.per_subnet", "0"),
                 ("zonal_shift.config.enabled", "false"),
+                ("secondary_ips.auto_assigned.per_subnet", "0"),
             ],
         ),
         (
@@ -286,7 +283,64 @@ async fn a_load_balancer_reports_the_documented_default_of_every_attribute_its_f
         assert_eq!(
             reported,
             expected_map(expected),
-            "case {case:?}: expected the documented defaults, got {reported:?}"
+            "case {case:?}: expected the whole documented collection, got {reported:?}"
+        );
+        // ...and in the order the service reports it in, which is the catalog's and
+        // neither alphabetical nor the request's.
+        let sequence = described_sequence(&router, &arn).await;
+        assert_eq!(
+            sequence,
+            expected_sequence(expected),
+            "case {case:?}: expected the collection in catalog order, got {sequence:?}"
+        );
+    }
+}
+
+/// One row of the uncarried-attribute table: the case name, the fields the load balancer
+/// is created with, and the value one request writes for the uncarried key.
+type UncarriedCase = (&'static str, Vec<(&'static str, &'static str)>, &'static str);
+
+/// An attribute the collection does not carry is still writable, and a write is what puts
+/// it there: `ipv6.deny_all_igw_traffic` is reported by neither a read nor a write of a
+/// fresh load balancer of either family that accepts it, and by both once written.
+#[tokio::test]
+async fn an_attribute_the_collection_does_not_carry_is_reported_only_once_written() {
+    let key = "ipv6.deny_all_igw_traffic";
+    // The documentation lists it for "both Application Load Balancers and Network Load
+    // Balancers", and makes its value follow the scheme, so both families and both
+    // schemes are asked.
+    let cases: Vec<UncarriedCase> = vec![
+        ("an internet-facing application load balancer", vec![], "true"),
+        (
+            "an internal application load balancer",
+            vec![("Scheme", "internal")],
+            "false",
+        ),
+        ("a network load balancer", vec![("Type", "network")], "true"),
+    ];
+
+    let (router, _engine) = emulator();
+
+    for (index, (case, fields, value)) in cases.iter().enumerate() {
+        let name = format!("lb-attr-uncarried-{index}");
+        let arn = create_load_balancer(&router, &name, fields).await;
+        let before = described_attributes(&router, &arn).await;
+        assert!(
+            !before.contains_key(key),
+            "case {case:?}: expected no {key} before a write, got {before:?}"
+        );
+
+        let reply = write_attributes(&router, &arn, &[(key, value)]).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected 200, got {} body {}",
+            reply.status, reply.body
+        );
+        let after = described_attributes(&router, &arn).await;
+        assert_eq!(
+            after.get(key).map(String::as_str),
+            Some(*value),
+            "case {case:?}: expected the written value reported, got {after:?}"
         );
     }
 }
@@ -295,17 +349,17 @@ async fn a_load_balancer_reports_the_documented_default_of_every_attribute_its_f
 // Writes: what lands, what comes back, and in which order.
 // ---------------------------------------------------------------------------
 
-/// A write answers with exactly the attributes the request named, in the request's own
-/// order, and a later read reports those values beside every attribute the request left
-/// alone.
+/// A write answers with the load balancer's WHOLE attribute collection — the same list,
+/// in the same order, a read then reports — carrying the values the request wrote beside
+/// every attribute it left alone.
 ///
 /// The rows differ along what the rule generalises over: which family's attributes a load
 /// balancer carries, how many attributes one request names and in which order, the kind
 /// of domain each attribute has (a boolean, an enumerated mode, an integer at a published
-/// bound, a free-text bucket name the model documents no default for), and a write that
+/// bound, a free-text bucket name the model states no value for), and a write that
 /// restates the value an attribute is fixed at.
 #[tokio::test]
-async fn a_write_stores_the_attributes_it_names_and_answers_them_in_request_order() {
+async fn a_write_answers_the_whole_collection_a_read_reports() {
     let three: Vec<(&str, &str)> = vec![
         ("idle_timeout.timeout_seconds", "120"),
         ("routing.http2.enabled", "false"),
@@ -332,7 +386,7 @@ async fn a_write_stores_the_attributes_it_names_and_answers_them_in_request_orde
             ],
         ),
         (
-            "the log attributes, including two the model documents no default for",
+            "the log attributes, including two the model states no value for",
             vec![],
             vec![
                 ("access_logs.s3.enabled", "true"),
@@ -379,20 +433,23 @@ async fn a_write_stores_the_attributes_it_names_and_answers_them_in_request_orde
             "case {case:?}: expected 200, got {} body {}",
             reply.status, reply.body
         );
-        let answered = attribute_sequence(&reply.body);
-        assert_eq!(
-            answered,
-            expected_sequence(writes),
-            "case {case:?}: expected the written attributes answered in request order, got \
-             {answered:?}"
-        );
 
+        // The answer is the whole collection, carrying what the request wrote: every key
+        // the load balancer reported before the write is in it, with the written values
+        // replacing their own.
+        let answered = attribute_sequence(&reply.body);
         let after = described_attributes(&router, &arn).await;
         assert_eq!(
             after,
             merged(&before, writes),
             "case {case:?}: expected the written values beside every untouched attribute, got \
              {after:?}"
+        );
+        assert_eq!(
+            answered,
+            described_sequence(&router, &arn).await,
+            "case {case:?}: expected the write to answer the collection a read reports, got \
+             {answered:?}"
         );
     }
 }
@@ -596,4 +653,94 @@ async fn a_request_carrying_one_bad_attribute_stores_none_of_them() {
         "case a good attribute beside a bad one: nothing in the request may be stored, got \
          {after:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// What an attribute DOES: deletion protection.
+// ---------------------------------------------------------------------------
+
+/// `deletion_protection.enabled` is not just reported: "You can't delete a load balancer
+/// if deletion protection is enabled", so while it is on `DeleteLoadBalancer` is refused
+/// with the modelled `OperationNotPermitted` and the load balancer stays, and once it is
+/// turned off the same delete succeeds.
+///
+/// One row per family that carries the attribute, which its documentation lists under
+/// "supported by all load balancers".
+#[tokio::test]
+async fn deletion_protection_refuses_the_delete_until_it_is_turned_off() {
+    /// The awsQuery code of `OperationNotPermittedException`
+    /// (`smithy_query(query="operation",operation="DeleteLoadBalancer")`).
+    const OPERATION_NOT_PERMITTED: &str = "OperationNotPermitted";
+
+    let cases: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        ("an application load balancer", vec![]),
+        ("a network load balancer", vec![("Type", "network")]),
+        ("a gateway load balancer", vec![("Type", "gateway")]),
+    ];
+
+    let (router, _engine) = emulator();
+
+    for (index, (case, fields)) in cases.iter().enumerate() {
+        let name = format!("lb-attr-protected-{index}");
+        let arn = create_load_balancer(&router, &name, fields).await;
+
+        // Off by default: the delete would succeed, so the protection is turned on first.
+        let reply = write_attributes(&router, &arn, &[("deletion_protection.enabled", "true")]).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected the protection to be stored, got {} body {}",
+            reply.status, reply.body
+        );
+
+        let refused = delete_load_balancer(&router, &arn).await;
+        assert_eq!(
+            (refused.status, refused.error_code().as_str()),
+            (400, OPERATION_NOT_PERMITTED),
+            "case {case:?}: expected 400 {OPERATION_NOT_PERMITTED}, got {} body {}",
+            refused.status,
+            refused.body
+        );
+        let message = refused.text("Message").map(|text| unescaped(&text));
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|text| text.contains(arn.as_str())
+                    && text.contains("deletion protection is enabled")),
+            "case {case:?}: the refusal must name the load balancer and the rule, got {message:?}"
+        );
+        // Nothing was removed: the load balancer still answers its attributes.
+        let still_there = described_attributes(&router, &arn).await;
+        assert_eq!(
+            still_there
+                .get("deletion_protection.enabled")
+                .map(String::as_str),
+            Some("true"),
+            "case {case:?}: a refused delete must leave the load balancer, got {still_there:?}"
+        );
+
+        let reply =
+            write_attributes(&router, &arn, &[("deletion_protection.enabled", "false")]).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected the protection to be turned off, got {} body {}",
+            reply.status, reply.body
+        );
+        let deleted = delete_load_balancer(&router, &arn).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: expected the delete to succeed once unprotected, got {} body {}",
+            deleted.status, deleted.body
+        );
+        // And it is gone: its attributes are no longer there to read.
+        let mut form = action("DescribeLoadBalancerAttributes");
+        form.push(p("LoadBalancerArn", &arn));
+        let gone = call(&router, &form).await;
+        assert_eq!(
+            (gone.status, gone.error_code().as_str()),
+            (400, "LoadBalancerNotFound"),
+            "case {case:?}: expected the load balancer to be gone, got {} body {}",
+            gone.status,
+            gone.body
+        );
+    }
 }

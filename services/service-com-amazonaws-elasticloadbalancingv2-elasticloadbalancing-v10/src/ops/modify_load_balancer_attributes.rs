@@ -3,8 +3,9 @@
 //! @op ModifyLoadBalancerAttributes
 //!
 //! Stores the attributes the request names onto the load balancer `LoadBalancerArn`
-//! names, leaving every attribute it does not name as it was, and answers with the
-//! attributes it wrote in the order the request named them.
+//! names, leaving every attribute it does not name as it was, and answers with that load
+//! balancer's WHOLE attribute collection — the same one `DescribeLoadBalancerAttributes`
+//! reports.
 //!
 //! An attribute is accepted only where the model's `LoadBalancerAttribute$Key`
 //! documentation says this load balancer carries it, and only with a value in the domain
@@ -215,26 +216,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The validated writes land under the SAME lock the lookup was made under, so
-        // the record is still there; an `if let` rather than an unwrap keeps that an
-        // assumption the code does not depend on.
-        if let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) {
-            for (key, value) in &writes {
-                load_balancer.attributes.insert(key.clone(), value.clone());
-            }
+        // the record is still there; the refusal below is the lookup's own, restated
+        // rather than assumed away.
+        let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) else {
+            return Err(
+                ModifyLoadBalancerAttributesErrorModeled::LoadBalancerNotFoundException(
+                    LoadBalancerNotFoundException {
+                        message: Some(crate::state::load_balancer_not_found_message(
+                            &input.load_balancer_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        for (key, value) in &writes {
+            load_balancer.attributes.insert(key.clone(), value.clone());
         }
 
-        // The attributes the call modified, in the order the request named them — not the
-        // whole set, which is what `DescribeLoadBalancerAttributes` reports.
+        // The load balancer's WHOLE attribute collection, as
+        // `DescribeLoadBalancerAttributes` reports it: a write answers with the
+        // resource's new state, not with the keys the request happened to name.
         Ok(ModifyLoadBalancerAttributesOutput {
-            attributes: Some(
-                writes
-                    .into_iter()
-                    .map(|(key, value)| LoadBalancerAttribute {
-                        key: Some(key),
-                        value: Some(value),
-                    })
-                    .collect(),
-            ),
+            attributes: Some(load_balancer.attribute_shapes()),
         })
     }
 }

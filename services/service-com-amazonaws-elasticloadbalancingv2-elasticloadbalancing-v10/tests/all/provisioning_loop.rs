@@ -268,6 +268,26 @@ pub(crate) fn members(xml: &str, container: &str) -> Vec<String> {
     found
 }
 
+/// The `Key`/`Value` pairs of every `<member>` of the first `Attributes` list of `body`,
+/// IN ORDER.
+///
+/// `pub(crate)` because the three attribute suites
+/// (`all/load_balancer_attributes.rs`, `all/target_group_attribute_writes.rs`,
+/// `all/attribute_collections.rs`) all compare an attribute collection as the ordered
+/// list it comes back as: ONE reader for the crate, so they cannot drift on how it is
+/// read.
+pub(crate) fn attribute_sequence(body: &str) -> Vec<(String, String)> {
+    members(body, "Attributes")
+        .iter()
+        .map(|member| {
+            (
+                first_text(member, "Key").unwrap_or_default(),
+                first_text(member, "Value").unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
 /// The XML inside the first element named `name` at or after `from`, and the offset
 /// just past that element's closing tag.
 ///

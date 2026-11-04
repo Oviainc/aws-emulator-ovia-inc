@@ -11,7 +11,8 @@
 //! listener for is `ListenerNotFoundException`.
 //!
 //! The whole request is checked before the first write, so a refused call stores
-//! nothing.
+//! nothing. An accepted one answers with the listener's WHOLE attribute collection — the
+//! same one `DescribeListenerAttributes` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -215,18 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             listener.attributes.insert(key.clone(), value.clone());
         }
 
-        // The attributes the call modified, in the order the request named them — not the
-        // whole set, which is what `DescribeListenerAttributes` reports.
+        // The listener's WHOLE attribute collection, as `DescribeListenerAttributes`
+        // reports it: a write answers with the resource's new state, not with the keys
+        // the request happened to name.
         Ok(ModifyListenerAttributesOutput {
-            attributes: Some(
-                writes
-                    .into_iter()
-                    .map(|(key, value)| ListenerAttribute {
-                        key: Some(key),
-                        value: Some(value),
-                    })
-                    .collect(),
-            ),
+            attributes: Some(listener.attribute_shapes(family)),
         })
     }
 }

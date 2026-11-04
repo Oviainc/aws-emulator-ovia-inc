@@ -5,6 +5,10 @@
 //! Removes the load balancer and its listeners from state, and drops the
 //! associations those listeners made with target groups.
 //!
+//! "You can't delete a load balancer if deletion protection is enabled", so a load
+//! balancer whose attribute collection carries `deletion_protection.enabled` at `true`
+//! is refused with the modelled `OperationNotPermittedException` and nothing is removed.
+//!
 //! The model is explicit that this is NOT a lookup failure: "if the load balancer
 //! does not exist or has already been deleted, the call succeeds" — so an unknown
 //! ARN is an empty success, not `LoadBalancerNotFoundException`. "Deleting a load
@@ -148,9 +152,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::scaffolded::Scaffolded::not_implemented("DeleteLoadBalancer")
         })?;
 
+        // "You can't delete a load balancer if deletion protection is enabled": the
+        // refusal is answered before anything is removed, so a protected load balancer
+        // and its listeners are left exactly as they were.
+        let mut guard = state.lock();
+        if guard
+            .load_balancers
+            .get(&input.load_balancer_arn)
+            .is_some_and(crate::state::LoadBalancerRecord::deletion_protection_enabled)
+        {
+            return Err(
+                DeleteLoadBalancerErrorModeled::OperationNotPermittedException(
+                    OperationNotPermittedException {
+                        message: Some(crate::state::deletion_protection_message(
+                            &input.load_balancer_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // The model: deleting a load balancer that is not there succeeds, so the
         // answer does not depend on whether this removed anything.
-        let mut guard = state.lock();
         guard.remove_load_balancer(&input.load_balancer_arn);
         // A load balancer that is gone presents no certificate, so every reference its
         // listeners held is given up — the service holding those certificates reads that

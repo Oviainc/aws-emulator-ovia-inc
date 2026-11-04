@@ -368,12 +368,15 @@ impl LoadBalancerRecord {
             .then(|| PRIVATE_LINK_INBOUND_RULES_DEFAULT.to_string())
     }
 
-    /// Every attribute this load balancer reports: each one the model documents for a
-    /// load balancer of this family, carrying what a caller set or, failing that, its
-    /// documented default. Sorted by key, so two reads of one load balancer answer
-    /// alike.
+    /// This load balancer's WHOLE attribute collection: every attribute the catalog
+    /// carries for a load balancer of this family, each holding what a caller wrote or,
+    /// failing that, the value it is carried at — which is what both a read and a write
+    /// of these attributes answers with.
+    ///
+    /// In [`LOAD_BALANCER_ATTRIBUTES`] order, which is the order the service reports
+    /// them in, so two reads of one load balancer answer alike.
     pub fn effective_attributes(&self) -> Vec<(String, String)> {
-        let mut reported: Vec<(String, String)> = LOAD_BALANCER_ATTRIBUTES
+        LOAD_BALANCER_ATTRIBUTES
             .iter()
             .filter(|spec| spec.applies_to(self))
             .filter_map(|spec| {
@@ -384,9 +387,7 @@ impl LoadBalancerRecord {
                     .or_else(|| spec.default_for(self))?;
                 Some((spec.key.to_string(), value))
             })
-            .collect();
-        reported.sort_by(|left, right| left.0.cmp(&right.0));
-        reported
+            .collect()
     }
 
     /// [`Self::effective_attributes`] as the modelled shape.
@@ -398,6 +399,22 @@ impl LoadBalancerRecord {
                 value: Some(value),
             })
             .collect()
+    }
+
+    /// Whether this load balancer may not be deleted: the value its attribute collection
+    /// carries `deletion_protection.enabled` at — an attribute every family has, whose
+    /// documentation defaults it to `false`. The catalog is the one source of that value,
+    /// here as in the collection.
+    pub fn deletion_protection_enabled(&self) -> bool {
+        self.attributes
+            .get(DELETION_PROTECTION_ATTRIBUTE)
+            .cloned()
+            .or_else(|| {
+                load_balancer_attribute(DELETION_PROTECTION_ATTRIBUTE)
+                    .and_then(|spec| spec.default_for(self))
+            })
+            .as_deref()
+            == Some("true")
     }
 }
 
@@ -853,11 +870,14 @@ pub fn downgrades_to_http(listener_protocol: Option<&str>, actions: &[Action]) -
 pub const HTTPS_TO_HTTP_REDIRECT_MESSAGE: &str = "You cannot redirect HTTPS to HTTP.";
 
 /// Every listener attribute this service models, with the load balancer families whose
-/// listeners carry it, the values it accepts and its documented default — each one a
-/// sentence of the model's own `ListenerAttribute$Key` documentation
+/// listeners carry it, the values it accepts and the value it is carried at until a write
+/// — each one a sentence of the model's own `ListenerAttribute$Key` documentation
 /// (`smithy_query(query="doc",shape="ListenerAttribute",member="Key")`), which is the
 /// only catalog of them; the Smithy shape itself is an unconstrained key/value pair, so
 /// nothing else in the model lists them.
+///
+/// The ORDER of this list is the order a listener's attribute collection is reported in
+/// ([`ListenerRecord::effective_attributes`]).
 pub static LISTENER_ATTRIBUTES: &[ListenerAttributeSpec] = &[
     // "The following attribute is supported by Network Load Balancers, and Gateway Load
     // Balancers: tcp.idle_timeout.seconds - The tcp idle timeout value, in seconds. The
@@ -879,8 +899,10 @@ pub static LISTENER_ATTRIBUTES: &[ListenerAttributeSpec] = &[
     },
     // "The following attributes are only supported by Application Load Balancers": the
     // mutual-TLS and TLS request header names, each of which the documentation describes
-    // as a header NAME the caller chooses, so the model states no domain and no default
-    // for any of them — they are reported once a caller has set one.
+    // as a header NAME the caller chooses, so the model states no domain and no value for
+    // any of them. An Application Load Balancer listener's attribute collection is the
+    // response-header set below, so none of these is in it: each is reported once a
+    // caller has written it.
     ListenerAttributeSpec {
         key: "routing.http.request.x_amzn_mtls_clientcert_serial_number.header_name",
         domain: AttributeDomain::Text,
@@ -930,75 +952,77 @@ pub static LISTENER_ATTRIBUTES: &[ListenerAttributeSpec] = &[
         default: None,
     },
     // "routing.http.response.server.enabled - Enables you to allow or remove the HTTP
-    // response server header." Allowed or removed: the two states the sentence names.
+    // response server header." Allowed or removed: the two states the sentence names,
+    // and the header is allowed until a caller removes it.
     ListenerAttributeSpec {
         key: "routing.http.response.server.enabled",
         domain: AttributeDomain::Boolean,
         families: &[LoadBalancerFamily::Application],
-        default: None,
+        default: Some("true"),
     },
     // The response header VALUES, each documented as the value of one HTTP response
-    // header — again a caller's string, with no domain or default in the model.
+    // header — again a caller's string, with no domain and no value stated for it, so the
+    // collection carries each at the empty string until a caller sets a header value.
     ListenerAttributeSpec {
         key: "routing.http.response.strict_transport_security.header_value",
         domain: AttributeDomain::Text,
         families: &[LoadBalancerFamily::Application],
-        default: None,
+        default: Some(""),
     },
     ListenerAttributeSpec {
         key: "routing.http.response.access_control_allow_origin.header_value",
         domain: AttributeDomain::Text,
         families: &[LoadBalancerFamily::Application],
-        default: None,
+        default: Some(""),
     },
     ListenerAttributeSpec {
         key: "routing.http.response.access_control_allow_methods.header_value",
         domain: AttributeDomain::Text,
         families: &[LoadBalancerFamily::Application],
-        default: None,
+        default: Some(""),
     },
     ListenerAttributeSpec {
         key: "routing.http.response.access_control_allow_headers.header_value",
         domain: AttributeDomain::Text,
         families: &[LoadBalancerFamily::Application],
-        default: None,
+        default: Some(""),
     },
     ListenerAttributeSpec {
         key: "routing.http.response.access_control_allow_credentials.header_value",
         domain: AttributeDomain::Text,
         families: &[LoadBalancerFamily::Application],
-        default: None,
+        default: Some(""),
     },
     ListenerAttributeSpec {
         key: "routing.http.response.access_control_expose_headers.header_value",
         domain: AttributeDomain::Text,
         families: &[LoadBalancerFamily::Application],
-        default: None,
+        default: Some(""),
     },
     // "Specifies how long the results of a preflight request can be cached, in seconds."
     ListenerAttributeSpec {
         key: "routing.http.response.access_control_max_age.header_value",
         domain: AttributeDomain::Text,
         families: &[LoadBalancerFamily::Application],
-        default: None,
+        default: Some(""),
     },
     ListenerAttributeSpec {
         key: "routing.http.response.content_security_policy.header_value",
         domain: AttributeDomain::Text,
         families: &[LoadBalancerFamily::Application],
-        default: None,
+        default: Some(""),
     },
     ListenerAttributeSpec {
         key: "routing.http.response.x_content_type_options.header_value",
         domain: AttributeDomain::Text,
         families: &[LoadBalancerFamily::Application],
-        default: None,
+        default: Some(""),
     },
     ListenerAttributeSpec {
         key: "routing.http.response.x_frame_options.header_value",
         domain: AttributeDomain::Text,
         families: &[LoadBalancerFamily::Application],
-        default: None,
+        default: Some(""),
     },
 ];
 
@@ -1011,8 +1035,10 @@ pub struct ListenerAttributeSpec {
     /// The load balancer families whose listeners carry the attribute, as the model's
     /// `ListenerAttribute$Key` documentation groups them.
     pub families: &'static [LoadBalancerFamily],
-    /// The documented default, or `None` for an attribute the model documents no default
-    /// for — which is then reported only once a caller has set it.
+    /// The value the attribute COLLECTION carries this attribute at until a caller
+    /// writes one: its documented default, and the empty string for a header-value
+    /// attribute the documentation states no value for. `None` marks an attribute the
+    /// collection does not carry at all, which a write of it is what puts there.
     pub default: Option<&'static str>,
 }
 
@@ -1241,8 +1267,10 @@ pub struct LoadBalancerAttributeSpec {
     /// The load balancer families that carry the attribute, as the model's
     /// `LoadBalancerAttribute$Key` documentation groups them.
     families: &'static [LoadBalancerFamily],
-    /// The documented default, or `None` for an attribute the model documents no default
-    /// for — which is then reported only once a caller has set it.
+    /// The value the attribute COLLECTION carries this attribute at until a caller
+    /// writes one: its documented default, and the empty string for a string-valued
+    /// attribute whose documentation states no value. `None` marks an attribute the
+    /// collection does not carry at all, which a write of it is what puts there.
     default: fn(&LoadBalancerRecord) -> Option<String>,
     /// The ONE value this attribute has on a load balancer whose documentation states it
     /// cannot be changed, or `None` where a caller may set it freely.
@@ -1278,49 +1306,20 @@ impl LoadBalancerAttributeSpec {
 }
 
 /// Every load balancer attribute this service models, with the families that carry it,
-/// the values it accepts and its documented default — each one a sentence of the model's
-/// own `LoadBalancerAttribute$Key` documentation
+/// the values it accepts and the value it is carried at until a write — each one a
+/// sentence of the model's own `LoadBalancerAttribute$Key` documentation
 /// (`smithy_query(query="doc",shape="LoadBalancerAttribute",member="Key")`), which is the
 /// only catalog of them; the Smithy shape itself is an unconstrained key/value pair, so
 /// nothing else in the model lists them.
+///
+/// The ORDER of this list is the order a load balancer's attribute collection is reported
+/// in ([`LoadBalancerRecord::effective_attributes`]), which is the service's own and
+/// neither alphabetical nor the documentation's grouping: the log destinations first, then
+/// the connection and routing settings, then the connection logs.
 pub static LOAD_BALANCER_ATTRIBUTES: &[LoadBalancerAttributeSpec] = &[
-    // "The following attributes are supported by all load balancers:"
-    //
-    // "deletion_protection.enabled - Indicates whether deletion protection is enabled.
-    // The value is true or false. The default is false."
-    LoadBalancerAttributeSpec {
-        key: "deletion_protection.enabled",
-        domain: AttributeDomain::Boolean,
-        families: EVERY_FAMILY,
-        default: |_| Some("false".to_string()),
-        fixed: |_| None,
-    },
-    // "load_balancing.cross_zone.enabled - ... The default for Network Load Balancers
-    // and Gateway Load Balancers is false. The default for Application Load Balancers is
-    // true, and can't be changed."
-    LoadBalancerAttributeSpec {
-        key: "load_balancing.cross_zone.enabled",
-        domain: AttributeDomain::Boolean,
-        families: EVERY_FAMILY,
-        default: |load_balancer| {
-            Some(
-                match load_balancer.family() {
-                    LoadBalancerFamily::Application => "true",
-                    LoadBalancerFamily::Network | LoadBalancerFamily::Gateway => "false",
-                }
-                .to_string(),
-            )
-        },
-        fixed: |load_balancer| {
-            (load_balancer.family() == LoadBalancerFamily::Application)
-                .then(|| "true".to_string())
-        },
-    },
-    // "The following attributes are supported by both Application Load Balancers and
-    // Network Load Balancers:"
-    //
     // "access_logs.s3.enabled - Indicates whether access logs are enabled. The value is
-    // true or false. The default is false."
+    // true or false. The default is false." Documented "supported by both Application
+    // Load Balancers and Network Load Balancers", as the two beside it are.
     LoadBalancerAttributeSpec {
         key: "access_logs.s3.enabled",
         domain: AttributeDomain::Boolean,
@@ -1329,12 +1328,13 @@ pub static LOAD_BALANCER_ATTRIBUTES: &[LoadBalancerAttributeSpec] = &[
         fixed: |_| None,
     },
     // "access_logs.s3.bucket - The name of the S3 bucket for the access logs." A name
-    // the caller chooses, with no domain and no default in the model.
+    // the caller chooses, with no domain and no value stated for it: the collection
+    // carries it at the empty string until a caller names a bucket.
     LoadBalancerAttributeSpec {
         key: "access_logs.s3.bucket",
         domain: AttributeDomain::Text,
         families: APPLICATION_AND_NETWORK,
-        default: |_| None,
+        default: |_| Some(String::new()),
         fixed: |_| None,
     },
     // "access_logs.s3.prefix - The prefix for the location in the S3 bucket for the
@@ -1343,86 +1343,11 @@ pub static LOAD_BALANCER_ATTRIBUTES: &[LoadBalancerAttributeSpec] = &[
         key: "access_logs.s3.prefix",
         domain: AttributeDomain::Text,
         families: APPLICATION_AND_NETWORK,
-        default: |_| None,
-        fixed: |_| None,
-    },
-    // "ipv6.deny_all_igw_traffic - Blocks internet gateway (IGW) access to the load
-    // balancer. It is set to false for internet-facing load balancers and true for
-    // internal load balancers".
-    LoadBalancerAttributeSpec {
-        key: "ipv6.deny_all_igw_traffic",
-        domain: AttributeDomain::Boolean,
-        families: APPLICATION_AND_NETWORK,
-        default: |load_balancer| {
-            Some(
-                if load_balancer.scheme == INTERNAL_SCHEME {
-                    "true"
-                } else {
-                    "false"
-                }
-                .to_string(),
-            )
-        },
-        fixed: |_| None,
-    },
-    // "zonal_shift.config.enabled - Indicates whether zonal shift is enabled. The
-    // possible values are true and false. The default is false."
-    LoadBalancerAttributeSpec {
-        key: "zonal_shift.config.enabled",
-        domain: AttributeDomain::Boolean,
-        families: APPLICATION_AND_NETWORK,
-        default: |_| Some("false".to_string()),
+        default: |_| Some(String::new()),
         fixed: |_| None,
     },
     // "The following attributes are supported by only Application Load Balancers:"
     //
-    // "idle_timeout.timeout_seconds - The idle timeout value, in seconds. The valid
-    // range is 1-4000 seconds. The default is 60 seconds."
-    LoadBalancerAttributeSpec {
-        key: "idle_timeout.timeout_seconds",
-        domain: AttributeDomain::Integer { min: 1, max: 4000 },
-        families: APPLICATION_ONLY,
-        default: |_| Some("60".to_string()),
-        fixed: |_| None,
-    },
-    // "client_keep_alive.seconds - The client keep alive value, in seconds. The valid
-    // range is 60-604800 seconds. The default is 3600 seconds."
-    LoadBalancerAttributeSpec {
-        key: "client_keep_alive.seconds",
-        domain: AttributeDomain::Integer {
-            min: 60,
-            max: 604_800,
-        },
-        families: APPLICATION_ONLY,
-        default: |_| Some("3600".to_string()),
-        fixed: |_| None,
-    },
-    // "connection_logs.s3.enabled - Indicates whether connection logs are enabled. The
-    // value is true or false. The default is false."
-    LoadBalancerAttributeSpec {
-        key: "connection_logs.s3.enabled",
-        domain: AttributeDomain::Boolean,
-        families: APPLICATION_ONLY,
-        default: |_| Some("false".to_string()),
-        fixed: |_| None,
-    },
-    // "connection_logs.s3.bucket - The name of the S3 bucket for the connection logs."
-    LoadBalancerAttributeSpec {
-        key: "connection_logs.s3.bucket",
-        domain: AttributeDomain::Text,
-        families: APPLICATION_ONLY,
-        default: |_| None,
-        fixed: |_| None,
-    },
-    // "connection_logs.s3.prefix - The prefix for the location in the S3 bucket for the
-    // connection logs."
-    LoadBalancerAttributeSpec {
-        key: "connection_logs.s3.prefix",
-        domain: AttributeDomain::Text,
-        families: APPLICATION_ONLY,
-        default: |_| None,
-        fixed: |_| None,
-    },
     // "health_check_logs.s3.enabled - Indicates whether health check logs are enabled.
     // The value is true or false. The default is false."
     LoadBalancerAttributeSpec {
@@ -1438,7 +1363,7 @@ pub static LOAD_BALANCER_ATTRIBUTES: &[LoadBalancerAttributeSpec] = &[
         key: "health_check_logs.s3.bucket",
         domain: AttributeDomain::Text,
         families: APPLICATION_ONLY,
-        default: |_| None,
+        default: |_| Some(String::new()),
         fixed: |_| None,
     },
     // "health_check_logs.s3.prefix - The prefix for the location in the S3 bucket for
@@ -1447,38 +1372,40 @@ pub static LOAD_BALANCER_ATTRIBUTES: &[LoadBalancerAttributeSpec] = &[
         key: "health_check_logs.s3.prefix",
         domain: AttributeDomain::Text,
         families: APPLICATION_ONLY,
-        default: |_| None,
+        default: |_| Some(String::new()),
         fixed: |_| None,
     },
-    // "routing.http.desync_mitigation_mode - ... The possible values are monitor,
-    // defensive, and strictest. The default is defensive."
+    // "idle_timeout.timeout_seconds - The idle timeout value, in seconds. The valid
+    // range is 1-4000 seconds. The default is 60 seconds."
     LoadBalancerAttributeSpec {
-        key: "routing.http.desync_mitigation_mode",
-        domain: AttributeDomain::OneOf(&["monitor", "defensive", "strictest"]),
+        key: "idle_timeout.timeout_seconds",
+        domain: AttributeDomain::Integer { min: 1, max: 4000 },
         families: APPLICATION_ONLY,
-        default: |_| Some("defensive".to_string()),
+        default: |_| Some("60".to_string()),
+        fixed: |_| None,
+    },
+    // "The following attributes are supported by all load balancers:"
+    //
+    // "deletion_protection.enabled - Indicates whether deletion protection is enabled.
+    // The value is true or false. The default is false."
+    LoadBalancerAttributeSpec {
+        key: "deletion_protection.enabled",
+        domain: AttributeDomain::Boolean,
+        families: EVERY_FAMILY,
+        default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "routing.http2.enabled - ... The default is true."
+    LoadBalancerAttributeSpec {
+        key: "routing.http2.enabled",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_ONLY,
+        default: |_| Some("true".to_string()),
         fixed: |_| None,
     },
     // "routing.http.drop_invalid_header_fields.enabled - ... The default is false."
     LoadBalancerAttributeSpec {
         key: "routing.http.drop_invalid_header_fields.enabled",
-        domain: AttributeDomain::Boolean,
-        families: APPLICATION_ONLY,
-        default: |_| Some("false".to_string()),
-        fixed: |_| None,
-    },
-    // "routing.http.preserve_host_header.enabled - ... The default is false."
-    LoadBalancerAttributeSpec {
-        key: "routing.http.preserve_host_header.enabled",
-        domain: AttributeDomain::Boolean,
-        families: APPLICATION_ONLY,
-        default: |_| Some("false".to_string()),
-        fixed: |_| None,
-    },
-    // "routing.http.x_amzn_tls_version_and_cipher_suite.enabled - ... The default is
-    // false."
-    LoadBalancerAttributeSpec {
-        key: "routing.http.x_amzn_tls_version_and_cipher_suite.enabled",
         domain: AttributeDomain::Boolean,
         families: APPLICATION_ONLY,
         default: |_| Some("false".to_string()),
@@ -1501,12 +1428,63 @@ pub static LOAD_BALANCER_ATTRIBUTES: &[LoadBalancerAttributeSpec] = &[
         default: |_| Some("append".to_string()),
         fixed: |_| None,
     },
-    // "routing.http2.enabled - ... The default is true."
+    // "routing.http.preserve_host_header.enabled - ... The default is false."
     LoadBalancerAttributeSpec {
-        key: "routing.http2.enabled",
+        key: "routing.http.preserve_host_header.enabled",
         domain: AttributeDomain::Boolean,
         families: APPLICATION_ONLY,
-        default: |_| Some("true".to_string()),
+        default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "routing.http.x_amzn_tls_version_and_cipher_suite.enabled - ... The default is
+    // false."
+    LoadBalancerAttributeSpec {
+        key: "routing.http.x_amzn_tls_version_and_cipher_suite.enabled",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_ONLY,
+        default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "routing.http.desync_mitigation_mode - ... The possible values are monitor,
+    // defensive, and strictest. The default is defensive."
+    LoadBalancerAttributeSpec {
+        key: "routing.http.desync_mitigation_mode",
+        domain: AttributeDomain::OneOf(&["monitor", "defensive", "strictest"]),
+        families: APPLICATION_ONLY,
+        default: |_| Some("defensive".to_string()),
+        fixed: |_| None,
+    },
+    // "load_balancing.cross_zone.enabled - ... The default for Network Load Balancers
+    // and Gateway Load Balancers is false. The default for Application Load Balancers is
+    // true, and can't be changed." Documented "supported by all load balancers".
+    LoadBalancerAttributeSpec {
+        key: "load_balancing.cross_zone.enabled",
+        domain: AttributeDomain::Boolean,
+        families: EVERY_FAMILY,
+        default: |load_balancer| {
+            Some(
+                match load_balancer.family() {
+                    LoadBalancerFamily::Application => "true",
+                    LoadBalancerFamily::Network | LoadBalancerFamily::Gateway => "false",
+                }
+                .to_string(),
+            )
+        },
+        fixed: |load_balancer| {
+            (load_balancer.family() == LoadBalancerFamily::Application)
+                .then(|| "true".to_string())
+        },
+    },
+    // "client_keep_alive.seconds - The client keep alive value, in seconds. The valid
+    // range is 60-604800 seconds. The default is 3600 seconds."
+    LoadBalancerAttributeSpec {
+        key: "client_keep_alive.seconds",
+        domain: AttributeDomain::Integer {
+            min: 60,
+            max: 604_800,
+        },
+        families: APPLICATION_ONLY,
+        default: |_| Some("3600".to_string()),
         fixed: |_| None,
     },
     // "waf.fail_open.enabled - ... The default is false."
@@ -1515,6 +1493,55 @@ pub static LOAD_BALANCER_ATTRIBUTES: &[LoadBalancerAttributeSpec] = &[
         domain: AttributeDomain::Boolean,
         families: APPLICATION_ONLY,
         default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "zonal_shift.config.enabled - Indicates whether zonal shift is enabled. The
+    // possible values are true and false. The default is false." Documented for both
+    // Application and Network Load Balancers.
+    LoadBalancerAttributeSpec {
+        key: "zonal_shift.config.enabled",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_AND_NETWORK,
+        default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "connection_logs.s3.enabled - Indicates whether connection logs are enabled. The
+    // value is true or false. The default is false."
+    LoadBalancerAttributeSpec {
+        key: "connection_logs.s3.enabled",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_ONLY,
+        default: |_| Some("false".to_string()),
+        fixed: |_| None,
+    },
+    // "connection_logs.s3.bucket - The name of the S3 bucket for the connection logs."
+    LoadBalancerAttributeSpec {
+        key: "connection_logs.s3.bucket",
+        domain: AttributeDomain::Text,
+        families: APPLICATION_ONLY,
+        default: |_| Some(String::new()),
+        fixed: |_| None,
+    },
+    // "connection_logs.s3.prefix - The prefix for the location in the S3 bucket for the
+    // connection logs."
+    LoadBalancerAttributeSpec {
+        key: "connection_logs.s3.prefix",
+        domain: AttributeDomain::Text,
+        families: APPLICATION_ONLY,
+        default: |_| Some(String::new()),
+        fixed: |_| None,
+    },
+    // "ipv6.deny_all_igw_traffic - Blocks internet gateway (IGW) access to the load
+    // balancer. It is set to false for internet-facing load balancers and true for
+    // internal load balancers". A write of it is accepted on the families the
+    // documentation lists it under, but the value follows the scheme rather than being
+    // held per load balancer, and the attribute collection a read and a write answer with
+    // does not carry it — so it is reported only once a caller has written one.
+    LoadBalancerAttributeSpec {
+        key: "ipv6.deny_all_igw_traffic",
+        domain: AttributeDomain::Boolean,
+        families: APPLICATION_AND_NETWORK,
+        default: |_| None,
         fixed: |_| None,
     },
     // "The following attributes are supported by only Network Load Balancers:"
@@ -1546,6 +1573,10 @@ pub static LOAD_BALANCER_ATTRIBUTES: &[LoadBalancerAttributeSpec] = &[
         fixed: |_| None,
     },
 ];
+
+/// The attribute whose documentation decides whether a load balancer can be deleted:
+/// "deletion_protection.enabled - Indicates whether deletion protection is enabled."
+pub const DELETION_PROTECTION_ATTRIBUTE: &str = "deletion_protection.enabled";
 
 /// The families of an attribute the documentation lists under "supported by all load
 /// balancers".
@@ -2104,6 +2135,17 @@ pub fn load_balancer_not_found_message(arn: &str) -> String {
     format!("Load balancer '{arn}' not found")
 }
 
+/// The message Elastic Load Balancing answers a delete of a load balancer whose
+/// deletion protection is on with, under the modelled "this operation is not allowed":
+/// `DeleteLoadBalancer` documents "You can't delete a load balancer if deletion
+/// protection is enabled".
+///
+/// Built from the request, like the not-found messages beside it: the ARN the caller
+/// named, under the rule it broke.
+pub fn deletion_protection_message(arn: &str) -> String {
+    format!("Load balancer '{arn}' cannot be deleted because deletion protection is enabled")
+}
+
 /// The message Elastic Load Balancing answers a `LoadBalancerNotFound` with for a read
 /// over a LIST of identifiers (`DescribeLoadBalancers`, whose `LoadBalancerArns` and
 /// `Names` are both lists).
@@ -2336,8 +2378,10 @@ pub struct AttributeSpec {
     pub domain: AttributeDomain,
     /// Whether a target group of this shape carries the attribute at all.
     applies: fn(&TargetGroupRecord) -> bool,
-    /// The documented default, or `None` for an attribute the model documents no
-    /// default for — which is then reported only once a caller has set it.
+    /// The value the attribute COLLECTION carries this attribute at until a caller
+    /// writes one: its documented default, and the empty string for a string-valued
+    /// attribute whose documentation states no value. `None` marks an attribute the
+    /// collection does not carry at all, which a write of it is what puts there.
     default: fn(&TargetGroupRecord) -> Option<String>,
 }
 
@@ -2363,11 +2407,15 @@ impl AttributeSpec {
 }
 
 /// Every target group attribute this service models, with the family it belongs to,
-/// the values it accepts and its default — each one a sentence of the model's own
-/// `TargetGroupAttribute$Key` documentation
+/// the values it accepts and the value it is carried at until a write — each one a
+/// sentence of the model's own `TargetGroupAttribute$Key` documentation
 /// (`smithy_query(query="doc",shape="TargetGroupAttribute",member="Key")`), which is
 /// the only catalog of them; the Smithy shape itself is an unconstrained key/value
 /// pair, so nothing else in the model lists them.
+///
+/// The ORDER of this list is the documentation's own, and the order a target group's
+/// attribute collection is reported in
+/// ([`TargetGroupRecord::effective_attributes`]).
 pub static TARGET_GROUP_ATTRIBUTES: &[AttributeSpec] = &[
     // Supported by all load balancers.
     AttributeSpec {
@@ -2470,8 +2518,9 @@ pub static TARGET_GROUP_ATTRIBUTES: &[AttributeSpec] = &[
         key: "stickiness.app_cookie.cookie_name",
         domain: AttributeDomain::CookieName,
         applies: TargetGroupRecord::is_application_with_addressable_targets,
-        // The model documents no default: the attribute is reported once set.
-        default: |_| None,
+        // A cookie name the caller chooses, with no value stated for it: the collection
+        // carries it at the empty string until a caller names a cookie.
+        default: |_| Some(String::new()),
     },
     AttributeSpec {
         key: "stickiness.app_cookie.duration_seconds",
@@ -2680,11 +2729,15 @@ impl TargetGroupRecord {
         }
     }
 
-    /// Every attribute this target group reports: each one the model documents for a
-    /// group of this shape, carrying what a caller set or, failing that, its documented
-    /// default. Keyed in a stable order so two reads of one target group answer alike.
+    /// This target group's WHOLE attribute collection: every attribute the catalog
+    /// carries for a group of this shape, each holding what a caller wrote or, failing
+    /// that, the value it is carried at — which is what both a read and a write of these
+    /// attributes answers with.
+    ///
+    /// In [`TARGET_GROUP_ATTRIBUTES`] order, which is the order the service reports them
+    /// in, so two reads of one target group answer alike.
     pub fn effective_attributes(&self) -> Vec<(String, String)> {
-        let mut reported: Vec<(String, String)> = TARGET_GROUP_ATTRIBUTES
+        TARGET_GROUP_ATTRIBUTES
             .iter()
             .filter(|spec| spec.applies_to(self))
             .filter_map(|spec| {
@@ -2695,9 +2748,7 @@ impl TargetGroupRecord {
                     .or_else(|| spec.default_for(self))?;
                 Some((spec.key.to_string(), value))
             })
-            .collect();
-        reported.sort_by(|left, right| left.0.cmp(&right.0));
-        reported
+            .collect()
     }
 
     /// [`Self::effective_attributes`] as the modelled shape.
@@ -3255,10 +3306,13 @@ impl ListenerRecord {
         }
     }
 
-    /// Every attribute a listener of a load balancer in `family` reports: the value
-    /// stored for it, else the default its documentation states, and nothing for an
-    /// attribute this family's listeners do not carry or whose default the model does
-    /// not state.
+    /// This listener's WHOLE attribute collection, for a listener of a load balancer in
+    /// `family`: every attribute the catalog carries for such a listener, each holding
+    /// the value stored for it or the value it is carried at — which is what both a read
+    /// and a write of these attributes answers with — and nothing for an attribute this
+    /// family's listeners do not carry or that the collection does not carry.
+    ///
+    /// In [`LISTENER_ATTRIBUTES`] order, which is the order the service reports them in.
     pub fn effective_attributes(&self, family: LoadBalancerFamily) -> Vec<(String, String)> {
         LISTENER_ATTRIBUTES
             .iter()
