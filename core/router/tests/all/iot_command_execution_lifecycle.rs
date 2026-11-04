@@ -314,10 +314,14 @@ fn a_started_command_execution_is_the_one_the_control_plane_reads_and_deletes() 
 
                 // "Only command executions that enter a terminal state can be deleted":
                 // while it is CREATED the delete is refused and changes nothing.
-                let (status, error_code, rendered, _) = delete(&execution_id, &target);
+                let (status, error_code, rendered, refusal) = delete(&execution_id, &target);
                 assert_eq!(
-                    (status, error_code.as_str()),
-                    (409, "ConflictException"),
+                    (status, error_code.as_str(), refusal["message"].as_str()),
+                    (
+                        400,
+                        "ValidationException",
+                        Some("Failed to delete command execution as it hasn't become terminal."),
+                    ),
                     "case {label:?}: deleting a non-terminal execution must be refused, \
                      got {status} with {rendered}"
                 );

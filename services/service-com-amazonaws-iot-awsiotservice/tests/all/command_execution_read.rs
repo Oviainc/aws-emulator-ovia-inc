@@ -25,10 +25,12 @@
 //! * an execution whose armed timeout the clock has already passed is reported
 //!   `TIMED_OUT` — the transition that was due at the deadline, which the device's own
 //!   plane then sees too — while a twin whose deadline is still ahead is untouched;
-//! * `DeleteCommandExecution` removes a TERMINAL command execution from the shared
-//!   store and refuses a non-terminal one 409 `ConflictException`, changing nothing;
-//!   an `executionId` the device holds nothing under removes nothing and answers 200,
-//!   the model declaring no not-found error for the operation.
+//! * `DeleteCommandExecution` removes a command execution a DEVICE reported the outcome
+//!   of the work for (`SUCCEEDED`, `FAILED`, `REJECTED`) from the shared store, and
+//!   refuses it in every other status it can be read in (`CREATED`, `IN_PROGRESS`,
+//!   `TIMED_OUT`) 400 `ValidationException` with the service's fixed deletability
+//!   message, changing nothing; an `executionId` the device holds nothing under removes
+//!   nothing and answers 200, the model declaring no not-found error for the operation.
 //!
 //! Each table spans what its rule generalises over — which `CommandExecutionStatus` the
 //! execution is in, how many parameters it carries and of which modelled type, whether
@@ -297,6 +299,12 @@ const STATUS_FAILED: &str = "FAILED";
 /// A stored `JobExecutionStatus` the command surface has NO value for, so a record in
 /// it is not a command execution any reader of this surface reports.
 const STATUS_CANCELED: &str = "CANCELED";
+
+/// The service's wording for a delete of a command execution that has not become
+/// deletable: FIXED text for that refusal, carrying no value of the request or the
+/// stored record.
+const NOT_TERMINAL_MESSAGE: &str =
+    "Failed to delete command execution as it hasn't become terminal.";
 
 /// The ARN of a device, as a `targetArn` names it.
 fn target_arn(region: &str, thing_name: &str) -> String {
@@ -861,28 +869,102 @@ async fn a_due_timeout_is_materialised_before_the_execution_is_reported() {
     }
 }
 
-/// RULE: `DeleteCommandExecution` removes a command execution that has reached a
-/// terminal status and refuses one that has not with 409 `ConflictException`, leaving it
-/// exactly as it was.
+/// One row of the deletability table.
+struct DeleteCase {
+    case: &'static str,
+    /// The `JobExecutionStatus` the record is stored in.
+    stored_status: &'static str,
+    /// Where the armed execution timeout's deadline falls relative to the instant the
+    /// delete is made, in seconds; `None` arms no timer at all. A deadline already past
+    /// is the `TIMED_OUT` move the clock owes, which the delete materialises before it
+    /// reads the status.
+    timeout_offset: Option<i64>,
+    /// Whether the delete removes the execution.
+    deletable: bool,
+    /// The `CommandExecutionStatus` the execution is reported in after the call, when it
+    /// survives it.
+    reported_status: &'static str,
+}
+
+/// RULE: `DeleteCommandExecution` removes a command execution only in a status a DEVICE
+/// reported the outcome of the work with — `SUCCEEDED`, `FAILED` or `REJECTED` — and
+/// refuses it in every other status it can be read in (`CREATED`, `IN_PROGRESS`, and
+/// `TIMED_OUT`, whether the record was stored that way or the clock moved it there) with
+/// HTTP 400 `ValidationException` carrying the service's fixed deletability message,
+/// leaving the execution exactly as it was and still readable.
 #[tokio::test]
-async fn only_a_terminal_command_execution_is_deleted() {
+async fn only_a_device_reported_command_execution_is_deleted() {
     let emulator = Emulator::new();
     emulator.create_command("cmd-delete", REGION).await;
     let command = command_arn(REGION, "cmd-delete");
     let now = now_epoch_seconds();
 
-    // One row per status an execution can be read in: the two non-terminal ones are
-    // refused, the four terminal ones are deleted.
-    let cases: [(&str, &str, bool); 6] = [
-        ("a created execution", STATUS_QUEUED, false),
-        ("an execution in progress", STATUS_IN_PROGRESS, false),
-        ("a succeeded execution", STATUS_SUCCEEDED, true),
-        ("a failed execution", STATUS_FAILED, true),
-        ("a rejected execution", STATUS_REJECTED, true),
-        ("a timed-out execution", STATUS_TIMED_OUT, true),
+    // One row per `CommandExecutionStatus` this model declares
+    // (`smithy_query(query="shape",shape="CommandExecutionStatus")`: CREATED,
+    // IN_PROGRESS, SUCCEEDED, FAILED, REJECTED, TIMED_OUT), plus the TIMED_OUT the CLOCK
+    // makes due during the delete itself, and rows that differ in whether a timer is
+    // armed at all.
+    let cases: [DeleteCase; 8] = [
+        DeleteCase {
+            case: "a created execution",
+            stored_status: STATUS_QUEUED,
+            timeout_offset: Some(3_600),
+            deletable: false,
+            reported_status: STATUS_CREATED,
+        },
+        DeleteCase {
+            case: "an execution in progress",
+            stored_status: STATUS_IN_PROGRESS,
+            timeout_offset: Some(3_600),
+            deletable: false,
+            reported_status: STATUS_IN_PROGRESS,
+        },
+        DeleteCase {
+            case: "an execution with no timer, in progress",
+            stored_status: STATUS_IN_PROGRESS,
+            timeout_offset: None,
+            deletable: false,
+            reported_status: STATUS_IN_PROGRESS,
+        },
+        DeleteCase {
+            case: "an execution the clock timed out at a deadline already past",
+            stored_status: STATUS_QUEUED,
+            timeout_offset: Some(-1),
+            deletable: false,
+            reported_status: STATUS_TIMED_OUT,
+        },
+        DeleteCase {
+            case: "an execution already stored timed out",
+            stored_status: STATUS_TIMED_OUT,
+            timeout_offset: None,
+            deletable: false,
+            reported_status: STATUS_TIMED_OUT,
+        },
+        DeleteCase {
+            case: "a succeeded execution",
+            stored_status: STATUS_SUCCEEDED,
+            timeout_offset: Some(3_600),
+            deletable: true,
+            reported_status: STATUS_SUCCEEDED,
+        },
+        DeleteCase {
+            case: "a failed execution, no timer",
+            stored_status: STATUS_FAILED,
+            timeout_offset: None,
+            deletable: true,
+            reported_status: STATUS_FAILED,
+        },
+        DeleteCase {
+            case: "a rejected execution",
+            stored_status: STATUS_REJECTED,
+            timeout_offset: Some(3_600),
+            deletable: true,
+            reported_status: STATUS_REJECTED,
+        },
     ];
 
-    for (index, (case, stored_status, deletable)) in cases.into_iter().enumerate() {
+    for (index, row) in cases.iter().enumerate() {
+        let case = row.case;
         let thing_name = format!("laser-delete-{index}");
         let execution_id = format!("exec-delete-{index}");
         emulator.seed(&Seed {
@@ -890,9 +972,9 @@ async fn only_a_terminal_command_execution_is_deleted() {
             thing_name: &thing_name,
             command_arn: command.clone(),
             parameters: json!({ "target": { "S": "off" } }),
-            timeout_seconds: Some(120),
-            timeout_expires_at: Some(now + 3_600),
-            status: stored_status,
+            timeout_seconds: row.timeout_offset.map(|_| 120),
+            timeout_expires_at: row.timeout_offset.map(|offset| now + offset),
+            status: row.stored_status,
             created_at: now - 120,
             started_at: Some(now - 100),
             last_updated_at: now - 60,
@@ -903,10 +985,11 @@ async fn only_a_terminal_command_execution_is_deleted() {
             .delete_execution(&execution_id, &target, REGION)
             .await;
 
-        if deletable {
+        if row.deletable {
             assert_eq!(
                 reply.status, 200,
-                "case {case:?}: a terminal execution is deletable, got {reply:?}"
+                "case {case:?}: an execution the device reported an outcome for is \
+                 deletable, got {reply:?}"
             );
             assert_eq!(
                 emulator.stored_status(&thing_name, &execution_id),
@@ -934,24 +1017,36 @@ async fn only_a_terminal_command_execution_is_deleted() {
         } else {
             assert_eq!(
                 (reply.status, reply.error_code.as_deref()),
-                (409, Some("ConflictException")),
-                "case {case:?}: only a terminal execution can be deleted, got {reply:?}"
-            );
-            assert!(
-                reply.message().contains(&execution_id),
-                "case {case:?}: the refusal must name the execution it refused, \
-                 got {reply:?}"
+                (400, Some("ValidationException")),
+                "case {case:?}: an execution no device reported an outcome for is \
+                 refused 400 ValidationException, got {reply:?}"
             );
             assert_eq!(
-                emulator.stored_status(&thing_name, &execution_id),
-                Some(stored_status.to_string()),
-                "case {case:?}: a refused delete must change nothing"
+                reply.message(),
+                NOT_TERMINAL_MESSAGE,
+                "case {case:?}: expected the fixed deletability message, got {reply:?}"
+            );
+            // The refusal's text is FIXED: it carries neither the requested id nor the
+            // status the store holds.
+            assert!(
+                !reply.message().contains(&execution_id)
+                    && !reply.message().contains(row.reported_status),
+                "case {case:?}: the refusal must interpolate no request or stored value, \
+                 got {reply:?}"
+            );
+            let stored = emulator.stored_status(&thing_name, &execution_id);
+            assert_eq!(
+                stored.as_deref().and_then(command_execution_status),
+                Some(row.reported_status),
+                "case {case:?}: a refused delete must leave the execution in the status \
+                 the clock decided, got {stored:?}"
             );
             let still_there = emulator
                 .get_execution(&execution_id, &target, None, REGION)
                 .await;
             assert_eq!(
-                still_there.status, 200,
+                (still_there.status, still_there.member("status")),
+                (200, &json!(row.reported_status)),
                 "case {case:?}: a refused delete leaves the execution readable, \
                  got {still_there:?}"
             );

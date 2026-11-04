@@ -8,11 +8,14 @@
 //! `GetCommandExecution` alike.
 //!
 //! "Only command executions that enter a terminal state can be deleted from your
-//! account", so an execution still `CREATED` or `IN_PROGRESS` is refused 409
-//! `ConflictException` and stays exactly as it was. The deadline the clock has already
-//! passed counts as reached: an execution whose armed timeout is due is `TIMED_OUT`,
-//! hence terminal, hence deletable, which is why the timers are materialised before the
-//! status is read.
+//! account": the statuses the execution ENTERS that way are the ones a DEVICE reported
+//! the outcome of the work with (`crate::state::DELETABLE_COMMAND_EXECUTION_STATUSES`),
+//! so an execution still `CREATED` or `IN_PROGRESS`, and one the cloud moved to
+//! `TIMED_OUT` because no device ever reported, is refused 400 `ValidationException` and
+//! stays exactly as it was — a timed-out execution remains readable through
+//! `GetCommandExecution`. The timers are still materialised before the status is read, so
+//! the status this gate consults is the one the deadline already decided and the device's
+//! own plane sees the same.
 //!
 //! `targetArn` must name a DEVICE (`…:thing/<name>`), or the request is refused 400
 //! `ValidationException` naming how the value was read. This operation models NO
@@ -82,6 +85,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The service's wording for a delete of an execution that has not become deletable:
+/// FIXED text for this refusal, interpolating no request value and no stored one.
+const NOT_TERMINAL_MESSAGE: &str =
+    "Failed to delete command execution as it hasn't become terminal.";
 
 /// A refusal of this request as the modelled `ValidationException` (HTTP 400).
 fn invalid_request(message: String) -> DeleteCommandExecutionError {
@@ -185,9 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = executions.lock();
         // The `TIMED_OUT` transitions the clock has already made due are materialised
-        // first, so an execution whose timeout has passed is deleted as the terminal
-        // execution it already is rather than refused as a running one. The move was
-        // owed at its own deadline whether or not this call happened.
+        // first, so the status the gate below reads is the one the deadline decided
+        // rather than the one the record was last written with. The move was owed at its
+        // own deadline whether or not this call happened; what it does NOT do is make the
+        // execution deletable.
         store.time_out_due_executions(&thing_name, now);
 
         // Only a COMMAND execution of this device is deletable here; an execution the
@@ -200,31 +209,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Ok(DeleteCommandExecutionOutput {});
         };
-        // Copied out before the store is written: the refusal below reads the status,
-        // and the removal needs the execution's number to address the record.
-        let (status, execution_number, is_pending) = (
-            record.status.clone(),
-            record.execution_number,
-            record.is_pending(),
-        );
+        // Copied out before the store is written: the gate below reads the status, and
+        // the removal needs the execution's number to address the record.
+        let (status, execution_number) = (record.status.clone(), record.execution_number);
 
         // "Only command executions that enter a terminal state can be deleted from your
-        // account": one that has not is refused, and nothing is removed.
-        if is_pending {
-            return Err(DeleteCommandExecutionErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "Command execution {} is in status {} and only command executions in a terminal status can be deleted",
-                        input.execution_id,
-                        // The lookup above only answers for a record this model can
-                        // name a status for, so the projection is always Some here;
-                        // the stored status is the fallback rather than a panic.
-                        crate::state::command_execution_status(&status).unwrap_or(&status)
-                    )),
-                    resource_id: Some(input.execution_id.clone()),
-                },
-            )
-            .into());
+        // account": an execution in any other status is refused, and nothing is removed.
+        if !crate::state::command_execution_is_deletable(&status) {
+            return Err(invalid_request(NOT_TERMINAL_MESSAGE.to_string()));
         }
 
         store.remove_execution(&thing_name, &input.execution_id, execution_number);

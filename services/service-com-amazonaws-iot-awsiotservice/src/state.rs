@@ -2940,6 +2940,30 @@ pub fn command_execution_status(stored_status: &str) -> Option<&'static str> {
     }
 }
 
+/// The `CommandExecutionStatus` values a command execution may be DELETED in.
+///
+/// `DeleteCommandExecution` is "Only command executions that enter a terminal state can
+/// be deleted from your account", and the statuses the service counts as having been
+/// ENTERED that way are the ones a DEVICE reported the outcome of the work with:
+/// `SUCCEEDED`, `FAILED` and `REJECTED`, the published list of the statuses the delete
+/// accepts. `CREATED` and `IN_PROGRESS` are an execution still running, and `TIMED_OUT`
+/// is the cloud giving up on a device that never reported at all — so a delete of an
+/// execution in any of those three is refused and the record stays readable, which is
+/// what keeps a timed-out execution available for diagnosis.
+pub const DELETABLE_COMMAND_EXECUTION_STATUSES: [&str; 3] = ["SUCCEEDED", "FAILED", "REJECTED"];
+
+/// True when a STORED execution's status is one a delete may remove it in.
+///
+/// The status is read on the command surface first ([`command_execution_status`]), so the
+/// gate is stated once in the vocabulary the operation's own model declares
+/// ([`DELETABLE_COMMAND_EXECUTION_STATUSES`]) and a stored status this model cannot name
+/// is not deletable either — the same record a command-execution reader reports nothing
+/// for.
+pub fn command_execution_is_deletable(stored_status: &str) -> bool {
+    command_execution_status(stored_status)
+        .is_some_and(|status| DELETABLE_COMMAND_EXECUTION_STATUSES.contains(&status))
+}
+
 /// When a command execution STARTED, in epoch seconds.
 ///
 /// `CommandExecutionSummary$startedAt` is "The date and time at which the command
