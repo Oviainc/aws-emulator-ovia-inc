@@ -12,6 +12,11 @@
 //! so what this reports is the status the clock had already reached and not a status
 //! moved on because somebody polled.
 //!
+//! A `ColumnStatisticsTaskRunId` outside the member's modelled `@pattern` is a MALFORMED
+//! request, not a miss: it is refused with the constraint refusal the boundary validator
+//! answers with (HTTP 400, `ValidationException`) before the store is read at all
+//! ([`is_modelled_hash_string`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -71,6 +76,57 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// `ColumnStatisticsTaskRunId`'s modelled `@pattern`, as the model writes it
+/// (`smithy_query operation=GetColumnStatisticsTaskRun`). A constraint refusal quotes the
+/// expression without the anchoring pair, which is the rendering
+/// [`::service_common::validation::unanchored`] owns, so the expression is held here as
+/// the model declares it and unanchored where it is quoted.
+const RUN_ID_PATTERN: &str = r"^[\u0020-\uD7FF\uE000-\uFFFD\uD800\uDC00-\uDBFF\uDFFF\t]*$";
+
+/// The sentence this read refuses an id no run of this account has with.
+///
+/// RECORDED constant: fixed text naming the MEMBER the request addressed the run by, with
+/// the value it sent withheld — the same shape the recorded settings miss of this surface
+/// has ([`crate::state::messages::COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND`]) — so no part
+/// of one request's id is part of the refusal.
+const RUN_NOT_FOUND: &str =
+    "For given input ColumnStatisticsTaskRunId, associated ColumnStatisticsTaskRun does not \
+     exist";
+
+/// The member path a constraint clause names this member by: the member as the wire
+/// spells it, lower-camel-cased, which is how the boundary validator's own clauses read.
+const RUN_ID_MEMBER_PATH: &str = "columnStatisticsTaskRunId";
+
+/// Whether `value` satisfies [`RUN_ID_PATTERN`], the expression `HashString` declares.
+///
+/// The expression admits a tab and the three Unicode ranges it spells: U+0020..U+D7FF,
+/// U+E000..U+FFFD, and the astral planes, which it writes as the UTF-16 surrogate pair
+/// range `\uD800\uDC00-\uDBFF\uDFFF` and which a Rust `char` holds directly
+/// (U+10000..U+10FFFF). So every other character is outside it: a control character below
+/// U+0020 other than a tab — a newline, a carriage return — and the two non-characters
+/// U+FFFE and U+FFFF.
+///
+/// It is checked HERE because the boundary validator cannot: the framework's regex engine
+/// does not compile an expression spelling a surrogate range, and a pattern it cannot
+/// compile admits every value.
+fn is_modelled_hash_string(value: &str) -> bool {
+    value.chars().all(|character| {
+        matches!(character,
+            '\t' | '\u{0020}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+    })
+}
+
+/// The constraint refusal a value outside [`RUN_ID_PATTERN`] earns: AWS's own
+/// validation-error envelope over the one clause that fired, naming the value the caller
+/// submitted, the member path it was sent at and the expression it had to satisfy.
+fn malformed_run_id_message(value: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{value}' at '{RUN_ID_MEMBER_PATH}' failed to \
+         satisfy constraint: Member must satisfy regular expression pattern: {}",
+        ::service_common::validation::unanchored(RUN_ID_PATTERN)
+    )
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,6 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // A malformed address is refused BEFORE anything is read: a value outside the
+        // member's modelled pattern is a bad request, and a run could never have been
+        // stored under it, so answering "no such run" would tell the caller the request
+        // was well-formed. The modelled errors of this operation carry no constraint
+        // violation, so the refusal goes out through the framework's own channel.
+        if !is_modelled_hash_string(&input.column_statistics_task_run_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                malformed_run_id_message(&input.column_statistics_task_run_id),
+            ));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This operation models no server fault, so an unreachable store is reported
             // as the operation's own timeout error, the same way `GetCrawler` reports it.
@@ -169,11 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetColumnStatisticsTaskRunErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
-                        message: Some(
-                            crate::state::messages::column_statistics_task_run_not_found(
-                                &input.column_statistics_task_run_id,
-                            ),
-                        ),
+                        message: Some(RUN_NOT_FOUND.to_string()),
                         from_federation_source: None,
                     },
                 )

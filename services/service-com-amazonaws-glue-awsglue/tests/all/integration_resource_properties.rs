@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the Glue integration resource property slice:
-//! `CreateIntegrationResourceProperty` and the `GetIntegrationResourceProperty` that reads
-//! back what it stored.
+//! `CreateIntegrationResourceProperty`, the `GetIntegrationResourceProperty` that reads
+//! back what it stored, and the `DeleteIntegrationResourceProperty` that removes it.
 //!
 //! Every call goes over the wire through the shared [`crate::wire`] harness, so what is
 //! asserted is the HTTP behaviour and not a direct call into a handler.
@@ -10,7 +10,7 @@
 //! The rule under test: a record is addressed by the ARN of the resource whose properties
 //! it carries, and there is ONE record per resource — so a create for a resource that
 //! already has one writes that record (each stated member replacing the stored one, each
-//! unstated member left alone) under the `ResourcePropertyArn` the first create minted,
+//! unstated member left alone) under the one `ResourcePropertyArn` that resource derives,
 //! rather than minting a second record or refusing the write. The round-trip suite is a
 //! table whose rows differ along which side of the integration the properties belong to,
 //! which resource kind the ARN names, how many members the side carries, their length, and
@@ -37,11 +37,6 @@ const MAX_ROLE_ARN_LENGTH: usize = 128;
 /// The longest `KmsArn`/`EventBusArn` a target carries: "len 1..2048" on `String2048`
 /// (same query).
 const MAX_KMS_ARN_LENGTH: usize = 2048;
-
-/// How many characters the id in a `ResourcePropertyArn` carries: the 32 lowercase
-/// hexadecimal characters this emulator mints a resource id as
-/// (`state::new_integration_resource_property_id`).
-const PROPERTY_ID_LENGTH: usize = 32;
 
 /// The ARN of the Glue connection `name`, as this emulator mints a connection's ARN.
 fn connection_arn(name: &str) -> String {
@@ -107,24 +102,24 @@ fn property_arn(case: &str, body: &Value) -> String {
         .to_string()
 }
 
-/// Assert that `arn` is a record ARN of this emulator's estate: the documented resource
-/// type ("The format is something like arn:aws:glue:::integrationresourceproperty/*" —
+/// Assert that `arn` is the record ARN the resource `resource_arn` names derives: the
+/// documented resource type ("The format is something like
+/// arn:aws:glue:::integrationresourceproperty/*" —
 /// `CreateIntegrationResourcePropertyResponse$ResourcePropertyArn`) under this endpoint's
-/// Region and account, naming a minted id.
-fn assert_record_arn(case: &str, arn: &str) {
-    let prefix = format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:integrationresourceproperty/");
-    let Some(id) = arn.strip_prefix(&prefix) else {
-        panic!("case {case}: expected a ResourcePropertyArn under {prefix:?}, got {arn:?}");
-    };
+/// Region and account, carrying the resource the record describes — the resource type and
+/// name its own ARN carries — so a caller that holds only the ARN it submitted derives the
+/// record's.
+fn assert_record_arn(case: &str, resource_arn: &str, arn: &str) {
+    let described = resource_arn
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("case {case}: {resource_arn:?} carries no resource portion"))
+        .1;
+    let expected =
+        format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:integrationresourceproperty/{described}");
     assert_eq!(
-        id.chars().count(),
-        PROPERTY_ID_LENGTH,
-        "case {case}: expected a {PROPERTY_ID_LENGTH}-character id, got {id:?}"
-    );
-    assert!(
-        id.chars()
-            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase()),
-        "case {case}: expected a lowercase hexadecimal id, got {id:?}"
+        arn, expected,
+        "case {case}: the record ARN must be derived from the resource it describes; expected \
+         {expected:?}, got {arn:?}"
     );
 }
 
@@ -134,7 +129,8 @@ fn assert_record_arn(case: &str, arn: &str) {
 
 /// What `CreateIntegrationResourceProperty` persists is what
 /// `GetIntegrationResourceProperty` reports: both calls answer the record now stored for
-/// the ARN the request named, member for member, under one minted `ResourcePropertyArn`.
+/// the ARN the request named, member for member, under the one `ResourcePropertyArn` that
+/// resource derives.
 #[tokio::test]
 async fn created_integration_resource_properties_are_read_back_from_the_store() {
     let router = emulator();
@@ -250,7 +246,7 @@ async fn created_integration_resource_properties_are_read_back_from_the_store() 
             "case {case}: the create must report the ResourceArn it stored, got {created}"
         );
         let record_arn = property_arn(case, &created);
-        assert_record_arn(case, &record_arn);
+        assert_record_arn(case, &resource_arn, &record_arn);
         // Every property member the request carried comes back from the store unchanged.
         assert_echoed(case, &sides, &created);
         // `CreateIntegrationResourcePropertyResponse` models no `Tags` member, so the tags
@@ -269,7 +265,7 @@ async fn created_integration_resource_properties_are_read_back_from_the_store() 
         assert_eq!(
             property_arn(case, &read),
             record_arn,
-            "case {case}: the read must report the record ARN the create minted, got {read}"
+            "case {case}: the read must report the same record ARN the create did, got {read}"
         );
         assert_echoed(case, &sides, &read);
 
@@ -295,8 +291,8 @@ async fn created_integration_resource_properties_are_read_back_from_the_store() 
 }
 
 /// A create for a resource that already has a record writes THAT record: it answers 200
-/// rather than refusing a duplicate, keeps the `ResourcePropertyArn` the first create
-/// minted, replaces every member it states and leaves every member it does not state as
+/// rather than refusing a duplicate, reports the same `ResourcePropertyArn` as the first
+/// create, replaces every member it states and leaves every member it does not state as
 /// stored — and the store still holds one record per resource.
 #[tokio::test]
 async fn a_second_create_for_one_resource_writes_the_record_it_already_has() {
@@ -388,8 +384,8 @@ async fn a_second_create_for_one_resource_writes_the_record_it_already_has() {
         assert_eq!(
             property_arn(case, &body),
             record_arn,
-            "case {case}: the record keeps the ResourcePropertyArn the first create minted, \
-             expected {record_arn}, got {body}"
+            "case {case}: the record keeps the ResourcePropertyArn the first create \
+             reported, expected {record_arn}, got {body}"
         );
         assert_echoed(case, expected, &body);
 
@@ -605,7 +601,7 @@ async fn a_create_stating_neither_processing_side_is_refused() {
     assert_eq!(
         property_arn("a resource that already has a record", &read),
         record_arn,
-        "case {:?}: the record keeps the ResourcePropertyArn the first create minted, expected \
+        "case {:?}: the record keeps the ResourcePropertyArn the first create reported, expected \
          {record_arn}, got {read}",
         "a resource that already has a record"
     );
@@ -763,7 +759,7 @@ async fn a_resource_arn_naming_an_absent_resource_is_refused() {
             }),
         )
         .await;
-        assert_record_arn(case, &property_arn(case, &created));
+        assert_record_arn(case, &resource_arn, &property_arn(case, &created));
     }
 }
 
@@ -900,4 +896,126 @@ async fn a_create_past_the_integration_resource_property_ceiling_is_refused() {
             .remove(&connection_arn("seeded-0"));
     }
     create_property(&router, &past).await;
+}
+
+// ---------------------------------------------------------------------------
+// Delete
+// ---------------------------------------------------------------------------
+
+/// `DeleteIntegrationResourceProperty` removes the record of the resource its `ResourceArn`
+/// names and nothing else: the read of that resource then misses, a second delete is that
+/// same miss, every other resource's record still reads back, and a create after the delete
+/// stores the record afresh under the ARN its resource derives. A `ResourceArn` that
+/// addresses neither leg of an integration is the bad parameter the create and the read
+/// answer for it.
+///
+/// The rows differ along which resource kind the record belongs to and which side of the
+/// integration its properties state.
+#[tokio::test]
+async fn deleting_an_integration_resource_property_removes_only_the_record_it_names() {
+    let router = emulator();
+
+    // (case, the ARN of the resource, the side the create states)
+    let mut rows: Vec<(&str, String, Value)> = Vec::new();
+    create_connection(&router, "deleted-connection").await;
+    rows.push((
+        "a connection's source properties",
+        connection_arn("deleted-connection"),
+        json!({ "SourceProcessingProperties": { "RoleArn": "arn:aws:iam::000000000000:role/s" } }),
+    ));
+    create_database(&router, "deleted_database").await;
+    rows.push((
+        "a database's target properties",
+        database_arn("deleted_database"),
+        json!({ "TargetProcessingProperties": { "RoleArn": "arn:aws:iam::000000000000:role/t" } }),
+    ));
+
+    // A bystander, to prove each delete is scoped to the record it names.
+    create_connection(&router, "kept-connection").await;
+    let bystander = connection_arn("kept-connection");
+    create_property(
+        &router,
+        &json!({
+            "ResourceArn": &bystander,
+            "SourceProcessingProperties": { "RoleArn": "arn:aws:iam::000000000000:role/kept" },
+        }),
+    )
+    .await;
+
+    for (case, resource_arn, properties) in &rows {
+        let mut request = properties.clone();
+        request["ResourceArn"] = json!(resource_arn);
+        let created = create_property(&router, &request).await;
+        let record_arn = property_arn(case, &created);
+        assert_record_arn(case, resource_arn, &record_arn);
+
+        ok(
+            &router,
+            "DeleteIntegrationResourceProperty",
+            &json!({ "ResourceArn": resource_arn }),
+        )
+        .await;
+
+        // The record is gone: the read of that resource misses, which is what makes the
+        // delete observable.
+        for (attempt, operation) in [
+            ("the read after the delete", "GetIntegrationResourceProperty"),
+            ("a second delete", "DeleteIntegrationResourceProperty"),
+        ] {
+            let (status, body) =
+                call(&router, operation, &json!({ "ResourceArn": resource_arn })).await;
+            assert_eq!(
+                status, 400,
+                "case {case}: {attempt} must be refused, got {status} with {body}"
+            );
+            assert!(
+                error_code(&body).contains("EntityNotFoundException"),
+                "case {case}: {attempt} expected EntityNotFoundException, got {body}"
+            );
+        }
+
+        // A create after the delete stores the record afresh, under the ARN the resource
+        // derives — the identity is the resource's, not the write's.
+        let reborn = create_property(&router, &request).await;
+        assert_eq!(
+            property_arn(case, &reborn),
+            record_arn,
+            "case {case}: the re-created record must carry the same ARN, got {reborn}"
+        );
+    }
+
+    // A value that addresses neither leg of an integration is a bad parameter, as it is for
+    // the create and the read.
+    for (case, resource_arn) in [
+        (
+            "a catalog table's ARN",
+            format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:table/deleted_database/orders"),
+        ),
+        ("a value that is no ARN at all", "deleted-connection".to_string()),
+    ] {
+        let (status, body) = call(
+            &router,
+            "DeleteIntegrationResourceProperty",
+            &json!({ "ResourceArn": resource_arn }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected 400 for {resource_arn:?}, got {status} with {body}"
+        );
+        assert!(
+            error_code(&body).contains("InvalidInputException"),
+            "case {case}: expected InvalidInputException for {resource_arn:?}, got {body}"
+        );
+    }
+
+    // Nothing any delete did reached the record it did not name.
+    let kept = get_property(&router, &bystander).await;
+    assert_eq!(
+        kept.get("SourceProcessingProperties")
+            .and_then(|side| side.get("RoleArn"))
+            .and_then(Value::as_str),
+        Some("arn:aws:iam::000000000000:role/kept"),
+        "case the bystander: a delete must leave every other record in place, got {kept}"
+    );
 }

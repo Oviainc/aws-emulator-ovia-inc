@@ -8,10 +8,10 @@
 //!
 //! The rule under test is the one `PutAssetType` documents — "Creates or updates an asset
 //! type … If an asset type with the given name already exists, it is updated" — read as:
-//! the request's `Name` is the key, so a put under a free name mints an asset type under a
-//! fresh identifier and a put under a name already stored replaces that asset type's
-//! forms while keeping its identifier, a read of that identifier — or of the name it is
-//! stored under — reports what the latest put stored, and each form entry must reference a
+//! the request's `Name` is the key, so a put under a free name registers an asset type and
+//! a put under a name already stored replaces that asset type's forms while reporting the
+//! same identifier, a read of that identifier — or of the name it is stored under —
+//! reports what the latest put stored, and each form entry must reference a
 //! form type this account holds. The
 //! suites are tables whose rows differ along what the rule generalises over: the form and
 //! length of the name, the number and keys of the forms, whether a reference names its
@@ -435,9 +435,10 @@ async fn reading_an_unknown_asset_type_is_refused() {
     let truncated = &id[..id.len() - 1];
     let extended = format!("{id}0");
     let recased = id.to_uppercase();
-    // Every row must name an identifier the store does NOT hold. A minted identifier is
-    // lowercase hexadecimal, so one drawn with no letter at all recases to itself; such a
-    // row would name the stored record, so it is dropped rather than asserted.
+    // Every row must name an identifier the store does NOT hold. The identifier is the
+    // name the put registered it under, so a row built by recasing it is a miss only while
+    // that name has a letter to recase; a row that comes out equal to the stored
+    // identifier would name the stored record, so it is dropped rather than asserted.
     let rows: Vec<(&str, &str)> = [
         ("never minted", "no-such-asset-type"),
         ("a prefix of a stored identifier", truncated),

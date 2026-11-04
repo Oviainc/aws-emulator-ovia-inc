@@ -668,7 +668,10 @@ async fn a_request_that_addresses_nothing_stored_is_refused_as_a_miss() {
             "a run id nothing minted",
             "GetColumnStatisticsTaskRun",
             json!({ "ColumnStatisticsTaskRunId": "ffffffffffffffffffffffffffffffff" }),
-            "ffffffffffffffffffffffffffffffff",
+            // The read's miss names the MEMBER the request addressed the run by and
+            // withholds the id it sent, as the settings miss of the same surface does.
+            "For given input ColumnStatisticsTaskRunId, associated ColumnStatisticsTaskRun \
+             does not exist",
         ),
     ];
 

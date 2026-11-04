@@ -87,6 +87,8 @@ mod connection_listing;
 mod connection_not_found;
 #[path = "all/connection_updates.rs"]
 mod connection_updates;
+#[path = "all/constraint_refusal_class.rs"]
+mod constraint_refusal_class;
 #[path = "all/crawler_deletion.rs"]
 mod crawler_deletion;
 #[path = "all/crawler_deletion_scope.rs"]
@@ -137,6 +139,8 @@ mod data_quality_rulesets;
 mod database_listing;
 #[path = "all/delete_partition.rs"]
 mod delete_partition;
+#[path = "all/derived_resource_identities.rs"]
+mod derived_resource_identities;
 #[path = "all/duplicate_create_refusals.rs"]
 mod duplicate_create_refusals;
 #[path = "all/error_classification.rs"]
@@ -207,6 +211,8 @@ mod job_runs;
 mod job_updates;
 #[path = "all/jobs.rs"]
 mod jobs;
+#[path = "all/lake_formation_authorization.rs"]
+mod lake_formation_authorization;
 #[path = "all/ml_task_run_reads.rs"]
 mod ml_task_run_reads;
 #[path = "all/ml_task_runs.rs"]
@@ -245,6 +251,8 @@ mod search_tables;
 mod security_configurations;
 #[path = "all/session_deletion.rs"]
 mod session_deletion;
+#[path = "all/session_tags.rs"]
+mod session_tags;
 #[path = "all/sessions.rs"]
 mod sessions;
 #[path = "all/state_roundtrip.rs"]

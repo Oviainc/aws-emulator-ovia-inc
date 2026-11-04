@@ -6,8 +6,10 @@
 //! account's per-resource namespace
 //! ([`crate::state::ComAmazonawsGlueAwsglueState::integration_resource_properties`]),
 //! keyed by that resource's ARN. There is one record per resource: a create for a resource
-//! that already has one writes THAT record, keeping the `ResourcePropertyArn` the first
-//! create minted. `GetIntegrationResourceProperty` reads the record back.
+//! that already has one writes THAT record, under the same `ResourcePropertyArn`, which is
+//! DERIVED from the resource the record describes — the resource type and name the
+//! request's `ResourceArn` carried — so a caller holding that ARN can derive the record's.
+//! `GetIntegrationResourceProperty` reads the record back.
 //!
 //! A create that states NEITHER side — no `SourceProcessingProperties` and no
 //! `TargetProcessingProperties` — carries no property to write, so it is refused with the
@@ -245,8 +247,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One record per resource: a create for a resource that already has one is that
-        // record's next write and mints no second record, so nothing here refuses it as a
-        // duplicate and the `ResourcePropertyArn` the first create minted survives.
+        // record's next write and stores no second record, so nothing here refuses it as a
+        // duplicate and the record keeps the `ResourcePropertyArn` its resource derives.
         let stored_already = store
             .integration_resource_properties
             .contains_key(&input.resource_arn);
@@ -269,11 +271,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // "The resource ARN created through this create API": the record's own ARN names
+        // the resource it describes, under this record type's ARN segment —
+        // `integrationresourceproperty/<resource type>/<resource name>` — so it is derived
+        // from the request's `ResourceArn` rather than minted, which is what lets a caller
+        // that holds only the ARN it submitted address the record afterwards. One resource
+        // has one record, so the derived name is unique in this namespace. The record is
+        // built member for member here rather than through the entry's own constructor,
+        // which mints an opaque per-call id no caller can derive.
+        let property_id = format!("{}/{}", resource.kind.arn_segment(), resource.name);
         let stored = store
             .integration_resource_properties
             .entry(input.resource_arn.clone())
-            .or_insert_with(|| {
-                crate::state::IntegrationResourcePropertyEntry::from_create_input(&input)
+            .or_insert_with(|| crate::state::IntegrationResourcePropertyEntry {
+                resource_arn: input.resource_arn.clone(),
+                property_id,
+                source_processing_properties: input.source_processing_properties.clone(),
+                target_processing_properties: input.target_processing_properties.clone(),
+                tags: input.tags.clone().unwrap_or_default(),
             });
         if stored_already {
             stored.apply_create(&input);

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIntegrationResourceProperty
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIntegrationResourceProperty`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIntegrationResourceProperty::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Removes the processing-properties record of ONE resource of an integration — the record
+//! `CreateIntegrationResourceProperty` wrote for the Glue connection or Glue database its
+//! `ResourceArn` names — from
+//! [`crate::state::ComAmazonawsGlueAwsglueState::integration_resource_properties`], so a
+//! later `GetIntegrationResourceProperty` of that resource misses. `ResourceArn` resolves
+//! the way the create and the read resolve it
+//! ([`crate::state::integration_resource_reference`]): a value that addresses neither leg
+//! of an integration is a bad parameter, and a resource this account holds no record for is
+//! the read's own `EntityNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +147,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIntegrationResourceProperty` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIntegrationResourcePropertyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIntegrationResourceProperty"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(
+                DeleteIntegrationResourcePropertyErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(
+                            "the Glue integration resource property store is unavailable".into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The same resolution of `ResourceArn` the create and the read go through, so a
+        // value that addresses no resource at all is a bad parameter here too rather than a
+        // record this account happens not to hold.
+        if let Err(message) = crate::state::integration_resource_reference(&input.resource_arn) {
+            return Err(
+                DeleteIntegrationResourcePropertyErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(message),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record is keyed by the resource's ARN, as the create stored it, so the delete
+        // reaches the record the read of the same ARN reports — and nothing else.
+        let mut store = state.lock();
+        if store
+            .integration_resource_properties
+            .remove(&input.resource_arn)
+            .is_none()
+        {
+            // A resource with no record is the miss the read of that resource answers,
+            // worded the one way this surface words it.
+            return Err(
+                DeleteIntegrationResourcePropertyErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::target_resource_not_found(
+                            &input.resource_arn,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+        ::tracing::info!(
+            operation = "DeleteIntegrationResourceProperty",
+            resource = %input.resource_arn,
+            "deleted the processing properties of a Glue integration resource"
+        );
+
+        Ok(DeleteIntegrationResourcePropertyOutput {})
     }
 }

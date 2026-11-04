@@ -6,12 +6,16 @@
 //! Every call goes over the wire through the shared [`crate::wire`] harness, so what is
 //! asserted is HTTP behaviour and not a direct call into a handler.
 //!
-//! The rule under test: the read answers the table definition the catalog holds, plus the
-//! Lake Formation facts about that table — all negative here, because no stored table's
-//! location is registered with Lake Formation and no stored table is a view. A table of a
-//! FEDERATED database is NOT answered from the catalog: that database "points to an entity
-//! outside the Glue Data Catalog", so the metadata comes from the source its registration
-//! names, and a source that cannot be reached is the retryable federation failure —
+//! The rule under test: an AUTHORIZED read answers the table definition the catalog holds,
+//! plus the Lake Formation facts about that table — all negative here, because no stored
+//! table's location is registered with Lake Formation and no stored table is a view. Every
+//! request below therefore carries the caller's own Lake Formation data permissions on the
+//! table, the member the model documents as what authorizes the call when no view context
+//! is found; what a request presenting NO such authorization earns is a rule of its own, in
+//! `tests/all/lake_formation_authorization.rs`. A table of a FEDERATED database is NOT
+//! answered from the catalog: that database "points to an entity outside the Glue Data
+//! Catalog", so the metadata comes from the source its registration names, and a source
+//! that cannot be reached is the retryable federation failure —
 //! `FederationSourceRetryableException`, the code that tells a client to retry rather than
 //! give up.
 //!
@@ -51,12 +55,19 @@ fn table_input(name: &str) -> Value {
 }
 
 /// A `GetUnfilteredTableMetadata` body for one table, plus whatever `extra` adds.
+///
+/// It carries `Permissions`, the caller's own Lake Formation data permissions on the table
+/// ("Used to authorize the call when no view context is found" —
+/// `GetUnfilteredTableMetadataRequest$Permissions`), because this read is vended by Lake
+/// Formation: a request presenting no Lake Formation authorization is refused before the
+/// table is resolved at all.
 fn unfiltered_body(database: &str, name: &str, permission_types: &[&str], extra: Value) -> Value {
     let mut body = json!({
         "CatalogId": ACCOUNT_ID,
         "DatabaseName": database,
         "Name": name,
         "SupportedPermissionTypes": permission_types,
+        "Permissions": ["SELECT"],
     });
     if let Some(members) = extra.as_object() {
         for (member, value) in members {

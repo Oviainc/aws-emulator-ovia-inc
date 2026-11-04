@@ -8,8 +8,8 @@
 //!
 //! The rule under test: a delete removes the ONE record its `Identifier` resolves to —
 //! resolved the way the matching read resolves it, which for an asset is the `AssetId` its
-//! put was addressed with and for an asset type is either the minted `AssetTypeId` or the
-//! `AssetTypeName` it was registered under — so a later read of that record misses while
+//! put was addressed with and for an asset type is the `AssetTypeId` a put reported, which
+//! IS the `AssetTypeName` it was registered under — so a later read of that record misses while
 //! every other record, and every record the deleted one merely REFERRED to, still reads
 //! back; and it reports no miss, because neither operation models a not-found error
 //! (`smithy_query operation=DeleteAsset,DeleteAssetType` lists `AccessDeniedException`,
@@ -46,7 +46,7 @@ async fn form_type(router: &MultiServiceRouter, name: &str) -> String {
         .to_string()
 }
 
-/// Register an asset type over one form type and return the identifier it minted.
+/// Register an asset type over one form type and return the identifier it reported.
 async fn asset_type(router: &MultiServiceRouter, name: &str, form_type_id: &str) -> String {
     let mut map = Map::new();
     map.insert(
@@ -383,9 +383,10 @@ async fn deleting_an_asset_the_store_does_not_hold_is_served() {
 /// every other asset type still reads back, and the form types its `Forms` entries named
 /// are untouched.
 ///
-/// The rows differ along which form the delete addresses the asset type by — the minted
-/// `AssetTypeId` or the `AssetTypeName` it was registered under — and along how many forms
-/// the asset type holds.
+/// The rows differ along which form the delete addresses the asset type by — the
+/// `AssetTypeId` the put reported or the `AssetTypeName` it was registered under, which are
+/// one value, because the identifier an asset type is addressed by IS the name it was
+/// registered under — and along how many forms the asset type holds.
 #[tokio::test]
 async fn deleting_an_asset_type_removes_only_the_one_it_names() {
     let router = emulator();
@@ -393,15 +394,15 @@ async fn deleting_an_asset_type_removes_only_the_one_it_names() {
 
     /// How the row's delete addresses the asset type.
     enum AddressedBy {
-        MintedId,
+        ReportedId,
         RegisteredName,
     }
 
     let rows: Vec<(&str, &str, AddressedBy)> = vec![
         (
-            "by the minted identifier",
+            "by the identifier the put reported",
             "MintedAssetType",
-            AddressedBy::MintedId,
+            AddressedBy::ReportedId,
         ),
         (
             "by the registered name",
@@ -414,13 +415,14 @@ async fn deleting_an_asset_type_removes_only_the_one_it_names() {
     let bystander = asset_type(&router, "BystanderAssetType", &shared_form).await;
 
     for (case, name, addressed_by) in &rows {
-        let minted = asset_type(&router, name, &shared_form).await;
-        assert_ne!(
-            &minted, name,
-            "case {case}: the minted identifier and the name are two distinct addresses"
+        let reported = asset_type(&router, name, &shared_form).await;
+        assert_eq!(
+            &reported, name,
+            "case {case}: the identifier a put reports is the name it registered the asset \
+             type under"
         );
         let identifier = match addressed_by {
-            AddressedBy::MintedId => minted.clone(),
+            AddressedBy::ReportedId => reported.clone(),
             AddressedBy::RegisteredName => (*name).to_string(),
         };
 
@@ -428,7 +430,7 @@ async fn deleting_an_asset_type_removes_only_the_one_it_names() {
 
         // The record is gone under BOTH addresses, so the delete reached the record itself
         // and not one of its two names.
-        assert_asset_type_misses(&router, case, &minted).await;
+        assert_asset_type_misses(&router, case, &reported).await;
         assert_asset_type_misses(&router, case, name).await;
 
         // The form type the asset type's entries named is its own record and is untouched.
@@ -444,11 +446,25 @@ async fn deleting_an_asset_type_removes_only_the_one_it_names() {
             "case {case}: the form type must survive the asset type's delete, got {form_read}"
         );
 
-        // A put under the freed name stores the asset type afresh, under a NEW identifier.
+        // A put under the freed name stores the asset type afresh, under the same
+        // identifier: the identity of an asset type is the name it is registered under, so
+        // what the second put makes new is the record and not its address.
         let reborn = asset_type(&router, name, &shared_form).await;
-        assert_ne!(
-            reborn, minted,
-            "case {case}: a put after the delete stores a new record, so it mints a new id"
+        assert_eq!(
+            &reborn, name,
+            "case {case}: a put after the delete registers the same name, so it reports the \
+             same identifier"
+        );
+        let read_again = ok(
+            &router,
+            "GetAssetType",
+            &json!({ "Identifier": &reborn }),
+        )
+        .await;
+        assert_eq!(
+            read_again.get("Id").and_then(Value::as_str),
+            Some(*name),
+            "case {case}: the re-registered asset type must read back, got {read_again}"
         );
         delete_asset_type(&router, case, &reborn).await;
     }
@@ -480,9 +496,12 @@ async fn deleting_an_asset_type_the_store_does_not_hold_is_served() {
 
     let rows: Vec<(&str, String)> = vec![
         ("never registered", "NoSuchAssetType".to_string()),
-        ("a prefix of a minted identifier", kept[..kept.len() - 1].to_string()),
         (
-            "a minted identifier with one more character",
+            "a prefix of an identifier the store holds",
+            kept[..kept.len() - 1].to_string(),
+        ),
+        (
+            "an identifier the store holds with one more character",
             format!("{kept}0"),
         ),
         ("a registered name recased", "KEPTTYPE".to_string()),
@@ -505,8 +524,8 @@ async fn deleting_an_asset_type_the_store_does_not_hold_is_served() {
         delete_asset_type(&router, case, identifier).await;
     }
 
-    // Nothing was removed: the asset type the store does hold is still readable under its
-    // minted identifier and its registered name.
+    // Nothing was removed: the asset type the store does hold is still readable under the
+    // identifier its put reported and under its registered name.
     for address in [kept.as_str(), "KeptType"] {
         let read = ok(&router, "GetAssetType", &json!({ "Identifier": address })).await;
         assert_eq!(

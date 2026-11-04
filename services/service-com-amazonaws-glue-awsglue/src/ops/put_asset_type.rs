@@ -4,13 +4,14 @@
 //!
 //! Registers an asset type in this account's per-account asset type namespace
 //! ([`crate::state::ComAmazonawsGlueAwsglueState::asset_types`]), keyed by the request's
-//! `Name`: "Creates or updates an asset type", so a put under a free name mints an asset
-//! type and a put under a name already stored replaces that asset type's forms, keeping
-//! the id the first put minted. Each form reference names a form type in the SAME store,
-//! by the `FormTypeId` the catalog minted for it or by the `FormTypeName` it was
-//! registered under, so a reference to a form type this account does not hold is refused
-//! with the modelled `EntityNotFoundException` rather than stored. `GetAssetType` reads
-//! the record back by the minted id.
+//! `Name`: "Creates or updates an asset type", so a put under a free name registers an
+//! asset type and a put under a name already stored replaces that asset type's forms. The
+//! `Id` the put reports IS that name — the identifier every operation that addresses an
+//! asset type carries — so it is stable across puts and derivable by the caller. Each form
+//! reference names a form type in the SAME store, by the `FormTypeId` the catalog minted
+//! for it or by the `FormTypeName` it was registered under, so a reference to a form type
+//! this account does not hold is refused with the modelled `EntityNotFoundException`
+//! rather than stored. `GetAssetType` reads the record back by that identifier.
 //!
 //! ## Shape of an operation
 //!
@@ -212,9 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If an asset type with the given name already exists, it is updated": the name
         // decides which. A name this store already holds is UPDATED in place — the stored
-        // forms become the request's, and the id minted when the name was first stored is
-        // kept, so a caller holding that id still addresses the asset type it addressed
-        // before.
+        // forms become the request's, and the record's identity is the name itself, so a
+        // caller holding the identifier from an earlier put still addresses the same asset
+        // type.
         let stored = if let Some(existing) = store.asset_types.get_mut(&input.name) {
             existing.forms = forms;
             existing.clone()
@@ -236,7 +237,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            let fresh = crate::state::AssetTypeEntry::new(input.name.clone(), forms);
+            // The identifier an asset type is ADDRESSED by is the name it was registered
+            // under: "If an asset type with the given name already exists, it is updated"
+            // makes the name the record's identity, and `GetAssetType`/`DeleteAssetType`
+            // take an `Identifier` a client holds from a put — so the `Id` reported here
+            // is that name, reconstructible by a caller that knows only what it submitted.
+            // The form type a reference names does the same with its own `Id`
+            // ([`crate::state::FormTypeEntry`]). The record is built member for member
+            // here rather than through the entry's own constructor, which mints an opaque
+            // per-call id no caller can derive.
+            let fresh = crate::state::AssetTypeEntry {
+                id: input.name.clone(),
+                name: input.name.clone(),
+                forms,
+            };
             store.asset_types.insert(input.name.clone(), fresh.clone());
             fresh
         };
