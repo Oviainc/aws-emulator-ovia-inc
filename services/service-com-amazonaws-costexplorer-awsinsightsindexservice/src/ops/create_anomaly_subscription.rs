@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAnomalySubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAnomalySubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAnomalySubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -152,18 +142,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAnomalySubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAnomalySubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAnomalySubscription"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Only reachable when this service was mounted on an engine that holds no
+            // store for it, so the subscription cannot be persisted and the operation
+            // genuinely cannot be served here.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        let subscription = input.anomaly_subscription;
+        // The subscription's monitors, subscribers and threshold have to hold together.
+        // The model declares no client-input error for this operation, so a combination
+        // its schema admits but its documentation forbids is refused through the 400
+        // `ValidationException` channel.
+        crate::state::validate_anomaly_subscription(&subscription)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let mut store = state.lock();
+        // Admission before any write, so a refused create leaves the registry exactly as
+        // it was.
+        if store.anomaly_subscriptions.len() >= crate::state::MAX_ANOMALY_SUBSCRIPTIONS {
+            return Err(CreateAnomalySubscriptionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} cost anomaly subscriptions for this \
+                         account",
+                        crate::state::MAX_ANOMALY_SUBSCRIPTIONS
+                    )),
+                },
+            )
+            .into());
+        }
+        // A subscription alerts on monitors, so every ARN it names has to be a monitor the
+        // account holds — that is the one 404 this operation models.
+        for monitor_arn in &subscription.monitor_arn_list {
+            if !store.anomaly_monitors.contains_key(monitor_arn) {
+                return Err(CreateAnomalySubscriptionErrorModeled::UnknownMonitorException(
+                    UnknownMonitorException {
+                        message: Some(format!(
+                            "The cost anomaly monitor {monitor_arn} does not exist for the \
+                             account."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // `SubscriptionArn`, `AccountId` and each subscriber's `Status` are members the
+        // SERVICE owns — the ARN is minted here and the account is this emulator's own —
+        // so whatever a caller put in them is not stored.
+        let arn = ::engine::emulator_arn(
+            "ce",
+            "",
+            &format!("anomalysubscription/{}", store.next_resource_id()),
+        );
+        // The deprecated scalar is shorthand for an expression, so a subscription written
+        // with it is stored carrying the expression that shorthand expands to as well.
+        let threshold_expression = subscription.threshold_expression.or_else(|| {
+            subscription
+                .threshold
+                .map(crate::state::threshold_expression_for)
+        });
+        store.anomaly_subscriptions.insert(
+            arn.clone(),
+            crate::state::AnomalySubscriptionRecord {
+                arn: arn.clone(),
+                account_id: ::engine::emulator_account_id().to_string(),
+                monitor_arn_list: subscription.monitor_arn_list,
+                subscribers: crate::state::admitted_subscribers(subscription.subscribers),
+                threshold: subscription.threshold,
+                threshold_expression,
+                frequency: subscription.frequency,
+                subscription_name: subscription.subscription_name,
+                resource_tags: input.resource_tags.unwrap_or_default(),
+            },
+        );
+        drop(store);
+
+        Ok(CreateAnomalySubscriptionOutput {
+            subscription_arn: arn,
+        })
     }
 }

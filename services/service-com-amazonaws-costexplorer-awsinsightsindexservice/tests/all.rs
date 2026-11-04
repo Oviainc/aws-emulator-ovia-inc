@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/anomaly_monitors.rs"]
 mod anomaly_monitors;
+#[path = "all/anomaly_subscriptions.rs"]
+mod anomaly_subscriptions;
 #[path = "all/cost_category_definitions.rs"]
 mod cost_category_definitions;
 #[path = "all/get_dimension_values_context.rs"]

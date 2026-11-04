@@ -233,27 +233,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
-        // One stable total order (the ARN ordering the registry is keyed on) is what
-        // makes the cursor resolvable: the next page is "everything at or after this
-        // ARN", so a definition created or deleted between pages neither duplicates nor
-        // skips the rest.
-        let mut visible = store
-            .cost_categories
-            .range::<String, _>(resume_at.as_ref().map_or(
-                (::std::ops::Bound::Unbounded, ::std::ops::Bound::Unbounded),
-                |from| (::std::ops::Bound::Included(from), ::std::ops::Bound::Unbounded),
-            ))
-            .map(|(_, def)| def)
-            .filter(|def| def.effective_on(at));
-
-        let mut references = Vec::new();
-        let mut next_token = None;
-        for def in visible.by_ref().take(page_size) {
-            references.push(def.to_reference());
-        }
-        if let Some(first_of_next_page) = visible.next() {
-            next_token = Some(crate::state::encode_next_token(&first_of_next_page.arn));
-        }
+        // The page walk, the cursor and the ARN order are the ones every paginated read in
+        // this service shares.
+        let page = crate::state::page(&store.cost_categories, resume_at.as_ref(), page_size, |def| {
+            def.effective_on(at)
+        });
+        let references = page
+            .records
+            .into_iter()
+            .map(crate::state::CostCategoryDefinition::to_reference)
+            .collect();
+        let next_token = page.next_token;
         drop(store);
 
         Ok(ListCostCategoryDefinitionsOutput {

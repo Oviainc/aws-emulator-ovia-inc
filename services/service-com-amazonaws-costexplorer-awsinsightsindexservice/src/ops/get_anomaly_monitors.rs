@@ -105,13 +105,6 @@ impl From<GetAnomalyMonitorsErrorModeled> for GetAnomalyMonitorsError {
     }
 }
 
-/// The page a request that names no `MaxResults` gets: every monitor the filter admits.
-///
-/// `PageSize` carries no modelled range and the operation documents no default page size,
-/// so a request that asks for no page size is answered with the whole result in one page
-/// rather than cut at a size this emulator invented.
-const UNPAGED: usize = usize::MAX;
-
 /// The `GetAnomalyMonitors` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -173,17 +166,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?),
         };
 
-        let page_size = match input.max_results {
-            None => UNPAGED,
-            Some(requested) => usize::try_from(requested)
-                .ok()
-                .filter(|size| *size >= 1)
-                .ok_or_else(|| {
-                    crate::scaffolded::Scaffolded::validation(format!(
-                        "MaxResults {requested} is not a page size; it must be at least 1"
-                    ))
-                })?,
-        };
+        let page_size = crate::state::requested_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         // "You can filter using a list of cost anomaly monitor Amazon Resource Names
         // (ARNs)": a list that names no ARN filters nothing out.
@@ -210,27 +194,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // One stable total order (the ARN ordering the registry is keyed on) is what makes
-        // the cursor resolvable: the next page is "everything at or after this ARN", so a
-        // monitor created or deleted between pages neither duplicates nor skips the rest.
-        let mut selected = store
-            .anomaly_monitors
-            .range::<String, _>(resume_at.as_ref().map_or(
-                (::std::ops::Bound::Unbounded, ::std::ops::Bound::Unbounded),
-                |from| (::std::ops::Bound::Included(from), ::std::ops::Bound::Unbounded),
-            ))
-            .map(|(_, monitor)| monitor)
-            .filter(|monitor| filter.is_none_or(|arns| arns.contains(&monitor.arn)));
-
-        let mut anomaly_monitors = Vec::new();
-        for monitor in selected.by_ref().take(page_size) {
-            anomaly_monitors.push(monitor.to_anomaly_monitor());
-        }
-        // A cursor is issued only when a monitor the filter admits is left over, so the
-        // last page of a result carries none.
-        let next_page_token = selected
-            .next()
-            .map(|monitor| crate::state::encode_next_token(&monitor.arn));
+        // The page walk, the cursor and the ARN order are the ones every paginated read
+        // in this service shares.
+        let page = crate::state::page(
+            &store.anomaly_monitors,
+            resume_at.as_ref(),
+            page_size,
+            |monitor| filter.is_none_or(|arns| arns.contains(&monitor.arn)),
+        );
+        let anomaly_monitors = page
+            .records
+            .into_iter()
+            .map(crate::state::AnomalyMonitorRecord::to_anomaly_monitor)
+            .collect();
+        let next_page_token = page.next_token;
         drop(store);
 
         Ok(GetAnomalyMonitorsOutput {

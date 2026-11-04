@@ -13,9 +13,27 @@
 //! operations resolve a monitor ARN against it, so the monitor's identity and content are
 //! derived in exactly one place.
 //!
-//! The billing-date helpers and the pagination cursor codec also live here rather than in
-//! one operation's file: all five operations have to agree on what a `ZonedDateTime`
-//! means, and duplicating that across five handlers is how they would drift apart.
+//! The cost anomaly SUBSCRIPTION registry is the third, and its record, admission rules
+//! and threshold expansion live in [`anomaly_subscriptions`] — one module per resource, so
+//! each file holds one registry's concern.
+//!
+//! The billing-date helpers live here rather than in one operation's file: all five
+//! operations have to agree on what a `ZonedDateTime` means, and duplicating that across
+//! five handlers is how they would drift apart. The pagination cursor codec and the page
+//! walk every paginated read shares are in [`pagination`], for the same reason.
+
+mod anomaly_subscriptions;
+mod pagination;
+
+pub use anomaly_subscriptions::{
+    admitted_subscribers, threshold_expression_for, validate_anomaly_subscription,
+    validate_threshold, AnomalySubscriptionRecord, MAX_ANOMALY_SUBSCRIPTIONS,
+    MAX_THRESHOLD_EXPRESSION_DEPTH, SUBSCRIBER_STATUS_CONFIRMED, THRESHOLD_ABSOLUTE_DIMENSION,
+    THRESHOLD_DIMENSIONS, THRESHOLD_MATCH_OPTION, THRESHOLD_VALUE_MAX,
+};
+pub use pagination::{
+    decode_next_token, encode_next_token, page, requested_page_size, Page, UNPAGED,
+};
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -318,30 +336,6 @@ pub fn mint_resource_id(sequence: u64) -> String {
         &rendered[16..20],
         &rendered[20..32]
     )
-}
-
-// ---------------------------------------------------------------------------
-// Pagination cursors
-// ---------------------------------------------------------------------------
-
-/// Encode the ARN a page resumes at as an opaque `NextToken`.
-///
-/// The cursor is SELF-CONTAINED rather than a key into server-side state: minting it is
-/// part of answering a read, and a read must not change what a later caller sees. Hex of
-/// the ARN is opaque to a client and survives definitions being added or deleted between
-/// pages, because the next page is resolved by ARN order, not by a saved offset.
-pub fn encode_next_token(resume_at: &str) -> String {
-    ::hex::encode(resume_at.as_bytes())
-}
-
-/// Decode a `NextToken` back into the ARN its page resumes at.
-///
-/// `None` for anything that is not a well-formed cursor (not hex, or not UTF-8). A
-/// well-formed cursor naming no stored ARN simply resumes at the first ARN after it,
-/// which is an empty page when none follows.
-pub fn decode_next_token(token: &str) -> Option<String> {
-    let bytes = ::hex::decode(token).ok()?;
-    String::from_utf8(bytes).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -707,9 +701,17 @@ pub struct ComAmazonawsCostexplorerAwsinsightsindexserviceState {
     /// BOUNDED at [`MAX_ANOMALY_MONITORS`] entries, refused by Create past that, so the
     /// store cannot grow without limit however many monitors a caller creates.
     pub anomaly_monitors: BTreeMap<String, AnomalyMonitorRecord>,
-    /// How many resource ids this service has minted — cost category definitions and
-    /// anomaly monitors share the counter, so every id it hands out is distinct from every
-    /// previous one whatever kind of resource asked for it.
+    /// Every cost anomaly subscription this account holds, keyed by its ARN.
+    ///
+    /// A `BTreeMap` for the same reason as the two registries above: one stable, total
+    /// order for the read side to paginate over.
+    ///
+    /// BOUNDED at [`MAX_ANOMALY_SUBSCRIPTIONS`] entries, refused by Create past that, so
+    /// the store cannot grow without limit however many subscriptions a caller creates.
+    pub anomaly_subscriptions: BTreeMap<String, AnomalySubscriptionRecord>,
+    /// How many resource ids this service has minted — cost category definitions, anomaly
+    /// monitors and anomaly subscriptions share the counter, so every id it hands out is
+    /// distinct from every previous one whatever kind of resource asked for it.
     pub resources_minted: u64,
 }
 

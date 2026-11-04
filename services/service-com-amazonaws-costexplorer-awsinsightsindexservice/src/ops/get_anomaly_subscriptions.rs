@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAnomalySubscriptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAnomalySubscriptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAnomalySubscriptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -152,18 +142,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAnomalySubscriptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAnomalySubscriptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAnomalySubscriptions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Only reachable when this service was mounted on an engine that holds no
+            // store for it, so there are no subscriptions to report and the operation
+            // genuinely cannot be served here.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // A page resumes at the ARN its cursor names. An unreadable cursor is the one
+        // failure this operation models for the member.
+        let resume_at = match input.next_page_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_next_token(token).ok_or_else(|| {
+                GetAnomalySubscriptionsErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: Some(
+                            "The pagination token is invalid. Try again without a pagination \
+                             token."
+                                .to_string(),
+                        ),
+                    },
+                )
+            })?),
+        };
+
+        let page_size = crate::state::requested_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // "A list of cost anomaly subscription ARNs": a list that names no ARN filters
+        // nothing out.
+        let filter = input
+            .subscription_arn_list
+            .as_deref()
+            .filter(|arns| !arns.is_empty());
+        // The monitor filter selects by association, so a monitor ARN no subscription
+        // alerts on reports an empty page rather than a failure: this operation models no
+        // unknown-monitor error.
+        let monitor_filter = input.monitor_arn.as_deref();
+
+        let store = state.lock();
+        if let Some(arns) = filter {
+            // The filter names resources, so an ARN the account holds no subscription for
+            // is a 404 rather than a page that silently omits it.
+            for arn in arns {
+                if !store.anomaly_subscriptions.contains_key(arn) {
+                    return Err(
+                        GetAnomalySubscriptionsErrorModeled::UnknownSubscriptionException(
+                            UnknownSubscriptionException {
+                                message: Some(format!(
+                                    "The cost anomaly subscription {arn} does not exist for \
+                                     the account."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        // The page walk, the cursor and the ARN order are the ones every paginated read
+        // in this service shares.
+        let page = crate::state::page(
+            &store.anomaly_subscriptions,
+            resume_at.as_ref(),
+            page_size,
+            |subscription| {
+                filter.is_none_or(|arns| arns.contains(&subscription.arn))
+                    && monitor_filter
+                        .is_none_or(|monitor_arn| subscription.monitors(monitor_arn))
+            },
+        );
+        let anomaly_subscriptions = page
+            .records
+            .into_iter()
+            .map(crate::state::AnomalySubscriptionRecord::to_anomaly_subscription)
+            .collect();
+        let next_page_token = page.next_token;
+        drop(store);
+
+        Ok(GetAnomalySubscriptionsOutput {
+            anomaly_subscriptions,
+            next_page_token,
+        })
     }
 }
