@@ -45,7 +45,11 @@
 //! `override_refusal` below is the seam the framework renders one through. A rule the model
 //! states only in prose reaches no boundary validator, so the handler that refuses it words
 //! its message through [`handler_constraint_violation`] rather than spelling a sentence of
-//! its own: one condition class, one wording, one spelling of the member.
+//! its own: one condition class, one wording, one spelling of the member. That envelope is
+//! for a violated constraint ON A MEMBER and nothing else: a refusal of another class —
+//! an unresolvable pagination token, whose member constraints are all satisfied and whose
+//! provenance is what fails — states the sentence AWS states for its own class, kept beside
+//! this service's other refusal wording in [`crate::state`].
 //!
 //! Two of those seams also serve this service's ACTIVATION handshake — the unsigned,
 //! non-modelled HTTP request a deployed gateway appliance makes to be issued the

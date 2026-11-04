@@ -35,7 +35,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gateway;
 
-use backup_gateway::state::{service_state, VirtualMachineInventory};
+use backup_gateway::state::{service_state, VirtualMachineInventory, PAGE_TOKEN_INVALID_MESSAGE};
 
 use crate::gateway_lifecycle::{build_engine, build_router, call, create, Reply, REGION};
 
@@ -646,12 +646,10 @@ async fn a_next_token_this_listing_did_not_issue_is_refused() {
             refused.status,
             refused.body
         );
-        assert!(
-            refused
-                .str_at("/Message")
-                .is_some_and(|stated| stated.contains("at 'nextToken'")),
-            "case {case:?}: the refusal must name the member it refused, at its \
-             validation path, got {:?}",
+        assert_eq!(
+            refused.str_at("/Message"),
+            Some(PAGE_TOKEN_INVALID_MESSAGE),
+            "case {case:?}: the refusal must state the pagination-token sentence, got {:?}",
             refused.body
         );
         assert!(

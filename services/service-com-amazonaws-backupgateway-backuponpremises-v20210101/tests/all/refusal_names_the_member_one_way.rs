@@ -14,14 +14,18 @@
 //! one condition class, so the wording cannot depend on whether the constraint was a
 //! modelled trait the boundary validator refused or a rule stated only in the model's prose
 //! that a handler refuses itself: the rules of `Tag$Key`, `Tag$Value` and
-//! `CreateGatewayInput$Tags`' documented ceiling, and the provenance of a `NextToken`.
+//! `CreateGatewayInput$Tags`' documented ceiling.
+//!
+//! A refusal that is NOT about a member failing a constraint is outside this class and is
+//! worded as its own class is: an unresolvable pagination token, whose member constraints
+//! all hold, is covered by `page_token_refusal_wording`.
 //!
 //! The tables below span that class rather than one request: every operation of this model
 //! that carries an Amazon Web Services tag pair, both halves of a pair, the offending pair
 //! at each position of a list of one, two and three, values differing in which space
-//! character they carry and in the case of the reserved prefix, the resource-level tag
-//! ceiling reached in one request and across two, and every listing that resolves a
-//! `NextToken`. `the_boundary_and_a_handler_name_one_member_alike` is the row that pins the
+//! character they carry and in the case of the reserved prefix, and the resource-level tag
+//! ceiling reached in one request and across two.
+//! `the_boundary_and_a_handler_name_one_member_alike` is the row that pins the
 //! spelling to the boundary validator's own, by reading the path out of a refusal of a
 //! MODELLED constraint on the very same member.
 
@@ -536,55 +540,5 @@ async fn the_tag_ceiling_is_reported_at_the_tag_member_itself() {
             stated, expected,
             "case {case:?}: the refusal must state {expected:?}, got {stated:?}"
         );
-    }
-}
-
-/// The same rule on a member that is not a list at all: a `NextToken` this service never
-/// issued is refused at `nextToken`, under the envelope, on every listing that resolves
-/// one — and the opaque token is not echoed back.
-#[tokio::test]
-async fn an_unissued_page_token_is_refused_at_the_token_member() {
-    let engine = build_engine();
-    let router = build_router(&engine);
-    // A real record exists, so a refusal below is about the token and not about an empty
-    // store.
-    let _gateway = create(&router, "gw-token-wording").await;
-
-    // Tokens inside `NextToken`'s modelled constraints (len 1..1000, pattern `^.+$`), so
-    // each reaches the handler: one that is not hex at all, one that is hex of something
-    // that is no ARN of this service, and one of the published length maximum.
-    let tokens = [
-        ("not a token at all", "not-a-token".to_string()),
-        ("hex of a string that is no ARN", hex::encode("nothing")),
-        ("a token of the 1000-character maximum", "a".repeat(1000)),
-    ];
-
-    for operation in ["ListGateways", "ListHypervisors", "ListVirtualMachines"] {
-        let expected = expected_one(
-            None,
-            "nextToken",
-            &format!("the token must be one a previous {operation} response returned"),
-        );
-        for (case, token) in &tokens {
-            let case = format!("{operation}: {case}");
-            let refused = call(&router, operation, &json!({ "NextToken": token })).await;
-            assert_eq!(
-                (refused.status, refused.code.as_deref()),
-                (400, Some("ValidationException")),
-                "case {case:?}: a token this service never issued must be refused with \
-                 400 ValidationException, got {} {:?}",
-                refused.status,
-                refused.body
-            );
-            let stated = message_of(&refused);
-            assert_eq!(
-                stated, expected,
-                "case {case:?}: the refusal must state {expected:?}, got {stated:?}"
-            );
-            assert!(
-                !stated.contains(token.as_str()),
-                "case {case:?}: the opaque token must not be echoed back, got {stated:?}"
-            );
-        }
     }
 }

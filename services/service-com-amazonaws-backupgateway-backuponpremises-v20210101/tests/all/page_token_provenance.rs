@@ -31,7 +31,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gateway;
 
-use backup_gateway::state::{service_state, VirtualMachineInventory};
+use backup_gateway::state::{service_state, VirtualMachineInventory, PAGE_TOKEN_INVALID_MESSAGE};
 
 use crate::gateway_lifecycle::{
     build_engine, build_router, call_in_region, create_body, issued_activation_key_for, Reply,
@@ -41,31 +41,31 @@ use crate::gateway_lifecycle::{
 /// A second region to seed, so a token can be replayed against a listing that did not
 /// issue it. Its name sorts BELOW the harness's `us-west-2`, which is what makes a
 /// cross-region boundary able to include a whole listing.
-const OTHER_REGION: &str = "eu-central-1";
+pub(crate) const OTHER_REGION: &str = "eu-central-1";
 
 /// One paginated listing of this service.
 #[derive(Debug, Clone, Copy)]
-struct Listing {
-    operation: &'static str,
+pub(crate) struct Listing {
+    pub(crate) operation: &'static str,
     /// The output member the records arrive in.
-    list_member: &'static str,
+    pub(crate) list_member: &'static str,
     /// The member of a record carrying its ARN.
-    arn_member: &'static str,
+    pub(crate) arn_member: &'static str,
     /// The ARN resource type of the records it lists — the `gateway` of
     /// `arn:aws:backup-gateway:<region>:<account>:gateway/<id>`.
-    resource_type: &'static str,
+    pub(crate) resource_type: &'static str,
     /// The id prefix this service mints a record of that type under, as seen in the ARNs
     /// it hands out: asserted against a minted ARN in every test below, so this table
     /// cannot drift from what the service mints.
-    id_prefix: &'static str,
+    pub(crate) id_prefix: &'static str,
     /// How many hex digits the minted id of that type carries behind its prefix — the
     /// eight of `hypervisor/hype-00000000`, the sixteen of
     /// `gateway/bgw-0000000000000000`. Part of the identifier form of the RESOURCE, so it
     /// sits beside the prefix and is asserted against a minted ARN in every test below.
-    id_digits: usize,
+    pub(crate) id_digits: usize,
 }
 
-const LISTINGS: [Listing; 3] = [
+pub(crate) const LISTINGS: [Listing; 3] = [
     Listing {
         operation: "ListGateways",
         list_member: "Gateways",
@@ -95,15 +95,15 @@ const LISTINGS: [Listing; 3] = [
 /// The ARNs one region's records are stored under, by resource kind — in the order the
 /// seed created them.
 #[derive(Debug, Default, Clone)]
-struct Seeded {
-    gateways: Vec<String>,
-    hypervisors: Vec<String>,
-    machines: Vec<String>,
+pub(crate) struct Seeded {
+    pub(crate) gateways: Vec<String>,
+    pub(crate) hypervisors: Vec<String>,
+    pub(crate) machines: Vec<String>,
 }
 
 impl Seeded {
     /// The ARNs of the records `listing` reports.
-    fn of(&self, listing: &Listing) -> &[String] {
+    pub(crate) fn of(&self, listing: &Listing) -> &[String] {
         match listing.operation {
             "ListGateways" => &self.gateways,
             "ListHypervisors" => &self.hypervisors,
@@ -136,7 +136,7 @@ fn minted_id(listing: &Listing, sequence: u64) -> String {
 /// — enough, at two or more, for every listing of that region to hand out a `NextToken`
 /// at `MaxResults=1`, and the number of records is what fixes the sequences the service
 /// mints in that region.
-async fn seed(
+pub(crate) async fn seed(
     engine: &Arc<engine::InMemoryEngine>,
     router: &MultiServiceRouter,
     region: &str,
@@ -223,7 +223,7 @@ async fn seed(
 }
 
 /// The ARNs a listing reply carries, read off the members `listing` names them in.
-fn listed_arns(reply: &Reply, listing: &Listing) -> Vec<String> {
+pub(crate) fn listed_arns(reply: &Reply, listing: &Listing) -> Vec<String> {
     reply
         .body
         .get(listing.list_member)
@@ -243,7 +243,7 @@ fn listed_arns(reply: &Reply, listing: &Listing) -> Vec<String> {
         .unwrap_or_default()
 }
 
-async fn list(
+pub(crate) async fn list(
     router: &MultiServiceRouter,
     region: &str,
     listing: &Listing,
@@ -290,7 +290,7 @@ fn assert_minted_form(listing: &Listing, region: &str, minted: &str) {
 /// The rows differ along every segment of the boundary ARN and along the spelling of a
 /// minted id, which is what the rule generalises over; the second row is a boundary that
 /// sorts BELOW every stored key, the shape that used to be answered with page one.
-fn forged_tokens(listing: &Listing) -> Vec<(String, String)> {
+pub(crate) fn forged_tokens(listing: &Listing) -> Vec<(String, String)> {
     let account = engine::EMULATOR_ACCOUNT_ID;
     let resource_type = listing.resource_type;
     let prefix = listing.id_prefix;
@@ -400,12 +400,11 @@ async fn a_next_token_this_service_never_issued_is_refused() {
                 refused.status,
                 refused.body
             );
-            assert!(
-                refused
-                    .str_at("/Message")
-                    .is_some_and(|stated| stated.contains("at 'nextToken'")),
-                "case {} / {case}: the refusal must name the member it refused, at its \
-                 validation path, got {:?}",
+            assert_eq!(
+                refused.str_at("/Message"),
+                Some(PAGE_TOKEN_INVALID_MESSAGE),
+                "case {} / {case}: the refusal must state the pagination-token sentence, \
+                 got {:?}",
                 listing.operation,
                 refused.body
             );

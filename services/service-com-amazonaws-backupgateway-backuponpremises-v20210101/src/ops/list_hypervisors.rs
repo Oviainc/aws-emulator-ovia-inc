@@ -173,15 +173,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .ok_or_else(|| {
                         ListHypervisorsErrorModeled::ValidationException(ValidationException {
                             error_code: None,
-                            // Worded by `crate::service`, as in `list_gateways`: the
-                            // member's validation path, under the validation-error
-                            // envelope, and the opaque token not echoed back.
-                            message: Some(crate::service::handler_constraint_violation(
-                                None,
-                                &crate::service::member_path("NextToken"),
-                                "the token must be one a previous ListHypervisors response \
-                                 returned",
-                            )),
+                            // The one sentence this service states for an unresolvable
+                            // pagination token, as in `list_gateways`: a condition of the
+                            // token's provenance rather than of a modelled constraint on
+                            // the member, so it is not worded as a member-constraint
+                            // violation, and nothing of the request is echoed.
+                            message: Some(
+                                crate::state::PAGE_TOKEN_INVALID_MESSAGE.to_string(),
+                            ),
                         })
                     })?,
             ),

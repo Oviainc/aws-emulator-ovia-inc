@@ -79,6 +79,8 @@ mod negative_paths;
 mod page_token_provenance;
 #[path = "all/page_token_query_identity.rs"]
 mod page_token_query_identity;
+#[path = "all/page_token_refusal_wording.rs"]
+mod page_token_refusal_wording;
 #[path = "all/pattern_requirement_is_the_modelled_expression.rs"]
 mod pattern_requirement_is_the_modelled_expression;
 #[path = "all/put_bandwidth_rate_limit_schedule.rs"]

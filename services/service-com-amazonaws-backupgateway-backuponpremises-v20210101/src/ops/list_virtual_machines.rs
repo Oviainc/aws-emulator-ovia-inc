@@ -185,19 +185,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .ok_or_else(|| {
                         ListVirtualMachinesErrorModeled::ValidationException(ValidationException {
                             error_code: None,
-                            // Worded by `crate::service`, as in `list_gateways`: the
-                            // member's validation path, under the validation-error
-                            // envelope, and the opaque token not echoed back. One
+                            // The one sentence this service states for an unresolvable
+                            // pagination token, as in `list_gateways`: a condition of the
+                            // token's provenance rather than of a modelled constraint on
+                            // the member, and nothing of the request is echoed. One
                             // sentence covers every token this listing did not issue,
                             // whichever way it fails to be one — a boundary never minted,
                             // or one minted for a differently filtered listing, which is
                             // not a token a previous response of THIS listing returned.
-                            message: Some(crate::service::handler_constraint_violation(
-                                None,
-                                &crate::service::member_path("NextToken"),
-                                "the token must be one a previous ListVirtualMachines \
-                                 response returned",
-                            )),
+                            message: Some(
+                                crate::state::PAGE_TOKEN_INVALID_MESSAGE.to_string(),
+                            ),
                         })
                     })?,
             ),

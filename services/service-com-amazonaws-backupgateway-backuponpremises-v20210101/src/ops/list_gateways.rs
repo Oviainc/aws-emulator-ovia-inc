@@ -172,17 +172,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .ok_or_else(|| {
                         ListGatewaysErrorModeled::ValidationException(ValidationException {
                             error_code: None,
-                            // Worded by `crate::service`, so this refusal names the member
-                            // the way a refusal of a modelled constraint on it does: the
-                            // member's validation path, under the validation-error
-                            // envelope. The token itself is not echoed — it is an opaque
-                            // boundary the client was handed, not a value it chose.
-                            message: Some(crate::service::handler_constraint_violation(
-                                None,
-                                &crate::service::member_path("NextToken"),
-                                "the token must be one a previous ListGateways response \
-                                 returned",
-                            )),
+                            // An unresolvable pagination token is its OWN condition class,
+                            // not a violated constraint on the token member: the modelled
+                            // traits on `NextToken` are satisfied, and what fails is where
+                            // the token came from. So it is stated as AWS states that
+                            // class — one fixed sentence, kept in `crate::state` so every
+                            // listing of this service words it alike — rather than through
+                            // the member-constraint envelope `crate::service` renders. The
+                            // sentence takes nothing from the request, so the opaque token
+                            // is not echoed either.
+                            message: Some(
+                                crate::state::PAGE_TOKEN_INVALID_MESSAGE.to_string(),
+                            ),
                         })
                     })?,
             ),

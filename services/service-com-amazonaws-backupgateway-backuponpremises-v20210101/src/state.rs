@@ -91,7 +91,8 @@
 //! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::resume_after`]): only a
 //! boundary this store really minted, for that resource type, in the region the listing
 //! reports and under the filters the request presenting it carries, resumes a listing,
-//! and every other string is refused — a boundary of
+//! and every other string is refused with the one sentence
+//! [`PAGE_TOKEN_INVALID_MESSAGE`] states — a boundary of
 //! the right shape that nothing was ever stored under would bound the range at a key the
 //! whole listing sorts above, so accepting it would hand a client page one for ever.
 //! Every resource of this service is REGIONAL — its region is a segment of the
@@ -826,6 +827,24 @@ pub const DEFAULT_PAGE_SIZE: usize = 100;
 
 /// See [`DEFAULT_PAGE_SIZE`].
 pub const MAX_PAGE_SIZE: usize = 100;
+
+/// The whole `ValidationException$Message` every paginated listing of this service answers
+/// a `NextToken` it never issued with.
+///
+/// An unresolvable pagination token is a condition class of its own, NOT a violation of a
+/// modelled constraint on the token member: `NextToken` is `@length(1, 1000)` with
+/// `@pattern ^.+$` (`smithy_query(query="operation",operation="ListGateways")`), so a token
+/// that satisfies those traits is a well-formed value whose PROVENANCE — whether a previous
+/// response of that same listing minted it ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::resume_after`])
+/// — is what fails. AWS states that condition in one FIXED sentence: no part of it is taken
+/// from the request or from state, so the token is never echoed, nor is the member path or
+/// the expression it satisfied. The sentence is recorded behaviour (the behavioral unit
+/// `backup-gateway.list-gateways-returns-list-shape` pins it); the modelled half is the
+/// error shape and its `@httpError 400`.
+///
+/// Kept here, in one place, because all three listings resolve a token through the one
+/// helper and so refuse an unissued one identically.
+pub const PAGE_TOKEN_INVALID_MESSAGE: &str = "The pagination token is invalid and cannot be processed.";
 
 /// How many tags one resource can carry.
 ///
