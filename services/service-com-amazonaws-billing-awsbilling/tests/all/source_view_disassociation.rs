@@ -32,7 +32,7 @@ use crate::billing_views::{
 use crate::rejection_fidelity::message;
 
 /// A pattern-valid `BillingViewArn` for a source view with resource id `id`.
-fn source_arn(id: &str) -> String {
+pub(crate) fn source_arn(id: &str) -> String {
     format!("arn:aws:billing::{ACCOUNT_ID}:billingview/{id}")
 }
 
@@ -127,7 +127,11 @@ fn source_views(body: &Value) -> Vec<String> {
 
 /// Put the stored view's `healthStatus.statusCode` at `status`, the one way a
 /// view's health moves in this emulator: no modelled operation sets it.
-fn set_health_status(engine: &std::sync::Arc<engine::InMemoryEngine>, arn: &str, status: &str) {
+pub(crate) fn set_health_status(
+    engine: &std::sync::Arc<engine::InMemoryEngine>,
+    arn: &str,
+    status: &str,
+) {
     let state = engine.state::<ComAmazonawsBillingAwsbillingState>();
     let mut state = state.lock();
     let view = state
@@ -138,7 +142,7 @@ fn set_health_status(engine: &std::sync::Arc<engine::InMemoryEngine>, arn: &str,
 }
 
 /// Create a `CUSTOM` billing view holding `held` and return its minted ARN.
-async fn create_view(
+pub(crate) async fn create_view(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,

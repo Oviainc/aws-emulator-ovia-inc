@@ -242,18 +242,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `BillingViewHealthStatusException`: "a billing view's health status
         // prevents an operation from being performed … if the billing view is in
-        // a state other than HEALTHY".
-        if view.health_status_code != crate::state::BILLING_VIEW_STATUS_HEALTHY {
+        // a state other than HEALTHY". The refusal is the one every writer of a
+        // stored view shares — see `crate::state::billing_view_not_healthy`.
+        if !view.is_healthy() {
             return Err(
                 DisassociateSourceViewsErrorModeled::BillingViewHealthStatusException(
-                    BillingViewHealthStatusException {
-                        message: format!(
-                            "Billing view {} is {}; it must be {} to disassociate source views",
-                            input.arn,
-                            view.health_status_code,
-                            crate::state::BILLING_VIEW_STATUS_HEALTHY
-                        ),
-                    },
+                    crate::state::billing_view_not_healthy(
+                        &input.arn,
+                        &view.health_status_code,
+                        "disassociate source views",
+                    ),
                 )
                 .into(),
             );

@@ -202,6 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(&input.arn, "arn"));
         };
         let target_is_managed = target.is_managed();
+        // The gate below needs the status string for its refusal, and the borrow
+        // cannot outlive this block, so the status is cloned once and drives
+        // both the gate and its message.
         let target_health = target.health_status_code.clone();
         let mut source_views = target.source_views.clone();
 
@@ -248,16 +251,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `BillingViewHealthStatusException`: "a billing view's health status
         // prevents an operation from being performed … if the billing view is in
-        // a state other than HEALTHY".
+        // a state other than HEALTHY". The refusal is the one every writer of a
+        // stored view shares — see `crate::state::billing_view_not_healthy`.
         if target_health != crate::state::BILLING_VIEW_STATUS_HEALTHY {
             return Err(AssociateSourceViewsErrorModeled::BillingViewHealthStatusException(
-                BillingViewHealthStatusException {
-                    message: format!(
-                        "Billing view {} is {target_health}; it must be {} to associate source views",
-                        input.arn,
-                        crate::state::BILLING_VIEW_STATUS_HEALTHY
-                    ),
-                },
+                crate::state::billing_view_not_healthy(
+                    &input.arn,
+                    &target_health,
+                    "associate source views",
+                ),
             )
             .into());
         }

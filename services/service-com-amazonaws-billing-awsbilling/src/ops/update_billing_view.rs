@@ -6,7 +6,10 @@
 //! outside the caller's own account is an `AccessDeniedException` (403); an ARN
 //! that names no existing `CUSTOM` view of this account — absent, or the
 //! account's `PRIMARY` view — is a `ValidationException` (400), because only a
-//! `CUSTOM` view may be edited and eligibility is decided before existence.
+//! `CUSTOM` view may be edited and eligibility is decided before existence. A
+//! view whose health status is anything other than `HEALTHY` is refused with
+//! `BillingViewHealthStatusException` (400) before anything is written, as every
+//! operation that writes a stored view is.
 //!
 //! ## Shape of an operation
 //!
@@ -199,6 +202,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.arn, "edited",
             ))
         })?;
+
+        // `BillingViewHealthStatusException`: "a billing view's health status
+        // prevents an operation from being performed … if the billing view is in
+        // a state other than HEALTHY". Nothing below this line is reached unless
+        // the view is HEALTHY, so a refused update leaves the record — and the
+        // instants a later read reports from it — exactly as it was. The refusal
+        // is the one every writer of a stored view shares — see
+        // `crate::state::billing_view_not_healthy`.
+        if !view.is_healthy() {
+            return Err(
+                UpdateBillingViewErrorModeled::BillingViewHealthStatusException(
+                    crate::state::billing_view_not_healthy(
+                        &input.arn,
+                        &view.health_status_code,
+                        "be updated",
+                    ),
+                )
+                .into(),
+            );
+        }
 
         let updated_at = std::time::SystemTime::now();
         if let Some(name) = input.name {

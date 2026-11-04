@@ -30,8 +30,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_state;
 
 use crate::ops::types::{
-    AccessDeniedException, BillingViewHealthStatus, Expression, ValidationException,
-    ValidationExceptionField, BILLING_FEATURE_VALUES,
+    AccessDeniedException, BillingViewHealthStatus, BillingViewHealthStatusException, Expression,
+    ValidationException, ValidationExceptionField, BILLING_FEATURE_VALUES,
 };
 
 /// `CUSTOM`, the `BillingViewType` a view created through `CreateBillingView`
@@ -398,6 +398,15 @@ impl BillingView {
     /// appeared.
     pub fn is_always_active(&self) -> bool {
         self.billing_view_type == BILLING_VIEW_TYPE_PRIMARY
+    }
+
+    /// Whether this view's `BillingViewStatus` is
+    /// [`BILLING_VIEW_STATUS_HEALTHY`], the one status in which an operation may
+    /// act on it: every other value (`CREATING`, `UNHEALTHY`, `UPDATING`) is a
+    /// state the modeled `BillingViewHealthStatusException` names — see
+    /// [`billing_view_not_healthy`].
+    pub fn is_healthy(&self) -> bool {
+        self.health_status_code == BILLING_VIEW_STATUS_HEALTHY
     }
 }
 
@@ -1181,6 +1190,29 @@ pub fn not_a_custom_view(arn: &str, action: &str) -> ValidationException {
             name: "arn".to_string(),
             message: format!("{arn} does not correspond to a Custom Billing View."),
         }]),
+    }
+}
+
+/// The `BillingViewHealthStatusException` payload for a request against a view
+/// whose stored status is not [`BILLING_VIEW_STATUS_HEALTHY`] — the modeled
+/// error "thrown when a billing view's health status prevents an operation from
+/// being performed … if the billing view is in a state other than HEALTHY".
+///
+/// `action` is the infinitive of what the refused request would have done to the
+/// view (`"associate source views"`, `"be updated"`), so the sentence names the
+/// action the caller asked for. Shared by every writer the model declares this
+/// error for, so no two of them can disagree about the same gate or report it in
+/// two wordings.
+pub fn billing_view_not_healthy(
+    arn: &str,
+    status: &str,
+    action: &str,
+) -> BillingViewHealthStatusException {
+    BillingViewHealthStatusException {
+        message: format!(
+            "Billing view {arn} is {status}; it must be \
+             {BILLING_VIEW_STATUS_HEALTHY} to {action}"
+        ),
     }
 }
 
