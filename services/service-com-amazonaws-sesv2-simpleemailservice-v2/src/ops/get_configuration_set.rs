@@ -195,10 +195,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Open and click tracking is configured per set; a set that configures no
             // custom redirect domain carries no `TrackingOptions` member at all.
             tracking_options: record.tracking_options.clone(),
-            // The delivery, reputation and sending views always exist: they carry the
-            // effective policy a send through this set is subject to, which is SES's
-            // own default until a caller changes it.
-            delivery_options: Some(record.delivery_options()),
+            // The delivery configuration of a set that configures none is reported as
+            // no member at all, rather than as the default a send would fall back to:
+            // what a read reports is what the set was configured with. The stored member
+            // IS that configuration — every write of it goes through one shared
+            // projection (`state::configuration_set_delivery_options`) — so the read
+            // reports it as it stands.
+            delivery_options: record.delivery_options.clone(),
+            // The reputation and sending views always exist: each is a per-set switch
+            // whose modelled default every set carries from the moment it is created.
             reputation_options: Some(record.reputation_options()),
             sending_options: Some(record.sending_options()),
             // The set's tag set, reported as the list it is: a configuration set that

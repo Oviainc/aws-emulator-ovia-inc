@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutConfigurationSetDeliveryOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutConfigurationSetDeliveryOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutConfigurationSetDeliveryOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the delivery configuration of the configuration set the request names — the TLS
+//! policy, the dedicated IP pool it sends from and the bound on delivery attempts — so
+//! `GetConfigurationSet` reports it as `DeliveryOptions`. A configuration-set name the
+//! account holds no set under, or a pool name it holds no dedicated IP pool under, is
+//! refused with `NotFoundException`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +144,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutConfigurationSetDeliveryOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutConfigurationSetDeliveryOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutConfigurationSetDeliveryOptions"))
+        // Request metadata is not needed: a configuration set is keyed by name within
+        // the one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutConfigurationSetDeliveryOptions without the shared emulator state",
+            ));
+        };
+
+        let name = input.configuration_set_name;
+        if !crate::state::configuration_set_name_is_valid(&name) {
+            return Err(bad_request(crate::state::configuration_set_name_invalid(
+                &name,
+            )));
+        }
+
+        // The members this operation carries ARE a `DeliveryOptions`, read through the
+        // same shared projection the create of a set reads it through, so the two cannot
+        // accept different values. The whole member is the state this operation owns, so
+        // the set afterwards is configured as this request describes and not as an
+        // earlier one did — and a request that describes no delivery configuration at all
+        // leaves the set carrying none, which is what the projection answers.
+        let options = crate::state::configuration_set_delivery_options(DeliveryOptions {
+            tls_policy: input.tls_policy,
+            sending_pool_name: input.sending_pool_name,
+            max_delivery_seconds: input.max_delivery_seconds,
+        })
+        .map_err(bad_request)?;
+
+        let mut store = state.lock();
+        // "The name of the dedicated IP pool to associate with the configuration set":
+        // the association is with a pool the account holds, so a name no pool is held
+        // under names a resource that does not exist. Read before the set is borrowed to
+        // write, and reported after it, so the set the request addresses is what a
+        // caller is told about first.
+        let missing_pool = options
+            .as_ref()
+            .and_then(|options| options.sending_pool_name.clone())
+            .filter(|pool_name| !store.dedicated_ip_pools.contains_key(pool_name));
+        let Some(record) = store.configuration_sets.get_mut(&name) else {
+            // The configuration this operation writes belongs to a configuration set, so
+            // a name the account holds no set under is refused and nothing is stored
+            // under it.
+            return Err(not_found(crate::state::configuration_set_not_found(&name)));
+        };
+        if let Some(pool_name) = missing_pool {
+            return Err(not_found(crate::state::dedicated_ip_pool_not_found(
+                &pool_name,
+            )));
+        }
+        record.delivery_options = options;
+
+        // `PutConfigurationSetDeliveryOptionsResponse` carries no members: the stored
+        // configuration is read back with `GetConfigurationSet`.
+        Ok(PutConfigurationSetDeliveryOptionsOutput {})
     }
+}
+
+/// Refuse the request with this service's input error.
+fn bad_request(message: impl Into<String>) -> PutConfigurationSetDeliveryOptionsError {
+    PutConfigurationSetDeliveryOptionsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// Refuse the request because a resource it addresses is not there.
+fn not_found(message: impl Into<String>) -> PutConfigurationSetDeliveryOptionsError {
+    PutConfigurationSetDeliveryOptionsErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.into()),
+    })
+    .into()
 }

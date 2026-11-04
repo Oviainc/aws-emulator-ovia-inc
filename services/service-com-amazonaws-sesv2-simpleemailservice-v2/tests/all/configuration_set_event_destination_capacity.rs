@@ -49,12 +49,22 @@ fn dimension(index: usize, source: &str) -> Value {
 }
 
 /// One row of the table: the event types the definition matches and the dimension
-/// configurations its CloudWatch destination carries, both of which a read must report
-/// unchanged.
+/// configurations its CloudWatch destination carries. The dimension configurations are
+/// reported unchanged; the event types are reported in the order SES reports a
+/// destination's types, ascending by name, whatever order the definition listed them in.
 struct ListCase {
     case: &'static str,
     matching_event_types: Vec<String>,
+    /// The event types a read must report: the ones sent, ascending by name. Written out
+    /// per row rather than derived from the row's own list, so the expectation does not
+    /// come from the behaviour under test.
+    reported_event_types: Vec<String>,
     dimensions: Vec<Value>,
+}
+
+/// `event_types` as a list of owned strings, for a row that writes its order out.
+fn types(event_types: &[&str]) -> Vec<String> {
+    event_types.iter().map(|value| value.to_string()).collect()
 }
 
 /// The rows of the table: the counts and orders a definition's lists can arrive in.
@@ -74,20 +84,19 @@ fn list_cases() -> Vec<ListCase> {
         ListCase {
             case: "no event type and one dimension",
             matching_event_types: Vec::new(),
+            reported_event_types: Vec::new(),
             dimensions: vec![dimension(0, DIMENSION_VALUE_SOURCES[0])],
         },
         ListCase {
             case: "one event type and one dimension per modelled value source",
-            matching_event_types: vec!["SEND".to_string()],
+            matching_event_types: types(&["SEND"]),
+            reported_event_types: types(&["SEND"]),
             dimensions: one_per_source,
         },
         ListCase {
             case: "several event types out of model order, several dimensions",
-            matching_event_types: vec![
-                "CLICK".to_string(),
-                "BOUNCE".to_string(),
-                "DELIVERY_DELAY".to_string(),
-            ],
+            matching_event_types: types(&["CLICK", "BOUNCE", "DELIVERY_DELAY"]),
+            reported_event_types: types(&["BOUNCE", "CLICK", "DELIVERY_DELAY"]),
             dimensions: (0..4)
                 .map(|index| {
                     dimension(
@@ -99,10 +108,22 @@ fn list_cases() -> Vec<ListCase> {
         },
         ListCase {
             // The sibling suite's table already pins every event type in the model's own
-            // order, so this row carries them reversed: what the rule is about is that the
-            // order SENT is the order stored.
+            // order, so this row carries them reversed: what the rule is about is that
+            // the order a read reports is SES's own, whatever order was sent.
             case: "every modelled event type in reverse order",
             matching_event_types: reversed,
+            reported_event_types: types(&[
+                "BOUNCE",
+                "CLICK",
+                "COMPLAINT",
+                "DELIVERY",
+                "DELIVERY_DELAY",
+                "OPEN",
+                "REJECT",
+                "RENDERING_FAILURE",
+                "SEND",
+                "SUBSCRIPTION",
+            ]),
             dimensions: (0..10)
                 .map(|index| {
                     dimension(
@@ -116,7 +137,7 @@ fn list_cases() -> Vec<ListCase> {
 }
 
 #[tokio::test]
-async fn a_definitions_lists_are_stored_and_reported_exactly_as_sent() {
+async fn a_definitions_lists_are_stored_whole_and_reported_as_ses_reports_them() {
     for case in list_cases() {
         let ses = Ses::new();
         let set = "lists-under-test";
@@ -161,10 +182,10 @@ async fn a_definitions_lists_are_stored_and_reported_exactly_as_sent() {
             .unwrap_or_else(|| json!([]));
         assert_eq!(
             reported_event_types,
-            json!(case.matching_event_types),
-            "case {:?}: expected MatchingEventTypes {:?} in that order, got {stored:?}",
+            json!(case.reported_event_types),
+            "case {:?}: expected MatchingEventTypes {:?}, got {stored:?}",
             case.case,
-            case.matching_event_types
+            case.reported_event_types
         );
         assert_eq!(
             stored

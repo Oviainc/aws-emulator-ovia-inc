@@ -128,7 +128,12 @@ struct TopicCase {
     /// The `SnsDestination$TopicArn` the definition names.
     topic_arn: &'static str,
     enabled: bool,
+    /// The event types the definition names, in the order it names them.
     matching_event_types: &'static [&'static str],
+    /// The same types as a read reports them: ascending by name, which is the order SES
+    /// reports a destination's matching event types in. Written out per row rather than
+    /// derived, so the expectation does not come from the behaviour under test.
+    reported_event_types: &'static [&'static str],
 }
 
 /// The rows of the table: the same attach, differing in the topic it publishes to.
@@ -144,6 +149,7 @@ const TOPIC_CASES: &[TopicCase] = &[
         topic_arn: "arn:aws:sns:us-east-1:123456789012:ses-events",
         enabled: true,
         matching_event_types: &["SEND"],
+        reported_event_types: &["SEND"],
     },
     TopicCase {
         case: "a topic in another Region, under another account, named with underscores",
@@ -152,6 +158,7 @@ const TOPIC_CASES: &[TopicCase] = &[
         topic_arn: "arn:aws:sns:eu-west-2:210987654321:ses_events_2",
         enabled: true,
         matching_event_types: &["BOUNCE", "COMPLAINT", "DELIVERY"],
+        reported_event_types: &["BOUNCE", "COMPLAINT", "DELIVERY"],
     },
     TopicCase {
         case: "a topic in the GovCloud partition",
@@ -160,6 +167,7 @@ const TOPIC_CASES: &[TopicCase] = &[
         topic_arn: "arn:aws-us-gov:sns:us-gov-west-1:123456789012:ses-events-gov",
         enabled: false,
         matching_event_types: &["REJECT", "RENDERING_FAILURE"],
+        reported_event_types: &["REJECT", "RENDERING_FAILURE"],
     },
     TopicCase {
         case: "a topic in the China partition, named with digits and mixed case",
@@ -168,6 +176,7 @@ const TOPIC_CASES: &[TopicCase] = &[
         topic_arn: "arn:aws-cn:sns:cn-north-1:123456789012:SESEvents9",
         enabled: true,
         matching_event_types: &["OPEN", "CLICK", "SUBSCRIPTION"],
+        reported_event_types: &["CLICK", "OPEN", "SUBSCRIPTION"],
     },
     TopicCase {
         case: "a FIFO topic",
@@ -176,6 +185,7 @@ const TOPIC_CASES: &[TopicCase] = &[
         topic_arn: "arn:aws:sns:ap-southeast-2:123456789012:ses-events.fifo",
         enabled: true,
         matching_event_types: &["DELIVERY_DELAY"],
+        reported_event_types: &["DELIVERY_DELAY"],
     },
     TopicCase {
         // `EventDestinationDefinition$MatchingEventTypes` is optional and `Enabled` is
@@ -187,6 +197,7 @@ const TOPIC_CASES: &[TopicCase] = &[
         topic_arn: "arn:aws:sns:us-west-2:123456789012:t",
         enabled: false,
         matching_event_types: &[],
+        reported_event_types: &[],
     },
 ];
 
@@ -302,10 +313,10 @@ async fn a_created_set_takes_an_sns_destination_for_the_topic_the_definition_nam
         );
         assert_eq!(
             list(&reported, "MatchingEventTypes"),
-            case.matching_event_types,
+            case.reported_event_types,
             "case {:?}: expected MatchingEventTypes {:?}, got {:?}",
             case.case,
-            case.matching_event_types,
+            case.reported_event_types,
             reported
         );
         // An SNS destination publishes to a topic and to nothing else: no other

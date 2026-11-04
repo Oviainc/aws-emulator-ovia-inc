@@ -47,6 +47,8 @@ mod configuration_set_listing;
 mod configuration_set_message_security;
 #[path = "all/configuration_set_not_found_message.rs"]
 mod configuration_set_not_found_message;
+#[path = "all/configuration_set_option_writes.rs"]
+mod configuration_set_option_writes;
 #[path = "all/configuration_set_sending_options.rs"]
 mod configuration_set_sending_options;
 #[path = "all/configuration_set_sending_pause.rs"]

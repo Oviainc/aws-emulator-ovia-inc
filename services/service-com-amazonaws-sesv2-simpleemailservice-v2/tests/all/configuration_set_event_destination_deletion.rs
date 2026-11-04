@@ -201,10 +201,11 @@ async fn deleting_destinations_in_any_order_removes_exactly_the_named_ones() {
                 again.error_code(),
                 again.message()
             );
-            assert!(
-                again.message().contains(&name) && again.message().contains(set),
-                "case {case:?}: a second delete of {name:?} must name the destination and the \
-                 set, got {:?}",
+            assert_eq!(
+                again.message(),
+                format!("No EventDestination found for {set}"),
+                "case {case:?}: a second delete of {name:?} must answer the service's fixed \
+                 sentence naming the set, got {:?}",
                 again.message()
             );
 

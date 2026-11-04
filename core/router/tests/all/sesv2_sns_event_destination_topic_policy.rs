@@ -86,6 +86,22 @@ const EVERY_EVENT_TYPE: &[&str] = &[
     "SUBSCRIPTION",
 ];
 
+/// Every value of the SESv2 `EventType` enum, ascending by name — the order a read of an
+/// event destination reports its matching event types in, whatever order the definition
+/// listed them.
+const EVERY_EVENT_TYPE_ASCENDING: &[&str] = &[
+    "BOUNCE",
+    "CLICK",
+    "COMPLAINT",
+    "DELIVERY",
+    "DELIVERY_DELAY",
+    "OPEN",
+    "REJECT",
+    "RENDERING_FAILURE",
+    "SEND",
+    "SUBSCRIPTION",
+];
+
 /// What a row's policy document is built from: the topic the grant is about, and the account of
 /// the ARN SNS minted for it — read off that ARN rather than written out, so a statement scoped
 /// by condition names the account this emulator really answers as.
@@ -109,8 +125,12 @@ struct Setup {
     custom_redirect_domain: &'static str,
     /// `SendingOptions$SendingEnabled` it is created with.
     sending_enabled: bool,
-    /// `EventDestinationDefinition$MatchingEventTypes`.
+    /// `EventDestinationDefinition$MatchingEventTypes`, as the definition lists them.
     matching_event_types: &'static [&'static str],
+    /// The same types as a read reports them: ascending by name, which is the order SES
+    /// reports a destination's matching event types in. Written out per row rather than
+    /// derived, so the expectation does not come from the behaviour under test.
+    reported_event_types: &'static [&'static str],
     /// `EventDestinationDefinition$Enabled`.
     enabled: bool,
 }
@@ -132,6 +152,7 @@ const SETUPS: &[Setup] = &[
         custom_redirect_domain: "clicks.events-apex.example.com",
         sending_enabled: true,
         matching_event_types: &["SEND", "DELIVERY"],
+        reported_event_types: &["DELIVERY", "SEND"],
         enabled: true,
     },
     Setup {
@@ -148,6 +169,7 @@ const SETUPS: &[Setup] = &[
         custom_redirect_domain: "clicks.mail.events-sub.example.org",
         sending_enabled: false,
         matching_event_types: &["BOUNCE", "COMPLAINT"],
+        reported_event_types: &["BOUNCE", "COMPLAINT"],
         enabled: true,
     },
     Setup {
@@ -165,6 +187,7 @@ const SETUPS: &[Setup] = &[
         custom_redirect_domain: "links.events-conditioned.example.net",
         sending_enabled: true,
         matching_event_types: EVERY_EVENT_TYPE,
+        reported_event_types: EVERY_EVENT_TYPE_ASCENDING,
         enabled: true,
     },
     Setup {
@@ -184,6 +207,7 @@ const SETUPS: &[Setup] = &[
         custom_redirect_domain: "opens.events-single.example.com",
         sending_enabled: true,
         matching_event_types: &["OPEN"],
+        reported_event_types: &["OPEN"],
         enabled: false,
     },
     Setup {
@@ -208,6 +232,7 @@ const SETUPS: &[Setup] = &[
         custom_redirect_domain: "clicks.events-paired.example.org",
         sending_enabled: false,
         matching_event_types: &["DELIVERY_DELAY", "SUBSCRIPTION"],
+        reported_event_types: &["DELIVERY_DELAY", "SUBSCRIPTION"],
         enabled: true,
     },
 ];
@@ -618,7 +643,7 @@ fn the_sesv2_sns_event_destination_setup_is_served_through_the_whole_emulator() 
                     (
                         Some(destination_name.as_str()),
                         Some(setup.enabled),
-                        setup.matching_event_types,
+                        setup.reported_event_types,
                         Some(topic_arn.as_str()),
                     ),
                     "case {case:?}: the event destination must report what was attached, naming \

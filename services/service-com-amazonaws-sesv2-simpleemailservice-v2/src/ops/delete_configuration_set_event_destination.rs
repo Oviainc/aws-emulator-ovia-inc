@@ -167,7 +167,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if set.event_destinations.remove(&destination_name).is_none() {
             return Err(not_found(crate::state::event_destination_not_found(
                 &set_name,
-                &destination_name,
             )));
         }
 

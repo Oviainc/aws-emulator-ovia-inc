@@ -186,44 +186,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // Members that select a resource no implemented operation of this emulator
-        // keeps: the dedicated IP pool `SendingPoolName` names is kept by the
-        // dedicated-IP operations, and the archive `ArchiveArn` names lives in
-        // MailManager. A request that names one is answered as unwritten rather than
-        // accepted as if the member had not been sent.
-        for (present, member) in [
-            (
-                input
-                    .delivery_options
-                    .as_ref()
-                    .is_some_and(|options| options.sending_pool_name.is_some()),
-                "DeliveryOptions.SendingPoolName",
-            ),
-            (
-                input
-                    .archiving_options
-                    .as_ref()
-                    .is_some_and(|options| options.archive_arn.is_some()),
-                "ArchivingOptions.ArchiveArn",
-            ),
-        ] {
-            if present {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                    "CreateConfigurationSet with {member}"
-                )));
-            }
+        // A member that selects a resource no implemented operation of this emulator
+        // keeps: the archive `ArchiveArn` names lives in MailManager. A request that
+        // names one is answered as unwritten rather than accepted as if the member had
+        // not been sent.
+        if input
+            .archiving_options
+            .as_ref()
+            .is_some_and(|options| options.archive_arn.is_some())
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateConfigurationSet with ArchivingOptions.ArchiveArn",
+            ));
         }
 
         // Every enum-valued member carries one of its own modelled values; the value
         // sets are the generated consts, so they follow the model.
         let mut record = ConfigurationSetRecord::new(&name, ::std::time::SystemTime::now());
         if let Some(options) = input.delivery_options {
-            if let Some(policy) = options.tls_policy {
-                record.tls_policy = enum_value("TlsPolicy", policy, TLS_POLICY_VALUES)?;
-            }
-            // The modelled range (300..=50400 seconds) is refused before this handler
-            // runs, so a value that reaches here is one SES would attempt delivery for.
-            record.max_delivery_seconds = options.max_delivery_seconds;
+            // The same shared projection every write of a set's delivery configuration
+            // goes through, so a create and a later write of it cannot read the request's
+            // members differently — including a member object that states nothing, which
+            // leaves the set carrying no delivery configuration at all.
+            record.delivery_options =
+                crate::state::configuration_set_delivery_options(options).map_err(bad_request)?;
         }
         if let Some(options) = input.tracking_options {
             let https_policy = match options.https_policy {
@@ -254,34 +240,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         if let Some(options) = input.vdm_options {
-            let dashboard_options = match options.dashboard_options {
-                Some(dashboard) => Some(DashboardOptions {
-                    engagement_metrics: match dashboard.engagement_metrics {
-                        Some(status) => {
-                            Some(enum_value("EngagementMetrics", status, FEATURE_STATUS_VALUES)?)
-                        }
-                        None => None,
-                    },
-                }),
-                None => None,
-            };
-            let guardian_options = match options.guardian_options {
-                Some(guardian) => Some(GuardianOptions {
-                    optimized_shared_delivery: match guardian.optimized_shared_delivery {
-                        Some(status) => Some(enum_value(
-                            "OptimizedSharedDelivery",
-                            status,
-                            FEATURE_STATUS_VALUES,
-                        )?),
-                        None => None,
-                    },
-                }),
-                None => None,
-            };
-            record.vdm_options = Some(VdmOptions {
-                dashboard_options,
-                guardian_options,
-            });
+            // The same shared projection every write of a set's VDM preferences goes
+            // through, so a create and a later write of them cannot read the request's
+            // members differently.
+            record.vdm_options =
+                Some(crate::state::configuration_set_vdm_options(options).map_err(bad_request)?);
         }
         record.message_security_options = input.message_security_options;
         record.tags = input
@@ -295,10 +258,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.configuration_sets.contains_key(&name) {
             return Err(CreateConfigurationSetErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
-                    message: Some(format!("Configuration set {name} already exists.")),
+                    message: Some(crate::state::configuration_set_already_exists(&name)),
                 },
             )
             .into());
+        }
+        // `DeliveryOptions$SendingPoolName` names "the dedicated IP pool to associate
+        // with the configuration set", so a set can only be associated with a pool the
+        // account holds: a name no pool is held under is the resource that does not
+        // exist, and nothing is stored under this set's name. It is asked after the name
+        // this create would take is resolved — a second create under a name the account
+        // already holds collides whatever it names beside it — and before the slice's own
+        // ceiling, which is about the store rather than about this request.
+        if let Some(pool_name) = record
+            .delivery_options
+            .as_ref()
+            .and_then(|options| options.sending_pool_name.as_ref())
+        {
+            if !store.dedicated_ip_pools.contains_key(pool_name) {
+                return Err(CreateConfigurationSetErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::dedicated_ip_pool_not_found(pool_name)),
+                    },
+                )
+                .into());
+            }
         }
         if store.configuration_sets.len() >= crate::state::MAX_CONFIGURATION_SETS {
             return Err(CreateConfigurationSetErrorModeled::LimitExceededException(

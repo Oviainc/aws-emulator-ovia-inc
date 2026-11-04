@@ -63,6 +63,22 @@ const EVERY_EVENT_TYPE: &[&str] = &[
     "SUBSCRIPTION",
 ];
 
+/// Every value of the SESv2 `EventType` enum, ascending by name — the order a read of an
+/// event destination reports its matching event types in, whatever order the definition
+/// listed them.
+const EVERY_EVENT_TYPE_ASCENDING: &[&str] = &[
+    "BOUNCE",
+    "CLICK",
+    "COMPLAINT",
+    "DELIVERY",
+    "DELIVERY_DELAY",
+    "OPEN",
+    "REJECT",
+    "RENDERING_FAILURE",
+    "SEND",
+    "SUBSCRIPTION",
+];
+
 /// The two routing refusals the router answers itself, which no row here may provoke:
 /// `AmbiguousService` (several services claimed one request) and `UnknownService` (none did).
 /// Neither is in any AWS model.
@@ -81,8 +97,12 @@ struct Setup {
     /// How many Easy DKIM CNAME tokens SES publishes for it — three for a domain, none for
     /// an address, where DKIM signing does not apply.
     dkim_tokens: usize,
-    /// `EventDestinationDefinition$MatchingEventTypes`.
+    /// `EventDestinationDefinition$MatchingEventTypes`, as the definition lists them.
     matching_event_types: &'static [&'static str],
+    /// The same types as a read reports them: ascending by name, which is the order SES
+    /// reports a destination's matching event types in. Written out per row rather than
+    /// derived, so the expectation does not come from the behaviour under test.
+    reported_event_types: &'static [&'static str],
     /// `EventDestinationDefinition$Enabled`.
     enabled: bool,
 }
@@ -95,6 +115,7 @@ const SETUPS: &[Setup] = &[
         identity_type: "DOMAIN",
         dkim_tokens: 3,
         matching_event_types: &["SEND", "DELIVERY"],
+        reported_event_types: &["DELIVERY", "SEND"],
         enabled: true,
     },
     Setup {
@@ -103,6 +124,7 @@ const SETUPS: &[Setup] = &[
         identity_type: "DOMAIN",
         dkim_tokens: 3,
         matching_event_types: &["BOUNCE", "COMPLAINT"],
+        reported_event_types: &["BOUNCE", "COMPLAINT"],
         enabled: true,
     },
     Setup {
@@ -111,6 +133,7 @@ const SETUPS: &[Setup] = &[
         identity_type: "DOMAIN",
         dkim_tokens: 3,
         matching_event_types: EVERY_EVENT_TYPE,
+        reported_event_types: EVERY_EVENT_TYPE_ASCENDING,
         enabled: true,
     },
     Setup {
@@ -119,6 +142,7 @@ const SETUPS: &[Setup] = &[
         identity_type: "EMAIL_ADDRESS",
         dkim_tokens: 0,
         matching_event_types: &["RENDERING_FAILURE"],
+        reported_event_types: &["RENDERING_FAILURE"],
         enabled: false,
     },
 ];
@@ -536,7 +560,7 @@ async fn the_setup_an_event_publication_scenario_performs_is_served_end_to_end()
         assert_eq!(
             matched,
             setup
-                .matching_event_types
+                .reported_event_types
                 .iter()
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>(),

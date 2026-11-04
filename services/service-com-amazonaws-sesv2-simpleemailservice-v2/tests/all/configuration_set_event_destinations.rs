@@ -162,6 +162,9 @@ pub(crate) struct DestinationCase {
     pub(crate) name: &'static str,
     pub(crate) definition: Value,
     enabled: bool,
+    /// The event types a read must report: the ones the definition named, in the order
+    /// SES reports them, which is ascending by name rather than the order they were sent
+    /// in.
     matching_event_types: Vec<String>,
     /// The destination member a read must report, as `(member, value)`.
     destination_member: (&'static str, Value),
@@ -170,7 +173,23 @@ pub(crate) struct DestinationCase {
 /// The rows of the create-and-read table: one per modelled destination kind, differing
 /// also in the enabled flag and in how many event types they match.
 pub(crate) fn destination_cases() -> Vec<DestinationCase> {
-    let every_event_type: Vec<String> = EVENT_TYPES.iter().map(|value| value.to_string()).collect();
+    // Every modelled event type, ascending by name — the order a read reports a
+    // destination's types in, written out rather than derived from the model's own order.
+    let every_event_type: Vec<String> = [
+        "BOUNCE",
+        "CLICK",
+        "COMPLAINT",
+        "DELIVERY",
+        "DELIVERY_DELAY",
+        "OPEN",
+        "REJECT",
+        "RENDERING_FAILURE",
+        "SEND",
+        "SUBSCRIPTION",
+    ]
+    .iter()
+    .map(|value| value.to_string())
+    .collect();
     vec![
         DestinationCase {
             case: "enabled Kinesis Firehose destination matching one event type",
@@ -268,7 +287,7 @@ pub(crate) fn destination_cases() -> Vec<DestinationCase> {
                 },
             }),
             enabled: true,
-            matching_event_types: vec!["OPEN".to_string(), "CLICK".to_string()],
+            matching_event_types: vec!["CLICK".to_string(), "OPEN".to_string()],
             destination_member: (
                 "PinpointDestination",
                 json!({"ApplicationArn": "arn:aws:mobiletargeting:us-east-1:123456789012:apps/1"}),
@@ -873,10 +892,11 @@ async fn a_destination_the_set_does_not_hold_is_refused_as_not_found() {
             reply.error_code(),
             reply.message()
         );
-        assert!(
-            reply.message().contains(name) && reply.message().contains(target_set),
-            "case {case:?} ({target_set}/{name}): the refusal must name the destination and the \
-             set, got {:?}",
+        assert_eq!(
+            reply.message(),
+            format!("No EventDestination found for {target_set}"),
+            "case {case:?} ({target_set}/{name}): the refusal must answer the service's fixed \
+             sentence naming the set, got {:?}",
             reply.message()
         );
     }

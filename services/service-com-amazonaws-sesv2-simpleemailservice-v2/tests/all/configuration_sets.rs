@@ -88,6 +88,11 @@ impl Reply {
         self.body.get(member).cloned().unwrap_or(Value::Null)
     }
 
+    /// The value at `pointer`, or `None` when the body carries nothing there.
+    pub(crate) fn pointer(&self, pointer: &str) -> Option<Value> {
+        self.body.pointer(pointer).cloned()
+    }
+
     /// Whether the body carries no members at all: what an operation whose output shape
     /// declares none answers with.
     pub(crate) fn is_empty_body(&self) -> bool {
@@ -225,13 +230,13 @@ struct ConfigurationSetCase {
     case: &'static str,
     name: String,
     body: Value,
-    /// `DeliveryOptions$TlsPolicy`, which every set reports: the request's value, or
-    /// SES's opportunistic default for a set that configured none.
-    tls_policy: &'static str,
-    /// `DeliveryOptions$MaxDeliverySeconds`, reported only where the request bounded
-    /// delivery.
-    max_delivery_seconds: Option<i64>,
+    /// `DeliveryOptions` as the read must report it: `Value::Null` where the request
+    /// configured no delivery options at all, so the set carries none of its own, and
+    /// otherwise exactly the members the request carried.
+    delivery_options: Value,
     /// `ReputationOptions$ReputationMetricsEnabled`.
+    /// What the request configured, or the state a set nobody configured starts in,
+    /// which is collecting the metrics.
     reputation_metrics_enabled: bool,
     /// `SendingOptions$SendingEnabled`.
     sending_enabled: bool,
@@ -260,9 +265,8 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
             case: "nothing configured, one-character name",
             name: "a".to_string(),
             body: json!({"ConfigurationSetName": "a"}),
-            tls_policy: "OPTIONAL",
-            max_delivery_seconds: None,
-            reputation_metrics_enabled: false,
+            delivery_options: Value::Null,
+            reputation_metrics_enabled: true,
             sending_enabled: true,
             tracking_options: Value::Null,
             suppression_options: Value::Null,
@@ -273,9 +277,8 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
             case: "nothing configured, longest allowed name",
             name: longest_name.clone(),
             body: json!({"ConfigurationSetName": longest_name}),
-            tls_policy: "OPTIONAL",
-            max_delivery_seconds: None,
-            reputation_metrics_enabled: false,
+            delivery_options: Value::Null,
+            reputation_metrics_enabled: true,
             sending_enabled: true,
             tracking_options: Value::Null,
             suppression_options: Value::Null,
@@ -289,9 +292,8 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
                 "ConfigurationSetName": "tracking-only-set",
                 "TrackingOptions": {"CustomRedirectDomain": "click.example.com"},
             }),
-            tls_policy: "OPTIONAL",
-            max_delivery_seconds: None,
-            reputation_metrics_enabled: false,
+            delivery_options: Value::Null,
+            reputation_metrics_enabled: true,
             sending_enabled: true,
             tracking_options: json!({"CustomRedirectDomain": "click.example.com"}),
             suppression_options: Value::Null,
@@ -310,9 +312,8 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
                     "HttpsPolicy": "REQUIRE_OPEN_ONLY",
                 },
             }),
-            tls_policy: "OPTIONAL",
-            max_delivery_seconds: None,
-            reputation_metrics_enabled: false,
+            delivery_options: Value::Null,
+            reputation_metrics_enabled: true,
             sending_enabled: true,
             tracking_options: json!({
                 "CustomRedirectDomain": "links.example.org",
@@ -331,9 +332,8 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
                 "ConfigurationSetName": "tls-require-300",
                 "DeliveryOptions": {"TlsPolicy": "REQUIRE", "MaxDeliverySeconds": 300},
             }),
-            tls_policy: "REQUIRE",
-            max_delivery_seconds: Some(300),
-            reputation_metrics_enabled: false,
+            delivery_options: json!({"TlsPolicy": "REQUIRE", "MaxDeliverySeconds": 300}),
+            reputation_metrics_enabled: true,
             sending_enabled: true,
             tracking_options: Value::Null,
             suppression_options: Value::Null,
@@ -348,9 +348,8 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
                 "ConfigurationSetName": "tls-optional-50400",
                 "DeliveryOptions": {"TlsPolicy": "OPTIONAL", "MaxDeliverySeconds": 50400},
             }),
-            tls_policy: "OPTIONAL",
-            max_delivery_seconds: Some(50400),
-            reputation_metrics_enabled: false,
+            delivery_options: json!({"TlsPolicy": "OPTIONAL", "MaxDeliverySeconds": 50400}),
+            reputation_metrics_enabled: true,
             sending_enabled: true,
             tracking_options: Value::Null,
             suppression_options: Value::Null,
@@ -365,10 +364,24 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
                 "ReputationOptions": {"ReputationMetricsEnabled": true},
                 "SendingOptions": {"SendingEnabled": false},
             }),
-            tls_policy: "OPTIONAL",
-            max_delivery_seconds: None,
+            delivery_options: Value::Null,
             reputation_metrics_enabled: true,
             sending_enabled: false,
+            tracking_options: Value::Null,
+            suppression_options: Value::Null,
+            vdm_options: Value::Null,
+            tags: json!([]),
+        },
+        ConfigurationSetCase {
+            case: "reputation metrics explicitly turned off",
+            name: "reputation-off".to_string(),
+            body: json!({
+                "ConfigurationSetName": "reputation-off",
+                "ReputationOptions": {"ReputationMetricsEnabled": false},
+            }),
+            delivery_options: Value::Null,
+            reputation_metrics_enabled: false,
+            sending_enabled: true,
             tracking_options: Value::Null,
             suppression_options: Value::Null,
             vdm_options: Value::Null,
@@ -387,9 +400,8 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
                     "SuppressionScope": "ACCOUNT",
                 },
             }),
-            tls_policy: "OPTIONAL",
-            max_delivery_seconds: None,
-            reputation_metrics_enabled: false,
+            delivery_options: Value::Null,
+            reputation_metrics_enabled: true,
             sending_enabled: true,
             tracking_options: Value::Null,
             suppression_options: json!({
@@ -409,9 +421,8 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
                     "SuppressionScope": "TENANT",
                 },
             }),
-            tls_policy: "OPTIONAL",
-            max_delivery_seconds: None,
-            reputation_metrics_enabled: false,
+            delivery_options: Value::Null,
+            reputation_metrics_enabled: true,
             sending_enabled: true,
             tracking_options: Value::Null,
             suppression_options: json!({
@@ -433,9 +444,8 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
                     "GuardianOptions": {"OptimizedSharedDelivery": "DISABLED"},
                 },
             }),
-            tls_policy: "OPTIONAL",
-            max_delivery_seconds: None,
-            reputation_metrics_enabled: false,
+            delivery_options: Value::Null,
+            reputation_metrics_enabled: true,
             sending_enabled: true,
             tracking_options: Value::Null,
             suppression_options: Value::Null,
@@ -464,8 +474,7 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
                     {"Key": "owner", "Value": "configuration-sets"},
                 ],
             }),
-            tls_policy: "REQUIRE",
-            max_delivery_seconds: Some(1800),
+            delivery_options: json!({"TlsPolicy": "REQUIRE", "MaxDeliverySeconds": 1800}),
             reputation_metrics_enabled: true,
             sending_enabled: true,
             tracking_options: json!({
@@ -516,23 +525,11 @@ async fn create_persists_the_configuration_and_get_reads_it_back() {
             read.body
         );
         assert_eq!(
-            read.body
-                .pointer("/DeliveryOptions/TlsPolicy")
-                .and_then(Value::as_str),
-            Some(case.tls_policy),
-            "case {:?}: expected TlsPolicy {:?}, got {:?}",
+            read.member("DeliveryOptions"),
+            case.delivery_options,
+            "case {:?}: expected DeliveryOptions {:?}, got {:?}",
             case.case,
-            case.tls_policy,
-            read.body
-        );
-        assert_eq!(
-            read.body
-                .pointer("/DeliveryOptions/MaxDeliverySeconds")
-                .and_then(Value::as_i64),
-            case.max_delivery_seconds,
-            "case {:?}: expected MaxDeliverySeconds {:?}, got {:?}",
-            case.case,
-            case.max_delivery_seconds,
+            case.delivery_options,
             read.body
         );
         assert_eq!(
@@ -637,13 +634,11 @@ async fn create_persists_the_configuration_and_get_reads_it_back() {
             read.body
         );
         assert_eq!(
-            read.body
-                .pointer("/DeliveryOptions/TlsPolicy")
-                .and_then(Value::as_str),
-            Some(case.tls_policy),
-            "case {:?}: expected TlsPolicy {:?} after the later creates, got {:?}",
+            read.member("DeliveryOptions"),
+            case.delivery_options,
+            "case {:?}: expected DeliveryOptions {:?} after the later creates, got {:?}",
             case.case,
-            case.tls_policy,
+            case.delivery_options,
             read.body
         );
     }

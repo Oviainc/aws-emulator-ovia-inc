@@ -368,6 +368,9 @@ struct UpdateCase {
     initial: Value,
     update: Value,
     enabled: bool,
+    /// The event types a read must report: the ones the definition named, in the order
+    /// SES reports them, which is ascending by name rather than the order they were sent
+    /// in.
     matching_event_types: Vec<String>,
     /// The destination members a read must report, as `(member, value)`.
     present: Vec<(&'static str, Value)>,
@@ -378,7 +381,23 @@ struct UpdateCase {
 /// The rows of the update table: each changes a different part of the destination's
 /// configuration, and one changes nothing at all.
 fn update_cases() -> Vec<UpdateCase> {
-    let every_event_type: Vec<String> = EVENT_TYPES.iter().map(|value| value.to_string()).collect();
+    // Every modelled event type, ascending by name — the order a read reports a
+    // destination's types in, written out rather than derived from the model's own order.
+    let every_event_type: Vec<String> = [
+        "BOUNCE",
+        "CLICK",
+        "COMPLAINT",
+        "DELIVERY",
+        "DELIVERY_DELAY",
+        "OPEN",
+        "REJECT",
+        "RENDERING_FAILURE",
+        "SEND",
+        "SUBSCRIPTION",
+    ]
+    .iter()
+    .map(|value| value.to_string())
+    .collect();
     vec![
         UpdateCase {
             case: "a disabled destination is enabled",
@@ -393,7 +412,7 @@ fn update_cases() -> Vec<UpdateCase> {
                 "SnsDestination": sns("events"),
             }),
             enabled: true,
-            matching_event_types: vec!["SEND".to_string(), "DELIVERY".to_string()],
+            matching_event_types: vec!["DELIVERY".to_string(), "SEND".to_string()],
             present: vec![("SnsDestination", sns("events"))],
             absent: vec!["KinesisFirehoseDestination", "CloudWatchDestination"],
         },
@@ -477,7 +496,7 @@ fn update_cases() -> Vec<UpdateCase> {
                 "KinesisFirehoseDestination": firehose("ses-events"),
             }),
             enabled: true,
-            matching_event_types: vec!["SEND".to_string(), "REJECT".to_string()],
+            matching_event_types: vec!["REJECT".to_string(), "SEND".to_string()],
             present: vec![("KinesisFirehoseDestination", firehose("ses-events"))],
             // The definition the update carried does not describe an SNS destination,
             // so the destination no longer publishes to one.
@@ -502,7 +521,7 @@ fn update_cases() -> Vec<UpdateCase> {
                 }]},
             }),
             enabled: true,
-            matching_event_types: vec!["OPEN".to_string(), "CLICK".to_string()],
+            matching_event_types: vec!["CLICK".to_string(), "OPEN".to_string()],
             present: vec![(
                 "CloudWatchDestination",
                 json!({"DimensionConfigurations": [{
@@ -671,12 +690,14 @@ async fn an_update_of_a_resource_the_account_does_not_hold_is_refused_as_not_fou
     let before = destination(&ses, set, "held").await;
 
     // A set the account does not hold, and a destination the set does not hold: both
-    // name a resource that does not exist, whatever the other half of the pair is.
+    // name a resource that does not exist, whatever the other half of the pair is. Each
+    // refusal names the resource SES states as missing — the set the request addressed,
+    // whether it is the set itself that is not there or the destination within it.
     for (case, set_name, destination_name, named) in [
         ("a set the account does not hold", "absent-set", "held", "absent-set"),
         ("another set the account does not hold", "Absent_Set-2", "absent", "Absent_Set-2"),
-        ("a destination the set does not hold", set, "absent-destination", "absent-destination"),
-        ("a destination name differing only in case", set, "HELD", "HELD"),
+        ("a destination the set does not hold", set, "absent-destination", set),
+        ("a destination name differing only in case", set, "HELD", set),
     ] {
         let reply = ses
             .update_destination(set_name, destination_name, definition.clone())
