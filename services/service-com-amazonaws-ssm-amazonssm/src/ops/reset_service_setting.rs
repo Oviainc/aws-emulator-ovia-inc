@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetServiceSetting
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetServiceSetting`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Restore one account-level service setting to the value its Amazon Web Services
+//! service team provisioned. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetServiceSetting::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Reset the service setting for the account to the default value as provisioned by the
+//! Amazon Web Services service team": the `SettingId` is resolved through the catalogue of
+//! settings those teams provision ([`crate::state::service_settings::SETTINGS`]) — by
+//! either of its documented spellings, the path or the setting's ARN — and the provisioned
+//! value that catalogue carries is what the reset stores, at the `Default` status. The
+//! reset is itself a modification, so it records who made it and when, and it answers
+//! with "the current, effective service setting after calling the ResetServiceSetting API
+//! operation" — the same reading `GetServiceSetting` reports afterwards.
+//!
+//! Restoring the provisioned value is idempotent: a setting nobody has customized is
+//! already at it, and the reset reports that reading rather than refusing — and records
+//! nothing, because nothing was restored.
+//!
+//! A reset that DOES restore a value records the restoration, so it writes to the one
+//! store the update writes to and is bounded the same way
+//! ([`crate::state::service_settings::MAX_SERVICE_SETTINGS_TOTAL`]): a restoration past
+//! that total is refused the way this crate's other total guards are refused, rather than
+//! growing the store without bound, while one of a setting already recorded is always
+//! accepted.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +174,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetServiceSetting` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetServiceSettingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetServiceSetting"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ResetServiceSettingErrorModeled::InternalServerError(InternalServerError {
+                message: Some(crate::state::service_settings::STORE_UNAVAILABLE.to_string()),
+            })
+        })?;
+        let setting = crate::state::service_settings::resolve(&input.setting_id).ok_or_else(|| {
+            ResetServiceSettingErrorModeled::ServiceSettingNotFound(ServiceSettingNotFound {
+                message: Some(crate::state::service_settings::NOT_FOUND_MESSAGE.to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let restored = crate::state::service_settings::ServiceSettingRecord {
+            value: setting.default_value.to_string(),
+            status: crate::state::service_settings::STATUS_DEFAULT.to_string(),
+            last_modified_date: ::std::time::SystemTime::now(),
+            last_modified_user: crate::state::service_settings::modifying_user(),
+        };
+        let mut held = state.lock();
+        // A reset restores the provisioned value, so one of a setting that is ALREADY at
+        // it restores nothing and records nothing: the reading it answers with is the one
+        // the setting already held, and the modification a later read reports stays the
+        // modification that was actually made.
+        let current = held.service_setting(&region, setting);
+        if current.value != setting.default_value
+            || current.status != crate::state::service_settings::STATUS_DEFAULT
+        {
+            held.record_service_setting(&region, setting.id, restored)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+        let effective = held.service_setting(&region, setting);
+        Ok(ResetServiceSettingOutput {
+            service_setting: Some(effective.to_service_setting(&region, setting.id)),
+        })
     }
 }

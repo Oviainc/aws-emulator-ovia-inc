@@ -79,10 +79,17 @@
 //! is attached to ([`resource_policies::PolicyResourceKey`]) rather than by the text of
 //! the ARN that named it.
 //!
-//! Last are **OpsCenter's OpsItems**, which live in [`ops_items`]: `CreateOpsItem`
+//! Then **OpsCenter's OpsItems**, which live in [`ops_items`]: `CreateOpsItem`
 //! mints one and `GetOpsItem` reports it, keyed by `(region, ops item id)` the same way,
 //! and everything a read reports — the status, the version, who created it and when —
 //! comes from what the create persisted.
+//!
+//! Last is the account's **service settings** ([`service_settings`]):
+//! `GetServiceSetting` reports one, `UpdateServiceSetting` overwrites it and
+//! `ResetServiceSetting` restores the value its service team provisioned. The settings an
+//! account holds are a catalogue nobody adds to, so only the ones an account has modified
+//! are stored and the rest are reported from that catalogue
+//! ([`ComAmazonawsSsmAmazonssmState::service_setting`]).
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -110,6 +117,12 @@ pub mod resource_policies;
 /// The OpsItems OpsCenter holds: the record a create persists, the rules it is held to
 /// and the store the reads project.
 pub mod ops_items;
+
+/// The account-level settings the Systems Manager service teams provision, which
+/// `GetServiceSetting` reports and `UpdateServiceSetting`/`ResetServiceSetting` modify.
+pub mod service_settings;
+
+use service_settings::ServiceSettingRecord;
 
 use crate::ops::types::{
     Activation, AttachmentInformation, DocumentDescription, DocumentParameter, DocumentRequires,
@@ -919,9 +932,15 @@ pub fn document_name_rejection(name: &str) -> Option<String> {
 
 /// What a `DocumentARN` value names: which document, and — when the value is a full
 /// ARN — in which Region and account.
+pub type DocumentQuery<'a> = ResourceQuery<'a>;
+
+/// What a value that may be a bare resource name or a full ARN names: the resource
+/// portion after its type prefix, and — when the value is an ARN — the Region and account
+/// that ARN names.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DocumentQuery<'a> {
-    /// The document name to look the document up by.
+pub struct ResourceQuery<'a> {
+    /// The resource the value names, to look it up by: a bare name as given, or the part
+    /// of an ARN's resource after the resource-type prefix.
     pub name: &'a str,
     /// The Region a full ARN named, or `None` when the request named a bare name.
     pub region: Option<&'a str>,
@@ -929,26 +948,36 @@ pub struct DocumentQuery<'a> {
     pub account: Option<&'a str>,
 }
 
-/// What `value` names, or `None` when it is an ARN that names no `ssm` document.
+/// What `value` names under the resource-type `prefix`, or `None` when it is an ARN that
+/// names no `ssm` resource of that type.
 ///
-/// A `DocumentARN` is "the name of the required SSM document. The name can be an
-/// Amazon Resource Name (ARN)" (`DocumentRequires$Name`), so either spelling resolves
-/// to the same document; the ARN is read through the one parse every service reads a
-/// caller-supplied ARN with.
-pub fn parse_document_query(value: &str) -> Option<DocumentQuery<'_>> {
+/// The ONE parse behind every member of this service that takes "a name or an Amazon
+/// Resource Name": the bare spelling is the name itself, and the ARN spelling is read
+/// through the one parse every service reads a caller-supplied ARN with and then stripped
+/// of its resource-type prefix, so the two spellings resolve to the same resource.
+pub fn parse_resource_query<'a>(value: &'a str, prefix: &str) -> Option<ResourceQuery<'a>> {
     if !value.starts_with(ARN_PREFIX) {
-        return Some(DocumentQuery {
+        return Some(ResourceQuery {
             name: value,
             region: None,
             account: None,
         });
     }
     let arn = ::service_common::arn::parse_of(value, ARN_SERVICE)?;
-    Some(DocumentQuery {
-        name: arn.resource.strip_prefix(ARN_DOCUMENT_RESOURCE_PREFIX)?,
+    Some(ResourceQuery {
+        name: arn.resource.strip_prefix(prefix)?,
         region: Some(arn.region),
         account: Some(arn.account),
     })
+}
+
+/// What `value` names, or `None` when it is an ARN that names no `ssm` document.
+///
+/// A `DocumentARN` is "the name of the required SSM document. The name can be an
+/// Amazon Resource Name (ARN)" (`DocumentRequires$Name`), so either spelling resolves
+/// to the same document, through [`parse_resource_query`].
+pub fn parse_document_query(value: &str) -> Option<DocumentQuery<'_>> {
+    parse_resource_query(value, ARN_DOCUMENT_RESOURCE_PREFIX)
 }
 
 /// Why a document's content is not one this service accepts. Each variant maps to the
@@ -2591,6 +2620,13 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// store never carry one id.
     pub ops_item_sequence: u64,
 
+    /// Every service setting an account has MODIFIED, keyed by `(region, setting id)`: a
+    /// setting is reached through one Region's endpoint and its ARN names that Region. A
+    /// setting nobody has modified holds no entry and is reported from the catalogue
+    /// instead ([`Self::service_setting`]), so the store holds the account's own choices
+    /// and invents none.
+    pub service_settings: BTreeMap<(String, String), ServiceSettingRecord>,
+
     /// When this store came into being, and so how old the documents Systems Manager
     /// publishes ([`PUBLISHED_DOCUMENTS`]) are here: they exist for as long as the
     /// account does, so there is no create to date them from. Captured ONCE, so two
@@ -2615,6 +2651,7 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             cloud_connectors: BTreeMap::new(),
             ops_items: BTreeMap::new(),
             ops_item_sequence: 0,
+            service_settings: BTreeMap::new(),
             created_at: SystemTime::now(),
             resource_policies: resource_policies::ResourcePolicyStore::default(),
         }
@@ -2674,6 +2711,54 @@ impl ComAmazonawsSsmAmazonssmState {
             .duration_since(::std::time::UNIX_EPOCH)
             .unwrap_or_default();
         minted_uuid(since_epoch.as_nanos(), self.minted_command_ids)
+    }
+
+    /// What `setting` holds at `region`'s endpoint.
+    ///
+    /// A setting the account has modified is reported from its stored record; one nobody
+    /// has modified is reported from the catalogue, at the value its service team
+    /// provisioned, the `Default` status and that team as its last modifier. The
+    /// provisioned reading is dated by the store's own beginning, because a setting
+    /// exists for as long as the account does and no call created it.
+    pub fn service_setting(
+        &self,
+        region: &str,
+        setting: &service_settings::SettingDefinition,
+    ) -> ServiceSettingRecord {
+        self.service_settings
+            .get(&(region.to_string(), setting.id.to_string()))
+            .cloned()
+            .unwrap_or_else(|| ServiceSettingRecord {
+                value: setting.default_value.to_string(),
+                status: service_settings::STATUS_DEFAULT.to_string(),
+                last_modified_date: self.created_at,
+                last_modified_user: service_settings::PROVISIONING_USER.to_string(),
+            })
+    }
+
+    /// Record a modification of the setting `id` names at `region`'s endpoint — what an
+    /// update and a reset each persist, so a later read reports the modification rather
+    /// than the provisioned reading — or the reason this emulator cannot hold it.
+    ///
+    /// The store is bounded by [`service_settings::MAX_SERVICE_SETTINGS_TOTAL`], because
+    /// the Region a setting is recorded under comes from the request's own credential
+    /// scope: a modification that would record a setting for a Region past that total is
+    /// refused, while a modification of a setting the store already holds is always
+    /// accepted, so the guard can never wedge a setting an account has already set.
+    pub fn record_service_setting(
+        &mut self,
+        region: &str,
+        id: &str,
+        record: ServiceSettingRecord,
+    ) -> Result<(), String> {
+        let key = (region.to_string(), id.to_string());
+        if !self.service_settings.contains_key(&key)
+            && self.service_settings.len() >= service_settings::MAX_SERVICE_SETTINGS_TOTAL
+        {
+            return Err(service_settings::store_full_message());
+        }
+        self.service_settings.insert(key, record);
+        Ok(())
     }
 
     /// The document `name` names in `region`, or `None` when that Region holds none.

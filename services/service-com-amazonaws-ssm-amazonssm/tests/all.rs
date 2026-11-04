@@ -55,5 +55,7 @@ mod run_command;
 mod secure_string_decryption;
 #[path = "all/secure_string_encryption_at_rest.rs"]
 mod secure_string_encryption_at_rest;
+#[path = "all/service_settings.rs"]
+mod service_settings;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

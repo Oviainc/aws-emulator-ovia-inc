@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateServiceSetting
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateServiceSetting`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Overwrite one account-level service setting with the account's own value — the write
+//! of the service-settings slice. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateServiceSetting::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "You can't create a new SettingId, but you can overwrite the default value", so the
+//! `SettingId` is resolved through the catalogue of settings the Systems Manager service
+//! teams provision ([`crate::state::service_settings::SETTINGS`]) — by either of its
+//! documented spellings, the path or the setting's ARN — and one the catalogue does not
+//! hold is reported as a setting no service team has provisioned rather than created. The
+//! value is checked against the values that setting documents, where it documents any,
+//! and what the account asked for is what gets persisted: `GetServiceSetting` reports it
+//! back with the `Customized` status until `ResetServiceSetting` restores the provisioned
+//! value.
+//!
+//! A setting is recorded under the Region of the request's own credential scope, so the
+//! store carries the emulator's own total guard
+//! ([`crate::state::service_settings::MAX_SERVICE_SETTINGS_TOTAL`]): a modification for a
+//! Region past it is refused the way this crate's other total guards are refused, rather
+//! than growing the store without bound, while a modification of a setting already
+//! recorded is always accepted.
+//!
+//! Implementing this operation also closes
+//! `issues/things-that-do-not-work/20261103T215115Z-ssm-updateservicesetting-stub.md`,
+//! which asks for exactly this handler; a reset has nothing to restore without it.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +181,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateServiceSetting` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateServiceSettingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateServiceSetting"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateServiceSettingErrorModeled::InternalServerError(InternalServerError {
+                message: Some(crate::state::service_settings::STORE_UNAVAILABLE.to_string()),
+            })
+        })?;
+        let setting =
+            crate::state::service_settings::resolve(&input.setting_id).ok_or_else(|| {
+                UpdateServiceSettingErrorModeled::ServiceSettingNotFound(ServiceSettingNotFound {
+                    message: Some(crate::state::service_settings::NOT_FOUND_MESSAGE.to_string()),
+                })
+            })?;
+        // `SettingValue`'s length is a MODELLED constraint the centralized walk has
+        // already refused anything outside; which values the setting itself accepts is
+        // what the model cannot say, so it is checked here.
+        if let Some(why) =
+            crate::state::service_settings::value_rejection(setting, &input.setting_value)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+        let region = crate::state::request_region(ctx.parts());
+        state
+            .lock()
+            .record_service_setting(
+                &region,
+                setting.id,
+                crate::state::service_settings::ServiceSettingRecord {
+                    value: input.setting_value.clone(),
+                    status: crate::state::service_settings::STATUS_CUSTOMIZED.to_string(),
+                    last_modified_date: ::std::time::SystemTime::now(),
+                    last_modified_user: crate::state::service_settings::modifying_user(),
+                },
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        Ok(UpdateServiceSettingOutput {})
     }
 }
