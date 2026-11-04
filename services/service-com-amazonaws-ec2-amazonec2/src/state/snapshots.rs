@@ -24,9 +24,8 @@
 //!
 //! [`ComAmazonawsEc2Amazonec2State::insert_snapshot`] is the one way a snapshot is stored,
 //! and it mints the id itself: a snapshot id is the service's to choose, never a caller's.
-//! `CreateSnapshots` and `CopySnapshot` are the writers wired to it so far; `CreateSnapshot`
-//! belongs beside them as its own stub issue is closed, and a reader resolves an id out of
-//! this store rather than keeping a second copy of it.
+//! `CreateSnapshot`, `CreateSnapshots` and `CopySnapshot` are the writers wired to it, and a
+//! reader resolves an id out of this store rather than keeping a second copy of it.
 
 use std::time::{Instant, SystemTime};
 

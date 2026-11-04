@@ -14,14 +14,15 @@
 //! 3. IT IS THE SAME SNAPSHOT A LATER READ REPORTS: `DescribeSnapshots` answers it by its own
 //!    id and in the listing filtered on the source volume, which is how a backup flow finds
 //!    it;
-//! 4. A REQUEST THAT CANNOT BE SERVED IS REFUSED WITH EC2'S OWN CODE AND NOTHING IS STORED: a
-//!    volume id outside the id form, a well-formed one the account holds no volume for, a
-//!    location or an Outpost this emulator has none of, and a `DryRun` that reports whether
-//!    the call would have worked.
+//! 4. A `VolumeId` THIS OPERATION CANNOT RESOLVE IS REFUSED WITH ONE ANSWER, whichever way it
+//!    fails to name a volume of the account, and nothing is stored;
+//! 5. ANY OTHER REQUEST THAT CANNOT BE SERVED IS REFUSED WITH EC2'S OWN CODE AND NOTHING IS
+//!    STORED: a location or an Outpost this emulator has none of, a value outside a modelled
+//!    enum's catalog, and a `DryRun` that reports whether the call would have worked.
 //!
 //! Each table row is a distinct input along what the rule generalises over — the volume's
-//! size, its encryption state, whether the request describes or tags the snapshot, and which
-//! refusal — so no row is the specification.
+//! size, its encryption state, whether the request describes or tags the snapshot, which id
+//! form an unresolvable volume id takes, and which refusal — so no row is the specification.
 
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -205,6 +206,82 @@ async fn a_snapshot_reports_the_volume_it_was_taken_of() {
     }
 }
 
+/// RULE 4: every `VolumeId` this operation cannot resolve to a volume of the account gets the
+/// SAME answer — 400 `InvalidVolumeID.Malformed` with the service's parameter-layer sentence
+/// naming the id the request sent — whether the value is not a volume id at all or is well
+/// formed and names no volume. The recorded unit `ec2.op-contract-create-snapshot` (corpus
+/// `simparity-behavioral-aws-v1`, named in this operation's issue) carries that answer for a
+/// well-formed id of the long form the account holds no volume for, which is why this
+/// operation does not split the two the way `DeleteVolume` and `AttachVolume` do.
+///
+/// The rows span both id forms EC2 has issued (8 and 17 hexadecimal digits), the all-zero
+/// placeholder, values outside that form, and the id of another kind of resource.
+#[tokio::test]
+async fn a_volume_id_this_operation_cannot_resolve_gets_one_answer() {
+    let (router, _engine) = super::ec2_query::emulator();
+    // One volume the account DOES hold, so each refusal below is about the id the request
+    // named rather than about an empty store.
+    let held = create_volume(&router, 1, false).await;
+
+    let rows: [(&str, &str); 8] = [
+        ("a well-formed long id naming no volume", UNKNOWN_VOLUME_ID),
+        ("a well-formed short id naming no volume", "vol-1a2b3c4d"),
+        (
+            "the all-zero placeholder no mint can issue",
+            "vol-00000000000000000",
+        ),
+        ("a value that is not a volume id at all", "not-a-volume"),
+        ("the prefix with no digits", "vol-"),
+        ("a digit count between the two id forms", "vol-0123456789"),
+        ("an uppercase id", "VOL-0123456789ABCDEF0"),
+        (
+            "the id of another kind of resource",
+            "snap-0123456789abcdef0",
+        ),
+    ];
+    for (case, volume_id) in rows {
+        let (status, body) = op(&router, "CreateSnapshot", &[p("VolumeId", volume_id)]).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidVolumeID.Malformed",
+            "case {case:?}: expected InvalidVolumeID.Malformed, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("Value ( {volume_id} ) for parameter VOLUME is invalid. "),
+            "case {case:?}: expected the refusal's whole sentence, got {:?}",
+            error_message(&body)
+        );
+    }
+
+    // Nothing was stored for any of them, and the volume the account holds is still
+    // snapshottable — so the rows above were refused for the ids they named.
+    let (status, listed) = op(&router, "DescribeSnapshots", &[p("OwnerId.1", "self")]).await;
+    assert_eq!(
+        status, 200,
+        "expected DescribeSnapshots to succeed, got {status} {listed}"
+    );
+    let stored = elements(&listed, "snapshotId");
+    assert!(
+        stored.is_empty(),
+        "a refused request stores no snapshot, got {stored:?}"
+    );
+    let (status, body) = op(&router, "CreateSnapshot", &[p("VolumeId", &held)]).await;
+    assert_eq!(
+        status, 200,
+        "the volume the account holds is still snapshottable, got {status} with body {body}"
+    );
+    assert_eq!(
+        elements(&body, "snapshotId").len(),
+        1,
+        "that create mints exactly one snapshot, got {body}"
+    );
+}
+
 /// One refusal row: the case, the request's parameters, and the HTTP status and EC2 error
 /// code it must be answered with.
 type RefusalRow = (&'static str, Vec<(String, String)>, u16, &'static str);
@@ -214,18 +291,6 @@ async fn a_request_that_cannot_be_served_is_refused_and_stores_nothing() {
     let (router, _engine) = super::ec2_query::emulator();
     let volume_id = create_volume(&router, 1, false).await;
     let rows: Vec<RefusalRow> = vec![
-        (
-            "a volume id outside the id form",
-            vec![p("VolumeId", "not-a-volume")],
-            400,
-            "InvalidVolumeID.Malformed",
-        ),
-        (
-            "a well-formed volume id the account holds no volume for",
-            vec![p("VolumeId", UNKNOWN_VOLUME_ID)],
-            400,
-            "InvalidVolume.NotFound",
-        ),
         (
             "a location only a volume in a Local Zone can ask for",
             vec![p("VolumeId", &volume_id), p("Location", "local")],
@@ -246,6 +311,15 @@ async fn a_request_that_cannot_be_served_is_refused_and_stores_nothing() {
                     "OutpostArn",
                     engine::emulator_arn("outposts", REGION, "outpost/op-0123456789abcdef0"),
                 ),
+            ],
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            "a tag specification naming a resource this call does not create",
+            vec![
+                p("VolumeId", &volume_id),
+                p("TagSpecification.1.ResourceType", "volume"),
             ],
             400,
             "InvalidParameterValue",
