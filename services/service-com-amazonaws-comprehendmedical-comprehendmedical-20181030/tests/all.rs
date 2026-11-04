@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/async_job_data_access_role.rs"]
 mod async_job_data_access_role;
+#[path = "all/data_access_role_refusal_classes.rs"]
+mod data_access_role_refusal_classes;
 #[path = "all/entities_detection_v2.rs"]
 mod entities_detection_v2;
 #[path = "all/icd10_cm_inference.rs"]
