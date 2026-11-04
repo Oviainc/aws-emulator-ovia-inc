@@ -185,12 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // associated with many VPCs (`AssociateProfile`'s own documentation). So the
         // lookup is by `ResourceId` alone, independent of the `ProfileId` asked for,
         // and which refusal it earns depends on what already holds that VPC: the same
-        // Profile means this exact association already exists; a different Profile
-        // means the VPC is taken and must be disassociated first.
+        // Profile means this exact association already exists, so the resource the
+        // request would create is reported as existing; a different Profile means the
+        // VPC's allowance of one Profile association is already spent, which is a
+        // quota refusal rather than a request conflict.
         if let Some(existing) = store.association_for_resource(&input.resource_id) {
-            let (existing_id, existing_profile_id) =
-                (existing.id.clone(), existing.profile_id.clone());
-            return Err(if existing_profile_id == input.profile_id {
+            return Err(if existing.profile_id == input.profile_id {
+                // Only this arm names the stored association, so its id is cloned
+                // here rather than before the branch.
+                let existing_id = existing.id.clone();
                 AssociateProfileErrorModeled::ResourceExistsException(ResourceExistsException {
                     message: Some(format!(
                         "Profile {} is already associated with resource {} by association \
@@ -202,21 +205,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 })
             } else {
-                AssociateProfileErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "Resource {} is already associated with Profile {existing_profile_id} by \
-                         association {existing_id}; a resource can have only one Profile \
-                         associated with it.",
-                        input.resource_id
-                    )),
-                })
+                AssociateProfileErrorModeled::LimitExceededException(
+                    crate::state::vpc_association_limit_exceeded(&input.resource_id),
+                )
             }
             .into());
         }
 
         // The store is bounded: once it is full a further association is refused with
         // the operation's own `LimitExceededException` rather than growing the
-        // emulator's heap.
+        // emulator's heap. This is the store's own ceiling, unrelated to the per-VPC
+        // allowance refused above.
         if store.profile_associations.len() >= crate::state::MAX_PROFILE_ASSOCIATIONS {
             return Err(AssociateProfileErrorModeled::LimitExceededException(
                 LimitExceededException {

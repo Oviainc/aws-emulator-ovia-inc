@@ -22,8 +22,8 @@
 //! * `ListProfileAssociations` narrows by `profileId` and `resourceId`;
 //! * `AssociateProfile` persists an association readable by `GetProfileAssociation`,
 //!   refuses a (ProfileId, ResourceId) pair that is already associated, refuses a
-//!   `ResourceId` another Profile already holds (a resource can have only one Profile
-//!   associated with it), and refuses a `ProfileId` that names nothing;
+//!   `ResourceId` another Profile already holds as having spent that VPC's one
+//!   Profile association, and refuses a `ProfileId` that names nothing;
 //! * `DisassociateProfile` removes the association and reports it `DELETING`;
 //! * `DeleteProfile` refuses with `ConflictException` while the Profile still has
 //!   associations, and otherwise removes it and reports it `DELETING`;
@@ -31,197 +31,10 @@
 //!   outside the modelled range is refused.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
-use bytes::Bytes;
-use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
+use serde_json::json;
 
-use service_com_amazonaws_route53profiles_route53profiles::EmulatedService;
-
-/// This service's sigv4 signing name, from the model (`OPERATIONS.md`, "Wire protocol").
-const SIGNING_NAME: &str = "route53profiles";
-
-/// The account id every generated emulator presents, as `engine` defines it.
-const ACCOUNT_ID: &str = engine::EMULATOR_ACCOUNT_ID;
-
-/// One response, reduced to what the assertions read.
-#[derive(Debug)]
-struct Reply {
-    status: u16,
-    /// The wire error code (`x-amzn-errortype`, else the body's `__type`), with any
-    /// `namespace#` prefix stripped. `None` on success.
-    error: Option<String>,
-    body: Value,
-}
-
-impl Reply {
-    /// The response's top-level `member`, panicking with the whole body when it is
-    /// not there — a failure that is otherwise invisible behind `Value::Null`.
-    fn member(&self, name: &str) -> &Value {
-        let value = &self.body[name];
-        assert!(
-            !value.is_null(),
-            "member {name} is absent from {}",
-            self.body
-        );
-        value
-    }
-
-    /// The string at `member.field`, for the single-structure outputs of this
-    /// service (`Profile`, `ProfileAssociation`).
-    fn nested_string(&self, member: &str, field: &str) -> String {
-        self.member(member)[field]
-            .as_str()
-            .unwrap_or_else(|| {
-                panic!(
-                    "{member}.{field} is not a string in {}",
-                    self.body
-                )
-            })
-            .to_string()
-    }
-
-    /// A list member as a slice, panicking when it is absent or not a list.
-    fn list(&self, name: &str) -> &[Value] {
-        self.body[name]
-            .as_array()
-            .unwrap_or_else(|| panic!("member {name} is not a list in {}", self.body))
-    }
-}
-
-/// One emulator over one shared engine: every call sees the same store.
-struct Emulator {
-    router: MultiServiceRouter,
-    region: String,
-}
-
-impl Emulator {
-    fn in_region(region: &str) -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self {
-            router,
-            region: region.to_string(),
-        }
-    }
-
-    fn new() -> Self {
-        Self::in_region("us-east-1")
-    }
-
-    async fn call(&self, method: &str, path_and_query: &str, body: Option<Value>) -> Reply {
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20260101/{}/{SIGNING_NAME}/aws4_request, \
-             SignedHeaders=host, Signature=00",
-            self.region
-        );
-        let payload = body
-            .map(|value| Bytes::from(serde_json::to_vec(&value).expect("a serializable body")))
-            .unwrap_or_default();
-        let request = http::Request::builder()
-            .method(method)
-            .uri(format!(
-                "https://{SIGNING_NAME}.{}.amazonaws.com{path_and_query}",
-                self.region
-            ))
-            .header("authorization", authorization)
-            .header("content-type", "application/json")
-            .body(payload)
-            .expect("a well-formed test request");
-
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let header_error = response
-            .headers()
-            .get("x-amzn-errortype")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let bytes = response.into_body();
-        let body: Value = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-        };
-        let error = if status < 400 {
-            None
-        } else {
-            header_error
-                .or_else(|| body["__type"].as_str().map(str::to_string))
-                .map(|code| {
-                    code.rsplit('#')
-                        .next()
-                        .unwrap_or(code.as_str())
-                        .split('/')
-                        .next()
-                        .unwrap_or(code.as_str())
-                        .to_string()
-                })
-        };
-        Reply {
-            status,
-            error,
-            body,
-        }
-    }
-
-    async fn create_profile(&self, body: Value) -> Reply {
-        self.call("POST", "/profile", Some(body)).await
-    }
-
-    /// A create with a token derived from the name, for the cases that do not test
-    /// idempotency themselves.
-    async fn create_named(&self, name: &str) -> Reply {
-        self.create_profile(json!({ "Name": name, "ClientToken": format!("tok-{name}") }))
-            .await
-    }
-
-    async fn get_profile(&self, id: &str) -> Reply {
-        self.call("GET", &format!("/profile/{id}"), None).await
-    }
-
-    async fn delete_profile(&self, id: &str) -> Reply {
-        self.call("DELETE", &format!("/profile/{id}"), None).await
-    }
-
-    async fn list_profiles(&self, query: &str) -> Reply {
-        self.call("GET", &format!("/profiles{query}"), None).await
-    }
-
-    async fn associate(&self, profile_id: &str, resource_id: &str, name: &str) -> Reply {
-        self.call(
-            "POST",
-            "/profileassociation",
-            Some(json!({
-                "ProfileId": profile_id,
-                "ResourceId": resource_id,
-                "Name": name,
-            })),
-        )
-        .await
-    }
-
-    async fn get_association(&self, id: &str) -> Reply {
-        self.call("GET", &format!("/profileassociation/{id}"), None)
-            .await
-    }
-
-    async fn list_associations(&self, query: &str) -> Reply {
-        self.call("GET", &format!("/profileassociations{query}"), None)
-            .await
-    }
-
-    async fn disassociate(&self, profile_id: &str, resource_id: &str) -> Reply {
-        self.call(
-            "DELETE",
-            &format!("/profileassociation/Profileid/{profile_id}/resourceid/{resource_id}"),
-            None,
-        )
-        .await
-    }
-}
+use super::harness::{Emulator, ACCOUNT_ID};
 
 /// The names in this table are the classes the modelled `Name` shape accepts —
 /// `@length(0..64)` with pattern `^(?!^[0-9]+$)([a-zA-Z0-9\-_' ']+)$`: a single
@@ -743,12 +556,12 @@ async fn the_association_lifecycle_is_persisted_and_reversible() {
         }
 
         // A resource can have only one Profile associated with it, so another Profile
-        // over the same `ResourceId` is refused too — and the first association is
-        // untouched.
+        // over the same `ResourceId` has spent that VPC's allowance — and the first
+        // association is untouched.
         let taken = em.associate(&rival_id, resource_id, "rival-assoc").await;
         assert_eq!(
             taken.error.as_deref(),
-            Some("ConflictException"),
+            Some("LimitExceededException"),
             "case {case}: a second Profile over the same ResourceId must be refused, \
              got {} / {:?}",
             taken.status,
@@ -900,7 +713,7 @@ async fn list_profile_associations_narrows_by_filter_and_pages_every_record_once
     let taken = em.associate(rival, &held_vpc, "rival-assoc").await;
     assert_eq!(
         taken.error.as_deref(),
-        Some("ConflictException"),
+        Some("LimitExceededException"),
         "a VPC already associated with one Profile must be refused to another, got {} / {:?}",
         taken.status,
         taken.body

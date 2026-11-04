@@ -394,12 +394,17 @@ impl ComAmazonawsRoute53profilesRoute53profilesState {
         })
     }
 
-    /// Whether any stored association still names `profile_id`. `DeleteProfile`
-    /// refuses with `ConflictException` while one does.
-    pub fn profile_has_associations(&self, profile_id: &str) -> bool {
+    /// A stored association that still names `profile_id`, or `None` when none
+    /// does. `DeleteProfile` refuses with `ConflictException` while one does, and
+    /// the refusal names the association the caller has to delete first, so the
+    /// answer is the record rather than a bare yes/no.
+    ///
+    /// Associations are keyed in a `BTreeMap`, so when several of them block the
+    /// delete the one reported is the same on every call.
+    pub fn association_blocking_profile(&self, profile_id: &str) -> Option<&ProfileAssociation> {
         self.profile_associations
             .values()
-            .any(|association| association.profile_id == profile_id)
+            .find(|association| association.profile_id == profile_id)
     }
 
     /// Record `tags` against `arn`, replacing whatever was there. An empty list
@@ -538,13 +543,31 @@ pub const PROFILE_RESOURCE_TYPE: &str = "PROFILE";
 /// The `ResourceType` a Profile-association error reports.
 pub const PROFILE_ASSOCIATION_RESOURCE_TYPE: &str = "PROFILE_ASSOCIATION";
 
-/// `ResourceNotFoundException` for a `ProfileId` that names no stored Profile.
-/// The message is built from the request, so it names the value given.
-pub fn profile_not_found(profile_id: &str) -> crate::ops::types::ResourceNotFoundException {
+/// The message every "this id names nothing" refusal of this service carries: one
+/// template shared by every resource kind of the Resolver family this service
+/// belongs to, whose only variable part is the id, taken verbatim from the request.
+///
+/// The family reports its sub-error code inside the message rather than in
+/// `Error.Code`, which stays `ResourceNotFoundException`.
+fn resource_not_found_message(id: &str) -> String {
+    format!("[RSLVR-05007] Can't find the resource with ID \"{id}\".")
+}
+
+/// `ResourceNotFoundException` for an id that names no stored resource of
+/// `resource_type`, built from the request so it names the value given.
+pub fn resource_not_found(
+    id: &str,
+    resource_type: &str,
+) -> crate::ops::types::ResourceNotFoundException {
     crate::ops::types::ResourceNotFoundException {
-        message: Some(format!("Profile {profile_id} was not found.")),
-        resource_type: Some(PROFILE_RESOURCE_TYPE.to_string()),
+        message: Some(resource_not_found_message(id)),
+        resource_type: Some(resource_type.to_string()),
     }
+}
+
+/// `ResourceNotFoundException` for a `ProfileId` that names no stored Profile.
+pub fn profile_not_found(profile_id: &str) -> crate::ops::types::ResourceNotFoundException {
+    resource_not_found(profile_id, PROFILE_RESOURCE_TYPE)
 }
 
 /// `ResourceNotFoundException` for an association id that names no stored
@@ -552,9 +575,53 @@ pub fn profile_not_found(profile_id: &str) -> crate::ops::types::ResourceNotFoun
 pub fn profile_association_not_found(
     association_id: &str,
 ) -> crate::ops::types::ResourceNotFoundException {
+    resource_not_found(association_id, PROFILE_ASSOCIATION_RESOURCE_TYPE)
+}
+
+/// `ResourceNotFoundException` for a (`ProfileId`, `ResourceId`) pair that names no
+/// stored association.
+///
+/// An operation addressed by the pair rather than by an association id cannot say
+/// which half of it is at fault, so its refusal names both ids from the request
+/// under this family's own sub-error code for an unresolvable pair.
+pub fn profile_resource_pair_not_found(
+    profile_id: &str,
+    resource_id: &str,
+) -> crate::ops::types::ResourceNotFoundException {
     crate::ops::types::ResourceNotFoundException {
         message: Some(format!(
-            "Profile association {association_id} was not found."
+            "[RSLVR-05300] Can't locate the Profile ID: \"{profile_id}\" or resource ID \
+             \"{resource_id}\"."
+        )),
+        resource_type: Some(PROFILE_ASSOCIATION_RESOURCE_TYPE.to_string()),
+    }
+}
+
+/// `ConflictException` refusing to delete a Profile an association still names.
+///
+/// The one variable part is the id of the association that blocks the delete, read
+/// off this service's own state — the resource the caller has to remove before
+/// retrying — not the `ProfileId` the request named.
+pub fn profile_still_associated(association_id: &str) -> crate::ops::types::ConflictException {
+    crate::ops::types::ConflictException {
+        message: Some(format!(
+            "[RSLVR-05102] The Profile is associated with a resource: \"{association_id}\". \
+             Delete the association and try again."
+        )),
+    }
+}
+
+/// `LimitExceededException` refusing to associate a VPC that a Profile already
+/// holds: a VPC admits one Profile association, so a second one asks for more than
+/// that per-VPC allowance.
+///
+/// The one variable part is the `ResourceId` the request named.
+pub fn vpc_association_limit_exceeded(
+    resource_id: &str,
+) -> crate::ops::types::LimitExceededException {
+    crate::ops::types::LimitExceededException {
+        message: Some(format!(
+            "VPC [{resource_id}] exceeded its maximum profile association limit."
         )),
         resource_type: Some(PROFILE_ASSOCIATION_RESOURCE_TYPE.to_string()),
     }
@@ -571,12 +638,7 @@ pub const PROFILE_RESOURCE_ASSOCIATION_RESOURCE_TYPE: &str = "PROFILE_RESOURCE_A
 pub fn profile_resource_association_not_found(
     association_id: &str,
 ) -> crate::ops::types::ResourceNotFoundException {
-    crate::ops::types::ResourceNotFoundException {
-        message: Some(format!(
-            "[RSLVR-05007] Can't find the resource with ID \"{association_id}\"."
-        )),
-        resource_type: Some(PROFILE_RESOURCE_ASSOCIATION_RESOURCE_TYPE.to_string()),
-    }
+    resource_not_found(association_id, PROFILE_RESOURCE_ASSOCIATION_RESOURCE_TYPE)
 }
 
 /// `ValidationException` for a `ResourceArn` naming a resource a Profile cannot

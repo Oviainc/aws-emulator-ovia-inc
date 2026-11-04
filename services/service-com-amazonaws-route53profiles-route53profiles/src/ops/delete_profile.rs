@@ -167,15 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A Profile still associated with a resource cannot be deleted: the
-        // associations have to be removed first.
-        if store.profile_has_associations(&input.profile_id) {
+        // associations have to be removed first, so the refusal names the blocking
+        // association read off the store rather than the Profile the request named.
+        if let Some(blocking) = store.association_blocking_profile(&input.profile_id) {
+            let blocking_id = blocking.id.clone();
             return Err(DeleteProfileErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "Profile {} still has resource associations and cannot be deleted.",
-                        input.profile_id
-                    )),
-                },
+                crate::state::profile_still_associated(&blocking_id),
             )
             .into());
         }

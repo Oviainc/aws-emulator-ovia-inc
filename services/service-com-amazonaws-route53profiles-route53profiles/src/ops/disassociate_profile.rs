@@ -165,20 +165,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The path names the pair, not the association id, so the stored association
         // is resolved through the pair it holds. A pair that is not associated — which
-        // is what a retry of a call that already succeeded names — is not found.
+        // is what a retry of a call that already succeeded names — is not found, and
+        // the refusal names both ids the request gave, since either half of the pair
+        // can be the reason it resolves to nothing.
         let association_id = store
             .association_id_for_pair(&input.profile_id, &input.resource_id)
             .ok_or_else(|| {
                 DisassociateProfileErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Profile {} is not associated with resource {}.",
-                            input.profile_id, input.resource_id
-                        )),
-                        resource_type: Some(
-                            crate::state::PROFILE_ASSOCIATION_RESOURCE_TYPE.to_string(),
-                        ),
-                    },
+                    crate::state::profile_resource_pair_not_found(
+                        &input.profile_id,
+                        &input.resource_id,
+                    ),
                 )
             })?;
 
