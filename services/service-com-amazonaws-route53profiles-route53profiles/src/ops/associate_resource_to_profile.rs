@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateResourceToProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateResourceToProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateResourceToProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: validates the Profile and the resource ARN, refuses a resource already
+//! associated with that Profile and a reserved DNS Firewall priority, and persists the
+//! resource association it reports.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +157,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateResourceToProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateResourceToProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateResourceToProfile"))
+        // Nothing in this operation's input or output is region-scoped: a
+        // `ProfileResourceAssociation` reports no ARN of its own, and the resource's
+        // ARN comes from the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AssociateResourceToProfileErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some(crate::state::NO_STORE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // The Profile named has to exist: a resource association can only name a
+        // Profile this account holds.
+        if !store.profiles.contains_key(&input.profile_id) {
+            return Err(
+                AssociateResourceToProfileErrorModeled::ResourceNotFoundException(
+                    crate::state::profile_not_found(&input.profile_id),
+                )
+                .into(),
+            );
+        }
+
+        // A Profile carries DNS configuration, so the ARN has to name a resource of a
+        // kind a Profile can hold; that resource's own type is what the association
+        // reports as `ResourceType`. `Arn` carries no pattern in the model, so this
+        // check is the only thing between an arbitrary ARN and the store.
+        let Some(resource_type) = crate::state::resource_type_of_arn(&input.resource_arn) else {
+            return Err(AssociateResourceToProfileErrorModeled::ValidationException(
+                crate::state::invalid_resource_arn(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // A DNS Firewall rule group is ordered within the Profile by the `priority` in
+        // its `ResourceProperties`, and the values outside the documented range are
+        // reserved for the service itself.
+        if !crate::state::firewall_priority_accepted(
+            &resource_type,
+            input.resource_properties.as_deref(),
+        ) {
+            return Err(AssociateResourceToProfileErrorModeled::ValidationException(
+                crate::state::reserved_firewall_priority(),
+            )
+            .into());
+        }
+
+        // A resource is held by one Profile once: a repeat of a pair the store already
+        // holds conflicts with the association holding it.
+        if let Some(existing) =
+            store.resource_association_for_pair(&input.profile_id, &input.resource_arn)
+        {
+            let existing_id = existing.id.clone();
+            return Err(AssociateResourceToProfileErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Resource {} is already associated with Profile {} by association \
+                         {existing_id}.",
+                        input.resource_arn, input.profile_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: once it is full a further association is refused with
+        // the operation's own `LimitExceededException` rather than growing the
+        // emulator's heap.
+        if store.profile_resource_associations.len()
+            >= crate::state::MAX_PROFILE_RESOURCE_ASSOCIATIONS
+        {
+            return Err(
+                AssociateResourceToProfileErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "The maximum number of Profile resource associations ({}) has \
+                             already been created.",
+                            crate::state::MAX_PROFILE_RESOURCE_ASSOCIATIONS
+                        )),
+                        resource_type: Some(
+                            crate::state::PROFILE_RESOURCE_ASSOCIATION_RESOURCE_TYPE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_profile_resource_association_id();
+        let now = ::std::time::SystemTime::now();
+        let started = ::std::time::Instant::now();
+        let association = crate::state::ProfileResourceAssociation {
+            id: id.clone(),
+            name: input.name,
+            owner_id: ::engine::emulator_account_id().to_string(),
+            profile_id: input.profile_id,
+            resource_arn: input.resource_arn,
+            resource_type,
+            resource_properties: input.resource_properties,
+            creation_time: now,
+            modification_time: now,
+            // The resource still has to reach every VPC the Profile is associated
+            // with, so the association is reported `CREATING` until the move to
+            // `COMPLETE` the clock owes falls due.
+            settled_at: Some(started + crate::state::ASSOCIATION_SETTLE_DELAY),
+        };
+        // Insert, then report from the record now in the store.
+        let stored = store
+            .profile_resource_associations
+            .entry(id)
+            .or_insert(association);
+        Ok(AssociateResourceToProfileOutput {
+            profile_resource_association: Some(crate::state::profile_resource_association_shape(
+                stored, started,
+            )),
+        })
     }
 }

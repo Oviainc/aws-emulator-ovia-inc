@@ -6,7 +6,7 @@
 //! create is visible to every later read and a delete is visible as an absence.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The service's own ARN namespace / sigv4 signing name, as the Smithy model's
 /// `aws.api#service` trait declares it (`arnNamespace`/`endpointPrefix`
@@ -32,9 +32,18 @@ const PROFILE_ID_PREFIX: &str = "rp";
 /// The id prefix of a Profile association (`rpassoc-` + 16 hex digits).
 const PROFILE_ASSOCIATION_ID_PREFIX: &str = "rpassoc";
 
+/// The id prefix of a Profile *resource* association (`rpr-` + 16 hex digits) —
+/// the id `GetProfileResourceAssociation` and
+/// `UpdateProfileResourceAssociation` take.
+const PROFILE_RESOURCE_ASSOCIATION_ID_PREFIX: &str = "rpr";
+
 /// `ProfileStatus` of a Profile or association this emulator has finished
 /// building — a member of [`crate::ops::types::PROFILE_STATUS_VALUES`].
 pub const STATUS_COMPLETE: &str = "COMPLETE";
+
+/// `ProfileStatus` of a resource association that is still being added to the
+/// Profile — a member of [`crate::ops::types::PROFILE_STATUS_VALUES`].
+pub const STATUS_CREATING: &str = "CREATING";
 
 /// `ProfileStatus` of a Profile or association that has just been removed.
 pub const STATUS_DELETING: &str = "DELETING";
@@ -88,6 +97,108 @@ pub struct ProfileAssociation {
     pub modification_time: SystemTime,
 }
 
+/// How long a resource association reports [`STATUS_CREATING`] before the move to
+/// [`STATUS_COMPLETE`] the clock owes falls due.
+///
+/// AWS answers `AssociateResourceToProfile` with a resource association that is
+/// still being built and reaches `COMPLETE` on its own later; an emulator must not
+/// make a caller wait as long as AWS does, so the transition is owed after this
+/// span instead. It is deliberately not zero, so a caller reading straight after
+/// the associate still observes the transient status, exactly as it would against
+/// AWS.
+pub const ASSOCIATION_SETTLE_DELAY: Duration = Duration::from_secs(3);
+
+/// A persisted association between a Profile and a DNS resource: every member the
+/// `ProfileResourceAssociation` shape reports.
+#[derive(Debug, Clone)]
+pub struct ProfileResourceAssociation {
+    /// The minted `Id` (`rpr-` + 16 hex digits).
+    pub id: String,
+    pub name: String,
+    pub owner_id: String,
+    pub profile_id: String,
+    /// `ResourceArn` — the ARN of the associated DNS resource, as the request gave
+    /// it.
+    pub resource_arn: String,
+    /// `ResourceType`, derived from [`Self::resource_arn`] by
+    /// [`resource_type_of_arn`].
+    pub resource_type: String,
+    /// `ResourceProperties`, the JSON document the request carried, echoed back
+    /// unchanged; `None` when the request named none.
+    pub resource_properties: Option<String>,
+    pub creation_time: SystemTime,
+    pub modification_time: SystemTime,
+    /// The instant at which the move from [`STATUS_CREATING`] to
+    /// [`STATUS_COMPLETE`] is owed, or `None` for an association with no
+    /// transition in flight.
+    pub settled_at: Option<Instant>,
+}
+
+impl ProfileResourceAssociation {
+    /// This association's `Status` as of `now`: [`STATUS_CREATING`] until the
+    /// transition the clock owes falls due, [`STATUS_COMPLETE`] after it.
+    pub fn status_at(&self, now: Instant) -> &'static str {
+        match self.settled_at {
+            Some(due) if now < due => STATUS_CREATING,
+            _ => STATUS_COMPLETE,
+        }
+    }
+}
+
+/// The `StatusMessage` reported beside a resource association's `Status`: every
+/// status this emulator reports carries the sentence AWS attaches to it.
+pub fn resource_association_status_message(status: &str) -> Option<String> {
+    match status {
+        STATUS_CREATING => Some("Creating the Profile resource association".to_string()),
+        STATUS_COMPLETE => Some("Completed creation of Profile resource association".to_string()),
+        _ => None,
+    }
+}
+
+/// The resources a Route 53 Profile can hold, as the `<service>` and
+/// resource-type segments of the resource's ARN
+/// (`arn:<partition>:<service>:<region>:<account>:<type>/<id>`).
+///
+/// A Profile carries DNS configuration only: a private hosted zone, a Resolver
+/// rule, a DNS Firewall rule group, a Resolver query-logging or DNSSEC-validation
+/// configuration, and an interface VPC endpoint. Any other ARN names a resource
+/// the service cannot associate, whatever else is well-formed about it.
+const ASSOCIABLE_ARN_SEGMENTS: [(&str, &str); 6] = [
+    ("route53", "hostedzone"),
+    ("route53resolver", "resolver-rule"),
+    ("route53resolver", "firewall-rule-group"),
+    ("route53resolver", "resolver-query-log-config"),
+    ("route53resolver", "resolver-dnssec-config"),
+    ("ec2", "vpc-endpoint"),
+];
+
+/// The `ResourceType` of the resource `resource_arn` names, or `None` when a
+/// Profile cannot hold that resource.
+///
+/// The type is the ARN's own resource-type segment in the upper-snake spelling the
+/// wire uses (`firewall-rule-group` -> `FIREWALL_RULE_GROUP`), so one rule covers
+/// every associable resource rather than a table of hand-written answers.
+pub fn resource_type_of_arn(resource_arn: &str) -> Option<String> {
+    let mut fields = resource_arn.split(':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    // partition, then the service that owns the resource.
+    let _partition = fields.next()?;
+    let service = fields.next()?;
+    // region, account, then the resource itself.
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    let (segment, resource_id) = fields.next()?.split_once('/')?;
+    if resource_id.is_empty() {
+        return None;
+    }
+    ASSOCIABLE_ARN_SEGMENTS
+        .iter()
+        .any(|(owner, associable)| *owner == service && *associable == segment)
+        .then(|| segment.to_ascii_uppercase().replace('-', "_"))
+}
+
 /// The most Profiles this emulator stores for one account.
 ///
 /// A ceiling, not a claim about AWS's published quota: it exists so a create loop
@@ -102,6 +213,14 @@ pub const MAX_PROFILES: usize = 100;
 /// associated with 1000 of VPCs (and you can request a higher quota)" — so a client
 /// exercising the documented number of VPCs is not refused.
 pub const MAX_PROFILE_ASSOCIATIONS: usize = 1000;
+
+/// The most Profile *resource* associations this emulator stores.
+///
+/// A ceiling, not a claim about AWS's published quota: it exists so an associate
+/// loop cannot grow the emulator's heap without bound.
+/// `AssociateResourceToProfile` models `LimitExceededException`, which is the
+/// refusal once the store is full.
+pub const MAX_PROFILE_RESOURCE_ASSOCIATIONS: usize = 1000;
 
 /// The most resources [`ComAmazonawsRoute53profilesRoute53profilesState::tags`] holds
 /// an entry for: one per resource that can exist at once.
@@ -136,6 +255,10 @@ pub struct ComAmazonawsRoute53profilesRoute53profilesState {
     /// order for `ListProfileAssociations`. Bounded by
     /// [`MAX_PROFILE_ASSOCIATIONS`].
     pub profile_associations: BTreeMap<String, ProfileAssociation>,
+    /// Every Profile resource association, keyed by its own `Id`, in the same
+    /// stable order for `ListProfileResourceAssociations`. Bounded by
+    /// [`MAX_PROFILE_RESOURCE_ASSOCIATIONS`].
+    pub profile_resource_associations: BTreeMap<String, ProfileResourceAssociation>,
     /// Tags carried by the `Tags` input of `CreateProfile`/`AssociateProfile`,
     /// keyed by the resource's ARN — the key `ListTagsForResource`,
     /// `TagResource` and `UntagResource` take, so that slice reads real data.
@@ -157,6 +280,11 @@ impl ComAmazonawsRoute53profilesRoute53profilesState {
         self.mint_id(PROFILE_ASSOCIATION_ID_PREFIX)
     }
 
+    /// Mint a fresh, unused Profile-resource-association `Id`.
+    pub fn mint_profile_resource_association_id(&mut self) -> String {
+        self.mint_id(PROFILE_RESOURCE_ASSOCIATION_ID_PREFIX)
+    }
+
     /// Mint an id of the form `<prefix>-<16 hex digits>`, which fits
     /// `ResourceId`'s modelled 1..64 length for either prefix.
     ///
@@ -175,7 +303,10 @@ impl ComAmazonawsRoute53profilesRoute53profilesState {
                 self.id_seed,
                 self.next_id & 0xFFFF_FFFF
             );
-            if !self.profiles.contains_key(&id) && !self.profile_associations.contains_key(&id) {
+            if !self.profiles.contains_key(&id)
+                && !self.profile_associations.contains_key(&id)
+                && !self.profile_resource_associations.contains_key(&id)
+            {
                 return id;
             }
         }
@@ -244,6 +375,23 @@ impl ComAmazonawsRoute53profilesRoute53profilesState {
         self.profile_associations
             .values()
             .find(|association| association.resource_id == resource_id)
+    }
+
+    /// The stored resource association of `profile_id` with the resource
+    /// `resource_arn` names, or `None` when that pair is not associated.
+    ///
+    /// `AssociateResourceToProfile` names the pair rather than an association id,
+    /// so this is the lookup it refuses a repeat on, and
+    /// `DisassociateResourceFromProfile` the one it resolves its path labels
+    /// through.
+    pub fn resource_association_for_pair(
+        &self,
+        profile_id: &str,
+        resource_arn: &str,
+    ) -> Option<&ProfileResourceAssociation> {
+        self.profile_resource_associations.values().find(|association| {
+            association.profile_id == profile_id && association.resource_arn == resource_arn
+        })
     }
 
     /// Whether any stored association still names `profile_id`. `DeleteProfile`
@@ -362,6 +510,28 @@ pub fn profile_association_shape(
     }
 }
 
+/// The stored resource association as the wire `ProfileResourceAssociation`
+/// shape, member for member, with its `Status` and `StatusMessage` as of `now`.
+pub fn profile_resource_association_shape(
+    association: &ProfileResourceAssociation,
+    now: Instant,
+) -> crate::ops::types::ProfileResourceAssociation {
+    let status = association.status_at(now);
+    crate::ops::types::ProfileResourceAssociation {
+        id: Some(association.id.clone()),
+        name: Some(association.name.clone()),
+        owner_id: Some(association.owner_id.clone()),
+        profile_id: Some(association.profile_id.clone()),
+        resource_arn: Some(association.resource_arn.clone()),
+        resource_type: Some(association.resource_type.clone()),
+        resource_properties: association.resource_properties.clone(),
+        status: Some(status.to_string()),
+        status_message: resource_association_status_message(status),
+        creation_time: Some(timestamp(association.creation_time)),
+        modification_time: Some(timestamp(association.modification_time)),
+    }
+}
+
 /// The `ResourceType` a Profile error reports.
 pub const PROFILE_RESOURCE_TYPE: &str = "PROFILE";
 
@@ -387,6 +557,93 @@ pub fn profile_association_not_found(
             "Profile association {association_id} was not found."
         )),
         resource_type: Some(PROFILE_ASSOCIATION_RESOURCE_TYPE.to_string()),
+    }
+}
+
+/// The `ResourceType` a Profile-resource-association error reports.
+pub const PROFILE_RESOURCE_ASSOCIATION_RESOURCE_TYPE: &str = "PROFILE_RESOURCE_ASSOCIATION";
+
+/// `ResourceNotFoundException` for a resource-association id that names no stored
+/// resource association.
+///
+/// The Resolver family answers a lookup of an id it holds nothing for with one
+/// template, naming only the id from the request.
+pub fn profile_resource_association_not_found(
+    association_id: &str,
+) -> crate::ops::types::ResourceNotFoundException {
+    crate::ops::types::ResourceNotFoundException {
+        message: Some(format!(
+            "[RSLVR-05007] Can't find the resource with ID \"{association_id}\"."
+        )),
+        resource_type: Some(PROFILE_RESOURCE_ASSOCIATION_RESOURCE_TYPE.to_string()),
+    }
+}
+
+/// `ValidationException` for a `ResourceArn` naming a resource a Profile cannot
+/// hold. The ARN is echoed from the request, which is all that varies.
+pub fn invalid_resource_arn(resource_arn: &str) -> crate::ops::types::ValidationException {
+    crate::ops::types::ValidationException {
+        message: Some(format!(
+            "[RSLVR-05022] The ARN in your request isn't valid:\"{resource_arn}\". Provide a \
+             valid ARN."
+        )),
+    }
+}
+
+/// The lowest `priority` a DNS Firewall rule group may be associated with, from
+/// `AssociateResourceToProfile$ResourceProperties`' own documentation: "The
+/// allowed values for priority are between 100 and 9900."
+pub const MIN_FIREWALL_PRIORITY: i64 = 100;
+
+/// The highest `priority` a DNS Firewall rule group may be associated with, from
+/// the same sentence.
+pub const MAX_FIREWALL_PRIORITY: i64 = 9900;
+
+/// `ValidationException` for a DNS Firewall rule group `priority` outside
+/// [`MIN_FIREWALL_PRIORITY`]..=[`MAX_FIREWALL_PRIORITY`]: the values outside that
+/// range are reserved for the service's own use, so none of them is accepted
+/// whatever was asked for — hence a message with no variable part.
+pub fn reserved_firewall_priority() -> crate::ops::types::ValidationException {
+    crate::ops::types::ValidationException {
+        message: Some(format!(
+            "[RSLVR-02017] The priority value you provided is reserved. Provide a number \
+             between \"{MIN_FIREWALL_PRIORITY}\" and \"{MAX_FIREWALL_PRIORITY}\"."
+        )),
+    }
+}
+
+/// The `ResourceType` of a DNS Firewall rule group, as
+/// [`resource_type_of_arn`] spells it: the one resource kind whose
+/// `ResourceProperties` carries a `priority`.
+pub const FIREWALL_RULE_GROUP_RESOURCE_TYPE: &str = "FIREWALL_RULE_GROUP";
+
+/// The `ResourceProperties` member a DNS Firewall rule group association carries,
+/// from `AssociateResourceToProfile$ResourceProperties`' documentation: "If you
+/// are adding a DNS Firewall rule group, include also a priority."
+pub const PRIORITY_PROPERTY: &str = "priority";
+
+/// Whether the `ResourceProperties` document a request carried states a DNS
+/// Firewall `priority` the service accepts.
+///
+/// Only a DNS Firewall rule group's properties carry a priority, so every other
+/// resource type's document passes; for a rule group, a document that states a
+/// priority has to state one inside the documented range, and a document that
+/// cannot be read as JSON states none that is.
+pub fn firewall_priority_accepted(resource_type: &str, resource_properties: Option<&str>) -> bool {
+    if resource_type != FIREWALL_RULE_GROUP_RESOURCE_TYPE {
+        return true;
+    }
+    let Some(document) = resource_properties else {
+        return true;
+    };
+    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(document) else {
+        return false;
+    };
+    match parsed.get(PRIORITY_PROPERTY) {
+        None => true,
+        Some(priority) => priority
+            .as_i64()
+            .is_some_and(|value| (MIN_FIREWALL_PRIORITY..=MAX_FIREWALL_PRIORITY).contains(&value)),
     }
 }
 
