@@ -80,12 +80,12 @@ const NO_ACTION: &str = "Cannot take action on a Finalized Revision.";
 const REVOCATION_COMMENT: &str = "withdrawn for review";
 
 /// Send `CreateDataGrant`.
-async fn create_data_grant(router: &MultiServiceRouter, body: Value) -> Answer {
+pub(crate) async fn create_data_grant(router: &MultiServiceRouter, body: Value) -> Answer {
     call(router, "POST", "/v1/data-grants", Some(body)).await
 }
 
 /// Read one data grant back, by its id or by its ARN (the member admits both).
-async fn get_data_grant(router: &MultiServiceRouter, identifier: &str) -> Answer {
+pub(crate) async fn get_data_grant(router: &MultiServiceRouter, identifier: &str) -> Answer {
     call(
         router,
         "GET",
@@ -96,7 +96,7 @@ async fn get_data_grant(router: &MultiServiceRouter, identifier: &str) -> Answer
 }
 
 /// Accept one data grant, which the model addresses by ARN.
-async fn accept_data_grant(router: &MultiServiceRouter, arn: &str) -> Answer {
+pub(crate) async fn accept_data_grant(router: &MultiServiceRouter, arn: &str) -> Answer {
     call(
         router,
         "POST",
@@ -107,7 +107,7 @@ async fn accept_data_grant(router: &MultiServiceRouter, arn: &str) -> Answer {
 }
 
 /// Delete one data grant, by its id or by its ARN.
-async fn delete_data_grant(router: &MultiServiceRouter, identifier: &str) -> Answer {
+pub(crate) async fn delete_data_grant(router: &MultiServiceRouter, identifier: &str) -> Answer {
     call(
         router,
         "DELETE",
@@ -161,7 +161,7 @@ async fn get_revision(router: &MultiServiceRouter, data_set_id: &str, revision_i
 }
 
 /// The refusal message an answer carries, or the empty string when it carries none.
-fn message(answer: &Answer) -> String {
+pub(crate) fn message(answer: &Answer) -> String {
     answer
         .member("Message")
         .as_str()

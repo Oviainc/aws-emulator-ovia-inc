@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataGrants
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataGrants`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataGrants::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enumerates the data grants state holds for the calling account as
+//! SENDER — the grants this account created — in creation order, bounded by
+//! `maxResults` and resumable through the opaque `NextToken`. A grant this account
+//! RECEIVED is reported by `ListReceivedDataGrants` / `GetReceivedDataGrant` instead,
+//! which is why the sender decides which of the two listings a record appears in.
+//! Reporting only: it never writes. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +144,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataGrants` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataGrantsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataGrants"))
+        // Nothing is read off the request's metadata: `MaxResults` has no modelled
+        // default here (unlike the other list operations of this service), so it is
+        // generated `Option<i32>` and the boundary walk checks its `@range` against the
+        // value the request actually carried.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDataGrantsErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        // Page over the ids state holds, in creation order, so the same call twice
+        // returns the same page.
+        let ordered: Vec<String> = store
+            .data_grant_order
+            .iter()
+            .filter(|id| {
+                store.data_grants.get(*id).is_some_and(|record| {
+                    record.sender_principal == crate::state::caller_account()
+                })
+            })
+            .cloned()
+            .collect();
+
+        let Some((start, end)) =
+            crate::state::page_window(&ordered, input.next_token.as_deref(), input.max_results)
+        else {
+            return Err(ListDataGrantsErrorModeled::ValidationException(
+                crate::state::invalid_next_token(),
+            )
+            .into());
+        };
+
+        let data_grant_summaries: Vec<DataGrantSummaryEntry> = ordered
+            .get(start..end)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|id| store.data_grants.get(id))
+            .map(|record| DataGrantSummaryEntry {
+                name: record.name.clone(),
+                sender_principal: record.sender_principal.clone(),
+                receiver_principal: record.receiver_principal.clone(),
+                acceptance_state: record.acceptance_state.clone(),
+                accepted_at: record.accepted_at,
+                ends_at: record.ends_at,
+                data_set_id: record.data_set_id.clone(),
+                source_data_set_id: record.source_data_set_id.clone(),
+                id: record.id.clone(),
+                arn: record.arn.clone(),
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+            })
+            .collect();
+
+        Ok(ListDataGrantsOutput {
+            data_grant_summaries: Some(data_grant_summaries),
+            // A token only when something is left to fetch, so a paginating client
+            // stops on this page rather than asking for an empty one.
+            next_token: crate::state::next_token(&ordered, start, end),
+        })
     }
 }
