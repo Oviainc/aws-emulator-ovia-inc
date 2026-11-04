@@ -215,6 +215,8 @@ mod protected_role_refusals;
 mod published_managed_policy_reads;
 #[path = "all/published_policy_families.rs"]
 mod published_policy_families;
+#[path = "all/published_role_template_acquisition.rs"]
+mod published_role_template_acquisition;
 #[path = "all/range_refusal_wording.rs"]
 mod range_refusal_wording;
 #[path = "all/refused_call_audit_parameters.rs"]

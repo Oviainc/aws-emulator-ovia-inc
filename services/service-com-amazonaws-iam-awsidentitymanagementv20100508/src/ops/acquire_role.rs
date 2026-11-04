@@ -5,7 +5,10 @@
 //! ## What this operation answers on the wire
 //!
 //! A mutation: it resolves the `TemplateArn` (and the minor version) the request carries
-//! against the role templates the account holds and CREATES a role from that template
+//! against the role templates the account can create roles from — the ones it recorded
+//! itself first, and otherwise the ones AWS services publish
+//! ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::role_template_version`])
+//! — and CREATES a role from that template
 //! version — "creates an IAM role from the specified role template. The new role takes its
 //! configuration — including its name, path, trust policy, inline and managed policies,
 //! permissions boundary, tags, and maximum session duration — from the role template
@@ -18,13 +21,15 @@
 //!
 //! The refusals, each the modelled one for what it refuses:
 //!
-//! * an ARN the account holds no role template under, or a minor version it holds no such
-//!   version of, references "a resource entity that does not exist": `404`
-//!   `<Code>NoSuchEntity</Code>` naming the template the request addressed
-//!   ([`crate::state::role_template_not_found`]). A role template is published by a
-//!   SERVICE — `managedByTypeType` declares the single value `Service` — and no operation
-//!   of this API creates one, so the account holds a template only where something
-//!   recorded it ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::role_templates`]).
+//! * an ARN neither the account recorded a template under nor a service publishes one at,
+//!   or a minor version no such template carries, references "a resource entity that does
+//!   not exist": `404` `<Code>NoSuchEntity</Code>` naming the template the request
+//!   addressed ([`crate::state::role_template_not_found`]). A role template is published by
+//!   a SERVICE — `managedByTypeType` declares the single value `Service` — and no operation
+//!   of this API creates one, so a template is there to create from only where a service
+//!   publishes it ([`crate::state::PUBLISHED_ROLE_TEMPLATES`]) or where something recorded
+//!   it ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::role_templates`]),
+//!   which `GetRoleTemplateVersion` reports from the same resolution.
 //! * a disabled template or a disabled minor version: "a disabled role template cannot be
 //!   used to create new roles", `400` `<Code>RoleTemplateDisabled</Code>`.
 //! * a value the template cannot be rendered with — an ARN that is no ARN, a required
@@ -388,7 +393,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // below reads a version while the store is written to.
         let Some(version) = store
             .role_template_version(&input.template_arn, input.template_minor_version)
-            .cloned()
         else {
             ::tracing::info!(
                 audit = true,

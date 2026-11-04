@@ -155,7 +155,11 @@ fn template(minor_version: i32) -> RoleTemplateVersion {
 
 /// Seed one minor version of a role template into the service's OWN store, under the ARN
 /// it is published at.
-fn seed(engine: &engine::InMemoryEngine, template_arn: &str, version: &RoleTemplateVersion) {
+pub(crate) fn seed(
+    engine: &engine::InMemoryEngine,
+    template_arn: &str,
+    version: &RoleTemplateVersion,
+) {
     let store = state::service_state(engine).expect("the IAM store");
     let minor_version = version
         .minor_version
@@ -179,7 +183,7 @@ fn held_roles(engine: &engine::InMemoryEngine) -> Vec<String> {
 /// One `AcquireRole` call: the template ARN, the minor version when a row names one, and
 /// the replacement values as the awsQuery map encoding carries them
 /// (`ReplacementValues.entry.<n>.key` / `.value.Values.member.<m>`).
-async fn acquire(
+pub(crate) async fn acquire(
     router: &MultiServiceRouter,
     akid: Option<&str>,
     template_arn: &str,
