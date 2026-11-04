@@ -13,9 +13,9 @@
 //! with an empty document. BOTH halves are the same refusal,
 //! `ResourceNotFoundException` (404): the pair names one published build, so an
 //! add-on name the catalog does not carry and a version it publishes no build of
-//! are the same miss — the build asked about does not exist — and it carries the
-//! one sentence this service states an unresolvable resource in
-//! (`crate::state::RESOURCE_NOT_FOUND_MESSAGE`).
+//! are the same miss — the schema asked about does not exist — and the sentence
+//! states the pair the request named
+//! (`crate::state::addon_schema_not_found_message`).
 //!
 //! The schema is the one the catalog holds for that build: the add-on's OWN
 //! configurable keys, each with the JSON type it takes, beside the namespace the
@@ -167,11 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // does not exist.
         let addon = guard
             .published_addon(&input.addon_name, now)
-            .ok_or_else(not_found)?;
+            .ok_or_else(|| not_found(&input.addon_name, &input.addon_version))?;
         let version = addon
             .published_versions(now)
             .find(|version| version.addon_version == input.addon_version)
-            .ok_or_else(not_found)?;
+            .ok_or_else(|| not_found(&input.addon_name, &input.addon_version))?;
 
         Ok(DescribeAddonConfigurationOutput {
             addon_name: Some(addon.addon_name.clone()),
@@ -185,10 +185,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Refuse a `(addonName, addonVersion)` pair the catalog publishes no build of.
 ///
 /// `ResourceNotFoundException` (404) is the modelled "The specified resource
-/// could not be found" channel, and the sentence is the one this service states
-/// a resource it could not resolve in (`crate::state::addon_not_found`).
-fn not_found() -> DescribeAddonConfigurationError {
-    DescribeAddonConfigurationErrorModeled::ResourceNotFoundException(state::addon_not_found())
-        .into()
+/// could not be found" channel, and the sentence is this operation's own: the
+/// SCHEMA asked for is what was not found, stated with the pair the request's
+/// query string named (`crate::state::addon_schema_not_found`).
+fn not_found(addon_name: &str, addon_version: &str) -> DescribeAddonConfigurationError {
+    DescribeAddonConfigurationErrorModeled::ResourceNotFoundException(
+        state::addon_schema_not_found(addon_name, addon_version),
+    )
+    .into()
 }
 

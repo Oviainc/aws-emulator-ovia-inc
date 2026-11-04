@@ -13,7 +13,9 @@
 //!   nothing is created. Rows span which position the unknown id sits at, how many ids
 //!   are unknown, the id form (EC2's 8- and 17-hex forms), whether the subnet was
 //!   created by the client or is one of the account's default subnets, and both
-//!   operations that take subnets (`CreateCluster`, `CreateNodegroup`).
+//!   operations that take subnets (`CreateCluster`, `CreateNodegroup`). When more than
+//!   one id is unknown, the one reported is the LAST of them in the order the request
+//!   listed them (`eks_wrapped_peer_refusals` pins that half on its own).
 //! * THE CONNECTOR ROLE. A registration resolves `connectorConfig.roleArn` against IAM
 //!   and is refused `InvalidRequestException` (400), naming the role, unless IAM holds
 //!   that role and its trust policy lets the SSM service principal assume it. Rows span
@@ -196,10 +198,10 @@ fn eks_resolves_its_subnets_against_ec2_and_its_connector_role_against_iam() {
                     unresolved: Some(unknown_long.clone()),
                 },
                 SubnetCase {
-                    case: "two unknown ids: the first one is the one reported",
+                    case: "two unknown ids: the last one in list order is reported",
                     cluster: "unknown-both",
                     subnets: vec![unknown_long.clone(), unknown_short.clone()],
-                    unresolved: Some(unknown_long.clone()),
+                    unresolved: Some(unknown_short.clone()),
                 },
                 SubnetCase {
                     case: "an unknown id in EC2's short 8-hex form",

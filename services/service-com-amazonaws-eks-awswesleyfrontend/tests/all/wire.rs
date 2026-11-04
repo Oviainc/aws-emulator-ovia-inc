@@ -22,6 +22,19 @@ pub struct Answer {
 }
 
 impl Answer {
+    /// The error `message` an answer carries, whichever casing the envelope spells it
+    /// with. Empty on a success answer, which carries none.
+    ///
+    /// Here rather than in a suite, beside [`error_code`], so the suites that assert
+    /// refusal WORDING all read the member the same way.
+    pub fn message(&self) -> String {
+        self.body["message"]
+            .as_str()
+            .or_else(|| self.body["Message"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
     pub fn cluster(&self) -> &serde_json::Value {
         &self.body["cluster"]
     }

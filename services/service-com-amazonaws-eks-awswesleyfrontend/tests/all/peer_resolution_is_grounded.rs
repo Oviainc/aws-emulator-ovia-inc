@@ -37,7 +37,7 @@ use std::time::{Duration, SystemTime};
 use service_com_amazonaws_eks_awswesleyfrontend::state::service_state;
 
 use crate::cluster_lifecycle::{create, describe, REGION};
-use crate::wire::{call, emulator, emulator_with_engine, encode_label, Answer};
+use crate::wire::{call, emulator, emulator_with_engine, encode_label};
 
 /// A role ARN of the account this emulator serves — passable, so the pass-role
 /// authorization (which needs no peer, and is pinned by `pass_role_authorization`)
@@ -73,15 +73,6 @@ fn cluster_body(name: &str, subnets: &[String]) -> serde_json::Value {
     })
 }
 
-/// The `message` an answer carries, whichever casing the envelope spells it with.
-fn message(answer: &Answer) -> String {
-    answer.body["message"]
-        .as_str()
-        .or_else(|| answer.body["Message"].as_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
 // ---------------------------------------------------------------------------
 // RULE (the EC2 half): with no EC2 to ask, a `subnetIds` list nothing resolved
 // is served, and the cluster or node group it names is stored.
@@ -98,7 +89,7 @@ async fn subnets_no_ec2_was_asked_about_are_not_refused() {
             answer.status, 200,
             "case {subnets:?}: with no EC2 to ask, a subnet refusal has no grounds, got \
              {answer:?} ({})",
-            message(&answer)
+            answer.message()
         );
         let described = describe(&router, &name).await;
         assert_eq!(
@@ -146,7 +137,7 @@ async fn a_nodegroup_in_subnets_no_ec2_was_asked_about_is_not_refused() {
             answer.status, 200,
             "case {subnets:?}: with no EC2 to ask, a node group's subnets are not refused, \
              got {answer:?} ({})",
-            message(&answer)
+            answer.message()
         );
         let described = call(
             &router,
@@ -209,7 +200,7 @@ async fn a_connector_role_no_iam_was_asked_about_is_not_refused() {
             answer.status, 200,
             "case {role:?}: with no IAM to ask, a connector-role refusal has no grounds, got \
              {answer:?} ({})",
-            message(&answer)
+            answer.message()
         );
         let described = describe(&router, &name).await;
         assert_eq!(
@@ -284,7 +275,7 @@ async fn a_capability_role_no_iam_was_asked_about_is_not_refused() {
             answer.status, 200,
             "case {role:?}: with no IAM to ask, a capability-role refusal has no grounds, got \
              {answer:?} ({})",
-            message(&answer)
+            answer.message()
         );
         let described = call(
             &router,

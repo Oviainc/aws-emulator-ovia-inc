@@ -132,15 +132,6 @@ fn role_rows() -> Vec<(&'static str, String, Verdict)> {
     ]
 }
 
-/// The message an answer carries, whichever casing the envelope spells it with.
-fn message(answer: &Answer) -> String {
-    answer.body["message"]
-        .as_str()
-        .or_else(|| answer.body["Message"].as_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
 /// Assert one row's answer, and that the fixed cross-account sentence is reserved for
 /// the values that name no role of this account.
 fn assert_row(case: &str, role_arn: &str, verdict: Verdict, answer: &Answer) {
@@ -156,7 +147,7 @@ fn assert_row(case: &str, role_arn: &str, verdict: Verdict, answer: &Answer) {
         "case {case:?} ({role_arn}): expected error {:?}, got {answer:?}",
         verdict.error_type()
     );
-    let actual = message(answer);
+    let actual = answer.message();
     match verdict {
         Verdict::Passed => {}
         Verdict::CrossAccount => assert_eq!(
@@ -417,7 +408,7 @@ async fn register_cluster_refuses_every_connector_role_that_is_not_of_this_accou
                  {answer:?}"
             );
             assert_eq!(
-                message(&answer),
+                answer.message(),
                 CONNECTOR_ROLE_ARN_REFUSAL,
                 "case {case:?} ({role_arn}): expected the connector-role refusal, got \
                  {answer:?}"

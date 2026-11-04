@@ -370,15 +370,6 @@ async fn run(router: &MultiServiceRouter, probe: &Probe) -> Answer {
     call(router, REGION, probe.method, &probe.uri, &probe.body).await
 }
 
-/// The `message` an error envelope carries.
-fn message(answer: &Answer) -> String {
-    answer.body["message"]
-        .as_str()
-        .or_else(|| answer.body["Message"].as_str())
-        .unwrap_or_default()
-        .to_owned()
-}
-
 // ---------------------------------------------------------------------------
 // RULE: an operation whose subject is a resource of the Amazon EKS-managed plane
 // of a cluster does not apply to a cluster Amazon EKS does not manage (one
@@ -415,11 +406,11 @@ async fn every_eks_managed_plane_operation_refuses_a_connected_cluster() {
             error_code(&refused)
         );
         assert_eq!(
-            message(&refused),
+            refused.message(),
             CONNECTED_CLUSTER_REFUSAL_MESSAGE,
             "case {:?}: expected the connected-cluster refusal sentence, got {:?}",
             probe.case,
-            message(&refused)
+            refused.message()
         );
 
         // The refusal is PERMANENT and wrote nothing, so replaying the very same
@@ -427,8 +418,8 @@ async fn every_eks_managed_plane_operation_refuses_a_connected_cluster() {
         // first attempt left behind.
         let replayed = run(&router, &probe).await;
         assert_eq!(
-            (replayed.status, error_code(&replayed), message(&replayed)),
-            (refused.status, error_code(&refused), message(&refused)),
+            (replayed.status, error_code(&replayed), replayed.message()),
+            (refused.status, error_code(&refused), refused.message()),
             "case {:?}: a replayed refused call must answer identically, got {replayed:?}",
             probe.case
         );
@@ -497,7 +488,7 @@ async fn an_unknown_cluster_is_still_not_found_and_an_eks_cluster_is_never_gated
             probe.case
         );
         assert_ne!(
-            message(&answer),
+            answer.message(),
             CONNECTED_CLUSTER_REFUSAL_MESSAGE,
             "case {:?}: an Amazon EKS cluster must never carry the connected-cluster sentence, \
              got {answer:?}",
@@ -562,10 +553,10 @@ async fn an_include_token_set_outside_the_documented_one_is_refused() {
         // One refusal for every unacceptable set: the sentence names the parameter
         // and nothing the caller sent.
         assert_eq!(
-            message(&answer),
+            answer.message(),
             "One or more values in the 'include' parameter is not valid",
             "case include={value:?}: expected the fixed include refusal, got {:?}",
-            message(&answer)
+            answer.message()
         );
     }
 

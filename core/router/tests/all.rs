@@ -727,6 +727,12 @@ mod cloudformation_provisions_codepipeline_pipelines;
 mod eks_wire;
 #[path = "all/eks_cluster_security_group.rs"]
 mod eks_cluster_security_group;
+// Declared HERE, beside the sibling suite above in the same quiet `n`/`o` gap, for the
+// reason that entry records: the appended tail at the end of this file and the `e…` span
+// beside the other `eks_*` suites are both regions every concurrently landing router suite
+// puts its line in.
+#[path = "all/eks_wrapped_peer_refusals.rs"]
+mod eks_wrapped_peer_refusals;
 // Declared HERE, in this same quiet `n`/`o` gap rather than in the appended tail at the end
 // of this file or beside the sibling `logs_emf_*` suite in it: both of those are where every
 // concurrently landing router suite puts its line.

@@ -152,14 +152,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }))
         })?;
 
+        // The tag plane states a resource it did not resolve in ONE fixed sentence,
+        // shared with the read and the delete path
+        // ([`crate::state::tag_resource_not_found`]): it names nothing from the
+        // request.
         let not_found = || {
             TagResourceError::from(TagResourceErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(format!(
-                        "The resource {} could not be found",
-                        input.resource_arn
-                    )),
-                },
+                crate::state::tag_resource_not_found(),
             ))
         };
 

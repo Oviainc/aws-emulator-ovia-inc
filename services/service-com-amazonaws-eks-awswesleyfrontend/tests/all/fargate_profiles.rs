@@ -65,15 +65,6 @@ fn without_status(answer: &Answer) -> serde_json::Value {
     document
 }
 
-/// The `message` an answer carries, whichever casing the envelope spells it with.
-fn message(answer: &Answer) -> String {
-    answer.body["message"]
-        .as_str()
-        .or_else(|| answer.body["Message"].as_str())
-        .unwrap_or_default()
-        .to_owned()
-}
-
 fn cluster_request(name: &str) -> serde_json::Value {
     serde_json::json!({
         "name": name,
@@ -261,7 +252,7 @@ async fn a_created_fargate_profile_reads_back_as_it_was_written() {
         assert_eq!(
             created.status, 200,
             "case {case:?}: the profile must be created, got {created:?} ({})",
-            message(&created)
+            created.message()
         );
 
         let document = profile(&created);
@@ -487,7 +478,7 @@ async fn selectors_a_profile_cannot_declare_with_are_refused_and_nothing_is_writ
             "case {case:?}: the payload must name the profile at fault, got {answer:?}"
         );
         assert!(
-            !message(&answer).is_empty(),
+            !answer.message().is_empty(),
             "case {case:?}: the refusal must say what is wrong, got {answer:?}"
         );
 
@@ -515,7 +506,7 @@ async fn selectors_a_profile_cannot_declare_with_are_refused_and_nothing_is_writ
             answer.status, 200,
             "case {count} selectors: within the documented range the create is served, got \
              {answer:?} ({})",
-            message(&answer)
+            answer.message()
         );
     }
 }
@@ -547,7 +538,7 @@ async fn the_payload_is_judged_before_the_kind_of_cluster_it_names() {
                  facts, got {answer:?}"
             );
             assert_ne!(
-                message(&answer),
+                answer.message(),
                 CONNECTED_CLUSTER_REFUSAL_MESSAGE,
                 "case {case:?} on {cluster}: a bad payload must not be reported as the \
                  connected-cluster refusal, got {answer:?}"
@@ -565,10 +556,10 @@ async fn the_payload_is_judged_before_the_kind_of_cluster_it_names() {
          got {refused:?}"
     );
     assert_eq!(
-        message(&refused),
+        refused.message(),
         CONNECTED_CLUSTER_REFUSAL_MESSAGE,
         "expected the connected-cluster refusal sentence, got {:?}",
-        message(&refused)
+        refused.message()
     );
     // And the same payload on the cluster Amazon EKS manages is created.
     let created = create_profile(&router, managed, &minimal_request("fp-order-sound")).await;
@@ -632,9 +623,9 @@ async fn a_profile_name_is_unique_within_its_cluster() {
         "a second create under a name the cluster holds is refused, got {conflict:?}"
     );
     assert!(
-        message(&conflict).contains(name) && message(&conflict).contains(first),
+        conflict.message().contains(name) && conflict.message().contains(first),
         "the refusal must name the profile and the cluster, got {:?}",
-        message(&conflict)
+        conflict.message()
     );
 
     // The SAME name is a different profile in another cluster, and in another region.
@@ -717,7 +708,7 @@ async fn profiles_are_bounded_per_cluster_and_go_with_the_cluster() {
         assert_eq!(
             answer.status, 200,
             "profile {index} is within the quota, got {answer:?} ({})",
-            message(&answer)
+            answer.message()
         );
     }
     let past_quota = create_profile(&router, cluster, &minimal_request("fp-past-quota")).await;
@@ -761,6 +752,6 @@ async fn profiles_are_bounded_per_cluster_and_go_with_the_cluster() {
     assert_eq!(
         recreated.status, 200,
         "and the name is free again, got {recreated:?} ({})",
-        message(&recreated)
+        recreated.message()
     );
 }

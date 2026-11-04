@@ -28,7 +28,10 @@
 //! `InvalidParameterException`) and be one IAM holds whose trust policy lets the SSM
 //! service principal assume it
 //! ([`crate::state::service_principal_trust_violation`]) — a registration whose connector
-//! IAM wiring could not work is refused rather than stored.
+//! IAM wiring could not work is refused rather than stored. That refusal comes from the
+//! plane that manages external clusters, so it reaches the caller WRAPPED, with the
+//! service, the status and the call behind it named in the tail
+//! ([`crate::state::wrapped_peer_tail`]).
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -101,6 +104,10 @@ use crate::state::{
     CONNECTOR_SERVICE_PRINCIPAL, MAX_CLUSTERS, MAX_STORED_CLUSTERS, STATUS_PENDING,
 };
 use std::time::SystemTime;
+
+/// The status the wrapped tail of the connector-role refusal reports: the status of
+/// the refusal itself, which the model fixes at 400 for `InvalidRequestException`.
+const CONNECTOR_REFUSAL_STATUS: u16 = 400;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -256,9 +263,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `clusterName` is left UNSET, as the recorded refusal leaves it: no cluster
             // was registered, so there is none to name — the message names the role,
             // which is what the caller has to fix.
+            //
+            // The role was judged by the plane that manages EXTERNAL clusters, and a
+            // refusal this service carries through from another is reported WRAPPED:
+            // the sentence, then the service that answered, the status it answered and
+            // the call that was made ([`state::wrapped_peer_tail`]) — the same shape
+            // `CreateCluster` reports EC2's subnet refusal in.
             return Err(RegisterClusterErrorModeled::InvalidRequestException(
                 InvalidRequestException {
-                    message: Some(why),
+                    message: Some(format!(
+                        "{why}{}",
+                        state::wrapped_peer_tail(
+                            state::EXTERNAL_CLUSTER_MANAGER,
+                            CONNECTOR_REFUSAL_STATUS
+                        )
+                    )),
                     ..Default::default()
                 },
             )

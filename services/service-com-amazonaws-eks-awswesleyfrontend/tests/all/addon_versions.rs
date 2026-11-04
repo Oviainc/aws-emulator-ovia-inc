@@ -28,8 +28,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    self, ADDON_ANY_PLATFORM_VERSION, ADDON_OWNER_AWS, ADDON_OWNER_MARKETPLACE,
-    ADDON_PUBLISHER_EKS, CLUSTER_ACTIVATION_DELAY, RESOURCE_NOT_FOUND_MESSAGE,
+    self, addon_schema_not_found_message, ADDON_ANY_PLATFORM_VERSION, ADDON_OWNER_AWS,
+    ADDON_OWNER_MARKETPLACE, ADDON_PUBLISHER_EKS, CLUSTER_ACTIVATION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -899,9 +899,12 @@ async fn the_configuration_schema_matches_the_catalog_flag() {
         );
         assert_eq!(
             answer.body["message"].as_str(),
-            Some(RESOURCE_NOT_FOUND_MESSAGE),
-            "case {case}: expected the sentence this service states an unresolvable resource \
-             in, got {:?}",
+            Some(
+                addon_schema_not_found_message(addon_name, addon_version)
+                    .as_str()
+            ),
+            "case {case}: expected the sentence naming the pair whose schema was not \
+             found, got {:?}",
             answer.body["message"]
         );
     }

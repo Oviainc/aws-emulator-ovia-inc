@@ -130,6 +130,7 @@ use crate::ops::types::{
     KubernetesNetworkConfigResponse, LaunchTemplateSpecification, Logging, MarketplaceInformation,
     NodeRepairConfig,
     Nodegroup, NodegroupHealth, NodegroupScalingConfig, NodegroupUpdateConfig,
+    NotFoundException,
     OidcIdentityProviderConfig, OutpostConfigResponse, PodIdentityAssociation,
     PodIdentityAssociationSummary, RemoteAccessConfig, RemoteNetworkConfigResponse,
     ResourceInUseException, ResourceNotFoundException, StorageConfigResponse, Taint, Update,
@@ -1000,13 +1001,36 @@ pub fn child_resource_not_found(message: String) -> ResourceNotFoundException {
 ///
 /// `DescribeAddonConfiguration` resolves that pair as ONE published build ("The
 /// version must match one of the versions returned by `DescribeAddonVersions`"),
-/// so whichever half of it the catalog does not carry, the build the caller
-/// asked about does not exist — and this service states a resource it could not
-/// resolve in one sentence, [`RESOURCE_NOT_FOUND_MESSAGE`], naming neither half
-/// (see [`resource_not_found`], the same form the reads of a resource inside a
-/// cluster carry).
-pub fn addon_not_found() -> ResourceNotFoundException {
-    resource_not_found()
+/// and the pair is the WHOLE of what the caller can act on, so the refusal names
+/// it: the SCHEMA asked for is what was not found, and the two values are taken
+/// from the request's own query string. Whichever half the catalog does not carry,
+/// the sentence is the same — the operation does not tell the two apart.
+///
+/// It is this operation's own sentence rather than the service-wide
+/// [`RESOURCE_NOT_FOUND_MESSAGE`], which names no member at all: that one is what
+/// an operation reporting a resource INSIDE a cluster carries
+/// ([`resource_not_found`]), and the add-on catalog is neither.
+pub fn addon_schema_not_found_message(addon_name: &str, addon_version: &str) -> String {
+    format!(
+        "Schema not found for requested addonName=[{addon_name}] and \
+         addonVersion=[{addon_version}]"
+    )
+}
+
+/// The `ResourceNotFoundException` payload `DescribeAddonConfiguration` answers a
+/// pair the catalog publishes no build of with.
+///
+/// NO identity member is set — see [`cluster_not_found`] for the rule: the
+/// exception's `addonName` names an add-on the service RESOLVED, and this refusal
+/// resolved none, so the pair is stated in the message and nowhere else.
+pub fn addon_schema_not_found(
+    addon_name: &str,
+    addon_version: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(addon_schema_not_found_message(addon_name, addon_version)),
+        ..Default::default()
+    }
 }
 
 /// The sentence an operation addressed to ONE EKS Anywhere subscription refuses an
@@ -1132,6 +1156,28 @@ pub fn is_eks_resource_arn(value: &str) -> bool {
 pub fn invalid_resource_arn() -> BadRequestException {
     BadRequestException {
         message: Some(INVALID_RESOURCE_ARN_MESSAGE.to_string()),
+    }
+}
+
+/// The sentence the tag plane refuses a well-formed resource ARN that no stored
+/// resource owns with.
+///
+/// `NotFoundException` is "a service resource associated with the request could not
+/// be found", and that is the whole of what the tag plane states: the sentence is
+/// FIXED and names nothing from the request. The ARN the caller sent is the caller's
+/// own, so echoing it back adds no diagnostic, and the tag plane discloses nothing
+/// about a resource it did not resolve — not even that the value it was handed is
+/// the one it looked for.
+pub const TAG_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The `NotFoundException` payload every tag operation answers such an ARN with,
+/// shared by the three of them (`ListTagsForResource`, `TagResource`,
+/// `UntagResource`) so the read, the write and the delete path cannot word the same
+/// miss differently.
+#[must_use]
+pub fn tag_resource_not_found() -> NotFoundException {
+    NotFoundException {
+        message: Some(TAG_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
     }
 }
 
@@ -8793,6 +8839,44 @@ fn trust_policy_refusal(role_arn: &str, principal: &str) -> String {
     format!("Nonexistent role or missing {service} service principal in trust policy: {role_arn}")
 }
 
+/// The internal service that answers for a cluster REGISTRATION.
+///
+/// `RegisterCluster` connects a cluster that runs outside Amazon Web Services, and
+/// the plane that manages those external clusters is what judges the connector
+/// role: a refusal it answered reaches the caller WRAPPED, naming the service
+/// behind it ([`wrapped_peer_tail`]).
+pub const EXTERNAL_CLUSTER_MANAGER: &str = "EksExternalClusterManager";
+
+/// How many attempts the tail of a wrapped refusal reports.
+///
+/// The clients this service calls another with are built with retries disabled
+/// (`callback_client!`), so the call behind a wrapped refusal was attempted exactly
+/// once; the count is a fact about that call rather than a value to pick.
+const PEER_SDK_ATTEMPT_COUNT: u32 = 1;
+
+/// The tail AWS appends to a message it carries through from an inner `service`:
+/// the service that answered, the status it answered with, the id of that call, and
+/// how many attempts were made to reach it.
+///
+/// A caller (or its tooling) correlates the refusal with the call behind it by this
+/// tail, so it is part of the message rather than an addition to it. The request id
+/// is drawn afresh per call ([`new_peer_request_id`]) because that is what a request
+/// id IS; nothing in the request decides it.
+///
+/// NOT the only wrapped form: a refusal carried through from EC2 comes back in that
+/// service's own older shape — semicolon-separated, with its error code and proxy,
+/// and no attempt count — which [`describe_subnets_once`] composes where it reads the
+/// answer. The two are what the respective recordings show, so neither may be routed
+/// through the other.
+#[must_use]
+pub fn wrapped_peer_tail(service: &str, status: u16) -> String {
+    format!(
+        " (Service: {service}, Status Code: {status}, Request ID: {}) \
+         (SDK Attempt Count: {PEER_SDK_ATTEMPT_COUNT})",
+        new_peer_request_id()
+    )
+}
+
 /// Whether an IAM `GetRole` failure is IAM reporting that the role does not
 /// exist (`NoSuchEntity`), as opposed to the call not reaching IAM.
 fn iam_role_is_absent(
@@ -8829,9 +8913,10 @@ pub async fn unresolved_subnet_refusal(
 
 /// What EC2 answered about the subnets a request names.
 ///
-/// One `DescribeSubnets` answers both of the questions a create asks about them:
-/// whether every id resolves, and — because Amazon EKS provisions the cluster's
-/// own EC2 resources in the network those subnets sit in — which VPC that is.
+/// One `DescribeSubnets` over the whole list answers both of the questions a create
+/// asks about them: whether every id resolves, and — because Amazon EKS provisions
+/// the cluster's own EC2 resources in the network those subnets sit in — which VPC
+/// that is.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedSubnets {
     /// Why the list does not resolve, in the wrapped form Amazon EKS reports a
@@ -8843,15 +8928,40 @@ pub struct ResolvedSubnets {
     pub vpc_id: Option<String>,
 }
 
+/// How many of a request's subnet ids this service resolves INDIVIDUALLY when the
+/// read over the whole list is refused — the cap on the narrowing walk below.
+///
+/// The subnets one Amazon EKS resource is placed in all sit in a single VPC
+/// ([`resolve_subnets`] reports a VPC only when the ids agree on one), and Amazon VPC
+/// publishes 200 subnets per VPC ("Amazon VPC quotas", *Subnets per VPC*), so a list
+/// naming more distinct ids than this names more subnets than one VPC can hold. The
+/// walk therefore does bounded work whatever length of list a request carries, and a
+/// list past the cap is answered with what EC2 said about the list as a whole.
+const MAX_SUBNETS_RESOLVED_INDIVIDUALLY: usize = 200;
+
 /// Resolve `subnet_ids` against EC2: the one reading of a request's subnets, which
 /// [`unresolved_subnet_refusal`] is the refusal half of.
+///
+/// WHICH id a refusal names: a list can carry more than one id the account holds no
+/// subnet for, and the one reported is the LAST of them in the order the request
+/// listed them. One `DescribeSubnets` over the whole list names only one of them, so
+/// when that read is refused the ids are resolved ON THEIR OWN, walking the request's
+/// list from the end backwards, and the first id EC2 refuses is the one carried
+/// through — that id is the last unresolvable member of the list, and the sentence
+/// naming it is still EC2's own.
+///
+/// That walk is BOUNDED where it grows, not by the size of the request: a repeated id
+/// is the same question and is asked once, at most
+/// [`MAX_SUBNETS_RESOLVED_INDIVIDUALLY`] distinct ids are asked about at all, the walk
+/// stops at the first refusal (so the ordinary case costs one more read), and every
+/// read goes to the one client built here rather than one client per id. A list that
+/// reaches the cap without a refusal is answered with EC2's own answer to the whole
+/// list.
 pub async fn resolve_subnets(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     subnet_ids: &[String],
 ) -> ResolvedSubnets {
-    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
-
     if subnet_ids.is_empty() {
         return ResolvedSubnets::default();
     }
@@ -8860,7 +8970,75 @@ pub async fn resolve_subnets(
     let Some(endpoint) = peer_endpoint("ec2", region) else {
         return ResolvedSubnets::default();
     };
-    let answer = callback_client!(aws_sdk_ec2, ctx, endpoint, region)
+    let ec2 = callback_client!(aws_sdk_ec2, ctx, endpoint, region);
+    match describe_subnets_once(&ec2, subnet_ids).await {
+        SubnetAnswer::Resolved(vpc_id) => ResolvedSubnets {
+            refusal: None,
+            vpc_id,
+        },
+        SubnetAnswer::Unanswered => ResolvedSubnets::default(),
+        SubnetAnswer::NotFound(whole_list) => {
+            // A one-id list has only one id EC2 could have been complaining about,
+            // so the answer already names it.
+            if subnet_ids.len() == 1 {
+                return ResolvedSubnets {
+                    refusal: Some(whole_list),
+                    vpc_id: None,
+                };
+            }
+            // The two halves of the bound this walk is held to: an id already asked
+            // about is not asked again (it has the same answer), and the number of
+            // ids asked about at all is capped. Both are counted HERE, at the loop
+            // that does the work, so the length of the list a caller sends is never
+            // what decides how many reads happen.
+            let mut asked: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+            for subnet_id in subnet_ids.iter().rev() {
+                if !asked.insert(subnet_id.as_str()) {
+                    continue;
+                }
+                if asked.len() > MAX_SUBNETS_RESOLVED_INDIVIDUALLY {
+                    break;
+                }
+                if let SubnetAnswer::NotFound(one) =
+                    describe_subnets_once(&ec2, ::std::slice::from_ref(subnet_id)).await
+                {
+                    return ResolvedSubnets {
+                        refusal: Some(one),
+                        vpc_id: None,
+                    };
+                }
+            }
+            // Every id the walk reached resolved on its own, so either the list as a
+            // whole was refused for something other than a missing id, or it is
+            // longer than the walk resolves: EC2's own answer to the list is what the
+            // caller is told.
+            ResolvedSubnets {
+                refusal: Some(whole_list),
+                vpc_id: None,
+            }
+        }
+    }
+}
+
+/// What ONE `DescribeSubnets` answered.
+enum SubnetAnswer {
+    /// Every id it named resolved, and the VPC the reported subnets agree on —
+    /// `None` when they do not agree on one.
+    Resolved(Option<String>),
+    /// EC2 refused the read because an id it named carries no subnet of the
+    /// account, in the wrapped form this service reports an inner service's
+    /// failure in.
+    NotFound(String),
+    /// Nothing EC2 reported that a refusal may be grounded in — including this
+    /// emulator failing to ask it at all.
+    Unanswered,
+}
+
+/// Ask `ec2` about exactly the ids in `subnet_ids`.
+async fn describe_subnets_once(ec2: &::aws_sdk_ec2::Client, subnet_ids: &[String]) -> SubnetAnswer {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    let answer = ec2
         .describe_subnets()
         .set_subnet_ids(Some(subnet_ids.to_vec()))
         .send()
@@ -8877,10 +9055,7 @@ pub async fn resolve_subnets(
                 .filter_map(::aws_sdk_ec2::types::Subnet::vpc_id);
             let first = reported.next().map(str::to_string);
             let vpc_id = first.filter(|vpc_id| reported.all(|other| other == vpc_id.as_str()));
-            return ResolvedSubnets {
-                refusal: None,
-                vpc_id,
-            };
+            return SubnetAnswer::Resolved(vpc_id);
         }
         Err(error) => error,
     };
@@ -8894,7 +9069,7 @@ pub async fn resolve_subnets(
             error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
             "the requested subnets could not be resolved against EC2"
         );
-        return ResolvedSubnets::default();
+        return SubnetAnswer::Unanswered;
     }
     let status = error
         .raw_response()
@@ -8914,15 +9089,14 @@ pub async fn resolve_subnets(
     // the status and the error code it answered, the id of the call that was made
     // and the proxy it went through — there is none, so that field is `null`. The
     // tail is what a caller (or its tooling) correlates this refusal with the call
-    // behind it by, so it is part of the message rather than an addition to it.
+    // behind it by, so it is part of the message rather than an addition to it. It is
+    // EC2's own older shape, which is why it is composed here rather than through
+    // [`wrapped_peer_tail`] (see that function's note).
     let request_id = new_peer_request_id();
-    ResolvedSubnets {
-        refusal: Some(format!(
-            "{detail} (Service: AmazonEC2; {status}Error Code: {code}; \
-             Request ID: {request_id}; Proxy: null)"
-        )),
-        vpc_id: None,
-    }
+    SubnetAnswer::NotFound(format!(
+        "{detail} (Service: AmazonEC2; {status}Error Code: {code}; \
+         Request ID: {request_id}; Proxy: null)"
+    ))
 }
 
 // ---------------------------------------------------------------------------
