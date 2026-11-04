@@ -219,9 +219,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            canonical_name, is_parameters_by_path_filter_key, is_under_path, name_rejection,
-            parameter_path, parameters_by_path_filter_options, parameters_by_path_page_size,
-            request_region, FILTER_KEY_TYPE, FILTER_OPTION_EQUALS, INVALID_NEXT_TOKEN,
+            canonical_name, invalid_filter_key_message, invalid_filter_option_message,
+            is_parameters_by_path_filter_key, is_under_path, name_rejection, parameter_path,
+            parameters_by_path_filter_options, parameters_by_path_page_size, request_region,
+            FILTER_KEY_TYPE, FILTER_OPTION_EQUALS, INVALID_NEXT_TOKEN,
+            PARAMETERS_BY_PATH_FILTER_KEYS,
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -243,10 +245,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let filters = input.parameter_filters.as_deref().unwrap_or_default();
         for filter in filters {
             if !is_parameters_by_path_filter_key(&filter.key) {
-                // The shape declares no members, so the refusal carries no message.
-                return Err(
-                    GetParametersByPathErrorModeled::InvalidFilterKey(InvalidFilterKey {}).into(),
-                );
+                // The modelled shape declares no members, yet the service words this
+                // refusal: it names the rejected key and the keys a hierarchy read
+                // accepts, which are fewer than a describe's.
+                return Err(crate::scaffolded::Scaffolded::invalid_filter_key(
+                    invalid_filter_key_message(&filter.key, PARAMETERS_BY_PATH_FILTER_KEYS),
+                ));
             }
             // "Valid options include Equals and BeginsWith" — and a filter naming none
             // compares whole values.
@@ -255,11 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !allowed.contains(&option) {
                 return Err(GetParametersByPathErrorModeled::InvalidFilterOption(
                     InvalidFilterOption {
-                        message: Some(format!(
-                            "Option '{option}' at filter key '{}' isn't valid: valid options are {}",
-                            filter.key,
-                            allowed.join(" and ")
-                        )),
+                        message: Some(invalid_filter_option_message(option, allowed)),
                     },
                 )
                 .into());

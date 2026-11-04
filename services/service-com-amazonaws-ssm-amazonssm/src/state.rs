@@ -159,6 +159,14 @@ pub const ARN_PREFIX: &str = "arn:";
 /// (`crate::ops::types::PARAMETER_TYPE_VALUES`).
 pub const TYPE_SECURE_STRING: &str = "SecureString";
 
+/// See [`TYPE_SECURE_STRING`]. A value of this type is a list: "Items in a StringList
+/// must be separated by a comma (,)" (`PutParameter`'s `Type` doc).
+pub const TYPE_STRING_LIST: &str = "StringList";
+
+/// The separator between the items of a [`TYPE_STRING_LIST`] value (same doc: "You
+/// can't use other punctuation or special character to escape items in the list").
+pub const STRING_LIST_SEPARATOR: char = ',';
+
 /// `ParameterTier` values, from the modelled enum
 /// (`crate::ops::types::PARAMETER_TIER_VALUES`).
 pub const TIER_STANDARD: &str = "Standard";
@@ -476,6 +484,158 @@ pub fn resolve_tier(
     }
 }
 
+// ---------------------------------------------------------------------------
+// The sentences Parameter Store words its parameter refusals with
+// ---------------------------------------------------------------------------
+
+/// The page a tier refusal points the caller at, as Parameter Store words those
+/// refusals.
+const ADVANCED_PARAMETERS_GUIDE: &str =
+    "https://docs.aws.amazon.com/systems-manager/latest/userguide/parameter-store-advanced-parameters.html";
+
+/// What a put against an existing name without `Overwrite` is refused with.
+///
+/// The sentence is wholly fixed and names no parameter: it tells the caller which
+/// REQUEST MEMBER to set, which is the whole of what it has to say ("The parameter
+/// already exists. You can't create duplicate parameters", `ParameterAlreadyExists`).
+pub const PARAMETER_ALREADY_EXISTS_MESSAGE: &str = "The parameter already exists. To \
+     overwrite this value, set the overwrite option in the request to true.";
+
+/// What a value that does not satisfy the request's `AllowedPattern` is refused with.
+///
+/// The rejected pattern is the request's own, so the caller can see which constraint
+/// its value failed; the value itself is never echoed, because a `SecureString`'s is
+/// secret.
+pub fn allowed_pattern_mismatch_message(pattern: &str) -> String {
+    format!("Parameter value, cannot be validated against allowedPattern: {pattern}")
+}
+
+/// The name a refusal quotes a parameter back by.
+///
+/// A top-level parameter's name carries no leading separator — that is the whole of its
+/// name, which is why `MyParameter` and `/MyParameter` are the one parameter
+/// ([`canonical_name`]) — while a hierarchical name is its whole path, separator and
+/// all: "For parameters in a hierarchy, you must include a leading forward slash
+/// character (/)" (`PutParameter`'s `Name` doc), so the separator is part of that name.
+pub fn reported_name(name: &str) -> &str {
+    let path = canonical_name(name);
+    if path.contains('/') {
+        name
+    } else {
+        path
+    }
+}
+
+/// What a read whose `name:version` selector names a version the parameter does not
+/// carry is refused with.
+///
+/// `name` is quoted back as [`reported_name`] renders it, and the version is the one the
+/// request asked for.
+pub fn version_not_found_message(name: &str, version: i64) -> String {
+    format!(
+        "Systems Manager could not find version {version} of {}. Verify the version and \
+         try again.",
+        reported_name(name)
+    )
+}
+
+/// What a read whose `name:label` selector names a label no version of the parameter
+/// carries is refused with (the label form of [`version_not_found_message`]).
+pub fn version_label_not_found_message(name: &str, label: &str) -> String {
+    format!(
+        "Systems Manager could not find a version of {} that has the specified label, \
+         {label}. Verify the parameter label and try again.",
+        reported_name(name)
+    )
+}
+
+/// What a `name:selector` read that resolves to no version is refused with: the
+/// version form for a selector that names a version number, the label form otherwise.
+///
+/// A selector is "either the version number or the label used to retrieve the parameter
+/// value" (`Parameter$Selector`), which is the same split [`ParameterRecord::select`]
+/// resolves by — so the sentence names whichever of the two the caller actually asked
+/// for.
+pub fn selector_not_found_message(name: &str, selector: &str) -> String {
+    match selector.parse::<i64>() {
+        Ok(version) => version_not_found_message(name, version),
+        Err(_) => version_label_not_found_message(name, selector),
+    }
+}
+
+/// What a mutation of a name the store holds no parameter for is refused with, where
+/// the service words the refusal at all.
+///
+/// The name is the one the request carried: a caller that passed a hierarchy path reads
+/// it back as it wrote it. (A READ of a missing parameter carries no message at all —
+/// see `GetParameter` — so this is not every `ParameterNotFound`.)
+pub fn parameter_not_found_message(name: &str) -> String {
+    format!("Parameter {name} not found.")
+}
+
+/// What an overwrite that would have to displace a LABELLED oldest version is refused
+/// with.
+///
+/// `oldest` is the version number the store holds as the oldest right now, so the
+/// sentence names the version whose label the caller must move; it is recomputed on
+/// every refusal rather than remembered. The modelled error carries this sentence in
+/// its own documentation (`ParameterMaxVersionLimitExceeded`).
+///
+/// This refusal names the parameter by its hierarchy path with the leading separator
+/// dropped, whichever depth the name has — not by [`reported_name`], which the version
+/// refusals use: the two are worded by different parts of the service and each keeps
+/// its own rendering.
+pub fn max_version_limit_message(name: &str, oldest: i64) -> String {
+    format!(
+        "You attempted to create a new version of {} by calling the PutParameter API with \
+         the overwrite flag. Version {oldest}, the oldest version, can\u{2019}t be deleted \
+         because it has a label associated with it. Move the label to another version of \
+         the parameter, and try again.",
+        canonical_name(name)
+    )
+}
+
+/// What a call that would put more than [`MAX_LABELS_PER_VERSION`] labels on one
+/// version is refused with: fixed text carrying the quota.
+pub fn label_limit_message() -> String {
+    format!(
+        "A parameter version can have maximum {MAX_LABELS_PER_VERSION} labels.Move one or \
+         more labels to another version and try again."
+    )
+}
+
+/// What a value larger than `tier`'s content size limit is refused with.
+///
+/// The standard tier's ceiling is one an upgrade lifts, so its refusal says so and
+/// points at the tier guide; the advanced tier's is the service's own ceiling, with no
+/// higher tier to name.
+pub fn value_limit_message(tier: &str) -> String {
+    let limit = value_limit(tier);
+    if tier == TIER_ADVANCED {
+        format!(
+            "{TIER_ADVANCED} tier parameters support a maximum parameter value of {limit} \
+             characters."
+        )
+    } else {
+        format!(
+            "{TIER_STANDARD} tier parameters support a maximum parameter value of {limit} \
+             characters. To create a larger parameter value, upgrade the parameter to use the \
+             advanced-parameter tier. For more information, see {ADVANCED_PARAMETERS_GUIDE}"
+        )
+    }
+}
+
+/// What a `Policies` document on a parameter that is not advanced is refused with:
+/// "Standard parameters ... can't be configured to use parameter policies"
+/// (`PutParameter`'s `Tier` doc), worded as the service words it.
+pub fn policies_require_advanced_message() -> String {
+    format!(
+        "You can't assign parameter policies to a standard-parameter tier. You must upgrade \
+         the parameter to use the advanced-parameter tier. For more information, see \
+         {ADVANCED_PARAMETERS_GUIDE}"
+    )
+}
+
 /// One stored version of one parameter: the value a put persisted, and everything the
 /// service recorded alongside it.
 #[derive(Debug, Clone)]
@@ -730,6 +890,9 @@ pub fn parameter_arn(region: &str, name: &str) -> String {
 pub struct ParameterQuery<'a> {
     /// The canonical name (no leading `/`) to look the parameter up by.
     pub name: &'a str,
+    /// The name AS THE REQUEST WROTE IT, selector stripped: a parameter is reached by
+    /// its canonical name, but a refusal quotes back the name the caller asked for.
+    pub path: &'a str,
     /// The `name:selector` suffix the request carried, without the colon, or `None`
     /// when it named none.
     pub selector: Option<&'a str>,
@@ -772,6 +935,7 @@ pub fn parse_parameter_query(name: &str) -> Option<ParameterQuery<'_>> {
     };
     Some(ParameterQuery {
         name: canonical_name(path),
+        path,
         selector,
         region,
         account,
@@ -1234,6 +1398,33 @@ pub fn string_filter_matches(held: &[&str], option: &str, wanted: &[String]) -> 
 }
 
 // ---------------------------------------------------------------------------
+// The sentences a filter refusal is worded with
+// ---------------------------------------------------------------------------
+
+/// What a `ParameterFilters` entry naming a key the operation does not accept is
+/// refused with.
+///
+/// `valid` is the accepting operation's OWN key vocabulary, so the caller is told what
+/// it may ask for here rather than what Parameter Store accepts somewhere else — the
+/// two operations that take these filters accept different keys
+/// ([`DESCRIBE_PARAMETERS_FILTER_KEYS`], [`PARAMETERS_BY_PATH_FILTER_KEYS`]).
+pub fn invalid_filter_key_message(key: &str, valid: &[&str]) -> String {
+    format!(
+        "The following filter key is not valid: {key}. Valid filter keys include: [{}].",
+        valid.join(", ")
+    )
+}
+
+/// What a `ParameterFilters` entry naming an option its key does not accept is refused
+/// with, where `valid` is the option vocabulary of THAT key.
+pub fn invalid_filter_option_message(option: &str, valid: &[&str]) -> String {
+    format!(
+        "The following filter option is not valid: {option}. Valid options include: [{}].",
+        valid.join(", ")
+    )
+}
+
+// ---------------------------------------------------------------------------
 // The filters a parameter describe accepts
 // ---------------------------------------------------------------------------
 
@@ -1264,12 +1455,13 @@ pub const FILTER_OPTION_ONE_LEVEL: &str = "OneLevel";
 /// The modelled key pattern is `^(tag:.+|Name|Type|KeyId|Path|Label|Tier|DataType)$`,
 /// and "for `DescribeParameters`, all of the listed patterns are valid except `Label`"
 /// (the `ParameterStringFilter$Key` doc) — which leaves these five plus the tag form
-/// ([`TAG_FILTER_KEY_PREFIX`]).
+/// ([`TAG_FILTER_KEY_PREFIX`]). They are held in the order the service LISTS them in
+/// when it refuses a key outside the set ([`invalid_filter_key_message`]).
 pub const DESCRIBE_PARAMETERS_FILTER_KEYS: &[&str] = &[
+    FILTER_KEY_PATH,
     FILTER_KEY_NAME,
     FILTER_KEY_TYPE,
     FILTER_KEY_KEY_ID,
-    FILTER_KEY_PATH,
     FILTER_KEY_TIER,
     FILTER_KEY_DATA_TYPE,
 ];

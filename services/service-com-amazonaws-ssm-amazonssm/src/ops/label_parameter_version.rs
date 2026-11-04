@@ -201,13 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = crate::state::trimmed_name(&input.name)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
-        // `ParameterNotFound` carries NO message: its `message` member is optional and
-        // Parameter Store words none for a name it holds no parameter for, so the error
-        // code is the whole of what this refusal says (as in `GetParameter` and
-        // `DeleteParameter`).
+        // Parameter Store words this refusal for a LABEL call: the caller is told which
+        // name it asked to label and that no parameter answers to it. (A READ of a
+        // missing parameter carries no message at all — `GetParameter` and
+        // `DeleteParameter` answer the code alone — so the sentence belongs here rather
+        // than to every `ParameterNotFound`.)
         let not_found = || {
             LabelParameterVersionErrorModeled::ParameterNotFound(ParameterNotFound {
-                message: None,
+                message: Some(crate::state::parameter_not_found_message(name)),
             })
         };
 
@@ -262,10 +263,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(target) = target else {
             return Err(LabelParameterVersionErrorModeled::ParameterVersionNotFound(
                 ParameterVersionNotFound {
-                    message: Some(format!(
-                        "Parameter {} has no version {}",
-                        record.name,
-                        input.parameter_version.unwrap_or_default()
+                    message: Some(crate::state::version_not_found_message(
+                        name,
+                        input.parameter_version.unwrap_or_default(),
                     )),
                 },
             )
@@ -288,12 +288,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if held.len() + arriving > crate::state::MAX_LABELS_PER_VERSION {
             return Err(
                 LabelParameterVersionErrorModeled::ParameterVersionLabelLimitExceeded(
-                    // The wording the modelled error itself carries: "A parameter version
-                    // can have a maximum of ten labels."
+                    // Fixed text carrying the quota, and the instruction for getting
+                    // under it: the labels already on the version are the caller's own,
+                    // so the refusal names none of them.
                     ParameterVersionLabelLimitExceeded {
-                        message: Some(
-                            "A parameter version can have a maximum of ten labels.".to_string(),
-                        ),
+                        message: Some(crate::state::label_limit_message()),
                     },
                 )
                 .into(),

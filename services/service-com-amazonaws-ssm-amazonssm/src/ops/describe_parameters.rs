@@ -211,9 +211,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             canonical_name, describe_filter_enum_values, describe_parameter_matches,
             describe_parameters_default_filter_option, describe_parameters_filter_options,
-            describe_parameters_page_size, is_describe_parameters_filter_key, name_rejection,
-            parameter_path, request_region, FILTER_KEY_PATH, FILTER_OPTION_EQUALS,
-            INVALID_NEXT_TOKEN, LEGACY_PARAMETERS_FILTER_KEYS, MAX_DESCRIBE_PARAMETERS_FILTERS,
+            describe_parameters_page_size, invalid_filter_key_message,
+            invalid_filter_option_message, is_describe_parameters_filter_key, name_rejection,
+            parameter_path, request_region, DESCRIBE_PARAMETERS_FILTER_KEYS, FILTER_KEY_PATH,
+            FILTER_OPTION_EQUALS, INVALID_NEXT_TOKEN, LEGACY_PARAMETERS_FILTER_KEYS,
+            MAX_DESCRIBE_PARAMETERS_FILTERS,
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -239,10 +241,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already refused anything outside those — these two arms are backstops.
         for filter in input.filters.as_deref().unwrap_or_default() {
             if !LEGACY_PARAMETERS_FILTER_KEYS.contains(&filter.key.as_str()) {
-                // The shape declares no members, so the refusal carries no message.
-                return Err(
-                    DescribeParametersErrorModeled::InvalidFilterKey(InvalidFilterKey {}).into(),
-                );
+                // The modelled shape declares no members, yet the service words this
+                // refusal: it names the rejected key and the keys this member accepts.
+                return Err(crate::scaffolded::Scaffolded::invalid_filter_key(
+                    invalid_filter_key_message(&filter.key, LEGACY_PARAMETERS_FILTER_KEYS),
+                ));
             }
             if filter.values.is_empty() {
                 return Err(invalid_filter_value(format!(
@@ -259,9 +262,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         for filter in input.parameter_filters.as_deref().unwrap_or_default() {
             if !is_describe_parameters_filter_key(&filter.key) {
-                return Err(
-                    DescribeParametersErrorModeled::InvalidFilterKey(InvalidFilterKey {}).into(),
-                );
+                return Err(crate::scaffolded::Scaffolded::invalid_filter_key(
+                    invalid_filter_key_message(&filter.key, DESCRIBE_PARAMETERS_FILTER_KEYS),
+                ));
             }
             let option = filter
                 .option
@@ -271,11 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !allowed.contains(&option) {
                 return Err(DescribeParametersErrorModeled::InvalidFilterOption(
                     InvalidFilterOption {
-                        message: Some(format!(
-                            "Option '{option}' at filter key '{}' isn't valid: valid options are {}",
-                            filter.key,
-                            allowed.join(" and ")
-                        )),
+                        message: Some(invalid_filter_option_message(option, allowed)),
                     },
                 )
                 .into());

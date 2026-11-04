@@ -41,6 +41,8 @@ mod parameter_labels;
 mod parameter_metadata;
 #[path = "all/parameter_not_found_payload.rs"]
 mod parameter_not_found_payload;
+#[path = "all/parameter_refusal_messages.rs"]
+mod parameter_refusal_messages;
 #[path = "all/parameter_store.rs"]
 mod parameter_store;
 #[path = "all/parameters_batch.rs"]

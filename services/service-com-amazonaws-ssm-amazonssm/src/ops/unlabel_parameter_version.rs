@@ -216,14 +216,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.parameter_mut(&region, query.name) else {
             return Err(not_found().into());
         };
-        let parameter_name = record.name.clone();
         let Some(version) = record.version_mut(input.parameter_version) else {
             return Err(
                 UnlabelParameterVersionErrorModeled::ParameterVersionNotFound(
                     ParameterVersionNotFound {
-                        message: Some(format!(
-                            "Parameter {parameter_name} has no version {}",
-                            input.parameter_version
+                        message: Some(crate::state::version_not_found_message(
+                            name,
+                            input.parameter_version,
                         )),
                     },
                 )

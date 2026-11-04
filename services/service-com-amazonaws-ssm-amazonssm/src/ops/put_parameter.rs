@@ -268,9 +268,9 @@ struct Existing {
     tier: Option<String>,
     /// How many versions are retained right now.
     retained: usize,
-    /// Whether the oldest retained version carries a label, which stops it from being
-    /// displaced.
-    oldest_labelled: bool,
+    /// The oldest retained version's number when that version carries a label, which
+    /// stops it from being displaced — and is the version the refusal names.
+    labelled_oldest: Option<i64>,
 }
 
 /// How large an `AllowedPattern` may compile to, in bytes of compiled program, and how
@@ -280,8 +280,8 @@ struct Existing {
 /// builds and the cache it matches through are bounded explicitly rather than left to
 /// the crate's defaults — a cache that cannot be thrashed into the slower engine. A
 /// pattern past the first is refused as one this service cannot evaluate. The haystack
-/// is bounded too: `PutParameter` refuses a `Value` larger than the biggest content
-/// size any tier allows before this runs, so neither factor of the matching cost is
+/// is bounded too: `PutParameter` refuses a `Value` larger than the content size limit
+/// of the tier it resolved before this runs, so neither factor of the matching cost is
 /// caller-unbounded.
 const COMPILED_PATTERN_LIMIT: usize = 64 * 1024;
 
@@ -373,33 +373,69 @@ fn policy_count(policies: Option<&str>) -> Result<usize, PolicyRejection> {
     Ok(entries.len())
 }
 
+/// Why a value is not one the request's `AllowedPattern` accepts, named by the modelled
+/// error that reports it.
+///
+/// The two mean opposite things, so they are never reported interchangeably: one says
+/// the caller's VALUE is wrong, the other that the caller's PATTERN is.
+#[derive(Debug)]
+enum PatternRejection {
+    /// The supplied `AllowedPattern` is not a regular expression at all:
+    /// `InvalidAllowedPatternException` ("The request doesn't meet the regular
+    /// expression requirement").
+    Pattern(String),
+    /// The value does not satisfy a well-formed `AllowedPattern`:
+    /// `ParameterPatternMismatchException`.
+    Value(String),
+}
+
 /// Why `value` does not satisfy `pattern`, or `None` when it does (or when the request
 /// named no pattern).
 ///
 /// `AllowedPattern` is "a regular expression used to validate the parameter value", so
 /// the value is matched against it in full — the whole value, not a substring, the way
-/// a regular-expression constraint on a member reads. The expression comes from the
-/// request, so it is evaluated by the `regex` crate, whose matching is linear in the
-/// input and has no backtracking blowup, under that crate's own compiled-size limit;
-/// the modelled `AllowedPattern` length (0..1024) bounds what is compiled.
-fn allowed_pattern_rejection(pattern: Option<&str>, value: &str) -> Option<String> {
+/// a regular-expression constraint on a member reads. A `StringList`'s value is not one
+/// value but a list ("Items in a StringList must be separated by a comma (,)"), so the
+/// constraint holds of each ITEM of it rather than of the comma-joined whole; every
+/// other type, `SecureString` included, is matched as the one value it is — and a
+/// `SecureString` is matched on the plaintext the request carried, before it is sealed.
+///
+/// The expression comes from the request, so it is evaluated by the `regex` crate, whose
+/// matching is linear in the input and has no backtracking blowup, under that crate's
+/// own compiled-size limit; the modelled `AllowedPattern` length (0..1024) bounds what
+/// is compiled.
+fn allowed_pattern_rejection(
+    pattern: Option<&str>,
+    type_: &str,
+    value: &str,
+) -> Option<PatternRejection> {
     let pattern = pattern.filter(|pattern| !pattern.is_empty())?;
     let anchored = format!("^(?:{pattern})$");
     // An explicit compiled-size budget, so a pattern inside the modelled 1024-character
     // `AllowedPattern` length still cannot compile into an arbitrarily large automaton.
-    match ::regex::RegexBuilder::new(&anchored)
+    let expression = match ::regex::RegexBuilder::new(&anchored)
         .size_limit(COMPILED_PATTERN_LIMIT)
         .dfa_size_limit(PATTERN_DFA_LIMIT)
         .build()
     {
-        Err(why) => Some(format!(
-            "AllowedPattern '{pattern}' is not a regular expression this service can \
-             evaluate: {why}"
-        )),
-        Ok(expression) => (!expression.is_match(value)).then(|| {
-            format!("Value doesn't satisfy the regular expression requirement '{pattern}'")
-        }),
-    }
+        Err(why) => {
+            return Some(PatternRejection::Pattern(format!(
+                "AllowedPattern '{pattern}' is not a regular expression this service can \
+                 evaluate: {why}"
+            )))
+        }
+        Ok(expression) => expression,
+    };
+    let satisfied = if type_ == crate::state::TYPE_STRING_LIST {
+        value
+            .split(crate::state::STRING_LIST_SEPARATOR)
+            .all(|item| expression.is_match(item))
+    } else {
+        expression.is_match(value)
+    };
+    (!satisfied).then(|| {
+        PatternRejection::Value(crate::state::allowed_pattern_mismatch_message(pattern))
+    })
 }
 
 /// The `PutParameter` operation.
@@ -441,25 +477,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Name`'s length and `KeyId`'s pattern are MODELLED constraints, so the
         // centralized walk has already refused anything outside them. `Value`
         // (`PSParameterValue`) carries NO modelled length, so its size is bounded here,
-        // before anything walks it. What is checked beyond that is what the model cannot
-        // say: every naming constraint, tier and quota rule the operation's own
-        // documentation states.
+        // against the limit of the tier this request resolves to — before anything
+        // matches a caller-supplied pattern against it. What is checked beyond that is
+        // what the model cannot say: every naming constraint, tier and quota rule the
+        // operation's own documentation states.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutParameterErrorModeled::InternalServerError(InternalServerError {
                 message: Some("the parameter store is unavailable".to_string()),
             })
         })?;
-
-        // The largest content size ANY tier allows, applied before the value is walked
-        // or matched, so no per-request work is proportional to an unbounded request:
-        // the exact per-tier limit is applied below, once the tier is resolved.
-        if input.value.len() > crate::state::ADVANCED_VALUE_LIMIT {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Value is {} bytes: the largest content size limit a parameter has is {} bytes",
-                input.value.len(),
-                crate::state::ADVANCED_VALUE_LIMIT
-            )));
-        }
 
         let name = crate::state::trimmed_name(&input.name)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
@@ -522,13 +548,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .to_string(),
             ));
         }
-        if let Some(why) = allowed_pattern_rejection(input.allowed_pattern.as_deref(), &input.value)
-        {
-            return Err(PutParameterErrorModeled::InvalidAllowedPatternException(
-                InvalidAllowedPatternException { message: Some(why) },
-            )
-            .into());
-        }
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
@@ -586,9 +605,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 type_: record.latest().map(|latest| latest.type_.clone()),
                 tier: record.latest().map(|latest| latest.tier.clone()),
                 retained: record.versions.len(),
-                oldest_labelled: record
+                labelled_oldest: record
                     .oldest()
-                    .is_some_and(|oldest| !oldest.labels.is_empty()),
+                    .filter(|oldest| !oldest.labels.is_empty())
+                    .map(|oldest| oldest.version),
             });
             (
                 store.parameters_in_region(&region),
@@ -599,13 +619,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "The parameter already exists. You can't create duplicate parameters" —
-        // unless the request asked to overwrite it.
+        // unless the request asked to overwrite it. The sentence names no parameter: it
+        // names the request member the caller has to set.
         if existing.is_some() && !overwrite {
             return Err(PutParameterErrorModeled::ParameterAlreadyExists(
                 ParameterAlreadyExists {
-                    message: Some(format!(
-                        "Parameter {name} already exists; set Overwrite to update it"
-                    )),
+                    message: Some(crate::state::PARAMETER_ALREADY_EXISTS_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -678,31 +697,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let limit = crate::state::value_limit(&tier);
         if input.value.len() > limit {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Value is {} bytes: a {tier} parameter has a content size limit of {limit} bytes",
-                input.value.len()
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::value_limit_message(&tier),
+            ));
+        }
+        // The value is matched against the request's `AllowedPattern` only now that it
+        // is known to be within the tier's content size limit, so the haystack a
+        // caller-supplied expression is matched against is bounded. A value that fails a
+        // well-formed pattern is the VALUE's fault; a pattern that is no regular
+        // expression is the PATTERN's, and the two are reported as the different
+        // refusals they are.
+        match allowed_pattern_rejection(input.allowed_pattern.as_deref(), &type_, &input.value) {
+            None => {}
+            Some(PatternRejection::Pattern(why)) => {
+                return Err(PutParameterErrorModeled::InvalidAllowedPatternException(
+                    InvalidAllowedPatternException { message: Some(why) },
+                )
+                .into())
+            }
+            Some(PatternRejection::Value(why)) => {
+                return Err(PutParameterErrorModeled::ParameterPatternMismatchException(
+                    ParameterPatternMismatchException { message: Some(why) },
+                )
+                .into())
+            }
         }
         // "Standard parameters ... can't be configured to use parameter policies."
         if has_policies && tier != crate::state::TIER_ADVANCED {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Policies require an {} parameter; this request would create a {tier} parameter",
-                crate::state::TIER_ADVANCED
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::policies_require_advanced_message(),
+            ));
         }
         // Retention displaces the oldest version — but "if the oldest version has a
         // label attached to it, Parameter Store won't delete the version and instead
-        // presents this error message".
-        if existing.as_ref().is_some_and(|held| {
-            held.retained >= crate::state::MAX_VERSIONS_RETAINED && held.oldest_labelled
-        }) {
+        // presents this error message", which names the version whose label is in the
+        // way as the store holds it now.
+        if let Some(oldest) = existing
+            .as_ref()
+            .filter(|held| held.retained >= crate::state::MAX_VERSIONS_RETAINED)
+            .and_then(|held| held.labelled_oldest)
+        {
             return Err(PutParameterErrorModeled::ParameterMaxVersionLimitExceeded(
                 ParameterMaxVersionLimitExceeded {
-                    message: Some(format!(
-                        "Parameter {name} retains {} versions and its oldest version can't be \
-                         deleted because it has a label associated with it",
-                        crate::state::MAX_VERSIONS_RETAINED
-                    )),
+                    message: Some(crate::state::max_version_limit_message(name, oldest)),
                 },
             )
             .into());

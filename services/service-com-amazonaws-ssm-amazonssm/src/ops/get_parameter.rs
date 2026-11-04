@@ -260,13 +260,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             let Some(version) = record.select(query.selector) else {
                 // The parameter exists, so what the request named is a version or a label
-                // this parameter does not carry.
+                // this parameter does not carry — and the refusal says which of the two
+                // the caller asked for.
                 return Err(GetParameterErrorModeled::ParameterVersionNotFound(
                     ParameterVersionNotFound {
-                        message: Some(format!(
-                            "Parameter {} has no version or label '{}'",
-                            record.name,
-                            query.selector.unwrap_or_default()
+                        message: Some(crate::state::selector_not_found_message(
+                            query.path,
+                            query.selector.unwrap_or_default(),
                         )),
                     },
                 )

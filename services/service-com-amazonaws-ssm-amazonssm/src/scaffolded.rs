@@ -177,6 +177,72 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `Message` member of the synthetic `InvalidFilterKey` error shape.
+///
+/// Named `Message` rather than `message`: the modelled `InvalidFilterKey` declares NO
+/// members at all, yet Parameter Store words this refusal, and it spells the member it
+/// words it in with a capital `M` — so a client reading the filter refusal finds it
+/// where the service puts it.
+static INVALID_FILTER_KEY_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#InvalidFilterKey$Message",
+        "smithy.framework",
+        "Message",
+    ),
+    ShapeType::String,
+    "Message",
+    0,
+)
+.with_xml_name("Message")
+.with_json_name("Message");
+
+/// Schema for the synthetic `InvalidFilterKey` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the shapes above: this is
+/// not the shape of that name in any service's model — the modelled one carries no
+/// members — so it must not collide with it. The wire `__type` still comes from
+/// [`OperationError::shape_name`] below, which answers the modelled name.
+pub static INVALID_FILTER_KEY_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#InvalidFilterKey",
+        "smithy.framework",
+        "InvalidFilterKey",
+    ),
+    ShapeType::Structure,
+    &[&INVALID_FILTER_KEY_MESSAGE],
+);
+
+/// The payload of an `InvalidFilterKey`: which key was rejected, and what the operation
+/// accepts instead.
+#[derive(Debug, Clone)]
+pub struct InvalidFilterKeyMessage {
+    pub message: String,
+}
+
+impl InvalidFilterKeyMessage {
+    /// An `InvalidFilterKey` carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for InvalidFilterKeyMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InvalidFilterKey: {}", self.message)
+    }
+}
+
+impl std::error::Error for InvalidFilterKeyMessage {}
+
+impl SerializableStruct for InvalidFilterKeyMessage {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&INVALID_FILTER_KEY_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -196,12 +262,29 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// A filter key the operation does not accept. Renders as HTTP 400 with the error
+    /// code `InvalidFilterKey` and a `Message` saying which key was rejected.
+    ///
+    /// The modelled shape of that name declares no members, so a handler cannot word
+    /// the refusal through it — and the service does word it. Answer this only where
+    /// the operation models `InvalidFilterKey`; it is not a general-purpose refusal.
+    InvalidFilterKey(InvalidFilterKeyMessage),
 }
 
 impl<E> Scaffolded<E> {
     /// The scaffold signal for `operation`.
     pub fn not_implemented(operation: &str) -> Self {
         Self::NotImplemented(NotImplemented::new(operation))
+    }
+
+    /// Refuse a filter key the operation does not accept, with HTTP 400
+    /// `InvalidFilterKey` carrying `message`.
+    ///
+    /// Reach for this only where the operation's own model declares
+    /// `InvalidFilterKey`: the error code is that modelled refusal's, and only the
+    /// message member it carries is synthetic.
+    pub fn invalid_filter_key(message: impl Into<String>) -> Self {
+        Self::InvalidFilterKey(InvalidFilterKeyMessage::new(message))
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
@@ -229,6 +312,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::InvalidFilterKey(e) => write!(f, "{e}"),
         }
     }
 }
@@ -241,6 +325,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::InvalidFilterKey(e) => e.source(),
         }
     }
 }
@@ -255,6 +340,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::InvalidFilterKey(e) => e,
         }
     }
 
@@ -263,6 +349,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::InvalidFilterKey(_) => &INVALID_FILTER_KEY_SCHEMA,
         }
     }
 
@@ -275,6 +362,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            Self::InvalidFilterKey(_) => "InvalidFilterKey",
         }
     }
 
@@ -286,7 +374,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
-            Self::ValidationException(_) => 400,
+            Self::ValidationException(_) | Self::InvalidFilterKey(_) => 400,
         }
     }
 
@@ -297,8 +385,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
-            // Same reason: the synthetic shape carries no `awsQueryError` trait.
-            Self::ValidationException(_) => None,
+            // Same reason: the synthetic shapes carry no `awsQueryError` trait.
+            Self::ValidationException(_) | Self::InvalidFilterKey(_) => None,
         }
     }
 }

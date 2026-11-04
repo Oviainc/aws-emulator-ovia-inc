@@ -1016,8 +1016,8 @@ async fn allowed_pattern_validates_the_value() {
             );
             assert_eq!(
                 error_code(&response),
-                "InvalidAllowedPatternException",
-                "case {case}: expected InvalidAllowedPatternException, got {response}"
+                "ParameterPatternMismatchException",
+                "case {case}: expected ParameterPatternMismatchException, got {response}"
             );
             let (status, response) = get(&router, &name).await;
             assert_eq!(
@@ -1027,7 +1027,8 @@ async fn allowed_pattern_validates_the_value() {
         }
     }
 
-    // A pattern that is not a regular expression at all is refused by the same error.
+    // A pattern that is not a regular expression at all is refused by the OTHER error:
+    // the caller's own pattern is what is wrong, not the value it was matched against.
     let (status, response) = put(
         &router,
         &json!({
