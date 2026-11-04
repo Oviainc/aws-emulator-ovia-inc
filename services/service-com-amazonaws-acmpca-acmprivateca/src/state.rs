@@ -256,6 +256,39 @@ pub const RESTORE_WITHOUT_RESTORATION_PERIOD_MESSAGE: &str =
 /// sentence is an example of the wording.
 pub const PERMISSION_NOT_FOUND_MESSAGE: &str = "Could not find a Permission for specified CA.";
 
+/// The `ActionType` members in the order the model DECLARES them, which is the order a
+/// refusal of an incomplete grant lists them in
+/// ([`INCOMPLETE_PERMISSION_ACTIONS_MESSAGE`]).
+///
+/// `ops::types::ACTION_TYPE_VALUES` is the same set sorted alphabetically, so it cannot be
+/// read for this order; the order below is the enum's, from
+/// `smithy_query(query="shape",shape="ActionType")`. A test pins that the two hold the same
+/// members, so a member added to the model cannot go unnoticed here.
+pub const ACTIONS_IN_MODEL_ORDER: &[&str] =
+    &["IssueCertificate", "GetCertificate", "ListPermissions"];
+
+/// What Amazon Web Services Private CA answers a grant that does not name every action a
+/// private CA's permission can carry: "in order for ACM to automatically renew private
+/// certificates, you must give the ACM service principal all available permissions
+/// (IssueCertificate, GetCertificate, and ListPermissions)" (`Permission` docs), so a grant
+/// naming only part of that set is refused rather than recorded.
+///
+/// Entirely fixed text — the bracketed actions are the `ActionType` members in the order
+/// the model declares them ([`ACTIONS_IN_MODEL_ORDER`]) and nothing in the sentence is
+/// taken from the request.
+pub const INCOMPLETE_PERMISSION_ACTIONS_MESSAGE: &str =
+    "Permissions must contain all three actions [IssueCertificate, GetCertificate, \
+     ListPermissions] for ACM to perform renewals.";
+
+/// What this service answers when the (CA, principal, source account) a grant names
+/// already holds a permission allowing a DIFFERENT set of actions: the model's own
+/// sentence for `PermissionAlreadyExistsException`, naming no value of the request's own.
+///
+/// Re-asserting the permission already in effect is not this refusal — it is answered with
+/// success ([`PermissionRecord::allows_exactly`]).
+pub const PERMISSION_ALREADY_EXISTS_MESSAGE: &str =
+    "The designated permission has already been given to the user.";
+
 /// What Amazon Web Services Private CA answers when the private CA a request names is
 /// resolved and the resource-based policy asked for is not attached to it.
 ///
@@ -484,6 +517,15 @@ impl PermissionRecord {
         (self.principal.as_str(), self.source_account.as_str())
     }
 
+    /// Whether this grant already allows exactly the actions `actions` asks for.
+    ///
+    /// A grant is the SET of actions it allows, so the order a request lists them in and a
+    /// member it repeats make no difference: what this answers is whether the access the
+    /// request asks for is the access that already holds.
+    pub fn allows_exactly(&self, actions: &[String]) -> bool {
+        action_set(&self.actions) == action_set(actions)
+    }
+
     /// The modelled `Permission` structure, read off this record.
     ///
     /// Both reported members that are not stored verbatim are DERIVED from the grant:
@@ -505,6 +547,27 @@ impl PermissionRecord {
             )),
         }
     }
+}
+
+/// The distinct `ActionType` members a list of granted actions names, which is what a
+/// grant IS: `ActionList` is a list, so a request can name a member more than once and
+/// in any order.
+fn action_set(actions: &[String]) -> HashSet<&str> {
+    actions.iter().map(String::as_str).collect()
+}
+
+/// Whether `actions` names EVERY action a private CA's permission can carry, which is what
+/// a grant has to name to be recorded: an incomplete grant cannot serve the renewals a
+/// permission exists for ([`INCOMPLETE_PERMISSION_ACTIONS_MESSAGE`]).
+///
+/// The set compared against is the model's own
+/// (`ops::types::ACTION_TYPE_VALUES`, generated from `ActionType`), so an action the model
+/// adds is part of the requirement without this being edited.
+pub fn grants_every_action(actions: &[String]) -> bool {
+    let granted = action_set(actions);
+    crate::ops::types::ACTION_TYPE_VALUES
+        .iter()
+        .all(|action| granted.contains(action))
 }
 
 /// The `ActionType` members a grant names, in the order a `Permission` REPORTS them:

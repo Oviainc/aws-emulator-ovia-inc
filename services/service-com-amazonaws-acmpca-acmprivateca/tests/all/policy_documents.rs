@@ -33,7 +33,7 @@ use crate::private_ca_lifecycle::{
 
 /// Every `ActionType` member the model declares, from
 /// `smithy_query(query="shape",shape="ActionType")`: `IssueCertificate`,
-/// `GetCertificate`, `ListPermissions`. A grant names one to three of them
+/// `GetCertificate`, `ListPermissions`. A grant names all of them, in any order
 /// (`ActionList`, len 1..3).
 const ACTIONS: [&str; 3] = ["IssueCertificate", "GetCertificate", "ListPermissions"];
 
@@ -166,9 +166,10 @@ async fn a_listed_permission_reports_the_policy_its_grant_expresses() {
     // rather than to whichever CA exists.
     let other_arn = certificate_authority(&emulator, "policy-grants-other").await;
 
-    // The rows differ along what the rule generalises over: how many actions a grant
-    // names and in which order, which principal holds it, which account assigned it and
-    // which CA it was made on.
+    // The rows differ along what the rule generalises over: the order a grant lists the
+    // actions in, which principal holds it, which account assigned it and which CA it was
+    // made on. Every grant names every action, which is what `CreatePermission` records
+    // ([`permission_action_set`] covers the refusal of a grant that does not).
     let rows: [GrantRow; 7] = [
         (
             "every action, in the order the model declares them",
@@ -192,25 +193,25 @@ async fn a_listed_permission_reports_the_policy_its_grant_expresses() {
             &[ACTIONS[1], ACTIONS[0], ACTIONS[2]],
         ),
         (
-            "one action",
+            "every action, another holder of the same CA",
             &arn,
             "acm-pca.amazonaws.com",
             Some("123456789012"),
-            &[ACTIONS[0]],
+            &[ACTIONS[2], ACTIONS[0], ACTIONS[1]],
         ),
         (
-            "one action, the last member",
+            "every action, a holder with no source account",
             &arn,
             "s3.amazonaws.com",
             None,
-            &[ACTIONS[2]],
+            &[ACTIONS[1], ACTIONS[2], ACTIONS[0]],
         ),
         (
-            "two actions, out of order",
+            "every action, the same holder under a third account",
             &arn,
             "acm.amazonaws.com",
             Some("999999999999"),
-            &[ACTIONS[2], ACTIONS[1]],
+            &[ACTIONS[2], ACTIONS[1], ACTIONS[0]],
         ),
         (
             "a grant on another CA",
@@ -328,13 +329,15 @@ async fn the_reported_policy_follows_the_grant_it_belongs_to() {
     let emulator = Emulator::new();
     let arn = certificate_authority(&emulator, "policy-follows").await;
 
+    // Each grant names every action — what differs is the holder and the account that
+    // assigned it, which is what the document a grant expresses is read off.
     let holders: [(&str, &str, &[&str]); 3] = [
-        ("acm.amazonaws.com", "123456789012", &[ACTIONS[0]]),
+        ("acm.amazonaws.com", "123456789012", &ACTIONS),
         ("ram.amazonaws.com", "210987654321", &ACTIONS),
         (
             "acm.amazonaws.com",
             "210987654321",
-            &[ACTIONS[1], ACTIONS[2]],
+            &[ACTIONS[1], ACTIONS[2], ACTIONS[0]],
         ),
     ];
     for (principal, account, actions) in holders {
@@ -370,8 +373,8 @@ async fn the_reported_policy_follows_the_grant_it_belongs_to() {
         }
     }
 
-    // Revoked and granted again with different actions: the reported document is the one
-    // the CURRENT grant expresses.
+    // Revoked, and the account's grant given to another holder: the reported document is
+    // the one the CURRENT grant expresses, and the revoked grant's is reported by nobody.
     let (principal, account, _) = holders[1];
     emulator
         .ok(
@@ -384,24 +387,38 @@ async fn the_reported_policy_follows_the_grant_it_belongs_to() {
             }),
         )
         .await;
+    let new_holder = "sns.amazonaws.com";
     emulator
         .ok(
             "granted again",
             "CreatePermission",
-            &grant(&arn, principal, Some(account), &[ACTIONS[1]]),
+            &grant(&arn, new_holder, Some(account), &ACTIONS),
         )
         .await;
     let permissions = all_permissions(&emulator, "granted again", &arn).await;
-    let policy = reported(&permissions, principal, account)
+    assert!(
+        reported(&permissions, principal, account).is_none(),
+        "case \"granted again\": the revoked grant must be gone, got {permissions:?}"
+    );
+    let policy = reported(&permissions, new_holder, account)
         .and_then(|permission| permission.get("Policy"))
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case \"granted again\": no Policy in {permissions:?}"))
         .to_string();
     let document: Value = serde_json::from_str(&policy).expect("a JSON policy");
+    let namespaced: Vec<String> = in_reported_order(&ACTIONS)
+        .iter()
+        .map(|action| format!("{ACTION_NAMESPACE}:{action}"))
+        .collect();
     assert_eq!(
         document["Statement"][0]["Action"],
-        json!([format!("{ACTION_NAMESPACE}:{}", ACTIONS[1])]),
-        "case \"granted again\": expected the new grant's single action, got {document:?}"
+        json!(namespaced),
+        "case \"granted again\": expected the new grant's actions, got {document:?}"
+    );
+    assert_eq!(
+        document["Statement"][0]["Principal"],
+        json!({"Service": new_holder}),
+        "case \"granted again\": expected the new holder as the principal, got {document:?}"
     );
     assert_ne!(
         policy, documents[1],

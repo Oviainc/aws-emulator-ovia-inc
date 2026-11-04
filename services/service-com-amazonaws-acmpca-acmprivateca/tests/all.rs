@@ -31,6 +31,8 @@ mod crl_publication;
 mod delete_certificate_authority;
 #[path = "all/enum_value_set_order.rs"]
 mod enum_value_set_order;
+#[path = "all/permission_action_set.rs"]
+mod permission_action_set;
 #[path = "all/permissions.rs"]
 mod permissions;
 #[path = "all/policy_documents.rs"]

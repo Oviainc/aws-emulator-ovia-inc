@@ -183,6 +183,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Nothing here is read off the request's metadata: the CA a grant is made on is
         // the one the request names by ARN, not one derived from the signed region.
         let _ = ctx;
+
+        // A grant has to name EVERY action a private CA's permission can carry: a
+        // permission exists so that the holder can renew certificates of the CA, which
+        // takes all of those actions, so a request naming only part of the set is refused
+        // at the front door — before the CA is resolved and before anything is written.
+        if !crate::state::grants_every_action(&input.actions) {
+            return Err(CreatePermissionError::validation(
+                crate::state::INCOMPLETE_PERMISSION_ACTIONS_MESSAGE,
+            ));
+        }
+
         let arn = input.certificate_authority_arn;
         if crate::state::parse_certificate_authority_arn(&arn).is_none() {
             return Err(invalid_arn(crate::state::INVALID_ARN_MESSAGE.to_string()));
@@ -218,17 +229,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
         };
 
-        // One grant per (CA, principal, source account): a second call naming the same
-        // three answers the modelled refusal instead of recording a duplicate or
-        // silently replacing the actions the first call granted.
-        if record.permission(&input.principal, &source_account).is_some() {
+        // One grant per (CA, principal, source account). Re-asserting the grant already in
+        // effect for those three asks for the state that already holds, so it answers
+        // success and changes nothing — the converge/retry a caller makes is idempotent.
+        // The modelled refusal is for a request that asks that same triple for a DIFFERENT
+        // set of actions, which would otherwise silently replace the access in force: a
+        // grant only ever records the whole action set today (the rule above), so that
+        // refusal stands for the sets a wider `ActionType` would make askable.
+        if let Some(existing) = record.permission(&input.principal, &source_account) {
+            if existing.allows_exactly(&input.actions) {
+                return Ok(CreatePermissionOutput);
+            }
             return Err(CreatePermissionErrorModeled::PermissionAlreadyExistsException(
                 PermissionAlreadyExistsException {
-                    message: Some(format!(
-                        "a permission on {arn} for principal {} and source account \
-                         {source_account} already exists",
-                        input.principal
-                    )),
+                    message: Some(crate::state::PERMISSION_ALREADY_EXISTS_MESSAGE.to_string()),
                 },
             )
             .into());

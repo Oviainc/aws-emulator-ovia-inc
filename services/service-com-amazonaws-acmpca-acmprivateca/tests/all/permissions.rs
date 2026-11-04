@@ -28,8 +28,9 @@ fn ceil_to_millisecond(seconds: f64) -> f64 {
 
 /// Every `ActionType` member the model declares, from
 /// `smithy_query(query="shape",shape="ActionType")`: `IssueCertificate`,
-/// `GetCertificate`, `ListPermissions`. A grant names one to three of them
-/// (`ActionList`, len 1..3).
+/// `GetCertificate`, `ListPermissions`. A grant names all of them, in any order
+/// (`ActionList`, len 1..3); the refusal of a grant that names fewer is covered by
+/// `permission_action_set`.
 const ACTIONS: [&str; 3] = ["IssueCertificate", "GetCertificate", "ListPermissions"];
 
 /// Create a private CA and return its ARN.
@@ -110,21 +111,21 @@ async fn a_granted_permission_is_listed_back_as_it_was_granted() {
     let arn = certificate_authority(&emulator, "granted").await;
     let other_arn = certificate_authority(&emulator, "granted-other").await;
 
-    // The rows differ along what the rule generalises over: how many actions a grant
-    // names and in which order, whether the request names a source account, and which
-    // (principal, source account) pair identifies the grant.
+    // The rows differ along what the rule generalises over: the order a grant lists the
+    // actions in, whether the request names a source account, and which (principal,
+    // source account) pair identifies the grant.
     let rows: [(&str, &str, Option<&str>, &[&str]); 4] = [
         (
-            "one action, no source account",
+            "the model's order, no source account",
             "acm.amazonaws.com",
             None,
-            &[ACTIONS[0]],
+            &ACTIONS,
         ),
         (
-            "two actions, an explicit source account",
+            "another order, an explicit source account",
             "acm.amazonaws.com",
             Some("123456789012"),
-            &[ACTIONS[1], ACTIONS[2]],
+            &[ACTIONS[1], ACTIONS[2], ACTIONS[0]],
         ),
         (
             "every action, in the order the request named them",
@@ -136,7 +137,7 @@ async fn a_granted_permission_is_listed_back_as_it_was_granted() {
             "the same principal under another source account",
             "ram.amazonaws.com",
             Some("123456789012"),
-            &[ACTIONS[1]],
+            &[ACTIONS[2], ACTIONS[1], ACTIONS[0]],
         ),
     ];
 
@@ -258,7 +259,7 @@ async fn a_grant_is_accepted_before_and_after_creation_settles() {
         .ok(
             "while creating",
             "CreatePermission",
-            &grant(&arn, "acm.amazonaws.com", None, &[ACTIONS[0]]),
+            &grant(&arn, "acm.amazonaws.com", None, &ACTIONS),
         )
         .await;
 
@@ -279,35 +280,52 @@ async fn a_grant_is_accepted_before_and_after_creation_settles() {
     );
 }
 
-/// A second grant naming the same CA, principal and source account is refused, and the
-/// grant already recorded is left exactly as it was.
+/// One repeated-grant row: the case, the principal that holds the grant, the account that
+/// assigned it (when the request names one), the actions the grant named and the actions
+/// the repeat of it names.
+type RepeatRow<'a> = (
+    &'a str,
+    &'a str,
+    Option<&'a str>,
+    &'a [&'a str],
+    &'a [&'a str],
+);
+
+/// A second grant naming the same CA, principal and source account asks for the access
+/// that already holds, so it answers success and leaves that grant exactly as it was.
 #[tokio::test]
-async fn a_repeated_grant_is_refused_and_changes_nothing() {
+async fn a_repeated_grant_succeeds_and_changes_nothing() {
     let emulator = Emulator::new();
     let arn = certificate_authority(&emulator, "repeated").await;
 
-    let rows: [(&str, &str, Option<&str>, &[&str]); 3] = [
+    // The rows differ along whether the request names a source account, which (principal,
+    // source account) pair identifies the grant, and the order the repeat lists the
+    // actions in — the grant is the SET of actions, so a reordered repeat is the same ask.
+    let rows: [RepeatRow; 3] = [
         (
             "no source account",
             "acm.amazonaws.com",
             None,
-            &[ACTIONS[0]],
+            &ACTIONS,
+            &ACTIONS,
         ),
         (
-            "an explicit source account",
+            "an explicit source account, the repeat reordered",
             "acm.amazonaws.com",
             Some("123456789012"),
-            &[ACTIONS[1]],
+            &ACTIONS,
+            &[ACTIONS[2], ACTIONS[1], ACTIONS[0]],
         ),
         (
             "another principal",
             "ram.amazonaws.com",
             Some("210987654321"),
+            &[ACTIONS[1], ACTIONS[0], ACTIONS[2]],
             &ACTIONS,
         ),
     ];
 
-    for (case, principal, source_account, actions) in rows {
+    for (case, principal, source_account, actions, repeat) in rows {
         emulator
             .ok(
                 case,
@@ -315,32 +333,34 @@ async fn a_repeated_grant_is_refused_and_changes_nothing() {
                 &grant(&arn, principal, source_account, actions),
             )
             .await;
-        // The repeat names a DIFFERENT action set: it is refused for the pair it names,
-        // not for the actions it asks for.
-        emulator
-            .refused(
+        // The repeat asks for exactly the access already in effect for that triple.
+        let answer = emulator
+            .ok(
                 case,
                 "CreatePermission",
-                &grant(&arn, principal, source_account, &[ACTIONS[2]]),
-                "PermissionAlreadyExistsException",
+                &grant(&arn, principal, source_account, repeat),
             )
             .await;
+        assert!(
+            answer.as_object().is_none_or(|members| members.is_empty()),
+            "case {case:?}: a repeated grant answers an empty body, got {answer:?}"
+        );
     }
 
     let permissions = all_permissions(&emulator, "repeated", &arn).await;
     assert_eq!(
         permissions.len(),
         rows.len(),
-        "case \"repeated\": a refused repeat must record nothing, got {permissions:?}"
+        "case \"repeated\": a repeat must record no second grant, got {permissions:?}"
     );
-    for (case, principal, source_account, actions) in rows {
+    for (case, principal, source_account, actions, _) in rows {
         let expected_account = source_account.unwrap_or(ACCOUNT);
         let permission = reported(&permissions, principal, expected_account)
             .unwrap_or_else(|| panic!("case {case:?}: no grant for {principal} in {permissions:?}"));
         assert_eq!(
             permission["Actions"],
             json!(crate::policy_documents::in_reported_order(actions)),
-            "case {case:?}: the first grant's actions must stand, got {permission:?}"
+            "case {case:?}: the grant's actions must stand, got {permission:?}"
         );
     }
 }
@@ -352,7 +372,8 @@ async fn permissions_are_paged_and_resumed_in_one_order() {
     let emulator = Emulator::new();
     let arn = certificate_authority(&emulator, "paged").await;
 
-    // Seven grants, so no published page-size bound divides the count evenly.
+    // Seven grants, so no published page-size bound divides the count evenly. Each names
+    // every action, which is what a grant records; what identifies them is the principal.
     let granted = 7usize;
     for index in 0..granted {
         emulator
@@ -363,7 +384,7 @@ async fn permissions_are_paged_and_resumed_in_one_order() {
                     &arn,
                     &format!("principal-{index}.amazonaws.com"),
                     None,
-                    &[ACTIONS[index % ACTIONS.len()]],
+                    &ACTIONS,
                 ),
             )
             .await;
@@ -558,36 +579,37 @@ async fn a_revocation_removes_exactly_the_grant_it_names() {
     let arn = certificate_authority(&emulator, "revoked").await;
     let long_principal = "p".repeat(128);
 
-    // The rows differ along what the rule generalises over: how many actions the grant
-    // named, whether the request names a source account, and which (principal, source
-    // account) pair identifies it — including one principal held under two accounts, so
-    // a revocation that ignored the account would take the wrong grant. `Principal` is
-    // len 0..128 (`smithy_query(query="operation",operation="DeletePermission")`), so the
-    // last row sits on that upper bound.
+    // The rows differ along what the rule generalises over: the order the grant listed
+    // the actions in, whether the request names a source account, and which (principal,
+    // source account) pair identifies it — including one principal held under two
+    // accounts, so a revocation that ignored the account would take the wrong grant.
+    // `Principal` is len 0..128
+    // (`smithy_query(query="operation",operation="DeletePermission")`), so the last row
+    // sits on that upper bound.
     let rows: Vec<(&str, &str, Option<&str>, Vec<&str>)> = vec![
         (
-            "one action, no source account",
+            "the model's order, no source account",
             "acm.amazonaws.com",
             None,
-            vec![ACTIONS[0]],
+            ACTIONS.to_vec(),
         ),
         (
             "the same principal, an explicit source account",
             "acm.amazonaws.com",
             Some("123456789012"),
-            vec![ACTIONS[1]],
+            vec![ACTIONS[1], ACTIONS[0], ACTIONS[2]],
         ),
         (
-            "every action, another principal",
+            "another principal, the actions reversed",
             "ram.amazonaws.com",
             Some("210987654321"),
-            ACTIONS.to_vec(),
+            vec![ACTIONS[2], ACTIONS[1], ACTIONS[0]],
         ),
         (
             "a principal at the modelled length bound",
             long_principal.as_str(),
             None,
-            vec![ACTIONS[2]],
+            ACTIONS.to_vec(),
         ),
     ];
 
@@ -688,7 +710,7 @@ async fn revoking_a_grant_the_ca_does_not_hold_is_refused() {
         .ok(
             "the one grant the CA holds",
             "CreatePermission",
-            &grant(&arn, "acm.amazonaws.com", None, &[ACTIONS[0]]),
+            &grant(&arn, "acm.amazonaws.com", None, &ACTIONS),
         )
         .await;
 
@@ -736,7 +758,7 @@ async fn revoking_a_grant_the_ca_does_not_hold_is_refused() {
     });
     assert_eq!(
         permission["Actions"],
-        json!([ACTIONS[0]]),
+        json!(crate::policy_documents::in_reported_order(&ACTIONS)),
         "case \"after the refusals\": the grant must keep its actions, got {permission:?}"
     );
 }
@@ -756,7 +778,7 @@ async fn a_grant_and_its_revocation_resolve_the_calling_account_the_same_way() {
             .ok(
                 case,
                 "CreatePermission",
-                &grant(&arn, "acm.amazonaws.com", granted_with, &[ACTIONS[0]]),
+                &grant(&arn, "acm.amazonaws.com", granted_with, &ACTIONS),
             )
             .await;
         let permissions = all_permissions(&emulator, case, &arn).await;
