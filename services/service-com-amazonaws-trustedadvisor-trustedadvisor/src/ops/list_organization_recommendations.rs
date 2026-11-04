@@ -13,6 +13,10 @@
 //! what makes this list prioritized-only: no filter here has to exclude
 //! anything, and `?type=standard` selects nothing.
 //!
+//! The filters this listing cuts on are the ones `ListRecommendations` cuts on
+//! too, so the predicate and the cursor scope they contribute are the SHARED
+//! [`crate::state::RecommendationFilters`] rather than this handler's own.
+//!
 //! `resourcesAggregates` and `pillarSpecificAggregates` are AGGREGATED on every
 //! read over the member accounts' recommendations the organization
 //! recommendation covers
@@ -234,46 +238,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
-        // `afterLastUpdatedAt` / `beforeLastUpdatedAt` are inclusive bounds on
-        // the stored `lastUpdatedAt`; every other filter is an equality (or
-        // membership) test. An absent filter keeps every organization
-        // recommendation.
-        let after = input
-            .after_last_updated_at
-            .as_ref()
-            .map(crate::state::millis_of);
-        let before = input
-            .before_last_updated_at
-            .as_ref()
-            .map(crate::state::millis_of);
-
+        // The eight filters this read cuts on, and the ONE predicate they
+        // select a stored recommendation with — the same one the account-level
+        // listing applies ([`crate::state::RecommendationFilters`]), so the two
+        // cannot select differently on the members both entry types carry.
+        let filters = crate::state::RecommendationFilters {
+            r#type: input.r#type.as_deref(),
+            status: input.status.as_deref(),
+            pillar: input.pillar.as_deref(),
+            aws_service: input.aws_service.as_deref(),
+            source: input.source.as_deref(),
+            check_identifier: input.check_identifier.as_deref(),
+            after_last_updated_at: input.after_last_updated_at.as_ref(),
+            before_last_updated_at: input.before_last_updated_at.as_ref(),
+        };
         let matching: Vec<(String, OrganizationRecommendationSummary)> = state
             .organization_recommendations
             .iter()
-            .filter(|(_, entry)| {
-                input.r#type.as_ref().is_none_or(|kind| &entry.r#type == kind)
-                    && input
-                        .status
-                        .as_ref()
-                        .is_none_or(|status| &entry.status == status)
-                    && input
-                        .pillar
-                        .as_ref()
-                        .is_none_or(|pillar| entry.pillars.iter().any(|stored| stored == pillar))
-                    && input.aws_service.as_ref().is_none_or(|service| {
-                        entry.aws_services.iter().any(|stored| stored == service)
-                    })
-                    && input
-                        .source
-                        .as_ref()
-                        .is_none_or(|source| &entry.source == source)
-                    && input
-                        .check_identifier
-                        .as_ref()
-                        .is_none_or(|check| entry.check_arn.as_ref() == Some(check))
-                    && after.is_none_or(|bound| entry.last_updated_at_millis >= bound)
-                    && before.is_none_or(|bound| entry.last_updated_at_millis <= bound)
-            })
+            .filter(|(_, entry)| filters.keeps(*entry))
             .map(|(arn, entry)| {
                 (
                     arn.clone(),
@@ -287,23 +269,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         // The cursor's scope carries this read's filters, so a token issued
-        // under one filter set cannot resume a differently filtered sequence.
-        let after_scope = after.map(|millis| millis.to_string());
-        let before_scope = before.map(|millis| millis.to_string());
+        // under one filter set cannot resume a differently filtered sequence —
+        // named and ordered once, beside the predicate. The list name is this
+        // read's own, so neither listing's token resumes the other.
         let page = crate::state::paginate(
-            &crate::state::list_scope(
-                "organizationRecommendations",
-                &[
-                    ("type", input.r#type.as_deref()),
-                    ("status", input.status.as_deref()),
-                    ("pillar", input.pillar.as_deref()),
-                    ("awsService", input.aws_service.as_deref()),
-                    ("source", input.source.as_deref()),
-                    ("checkIdentifier", input.check_identifier.as_deref()),
-                    ("afterLastUpdatedAt", after_scope.as_deref()),
-                    ("beforeLastUpdatedAt", before_scope.as_deref()),
-                ],
-            ),
+            &filters.scope("organizationRecommendations"),
             matching,
             input.next_token.as_deref(),
             input.max_results,

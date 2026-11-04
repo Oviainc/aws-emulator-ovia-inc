@@ -81,6 +81,15 @@
 //! their rows on — each stated once, so no account-level and organization-level
 //! view of one resource can disagree.
 //!
+//! The two levels' LISTING of recommendations lives here for that same reason:
+//! [`RecommendationFilters`] is the `type` / `status` / `pillar` / `awsService`
+//! / `source` / `checkIdentifier` predicate and the two inclusive
+//! `lastUpdatedAt` bounds both listings cut their rows on, plus the cursor scope
+//! those filters contribute, read off either entry type through
+//! [`RecommendationFilterable`] — so the account-level and the
+//! organization-level listing cannot select differently on the members the two
+//! entry types carry identically.
+//!
 //! The same ownership test ([`is_foreign_resource`]) SCOPES the account-level
 //! views: [`recommendations`](ComAmazonawsTrustedadvisorTrustedadvisorState::recommendations)
 //! and [`recommendation_resources`](ComAmazonawsTrustedadvisorTrustedadvisorState::recommendation_resources)
@@ -898,6 +907,159 @@ impl<'request> ResourceFilters<'request> {
             ("exclusionStatus", self.exclusion_status),
             ("regionCode", self.region_code),
         ]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The recommendation listings' filters
+// ---------------------------------------------------------------------------
+
+/// The members of one stored recommendation a recommendation listing's filters
+/// select on, borrowed from the entry they live on: its classification members
+/// and its `lastUpdatedAt` stamp.
+///
+/// Handed out by [`RecommendationFilterable::classification`] so
+/// [`RecommendationFilters::keeps`] selects EITHER kind of stored
+/// recommendation without naming either one, exactly as [`LifecycleMembers`]
+/// lets [`apply_lifecycle_update`] write both.
+pub struct RecommendationClassification<'entry> {
+    pub r#type: &'entry str,
+    pub status: &'entry str,
+    pub pillars: &'entry [String],
+    pub aws_services: &'entry [String],
+    pub source: &'entry str,
+    pub check_arn: Option<&'entry str>,
+    pub last_updated_at_millis: i64,
+}
+
+/// A stored recommendation a `List…Recommendations` operation reports: the
+/// account-level [`RecommendationEntry`] and the organization-level
+/// [`OrganizationRecommendationEntry`].
+///
+/// The two listings model the same eight filters over members the two entry
+/// types carry identically, so they apply ONE rule to two kinds of entry. This
+/// is the seam that lets that rule be stated once — by
+/// [`RecommendationFilters`] — instead of once per operation, where the
+/// account-level and the organization-level listing could drift apart on the
+/// same members.
+pub trait RecommendationFilterable {
+    /// The members a listing's filters read, borrowed.
+    fn classification(&self) -> RecommendationClassification<'_>;
+}
+
+impl RecommendationFilterable for RecommendationEntry {
+    fn classification(&self) -> RecommendationClassification<'_> {
+        RecommendationClassification {
+            r#type: &self.r#type,
+            status: &self.status,
+            pillars: &self.pillars,
+            aws_services: &self.aws_services,
+            source: &self.source,
+            check_arn: self.check_arn.as_deref(),
+            last_updated_at_millis: self.last_updated_at_millis,
+        }
+    }
+}
+
+impl RecommendationFilterable for OrganizationRecommendationEntry {
+    fn classification(&self) -> RecommendationClassification<'_> {
+        RecommendationClassification {
+            r#type: &self.r#type,
+            status: &self.status,
+            pillars: &self.pillars,
+            aws_services: &self.aws_services,
+            source: &self.source,
+            check_arn: self.check_arn.as_deref(),
+            last_updated_at_millis: self.last_updated_at_millis,
+        }
+    }
+}
+
+/// The filters BOTH recommendation listings cut their rows on, as one read's
+/// request states them: `type`, `status`, `pillar`, `awsService`, `source`,
+/// `checkIdentifier` and the two `lastUpdatedAt` bounds, each `None` when the
+/// request named it not at all.
+///
+/// The eight are modelled identically on the two operations and select over
+/// members both entry types carry, so the predicate is stated once — by
+/// [`Self::keeps`] — and the cursor scope the filters contribute once, by
+/// [`Self::scope`], as [`ResourceFilters`] already states the resource lists'.
+/// `ListRecommendations` layers its extra ownership test
+/// ([`is_foreign_resource`]) on top of this one; it has no organization-level
+/// counterpart, because the organization listing is the cross-account view.
+#[derive(Debug, Clone, Copy)]
+pub struct RecommendationFilters<'request> {
+    pub r#type: Option<&'request str>,
+    pub status: Option<&'request str>,
+    pub pillar: Option<&'request str>,
+    pub aws_service: Option<&'request str>,
+    pub source: Option<&'request str>,
+    pub check_identifier: Option<&'request str>,
+    /// `afterLastUpdatedAt`, as the request's timestamp.
+    pub after_last_updated_at: Option<&'request ::aws_smithy_types::DateTime>,
+    /// `beforeLastUpdatedAt`, as the request's timestamp.
+    pub before_last_updated_at: Option<&'request ::aws_smithy_types::DateTime>,
+}
+
+impl RecommendationFilters<'_> {
+    /// `afterLastUpdatedAt` and `beforeLastUpdatedAt` on the scale the stored
+    /// `lastUpdatedAt` is held on — the ONE conversion both bounds go through
+    /// ([`millis_of`]), so the predicate and the cursor scope read the same
+    /// instant.
+    fn bounds_millis(&self) -> (Option<i64>, Option<i64>) {
+        (
+            self.after_last_updated_at.map(millis_of),
+            self.before_last_updated_at.map(millis_of),
+        )
+    }
+
+    /// Whether this read reports `entry`: `afterLastUpdatedAt` and
+    /// `beforeLastUpdatedAt` are INCLUSIVE bounds on the stored `lastUpdatedAt`,
+    /// `pillar` and `awsService` are membership tests over the lists the entry
+    /// holds, the remaining filters are equality tests on the entry's own
+    /// member, and a filter the request omitted keeps every recommendation.
+    pub fn keeps<Entry: RecommendationFilterable>(&self, entry: &Entry) -> bool {
+        let row = entry.classification();
+        let (after, before) = self.bounds_millis();
+        self.r#type.is_none_or(|kind| row.r#type == kind)
+            && self.status.is_none_or(|status| row.status == status)
+            && self
+                .pillar
+                .is_none_or(|pillar| row.pillars.iter().any(|stored| stored == pillar))
+            && self
+                .aws_service
+                .is_none_or(|service| row.aws_services.iter().any(|stored| stored == service))
+            && self.source.is_none_or(|source| row.source == source)
+            && self
+                .check_identifier
+                .is_none_or(|check| row.check_arn == Some(check))
+            && after.is_none_or(|bound| row.last_updated_at_millis >= bound)
+            && before.is_none_or(|bound| row.last_updated_at_millis <= bound)
+    }
+
+    /// The cursor scope of a read of `list` under these filters: [`list_scope`]
+    /// over the filters in force, under the member names the requests carry and
+    /// in the order both reads list them — so a token issued under one filter
+    /// set cannot resume a differently filtered sequence. The two timestamp
+    /// bounds enter it on the same millisecond scale the predicate compares
+    /// them on.
+    pub fn scope(&self, list: &str) -> String {
+        let (after, before) = self.bounds_millis();
+        let after = after.map(|millis| millis.to_string());
+        let before = before.map(|millis| millis.to_string());
+        list_scope(
+            list,
+            &[
+                ("type", self.r#type),
+                ("status", self.status),
+                ("pillar", self.pillar),
+                ("awsService", self.aws_service),
+                ("source", self.source),
+                ("checkIdentifier", self.check_identifier),
+                ("afterLastUpdatedAt", after.as_deref()),
+                ("beforeLastUpdatedAt", before.as_deref()),
+            ],
+        )
     }
 }
 

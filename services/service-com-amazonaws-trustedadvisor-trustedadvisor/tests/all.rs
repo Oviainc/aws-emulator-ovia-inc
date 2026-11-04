@@ -57,6 +57,8 @@ mod resource_arn_owning_account;
 mod seeded_support_plan;
 #[path = "all/shared_lifecycle_write.rs"]
 mod shared_lifecycle_write;
+#[path = "all/shared_recommendation_filters.rs"]
+mod shared_recommendation_filters;
 #[path = "all/shared_resource_view.rs"]
 mod shared_resource_view;
 #[path = "all/state_roundtrip.rs"]

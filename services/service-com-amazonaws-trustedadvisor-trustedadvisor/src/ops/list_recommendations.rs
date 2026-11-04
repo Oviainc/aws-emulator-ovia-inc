@@ -4,7 +4,10 @@
 //! Reports the stored recommendations from [`crate::state`], one
 //! `RecommendationSummary` per [`crate::state::RecommendationEntry`] the
 //! request's filters keep, in recommendation-ARN order and cut into a page by
-//! the shared cursor helper.
+//! the shared cursor helper. The filters themselves are the ones
+//! `ListOrganizationRecommendations` cuts its rows on too, so the predicate and
+//! the cursor scope they contribute are the SHARED
+//! [`crate::state::RecommendationFilters`] rather than this handler's own.
 //!
 //! This is the ACCOUNT-level listing (`RecommendationSummary` is documented
 //! "Summary of Recommendation for an Account" and its `arn` is an
@@ -116,8 +119,9 @@ use super::types::*;
 /// The stored recommendation, as the modelled `RecommendationSummary`, with its
 /// `name` in the language the request asked for (`None` when it named none).
 ///
-/// The date-time conversion both bounds go through is
-/// [`crate::state::millis_of`], shared with the organization-level listing.
+/// Which recommendations are reported is decided by
+/// [`crate::state::RecommendationFilters`], the one predicate this listing and
+/// the organization-level listing share.
 ///
 /// `statusReason` is left absent: the store records no discrepancy in how a
 /// status was determined, and the member is optional.
@@ -246,42 +250,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
-        // `afterLastUpdatedAt` / `beforeLastUpdatedAt` are inclusive bounds on
-        // the stored `lastUpdatedAt`; every other filter is an equality (or
-        // membership) test. An absent filter keeps every recommendation.
-        let after = input
-            .after_last_updated_at
-            .as_ref()
-            .map(crate::state::millis_of);
-        let before = input
-            .before_last_updated_at
-            .as_ref()
-            .map(crate::state::millis_of);
-
+        // The eight filters this read cuts on, and the ONE predicate they
+        // select a stored recommendation with — the same one the
+        // organization-level listing applies
+        // ([`crate::state::RecommendationFilters`]), so the two cannot select
+        // differently on the members both entry types carry.
+        let filters = crate::state::RecommendationFilters {
+            r#type: input.r#type.as_deref(),
+            status: input.status.as_deref(),
+            pillar: input.pillar.as_deref(),
+            aws_service: input.aws_service.as_deref(),
+            source: input.source.as_deref(),
+            check_identifier: input.check_identifier.as_deref(),
+            after_last_updated_at: input.after_last_updated_at.as_ref(),
+            before_last_updated_at: input.before_last_updated_at.as_ref(),
+        };
         let matching: Vec<(String, RecommendationSummary)> = state
             .recommendations
             .iter()
             .filter(|(_, entry)| {
                 // The row's own ARN names its owning account: another account's
                 // recommendation is not part of this account's listing, whatever
-                // the request's filters keep.
-                !crate::state::is_foreign_resource(&entry.arn)
-                    && input.r#type.as_ref().is_none_or(|kind| &entry.r#type == kind)
-                    && input.status.as_ref().is_none_or(|status| &entry.status == status)
-                    && input
-                        .pillar
-                        .as_ref()
-                        .is_none_or(|pillar| entry.pillars.iter().any(|stored| stored == pillar))
-                    && input.aws_service.as_ref().is_none_or(|service| {
-                        entry.aws_services.iter().any(|stored| stored == service)
-                    })
-                    && input.source.as_ref().is_none_or(|source| &entry.source == source)
-                    && input
-                        .check_identifier
-                        .as_ref()
-                        .is_none_or(|check| entry.check_arn.as_ref() == Some(check))
-                    && after.is_none_or(|bound| entry.last_updated_at_millis >= bound)
-                    && before.is_none_or(|bound| entry.last_updated_at_millis <= bound)
+                // the request's filters keep. That test is this listing's own —
+                // it is orthogonal to the eight shared filters.
+                !crate::state::is_foreign_resource(&entry.arn) && filters.keeps(*entry)
             })
             .map(|(arn, entry)| {
                 (
@@ -297,23 +289,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         // The cursor's scope carries this read's filters, so a token issued
-        // under one filter set cannot resume a differently filtered sequence.
-        let after_scope = after.map(|millis| millis.to_string());
-        let before_scope = before.map(|millis| millis.to_string());
+        // under one filter set cannot resume a differently filtered sequence —
+        // named and ordered once, beside the predicate.
         let page = crate::state::paginate(
-            &crate::state::list_scope(
-                "recommendations",
-                &[
-                    ("type", input.r#type.as_deref()),
-                    ("status", input.status.as_deref()),
-                    ("pillar", input.pillar.as_deref()),
-                    ("awsService", input.aws_service.as_deref()),
-                    ("source", input.source.as_deref()),
-                    ("checkIdentifier", input.check_identifier.as_deref()),
-                    ("afterLastUpdatedAt", after_scope.as_deref()),
-                    ("beforeLastUpdatedAt", before_scope.as_deref()),
-                ],
-            ),
+            &filters.scope("recommendations"),
             matching,
             input.next_token.as_deref(),
             input.max_results,
