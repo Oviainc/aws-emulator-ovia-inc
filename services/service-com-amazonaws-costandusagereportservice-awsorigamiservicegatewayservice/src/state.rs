@@ -13,7 +13,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
-use crate::ops::types::{ReportDefinition, ReportStatus, ResourceNotFoundException, Tag};
+use crate::ops::types::{
+    ReportDefinition, ReportStatus, ResourceNotFoundException, Tag, ValidationException,
+};
 
 /// How many report definitions one account may hold.
 ///
@@ -45,6 +47,34 @@ pub const MAX_TAGS_PER_REPORT: usize = 50;
 /// handlers that answer this refusal cannot drift apart.
 pub fn report_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException { message: None }
+}
+
+/// The type every report definition this service holds is of.
+///
+/// The service's one resource is the Cost and Usage Report, and no member of the model
+/// names its type (`smithy_query(query="digest")` lists no report-type shape), so the
+/// single type this service's reports carry is stated here rather than read off a
+/// request. It is a variable part of [`report_to_update_not_found`] only in the sense
+/// that the sentence names it: a service holding one type always fills it the same way.
+const REPORT_TYPE: &str = "CUR";
+
+/// The refusal for an UPDATE naming a report the account does not hold.
+///
+/// Unlike the tag plane's [`report_not_found`], the update path refuses with the
+/// operation's own `ValidationException` — the only client-input error it models — and
+/// that refusal multiplexes several conditions, so the message is what tells them apart
+/// and it IDENTIFIES the report the update could not find: the name the request named,
+/// the type of report the service looked for ([`REPORT_TYPE`]), and the account the
+/// lookup ran against. The account is this emulator's own canonical one, read through
+/// `engine::emulator_account_id` rather than written as a literal.
+pub fn report_to_update_not_found(report_name: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "The report name [{report_name}] and report type [{REPORT_TYPE}] to be update \
+             doesn't exist in account [{}]",
+            ::engine::emulator_account_id()
+        )),
+    }
 }
 
 /// The billing view a report definition is scoped to when its creation named none: the

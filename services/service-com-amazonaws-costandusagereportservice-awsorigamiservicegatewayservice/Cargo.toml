@@ -24,6 +24,9 @@ tracing = { workspace = true }
 # Hex is the alphabet the modelled DescribeReportDefinitions NextToken pattern allows,
 # so pagination tokens are hex-encoded report names.
 hex = { workspace = true }
+# `validation_message`: how a boundary constraint refusal is worded, shared so this
+# service's envelope and its `@pattern` rendering cannot drift from the other services'.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

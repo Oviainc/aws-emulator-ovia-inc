@@ -134,10 +134,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// its `ReportName`, so a definition carrying a different name renames the report,
     /// keeping its position in creation order and its tags. A `ReportName` the account
     /// does not hold is refused with `ValidationException` (this operation's only
-    /// modelled client-input error) rather than silently succeeding, and so is a rename
-    /// onto a name another report already holds and a definition whose Parquet preference
-    /// is not usable ([`crate::state::parquet_preference_is_usable`]) — the replacement has
-    /// to be a definition the service could deliver.
+    /// modelled client-input error) naming the report the update could not find
+    /// ([`crate::state::report_to_update_not_found`]) rather than silently succeeding,
+    /// and so is a rename onto a name another report already holds and a definition whose
+    /// Parquet preference is not usable
+    /// ([`crate::state::parquet_preference_is_usable`]) — the replacement has to be a
+    /// definition the service could deliver.
     async fn handle(
         &self,
         input: Self::Input,
@@ -156,12 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(at) = store.position(&input.report_name) else {
             return Err(ModifyReportDefinitionErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "The report {} in the request doesn't exist.",
-                        input.report_name
-                    )),
-                },
+                crate::state::report_to_update_not_found(&input.report_name),
             )
             .into());
         };

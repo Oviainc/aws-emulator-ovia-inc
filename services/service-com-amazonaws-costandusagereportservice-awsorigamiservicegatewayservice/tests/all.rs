@@ -15,6 +15,8 @@
 mod modelled_constraints;
 #[path = "all/refusal_envelope.rs"]
 mod refusal_envelope;
+#[path = "all/refusal_message_text.rs"]
+mod refusal_message_text;
 #[path = "all/report_definition_lifecycle.rs"]
 mod report_definition_lifecycle;
 #[path = "all/service_populated_read_back.rs"]
