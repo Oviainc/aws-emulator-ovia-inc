@@ -274,6 +274,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Refused BEFORE the state lock is taken, for the same reason the environment
+        // variable ceiling above is: a batch configuration the request carries is the
+        // caller's alone and needs nothing out of the store to be judged. The window
+        // itself is `crate::state::build_batch_config_violation`.
+        if let Some(message) = input
+            .build_batch_config_override
+            .as_ref()
+            .and_then(crate::state::build_batch_config_violation)
+        {
+            return Err(invalid_input(message));
+        }
+
         // READ PASS: take the shared lock only long enough to copy the project and
         // settle the idempotency question, then release it so none of the
         // caller-driven resolution below runs inside the critical section every other
@@ -301,6 +313,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
+            // A batch build is a per-PROJECT capability: `Project$buildBatchConfig` is
+            // the object "that defines the batch build options for the project", so a
+            // project carrying none has no batch build options at all and nothing is
+            // minted for it. Asserted before the token below, so the refusal does not
+            // depend on whether this request carries an idempotency token.
+            if project.build_batch_config.is_none() {
+                return Err(invalid_input(
+                    crate::state::PROJECT_NOT_BATCH_ENABLED_MESSAGE.to_string(),
+                ));
+            }
+            // The stored configuration is held to the same window a request's override
+            // is: the batch this call starts would otherwise run under a timeout no
+            // batch build could be held to.
+            if let Some(message) = project
+                .build_batch_config
+                .as_ref()
+                .and_then(crate::state::build_batch_config_violation)
+            {
+                return Err(invalid_input(message));
+            }
             if let Some(build_batch) =
                 resolve_idempotency_token(&mut guard, token_key.as_ref(), &fingerprint, now)?
             {
@@ -529,6 +561,18 @@ fn resolve_idempotency_token(
     Ok(state
         .settled_build_batch(&issued.build_id, now)
         .map(|stored| stored.build_batch.clone()))
+}
+
+/// A refusal of the request itself, as this operation's one modelled error for a
+/// malformed input. The `message` is composed by the rule that refused it
+/// (`crate::state::build_batch_config_violation`,
+/// `crate::state::PROJECT_NOT_BATCH_ENABLED_MESSAGE`), so nothing of the request is
+/// quoted here.
+fn invalid_input(message: String) -> StartBuildBatchError {
+    StartBuildBatchErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+    })
+    .into()
 }
 
 /// The project's source with this request's source `*Override` members applied.

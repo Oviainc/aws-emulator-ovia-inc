@@ -20,7 +20,7 @@ use service_com_amazonaws_codebuild_codebuild_20161006::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::project_build_lifecycle::{
-    call, create_project, emulator, error_type, expected_arn, REGION,
+    batch_enabled, call, create_project, emulator, error_type, expected_arn, REGION,
 };
 use super::report_group_lifecycle::create_report_group_body;
 
@@ -184,7 +184,7 @@ async fn project_management_states_codebuilds_fixed_absent_project_sentence() {
 #[tokio::test]
 async fn an_absent_batch_build_is_named_by_its_modelled_shape_name() {
     let router = emulator();
-    create_project(&router, "batch-proj", json!({})).await;
+    create_project(&router, "batch-proj", batch_enabled()).await;
     let (status, answer) = call(&router, "StartBuildBatch", json!({"projectName": "batch-proj"})).await;
     assert_eq!(
         status, 200,

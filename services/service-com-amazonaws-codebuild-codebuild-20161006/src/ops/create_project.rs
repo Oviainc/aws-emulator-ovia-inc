@@ -232,6 +232,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A batch build configuration states the wait the batch it configures is held
+        // to, so a `timeoutInMins` outside the window AWS documents is refused wherever
+        // one is accepted — here, `UpdateProject` and `StartBuildBatch`'s override —
+        // rather than persisted. Needs no state either, so it is checked beside the rule
+        // above.
+        if let Some(message) = input
+            .build_batch_config
+            .as_ref()
+            .and_then(crate::state::build_batch_config_violation)
+        {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&arn),
+            );
+            return Err(CreateProjectErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let mut guard = state.lock();
 
         if guard.projects.contains_key(&input.name) {

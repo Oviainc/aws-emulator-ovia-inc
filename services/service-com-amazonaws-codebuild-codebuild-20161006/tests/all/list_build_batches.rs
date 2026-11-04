@@ -23,7 +23,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::project_build_lifecycle::{
-    call, create_project, emulator, error_type, listed_ids, PAST_THE_SETTLE_SPAN,
+    batch_enabled, call, create_project, emulator, error_type, listed_ids, PAST_THE_SETTLE_SPAN,
 };
 
 /// The bounds `ListBuildBatchesInput$maxResults` is held to, from the model: its target
@@ -79,7 +79,7 @@ async fn start_batches(
     let mut created: Vec<&str> = Vec::new();
     for (project, count) in per_project {
         if !created.contains(project) {
-            create_project(router, project, json!({})).await;
+            create_project(router, project, batch_enabled()).await;
             created.push(project);
         }
         for _ in 0..*count {

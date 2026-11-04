@@ -19,6 +19,8 @@ Issue-Commit: cfbb9a1e24eec7d8c98af7d6e9e62a0e8013f018
 
 > _Note: this issue was identified against the code base at commit `cfbb9a1e24eec7d8c98af7d6e9e62a0e8013f018`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Causes 1, 2 and 6 are FIXED and their replay keys pass. Causes 3, 4 and 5 are NOT: they are re-filed, with the blocker each one is on, as `issues/things-that-do-not-work/20261025T062553Z-codebuild-3-of-the-6-divergence-causes-remain-open.md`, which carries their replay keys so they are not recorded as working. Cause 4's own refusal for a sandbox that cannot take a command IS fixed here (it states CodeBuild's sentence); only its execution half moved._
+
 ## Operation
 StartBuildBatch
 

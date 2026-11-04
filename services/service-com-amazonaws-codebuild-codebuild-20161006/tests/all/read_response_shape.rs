@@ -23,7 +23,9 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::project_build_lifecycle::{call, create_project, emulator, expected_arn, REGION};
+use super::project_build_lifecycle::{
+    batch_enabled, call, create_project, emulator, expected_arn, merged, REGION,
+};
 
 /// The KMS key a run with no `encryptionKey` configured reports, from the default AWS
 /// documents on `Project$encryptionKey`: "If you don't specify a value, CodeBuild uses
@@ -82,7 +84,7 @@ async fn result_collections_are_always_stated_even_when_empty() {
         let mut held_build = "no-such-project:00000000-0000-8000-8000-000000000000".to_string();
         let mut held_batch = held_build.clone();
         if case != "an empty account" {
-            create_project(&router, "shape-proj", json!({})).await;
+            create_project(&router, "shape-proj", batch_enabled()).await;
             let started = read(&router, "StartBuild", json!({"projectName": "shape-proj"})).await;
             held_build = started["build"]["id"]
                 .as_str()
@@ -497,7 +499,7 @@ async fn a_started_run_reports_the_configuration_it_runs_with() {
     for (index, (case, configuration, effective)) in rows.into_iter().enumerate() {
         let router = emulator();
         let project = format!("run-config-{index}");
-        create_project(&router, &project, configuration).await;
+        create_project(&router, &project, merged(configuration, batch_enabled())).await;
 
         // (what starts the run, the member its answer carries, the read that reports
         // it back, the request member and the member the read's answer carries)

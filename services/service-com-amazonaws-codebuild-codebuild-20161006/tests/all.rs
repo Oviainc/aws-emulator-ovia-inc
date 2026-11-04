@@ -81,6 +81,8 @@ mod sandbox_sessions;
 mod source_credential_arn_shape;
 #[path = "all/source_credentials.rs"]
 mod source_credentials;
+#[path = "all/start_build_batch_validation.rs"]
+mod start_build_batch_validation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stop_build_batch.rs"]

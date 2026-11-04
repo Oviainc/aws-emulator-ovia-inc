@@ -106,6 +106,31 @@ pub(crate) async fn create_project(router: &MultiServiceRouter, name: &str, extr
     body["project"].clone()
 }
 
+/// `CreateProject` members that make a project BATCH-ENABLED, for a suite whose subject
+/// is a batch build rather than the batch-enablement rule itself.
+///
+/// `Project$buildBatchConfig` "defines the batch build options for the project", and a
+/// project that carries none cannot be batch built at all — so every suite that starts a
+/// batch build creates its project with one. The suite that owns that rule is
+/// `start_build_batch_validation`.
+pub(crate) fn batch_enabled() -> Value {
+    json!({
+        "buildBatchConfig": {
+            "serviceRole": "arn:aws:iam::000000000000:role/service-role/codebuild",
+            "timeoutInMins": 60,
+        }
+    })
+}
+
+/// `extra` with `more`'s members merged in — for a row that needs its own project
+/// configuration AND one of the fragments above.
+pub(crate) fn merged(mut extra: Value, more: Value) -> Value {
+    if let (Value::Object(target), Value::Object(members)) = (&mut extra, more) {
+        target.extend(members);
+    }
+    extra
+}
+
 /// Start a build of `project_name`, asserting it succeeded, and hand back the build.
 pub(crate) async fn start_build(router: &MultiServiceRouter, body: Value) -> Value {
     let (status, response) = call(router, "StartBuild", body.clone()).await;

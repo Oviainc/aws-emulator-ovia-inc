@@ -27,8 +27,8 @@ use service_com_amazonaws_codebuild_codebuild_20161006::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::project_build_lifecycle::{
-    call, create_project, emulator, emulator_on, error_type, expected_arn, listed_ids,
-    PAST_THE_SETTLE_SPAN, REGION,
+    batch_enabled, call, create_project, emulator, emulator_on, error_type, expected_arn,
+    listed_ids, PAST_THE_SETTLE_SPAN, REGION,
 };
 
 /// Start one batch build of `project` and hand back its id.
@@ -98,7 +98,7 @@ async fn delete_build_batch_removes_a_finished_batch_and_refuses_one_still_runni
     for (target, project) in cases {
         // A fresh emulator per row: a row's state must not depend on the one before.
         let router = emulator();
-        create_project(&router, project, json!({})).await;
+        create_project(&router, project, batch_enabled()).await;
         // Two batch builds, so every row also proves the one the call did not name
         // survives it.
         let first = start_build_batch(&router, project).await;
@@ -267,7 +267,7 @@ async fn delete_build_batch_removes_a_finished_batch_and_refuses_one_still_runni
 #[tokio::test]
 async fn deleting_a_batch_build_does_not_rewind_the_batch_number() {
     let router = emulator();
-    create_project(&router, "del-batch-numbers", json!({})).await;
+    create_project(&router, "del-batch-numbers", batch_enabled()).await;
 
     let mut ids = Vec::new();
     for expected in 1..=3_i64 {

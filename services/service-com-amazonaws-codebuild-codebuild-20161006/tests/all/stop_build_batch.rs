@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::project_build_lifecycle::{
-    call, create_project, emulator, error_type, PAST_THE_SETTLE_SPAN,
+    batch_enabled, call, create_project, emulator, error_type, PAST_THE_SETTLE_SPAN,
 };
 
 /// Start one batch build of `project` and hand back its id.
@@ -71,7 +71,7 @@ async fn stop_build_batch_ends_a_running_batch_and_leaves_a_finished_one_alone()
     for (target, project) in cases {
         // A fresh emulator per row: a row's state must not depend on the one before.
         let router = emulator();
-        create_project(&router, project, json!({})).await;
+        create_project(&router, project, batch_enabled()).await;
         let started = start_build_batch(&router, project).await;
         // A second batch build, so every row also proves the one the call did not
         // name is untouched by it.
@@ -207,7 +207,7 @@ async fn stop_build_batch_ends_a_running_batch_and_leaves_a_finished_one_alone()
 #[tokio::test]
 async fn a_stopped_batch_build_deletes_cleanly() {
     let router = emulator();
-    create_project(&router, "stop-then-delete", json!({})).await;
+    create_project(&router, "stop-then-delete", batch_enabled()).await;
     let id = start_build_batch(&router, "stop-then-delete").await;
 
     // While it runs, the delete is refused — the state the stop below changes.

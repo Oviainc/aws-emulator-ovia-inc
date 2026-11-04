@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // session could ever pick up.
         if !stored.is_running() {
             let status = stored.sandbox.status.clone().unwrap_or_default();
-            return Err(sandbox_not_running(store_id, &status));
+            return Err(sandbox_not_running(&status));
         }
         // Addressed by its own id from here on, so an ARN in the request is stored and
         // reported as the id it names.
@@ -251,11 +251,15 @@ fn sandbox_not_found() -> StartCommandExecutionError {
 
 /// The modelled refusal for a sandbox whose session is not live: there is no session
 /// for a command to run in.
-fn sandbox_not_running(sandbox_id: &str, status: &str) -> StartCommandExecutionError {
+///
+/// CodeBuild states the rule in one fixed clause whose ONLY variable part is the status
+/// the sandbox is actually in, which is read off the stored record rather than written
+/// here — so the same sentence answers a sandbox still in the queue and one that has
+/// stopped, and nothing of the request (above all no identifier) reaches the wire.
+fn sandbox_not_running(status: &str) -> StartCommandExecutionError {
     StartCommandExecutionErrorModeled::InvalidInputException(InvalidInputException {
         message: Some(format!(
-            "Invalid input: sandbox {sandbox_id} is not running (status {status}) and \
-             cannot run a command execution"
+            "Command execution cannot be started if sandbox status is {status}"
         )),
     })
     .into()

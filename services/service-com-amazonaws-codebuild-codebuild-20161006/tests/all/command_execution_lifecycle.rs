@@ -12,7 +12,8 @@
 //! record back under that sandbox. A command execution acts on the sandbox's LIVE
 //! session, so a sandbox the account does not hold is refused with
 //! `ResourceNotFoundException` and one that is not running — still queued, or stopped
-//! — with `InvalidInputException`, and in both cases nothing is persisted. Nothing in
+//! — with `InvalidInputException` stating the status it is in, and in both cases nothing
+//! is persisted. Nothing in
 //! this emulator executes a sandbox command, so the transition the clock owes an
 //! execution ends it in `FAULT` with the reason as its error text and with no exit
 //! code and no output.
@@ -513,8 +514,8 @@ async fn a_command_execution_settles_once_from_stored_state_and_never_changes_ag
 
 /// RULE: a sandbox the account does not hold is refused with
 /// `ResourceNotFoundException`, a sandbox whose session is not live — still queued, or
-/// stopped — with `InvalidInputException` naming its status, and a refused submission
-/// persists nothing.
+/// stopped — with `InvalidInputException` stating the status it is in, and a refused
+/// submission persists nothing.
 #[tokio::test]
 async fn start_command_execution_refuses_a_sandbox_it_cannot_run_a_command_in() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -570,25 +571,25 @@ async fn start_command_execution_refuses_a_sandbox_it_cannot_run_a_command_in() 
         );
     }
 
-    // (case, the sandboxId asked for, the id the refusal must name)
-    let not_live: Vec<(&str, String, String)> = vec![
+    // (case, the sandboxId asked for, the status the refusal must state)
+    let not_live: Vec<(&str, String, &str)> = vec![
         (
             "a sandbox still in the queue",
             queued_id.clone(),
-            queued_id.clone(),
+            state::SANDBOX_STATUS_QUEUED,
         ),
         (
             "a sandbox that has been stopped, by id",
             ended_id.clone(),
-            ended_id.clone(),
+            state::SANDBOX_STATUS_STOPPED,
         ),
         (
             "a sandbox that has been stopped, by ARN",
             ended_arn,
-            ended_id.clone(),
+            state::SANDBOX_STATUS_STOPPED,
         ),
     ];
-    for (case, sandbox_id, named) in not_live {
+    for (case, sandbox_id, status_named) in not_live {
         let (status, body) = call(
             &router,
             "StartCommandExecution",
@@ -600,9 +601,13 @@ async fn start_command_execution_refuses_a_sandbox_it_cannot_run_a_command_in() 
             error_type(&body).contains("InvalidInputException"),
             "{case}: expected InvalidInputException, got {body}"
         );
-        assert!(
-            text(&body, "message").contains(&named),
-            "{case}: the refusal must name the sandbox asked for, got {body}"
+        // CodeBuild states the rule and the status the sandbox is in, and quotes
+        // nothing of the request.
+        assert_eq!(
+            text(&body, "message"),
+            format!("Command execution cannot be started if sandbox status is {status_named}"),
+            "{case}: expected CodeBuild's sentence for a sandbox that cannot take a \
+             command, got {body}"
         );
     }
 
@@ -677,9 +682,13 @@ async fn a_sandbox_started_over_the_wire_runs_commands_only_while_it_is_live() {
         error_type(&body).contains("InvalidInputException"),
         "a sandbox that has been stopped: expected InvalidInputException, got {body}"
     );
-    assert!(
-        text(&body, "message").contains(&sandbox_id),
-        "a sandbox that has been stopped: the refusal must name it, got {body}"
+    assert_eq!(
+        text(&body, "message"),
+        format!(
+            "Command execution cannot be started if sandbox status is {}",
+            state::SANDBOX_STATUS_STOPPED
+        ),
+        "a sandbox that has been stopped: the refusal must state its status, got {body}"
     );
 
     // The execution started while it was live is still there: stopping the sandbox

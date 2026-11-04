@@ -19,6 +19,11 @@ use service_com_amazonaws_codebuild_codebuild_20161006::state::{
 use service_com_amazonaws_codebuild_codebuild_20161006::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+// This suite drives the wire through its own harness (its own region, access key and
+// `call`), and reaches into the shared harness for the ONE fragment both need: the
+// `buildBatchConfig` that makes a project batch-enabled.
+use crate::project_build_lifecycle::batch_enabled;
+
 /// The region every request below is signed for — deliberately not the emulator's
 /// `us-east-1` default, so an ARN assertion proves the region came from the request.
 const REGION: &str = "us-west-2";
@@ -336,7 +341,7 @@ async fn the_project_to_build_batch_path_is_served_from_stored_state() {
     );
 
     // Numbering is per project: another project starts at 1 again.
-    create_project(&router, "other-proj", json!({})).await;
+    create_project(&router, "other-proj", batch_enabled()).await;
     let elsewhere = start_build_batch(&router, json!({"projectName": "other-proj"})).await;
     assert_eq!(
         elsewhere["buildBatchNumber"], 1,
@@ -451,6 +456,7 @@ async fn each_override_replaces_the_project_setting_for_that_batch_build_only() 
             "encryptionKey": "alias/project-key",
             "cache": {"type": "NO_CACHE"},
             "logsConfig": {"cloudWatchLogs": {"status": "DISABLED"}},
+            "buildBatchConfig": {"timeoutInMins": 60},
         }),
     )
     .await;
@@ -694,6 +700,7 @@ async fn environment_variable_overrides_are_merged_by_name_for_a_batch_build() {
         &router,
         "batch-env-proj",
         json!({
+            "buildBatchConfig": {"timeoutInMins": 60},
             "environment": {
                 "type": "LINUX_CONTAINER",
                 "image": "aws/codebuild/standard:7.0",
@@ -792,7 +799,7 @@ async fn environment_variable_overrides_are_merged_by_name_for_a_batch_build() {
 #[tokio::test]
 async fn an_idempotency_token_resolves_to_the_batch_build_it_started() {
     let router = emulator();
-    create_project(&router, "idem-batch-proj", json!({})).await;
+    create_project(&router, "idem-batch-proj", batch_enabled()).await;
 
     let request = json!({"projectName": "idem-batch-proj", "idempotencyToken": "token-1"});
     let first = start_build_batch(&router, request.clone()).await;

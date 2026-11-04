@@ -26,8 +26,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_codebuild_codebuild_20161006::state;
 
 use crate::project_build_lifecycle::{
-    call, create_project, create_project_body, emulator, error_type, expected_arn, listed_ids,
-    PAST_THE_SETTLE_SPAN, REGION,
+    batch_enabled, call, create_project, create_project_body, emulator, error_type, expected_arn,
+    listed_ids, PAST_THE_SETTLE_SPAN, REGION,
 };
 
 /// A well-formed uuid half for a resource id this service never minted: every id it
@@ -414,7 +414,7 @@ async fn deleting_a_batch_build_id_that_denotes_nothing_is_refused() {
         // A fresh emulator per row, holding one finished batch build and one build, so
         // every row proves the refusal removed neither.
         let router = emulator();
-        create_project(&router, "del-batch-kept", json!({})).await;
+        create_project(&router, "del-batch-kept", batch_enabled()).await;
         let kept_batch = start_build_batch(&router, "del-batch-kept").await;
         let kept_build = start_build(&router, "del-batch-kept").await;
         tokio::time::sleep(PAST_THE_SETTLE_SPAN).await;

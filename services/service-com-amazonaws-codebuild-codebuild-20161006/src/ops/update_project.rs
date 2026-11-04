@@ -269,6 +269,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same discipline for the resulting batch build configuration: the window
+        // `crate::state::build_batch_config_violation` describes holds wherever a
+        // `ProjectBuildBatchConfig` is accepted, so an update that would leave the
+        // project configured with a batch timeout outside it is refused and the project
+        // stays as it was.
+        if let Some(message) = project
+            .build_batch_config
+            .as_ref()
+            .and_then(crate::state::build_batch_config_violation)
+        {
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&arn),
+            );
+            return Err(UpdateProjectErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // `lastModified` reports when the project was last changed, so a successful
         // update has to move it. The service clock is millisecond-resolution, so two
         // updates landing inside one millisecond would otherwise report the same

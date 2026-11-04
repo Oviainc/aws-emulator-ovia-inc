@@ -23,7 +23,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::project_build_lifecycle::{
-    call, create_project, emulator, error_type, expected_arn, listed_ids, PAST_THE_SETTLE_SPAN,
+    batch_enabled, call, create_project, emulator, error_type, expected_arn, listed_ids,
+    PAST_THE_SETTLE_SPAN,
 };
 
 /// The bounds `ListBuildBatchesForProjectInput$maxResults` is held to, from the model:
@@ -75,7 +76,7 @@ async fn start_batches(
     let mut started: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (project, count) in per_project {
         if !started.contains_key(*project) {
-            create_project(router, project, json!({})).await;
+            create_project(router, project, batch_enabled()).await;
             started.insert((*project).to_string(), Vec::new());
         }
         for _ in 0..*count {

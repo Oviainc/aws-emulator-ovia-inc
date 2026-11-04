@@ -3895,3 +3895,58 @@ pub fn inline_buildspec_violation(
         )
     })
 }
+
+/// The shortest wait a batch build's own timeout may be set to, in minutes.
+///
+/// `ProjectBuildBatchConfig$timeoutInMins` — "the maximum amount of time, in minutes,
+/// that the batch build must be completed in" — targets the UNCONSTRAINED `WrapperInt`,
+/// so the framework's pre-handler constraint walk holds it to nothing and the service is
+/// what has to. The window is the one the model pins on the sibling member that times
+/// the BUILDS of the same batch: `StartBuildBatchInput$buildTimeoutInMinutesOverride`
+/// targets `BuildTimeOut`, which is `@range(min: 5, max: 2160)`
+/// (`smithy_query(query="shape",shape="BuildTimeOut")`), the same 5..2160 minutes AWS
+/// documents for every CodeBuild timeout in minutes.
+pub const BATCH_TIMEOUT_MIN_MINUTES: i32 = 5;
+
+/// The longest wait a batch build's own timeout may be set to, in minutes. See
+/// [`BATCH_TIMEOUT_MIN_MINUTES`] for where the window comes from.
+pub const BATCH_TIMEOUT_MAX_MINUTES: i32 = 2160;
+
+/// Why `config` cannot be a batch build configuration, as the message the modelled
+/// `InvalidInputException` carries — or `None` when it can.
+///
+/// The one rule here is the timeout window [`BATCH_TIMEOUT_MIN_MINUTES`] describes: a
+/// `timeoutInMins` outside it is a malformed request, so it is refused wherever a
+/// `ProjectBuildBatchConfig` is ACCEPTED — the `buildBatchConfig` of `CreateProject` and
+/// `UpdateProject`, and the `buildBatchConfigOverride` of `StartBuildBatch` — rather
+/// than persisted as a timeout no batch build could ever be held to. A config that
+/// states no timeout at all is accepted: the member is optional.
+pub fn build_batch_config_violation(
+    config: &crate::ops::types::ProjectBuildBatchConfig,
+) -> Option<String> {
+    let minutes = config.timeout_in_mins?;
+    (!(BATCH_TIMEOUT_MIN_MINUTES..=BATCH_TIMEOUT_MAX_MINUTES).contains(&minutes)).then(|| {
+        // CodeBuild states the rule, naming the member at fault and the window it is
+        // held to, and quotes NOTHING of the request — so the sentence is the same for
+        // every rejected value and a client can key on it. Both bounds are read from the
+        // window above rather than written into the text. Recorded behaviour — the model
+        // states no message for the error.
+        format!(
+            "TimeoutInMins must be between {BATCH_TIMEOUT_MIN_MINUTES} and \
+             {BATCH_TIMEOUT_MAX_MINUTES}"
+        )
+    })
+}
+
+/// What CodeBuild states as the reason a project cannot be built as a BATCH, carried by
+/// the modelled `InvalidInputException`.
+///
+/// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule: it quotes neither the project
+/// the request named nor an ARN, so the sentence is the same for every project that is
+/// not batch-enabled. A project's own `buildBatchConfig` "defines the batch build options
+/// for the project", and it is what makes the project batch-capable: one that carries
+/// none has no batch build options at all, so a batch of it is a malformed request rather
+/// than a missing resource — the project itself exists. Recorded behaviour — the model
+/// states no message for the error.
+pub const PROJECT_NOT_BATCH_ENABLED_MESSAGE: &str =
+    "BatchConfig must be configured on the project to use the BuildBatch feature";
