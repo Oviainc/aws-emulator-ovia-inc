@@ -23,6 +23,9 @@ mod encryption_config;
 #[path = "all/enum_value_set_order.rs"]
 mod enum_value_set_order;
 
+#[path = "all/filter_expression_unary_forms.rs"]
+mod filter_expression_unary_forms;
+
 #[path = "all/graphs_rules_retrievals_and_insights.rs"]
 mod graphs_rules_retrievals_and_insights;
 

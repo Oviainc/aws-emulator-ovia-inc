@@ -3614,6 +3614,11 @@ pub mod filter_expression {
     /// (`annotation.<key>`) and a root-cause path (`rootcause.<…>`).
     const KEYWORD_PREFIXES: &[&str] = &["annotation.", "rootcause."];
 
+    /// The keyword whose caller-chosen key may also be written as a SUBSCRIPT —
+    /// `annotation[<key>]` for `annotation.<key>` — which is the form AWS's
+    /// filter-expression reference writes an annotation predicate in.
+    const SUBSCRIPTED_KEYWORD: &str = "annotation";
+
     /// The comparison operators written as words, from the same reference's
     /// string operators. They sit beside `=`, `!=`, `<`, `<=`, `>` and `>=`.
     const WORD_COMPARISONS: &[(&str, Operator)] = &[
@@ -3708,7 +3713,8 @@ pub mod filter_expression {
     /// The punctuation a token may begin with, beside the two string quotes —
     /// the lexemes [`could_begin_a_token`] judges a run of input against.
     const PUNCTUATION: &[&str] = &[
-        "\"", "'", "(", ")", "{", "}", ",", ":", "=", "!=", "<", "<=", ">", ">=",
+        "\"", "'", "(", ")", "{", "}", "[", "]", ",", ":", "=", "!", "!=", "<", "<=", ">",
+        ">=",
     ];
 
     /// The words that are not keyword paths: the boolean operators, the boolean
@@ -3806,6 +3812,10 @@ pub mod filter_expression {
         CloseParen,
         OpenBrace,
         CloseBrace,
+        /// `[`, which opens a subscripted keyword's key.
+        OpenBracket,
+        /// `]`, which closes one.
+        CloseBracket,
         Comma,
         Colon,
     }
@@ -3867,8 +3877,15 @@ pub mod filter_expression {
         And(Box<Node>, Box<Node>),
         /// `left OR right`.
         Or(Box<Node>, Box<Node>),
-        /// `NOT inner`.
+        /// `NOT inner`, written either as the word or as `!`.
         Not(Box<Node>),
+        /// `annotation[<key>]`: whether the field the subscript names is SET at
+        /// all, whatever value it holds — the unary predicate form, which makes
+        /// no comparison.
+        Exists {
+            /// The field's path, as the dotted form writes it.
+            path: String,
+        },
         /// `keyword [ ( arguments ) ] [ { block } | comparison operand ]`.
         Predicate {
             /// The keyword's path, which [`is_indexed_field`] accepted.
@@ -3970,6 +3987,14 @@ pub mod filter_expression {
                     at += 1;
                     push!(start, Token::CloseBrace);
                 }
+                '[' => {
+                    at += 1;
+                    push!(start, Token::OpenBracket);
+                }
+                ']' => {
+                    at += 1;
+                    push!(start, Token::CloseBracket);
+                }
                 ',' => {
                     at += 1;
                     push!(start, Token::Comma);
@@ -4018,16 +4043,19 @@ pub mod filter_expression {
                         })
                     );
                 }
+                // `!` is the language's NEGATION operator, the symbol spelling
+                // of `NOT`, and `!=` is the inequality comparison: which of the
+                // two was written is decided by the character after it, so the
+                // longer lexeme wins and a bare `!` is read as the operator
+                // rather than refused.
                 '!' => {
-                    if characters.get(at + 1) != Some(&'=') {
-                        return Err(invalid_symbol(
-                            characters,
-                            start,
-                            unreadable_symbol(&characters[start..]),
-                        ));
+                    if characters.get(at + 1) == Some(&'=') {
+                        at += 2;
+                        push!(start, Token::Comparison(Operator::NotEqual));
+                    } else {
+                        at += 1;
+                        push!(start, Token::Not);
                     }
-                    at += 2;
-                    push!(start, Token::Comparison(Operator::NotEqual));
                 }
                 digit
                     if digit.is_ascii_digit()
@@ -4088,8 +4116,9 @@ pub mod filter_expression {
     ///
     /// ```text
     /// expression := term (("AND" | "OR") term)*
-    /// term       := "NOT" term | "(" expression ")" | predicate
+    /// term       := ("NOT" | "!") term | "(" expression ")" | predicate | existence
     /// predicate  := keyword ["(" arguments ")"] ["{" expression "}" | comparison operand]
+    /// existence  := "annotation" "[" key "]"
     /// arguments  := argument ("," argument)*
     /// argument   := [label ":"] operand
     /// operand    := text | number | boolean | keyword
@@ -4270,10 +4299,64 @@ pub mod filter_expression {
                 }
                 Some(Token::Field(path)) => {
                     self.at += 1;
+                    if path == SUBSCRIPTED_KEYWORD && self.peek() == Some(&Token::OpenBracket) {
+                        return self.subscripted(path, start, depth);
+                    }
                     self.predicate(path, start, depth)
                 }
                 _ => Err(self.invalid()),
             }
+        }
+
+        /// A keyword whose caller-chosen key is written as a SUBSCRIPT:
+        /// `annotation[<key>]` names the same field as `annotation.<key>`, so
+        /// the two forms are read as one path and whatever follows reads exactly
+        /// as it does after the dotted form. The bare form — a subscript with no
+        /// comparison after it — is the unary predicate: the field is SET.
+        ///
+        /// ```text
+        /// existence := "annotation" "[" key "]"
+        /// key       := word | text
+        /// ```
+        ///
+        /// The key is the caller's own data rather than a name of this language,
+        /// so it is read as whatever was WRITTEN between the brackets: the word
+        /// there, whichever lexeme the tokenizer made of it — a key spelling
+        /// `true`, `and` or `contains` is still that key — or, quoted, whatever
+        /// the quotes hold, which is how a key no bare word can spell is written.
+        fn subscripted(&mut self, root: String, start: usize, depth: usize) -> Result<Node, Error> {
+            self.expect(&Token::OpenBracket)?;
+            let Some(written) = self.tokens.get(self.at).cloned() else {
+                return Err(self.invalid());
+            };
+            let key = match &written.token {
+                Token::Text(text) => text.clone(),
+                _ => {
+                    let word: String = self
+                        .source
+                        .get(written.start..written.end)
+                        .unwrap_or_default()
+                        .iter()
+                        .collect();
+                    if !word.chars().all(is_word_character) {
+                        return Err(self.invalid());
+                    }
+                    word
+                }
+            };
+            self.at += 1;
+            self.expect(&Token::CloseBracket)?;
+            let path = format!("{root}.{key}");
+            // A subscript that names NO key — an empty quoted one — addresses no
+            // field, so it is refused where the keyword was read, exactly as a
+            // word that names no field of the language is.
+            if !is_indexed_field(&path) {
+                return Err(self.unreadable_at(start));
+            }
+            if matches!(self.peek(), Some(Token::Comparison(_))) {
+                return self.predicate(path, start, depth);
+            }
+            Ok(Node::Exists { path })
         }
 
         fn predicate(&mut self, path: String, start: usize, depth: usize) -> Result<Node, Error> {

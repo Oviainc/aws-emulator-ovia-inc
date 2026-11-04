@@ -51,6 +51,13 @@
 //! | `rootcause.responsetime.entity.coverage` | number | `ResponseTimeRootCauseEntity$Coverage` |
 //! | `rootcause.{fault,error,responsetime}.exception.{name,message}` | string | `RootCauseException$Name` / `$Message` |
 //!
+//! An annotation's key is written either after a dot or as a SUBSCRIPT
+//! (`annotation[<key>]`), and both name the one field. A subscript with no
+//! comparison after it is the unary predicate: it asks whether that annotation
+//! is SET at all, whatever value it holds, so a trace that recorded the key
+//! matches and one that never recorded it does not — and negated
+//! (`!annotation[<key>]`, `NOT annotation[<key>]`) it asks the opposite.
+//!
 //! A root-cause keyword is written either as the whole path above or as the
 //! class and part followed by a `{ … }` block whose keywords are that part's
 //! own members — `rootcause.responsetime.entity { name = "…" }` is
@@ -288,6 +295,14 @@ enum Node {
         selector: Selector,
         inner: Option<Box<Node>>,
     },
+    /// Whether a field is SET at all, whatever value it holds — what the unary
+    /// `annotation[<key>]` predicate asks. A key only some of a trace's entities
+    /// recorded is set for the trace when any entity IN SCOPE recorded it, which
+    /// is how every other keyword reads a value a trace carries more than once.
+    Present {
+        /// The annotation key, the one field whose presence this module reads.
+        key: String,
+    },
 }
 
 /// A comparison's right-hand value.
@@ -372,6 +387,7 @@ fn compile(
             Box::new(compile(right, block)?),
         )),
         filter_expression::Node::Not(inner) => Ok(Node::Not(Box::new(compile(inner, block)?))),
+        filter_expression::Node::Exists { path } => compile_exists(path, block),
         filter_expression::Node::Predicate {
             path,
             arguments,
@@ -444,6 +460,26 @@ fn compile_predicate(
     }
 }
 
+/// Compile one unary existence predicate: whether the field the subscript named
+/// is set at all.
+///
+/// An annotation is the one field whose VALUE is the submitted document's rather
+/// than derived, so "was it recorded" is a question this module can answer from
+/// the annotation index; a field whose presence it cannot read is named rather
+/// than answered with silence, exactly as an unevaluated comparison is.
+fn compile_exists(path: &str, inside: Option<RootCauseBlock>) -> Result<Node, FilterError> {
+    let field = match inside {
+        None => field_of(path)?,
+        Some(block) => root_cause_member(block, path)?,
+    };
+    match field {
+        Field::Annotation(key) => Ok(Node::Present { key }),
+        _ => Err(unevaluated(format!(
+            "whether `{path}` is set is not evaluated by this emulator yet"
+        ))),
+    }
+}
+
 /// The scope a `service(…)` / `edge(…)` predicate selects.
 fn selector_of(
     path: &str,
@@ -502,6 +538,7 @@ fn note_reads(node: &Node, reads: &mut Reads) {
             note_reads(right, reads);
         }
         Node::Not(inner) => note_reads(inner, reads),
+        Node::Present { .. } => reads.annotations = true,
         Node::Scoped { selector, inner } => {
             if matches!(selector, Selector::Edge { .. }) {
                 reads.edges = true;
@@ -1047,6 +1084,15 @@ fn evaluate(node: &Node, facts: &Facts<'_>, scope: &Scope, budget: &mut QueryBud
         Node::Compare { field, op, value } => {
             budget.spend(scope.indices().len());
             compare(field, *op, value, facts, scope)
+        }
+        Node::Present { key } => {
+            budget.spend(scope.indices().len());
+            facts
+                .annotations
+                .get(key.as_str())
+                .is_some_and(|recorded| {
+                    recorded.iter().any(|(at, _)| scope.contains(*at))
+                })
         }
         Node::Scoped { selector, inner } => {
             budget.spend(facts.trace.segments.len());
