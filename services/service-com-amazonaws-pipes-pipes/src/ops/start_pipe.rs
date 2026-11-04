@@ -4,8 +4,10 @@
 //! IMPLEMENTED: moves the stored pipe's `DesiredState` to `RUNNING` and its
 //! `CurrentState` through `STARTING`, and starts the data-plane poller that a RUNNING
 //! pipe is. A start that lands while a move is already in flight is
-//! `ConflictException` (409); an unknown name is `NotFoundException` (404). This is the
-//! ONLY file to touch for this operation.
+//! `ConflictException` (409); an unknown name is `NotFoundException` (404). A pipe whose
+//! stored `RoleArn` this service cannot assume ([`crate::state::execution_role`]) cannot be
+//! started: it settles in `START_FAILED` carrying the `StateReason` that says so, and runs
+//! nothing. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -181,10 +183,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         pipe.desired_state = crate::state::requested_state::RUNNING.to_string();
-        pipe.begin_transition(
-            crate::state::pipe_state::STARTING,
-            crate::state::pipe_state::RUNNING,
-        );
+        // Whether this service can assume the role the pipe HOLDS: a start asks the pipe to
+        // run under it, and a role no stage could act as is a start that cannot be
+        // completed. The IAM store of the same engine is read for the length of this one
+        // decision and no call leaves the process while either guard is held.
+        let unassumable =
+            crate::state::execution_role::engine_assume_refusal(&*self.engine, &pipe.role_arn);
+        match &unassumable {
+            None => pipe.begin_transition(
+                crate::state::pipe_state::STARTING,
+                crate::state::pipe_state::RUNNING,
+            ),
+            Some(reason) => pipe.begin_failed_transition(
+                crate::state::pipe_state::STARTING,
+                crate::state::pipe_state::START_FAILED,
+                reason.clone(),
+            ),
+        }
         pipe.last_modified_time = ::std::time::SystemTime::now();
 
         let output = StartPipeOutput {
@@ -199,7 +214,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // accumulated while it was stopped: the poller is started here, outside the
         // lock, and does nothing until the pipe's `STARTING` span has lapsed.
         drop(state);
-        crate::state::data_plane::drive_pipe(ctx, &self.engine, &input.name);
+        if unassumable.is_none() {
+            crate::state::data_plane::drive_pipe(ctx, &self.engine, &input.name);
+        }
         Ok(output)
     }
 }

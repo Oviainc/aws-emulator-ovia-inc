@@ -63,6 +63,61 @@ pub fn iam_state<Eng: Send + Sync + 'static>(
 /// it, as a trust document names one.
 pub const SERVICE_PRINCIPAL: &str = "pipes.amazonaws.com";
 
+/// Why this service cannot assume the role `role_arn` AT ALL, or `None` when nothing of
+/// the kind can be shown.
+///
+/// This is the first half of [`call_refusal`] on its own: a role whose trust document is a
+/// policy that withholds [`ASSUME_ROLE_ACTION`](::service_common::iam_trust_policy::ASSUME_ROLE_ACTION)
+/// from [`SERVICE_PRINCIPAL`] is one no stage of the pipe can act as, so there is nothing
+/// for a pipe carrying it to do and a lifecycle call that stores it cannot complete.
+/// Asked by itself because the answer is about the ROLE rather than about any one call,
+/// and `CreatePipe`/`UpdatePipe` need it before the pipe has made a call at all.
+///
+/// The cases that show nothing are the module's: an engine carrying no IAM store, a
+/// `RoleArn` the store holds no role for (it may belong to another account), a role
+/// carrying no trust document, and a document that cannot be read as a policy.
+pub fn assume_refusal(role_arn: &str, iam: &IamState) -> Option<String> {
+    let role = iam.roles.values().find(|role| role.arn == role_arn)?;
+    let trust = role.assume_role_policy_document.as_deref()?;
+    match ::service_common::iam_trust_policy::admits_service_principal(trust, SERVICE_PRINCIPAL) {
+        Some(false) => Some(assume_failure_reason(role_arn)),
+        _ => None,
+    }
+}
+
+/// [`assume_refusal`] against the IAM store of the shared engine this service runs in, for
+/// a handler that holds the engine rather than a locked IAM state.
+pub fn engine_assume_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    role_arn: &str,
+) -> Option<String> {
+    let iam = iam_state(engine)?;
+    let held = iam.lock();
+    assume_refusal(role_arn, &held)
+}
+
+/// The sentence a pipe reports as its `StateReason` when this service cannot assume the
+/// pipe's execution role: WHICH role it is (the one variable part) and WHY assuming it
+/// fails.
+///
+/// Bounded by [`STATE_REASON_LENGTH_MAX`], so the sentence is always a legal value of the
+/// member that carries it however long the role ARN the request named is.
+pub fn assume_failure_reason(role_arn: &str) -> String {
+    let reason = format!(
+        "Pipes cannot assume the execution role {role_arn}: its trust policy does not let \
+         {SERVICE_PRINCIPAL} perform {}.",
+        ::service_common::iam_trust_policy::ASSUME_ROLE_ACTION
+    );
+    match reason.char_indices().nth(STATE_REASON_LENGTH_MAX) {
+        None => reason,
+        Some((cut, _)) => reason[..cut].to_string(),
+    }
+}
+
+/// The longest `StateReason` a pipe can report. Source: the `@length(min: 0, max: 512)` of
+/// `PipeStateReason` in `smithy-model/com-amazonaws-pipes-pipes.json`.
+pub const STATE_REASON_LENGTH_MAX: usize = 512;
+
 /// Why the role `role_arn` names may not perform `action` on `resource`, or `None` when
 /// nothing of the kind can be shown (see the module docs for the cases that show nothing).
 ///
@@ -75,18 +130,13 @@ pub fn call_refusal(
     resource: &str,
     iam: &IamState,
 ) -> Option<String> {
-    let role = iam.roles.values().find(|role| role.arn == role_arn)?;
+    // A role this account does not hold shows nothing: it may belong to another account.
+    iam.roles.values().find(|role| role.arn == role_arn)?;
     // The trust document first: a role this service cannot assume never reaches its
-    // permissions.
-    let trust = role.assume_role_policy_document.as_deref();
-    if trust.and_then(|document| {
-        ::service_common::iam_trust_policy::admits_service_principal(document, SERVICE_PRINCIPAL)
-    }) == Some(false)
-    {
-        return Some(format!(
-            "its execution role {role_arn} does not let {SERVICE_PRINCIPAL} perform {}",
-            ::service_common::iam_trust_policy::ASSUME_ROLE_ACTION
-        ));
+    // permissions. One reading of it, shared with the lifecycle calls that store the role
+    // ([`assume_refusal`]).
+    if let Some(refusal) = assume_refusal(role_arn, iam) {
+        return Some(refusal);
     }
     // The documents in force on the role. The collection is bounded by IAM's own quotas
     // on how many policies one role carries, so this walk is bounded by the store rather

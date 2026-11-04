@@ -47,6 +47,8 @@ mod pipe_source_checkout;
 mod pipe_tagging;
 #[path = "all/pipe_target_parameter_refusal.rs"]
 mod pipe_target_parameter_refusal;
+#[path = "all/pipe_unassumable_role.rs"]
+mod pipe_unassumable_role;
 #[path = "all/pipe_update.rs"]
 mod pipe_update;
 #[path = "all/state_roundtrip.rs"]

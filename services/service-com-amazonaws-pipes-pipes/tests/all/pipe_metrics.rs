@@ -16,9 +16,11 @@
 //!
 //! The rows differ along what the rule generalises over — WHICH stage makes the call
 //! (source, enrichment, target), and WHY the role does or does not bar it (a grant, an
-//! explicit deny, policies stating nothing about the action, a trust document naming
-//! another service, and a role the account does not hold at all, which shows nothing and
-//! lets the call through).
+//! explicit deny, policies stating nothing about the action, and a role the account does
+//! not hold at all, which shows nothing and lets the call through).
+//!
+//! A role whose TRUST document withholds the assume is not a row here: such a pipe never
+//! reaches `RUNNING` at all, which is `tests/all/pipe_unassumable_role.rs`.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -416,15 +418,6 @@ async fn a_running_pipe_publishes_its_counters_and_fails_the_stage_its_role_bars
             case: "source-receive-not-stated",
             trust: Some(SERVICE_PRINCIPAL),
             allowed: &["sqs:SendMessage"],
-            denied: None,
-            enrichment: false,
-            delivered: false,
-            moved: &[EXECUTION_FAILED_METRIC],
-        },
-        Row {
-            case: "trust-names-another-service",
-            trust: Some("lambda.amazonaws.com"),
-            allowed: &["sqs:*"],
             denied: None,
             enrichment: false,
             delivered: false,

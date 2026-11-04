@@ -8,8 +8,10 @@
 //! the enrichment, deliver each event to the target — is [`data_plane`].
 //!
 //! Two modules serve the stages that data plane runs: [`execution_role`], the decision of
-//! whether the pipe's own `RoleArn` lets a stage make the call it is about to make, and
-//! [`metrics`], the CloudWatch series the running pipe publishes about its executions —
+//! whether the pipe's own `RoleArn` lets a stage make the call it is about to make — and,
+//! before any stage runs, whether this service can assume that role at all, which is what
+//! the lifecycle calls that store a role settle the pipe's terminal failure state from —
+//! and [`metrics`], the CloudWatch series the running pipe publishes about its executions —
 //! the only signal that distinguishes a pipe whose stage was refused from a pipe that
 //! never ran.
 
@@ -36,6 +38,13 @@ pub mod pipe_state {
     pub const STOPPING: &str = "STOPPING";
     pub const DELETING: &str = "DELETING";
     pub const UPDATING: &str = "UPDATING";
+    /// Where a pipe rests when the creation `CREATING` began could not be completed.
+    pub const CREATE_FAILED: &str = "CREATE_FAILED";
+    /// Where a pipe rests when the start `STARTING` began could not be completed.
+    pub const START_FAILED: &str = "START_FAILED";
+    /// Where a pipe rests when the reconfiguration `UPDATING` began could not be
+    /// completed.
+    pub const UPDATE_FAILED: &str = "UPDATE_FAILED";
 }
 
 /// The `PipeState` values that mean "a move this pipe is already making has not landed
@@ -840,13 +849,17 @@ const DEFAULT_REGION: &str = "us-east-1";
 /// pipe (see [`ComAmazonawsPipesPipesState::settle_due_transitions`]).
 pub const STATE_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
-/// A state move the clock owes a pipe: at `due_at` its `CurrentState` becomes `to`.
+/// A state move the clock owes a pipe: at `due_at` its `CurrentState` becomes `to`, and
+/// its `StateReason` becomes `reason` — the sentence that says why the move landed where
+/// it did, which a move that simply succeeded has none of.
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
     /// The monotonic instant the move became (or becomes) due.
     pub due_at: Instant,
     /// The `PipeState` the pipe settles into.
     pub to: String,
+    /// The `StateReason` the pipe carries once it has settled, if the move has one.
+    pub reason: Option<String>,
 }
 
 /// The move owed to the clock when a lifecycle call starts a transition into `to`.
@@ -854,6 +867,22 @@ pub fn pending_transition(to: &str) -> PendingTransition {
     PendingTransition {
         due_at: Instant::now() + STATE_SETTLE_DELAY,
         to: to.to_string(),
+        reason: None,
+    }
+}
+
+/// The move owed to the clock when a lifecycle call cannot be completed: the pipe settles
+/// in the terminal failure state `to` of the move that was in flight, carrying `reason` as
+/// its `StateReason`.
+///
+/// The failure is settled rather than answered, because the call itself was accepted — the
+/// state pair (`DesiredState` the caller asked for, `CurrentState` the pipe reached) plus
+/// `StateReason` is where the pipe reports it.
+pub fn failed_transition(to: &str, reason: String) -> PendingTransition {
+    PendingTransition {
+        due_at: Instant::now() + STATE_SETTLE_DELAY,
+        to: to.to_string(),
+        reason: Some(reason),
     }
 }
 
@@ -894,15 +923,28 @@ impl PipeRecord {
         self.pending = Some(pending_transition(settled));
     }
 
+    /// Put the pipe into `transient` now and owe it the FAILURE of that move: at the same
+    /// span [`begin_transition`](Self::begin_transition) uses it settles in `failed`,
+    /// carrying `reason`.
+    pub fn begin_failed_transition(&mut self, transient: &str, failed: &str, reason: String) {
+        self.current_state = transient.to_string();
+        self.pending = Some(failed_transition(failed, reason));
+    }
+
     /// Materialise the move the clock has ALREADY made due, if it has. A no-op while the
     /// move is still in the future, so a caller acting immediately still sees the
     /// transient state.
+    ///
+    /// The `StateReason` is the settled move's own: a move that failed installs the
+    /// sentence saying why, and one that simply landed clears whatever a previous failure
+    /// had left, because the reason describes the state the pipe is in now.
     pub fn settle(&mut self, now: Instant) {
         let settled = match &self.pending {
-            Some(pending) if now >= pending.due_at => pending.to.clone(),
+            Some(pending) if now >= pending.due_at => pending.clone(),
             _ => return,
         };
-        self.current_state = settled;
+        self.current_state = settled.to;
+        self.state_reason = settled.reason;
         self.pending = None;
     }
 

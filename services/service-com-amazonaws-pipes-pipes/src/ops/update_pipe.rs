@@ -7,8 +7,11 @@
 //! mid-transition is `ConflictException` (409); `SourceParameters` the pipe's source
 //! cannot have, and a configuration the resources it names cannot hold (a batch size past
 //! what the target takes per delivery, a FIFO queue target with no message group id, a
-//! filter that is not an event pattern), are `ValidationException` (400). This is the ONLY
-//! file to touch for this operation.
+//! filter that is not an event pattern), are `ValidationException` (400). An update that
+//! leaves the pipe on a `RoleArn` this service cannot assume
+//! ([`crate::state::execution_role`]) cannot be completed: the pipe settles in
+//! `UPDATE_FAILED` carrying the `StateReason` that says so, and runs nothing. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -225,6 +228,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // Whether this service can assume the role this update stores, decided against
+        // the account's own IAM records BEFORE the pipes store is locked. A role whose
+        // trust policy withholds the assume is one no stage of the pipe could act as, so
+        // the reconfiguration this call starts cannot be completed.
+        let unassumable =
+            crate::state::execution_role::engine_assume_refusal(&*self.engine, &input.role_arn);
+
         let mut state = store.lock();
         state.settle_due_transitions();
 
@@ -337,8 +347,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let settled = pipe.desired_state.clone();
         // The move the clock owes: `UPDATING` now, then the state the pipe is meant to
         // be in. Never zero, so a caller acting straight after this call still sees
-        // `UPDATING`.
-        pipe.begin_transition(crate::state::pipe_state::UPDATING, &settled);
+        // `UPDATING`. An update that left the pipe on a role this service cannot assume
+        // settles in `UPDATE_FAILED` instead, carrying the reason: the call was accepted,
+        // so the failure is a state the pipe rests in rather than an answer to it.
+        match &unassumable {
+            None => pipe.begin_transition(crate::state::pipe_state::UPDATING, &settled),
+            Some(reason) => pipe.begin_failed_transition(
+                crate::state::pipe_state::UPDATING,
+                crate::state::pipe_state::UPDATE_FAILED,
+                reason.clone(),
+            ),
+        }
         pipe.last_modified_time = ::std::time::SystemTime::now();
 
         let output = UpdatePipeOutput {
@@ -352,7 +371,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An update that leaves the pipe meant to RUN starts its poller if the pipe has
         // none — an update that stopped it needs no call, because the poller ends itself
         // as soon as the pipe is no longer RUNNING.
-        let runnable = settled == crate::state::requested_state::RUNNING;
+        let runnable =
+            settled == crate::state::requested_state::RUNNING && unassumable.is_none();
         drop(state);
         if runnable {
             crate::state::data_plane::drive_pipe(ctx, &self.engine, &input.name);

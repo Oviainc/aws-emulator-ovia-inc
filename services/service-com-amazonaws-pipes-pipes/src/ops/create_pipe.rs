@@ -11,7 +11,10 @@
 //! with the `BadRequestException` (400) the tagging layer answers a broken tag rule with,
 //! so a pipe cannot be created carrying a tag `TagResource` would refuse. A pipe the caller
 //! asked to RUN also gets its data-plane poller ([`crate::state::data_plane`]), which is
-//! what makes the pipe move records with no further client action. This is the ONLY file
+//! what makes the pipe move records with no further client action — unless this service
+//! cannot assume the pipe's `RoleArn` at all ([`crate::state::execution_role`]), in which
+//! case the creation this call accepted cannot be completed and the pipe settles in
+//! `CREATE_FAILED` carrying the `StateReason` that says so. This is the ONLY file
 //! to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -265,6 +268,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx.parts());
+        // Whether this service can assume the role the pipe is to act as, decided against
+        // the account's own IAM records BEFORE the pipes store is locked. A role whose
+        // trust policy withholds the assume is one no stage of the pipe could ever act
+        // as, so the creation this call starts cannot be completed.
+        let unassumable =
+            crate::state::execution_role::engine_assume_refusal(&*self.engine, &input.role_arn);
         let mut state = store.lock();
         state.settle_due_transitions();
 
@@ -300,15 +309,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A pipe AWS has just accepted is reported `CREATING` and reaches the state the
         // caller asked for a moment later; the record stores that due instant rather than
-        // sleeping for it.
+        // sleeping for it. A pipe this service cannot assume the role of reaches
+        // `CREATE_FAILED` instead, at the same span and carrying the reason — the creation
+        // was accepted, so the failure is a state the pipe settles in rather than an
+        // answer to this call.
         let now = ::std::time::SystemTime::now();
+        let pending = match &unassumable {
+            None => crate::state::pending_transition(&desired_state),
+            Some(reason) => crate::state::failed_transition(
+                crate::state::pipe_state::CREATE_FAILED,
+                reason.clone(),
+            ),
+        };
         let record = crate::state::PipeRecord {
             arn: crate::state::pipe_arn(&region, &input.name),
             name: input.name.clone(),
             description: crate::state::stored_description(input.description.clone()),
             current_state: crate::state::pipe_state::CREATING.to_string(),
-            // The move the clock owes: `CREATING` -> the state the caller asked for.
-            pending: Some(crate::state::pending_transition(&desired_state)),
+            // The move the clock owes: `CREATING` -> where this creation lands.
+            pending: Some(pending),
             desired_state,
             state_reason: None,
             source: input.source.clone(),
@@ -339,7 +358,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_modified_time: Some(crate::state::timestamp(record.last_modified_time)),
         };
         let name = record.name.clone();
-        let runnable = record.desired_state == crate::state::requested_state::RUNNING;
+        let runnable = record.desired_state == crate::state::requested_state::RUNNING
+            && unassumable.is_none();
         state.pipes.insert(name.clone(), record);
         // The data plane of a pipe the caller asked to RUN: the lock is released first,
         // and the poller waits out the `CREATING` span before it consumes anything, so
