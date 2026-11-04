@@ -19,6 +19,8 @@ mod application_create_refusals;
 mod application_deletion;
 #[path = "all/application_listing.rs"]
 mod application_listing;
+#[path = "all/application_plane_identity.rs"]
+mod application_plane_identity;
 #[path = "all/application_updates.rs"]
 mod application_updates;
 #[path = "all/applications.rs"]

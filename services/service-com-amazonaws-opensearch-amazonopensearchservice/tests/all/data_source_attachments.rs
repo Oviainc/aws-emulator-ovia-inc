@@ -304,7 +304,7 @@ async fn the_listing_reports_every_attachment_of_the_application() {
             assert_eq!(
                 answer.body["arn"],
                 json!(format!(
-                    "arn:aws:es:us-east-1:{}:application/{id}",
+                    "arn:aws:opensearch:us-east-1:{}:application/{id}",
                     engine::emulator_account_id()
                 )),
                 "case {case}: the attach reports the application's own ARN, got {:?}",

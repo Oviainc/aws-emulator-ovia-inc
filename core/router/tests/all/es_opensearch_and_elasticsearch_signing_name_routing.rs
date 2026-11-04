@@ -429,11 +429,15 @@ fn the_es_endpoint_serves_both_api_versions() {
                             "workspace": { "createWorkspace": true, "name": "router-workspace" },
                         },
                     })),
-                    expected_status: 409,
+                    // The shape's `@httpError` is 409 and this operation carries it
+                    // under the status the service was recorded answering its own miss
+                    // with.
+                    expected_status: 404,
                     expected_error: Some("ResourceNotFoundException"),
-                    // A SUB-API of an application names the id it could not resolve;
-                    // only the modern model declares the operation at all.
-                    expected_contains: &["Application abc123xyz not found"],
+                    // The refusal states that no such application exists and names the
+                    // id it could not resolve; only the modern model declares the
+                    // operation at all.
+                    expected_contains: &["Application abc123xyz does not exist"],
                     expected_absent: &[],
                 },
                 Call {

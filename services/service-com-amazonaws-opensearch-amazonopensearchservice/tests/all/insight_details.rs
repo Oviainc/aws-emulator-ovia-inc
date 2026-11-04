@@ -13,8 +13,10 @@
 //! its stored name, type and value, in the order the insight holds them — rendering
 //! each value with the markup the field carries when the request asks for HTML content
 //! and as plain content otherwise; the insight is addressed by the ENTITY and the id
-//! together, and an address this read cannot resolve — either half of it — is refused
-//! as ONE missing resource naming neither half; and nothing is written.
+//! together, and an ENTITY this read cannot resolve is refused as ONE missing resource
+//! naming neither half of the address, while an id that entity holds no insight under
+//! is answered with the ONE field the service states about an insight's details rather
+//! than refused; and nothing is written.
 //!
 //! So the assertions span a SET of inputs rather than one call: a table of fields
 //! covering both values of `InsightFieldType`, a field with a marked-up rendering and
@@ -265,35 +267,54 @@ fn reported_value(reported: &[Value], name: &str, case: &str) -> String {
         .unwrap_or_else(|| panic!("case {case}: expected the field {name:?} to be reported"))
 }
 
-/// A read whose ADDRESS this service cannot resolve, asserted as the rule states it:
-/// the modelled missing-resource error, on the status this service's recorded wire
-/// answer carries it on, with a sentence that names NEITHER half of the address.
-///
-/// `names_entity` is the entity as a caller names it: the domain name of a
-/// `DomainName` entity, and the account id an `Account` entity stands for.
-fn address_not_found(answer: &Answer, case: &str, insight_id: &str, names_entity: &str) {
-    refused(
-        answer,
-        case,
-        RECORDED_NOT_FOUND_STATUS,
-        "ResourceNotFoundException",
-    );
-    let said = answer.body["message"].as_str().unwrap_or_default();
+/// The guidance view, asserted as the rule states it: the ONE field the service states
+/// about an insight's details, under the name and the modelled type it states it with
+/// and carrying the service's own sentence — whichever entity and id the read named,
+/// and in either rendering, because the guidance is content the service states rather
+/// than content it marks up.
+fn guidance(answer: &Answer, case: &str) -> Vec<Value> {
+    /// The sentence the service states about an insight's details, as the wire answer
+    /// recorded for a detail read words it.
+    const GUIDANCE: &str = "Please use the Amazon OpenSearch Console to view the Insight \
+                            Details for a better user experience.";
+
+    let reported = fields(answer, case);
     assert_eq!(
-        said, "Resource not found",
-        "case {case}: expected the fixed missing-resource sentence, got {:?}",
+        reported.len(),
+        1,
+        "case {case}: expected the one guidance field, got {:?}",
         answer.body
     );
-    assert!(
-        !said.contains(insight_id) && !said.contains(names_entity),
-        "case {case}: expected the refusal to name neither half of the address, got {said:?}"
+    let field = &reported[0];
+    assert_eq!(
+        field["Name"].as_str(),
+        Some("Message"),
+        "case {case}: expected the guidance field's name, got {field:?}"
     );
-    // A refusal carries no detail of some other insight either.
+    let field_type = field["Type"].as_str().unwrap_or_default();
+    // The type catalog is the model's own enum, as generated into `ops::types`.
     assert!(
-        answer.body["Fields"].is_null(),
-        "case {case}: expected no Fields on a refusal, got {:?}",
-        answer.body
+        INSIGHT_FIELD_TYPE_VALUES.contains(&field_type),
+        "case {case}: expected a modelled field type, got {field_type:?}"
     );
+    assert_eq!(
+        field_type, "text",
+        "case {case}: expected the guidance to be text, got {field:?}"
+    );
+    assert_eq!(
+        field["Value"].as_str(),
+        Some(GUIDANCE),
+        "case {case}: expected {GUIDANCE:?}, got {field:?}"
+    );
+    // It is the guidance, not some other insight's view: no stored field is reported.
+    for held in field_names() {
+        assert!(
+            !names(&reported).contains(&held),
+            "case {case}: expected no stored field of another insight, got {:?}",
+            names(&reported)
+        );
+    }
+    reported
 }
 
 /// `POST /2021-01-01/opensearch/insights` for `entity` — the listing the detail read
@@ -480,28 +501,23 @@ async fn an_insight_is_addressed_through_the_entity_that_holds_it() {
     // A sibling domain of the same account does not hold this insight, and no
     // `DomainName` entity holds the account's own one: an insight is reported by the
     // entity that holds it, so another entity of the same account resolves no insight
-    // under that id and the read is refused for the address it carried — the id itself
-    // never widens the entity a read is scoped to.
-    for (entity, insight_id, names_entity) in [
-        (
-            domain_entity("insight-detail-other"),
-            id.clone(),
-            "insight-detail-other",
-        ),
+    // under that id and is answered with the guidance view rather than with the
+    // insight — the id itself never widens the entity a read is scoped to.
+    for (entity, insight_id) in [
+        (domain_entity("insight-detail-other"), id.clone()),
         (
             domain_entity("insight-detail-entity"),
             account_wide_id.clone(),
-            "insight-detail-entity",
         ),
     ] {
         let case = format!("DescribeInsightDetails({entity:?}, {insight_id:?})");
         let answer = describe_insight(&emulator, entity.clone(), &insight_id, json!({})).await;
-        address_not_found(&answer, &case, &insight_id, names_entity);
+        guidance(&answer, &case);
     }
 }
 
 #[tokio::test]
-async fn an_id_the_entity_holds_no_insight_under_is_refused() {
+async fn an_id_the_entity_holds_no_insight_under_is_answered_with_the_guidance_view() {
     let emulator = Emulator::new();
     let id = seeded(&emulator, "insight-detail-missing").await;
     create_baseline(&emulator, "insight-detail-nothing").await;
@@ -521,34 +537,22 @@ async fn an_id_the_entity_holds_no_insight_under_is_refused() {
     // the account named both ways — every entity type the model admits, each one this
     // account does hold, so the entity resolves and only the id does not.
     let entities = [
-        (
-            domain_entity("insight-detail-missing"),
-            "insight-detail-missing".to_string(),
-        ),
-        (
-            domain_entity("insight-detail-nothing"),
-            "insight-detail-nothing".to_string(),
-        ),
-        (
-            json!({"Type": "Account"}),
-            engine::emulator_account_id().to_string(),
-        ),
-        (
-            json!({"Type": "Account", "Value": engine::emulator_account_id()}),
-            engine::emulator_account_id().to_string(),
-        ),
+        domain_entity("insight-detail-missing"),
+        domain_entity("insight-detail-nothing"),
+        json!({"Type": "Account"}),
+        json!({"Type": "Account", "Value": engine::emulator_account_id()}),
     ];
 
-    for (entity, names_entity) in &entities {
+    for entity in &entities {
         let before = list(&emulator, entity.clone()).await;
         for unheld in &unheld_ids {
             assert_ne!(
                 unheld, &id,
                 "case DescribeInsightDetails({unheld:?}): the row must name another id"
             );
-            // The three ways a request can answer `ShowHtmlContent`: an address that
-            // resolves nothing is refused whichever rendering was asked for, because
-            // `ShowHtmlContent` only picks how a field it HAS is reported.
+            // The three ways a request can answer `ShowHtmlContent`: the guidance is
+            // content the service states rather than content it marks up, so every one
+            // of them is answered with the same sentence.
             for extra in [
                 json!({}),
                 json!({"ShowHtmlContent": false}),
@@ -557,15 +561,16 @@ async fn an_id_the_entity_holds_no_insight_under_is_refused() {
                 let case = format!("DescribeInsightDetails({entity:?}, {unheld:?}, {extra:?})");
                 let answer =
                     describe_insight(&emulator, entity.clone(), unheld, extra.clone()).await;
-                address_not_found(&answer, &case, unheld, names_entity);
+                let reported = guidance(&answer, &case);
 
                 // A report: a second identical read answers exactly the same.
                 let again =
                     describe_insight(&emulator, entity.clone(), unheld, extra.clone()).await;
                 assert_eq!(
-                    (again.status, again.body),
-                    (answer.status, answer.body.clone()),
-                    "case {case}(twice): expected the same refusal"
+                    fields(&again, &case),
+                    reported,
+                    "case {case}(twice): expected the same guidance view, got {:?}",
+                    again.body
                 );
             }
         }

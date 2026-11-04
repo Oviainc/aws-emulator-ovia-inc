@@ -243,7 +243,7 @@ async fn a_created_application_round_trips_through_get() {
         assert_eq!(
             created.body["arn"],
             json!(format!(
-                "arn:aws:es:{REGION}:{}:application/{id}",
+                "arn:aws:opensearch:{REGION}:{}:application/{id}",
                 engine::emulator_account_id()
             )),
             "case {case}: the create reports the application's own ARN, got {:?}",

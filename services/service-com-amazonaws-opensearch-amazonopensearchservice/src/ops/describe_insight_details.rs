@@ -6,9 +6,10 @@
 //! request addresses ([`crate::state::InsightDetailField`]), in the order they are
 //! stored, each rendered with its markup or as plain content according to the
 //! request's `ShowHtmlContent`. The insight is addressed by the entity that holds it
-//! and its own id together, and an address this service cannot resolve — an entity
-//! this account does not hold, or an id that entity holds no insight under — is
-//! reported as ONE missing resource naming neither half of it. It
+//! and its own id together: an ENTITY this service cannot resolve is reported as ONE
+//! missing resource naming neither half of the address, while an id that entity holds
+//! no insight under is not refused at all — it is answered with the guidance the
+//! service states about an insight's details ([`GUIDANCE`]). It
 //! only REPORTS: an insight and its fields are raised by the service observing a
 //! domain, never by a read of them.
 //!
@@ -196,12 +197,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account does not hold and one outside `InsightEntityType` are told apart here
         // exactly as a listing tells them apart.
         //
-        // An address this service cannot resolve — either half of it — is reported as
-        // ONE missing resource, naming neither half: which of the two failed to resolve
-        // is not disclosed, exactly as the feedback submission that addresses an insight
-        // the same way reports it ([`crate::state::insight_resource_not_found`]) — on
-        // the status its recorded wire answer carries
+        // An ENTITY this service cannot resolve is reported as ONE missing resource,
+        // naming neither half of the address: which half failed to resolve is not
+        // disclosed, exactly as the feedback submission that addresses an insight the
+        // same way reports it ([`crate::state::insight_resource_not_found`]) — on the
+        // status its recorded wire answer carries
         // ([`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`]).
+        //
+        // The ID is not resolved that way: a detail read of an id the entity holds no
+        // insight under is ANSWERED, which is what the recorded wire answer for such a
+        // read does, so it resolves to no insight of that entity rather than to a
+        // refusal.
         let address_not_found = || {
             crate::scaffolded::Scaffolded::not_found(
                 DescribeInsightDetailsErrorModeled::ResourceNotFoundException(
@@ -216,8 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 InsightEntityRefusal::Validation(payload) => {
                     DescribeInsightDetailsErrorModeled::ValidationException(payload).into()
                 }
-            })?
-            .ok_or_else(address_not_found)?;
+            })?;
 
         // "Specifies whether to show response with HTML content in response or not":
         // it picks the rendering each field's content is reported in, so the fields a
@@ -227,15 +232,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(SHOW_HTML_CONTENT_DEFAULT);
 
         // "The list of fields that contain detailed information about the insight", in
-        // the order they are held: the insight's OWN stored fields, and an EMPTY list
-        // where the service has raised none for it — an insight that exists and details
-        // nothing. Nothing is reported for an insight that does not exist.
-        let fields = insight
-            .details
-            .iter()
-            .map(|field| field.to_insight_field(show_html))
-            .collect();
+        // the order they are held. An insight this entity holds details with its own
+        // stored fields — an EMPTY list where the service has raised none for it, an
+        // insight that exists and details nothing — and an id it holds no insight
+        // under details with the guidance the service states about an insight's
+        // details, which is the whole of what it answers where there is no stored
+        // detail to report.
+        let fields = match insight {
+            Some(insight) => insight
+                .details
+                .iter()
+                .map(|field| field.to_insight_field(show_html))
+                .collect(),
+            None => guidance_details()
+                .iter()
+                .map(|field| field.to_insight_field(show_html))
+                .collect(),
+        };
 
         Ok(DescribeInsightDetailsOutput { fields })
     }
+}
+
+/// The `InsightDetailsField$Name` the service states its own guidance under.
+const GUIDANCE_FIELD: &str = "Message";
+
+/// The guidance the service states about an insight's details, as the recorded wire
+/// answer for a detail read words it: the details are rendered in the console, so what
+/// this API answers is the direction there.
+const GUIDANCE: &str = "Please use the Amazon OpenSearch Console to view the Insight \
+                        Details for a better user experience.";
+
+/// The detail fields a read of an insight the service holds no detail fields for is
+/// answered with: the ONE field above.
+///
+/// A detail read is not keyed on an insight existing under the requested id — any id of
+/// the modelled `GUID` form is answered rather than refused — and `Fields` is
+/// `@required`, so the view carries this field where there is no stored detail to
+/// report. It carries no part of the request and no stored insight: the service states
+/// the same guidance whichever entity and id a read names.
+fn guidance_details() -> Vec<crate::state::InsightDetailField> {
+    vec![crate::state::InsightDetailField {
+        name: GUIDANCE_FIELD.to_string(),
+        field_type: crate::state::INSIGHT_FIELD_TYPE_TEXT.to_string(),
+        value: GUIDANCE.to_string(),
+        // The guidance is content the service states, not content it marks up, so a
+        // request asking for HTML content is answered with the same sentence.
+        html_value: None,
+    }]
 }

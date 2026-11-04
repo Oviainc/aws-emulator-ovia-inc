@@ -18,11 +18,12 @@
 //!   is the missing resource, and against a domain the account holds, where the SAME
 //!   request earns the handler's own refusal, so resolving first does not suppress the
 //!   rules that follow;
-//! * a read of ONE insight refuses an address it cannot resolve as one missing resource,
+//! * a read of ONE insight refuses an ENTITY it cannot resolve as one missing resource,
 //!   naming neither the entity nor the id — over a table of entities this account holds
-//!   nothing for and of ids no entity holds an insight under — while an entity whose
-//!   type is outside the published set stays the malformed request it is, and the
-//!   insight an entity DOES hold is reported;
+//!   nothing for, each against several ids — while an entity whose type is outside the
+//!   published set stays the malformed request it is, the insight an entity DOES hold is
+//!   reported, and an id a resolved entity holds no insight under is answered with the
+//!   guidance the service states about an insight's details;
 //! * each of those refusals is answered on the status this service's recorded wire
 //!   answer carries a missing-resource refusal on
 //!   ([`RECORDED_NOT_FOUND_STATUS`]), which is not the status the error shape's own
@@ -202,7 +203,7 @@ async fn an_absent_domain_is_refused_before_the_maintenance_start_requires_a_nod
 }
 
 #[tokio::test]
-async fn a_read_of_one_insight_names_neither_half_of_an_address_it_cannot_resolve() {
+async fn a_read_of_one_insight_names_neither_half_of_an_entity_it_cannot_resolve() {
     let emulator = Emulator::new();
     let held = "insight-address";
     created_domain(&emulator, held).await;
@@ -270,8 +271,12 @@ async fn a_read_of_one_insight_names_neither_half_of_an_address_it_cannot_resolv
         );
     }
 
-    // Only the ADDRESS decides, and both halves of it have to resolve: the insight this
-    // entity DOES hold is reported.
+    // Only the ENTITY half of the address decides whether the read resolves: the
+    // insight this entity DOES hold is reported, and an id it holds no insight under is
+    // ANSWERED — with the guidance the service states about an insight's details, which
+    // is what the recorded wire answer for such a read carries (the detail read of
+    // `opensearch-domain-insights-operations`), so the id is not resolved the way the
+    // entity is.
     let held_id = guid("00000000000a");
     raise_on_domain(
         &emulator,
@@ -289,11 +294,15 @@ async fn a_read_of_one_insight_names_neither_half_of_an_address_it_cannot_resolv
         let answer = describe_insight(&emulator, domain_entity(held), id, json!({})).await;
         let case = format!("DescribeInsightDetails(DomainName {held:?}, {id})");
         assert_eq!(
-            (answer.status, error_code(&answer).as_str()),
-            (RECORDED_NOT_FOUND_STATUS, "ResourceNotFoundException"),
-            "case {case}: an id this entity holds no insight under resolves nothing, so expected \
-             {RECORDED_NOT_FOUND_STATUS} ResourceNotFoundException, got {} with {:?}",
-            answer.status,
+            answer.status, 200,
+            "case {case}: an id a RESOLVED entity holds no insight under is answered, so \
+             expected 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.body["Fields"][0]["Name"].as_str(),
+            Some("Message"),
+            "case {case}: expected the guidance field the service states, got {:?}",
             answer.body
         );
     }

@@ -16,16 +16,24 @@
 //!   including each published length bound — with the read repeated to show it
 //!   changes nothing and the next write replacing the previous value;
 //! * while nothing is default the read is refused with the modelled
-//!   `ResourceNotFoundException`, and a write that clears the setting answers with
-//!   NO `applicationArn` member rather than an empty one;
+//!   `ResourceNotFoundException`, and a write either way answers with the
+//!   `applicationArn` the request named — the application the call acted on —
+//!   including the write that clears the setting;
 //! * clearing is asked for by naming the ARN in effect: a clear naming any other
 //!   application leaves the setting exactly as it was;
-//! * a value that is not an ARN, and one past each published length bound, are
-//!   refused with `ValidationException` and leave the stored setting untouched.
+//! * a value outside the expression the service validates an application ARN against,
+//!   and one past each published length bound, are refused with `ValidationException`
+//!   and leave the stored setting untouched — the first stated as the constraint
+//!   report that names the member, echoes the value and quotes the expression.
 
 use serde_json::{json, Value};
 
+use super::constraint_refusal_messages::{clause, expression, message, report};
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX};
+
+/// The expression the service validates an application ARN against, as the refusal
+/// quotes it — the one the wire refusal recorded for this operation states.
+const ARN_EXPRESSION: &str = r"arn:aws[a-z\-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]+:[a-z0-9-]*/(.+)";
 
 /// `GetDefaultApplicationSetting`: `GET /opensearch/defaultApplicationSetting`.
 async fn get(emulator: &Emulator) -> Answer {
@@ -99,9 +107,9 @@ fn arn_rows() -> Vec<String> {
         "arn:aws:es:us-east-1:123456789012:application/abc123".to_string(),
         // Another partition, Region and account.
         "arn:aws-cn:es:cn-north-1:210987654321:application/d4t4".to_string(),
-        // A resource carrying colons: the resource is the ARN's last field, so the
-        // colons belong to it.
-        "arn:aws:es:eu-west-1:123456789012:application:with:colons".to_string(),
+        // A resource carrying colons AFTER its type: the resource is the ARN's last
+        // field, so the colons belong to it.
+        "arn:aws:es:eu-west-1:123456789012:application/with:colons".to_string(),
         // Exactly the shortest ARN the constraint allows (20 characters).
         "arn:aws:es:a:1:a/abc".to_string(),
         // Exactly the longest (2048 characters).
@@ -168,7 +176,7 @@ async fn the_default_application_setting_round_trips_whatever_arn_is_written_to_
 }
 
 #[tokio::test]
-async fn an_unset_default_application_setting_is_not_found_and_clearing_reports_no_arn() {
+async fn an_unset_default_application_setting_is_not_found_and_clearing_reports_the_arn() {
     for arn in arn_rows() {
         let case = format!("clear({}..)", label(&arn));
         let emulator = Emulator::new();
@@ -196,11 +204,12 @@ async fn an_unset_default_application_setting_is_not_found_and_clearing_reports_
             "case {case}: expected 200 from the clear, got {} with {:?}",
             cleared.status, cleared.body
         );
-        // Nothing is default any more, so the answer carries NO `applicationArn`
-        // member — not the member with an empty value.
-        assert!(
-            cleared.body.get("applicationArn").is_none(),
-            "case {case}: a cleared setting must report no applicationArn member, got {:?}",
+        // The answer names the application the call acted on, which is the one the
+        // request named — the clear reports the ARN it cleared.
+        assert_eq!(
+            reported_arn(&cleared, &case),
+            arn,
+            "case {case}: the clear must report the ARN it was asked about, got {:?}",
             cleared.body
         );
 
@@ -244,12 +253,13 @@ async fn clearing_an_application_that_is_not_the_default_leaves_the_setting_in_e
             "case {case}: expected 200, got {} with {:?}",
             answer.status, answer.body
         );
-        // The answer reports the setting in effect after the call, which the request
-        // did not name and so did not change.
+        // The answer reports the application the request named, while the SETTING —
+        // read back through the operation that reports it — is the one the request did
+        // not name and so did not change.
         assert_eq!(
             &reported_arn(&answer, &case),
-            in_effect,
-            "case {case}: expected the untouched default back, got {:?}",
+            other,
+            "case {case}: expected the ARN the request named back, got {:?}",
             answer.body
         );
         let read = get(&emulator).await;
@@ -263,33 +273,34 @@ async fn clearing_an_application_that_is_not_the_default_leaves_the_setting_in_e
 }
 
 #[tokio::test]
-async fn a_value_that_is_not_an_arn_is_refused_and_the_stored_setting_stands() {
+async fn a_value_outside_the_arn_expression_is_refused_and_the_stored_setting_stands() {
     let emulator = Emulator::new();
     let in_effect = arn_rows()[0].clone();
     put(&emulator, &in_effect, true).await;
 
     // Inside `ARN`'s length bound (20..2048) and so past the boundary validator, yet
-    // not an ARN: no `arn` literal, too few fields, or an empty partition, service or
-    // resource field.
-    let too_long = format!("{}x", longest_arn());
-    let malformed: Vec<&str> = vec![
+    // outside the expression the service validates an application ARN against: no `arn`
+    // literal, too few fields, an empty partition or service field, an account that is
+    // not digits, a resource naming no value under its type, or the literal in another
+    // case. Each is refused with the constraint report that echoes the value, names the
+    // member and quotes the expression.
+    let outside: Vec<&str> = vec![
         "not-an-arn-at-all-xx",
         "arn:aws:es:us-east-1:application/abc",
         "arn:aws:es:us-east-1:123456789012:",
+        "arn:aws:es:us-east-1:123456789012:application",
         "arn::es:us-east-1:123456789012:application/abc",
         "arn:aws::us-east-1:123456789012:application/abc",
+        "arn:aws:es:us-east-1:not-an-account:application/abc",
         "ARN:aws:es:us-east-1:123456789012:application/abc",
-        // One past each published length bound: refused at the request boundary.
-        "arn:aws:es:a:1:a/ab",
-        too_long.as_str(),
     ];
 
-    for value in malformed {
+    for value in outside {
         let case = format!("PutDefaultApplicationSetting({:?}..)", label(value));
         let answer = put(&emulator, value, true).await;
         assert_eq!(
             answer.status, 400,
-            "case {case}: expected 400 for a value that is not an ARN, got {} with {:?}",
+            "case {case}: expected 400 for a value outside the expression, got {} with {:?}",
             answer.status, answer.body
         );
         assert_eq!(
@@ -298,9 +309,46 @@ async fn a_value_that_is_not_an_arn_is_refused_and_the_stored_setting_stands() {
             "case {case}: expected ValidationException, got {:?}",
             answer.body
         );
+        let expected = report(&[clause(
+            value,
+            "applicationArn",
+            &expression(ARN_EXPRESSION),
+        )]);
+        let stated = message(&answer, &case);
+        assert_eq!(
+            stated, expected,
+            "case {case}: expected {expected:?}, got {stated:?}"
+        );
 
         // A refused write stored nothing: the setting still holds what the accepted
         // write put in effect.
+        let read = get(&emulator).await;
+        assert_eq!(
+            reported_arn(&read, &case),
+            in_effect,
+            "case {case}: a refused write must leave the setting as it was, got {:?}",
+            read.body
+        );
+    }
+
+    // One past each published length bound: refused at the request boundary, against
+    // `ARN`'s own `@length`, rather than against the expression above.
+    let too_long = format!("{}x", longest_arn());
+    for value in ["arn:aws:es:a:1:a/ab", too_long.as_str()] {
+        let case = format!("PutDefaultApplicationSetting({:?}..)", label(value));
+        let answer = put(&emulator, value, true).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case}: expected 400 for a value past a published length bound, got {} with \
+             {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            error_code(&answer),
+            "ValidationException",
+            "case {case}: expected ValidationException, got {:?}",
+            answer.body
+        );
         let read = get(&emulator).await;
         assert_eq!(
             reported_arn(&read, &case),

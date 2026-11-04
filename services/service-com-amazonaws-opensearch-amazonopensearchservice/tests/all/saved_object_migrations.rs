@@ -674,7 +674,7 @@ async fn a_request_the_service_cannot_run_is_refused_and_starts_nothing() {
                 "source": { "datasourceArn": SOURCE },
                 "workspace": { "workspaceId": "ws-reporting" },
             }),
-            409,
+            404,
             "ResourceNotFoundException",
         ),
     ];

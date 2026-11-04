@@ -15,7 +15,9 @@
 //!
 //! A `clientToken` a start was already served under answers with THAT job rather than
 //! starting another, and an `applicationId` naming no application of this account names
-//! nothing to migrate into ([`crate::state::application_not_found`]).
+//! nothing to migrate into: that miss is the modelled not-found shape stating that no
+//! such application exists and naming the id ([`application_does_not_exist`]), under
+//! the status the service answers it with ([`APPLICATION_NOT_FOUND_STATUS`]).
 //!
 //! ## Shape of an operation
 //!
@@ -97,10 +99,9 @@
 use super::types::*;
 
 use crate::state::{
-    application_not_found_named, migration_client_token_taken, migration_quota_exceeded,
-    migration_workspace_refusal, service_state, state_unavailable,
-    unsupported_conflict_resolution, Migration, CONFLICT_RESOLUTION_VALUES, MIGRATION_QUOTA,
-    MIGRATION_STATUS_PENDING,
+    migration_client_token_taken, migration_quota_exceeded, migration_workspace_refusal,
+    service_state, state_unavailable, unsupported_conflict_resolution, Migration,
+    CONFLICT_RESOLUTION_VALUES, MIGRATION_QUOTA, MIGRATION_STATUS_PENDING,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -137,6 +138,29 @@ pub type StartMigrationError = crate::scaffolded::Scaffolded<StartMigrationError
 impl From<StartMigrationErrorModeled> for StartMigrationError {
     fn from(modeled: StartMigrationErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The status this operation answers an `applicationId` naming no application of this
+/// account with.
+///
+/// This model annotates `ResourceNotFoundException` with `@httpError(409)`, and the
+/// recorded wire answer for a start naming an application this account does not hold is
+/// HTTP 404 — the status a missing resource is reported under — so the modelled shape
+/// and its message travel under that status instead.
+const APPLICATION_NOT_FOUND_STATUS: u16 = 404;
+
+/// The `ResourceNotFoundException` payload for an `applicationId` naming no application
+/// of this account.
+///
+/// It states what the application surface states about such an id — that no such
+/// application exists ([`crate::state::APPLICATION_DOES_NOT_EXIST`]) — with the id the
+/// request carried named in it, because a start names the application among its other
+/// input and the refusal tells a caller WHICH value could not be resolved. That is how
+/// the wire refusal recorded for this operation words it.
+fn application_does_not_exist(application_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Application {application_id} does not exist")),
     }
 }
 
@@ -229,12 +253,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The job migrates saved objects INTO an application's workspace, so an id
-        // naming no application of this account names nothing to migrate into.
+        // naming no application of this account names nothing to migrate into. The
+        // refusal is the modelled not-found shape carried under the status the service
+        // was recorded answering THIS operation's miss with
+        // ([`APPLICATION_NOT_FOUND_STATUS`]) rather than the status the shape's own
+        // `@httpError` annotates.
         if !store.applications.contains_key(&input.application_id) {
-            return Err(StartMigrationErrorModeled::ResourceNotFoundException(
-                application_not_found_named(&input.application_id),
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                StartMigrationErrorModeled::ResourceNotFoundException(application_does_not_exist(
+                    &input.application_id,
+                )),
+                APPLICATION_NOT_FOUND_STATUS,
+            ));
         }
 
         // The store is bounded: past its quota a start is refused rather than adding

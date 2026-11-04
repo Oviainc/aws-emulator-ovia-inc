@@ -13,7 +13,9 @@
 //! * a refusal that could not resolve the application a request named states the
 //!   sentence of the SURFACE it was asked on — the fixed one for the CRUD operations
 //!   that address one application, the id for every sub-API of one, and the id with the
-//!   account beside it on the one path whose refusal states both — over a table of ids;
+//!   account beside it on the one path whose refusal states both — over a table of ids,
+//!   with the start of a migration stating that no such application exists, naming the
+//!   id, under the status the service answers its own miss with;
 //! * a create refused for a name the account already uses names that name;
 //! * the two data-source-attachment refusals state the application and the data source,
 //!   each in the words of the operation that answers it, over a table of data sources;
@@ -178,7 +180,6 @@ async fn an_application_refusal_states_the_sentence_of_the_surface_it_was_asked_
                 describe_attachment(&emulator, &id, &arn).await,
             ),
             ("DetachDataSource", detach(&emulator, &id, &arn).await),
-            ("StartMigration", start_migration(&emulator, &id).await),
         ] {
             let case = format!("{operation} for the absent application {id:?}");
             assert_eq!(
@@ -195,6 +196,28 @@ async fn an_application_refusal_states_the_sentence_of_the_surface_it_was_asked_
                 answer.body
             );
         }
+
+        // `StartMigration` states what the CRUD surface states about such an id — that
+        // no such application exists — with the id named in it, under the status the
+        // service answers its miss with: the modelled shape's `@httpError` is 409 and
+        // the recorded answer for a start naming an application this account does not
+        // hold is 404.
+        let started = start_migration(&emulator, &id).await;
+        let case = format!("StartMigration for the absent application {id:?}");
+        let states = format!("Application {id} does not exist");
+        assert_eq!(
+            (started.status, error_code(&started).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case}: expected the modelled not-found under 404, got {} with {:?}",
+            started.status,
+            started.body
+        );
+        assert_eq!(
+            message(&started),
+            states,
+            "case {case}: expected {states:?}, got {:?}",
+            started.body
+        );
 
         // `ListMigrations` models no not-found at all, so the same sentence travels in
         // the client-input error it does model.

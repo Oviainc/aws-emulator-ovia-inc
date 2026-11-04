@@ -57,7 +57,7 @@ const GUID_EXPRESSION: &str =
     r"\p{XDigit}{8}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{12}";
 
 /// The `message` the answer states, with the case named on failure.
-fn message(answer: &Answer, case: &str) -> String {
+pub(crate) fn message(answer: &Answer, case: &str) -> String {
     answer.body["message"]
         .as_str()
         .or_else(|| answer.body["Message"].as_str())
@@ -100,12 +100,12 @@ async fn refuses(
 
 /// One clause of a report: the value echoed, the member path it is stated at and the
 /// requirement it broke.
-fn clause(value: &str, path: &str, requirement: &str) -> String {
+pub(crate) fn clause(value: &str, path: &str, requirement: &str) -> String {
     format!("Value '{value}' at '{path}' failed to satisfy constraint: {requirement}")
 }
 
 /// The whole report over `clauses`, in the envelope AWS states one in.
-fn report(clauses: &[String]) -> String {
+pub(crate) fn report(clauses: &[String]) -> String {
     match clauses {
         [one] => format!("1 validation error detected: {one}"),
         many => format!(
@@ -118,7 +118,7 @@ fn report(clauses: &[String]) -> String {
 
 /// `Member must satisfy regular expression pattern: <expression>`, the framework's own
 /// requirement sentence for a `@pattern`.
-fn expression(stated: &str) -> String {
+pub(crate) fn expression(stated: &str) -> String {
     format!("Member must satisfy regular expression pattern: {stated}")
 }
 

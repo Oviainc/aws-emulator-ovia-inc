@@ -10,10 +10,14 @@
 //! reports the setting IN EFFECT after the call, so a cleared setting answers with
 //! no `applicationArn` at all rather than an empty one.
 //!
-//! The ARN is checked for ARN SYNTAX only: resolving it to a stored application
-//! needs the application registry, which `CreateApplication` (its own stub issue)
-//! owns — so this operation refuses a value no ARN parser would accept and stores
-//! any well-formed one.
+//! The ARN is checked against the expression this service validates an application ARN
+//! against ([`APPLICATION_ARN_PATTERN`]) and no further: resolving it to a stored
+//! application is the application registry's job, so this operation refuses a value
+//! outside that expression — as the constraint report every other value outside its
+//! member's expression is refused with — and stores any value inside it.
+//!
+//! Either way the answer reports the application the call acted on: the ARN the request
+//! named.
 //!
 //! ## Shape of an operation
 //!
@@ -162,13 +166,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
 
         // `ARN`'s modelled constraint is a length bound and the pattern `.*`, so the
-        // boundary accepts any 20..2048-character string: a value that is not an ARN
-        // at all is a bad request, not a setting to store.
-        if !crate::state::is_arn(&input.application_arn) {
-            return Err(PutDefaultApplicationSettingErrorModeled::ValidationException(
-                crate::state::malformed_arn("applicationArn", &input.application_arn),
-            )
-            .into());
+        // boundary accepts any 20..2048-character string: a value outside the
+        // expression this service validates an application ARN against is a bad request
+        // rather than a setting to store, and it is stated as the constraint report
+        // every other value outside its member's expression is refused with.
+        if outside_application_arn_expression(&input.application_arn) {
+            return Err(
+                PutDefaultApplicationSettingErrorModeled::ValidationException(
+                    malformed_application_arn(&input.application_arn),
+                )
+                .into(),
+            );
         }
 
         let mut store = state.lock();
@@ -183,10 +191,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.default_application_arn = None;
         }
 
-        // The answer reports the setting in effect after the call: the ARN just set,
-        // the ARN still in effect, or NO member at all once nothing is default.
+        // The answer reports the APPLICATION the call acted on — "sets the default
+        // application to the application with the specified ARN", and a clear names
+        // "the current applications ARN" — so it carries the ARN the request named,
+        // whether the call made that application the default or cleared it from being
+        // one. What the SETTING now holds is read back through
+        // `GetDefaultApplicationSetting`, which is the operation that reports it.
         Ok(PutDefaultApplicationSettingOutput {
-            application_arn: store.default_application_arn.clone(),
+            application_arn: Some(input.application_arn),
         })
+    }
+}
+
+// =============================================================================
+// The expression this operation validates `applicationArn` against
+// =============================================================================
+//
+// `ARN` is `@length(min: 20, max: 2048)` with `@pattern(".*")`
+// (`smithy_query(query="operation",operation="PutDefaultApplicationSetting")`), so the
+// request boundary enforces the length and admits every string inside it. The service
+// validates this member against an ARN expression of its own, and the refusal recorded
+// for a value outside it quotes exactly that expression — so the expression is declared
+// below the way a model declares a whole-value pattern, the CHECK runs it as written,
+// and the clause quotes it through `crate::service::validation`'s ONE `@pattern`
+// rendering rather than stating a sentence of this operation's own.
+
+use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+use ::aws_smithy_schema_server::constraints::{validate, PatternTrait};
+use ::std::sync::LazyLock;
+
+/// This service's Smithy namespace, for the shadow member schema below.
+const NAMESPACE: &str = "com.amazonaws.opensearch";
+
+/// The member the ARN is carried at, as the model names it — the name the refusal's
+/// clause states.
+const APPLICATION_ARN_MEMBER: &str = "applicationArn";
+
+/// The expression an application ARN has to satisfy over its WHOLE value: the `arn`
+/// literal, a partition of the `aws` family, a service, a Region field that may be
+/// empty, an account of digits, and a resource naming a type and a value under it.
+///
+/// The model declares `ARN` with `@pattern(".*")`, which admits every string, so this
+/// expression is the service's own: it is the one the wire refusal recorded for this
+/// operation quotes, and it is declared here the way a model declares a whole-value
+/// pattern — the anchors below express how the service applies it, which is no part of
+/// what it quotes.
+const APPLICATION_ARN_PATTERN: &str =
+    r"arn:aws[a-z\-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]+:[a-z0-9-]*/(.+)";
+
+/// [`APPLICATION_ARN_PATTERN`] anchored at both ends, inside a non-capturing group that
+/// keeps any top-level alternation within the anchors, so the WHOLE value has to match.
+static ANCHORED_PATTERN: LazyLock<String> =
+    LazyLock::new(|| format!("^(?:{APPLICATION_ARN_PATTERN})$"));
+
+/// The shadow member's constraints: the anchored expression and nothing else — the
+/// member's `@length` is enforced by the boundary walk already, and checking it twice
+/// would state it twice.
+static MEMBER_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(PatternTrait::new(ANCHORED_PATTERN.as_str())));
+    traits
+});
+
+/// The member schema the validating walk reads: its name gives the violation's path and
+/// its trait map carries the constraint.
+static M_APPLICATION_ARN: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.opensearch#StatedDefaultApplicationSetting$applicationArn",
+        NAMESPACE,
+        APPLICATION_ARN_MEMBER,
+    ),
+    ShapeType::String,
+    APPLICATION_ARN_MEMBER,
+    0,
+)
+.with_traits(&MEMBER_TRAITS);
+
+/// The root of the shadow input the walk is driven over. Its member list is empty on
+/// purpose: the walk visits what [`StatedInput`] WRITES, and a root struct schema
+/// carries no member name, so it contributes no path segment.
+static STATED_INPUT_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "com.amazonaws.opensearch#StatedDefaultApplicationSetting",
+        NAMESPACE,
+        "StatedDefaultApplicationSetting",
+    ),
+    ShapeType::Structure,
+    &[],
+);
+
+/// One request's ARN, written for the validating walk the way the codec writes a string
+/// member.
+struct StatedInput<'a> {
+    application_arn: &'a str,
+}
+
+impl SerializableStruct for StatedInput<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&M_APPLICATION_ARN, self.application_arn)
+    }
+}
+
+/// Whether `value`'s WHOLE value is outside [`APPLICATION_ARN_PATTERN`].
+///
+/// The check is the framework's own walk ([`validate`]) over the shadow member above,
+/// the same walk the request boundary runs for a member the MODEL constrains, so
+/// nothing about constraint checking is re-implemented here.
+fn outside_application_arn_expression(value: &str) -> bool {
+    !validate(&StatedInput { application_arn: value }, &STATED_INPUT_SCHEMA).is_empty()
+}
+
+/// The `ValidationException` payload for an `applicationArn` outside the expression
+/// above: the constraint report, stated through
+/// [`crate::service::validation::constraint_report`] — the one builder of that envelope
+/// — so a caller cannot tell this constraint from one the model's traits carry.
+fn malformed_application_arn(value: &str) -> ValidationException {
+    ValidationException {
+        message: Some(crate::service::validation::constraint_report(
+            APPLICATION_ARN_MEMBER,
+            value,
+            ::aws_smithy_schema_server::ViolationKind::Pattern(APPLICATION_ARN_PATTERN.to_owned()),
+        )),
     }
 }
