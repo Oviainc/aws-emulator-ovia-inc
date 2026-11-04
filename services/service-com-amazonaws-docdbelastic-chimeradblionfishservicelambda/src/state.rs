@@ -835,6 +835,34 @@ pub fn not_found(kind: ResourceKind, arn: &str) -> ResourceNotFoundException {
     }
 }
 
+/// What an ARN-ADDRESSED call answers for a `resourceArn` this store holds no record
+/// under: fixed text that names no resource class and interpolates nothing.
+///
+/// The tagging surface (`POST`, `DELETE` and `GET /tags/{resourceArn}`) addresses its
+/// resource GENERICALLY — by the whole ARN of ANY resource class this service owns,
+/// rather than by a typed identifier of one named class — so it words a miss
+/// generically, where each resource's own reader
+/// ([`ResourceKind::not_found_message`]) was asked for a resource of one named kind and
+/// says which. Like every sentence here the WHOLE message is fixed: the ARN the request
+/// named travels in `ResourceNotFoundException$resourceId`.
+pub const TAGGED_RESOURCE_NOT_FOUND: &str = "Resource was not found";
+
+/// The `ResourceNotFoundException` (HTTP 404) an ARN-addressed tagging call answers for
+/// an ARN this store holds no resource under.
+///
+/// The two structured members are built exactly as [`not_found`] builds them — the ARN
+/// in `resourceId`, and in `resourceType` the class the ARN's own resource segment
+/// names ([`tagged_resource_kind`]), which is the one thing a generic sentence does not
+/// state — while the message is the generic [`TAGGED_RESOURCE_NOT_FOUND`]. One
+/// constructor for the whole tagging surface, so a tag write, a tag removal and a tag
+/// read of the same ARN cannot word one miss three ways.
+pub fn tagged_resource_not_found(arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: TAGGED_RESOURCE_NOT_FOUND.to_string(),
+        ..not_found(tagged_resource_kind(arn), arn)
+    }
+}
+
 /// The `ConflictException` (HTTP 409) for a request that collides with the already
 /// existing resource `arn` of kind `kind`.
 ///

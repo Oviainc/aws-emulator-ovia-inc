@@ -4,16 +4,19 @@
 //!
 //! The rule these suites assert: a request naming an identifier this store holds no
 //! resource under is refused 404 `ResourceNotFoundException` whose `message` is the
-//! FIXED sentence of the resource class the operation addressed — the whole message is
-//! fixed text, with no part taken from the request — and the identifier the request
-//! named is reported in `resourceId` alone.
+//! FIXED sentence of the resource the operation ADDRESSED — the class's own sentence
+//! where the operation was asked for a resource of one named class, and the generic
+//! resource sentence where it addresses any class by bare ARN — the whole message being
+//! fixed text, with no part taken from the request, and the identifier the request named
+//! being reported in `resourceId` alone.
 //!
 //! The rule generalises over the operation, over the resource class and over the form
 //! of the identifier, so the table below spans every not-found path of the implemented
 //! lifecycle and, for each, identifiers differing in region, account, which ARN
 //! resource segment they spell, their length and whether they are an ARN at all: the
 //! sentence must be the same for all of them, which is exactly what an interpolated
-//! message is not.
+//! message is not. The ARN-addressed tagging surface has its own suite
+//! (`tagging_not_found_sentence`), which spans all three of its operations.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -34,6 +37,12 @@ const CLUSTER_SENTENCE: &str = "Unable to find the cluster";
 /// The same sentence for the other resource class this service owns, the cluster
 /// snapshot: one fixed sentence per class, naming the class and nothing else.
 const SNAPSHOT_SENTENCE: &str = "Unable to find the snapshot";
+
+/// The sentence an operation that addresses ANY class by bare ARN answers instead,
+/// naming no class at all.
+///
+/// Recorded AWS behavior for the tag operations, whose only identifier is an `Arn`.
+const TAGGED_RESOURCE_SENTENCE: &str = "Resource was not found";
 
 /// A SigV4 `Authorization` header for this service in [`REGION`].
 fn authorization() -> String {
@@ -184,9 +193,8 @@ struct Lookup {
     path: fn(&str) -> String,
     /// The request body, built from the identifier when the identifier travels in it.
     body: fn(&str) -> Option<Value>,
-    /// The fixed sentence this path must answer, given the identifier: every row but
-    /// the tagging one ignores it, because the class comes from the operation.
-    sentence: fn(&str) -> &'static str,
+    /// The fixed sentence this path must answer, whatever identifier it was handed.
+    sentence: &'static str,
     /// The ARN resource segment of the class looked up, and of the other class.
     segments: (&'static str, &'static str),
 }
@@ -199,7 +207,7 @@ fn lookups() -> Vec<Lookup> {
             method: "GET",
             path: |arn| format!("/cluster/{}", label(arn)),
             body: |_| None,
-            sentence: |_| CLUSTER_SENTENCE,
+            sentence: CLUSTER_SENTENCE,
             segments: ("cluster", "cluster-snapshot"),
         },
         Lookup {
@@ -207,7 +215,7 @@ fn lookups() -> Vec<Lookup> {
             method: "PUT",
             path: |arn| format!("/cluster/{}", label(arn)),
             body: |_| Some(json!({"shardCount": 2})),
-            sentence: |_| CLUSTER_SENTENCE,
+            sentence: CLUSTER_SENTENCE,
             segments: ("cluster", "cluster-snapshot"),
         },
         Lookup {
@@ -215,7 +223,7 @@ fn lookups() -> Vec<Lookup> {
             method: "DELETE",
             path: |arn| format!("/cluster/{}", label(arn)),
             body: |_| None,
-            sentence: |_| CLUSTER_SENTENCE,
+            sentence: CLUSTER_SENTENCE,
             segments: ("cluster", "cluster-snapshot"),
         },
         Lookup {
@@ -226,7 +234,7 @@ fn lookups() -> Vec<Lookup> {
             method: "POST",
             path: |_| "/cluster-snapshot".to_string(),
             body: |arn| Some(json!({"clusterArn": arn, "snapshotName": "probe-snapshot"})),
-            sentence: |_| CLUSTER_SENTENCE,
+            sentence: CLUSTER_SENTENCE,
             segments: ("cluster", "cluster-snapshot"),
         },
         Lookup {
@@ -234,7 +242,7 @@ fn lookups() -> Vec<Lookup> {
             method: "GET",
             path: |arn| format!("/pending-action/{}", label(arn)),
             body: |_| None,
-            sentence: |_| CLUSTER_SENTENCE,
+            sentence: CLUSTER_SENTENCE,
             segments: ("cluster", "cluster-snapshot"),
         },
         Lookup {
@@ -248,7 +256,7 @@ fn lookups() -> Vec<Lookup> {
                     "optInType": "IMMEDIATE",
                 }))
             },
-            sentence: |_| CLUSTER_SENTENCE,
+            sentence: CLUSTER_SENTENCE,
             segments: ("cluster", "cluster-snapshot"),
         },
         Lookup {
@@ -256,7 +264,7 @@ fn lookups() -> Vec<Lookup> {
             method: "GET",
             path: |arn| format!("/cluster-snapshot/{}", label(arn)),
             body: |_| None,
-            sentence: |_| SNAPSHOT_SENTENCE,
+            sentence: SNAPSHOT_SENTENCE,
             segments: ("cluster-snapshot", "cluster"),
         },
         Lookup {
@@ -264,7 +272,7 @@ fn lookups() -> Vec<Lookup> {
             method: "DELETE",
             path: |arn| format!("/cluster-snapshot/{}", label(arn)),
             body: |_| None,
-            sentence: |_| SNAPSHOT_SENTENCE,
+            sentence: SNAPSHOT_SENTENCE,
             segments: ("cluster-snapshot", "cluster"),
         },
         Lookup {
@@ -272,23 +280,18 @@ fn lookups() -> Vec<Lookup> {
             method: "POST",
             path: |arn| format!("/cluster-snapshot/{}/restore", label(arn)),
             body: |_| Some(json!({"clusterName": "restored"})),
-            sentence: |_| SNAPSHOT_SENTENCE,
+            sentence: SNAPSHOT_SENTENCE,
             segments: ("cluster-snapshot", "cluster"),
         },
         Lookup {
-            // A tagging call names no resource class of its own, so the class — and so
-            // the sentence — follows the ARN's own resource segment.
+            // A tagging call is asked for no resource class of its own — its only
+            // identifier is a bare ARN of ANY class this service owns — so it words the
+            // miss generically, whichever segment the ARN spells.
             operation: "ListTagsForResource",
             method: "GET",
             path: |arn| format!("/tags/{}", label(arn)),
             body: |_| None,
-            sentence: |arn| {
-                if arn.contains(":cluster-snapshot/") {
-                    SNAPSHOT_SENTENCE
-                } else {
-                    CLUSTER_SENTENCE
-                }
-            },
+            sentence: TAGGED_RESOURCE_SENTENCE,
             segments: ("cluster", "cluster-snapshot"),
         },
     ]
@@ -342,7 +345,7 @@ async fn a_not_found_refusal_states_the_fixed_sentence_of_its_resource_class() {
                 .as_str()
                 .unwrap_or_else(|| panic!("case {case:?}: the refusal must carry `message`, got {response}"))
                 .to_string();
-            let expected = (lookup.sentence)(&identifier.value);
+            let expected = lookup.sentence;
             assert_eq!(
                 message, expected,
                 "case {case:?}: the refusal must be the fixed sentence {expected:?}, got \

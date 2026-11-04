@@ -39,9 +39,22 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## Naming the error shape a failure is refused with
+//!
+//! Every failure this service answers names its error shape in the `x-amzn-errortype`
+//! header in the QUALIFIED form its wire carries — the shape name, the separator, then
+//! the locator of the namespace that declares it — where the framework's restJson1
+//! renderers write the bare name. [`error_type_locator`] owns that one value and wires it
+//! at the two layers every response of this service passes through: the per-operation
+//! wrapper handed back from [`Service::override_operation`], and the definition wrapper
+//! handed back from [`Service::definition`].
 
+pub mod error_type_locator;
+
+use error_type_locator::{ErrorTypeLocatorDefinition, QualifyingErrorType};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -51,7 +64,13 @@ use std::sync::Arc;
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, with its framework-level error renderers wrapped so a response
+    /// no operation produced names its error shape the way this service names it.
+    entry: ErrorTypeLocatorDefinition<crate::ServiceDefinition<Eng>>,
+    /// Serves each modelled operation exactly as the generated table does, naming the
+    /// error shape of whatever it answers. Held on the service because
+    /// [`Service::override_operation`] hands back a borrow of `self`.
+    qualifying_error_type: QualifyingErrorType,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +79,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: ErrorTypeLocatorDefinition::new(crate::ServiceDefinition::new(engine)),
+            qualifying_error_type: QualifyingErrorType,
         }
     }
 }
@@ -69,7 +89,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
-        // The router reads it through this one accessor. Do not edit the entry.
+        // The router reads it through this one accessor. Do not edit the entry: what is
+        // handed back is that entry under this service's [`ErrorTypeLocatorDefinition`],
+        // which reads identity, protocol and the routing table straight off it and names
+        // the error shape on the three framework-level error renderers.
         &self.entry
     }
 
@@ -91,8 +114,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // NOT a re-route: the operation served is the one the generated routing table
+        // names for this request, wrapped so that every response names its error shape the
+        // way this service's wire names it (see [`QualifyingErrorType`]) — the one place
+        // every operation's response passes. The routing DECISION stays the model's: the
+        // key is resolved by its own protocol, and a request the generated table does not
+        // answer declines here, leaving the router's routing-error path (which the
+        // definition wrapper covers) unchanged.
+        if !self.entry.routes(req) {
+            return None;
+        }
+        Some(&self.qualifying_error_type)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
