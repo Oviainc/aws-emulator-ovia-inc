@@ -92,58 +92,13 @@ const MAX_REFERENCES: usize = 256;
 /// request (or the declaration's `Default`) supplies for such a parameter is the NAME of a
 /// Parameter Store parameter, and the value the deployment runs with is that parameter's own
 /// value.
-const SSM_PARAMETER_TYPE: &str = "AWS::SSM::Parameter::Value<";
-
-/// The parameter VALUES a deployment of `template_body` runs with: the ones submitted, with
-/// every parameter declared under an SSM parameter type replaced by the value Parameter
-/// Store holds under the name it supplies.
 ///
-/// The rule: "when you use an SSM parameter type, CloudFormation retrieves the value of the
-/// Systems Manager parameter and uses it for your stack" — the name is what the template is
-/// given and what the stack reports as that parameter's value
-/// (`Parameter$ParameterValue`), while the VALUE in force, which the template's own
-/// declarations and its `Rules` assertions are evaluated against, is the one the store
-/// answers. A parameter declared under any other type is its submitted value, verbatim.
-///
-/// Read through the SAME in-process, signed call a dynamic reference rides on, so a
-/// parameter resolves against the very records `PutParameter` wrote. A name the store does
-/// not answer for leaves that parameter's submitted value in force: one unanswered read is
-/// no evidence about the parameter, and nothing here invents a value for it.
-pub async fn resolved_parameter_values(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    region: &str,
-    template_body: &str,
-    parameters: &[super::StoredParameter],
-) -> BTreeMap<String, String> {
-    let mut values: BTreeMap<String, String> = parameters
-        .iter()
-        .map(|parameter| (parameter.key.clone(), parameter.value.clone()))
-        .collect();
-    let Some(declared_template) = super::declared_template(template_body) else {
-        return values;
-    };
-    for (key, declared_type) in declared_template.parameter_types() {
-        if !declared_type.starts_with(SSM_PARAMETER_TYPE) {
-            continue;
-        }
-        let Some(name) = values.get(&key).filter(|name| !name.is_empty()) else {
-            continue;
-        };
-        let request = json!({ "Name": name, "WithDecryption": false });
-        let Ok(answer) = call_ssm(ctx, region, GET_PARAMETER, &request).await else {
-            continue;
-        };
-        let Some(held) = answer
-            .pointer("/Parameter/Value")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-        values.insert(key, held);
-    }
-    values
-}
+/// Resolving one is [`super::ssm_parameters`], which is the ONE reader of that rule: it
+/// records the value the store answered on the parameter itself, so the stack reports it as
+/// `Parameter$ResolvedValue` and every later evaluation of the stack's own outputs and
+/// resources resolves to it. Only the SPELLING of the type head lives here, beside the
+/// `{{resolve:ssm:…}}` forms it sits next to.
+pub const SSM_PARAMETER_TYPE: &str = "AWS::SSM::Parameter::Value<";
 
 /// One resolved reference: the value the store answered, and whether that value is one the
 /// stack must keep out of its own records (see the module docs).

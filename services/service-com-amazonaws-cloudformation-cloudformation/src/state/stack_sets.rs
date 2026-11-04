@@ -588,6 +588,9 @@ pub fn parameters_with_overrides(
                 key: parameter.key.clone(),
                 value: overridden.value.clone(),
                 no_echo: parameter.no_echo,
+                // The override states a NAME where the parameter is SSM-typed, so the
+                // value it resolves to is read where the instance is deployed.
+                resolved_value: None,
             },
             None => parameter.clone(),
         })

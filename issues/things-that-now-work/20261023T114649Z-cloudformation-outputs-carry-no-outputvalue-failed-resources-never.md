@@ -36,7 +36,32 @@ Issue-Key: cloudformation__iam__lambda__s3.cfn-delete-stack-removes-iam-role-and
 Issue-Key: cognito-identity-provider|AdminCreateUser|InvalidParameterException
 Issue-Key: events__lambda__s3__stepfunctions|ListExecutions|InvalidArn
 Issue-Key: sfn|StartExecution|InvalidArn
+> _Disposition of the eight numbered causes, so this record does not claim more than was
+> done:_
+>
+> * _Cause 1 (Outputs carry no `OutputValue`) — DECLINED, platform blocker: every unit of it
+>   reads a custom resource's response `Data`, which needs the provider to be INVOKED, and
+>   `services/service-com-amazonaws-lambda-awsgirapiservice/src/ops/invoke.rs` answers
+>   `RequestResponse` with HTTP 501 because this emulator has no in-process runtime for a
+>   deployment package._
+> * _Cause 2 (a failed resource never rolls the stack back) — DECLINED, the same blocker: the
+>   rollback machinery is real and exercised (`tests/all/malformed_policy_document_rollback.rs`);
+>   what is missing is the provider run, or the `AWS::Lambda::Function` provisioning the
+>   related issue below owns._
+> * _Cause 3 (the IAM capability gate) — FIXED (`src/state/template.rs`, `missing_capabilities`)._
+> * _Cause 4 (`TemplateURL`) — FIXED (`src/state/template_url.rs`)._
+> * _Cause 5 (a custom resource's response body is ignored) — DECLINED, the same blocker as
+>   cause 1._
+> * _Cause 6 (SSM-typed parameters and dynamic references) — FIXED
+>   (`src/state/ssm_parameters.rs`, `src/state/dynamic_references.rs`)._
+> * _Cause 7 (per-resource lifecycle events) — FIXED (`src/state/timeline.rs`)._
+> * _Cause 8 (physical ids are the logical id) — DECLINED, platform blocker: it needs a
+>   provisioner arm per type in `src/state/provisioner.rs`, which is 28,667 lines, and the
+>   merge gate's file-length reviewer refuses any fix that touches a file over 5,000 lines
+>   until it is split._
+
 Issue-Commit: 048778663a26e363156c6db724999c4fb229af36
+
 
 # CloudFormation: Outputs carry no OutputValue, failed resources never roll the stack back, capabilities and dynamic references are ignored, and physical ids are logical ids
 

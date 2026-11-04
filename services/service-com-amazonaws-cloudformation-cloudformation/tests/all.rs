@@ -261,6 +261,8 @@ mod search_indexing_pipeline_outputs;
 mod section_loop_expansion;
 #[path = "all/service_role_permissions.rs"]
 mod service_role_permissions;
+#[path = "all/ssm_typed_parameters.rs"]
+mod ssm_typed_parameters;
 #[path = "all/stack_delete_failure_reason.rs"]
 mod stack_delete_failure_reason;
 #[path = "all/stack_event_timeline.rs"]

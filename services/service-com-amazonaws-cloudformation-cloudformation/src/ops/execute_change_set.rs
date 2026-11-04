@@ -221,6 +221,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A change set, like the stack it plans changes for, belongs to the Region the
         // request is signed for.
         let request_region = crate::state::request_region(ctx.parts());
+        // An SSM-typed parameter the change set carries holds the NAME of a Parameter Store
+        // parameter rather than a value, and THIS call is the one that deploys it — a change
+        // set is a plan, so the value in force is the one the store holds when the plan is
+        // executed (`crate::state::ssm_parameters`). The read reaches another service, so it
+        // happens HERE, before the store lock below is taken: the change set's own records
+        // are read under a lock of their own and the resolution runs with it released.
+        let planned = {
+            let store = state.lock();
+            store
+                .resolve_change_set(
+                    &request_region,
+                    &input.change_set_name,
+                    input.stack_name.as_deref(),
+                )
+                .map(|change_set| {
+                    (
+                        change_set.change_set_id.clone(),
+                        change_set.template_body.clone(),
+                        change_set.parameters.clone(),
+                    )
+                })
+        };
+        // `None` for a request that addresses no change set this Region holds, which the
+        // block below refuses with the modelled `ChangeSetNotFoundException`: there is
+        // nothing to resolve for a plan that does not exist.
+        let resolved_parameters = match planned {
+            Some((change_set_id, template_body, parameters)) => {
+                // The values in force for that plan: the ones it carries, plus the
+                // template's own `Default` for a declared parameter it states none for —
+                // the same resolution a create or an update makes before it deploys, and
+                // what decides which of them address a Parameter Store name at all.
+                let mut parameters =
+                    crate::state::parameters_in_force(&template_body, parameters);
+                crate::state::ssm_parameters::resolve(
+                    ctx,
+                    &request_region,
+                    &template_body,
+                    &mut parameters,
+                )
+                .await;
+                Some((change_set_id, parameters))
+            }
+            None => None,
+        };
         // The store is written under the lock and the lock is RELEASED with this block:
         // the calls that create or delete the stack's resources run after it, and each of
         // those reaches another service's own handler, which takes that service's lock.
@@ -302,7 +346,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let stack_id = change_set.stack_id.clone();
             let creates_the_stack = change_set.change_set_type == change_set_type::CREATE;
             let template_body = change_set.template_body.clone();
-            let parameters = change_set.parameters.clone();
+            // The parameters this execution deploys: the change set's own values in force,
+            // with every SSM-typed one carrying the value Parameter Store held when this
+            // call resolved it just above.
+            //
+            // A plan whose id does not match the one that was resolved is not the plan this
+            // request resolved: the change set it addressed was replaced between the two
+            // reads, so the one it named is gone and the execution is refused with the
+            // modelled not-found rather than deploying a plan whose SSM-typed parameters
+            // still carry the NAMES they address.
+            let parameters = match &resolved_parameters {
+                Some((resolved_for, parameters)) if *resolved_for == change_set.change_set_id => {
+                    parameters.clone()
+                }
+                _ => {
+                    return Err(ExecuteChangeSetError::from(
+                        ExecuteChangeSetErrorModeled::ChangeSetNotFoundException(
+                            ChangeSetNotFoundException {
+                                message: Some(crate::state::change_set_does_not_exist(
+                                    &input.change_set_name,
+                                )),
+                            },
+                        ),
+                    ))
+                }
+            };
             let capabilities = change_set.capabilities.clone();
             let tags = change_set.tags.clone();
             let notification_arns = change_set.notification_arns.clone();

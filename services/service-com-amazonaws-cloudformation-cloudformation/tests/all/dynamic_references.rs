@@ -43,7 +43,15 @@ const SSM_TARGET_PREFIX: &str = "AmazonSSM";
 /// One Systems Manager call over the awsJson1_1 wire its model declares, signed for `ssm`
 /// in the Region the stacks here are created in — so a parameter this suite writes is the
 /// one a stack's reference resolves against.
-async fn ssm(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+///
+/// The ONE Systems Manager caller of this crate's suites: `ssm_typed_parameters.rs` writes
+/// and reads the parameters an SSM-TYPED template parameter addresses through it, so the
+/// calling convention is spelled once.
+pub(crate) async fn ssm(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/ssm/aws4_request, \
          SignedHeaders=host, Signature=0123456789abcdef"
@@ -68,8 +76,9 @@ async fn ssm(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16
     (status_code, parsed)
 }
 
-/// Write one parameter a reference can name, and assert the store took it.
-async fn put_parameter(
+/// Write one parameter a reference or an SSM-typed parameter can name, and assert the store
+/// took it.
+pub(crate) async fn put_parameter(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,

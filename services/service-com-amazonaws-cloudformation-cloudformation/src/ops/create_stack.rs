@@ -457,19 +457,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the template's own `Default` for a declared parameter it passed none for.
         // Resolved HERE because the template's own processing reads them — a
         // language-extensions directive counting a list-typed parameter's items among them.
-        let parameters = crate::state::parameters_in_force(&template_body, parameters);
-        // What the DEPLOYMENT evaluates the template against: the values in force, with a
-        // parameter declared under an SSM parameter type carrying the value Parameter Store
-        // holds under the name it supplies
-        // ([`crate::state::dynamic_references::resolved_parameter_values`]). The stack goes
-        // on reporting the submitted value, which is what `Parameter$ParameterValue` is.
-        let parameter_values = crate::state::dynamic_references::resolved_parameter_values(
+        let mut parameters = crate::state::parameters_in_force(&template_body, parameters);
+        // A parameter the template declares with an SSM-typed `Type` carries the NAME of a
+        // Parameter Store parameter, not a value: the value the store holds is read HERE,
+        // before anything is written or deployed, so every expression the template builds
+        // from the parameter carries that value while the stack goes on reporting the name
+        // as `Parameter$ParameterValue` (`crate::state::ssm_parameters`).
+        crate::state::ssm_parameters::resolve(
             ctx,
             &crate::state::request_region(ctx.parts()),
             &template_body,
-            &parameters,
+            &mut parameters,
         )
         .await;
+        let parameter_values = crate::state::parameter_value_map(&parameters);
         // Applying the template's transforms is caller-sized work, so it happens HERE —
         // before the store lock below — and never while every other request waits on that
         // lock. The stage it computes is what the stack deploys.

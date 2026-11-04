@@ -288,7 +288,7 @@ pub fn computed_changes(
     // recreated (see [`propagate_recreations`]) — rather than from a value this emulator
     // claims to know.
     let before_parameters = parameter_values(current.template, current.parameters);
-    let before_types = current.template.parameter_types();
+    let before_types = super::ssm_parameters::parameter_types_in_force(current.template);
     let before = template::Scope {
         stack: current.stack,
         parameters: &before_parameters,
@@ -299,7 +299,7 @@ pub fn computed_changes(
         imports: current.imports,
     };
     let after_parameters = parameter_values(submitted, submitted_parameters);
-    let after_types = submitted.parameter_types();
+    let after_types = super::ssm_parameters::parameter_types_in_force(submitted);
     let after = template::Scope {
         stack: current.stack,
         parameters: &after_parameters,
@@ -569,14 +569,19 @@ fn detail_order(left: &StoredChangeDetail, right: &StoredChangeDetail) -> ::std:
 /// The parameter values in force for one revision: the template's own declared defaults,
 /// overridden by the values the revision carries — the same resolution a deployment makes
 /// ("`Default`: A value of the appropriate type for the template to use if no value is
-/// specified").
+/// specified"). An SSM-typed parameter carries the value Parameter Store held when the
+/// revision was resolved ([`StoredParameter::value_in_force`]), which is what its
+/// expressions resolve to.
 fn parameter_values(
     declared: &template::Template,
     carried: &[StoredParameter],
 ) -> BTreeMap<String, String> {
     let mut values = declared.parameter_defaults();
     for parameter in carried {
-        values.insert(parameter.key.clone(), parameter.value.clone());
+        values.insert(
+            parameter.key.clone(),
+            parameter.value_in_force().to_string(),
+        );
     }
     values
 }

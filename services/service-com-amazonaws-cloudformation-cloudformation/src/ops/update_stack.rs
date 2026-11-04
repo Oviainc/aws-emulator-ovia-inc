@@ -615,18 +615,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // A parameter the template declares and the request passed no value for takes the
         // template's own `Default`, exactly as on a create.
-        let parameters = crate::state::parameters_in_force(&template_body, parameters);
-        // What the DEPLOYMENT evaluates the template against: the values in force, with a
-        // parameter declared under an SSM parameter type carrying the value Parameter Store
-        // holds under the name it supplies — the same resolution a create runs
-        // ([`crate::state::dynamic_references::resolved_parameter_values`]).
-        let parameter_values = crate::state::dynamic_references::resolved_parameter_values(
-            ctx,
-            &request_region,
-            &template_body,
-            &parameters,
-        )
-        .await;
+        let mut parameters = crate::state::parameters_in_force(&template_body, parameters);
+        // The same Parameter Store resolution a create performs: an SSM-typed parameter's
+        // value is the NAME of a parameter, and the value in force on the updated stack is
+        // the one the store holds NOW (`crate::state::ssm_parameters`).
+        crate::state::ssm_parameters::resolve(ctx, &request_region, &template_body, &mut parameters)
+            .await;
+        let parameter_values = crate::state::parameter_value_map(&parameters);
         // The stage this update would deploy, computed from the values in force: a
         // language-extensions directive reads them, so the stage depends on them. An update
         // reusing the stack's own template keeps the stage that was computed for it.
