@@ -217,6 +217,20 @@ pub fn effective_bucket_encryption(stored: Option<&BucketEncryption>) -> BucketE
     stored.cloned().unwrap_or(DEFAULT_BUCKET_ENCRYPTION)
 }
 
+/// The stored form of a table bucket's metrics configuration.
+///
+/// `PutTableBucketMetricsConfiguration` carries no settings — its whole input is
+/// the table bucket's ARN — so what a put persists is that the bucket HAS a
+/// metrics configuration, under the id the service minted for it, and that id is
+/// what a read reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsConfiguration {
+    /// The configuration's unique identifier, minted by this service: it
+    /// carries nothing from the request, so a caller can neither choose it nor
+    /// read a bucket's name out of it.
+    pub id: String,
+}
+
 /// A table bucket, as this emulator stores it.
 ///
 /// `encryption` and `storage_class` are `None` when the create named neither:
@@ -238,6 +252,11 @@ pub struct TableBucket {
     pub created_at: SystemTime,
     pub encryption: Option<BucketEncryption>,
     pub storage_class: Option<StorageClass>,
+    /// The bucket's metrics configuration, `None` until a put turns metrics on:
+    /// a table bucket collects no metrics until one is set on it, which is why
+    /// a read of a bucket that has none is refused rather than answered with a
+    /// default.
+    pub metrics: Option<MetricsConfiguration>,
     pub tags: BTreeMap<String, String>,
     /// The namespaces resident in this bucket, keyed by namespace name, so a
     /// list has one stable order to page over.
@@ -374,6 +393,22 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
             let candidate = self.mint_id("table");
             let suffix = format!("/table/{candidate}");
             if !self.tables_by_arn.keys().any(|arn| arn.ends_with(&suffix)) {
+                return candidate;
+            }
+        }
+    }
+
+    /// A fresh id for a metrics configuration, retried against the store so an
+    /// id is never reused while another configuration carries it.
+    pub fn mint_metrics_configuration_id(&mut self) -> String {
+        loop {
+            let candidate = self.mint_id("metrics-configuration");
+            if !self.table_buckets.values().any(|bucket| {
+                bucket
+                    .metrics
+                    .as_ref()
+                    .is_some_and(|metrics| metrics.id == candidate)
+            }) {
                 return candidate;
             }
         }
@@ -623,6 +658,14 @@ pub const INVALID_TABLE_BUCKET_ARN_MESSAGE: &str = "The specified table bucket A
 /// text — it names the CLASS of the failure and takes nothing from the request,
 /// and it says "bucket" rather than "table bucket".
 pub const BUCKET_NOT_FOUND_MESSAGE: &str = "The specified bucket does not exist.";
+
+/// How this service states a table bucket that has no metrics configuration:
+/// the `NotFoundException` (HTTP 404) the metrics operations model. FIXED
+/// text — it names the CLASS of the failure (the configuration the request
+/// addresses is not there) and takes nothing from the request, as
+/// [`BUCKET_NOT_FOUND_MESSAGE`] does for the bucket itself.
+pub const METRICS_CONFIGURATION_NOT_FOUND_MESSAGE: &str =
+    "The specified metrics configuration does not exist.";
 
 /// How this service states a value that cannot be a taggable resource's ARN at
 /// all — the `resourceArn` member of the tagging operations, which the model

@@ -23,3 +23,5 @@ mod state_roundtrip;
 mod table_bucket_encryption;
 #[path = "all/table_bucket_lifecycle.rs"]
 mod table_bucket_lifecycle;
+#[path = "all/table_bucket_metrics_configuration.rs"]
+mod table_bucket_metrics_configuration;

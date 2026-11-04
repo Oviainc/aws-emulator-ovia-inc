@@ -265,6 +265,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: ::std::time::SystemTime::now(),
             encryption,
             storage_class,
+            // A fresh table bucket collects no metrics:
+            // `PutTableBucketMetricsConfiguration` is what turns them on.
+            metrics: None,
             tags,
             // A fresh bucket holds no namespaces; `CreateNamespace` is what
             // puts one in it.
