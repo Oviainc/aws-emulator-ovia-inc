@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListQueryExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListQueryExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListQueryExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: lists the ids of the executions this account holds for one workgroup,
+//! newest first, a page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -150,20 +143,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListQueryExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListQueryExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListQueryExecutions"))
+        // "If a workgroup is not specified, a list of available query execution IDs for
+        // the queries in the primary workgroup is returned."
+        let work_group = input
+            .work_group
+            .unwrap_or_else(|| crate::state::DEFAULT_WORK_GROUP.to_string());
+        // "The maximum number of query executions to return in this request", bounded by
+        // the modelled maximum, which is also what a request naming none gets.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_IDS))
+            .unwrap_or(0)
+            .min(usize::try_from(MAX_PAGE_IDS).unwrap_or(0));
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListQueryExecutionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("Athena state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // A read: nothing below writes the store.
+        let store = state.lock();
+
+        // A history belongs to a workgroup, so a workgroup this account does not have
+        // has no history to report rather than an empty one.
+        if !store.holds_work_group(&work_group) {
+            return Err(ListQueryExecutionsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    athena_error_code: None,
+                    message: Some(crate::state::work_group_not_found(&work_group)),
+                },
+            )
+            .into());
+        }
+
+        let position = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(position) = store.executions_page_position(&work_group, token) else {
+                    return Err(ListQueryExecutionsErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            athena_error_code: None,
+                            message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
+                        },
+                    )
+                    .into());
+                };
+                position
+            }
+        };
+
+        // Newest first, which is the order Athena reports a query history in.
+        let ids = store.query_execution_ids(&work_group);
+        let end = position.saturating_add(page_size).min(ids.len());
+        let page: Vec<String> = ids
+            .get(position..end)
+            .unwrap_or_default()
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect();
+
+        // A token only where this page reported something and ids remain behind it: a
+        // page of no ids (`MaxResults` of 0 asks for none) hands back no token, so a
+        // caller following tokens always makes progress.
+        let more = !page.is_empty() && end < ids.len();
+        Ok(ListQueryExecutionsOutput {
+            // `QueryExecutionIdList` holds at least one id, so a page with none reports
+            // the member as absent rather than as an empty list.
+            query_execution_ids: (!page.is_empty()).then_some(page),
+            next_token: more.then(|| store.executions_page_token(&work_group, end)),
+        })
     }
 }
+
+/// The largest page this operation returns, which is the modelled maximum of
+/// `MaxQueryExecutionsCount` (range 0..50) and also the page size a request that names
+/// none gets.
+const MAX_PAGE_IDS: i32 = 50;

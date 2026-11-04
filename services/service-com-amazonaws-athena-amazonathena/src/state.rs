@@ -21,16 +21,31 @@
 //! a registered `GLUE` catalog naming the same catalog id — IS the account's Glue Data
 //! Catalog. So those reads project what GLUE persisted ([`to_table_metadata`]) instead of
 //! holding a second copy that could drift from the catalog a client writes through.
+//!
+//! QUERY EXECUTIONS are the service's other resource, and the one with a lifecycle:
+//! `StartQueryExecution` RUNS the submitted SQL on a real engine ([`query_engine`]) and
+//! stores what it produced in a [`QueryExecutionRecord`], and every later read —
+//! `GetQueryExecution`, `GetQueryResults`, `ListQueryExecutions`,
+//! `BatchGetQueryExecution` — answers out of that record. The record's `Status.State`
+//! is DERIVED from the clock and the stored outcome
+//! ([`QueryExecutionRecord::state_at`]), so a query a caller reads straight back is
+//! still QUEUED, is RUNNING a moment later and is terminal from its completion instant
+//! on, and no read ever has to write to move it.
+
+/// The SQL engine a query execution runs on, and the result set it produces.
+pub mod query_engine;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
+use ::service_common::page_tokens::PageTokenKey;
 use ::service_com_amazonaws_glue_awsglue::ops::types::Column as GlueColumn;
 use ::service_com_amazonaws_glue_awsglue::state as glue_state;
 
 use crate::ops::types::{
-    Column, DataCatalog, EngineVersion, TableMetadata, Tag, WorkGroup, WorkGroupConfiguration,
-    CONNECTION_TYPE_VALUES,
+    Column, DataCatalog, EngineVersion, QueryExecution, QueryExecutionContext,
+    QueryExecutionStatistics, QueryExecutionStatus, ResultConfiguration, ResultReuseConfiguration,
+    TableMetadata, Tag, WorkGroup, WorkGroupConfiguration, CONNECTION_TYPE_VALUES,
 };
 
 /// The `WorkGroupState` a freshly created workgroup is in. One of
@@ -774,6 +789,489 @@ pub fn parameters_bytes(parameters: &HashMap<String, String>) -> usize {
         })
 }
 
+// ---------------------------------------------------------------------------
+// Query executions
+// ---------------------------------------------------------------------------
+
+/// The workgroup a query belongs to when the request names none.
+///
+/// `ListQueryExecutionsInput$WorkGroup` documents it: "If a workgroup is not specified,
+/// a list of available query execution IDs for the queries in the primary workgroup is
+/// returned", and `StartQueryExecution` likewise runs in the primary workgroup. It is
+/// Athena's own default workgroup, present in every account, which is why a query may
+/// name it without this registry holding a [`WorkGroupRecord`] for it.
+pub const DEFAULT_WORK_GROUP: &str = "primary";
+
+/// The database a query runs in when its `QueryExecutionContext` names none. The Glue
+/// Data Catalog's own default database carries this name, so a query that qualifies
+/// nothing runs where an unqualified name resolves.
+pub const DEFAULT_QUERY_DATABASE: &str = "default";
+
+/// The `QueryExecutionState` of a query that has been submitted and is waiting for
+/// resources. `QueryExecutionStatus$State` documents it: "QUEUED indicates that the
+/// query has been submitted to the service, and Athena will execute the query as soon as
+/// resources are available." One of `QUERY_EXECUTION_STATE_VALUES` in
+/// [`crate::ops::types`].
+pub const QUERY_STATE_QUEUED: &str = "QUEUED";
+/// The `QueryExecutionState` of a query in its execution phase; see
+/// [`QUERY_STATE_QUEUED`].
+pub const QUERY_STATE_RUNNING: &str = "RUNNING";
+/// The `QueryExecutionState` of a query that "completed without errors"; see
+/// [`QUERY_STATE_QUEUED`].
+pub const QUERY_STATE_SUCCEEDED: &str = "SUCCEEDED";
+/// The `QueryExecutionState` of a query that "experienced an error and did not complete
+/// processing"; see [`QUERY_STATE_QUEUED`].
+pub const QUERY_STATE_FAILED: &str = "FAILED";
+/// The `QueryExecutionState` of a query "a user input interrupted"; see
+/// [`QUERY_STATE_QUEUED`].
+pub const QUERY_STATE_CANCELLED: &str = "CANCELLED";
+
+/// How long after `StartQueryExecution` a query's completion is DUE.
+///
+/// Athena hands back a query execution in a non-terminal state and the terminal state
+/// arrives later, so this is a transition the CLOCK owes: the instant is stored on the
+/// record and every read derives the state from it. The span is this emulator's, not a
+/// duration AWS publishes (a real query takes as long as the data it scans), and it is
+/// never zero — a caller reading straight back must still observe the transient states
+/// and the errors they carry.
+pub const QUERY_EXECUTION_COMPLETION: Duration = Duration::from_secs(3);
+
+/// How long a query stays [`QUERY_STATE_QUEUED`] before it is [`QUERY_STATE_RUNNING`]:
+/// the first half of [`QUERY_EXECUTION_COMPLETION`], so both non-terminal states Athena
+/// reports are observable and neither is skipped.
+pub const QUERY_EXECUTION_QUEUED: Duration = Duration::from_millis(1_500);
+
+/// The `StateChangeReason` of a query a `StopQueryExecution` call interrupted.
+pub const QUERY_CANCELLED_BY_USER: &str = "Query cancelled by user";
+
+/// The `AthenaError$ErrorCategory` of a query the engine refused: the documented
+/// category list is "1 - System, 2 - User, 3 - Other", and SQL the engine would not run
+/// is the caller's own input.
+const ERROR_CATEGORY_USER: i32 = 2;
+
+/// The `AthenaError$ErrorCategory` of a query this EMULATOR stopped — a bound it holds
+/// a run to, or its confinement refusing what the statement asked for: neither the
+/// caller's SQL being wrong nor the engine failing, which is what "3 - Other" names in
+/// the list quoted on [`ERROR_CATEGORY_USER`].
+const ERROR_CATEGORY_OTHER: i32 = 3;
+
+/// How many query executions this emulator retains.
+///
+/// The EMULATOR's own bound, with no counterpart in the model: each retained execution
+/// holds its query text and its result set, so without it a caller could make the
+/// emulator keep result sets without limit. Athena retains query history for 45 days,
+/// which is a retention this emulator cannot usefully apply in a process lifetime, so
+/// the bound is a count and the OLDEST execution is dropped when a new one arrives past
+/// it.
+pub const MAX_QUERY_EXECUTIONS: usize = 200;
+
+/// How many query databases may be open at once. The catalog and database a query names
+/// are caller-chosen, so without this bound a caller could make the emulator open engine
+/// connections without limit.
+pub const MAX_QUERY_DATABASES: usize = 16;
+
+/// One query execution, as this service persists it.
+///
+/// The outcome is stored once, by the call that ran the SQL; the STATE is derived from
+/// it and the clock ([`QueryExecutionRecord::state_at`]), so no read moves a query
+/// along and two reads at the same instant report the same state.
+#[derive(Debug, Clone)]
+pub struct QueryExecutionRecord {
+    /// The `QueryExecutionId` this execution was minted under, which is also its key.
+    pub id: String,
+    /// The `QueryString` submitted, byte for byte, reported as `QueryExecution$Query`.
+    pub query_string: String,
+    /// The `StatementType` the submitted SQL parses as, or `None` when it does not
+    /// parse at all — there is then no statement to classify.
+    pub statement_type: Option<String>,
+    /// The workgroup the query belongs to, [`DEFAULT_WORK_GROUP`] when it named none.
+    pub work_group: String,
+    /// The `QueryExecutionContext` the request carried, as it carried it: the database
+    /// and catalog the query addressed, or an empty context when it named neither (the
+    /// defaults an unqualified query resolves against are
+    /// [`GLUE_DATA_CATALOG_NAME`] and [`DEFAULT_QUERY_DATABASE`]).
+    pub context: QueryExecutionContext,
+    /// The result configuration in force for this query, with `OutputLocation`
+    /// resolved against the workgroup's own settings by the call that started it.
+    pub result_configuration: ResultConfiguration,
+    /// The result-reuse configuration the request carried, if any.
+    pub result_reuse_configuration: Option<ResultReuseConfiguration>,
+    /// The `ExecutionParameters` the request carried, in order.
+    pub execution_parameters: Vec<String>,
+    /// The engine version the query ran on.
+    pub engine_version: EngineVersion,
+    /// When `StartQueryExecution` accepted it, reported as `SubmissionDateTime`.
+    pub submitted_at: SystemTime,
+    /// When its completion is due: at least [`QUERY_EXECUTION_COMPLETION`] after the
+    /// submit, and never before the engine had actually finished.
+    pub completion_due_at: SystemTime,
+    /// What running the SQL produced, or `None` while the run has not reported — the
+    /// record is written BEFORE the SQL runs, so one `ClientRequestToken` can never
+    /// start a second run, and a query whose run has not reported is still RUNNING.
+    pub outcome: Option<query_engine::Outcome>,
+    /// What the engine spent running it, reported as `EngineExecutionTimeInMillis`.
+    pub engine_time: Duration,
+    /// When a `StopQueryExecution` call interrupted it, if one did. Only a query that
+    /// had not reached a terminal state can carry this.
+    pub cancelled_at: Option<SystemTime>,
+}
+
+impl QueryExecutionRecord {
+    /// When this query stops being [`QUERY_STATE_QUEUED`].
+    fn running_due_at(&self) -> SystemTime {
+        self.submitted_at
+            .checked_add(QUERY_EXECUTION_QUEUED)
+            .unwrap_or(self.completion_due_at)
+    }
+
+    /// The `QueryExecutionState` this query is in at `now`.
+    ///
+    /// Derived, never written: a cancelled query is [`QUERY_STATE_CANCELLED`] from the
+    /// instant it was cancelled, and every other query walks QUEUED, then RUNNING, then
+    /// the terminal state its stored outcome names — and stays RUNNING while its run has
+    /// reported no outcome at all, because a query whose work is not over has not
+    /// reached a terminal state however long ago it was submitted.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if self.cancelled_at.is_some() {
+            return QUERY_STATE_CANCELLED;
+        }
+        if now < self.running_due_at() {
+            return QUERY_STATE_QUEUED;
+        }
+        let Some(outcome) = &self.outcome else {
+            return QUERY_STATE_RUNNING;
+        };
+        if now < self.completion_due_at {
+            return QUERY_STATE_RUNNING;
+        }
+        match outcome {
+            query_engine::Outcome::Succeeded { .. } => QUERY_STATE_SUCCEEDED,
+            query_engine::Outcome::Failed { .. } => QUERY_STATE_FAILED,
+        }
+    }
+
+    /// Whether this query has reached a terminal state at `now`.
+    pub fn is_terminal_at(&self, now: SystemTime) -> bool {
+        !matches!(
+            self.state_at(now),
+            QUERY_STATE_QUEUED | QUERY_STATE_RUNNING
+        )
+    }
+
+    /// When this query completed, or `None` while it has not: `CompletionDateTime` is
+    /// the completion a terminal state reports, and a running query has none.
+    pub fn completion_at(&self, now: SystemTime) -> Option<SystemTime> {
+        if let Some(cancelled) = self.cancelled_at {
+            return Some(cancelled);
+        }
+        (self.outcome.is_some() && now >= self.completion_due_at)
+            .then_some(self.completion_due_at)
+    }
+
+    /// The result set this query produced, once it has SUCCEEDED. `None` for a query
+    /// that is not there yet, failed, or was cancelled: a result set is readable only
+    /// from a query that completed without errors.
+    pub fn result_set_at(&self, now: SystemTime) -> Option<&query_engine::StoredResultSet> {
+        if self.state_at(now) != QUERY_STATE_SUCCEEDED {
+            return None;
+        }
+        match self.outcome.as_ref()? {
+            query_engine::Outcome::Succeeded { result, .. } => Some(result),
+            query_engine::Outcome::Failed { .. } => None,
+        }
+    }
+
+    /// How many rows this query's statement wrote, for `UpdateCount`.
+    pub fn update_count(&self) -> Option<i64> {
+        match self.outcome.as_ref()? {
+            query_engine::Outcome::Succeeded { update_count, .. } => *update_count,
+            query_engine::Outcome::Failed { .. } => None,
+        }
+    }
+
+    /// The message for why this query failed, and whose doing the failure was, if it
+    /// failed.
+    fn failure(&self) -> Option<(&str, query_engine::FailureCause)> {
+        match self.outcome.as_ref()? {
+            query_engine::Outcome::Failed { message, cause } => Some((message, *cause)),
+            query_engine::Outcome::Succeeded { .. } => None,
+        }
+    }
+
+    /// The record as the modelled `QueryExecution` a read answers with.
+    pub fn to_query_execution(&self, now: SystemTime) -> QueryExecution {
+        let state = self.state_at(now);
+        let failure = (state == QUERY_STATE_FAILED).then(|| self.failure()).flatten();
+        let state_change_reason = match state {
+            QUERY_STATE_CANCELLED => Some(QUERY_CANCELLED_BY_USER.to_string()),
+            QUERY_STATE_FAILED => failure.map(|(message, _)| message.to_string()),
+            _ => None,
+        };
+        let athena_error = failure.map(|(message, cause)| crate::ops::types::AthenaError {
+            error_category: Some(match cause {
+                query_engine::FailureCause::Sql => ERROR_CATEGORY_USER,
+                query_engine::FailureCause::Emulator => ERROR_CATEGORY_OTHER,
+            }),
+            // Athena's error TYPE is a published code per failure; the engine
+            // reports no such code, so none is invented here.
+            error_type: None,
+            // "The FAILED state is always terminal with no automatic retry."
+            retryable: false,
+            error_message: Some(message.to_string()),
+        });
+        QueryExecution {
+            query_execution_id: Some(self.id.clone()),
+            query: Some(self.query_string.clone()),
+            statement_type: self.statement_type.clone(),
+            // Athena fills this only for a workgroup with managed query results, which
+            // this emulator does not store results through.
+            managed_query_results_configuration: None,
+            result_configuration: Some(self.result_configuration.clone()),
+            result_reuse_configuration: self.result_reuse_configuration.clone(),
+            query_execution_context: Some(self.context.clone()),
+            status: Some(QueryExecutionStatus {
+                state: Some(state.to_string()),
+                state_change_reason,
+                submission_date_time: Some(::aws_smithy_types::DateTime::from(self.submitted_at)),
+                completion_date_time: self
+                    .completion_at(now)
+                    .map(::aws_smithy_types::DateTime::from),
+                athena_error,
+            }),
+            statistics: Some(self.statistics_at(now)),
+            work_group: Some(self.work_group.clone()),
+            engine_version: Some(self.engine_version.clone()),
+            // `ExecutionParameters` holds at least one value, so a query that carried
+            // none reports the member as absent rather than as an empty list.
+            execution_parameters: (!self.execution_parameters.is_empty())
+                .then(|| self.execution_parameters.clone()),
+            // The substatement (`SELECT`, `CREATE_TABLE`) is a finer classification than
+            // the parse answers here, so none is reported.
+            substatement_type: None,
+            query_results_s3_access_grants_configuration: None,
+        }
+    }
+
+    /// The `QueryExecutionStatistics` this query reports at `now`.
+    ///
+    /// Measured, not chosen: the engine time is what the engine actually spent, the
+    /// scanned bytes are the size of the values it read, and the queue and total times
+    /// come from the instants on the record.
+    fn statistics_at(&self, now: SystemTime) -> QueryExecutionStatistics {
+        let terminal = self.is_terminal_at(now);
+        let queue_until = now.min(self.running_due_at());
+        let total_until = self.completion_at(now).unwrap_or(now);
+        let data_scanned = match (self.outcome.as_ref(), terminal) {
+            (
+                Some(query_engine::Outcome::Succeeded {
+                    data_scanned_bytes, ..
+                }),
+                true,
+            ) => *data_scanned_bytes,
+            _ => 0,
+        };
+        QueryExecutionStatistics {
+            // The engine ran once, when the query was submitted; its cost is reported
+            // from the moment the query is terminal, which is when the run is over as
+            // far as a caller can see.
+            engine_execution_time_in_millis: Some(if terminal {
+                millis_of(self.engine_time)
+            } else {
+                0
+            }),
+            data_scanned_in_bytes: Some(data_scanned),
+            // Written only when a query's results are written as a manifest, which this
+            // emulator does not do.
+            data_manifest_location: None,
+            total_execution_time_in_millis: Some(millis_between(self.submitted_at, total_until)),
+            query_queue_time_in_millis: Some(millis_between(self.submitted_at, queue_until)),
+            // Athena's own pre-processing, planning and publishing phases are not
+            // modelled here, so no time is reported for them rather than a made-up one.
+            service_pre_processing_time_in_millis: None,
+            query_planning_time_in_millis: None,
+            service_processing_time_in_millis: None,
+            result_reuse_information: None,
+            dpu_count: None,
+        }
+    }
+}
+
+/// A duration in whole milliseconds, saturating.
+fn millis_of(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// The whole milliseconds from `from` to `until`, or 0 when `until` is not after `from`.
+fn millis_between(from: SystemTime, until: SystemTime) -> i64 {
+    until
+        .duration_since(from)
+        .map_or(0, millis_of)
+}
+
+/// A fresh `QueryExecutionId`: a version-4 UUID, which is the form Athena mints a query
+/// execution id in and satisfies the modelled `QueryExecutionId` (1 to 128 characters,
+/// `^\S+$`). Minted from the maintained crate rather than laid out here.
+pub fn new_query_execution_id() -> String {
+    ::uuid::Uuid::new_v4().as_hyphenated().to_string()
+}
+
+/// The result configuration ONE query runs under, given the configuration the request
+/// carried and the workgroup the query belongs to.
+///
+/// `ResultConfiguration$OutputLocation` documents the rule: "To run the query, you must
+/// specify the query results location using one of the ways: either for individual
+/// queries using either this setting (client-side), or in the workgroup […] If none of
+/// them is set, Athena issues an error that no output location is provided. If workgroup
+/// settings override client-side settings, then the query uses the settings specified for
+/// the workgroup." So the workgroup's configuration replaces the request's whole
+/// configuration when the workgroup enforces its own, and otherwise the request's
+/// configuration stands with the workgroup's output location behind it. `None` when
+/// neither names one, which is the refusal the quoted sentence calls for.
+pub fn resolved_result_configuration(
+    requested: Option<ResultConfiguration>,
+    work_group: Option<&WorkGroupRecord>,
+) -> Option<ResultConfiguration> {
+    let group = work_group.and_then(|record| record.configuration.result_configuration.clone());
+    let enforced = work_group
+        .and_then(|record| record.configuration.enforce_work_group_configuration)
+        .unwrap_or(false);
+    let resolved = if enforced {
+        group.clone()
+    } else {
+        match (requested, group.clone()) {
+            (Some(mut requested), group) => {
+                if output_location(Some(&requested)).is_none() {
+                    requested.output_location = group.and_then(|group| group.output_location);
+                }
+                Some(requested)
+            }
+            (None, group) => group,
+        }
+    };
+    let resolved = resolved?;
+    output_location(Some(&resolved))
+        .is_some()
+        .then_some(resolved)
+}
+
+/// The output location a result configuration names, treating an empty one as naming
+/// none: a location of no characters addresses no bucket.
+fn output_location(configuration: Option<&ResultConfiguration>) -> Option<&str> {
+    configuration
+        .and_then(|configuration| configuration.output_location.as_deref())
+        .map(str::trim)
+        .filter(|location| !location.is_empty())
+}
+
+/// The message a query with nowhere to write its results is refused with: the error the
+/// `ResultConfiguration$OutputLocation` sentence quoted on
+/// [`resolved_result_configuration`] calls for.
+pub const NO_OUTPUT_LOCATION: &str = "No output location provided. An output location is \
+     required either through the Workgroup result configuration setting or as an API input.";
+
+/// The message a `StartQueryExecution` that reuses a `ClientRequestToken` under changed
+/// parameters is refused with. `ClientRequestToken` documents it: "An error is returned
+/// if a parameter, such as QueryString, has changed."
+pub const IDEMPOTENT_PARAMETERS_DO_NOT_MATCH: &str = "Idempotent parameters do not match";
+
+/// Whether two result configurations say the same thing, member by member.
+///
+/// Compared rather than derived: a reused `ClientRequestToken` may not have changed any
+/// parameter of the query, and where its results are written and how they are encrypted
+/// are parameters of it.
+pub fn same_result_configuration(one: &ResultConfiguration, other: &ResultConfiguration) -> bool {
+    let encryption = |configuration: &ResultConfiguration| {
+        configuration
+            .encryption_configuration
+            .as_ref()
+            .map(|encryption| (encryption.encryption_option.clone(), encryption.kms_key.clone()))
+    };
+    let acl = |configuration: &ResultConfiguration| {
+        configuration
+            .acl_configuration
+            .as_ref()
+            .map(|acl| acl.s3_acl_option.clone())
+    };
+    one.output_location == other.output_location
+        && one.expected_bucket_owner == other.expected_bucket_owner
+        && encryption(one) == encryption(other)
+        && acl(one) == acl(other)
+}
+
+/// Whether two result-reuse configurations say the same thing; see
+/// [`same_result_configuration`].
+pub fn same_result_reuse_configuration(
+    one: Option<&ResultReuseConfiguration>,
+    other: Option<&ResultReuseConfiguration>,
+) -> bool {
+    let by_age = |configuration: Option<&ResultReuseConfiguration>| {
+        configuration
+            .and_then(|configuration| configuration.result_reuse_by_age_configuration.as_ref())
+            .map(|by_age| (by_age.enabled, by_age.max_age_in_minutes))
+    };
+    by_age(one) == by_age(other)
+}
+
+/// The message a read of a query execution no `StartQueryExecution` minted answers with.
+pub fn query_execution_not_found(id: &str) -> String {
+    format!("QueryExecution {id} was not found")
+}
+
+/// The message an operation addressing a workgroup this account holds none of answers
+/// with.
+pub fn work_group_not_found(name: &str) -> String {
+    format!("WorkGroup {name} is not found.")
+}
+
+/// The `ErrorCode` `BatchGetQueryExecution` reports beside
+/// [`query_execution_not_found`] for an id this account holds no execution for: the id
+/// is the caller's own input, which is what `INVALID_INPUT` names.
+pub const ERROR_CODE_INVALID_INPUT: &str = "INVALID_INPUT";
+
+/// The message `GetQueryResults` refuses a query that has not finished with.
+pub fn query_not_yet_finished(state: &str) -> String {
+    format!("Query has not yet finished. Current state: {state}")
+}
+
+/// The message `GetQueryResults` refuses a query that finished in a state other than
+/// SUCCEEDED with: there are no results to read from a query that did not succeed.
+pub fn query_did_not_succeed(state: &str) -> String {
+    format!("Query did not finish successfully. Final query state: {state}")
+}
+
+/// The message a paginated read refuses a `NextToken` it did not mint with.
+pub const INVALID_NEXT_TOKEN: &str = "Invalid NextToken is provided";
+
+/// The separator inside a page cursor. A unit separator, which no identifier, workgroup
+/// name or decimal position can contain, so the parts of a cursor can never run together.
+const CURSOR_SEPARATOR: char = '\u{1f}';
+
+/// The cursor a `GetQueryResults` page hands back: the execution it is paging and the
+/// row to resume at.
+fn results_cursor(id: &str, position: usize) -> String {
+    format!("results{CURSOR_SEPARATOR}{id}{CURSOR_SEPARATOR}{position}")
+}
+
+/// The cursor a `ListQueryExecutions` page hands back: the workgroup it filtered on and
+/// the position to resume at.
+fn executions_cursor(work_group: &str, position: usize) -> String {
+    format!("executions{CURSOR_SEPARATOR}{work_group}{CURSOR_SEPARATOR}{position}")
+}
+
+/// The position `cursor` names for `kind` within `scope`, or `None` for any cursor that
+/// is not one of those — including one minted for another execution, another workgroup
+/// or another operation, which names no position in THIS read.
+fn cursor_position(cursor: &str, kind: &str, scope: &str) -> Option<usize> {
+    let mut parts = cursor.split(CURSOR_SEPARATOR);
+    let minted_kind = parts.next()?;
+    let minted_scope = parts.next()?;
+    let position = parts.next()?;
+    if parts.next().is_some() || minted_kind != kind || minted_scope != scope {
+        return None;
+    }
+    position.parse().ok()
+}
+
 /// Per-service state for com-amazonaws-athena-amazonathena. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAthenaAmazonathenaState {
@@ -784,6 +1282,174 @@ pub struct ComAmazonawsAthenaAmazonathenaState {
     /// `CreateDataCatalogInput$Name` documentation calls unique per account. A
     /// `BTreeMap` for the same reason as [`Self::work_groups`].
     pub data_catalogs: BTreeMap<String, DataCatalogRecord>,
+    /// Every query execution this account still holds, keyed by its
+    /// `QueryExecutionId`. Written only through [`Self::record_query_execution`], which
+    /// is what keeps it and [`Self::query_execution_order`] in step.
+    query_executions: HashMap<String, QueryExecutionRecord>,
+    /// The ids of [`Self::query_executions`] in submission order, oldest first — the
+    /// order `ListQueryExecutions` reports reversed, and the order executions are
+    /// dropped in once [`MAX_QUERY_EXECUTIONS`] is reached.
+    query_execution_order: Vec<String>,
+    /// Which `QueryExecutionId` each `ClientRequestToken` already minted, so the
+    /// documented idempotency ("the same response is returned and another query is not
+    /// created") is answered from state. An entry is dropped with the execution it
+    /// names.
+    idempotency_tokens: HashMap<String, String>,
+    /// The engine databases queries run in, keyed by the catalog and database they
+    /// address. Opened on demand by [`Self::query_database`], never by a read.
+    query_databases: BTreeMap<String, query_engine::DatabaseHandle>,
+    /// The secret this store's page tokens are authenticated under, so a `NextToken`
+    /// this store did not mint names no page. Drawn from the system's randomness when
+    /// the store is created and never reported.
+    page_token_key: PageTokenKey,
+}
+
+impl ComAmazonawsAthenaAmazonathenaState {
+    /// Whether this account has the workgroup `name`: one `CreateWorkGroup` registered,
+    /// or [`DEFAULT_WORK_GROUP`] — Athena's own default workgroup, which every account
+    /// has and which therefore needs no record here.
+    pub fn holds_work_group(&self, name: &str) -> bool {
+        name == DEFAULT_WORK_GROUP || self.work_groups.contains_key(name)
+    }
+
+    /// The execution `id` names, or `None` when this account holds none.
+    pub fn query_execution(&self, id: &str) -> Option<&QueryExecutionRecord> {
+        self.query_executions.get(id)
+    }
+
+    /// The `QueryExecutionId` a `ClientRequestToken` already minted, if it did.
+    pub fn query_execution_for_token(&self, token: &str) -> Option<&QueryExecutionRecord> {
+        let id = self.idempotency_tokens.get(token)?;
+        self.query_executions.get(id)
+    }
+
+    /// The ids of the executions of `work_group`, newest first — the order
+    /// `ListQueryExecutions` reports.
+    pub fn query_execution_ids(&self, work_group: &str) -> Vec<&str> {
+        self.query_execution_order
+            .iter()
+            .rev()
+            .filter_map(|id| self.query_executions.get(id))
+            .filter(|record| record.work_group == work_group)
+            .map(|record| record.id.as_str())
+            .collect()
+    }
+
+    /// Store a query execution, under `token` when the request carried one.
+    ///
+    /// The oldest execution is dropped once [`MAX_QUERY_EXECUTIONS`] are held, together
+    /// with any token that named it: a token whose execution is gone cannot answer with
+    /// the same id, so it is not kept pointing at nothing.
+    pub fn record_query_execution(&mut self, record: QueryExecutionRecord, token: Option<String>) {
+        while self.query_execution_order.len() >= MAX_QUERY_EXECUTIONS {
+            let oldest = self.query_execution_order.remove(0);
+            self.query_executions.remove(&oldest);
+            self.idempotency_tokens
+                .retain(|_, minted| minted != &oldest);
+        }
+        let id = record.id.clone();
+        if let Some(token) = token {
+            self.idempotency_tokens.insert(token, id.clone());
+        }
+        self.query_execution_order.push(id.clone());
+        self.query_executions.insert(id, record);
+    }
+
+    /// Write what the run of execution `id` produced onto its record.
+    ///
+    /// Called by the request that started the query, once the engine has reported. The
+    /// completion instant is moved out to `now` when the run took longer than the span
+    /// the record was stored with, so a query is never reported complete while its work
+    /// was still running. Does nothing for an execution the registry no longer holds.
+    pub fn complete_query_execution(
+        &mut self,
+        id: &str,
+        completion: query_engine::Completion,
+        now: SystemTime,
+    ) {
+        let Some(record) = self.query_executions.get_mut(id) else {
+            return;
+        };
+        record.completion_due_at = record.completion_due_at.max(now);
+        record.engine_time = completion.engine_time;
+        record.outcome = Some(completion.outcome);
+    }
+
+    /// Cancel the execution `id` names, as `StopQueryExecution` does.
+    ///
+    /// `true` when this call is what cancelled it; `false` for an execution that had
+    /// already reached a terminal state, which a stop leaves exactly as it was — a query
+    /// that already succeeded or failed was not interrupted by a user.
+    pub fn cancel_query_execution(&mut self, id: &str, now: SystemTime) -> bool {
+        let Some(record) = self.query_executions.get_mut(id) else {
+            return false;
+        };
+        if record.is_terminal_at(now) {
+            return false;
+        }
+        record.cancelled_at = Some(now);
+        true
+    }
+
+    /// The engine database for `catalog` and `database`, opened on first use.
+    ///
+    /// `Err` carries the engine's own message when a database cannot be opened, and the
+    /// emulator's when [`MAX_QUERY_DATABASES`] are already open.
+    pub fn query_database(
+        &mut self,
+        catalog: &str,
+        database: &str,
+    ) -> Result<query_engine::DatabaseHandle, String> {
+        let key = format!("{catalog}{CURSOR_SEPARATOR}{database}");
+        if let Some(handle) = self.query_databases.get(&key) {
+            return Ok(::std::sync::Arc::clone(handle));
+        }
+        if self.query_databases.len() >= MAX_QUERY_DATABASES {
+            return Err(format!(
+                "this emulator holds the maximum of {MAX_QUERY_DATABASES} query \
+                 databases open, so no query can be run in {database}"
+            ));
+        }
+        let handle = query_engine::open_database()?;
+        self.query_databases
+            .insert(key, ::std::sync::Arc::clone(&handle));
+        Ok(handle)
+    }
+
+    /// The `NextToken` a `GetQueryResults` page of execution `id` resumes at `position`
+    /// hands back.
+    pub fn results_page_token(&self, id: &str, position: usize) -> String {
+        ::hex::encode(self.page_token_key.mint(&results_cursor(id, position)))
+    }
+
+    /// The row `token` resumes execution `id` at, or `None` for a token this store did
+    /// not mint for THAT execution.
+    pub fn results_page_position(&self, id: &str, token: &str) -> Option<usize> {
+        let cursor = self.page_cursor(token)?;
+        cursor_position(&cursor, "results", id)
+    }
+
+    /// The `NextToken` a `ListQueryExecutions` page of `work_group` resumed at
+    /// `position` hands back.
+    pub fn executions_page_token(&self, work_group: &str, position: usize) -> String {
+        ::hex::encode(
+            self.page_token_key
+                .mint(&executions_cursor(work_group, position)),
+        )
+    }
+
+    /// The position `token` resumes a listing of `work_group` at, or `None` for a token
+    /// this store did not mint for THAT workgroup.
+    pub fn executions_page_position(&self, work_group: &str, token: &str) -> Option<usize> {
+        let cursor = self.page_cursor(token)?;
+        cursor_position(&cursor, "executions", work_group)
+    }
+
+    /// The cursor `token` carries, or `None` for any value this store did not mint.
+    fn page_cursor(&self, token: &str) -> Option<String> {
+        let bytes = ::hex::decode(token).ok()?;
+        self.page_token_key.cursor_of(&bytes)
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

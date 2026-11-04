@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQueryResults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetQueryResults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetQueryResults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages the result set the named execution's run produced — the column
+//! labels first for a DML query, then the rows — and refuses an execution that has not
+//! finished successfully.
 //!
 //! ## Shape of an operation
 //!
@@ -165,20 +159,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetQueryResults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetQueryResultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetQueryResults"))
+        // "If set to DATA_MANIFEST, it returns the manifest file in rows" — and no
+        // query here writes one (`DataManifestLocation` is reported for none), so there
+        // is no manifest to page rather than an empty one to invent.
+        if input.query_result_type.as_deref() == Some(QUERY_RESULT_TYPE_DATA_MANIFEST) {
+            return Err(invalid_request(format!(
+                "Query result type {QUERY_RESULT_TYPE_DATA_MANIFEST} is not available: this \
+                 query wrote no data manifest"
+            )));
+        }
+        // "The maximum number of results (rows) to return in this request", bounded by
+        // the modelled maximum so a request that names none still pages.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_ROWS))
+            .unwrap_or(1)
+            .clamp(1, usize::try_from(MAX_PAGE_ROWS).unwrap_or(1));
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetQueryResultsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("Athena state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // A read: nothing below writes the store. The page a `NextToken` names travels
+        // inside the token, so no page is kept on the side either.
+        let store = state.lock();
+
+        let Some(record) = store.query_execution(&input.query_execution_id) else {
+            return Err(invalid_request(crate::state::query_execution_not_found(
+                &input.query_execution_id,
+            )));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let state_name = record.state_at(now);
+        // There are results to read only from a query that completed without errors:
+        // one still running has not produced them yet, and one that failed or was
+        // cancelled never will.
+        let Some(result) = record.result_set_at(now) else {
+            return Err(invalid_request(if record.is_terminal_at(now) {
+                crate::state::query_did_not_succeed(state_name)
+            } else {
+                crate::state::query_not_yet_finished(state_name)
+            }));
+        };
+
+        let position = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(position) =
+                    store.results_page_position(&input.query_execution_id, token)
+                else {
+                    return Err(invalid_request(
+                        crate::state::INVALID_NEXT_TOKEN.to_string(),
+                    ));
+                };
+                position
+            }
+        };
+
+        // A DML query's results are read as the data files Athena wrote them to, whose
+        // first line is the column labels — so the first row of the FIRST page carries
+        // the labels and the data rows follow it. A query that defines or describes
+        // something writes no such header.
+        let labels = usize::from(
+            record.statement_type.as_deref() == Some(crate::state::query_engine::STATEMENT_TYPE_DML)
+                && !result.column_info.is_empty(),
+        );
+        let total = labels.saturating_add(result.rows.len());
+        let end = position.saturating_add(page_size).min(total);
+        // The capacity comes from the STORED result set's own length (`end` is clamped to
+        // `total` above), never from the caller's `MaxResults`: a page can hold no more
+        // rows than the execution really produced.
+        let mut rows: Vec<Row> = Vec::with_capacity(end.saturating_sub(position).min(total));
+        for index in position..end {
+            if index < labels {
+                rows.push(label_row(&result.column_info));
+                continue;
+            }
+            let Some(row) = result.rows.get(index - labels) else {
+                break;
+            };
+            rows.push(row.clone());
+        }
+
+        Ok(GetQueryResultsOutput {
+            update_count: record.update_count(),
+            result_set: Some(ResultSet {
+                rows: Some(rows),
+                result_set_metadata: Some(ResultSetMetadata {
+                    column_info: Some(result.column_info.clone()),
+                }),
+            }),
+            // A token only where rows remain: the last page of a result set ends the
+            // pagination rather than handing back a token that pages nothing.
+            next_token: (end < total).then(|| store.results_page_token(&input.query_execution_id, end)),
+        })
     }
+}
+
+/// The `QueryResultType` that asks for the manifest file instead of the rows, one of the
+/// model's `QueryResultType` values.
+const QUERY_RESULT_TYPE_DATA_MANIFEST: &str = "DATA_MANIFEST";
+
+/// The largest page this operation returns, which is the modelled maximum of
+/// `MaxQueryResults` (range 1..1000) and also the page size a request that names none
+/// gets.
+const MAX_PAGE_ROWS: i32 = 1_000;
+
+/// The column-label row that precedes a DML query's data rows: one datum per column,
+/// carrying that column's label.
+fn label_row(column_info: &[ColumnInfo]) -> Row {
+    Row {
+        data: Some(
+            column_info
+                .iter()
+                .map(|column| Datum {
+                    var_char_value: Some(
+                        column.label.clone().unwrap_or_else(|| column.name.clone()),
+                    ),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// `InvalidRequestException` is the client error this operation models: "Indicates that
+/// something is wrong with the input to the request."
+fn invalid_request(message: String) -> GetQueryResultsError {
+    GetQueryResultsErrorModeled::InvalidRequestException(InvalidRequestException {
+        athena_error_code: None,
+        message: Some(message),
+    })
+    .into()
 }

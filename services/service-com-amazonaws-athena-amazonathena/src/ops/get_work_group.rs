@@ -151,7 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetWorkGroupErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     athena_error_code: None,
-                    message: Some(format!("WorkGroup {} is not found.", input.work_group)),
+                    message: Some(crate::state::work_group_not_found(&input.work_group)),
                 },
             )
             .into());

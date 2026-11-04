@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartQueryExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartQueryExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartQueryExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: runs the submitted SQL on this service's in-process SQL engine, persists
+//! the execution and the result set it produced, and answers with the id it minted —
+//! the same id, and no second execution, for a repeated `ClientRequestToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +102,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::std::time::{Duration, SystemTime};
+
+use crate::state::query_engine;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -176,20 +174,211 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartQueryExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartQueryExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartQueryExecution"))
+        let query_string = input.query_string;
+        // The workgroup a query belongs to. A query runs in a workgroup this account
+        // has — one `CreateWorkGroup` registered, or Athena's own default workgroup,
+        // which every account has and which this registry therefore holds no record of
+        // (`GetWorkGroup` is what reports a registered workgroup's own settings).
+        let work_group = input
+            .work_group
+            .unwrap_or_else(|| crate::state::DEFAULT_WORK_GROUP.to_string());
+        let context = input.query_execution_context.unwrap_or_default();
+        let execution_parameters = input.execution_parameters.unwrap_or_default();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server("Athena state is not reachable on this engine"));
+        };
+
+        // The SQL is PARSED to classify it, before any lock is taken; what it computes
+        // is the engine's own answer below.
+        let submitted = query_engine::submitted(&query_string);
+        let id = crate::state::new_query_execution_id();
+        let submitted_at = SystemTime::now();
+        // Everything that reads or writes the registry happens here, and the lock is
+        // released before the engine is asked to run anything: a query running on one
+        // database must not serialise every other Athena request behind it. The
+        // execution and its token are RESERVED here too, before the SQL runs, so a
+        // concurrent call carrying the same token answers with this id rather than
+        // running the statement a second time.
+        let prepared = {
+            let mut store = state.lock();
+
+            // A query cannot run in a workgroup that does not exist: its settings, its
+            // results location and the history it belongs to are the workgroup's.
+            if !store.holds_work_group(&work_group) {
+                return Err(invalid_request(crate::state::work_group_not_found(
+                    &work_group,
+                )));
+            }
+
+            let group = store.work_groups.get(&work_group).cloned();
+            // Nowhere to write the results is a refusal, not a query that runs: "If
+            // none of them is set, Athena issues an error that no output location is
+            // provided." Resolved BEFORE the idempotency check below, so that check
+            // compares the configuration the query would really run under against the
+            // one the earlier call ran under.
+            let Some(result_configuration) = crate::state::resolved_result_configuration(
+                input.result_configuration,
+                group.as_ref(),
+            ) else {
+                return Err(invalid_request(
+                    crate::state::NO_OUTPUT_LOCATION.to_string(),
+                ));
+            };
+
+            // "If another StartQueryExecution request is received, the same response is
+            // returned and another query is not created." The answer comes from the
+            // token the earlier call stored, so no second execution is minted and no
+            // statement runs twice — and a token reused under changed parameters is
+            // refused rather than answered with an id that ran different SQL, or wrote
+            // its results elsewhere.
+            if let Some(token) = input.client_request_token.as_deref() {
+                if let Some(existing) = store.query_execution_for_token(token) {
+                    if existing.query_string != query_string
+                        || existing.work_group != work_group
+                        || existing.context.database != context.database
+                        || existing.context.catalog != context.catalog
+                        || existing.execution_parameters != execution_parameters
+                        || !crate::state::same_result_configuration(
+                            &existing.result_configuration,
+                            &result_configuration,
+                        )
+                        || !crate::state::same_result_reuse_configuration(
+                            existing.result_reuse_configuration.as_ref(),
+                            input.result_reuse_configuration.as_ref(),
+                        )
+                    {
+                        return Err(invalid_request(
+                            crate::state::IDEMPOTENT_PARAMETERS_DO_NOT_MATCH.to_string(),
+                        ));
+                    }
+                    return Ok(StartQueryExecutionOutput {
+                        query_execution_id: Some(existing.id.clone()),
+                    });
+                }
+            }
+
+            // The engine database a query runs in is the one its context addresses: the
+            // catalog and database it names, or the defaults an unqualified query
+            // resolves against.
+            let catalog = context
+                .catalog
+                .clone()
+                .unwrap_or_else(|| crate::state::GLUE_DATA_CATALOG_NAME.to_string());
+            let database = context
+                .database
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_QUERY_DATABASE.to_string());
+            let handle = match store.query_database(&catalog, &database) {
+                Ok(handle) => handle,
+                Err(message) => return Err(internal_server(&message)),
+            };
+
+            // The completion is due a span after the submit; `complete_query_execution`
+            // moves it out if the engine was still running then, so a query is reported
+            // complete because its work is over and not because a span elapsed.
+            let record = crate::state::QueryExecutionRecord {
+                id: id.clone(),
+                query_string: query_string.clone(),
+                statement_type: submitted.statement_type.map(str::to_string),
+                work_group,
+                context,
+                result_configuration,
+                result_reuse_configuration: input.result_reuse_configuration,
+                execution_parameters: execution_parameters.clone(),
+                engine_version: crate::state::resolved_engine_version(
+                    group
+                        .as_ref()
+                        .and_then(|group| group.configuration.engine_version.as_ref()),
+                ),
+                submitted_at,
+                completion_due_at: submitted_at
+                    .checked_add(crate::state::QUERY_EXECUTION_COMPLETION)
+                    .unwrap_or(submitted_at),
+                // Written by this same call, once the engine has reported.
+                outcome: None,
+                engine_time: Duration::ZERO,
+                cancelled_at: None,
+            };
+            store.record_query_execution(record, input.client_request_token);
+
+            handle
+        };
+
+        let completion = match submitted.statements {
+            // One statement, or text this parser could not read at all — in which case
+            // the engine is the one that reports why.
+            Some(1) | None => {
+                let sql = query_string.clone();
+                let counts_rows = submitted.counts_rows;
+                let parameters = execution_parameters.clone();
+                // The engine is synchronous and CPU-bound, so it runs on a blocking
+                // thread rather than on an async worker, and under the deadline and step
+                // budget `query_engine::run` installs.
+                let run = ::tokio::task::spawn_blocking(move || {
+                    query_engine::run(&prepared, &sql, counts_rows, &parameters)
+                })
+                .await;
+                run.unwrap_or_else(|_| query_engine::Completion {
+                    outcome: query_engine::Outcome::Failed {
+                        message: UNREPORTED_RUN.to_string(),
+                        cause: query_engine::FailureCause::Emulator,
+                    },
+                    engine_time: Duration::ZERO,
+                })
+            }
+            // A query execution runs ONE statement, so text carrying another count is a
+            // query that fails rather than one that runs its first statement and drops
+            // the rest.
+            Some(count) => query_engine::Completion {
+                outcome: query_engine::Outcome::Failed {
+                    message: one_statement_only(count),
+                    cause: query_engine::FailureCause::Emulator,
+                },
+                engine_time: Duration::ZERO,
+            },
+        };
+
+        state
+            .lock()
+            .complete_query_execution(&id, completion, SystemTime::now());
+
+        Ok(StartQueryExecutionOutput {
+            query_execution_id: Some(id),
+        })
     }
+}
+
+/// The `StateChangeReason` of a query whose run reported nothing at all, because the
+/// thread it ran on did not return: the only thing that can honestly be said about it.
+const UNREPORTED_RUN: &str = "the SQL engine did not report a result for this query";
+
+/// The `StateChangeReason` of a query that does not carry exactly one SQL statement.
+fn one_statement_only(statements: usize) -> String {
+    format!(
+        "a query execution runs one SQL statement, and this query carries {statements}"
+    )
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// `InvalidRequestException` is the client error this operation models: "Indicates that
+/// something is wrong with the input to the request."
+fn invalid_request(message: String) -> StartQueryExecutionError {
+    StartQueryExecutionErrorModeled::InvalidRequestException(InvalidRequestException {
+        athena_error_code: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The operation's own server error (HTTP 500): "Indicates a platform issue, which may
+/// be due to a transient condition or outage."
+fn internal_server(message: &str) -> StartQueryExecutionError {
+    StartQueryExecutionErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

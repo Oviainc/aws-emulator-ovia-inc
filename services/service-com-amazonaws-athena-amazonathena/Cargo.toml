@@ -12,6 +12,36 @@ engine = { workspace = true }
 # operations read the databases and tables out of Glue's own store rather than keeping a
 # second copy of them here.
 service-com-amazonaws-glue-awsglue = { workspace = true }
+# `page_tokens`: the authenticated continuation token every paginated read here hands
+# back, so a `NextToken` this process did not mint names no page.
+service-common = { path = "../common" }
+# The SQL engine a query execution RUNS on, in-process.
+#
+# MEMORY-SAFETY POSTURE: the rationale, the bounds and the alternatives considered are
+# recorded in this crate's README.md, section "The SQL engine, and its memory-safety
+# posture". In short: this crate contains no `unsafe` and keeps the workspace's
+# `unsafe_code = "forbid"` lint; the native component the `bundled` feature links is the
+# SAME engine the workspace already links through `vendor/emulator-telemetry`
+# (`rusqlite` 0.37, `bundled`), so no new native library enters the emulator process.
+#
+# CAPABILITY: this is an EXECUTION SUBSTRATE — it compiles caller-supplied SQL into
+# instructions and runs them — and a NATIVE component: `bundled` makes libsqlite3-sys
+# compile the SQLite C amalgamation at build time and link it in. Every host-filesystem
+# escape it would otherwise re-open (`ATTACH DATABASE '<path>'`, `VACUUM INTO '<path>'`, a
+# `PRAGMA` that re-enables a switch, extension loading, a virtual-table module) is closed
+# in `Database::open` in src/state/query_engine.rs, before any request reaches the engine:
+# default-deny authorizer, `SQLITE_LIMIT_ATTACHED = 0`, defensive mode, untrusted schema,
+# no URI filenames, `temp_store = MEMORY`, `max_page_count`, `hard_heap_limit`, plus
+# length, column, depth and compound-select limits. `limits` and `hooks` are the features
+# those controls need; `load_extension` is deliberately absent.
+rusqlite = { version = "0.37", features = ["bundled", "column_decltype", "hooks", "limits"] }
+# `StatementType` is read off the PARSE of the submitted SQL rather than off its leading
+# word, with the maintained parser this workspace already uses for caller-supplied SQL.
+sqlparser = "0.59"
+# Mints the version-4 UUID a `QueryExecutionId` is.
+uuid = { version = "1", features = ["v4"] }
+# Renders the authenticated bytes of a page token, and a binary result value, as hex.
+hex = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -31,7 +61,9 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
+# The query-lifecycle suite waits out the span a started query's completion is due
+# after, so it needs the timer driver as well as the runtime.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

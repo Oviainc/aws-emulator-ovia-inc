@@ -14,6 +14,9 @@
 #[path = "all/data_catalog_lifecycle.rs"]
 mod data_catalog_lifecycle;
 
+#[path = "all/query_execution_lifecycle.rs"]
+mod query_execution_lifecycle;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
