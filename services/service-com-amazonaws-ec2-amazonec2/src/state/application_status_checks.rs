@@ -16,7 +16,9 @@
 //! during the deletion grace period"
 //! (`DescribeApplicationStatusChecksRequest$IncludeAll`) — so whether a check is active is
 //! read off that member ([`application_status_check_is_active`]) rather than from a second
-//! map of deleted checks.
+//! map of deleted checks. `DeleteApplicationStatusCheck` is what sets it
+//! ([`ComAmazonawsEc2Amazonec2State::begin_application_status_check_deletion`]), which is also
+//! what removes the check's associations and what bounds how many deletions the store keeps.
 //!
 //! A SUBMODULE of [`crate::state`], the way CloudFront's function slice is a submodule of
 //! its state: this surface grows as the sibling modify and delete operations are implemented,
@@ -275,6 +277,144 @@ pub fn application_status_check_limit_exceeded<E>(held: usize) -> Scaffolded<E> 
         "You have reached the limit of {MAX_APPLICATION_STATUS_CHECKS} application status \
          checks for this account, which already holds {held}"
     ))
+}
+
+/// How many deleted application status checks this store keeps inside their deletion grace
+/// period, the oldest-deleted dropped to make room for a newer one.
+///
+/// The grace period itself is a span AWS publishes no length for — "recently deleted
+/// application status checks that remain available during the deletion grace period"
+/// (`DescribeApplicationStatusChecksRequest$IncludeAll`) — so what ends it here is this
+/// bounded history, the arrangement this store already keeps a resource's deletions under
+/// ([`super::MAX_REMEMBERED_VERIFIED_ACCESS_GROUP_DELETIONS`]). It is the account's own quota
+/// of checks ([`MAX_APPLICATION_STATUS_CHECKS`]), so a caller that deletes everything it may
+/// hold can still read every one of those deletions back.
+pub const MAX_REMEMBERED_APPLICATION_STATUS_CHECK_DELETIONS: usize = MAX_APPLICATION_STATUS_CHECKS;
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Delete the application status check `application_status_check_id` as of `at` and answer
+    /// it as this call leaves it, or `None` when the store holds no check under that id.
+    ///
+    /// The one way a check is deleted, so the delete's answer and what a later
+    /// `DescribeApplicationStatusChecks` reports cannot disagree. The record STAYS in the
+    /// store carrying "the date and time when the application status check was deleted"
+    /// (`ApplicationStatusCheckResponseObject$DeletionTime`), which is what makes it one
+    /// inside its deletion grace period ([`application_status_check_is_active`]): reported
+    /// only to a caller that asks for deleted checks, and no longer counted against the
+    /// account's quota.
+    ///
+    /// "Deleting a check automatically removes all of its associations"
+    /// (`DeleteApplicationStatusCheck`), so both halves go: the TAG associations are the
+    /// check's own `TargetTagAssociations` member, and the bytes they held go back to the
+    /// store's budget on the terms [`tag_association_bytes`] took them on, while an INSTANCE
+    /// association is the per-check result that instance holds, which stops being one of the
+    /// results `DescribeApplicationStatus` aggregates for it.
+    ///
+    /// The deletion history is bounded by
+    /// [`MAX_REMEMBERED_APPLICATION_STATUS_CHECK_DELETIONS`]: once it is full the
+    /// oldest-deleted check leaves the store for good, giving back the bytes it held and taking
+    /// the create token that minted it with it — a token must never answer with a check that is
+    /// no longer stored.
+    /// A check already inside its deletion grace period has been deleted once: this reports the
+    /// record THAT delete left — its instant, and the associations it already took — and writes
+    /// nothing again, so a retried delete answers what the first one answered and the deletion
+    /// instant a reader sees never moves.
+    pub fn begin_application_status_check_deletion(
+        &mut self,
+        application_status_check_id: &str,
+        at: SystemTime,
+    ) -> Option<ApplicationStatusCheckResponseObject> {
+        let held = self
+            .application_status_checks
+            .get(application_status_check_id)?;
+        if !application_status_check_is_active(held) {
+            return Some(held.clone());
+        }
+
+        // The instance half of "all of its associations": the instance holds this check's
+        // result, so removing the result is what ends the monitoring. An instance this check
+        // was the last thing monitoring, and which carries no suppression either, holds nothing
+        // at all afterwards, so its row goes too — a read of it answers `not-applicable` from
+        // the absence, exactly as it did before any association was made. A row this check was
+        // never associated with is left exactly as it is.
+        self.application_status.retain(|_, record| {
+            let monitored = record.details.remove(application_status_check_id).is_some();
+            !monitored || !record.details.is_empty() || record.suppression.is_some()
+        });
+
+        let check = self
+            .application_status_checks
+            .get_mut(application_status_check_id)?;
+        // The tag half: the pairs leave the check, and their bytes leave the budget.
+        let released =
+            tag_association_bytes(check.target_tag_associations.as_deref().unwrap_or_default());
+        check.target_tag_associations = Some(Vec::new());
+        check.deletion_time = Some(super::system_time_to_date_time(at));
+        let deleted = check.clone();
+        self.release_stored_bytes(released);
+
+        self.forget_oldest_application_status_check_deletions(application_status_check_id);
+        Some(deleted)
+    }
+
+    /// Drop the checks whose deletion grace period has ended: the oldest-deleted ones past
+    /// [`MAX_REMEMBERED_APPLICATION_STATUS_CHECK_DELETIONS`], `keep` — the check the delete
+    /// running right now is about — never among them.
+    ///
+    /// Ordered by the instant each was deleted at, the id breaking a tie, so the history drops
+    /// deletions in the order they happened however many land in one millisecond.
+    fn forget_oldest_application_status_check_deletions(&mut self, keep: &str) {
+        let mut deleted: Vec<((i64, u32), String)> = self
+            .application_status_checks
+            .iter()
+            .filter(|(application_status_check_id, check)| {
+                application_status_check_id.as_str() != keep
+                    && !application_status_check_is_active(check)
+            })
+            .map(|(application_status_check_id, check)| {
+                (
+                    check
+                        .deletion_time
+                        .map(super::date_time_key)
+                        .unwrap_or_default(),
+                    application_status_check_id.clone(),
+                )
+            })
+            .collect();
+        deleted.sort();
+        // `keep` is one of the deletions this history holds, so it counts towards the bound
+        // even though it is never the one dropped.
+        let held = deleted.len().saturating_add(1);
+        let over = held.saturating_sub(MAX_REMEMBERED_APPLICATION_STATUS_CHECK_DELETIONS);
+        for (_, application_status_check_id) in deleted.into_iter().take(over) {
+            self.forget_application_status_check(&application_status_check_id);
+        }
+    }
+
+    /// Remove one application status check from the store for good, giving its caller-chosen
+    /// bytes back to the store's budget on the terms
+    /// [`application_status_check_payload_bytes`] took them on and dropping the
+    /// `CreateApplicationStatusCheck` token that minted it.
+    fn forget_application_status_check(&mut self, application_status_check_id: &str) {
+        let Some(check) = self
+            .application_status_checks
+            .remove(application_status_check_id)
+        else {
+            return;
+        };
+        let minting_token = self
+            .application_status_check_client_tokens
+            .iter()
+            .find(|(_, minted)| minted.as_str() == application_status_check_id)
+            .map(|(token, _)| token.clone());
+        if let Some(token) = &minting_token {
+            self.application_status_check_client_tokens.remove(token);
+        }
+        self.release_stored_bytes(application_status_check_payload_bytes(
+            &check,
+            minting_token.as_deref(),
+        ));
+    }
 }
 
 /// Whether `matcher` is the form `StatusCodeMatcher` documents: "a comma-separated list of

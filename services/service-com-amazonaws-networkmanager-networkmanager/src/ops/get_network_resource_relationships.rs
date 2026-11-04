@@ -272,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 [relationship.from.as_deref(), relationship.to.as_deref()]
                     .into_iter()
                     .flatten()
-                    .any(&selected)
+                    .any(selected)
             })
             .collect();
         drop(store);

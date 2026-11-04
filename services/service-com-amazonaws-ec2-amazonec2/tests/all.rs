@@ -468,6 +468,11 @@ mod create_application_status_check;
 // `DescribeApplicationStatusChecks` and `DescribeApplicationStatus`.
 #[path = "all/associate_application_status_check.rs"]
 mod associate_application_status_check;
+// What `DeleteApplicationStatusCheck` does to the check it names: its deletion instant, the
+// associations it takes with it, the quota slot it gives back and the bounded grace period the
+// deleted record spends still readable.
+#[path = "all/delete_application_status_check.rs"]
+mod delete_application_status_check;
 // What `AssignIpv6Addresses` takes out of the IPv6 block of the subnet a network interface
 // sits in, and records on that interface — named addresses and prefixes against a count of
 // each, read back through `DescribeNetworkInterfaces`.
