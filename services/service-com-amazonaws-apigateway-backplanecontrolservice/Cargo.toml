@@ -62,6 +62,23 @@ boon = "0.6"
 # that service's, and the data plane here asks it for the decision rather than keeping a
 # second reading of a rule tree (`service::invoke::web_acl_decision`).
 service-com-amazonaws-wafv2-awswaf-20190729 = { workspace = true }
+# An `AWS` integration names another service's action, and where that action is one this
+# emulator serves it is PERFORMED by making the call over the in-process transport
+# (`service::invoke::aws_integration`). The SDK client is what signs and shapes that call,
+# so this service builds no request for another service's API by hand. `rt-tokio` for the
+# byte stream an object's bytes arrive as; the rest of the crate's defaults (its own
+# transport, a credentials chain that reads the environment) are not used, because the
+# transport and the credentials are the callback's.
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "behavior-version-latest",
+] }
+# Matches an `IntegrationResponse$selectionPattern` — "the regular expression (regex)
+# pattern used to choose an integration response based on the response from the back end" —
+# against the status a backend answered with. The maintained engine, whose matching is
+# linear in the subject, so a pattern a control-plane call stored cannot make a request to a
+# deployed stage expensive.
+regex = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

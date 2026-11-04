@@ -304,6 +304,11 @@ pub mod front_door;
 /// serves from one endpoint and tells apart by the `restJson1` route a request addresses.
 pub mod greengrass;
 pub mod iam_authorization;
+/// The ONE reading of whether an in-process call to another emulated service reached that
+/// service at all, rather than being refused by the front door for a request no mounted
+/// service claims — so no performer of such a call maps the transport's own refusal as if
+/// it were the addressed service's answer.
+pub mod in_process_refusal;
 /// The ONE construction of the in-process IAM client a service resolves a caller-supplied
 /// IAM entity through, so that hop is configured once rather than per service.
 pub mod iam_client;

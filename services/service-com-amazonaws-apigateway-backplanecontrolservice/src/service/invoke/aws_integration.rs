@@ -1,0 +1,1217 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The `AWS` integration: how a method request is served by making the AWS SERVICE CALL
+//! its `uri` names, in process.
+//!
+//! `IntegrationType` gives `AWS` "for integrating the API method request with an AWS
+//! service action, including the Lambda function-invoking action", and
+//! `Integration$uri` gives the form that action is named in: "for integrations of the
+//! `aws` type, the URI is of the form
+//! `arn:aws:apigateway:{region}:{subdomain.service|service}:path|action/{service_api}`".
+//! Two parts of it decide everything here — the SUBDOMAIN, which names the service the
+//! call is made to, and the resource, which names the call in one of the two documented
+//! forms: `path/{resource-path}`, the service's own REST path, or
+//! `action/{ActionName}&{parameter}={value}`.
+//!
+//! The service this module serves is AMAZON S3, whose object actions are the ones the
+//! `path` form addresses as a path (`path/{bucket}/{key}`). The call is made THROUGH THE
+//! EMULATOR this service is running within, over the in-process transport
+//! `OperationContext::callback` hands a handler: nothing is invented and NO CONNECTION IS
+//! OPENED, so what the method request is answered with is what Amazon S3 itself answered
+//! the integration request — its status, its content type and its bytes. The destination is
+//! not an address this data plane dials: the `uri`'s own Region label only names which
+//! Region's endpoint the client is configured for, the transport serves it in process
+//! whatever that label says, and a `uri` naming any other service's action — or a form this
+//! module does not read — is left to [`super::perform_integration`]'s refusal, which states
+//! the configuration rather than inventing a backend answer. An answer the transport itself
+//! refused, rather than Amazon S3, is told apart from a backend answer and reported as an
+//! integration that reached nothing ([`refused`]).
+//!
+//! # Who the call is made as
+//!
+//! `Integration$credentials` is "the credentials required for the integration": a role
+//! API Gateway assumes to make the call. So the role decides whether the call happens at
+//! all, and both halves of that are IAM's own records, read through the ONE reading of
+//! them this tree has:
+//!
+//! * the role has to be one this service can assume — `sts:AssumeRole` granted to
+//!   [`SERVICE_PRINCIPAL`] by the role's trust policy
+//!   ([`::service_common::iam_role::role_is_unassumable`]). A role nothing can assume
+//!   makes no call, so the integration could not be performed at all and is answered
+//!   through the api's `API_CONFIGURATION_ERROR` gateway response, exactly as every other
+//!   integration this stage cannot perform is;
+//! * the call it would make has to be one the role's own identity-based policies allow on
+//!   the object it addresses ([`::service_common::iam_authorization`], the tree's one
+//!   evaluation of policy documents). A call they do not allow is REFUSED, and it is
+//!   refused the way the service it was addressed to refuses an unauthorized call: HTTP
+//!   403 with the `AccessDenied` code and the sentence Amazon S3 publishes for it. That
+//!   refusal is then mapped like any other backend answer (below), which is what lets an
+//!   api that declares an integration response for the 4xx class answer its caller 403 and
+//!   one that declares none answer through its default.
+//!
+//! Nothing is refused on evidence this emulator does not have: a `credentials` value
+//! naming no role of this account, an emulator with no IAM mounted, and an enumeration of
+//! the role's policies that could not be read all leave the call to be made, for the
+//! reason `::service_common::iam_role` gives. The documented "caller's identity"
+//! spelling ([`CALLER_CREDENTIALS`]) names no role to assume at all.
+//!
+//! What never travels is the CALLER'S OWN credential. The integration request is signed
+//! with the credentials the in-process callback hands this handler, which is what a role
+//! the integration names is resolved against; an `Authorization` header (or a session
+//! token) the client presented is not carried onto a call to a destination that client did
+//! not choose, and neither it nor the signing credentials are reported or logged.
+//!
+//! # How the answer becomes the method response
+//!
+//! A non-proxy integration's answer is MAPPED, and `IntegrationResponse$selectionPattern`
+//! says how: "the regular expression (regex) pattern used to choose an integration
+//! response based on the response from the back end … If the back end is an AWS Lambda
+//! function, the AWS Lambda function error header is matched. For all other HTTP and AWS
+//! back ends, the HTTP status code is matched." So the pattern is matched against the
+//! status Amazon S3 answered with, the integration response with no pattern is the
+//! fallback ([`super::default_integration_response`]), and the `statusCode` of the one
+//! selected is the status the CALLER sees. Its response template renders the body when it
+//! declares one, read off what the backend answered; with no template the backend's own
+//! bytes and content type are what the caller gets, which is what passing a response
+//! through means.
+
+use std::collections::BTreeMap;
+
+use ::aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use ::aws_smithy_runtime_api::client::result::SdkError;
+use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+use ::service_common::iam_authorization::{self as iam, Decision};
+use ::smithy_server_runtime::OperationContext;
+
+use crate::ops::put_integration_response::is_static_mapping_value;
+use crate::ops::types::{GetIntegrationOutput, GetIntegrationResponseOutput};
+use crate::state::MethodEntry;
+
+use super::super::mapping_template::TemplateInputs;
+use super::{
+    default_integration_response, mapped_response_headers, response_body, IntegratedResponse,
+    MethodRequest, UnservedIntegration, API_CONFIGURATION_ERROR, JSON_CONTENT_TYPE,
+    METHOD_REQUEST_HEADER_PREFIX, METHOD_REQUEST_PATH_PREFIX, METHOD_REQUEST_QUERY_PREFIX,
+};
+
+/// The integration type whose `uri` names an AWS service action: `AWS`, "for integrating
+/// the API method request with an AWS service action" (`IntegrationType`). `AWS_PROXY` is
+/// the Lambda proxy type and is not this one.
+const AWS_SERVICE_INTEGRATION_TYPE: &str = "AWS";
+
+/// The vendor field of every AWS integration ARN, from the form
+/// `Integration$uri` documents: `arn:aws:apigateway:{region}:{subdomain}:path|action/…`.
+const APIGATEWAY_VENDOR: &str = "apigateway";
+
+/// The subdomain field that names Amazon S3, which is the service whose calls this module
+/// makes.
+const S3_SUBDOMAIN: &str = "s3";
+
+/// The resource prefix of the PATH form: the rest of the resource is the service's own
+/// REST path, which for Amazon S3 is `/{bucket}/{key}`.
+const PATH_FORM_PREFIX: &str = "path/";
+
+/// The resource prefix of the ACTION form: the rest names the action and then its
+/// parameters, `action/{ActionName}&{parameter}={value}`.
+const ACTION_FORM_PREFIX: &str = "action/";
+
+/// The `Bucket` parameter of the action form, as the Amazon S3 API names it.
+const BUCKET_PARAMETER: &str = "Bucket";
+
+/// The `Key` parameter of the action form, as the Amazon S3 API names it.
+const KEY_PARAMETER: &str = "Key";
+
+/// The mapping-expression prefix of a PATH parameter of the INTEGRATION request, which is
+/// how `Integration$requestParameters` names the value a `{placeholder}` in the `uri`
+/// stands for: `integration.request.path.{name}`.
+const INTEGRATION_REQUEST_PATH_PREFIX: &str = "integration.request.path.";
+
+/// The service principal an integration's execution role has to trust for API Gateway to
+/// make the call under it, as a trust document names one.
+const SERVICE_PRINCIPAL: &str = "apigateway.amazonaws.com";
+
+/// The `credentials` value that asks for the CALLER's own identity to be passed through
+/// rather than for a role to be assumed: `Integration$credentials` documents it as "to
+/// require that the caller's identity be passed through from the request, specify the
+/// string `arn:aws:iam::\*:user/\*`". It names no role, so there is no role to resolve.
+const CALLER_CREDENTIALS: &str = "arn:aws:iam::*:user/*";
+
+/// The error code an AWS service refuses an unauthorized call with, and the sentence
+/// Amazon S3 publishes beside it ("AccessDenied — Access Denied", Amazon S3 "Error
+/// responses").
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+
+/// See [`ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// The HTTP status that refusal is answered with (Amazon S3 "Error responses": 403
+/// Forbidden).
+const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The media type an Amazon S3 REST error body is XML under.
+const XML_CONTENT_TYPE: &str = "application/xml";
+
+/// The most bytes one integration answer may carry into a method response: API Gateway's
+/// published quota for a payload is 10 MB, so an answer past it is one this stage cannot
+/// pass on rather than one buffered without bound.
+const MAX_INTEGRATION_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+
+/// One Amazon S3 OBJECT action, which is what the `path` form of an integration `uri`
+/// addresses as `path/{bucket}/{key}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectAction {
+    /// `GetObject`: the object's bytes.
+    Get,
+    /// `HeadObject`: the object's metadata, with no body.
+    Head,
+    /// `PutObject`: the method request's payload becomes the object.
+    Put,
+    /// `DeleteObject`: the object is removed.
+    Delete,
+}
+
+impl ObjectAction {
+    /// The action the integration's own HTTP method names, which is what the PATH form
+    /// carries instead of an action name: `Integration$httpMethod` is "the integration's
+    /// HTTP method type", and an object is read with `GET`, headed with `HEAD`, written
+    /// with `PUT` and removed with `DELETE`.
+    fn of_verb(verb: &str) -> Option<Self> {
+        match verb.to_ascii_uppercase().as_str() {
+            "GET" => Some(Self::Get),
+            "HEAD" => Some(Self::Head),
+            "PUT" => Some(Self::Put),
+            "DELETE" => Some(Self::Delete),
+            _ => None,
+        }
+    }
+
+    /// The action the ACTION form names, by the Amazon S3 operation's own name.
+    fn of_action_name(name: &str) -> Option<Self> {
+        match name {
+            "GetObject" => Some(Self::Get),
+            "HeadObject" => Some(Self::Head),
+            "PutObject" => Some(Self::Put),
+            "DeleteObject" => Some(Self::Delete),
+            _ => None,
+        }
+    }
+
+    /// The IAM action a call of it is authorized by. `HeadObject` is authorized by
+    /// `s3:GetObject` — "You need the `s3:GetObject` permission for this operation"
+    /// (`HeadObject`'s documentation) — so the two share one action.
+    fn iam_action(self) -> &'static str {
+        match self {
+            Self::Get | Self::Head => "s3:GetObject",
+            Self::Put => "s3:PutObject",
+            Self::Delete => "s3:DeleteObject",
+        }
+    }
+}
+
+/// What an `AWS` integration addresses, as its `uri` resolves against this call: the
+/// object, the Region of the service endpoint the call is made at, and the action.
+#[derive(Debug)]
+struct ObjectCall {
+    /// The partition the integration ARN names, which the object's own ARN carries.
+    partition: String,
+    /// The Region the integration ARN names, or the api's own when it names none.
+    region: String,
+    bucket: String,
+    key: String,
+    action: ObjectAction,
+}
+
+impl ObjectCall {
+    /// The ARN of the object this call addresses, which is the resource an identity-based
+    /// policy grants the action on: an Amazon S3 object ARN carries neither Region nor
+    /// account (`arn:{partition}:s3:::{bucket}/{key}`).
+    fn object_arn(&self) -> String {
+        format!(
+            "arn:{partition}:s3:::{bucket}/{key}",
+            partition = self.partition,
+            bucket = self.bucket,
+            key = self.key
+        )
+    }
+}
+
+/// What the AWS service answered the integration request: the three things a mapped
+/// method response is built from.
+#[derive(Debug)]
+struct Answered {
+    status: u16,
+    /// The content type the answer declared, or `None` for one that declared none.
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+impl Answered {
+    /// The refusal an AWS service answers a call the caller may not make with, as the
+    /// service's own REST error body ([`ACCESS_DENIED_CODE`]).
+    fn access_denied(resource: &str) -> Self {
+        Self {
+            status: ACCESS_DENIED_STATUS,
+            content_type: Some(XML_CONTENT_TYPE.to_string()),
+            body: error_body(ACCESS_DENIED_CODE, ACCESS_DENIED_MESSAGE, resource),
+        }
+    }
+}
+
+/// Amazon S3's REST error body: the code, the sentence and the resource the call
+/// addressed, which is the envelope every Amazon S3 refusal carries.
+fn error_body(code: &str, message: &str, resource: &str) -> Vec<u8> {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{code}</Code>\
+         <Message>{message}</Message><Resource>{resource}</Resource></Error>"
+    )
+    .into_bytes()
+}
+
+/// Perform this call through the method's `AWS` integration, or `None` when the
+/// integration is not an AWS service call this module makes — in which case the caller
+/// performs it from the api's own records ([`super::perform_integration`]).
+///
+/// `region` is the api's own Region, which is the endpoint the call is made at when the
+/// integration ARN names none of its own.
+pub(super) async fn performed(
+    ctx: &OperationContext<'_>,
+    region: &str,
+    method: &MethodEntry,
+    call: &MethodRequest,
+) -> Option<Result<IntegratedResponse, UnservedIntegration>> {
+    let integration = method.integration.as_ref()?;
+    if integration.r#type.as_deref() != Some(AWS_SERVICE_INTEGRATION_TYPE) {
+        return None;
+    }
+    let addressed = addressed_object(integration, region, &call.inputs)?;
+    let object = match addressed {
+        Ok(object) => object,
+        Err(reason) => {
+            return Some(Err(UnservedIntegration {
+                refusal: API_CONFIGURATION_ERROR,
+                reason,
+            }))
+        }
+    };
+    Some(served(ctx, integration, method, call, &object).await)
+}
+
+/// The method response this call earns: the role decides whether the call is made, the
+/// service answers it, and the integration response maps that answer.
+async fn served(
+    ctx: &OperationContext<'_>,
+    integration: &GetIntegrationOutput,
+    method: &MethodEntry,
+    call: &MethodRequest,
+    object: &ObjectCall,
+) -> Result<IntegratedResponse, UnservedIntegration> {
+    let answered = match authorization(ctx, integration, object).await {
+        Authorization::Unassumable(reason) => {
+            return Err(UnservedIntegration {
+                refusal: API_CONFIGURATION_ERROR,
+                reason,
+            })
+        }
+        Authorization::Withheld(resource) => Answered::access_denied(&resource),
+        Authorization::Admitted => answered_by_s3(ctx, object, call).await?,
+    };
+    mapped(method, integration, call, answered)
+}
+
+/// What the integration's execution role makes of this call.
+#[derive(Debug)]
+enum Authorization {
+    /// There is a role to make the call under, and the policies in force on it allow the
+    /// call — or nothing about the role could be shown, which refuses nothing.
+    Admitted,
+    /// The role cannot be assumed by this service at all, so no call is made: the
+    /// sentence says which role and why, for the log and for the execution log
+    /// `TestInvokeMethod` reports.
+    Unassumable(String),
+    /// The role may not make this call, so the service refuses it: the object's own path,
+    /// which the refusal names as the resource.
+    Withheld(String),
+}
+
+/// What the integration's `credentials` role makes of the call `object` addresses.
+async fn authorization(
+    ctx: &OperationContext<'_>,
+    integration: &GetIntegrationOutput,
+    object: &ObjectCall,
+) -> Authorization {
+    let role_arn = integration
+        .credentials
+        .as_deref()
+        .map(str::trim)
+        .filter(|credentials| !credentials.is_empty() && *credentials != CALLER_CREDENTIALS);
+    let Some(role_arn) = role_arn else {
+        return Authorization::Admitted;
+    };
+    if ::service_common::iam_role::role_is_unassumable(
+        ctx,
+        &object.region,
+        role_arn,
+        SERVICE_PRINCIPAL,
+    )
+    .await
+    {
+        return Authorization::Unassumable(format!(
+            "the integration's execution role {role_arn} does not let {SERVICE_PRINCIPAL} \
+             assume it, so no call can be made under it"
+        ));
+    }
+    // The permissions in force on the role are what IAM holds for it; a role whose
+    // policies could not be READ grounds no refusal, so only an enumeration IAM ANSWERED
+    // decides this.
+    let Some(documents) = role_identity_documents(ctx, &object.region, role_arn).await else {
+        return Authorization::Admitted;
+    };
+    let resource = object.object_arn();
+    let request = iam::Request::new(object.action.iam_action(), &resource, &[]);
+    if iam::identity_decision(&documents, &request) == Decision::Allowed {
+        return Authorization::Admitted;
+    }
+    ::tracing::warn!(
+        action = %object.action.iam_action(),
+        "the integration's execution role may not make this call, so the service refuses it"
+    );
+    Authorization::Withheld(format!("/{}/{}", object.bucket, object.key))
+}
+
+/// Every identity-based policy document IAM holds for the role `role_arn` names — the
+/// documents of the managed policies attached to it, and its inline policies — or `None`
+/// when this emulator could not read them at all (there is no IAM to ask, the value names
+/// no role of this account, or an answer could not be read), which grounds no refusal.
+///
+/// An enumeration that succeeds and reports NO policy is a role that carries none, which
+/// is an answer rather than a silence: it is reported as the empty set, and a call no
+/// policy allows is withheld.
+async fn role_identity_documents(
+    ctx: &OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> Option<Vec<String>> {
+    let role_name = ::service_common::iam_role::role_name(role_arn)?;
+    let iam = ::service_common::iam_client::iam_client(ctx, region);
+    let mut documents = Vec::new();
+
+    let attached = iam
+        .list_attached_role_policies()
+        .role_name(role_name)
+        .send()
+        .await
+        .ok()?;
+    for policy in attached.attached_policies() {
+        let policy_arn = policy.policy_arn()?;
+        let described = iam.get_policy().policy_arn(policy_arn).send().await.ok()?;
+        let version_id = described.policy()?.default_version_id()?;
+        let version = iam
+            .get_policy_version()
+            .policy_arn(policy_arn)
+            .version_id(version_id)
+            .send()
+            .await
+            .ok()?;
+        documents.push(version.policy_version()?.document()?.to_string());
+    }
+
+    let inline = iam
+        .list_role_policies()
+        .role_name(role_name)
+        .send()
+        .await
+        .ok()?;
+    for policy_name in inline.policy_names() {
+        let policy = iam
+            .get_role_policy()
+            .role_name(role_name)
+            .policy_name(policy_name)
+            .send()
+            .await
+            .ok()?;
+        documents.push(policy.policy_document().to_string());
+    }
+
+    Some(documents)
+}
+
+/// Make the call `object` addresses against Amazon S3, in process, and report what it
+/// answered.
+///
+/// `Err` only where there is no answer to report at all — the call did not reach the
+/// service, or its answer is larger than one method response may carry — because an
+/// integration that produced no answer is one this stage could not perform. Every answer
+/// the service DID give, refusals included, is reported as [`Answered`] and mapped.
+async fn answered_by_s3(
+    ctx: &OperationContext<'_>,
+    object: &ObjectCall,
+    call: &MethodRequest,
+) -> Result<Answered, UnservedIntegration> {
+    let client = s3_client(ctx, &object.region);
+    match object.action {
+        ObjectAction::Get => match client
+            .get_object()
+            .bucket(&object.bucket)
+            .key(&object.key)
+            .send()
+            .await
+        {
+            Ok(answer) => {
+                let content_type = answer.content_type().map(str::to_string);
+                // The CLAMP PRECEDES the allocation: an answer that declares more bytes
+                // than one method response carries is refused before any of them is
+                // buffered, and what IS collected is bounded again below, for an answer
+                // that declared no length at all.
+                if let Some(declared) = answer.content_length() {
+                    bounded(usize::try_from(declared).unwrap_or(usize::MAX))?;
+                }
+                let collected = answer.body.collect().await.map_err(|error| {
+                    ::tracing::warn!(
+                        error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                        "the object the integration read could not be collected"
+                    );
+                    unanswered("the object's bytes could not be read in full")
+                })?;
+                let body = collected.into_bytes().to_vec();
+                bounded(body.len())?;
+                Ok(Answered {
+                    status: 200,
+                    content_type,
+                    body,
+                })
+            }
+            Err(error) => refused(&error, object),
+        },
+        ObjectAction::Head => match client
+            .head_object()
+            .bucket(&object.bucket)
+            .key(&object.key)
+            .send()
+            .await
+        {
+            Ok(answer) => Ok(Answered {
+                status: 200,
+                content_type: answer.content_type().map(str::to_string),
+                body: Vec::new(),
+            }),
+            Err(error) => refused(&error, object),
+        },
+        ObjectAction::Put => {
+            let payload = call.inputs.payload.clone().unwrap_or_default();
+            bounded(payload.len())?;
+            let mut put = client
+                .put_object()
+                .bucket(&object.bucket)
+                .key(&object.key)
+                .body(::aws_sdk_s3::primitives::ByteStream::from(payload));
+            // The integration request carries the method request's own media type, which
+            // is what the object is then stored and served under.
+            if !call.media_type().is_empty() {
+                put = put.content_type(call.media_type());
+            }
+            match put.send().await {
+                Ok(_) => Ok(Answered {
+                    status: 200,
+                    content_type: None,
+                    body: Vec::new(),
+                }),
+                Err(error) => refused(&error, object),
+            }
+        }
+        ObjectAction::Delete => match client
+            .delete_object()
+            .bucket(&object.bucket)
+            .key(&object.key)
+            .send()
+            .await
+        {
+            // Amazon S3 answers a delete `204 No Content`, which carries no body.
+            Ok(_) => Ok(Answered {
+                status: 204,
+                content_type: None,
+                body: Vec::new(),
+            }),
+            Err(error) => refused(&error, object),
+        },
+    }
+}
+
+/// An integration whose answer this stage could not produce at all, for the reason
+/// `reason` gives.
+fn unanswered(reason: &str) -> UnservedIntegration {
+    UnservedIntegration {
+        refusal: API_CONFIGURATION_ERROR,
+        reason: reason.to_string(),
+    }
+}
+
+/// `Ok` while `bytes` is within what one integration answer may carry
+/// ([`MAX_INTEGRATION_PAYLOAD_BYTES`]).
+fn bounded(bytes: usize) -> Result<(), UnservedIntegration> {
+    if bytes > MAX_INTEGRATION_PAYLOAD_BYTES {
+        return Err(UnservedIntegration {
+            refusal: API_CONFIGURATION_ERROR,
+            reason: format!(
+                "the integration's payload of {bytes} bytes is larger than the \
+                 {MAX_INTEGRATION_PAYLOAD_BYTES} bytes one method response carries"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// What the service answered a call it REFUSED, read off the answer itself: the status it
+/// sent and the body it sent, so the mapping sees the service's own refusal.
+///
+/// A failure that is not the service answering — the call did not reach it, or its answer
+/// could not be read — is an integration that produced no answer, so it is reported as one
+/// this stage could not perform rather than as a refusal nothing sent.
+fn refused<E>(
+    error: &SdkError<E, HttpResponse>,
+    object: &ObjectCall,
+) -> Result<Answered, UnservedIntegration>
+where
+    E: ProvideErrorMetadata + ::std::error::Error + 'static,
+{
+    let SdkError::ServiceError(service) = error else {
+        ::tracing::warn!(
+            error = %::aws_smithy_types::error::display::DisplayErrorContext(error),
+            "the integration request was not answered by Amazon S3"
+        );
+        return Err(unanswered(
+            "the integration request to Amazon S3 was not answered, so there is no backend \
+             answer to map",
+        ));
+    };
+    let answer = service.raw();
+    let status = answer.status().as_u16();
+    let content_type = answer
+        .headers()
+        .get(::http::header::CONTENT_TYPE.as_str())
+        .map(str::to_string);
+    // The body the service sent, when the answer carried one that was buffered; a refusal
+    // whose body was not is rendered from the code and sentence the answer itself reported.
+    let body = match answer.body().bytes() {
+        Some(bytes) if !bytes.is_empty() => bytes.to_vec(),
+        _ => error_body(
+            service.err().code().unwrap_or(ACCESS_DENIED_CODE),
+            service.err().message().unwrap_or(ACCESS_DENIED_MESSAGE),
+            &format!("/{}/{}", object.bucket, object.key),
+        ),
+    };
+    // The FRONT DOOR's own refusal is not an answer from Amazon S3: a deployment with no
+    // object store mounted answers the integration request that way, and mapping it as a
+    // backend answer would hand the caller a status and a body for a call nothing made.
+    // `service_common` owns the one reading of that refusal.
+    if ::service_common::in_process_refusal::is_transport_refusal(&body) {
+        ::tracing::warn!(
+            status,
+            "the integration request reached no Amazon S3: this emulator mounts none, so \
+             there is no backend answer to map"
+        );
+        return Err(unanswered(
+            "the integration request reached no Amazon S3 in this emulator, so there is no \
+             backend answer to map",
+        ));
+    }
+    bounded(body.len())?;
+    Ok(Answered {
+        status,
+        content_type: content_type.or_else(|| Some(XML_CONTENT_TYPE.to_string())),
+        body,
+    })
+}
+
+/// The Amazon S3 client the integration request is made with.
+///
+/// The transport is the emulator's own, in process, so the call is served by the Amazon S3
+/// this emulator mounts and no connection is opened; the credentials are the ones the
+/// callback hands over, which sign this call and are never reported or logged.
+fn s3_client(ctx: &OperationContext<'_>, region: &str) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The emulator serves one endpoint for every service, so the bucket travels in the
+        // path rather than in a per-bucket host the router could not resolve.
+        .force_path_style(true)
+        // The transport is in-process: there is nothing to retry, time out or watch for a
+        // stalled stream, and each of those would need a sleep implementation this client
+        // is not given.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// The method response the integration's own responses map `answered` to.
+fn mapped(
+    method: &MethodEntry,
+    integration: &GetIntegrationOutput,
+    call: &MethodRequest,
+    answered: Answered,
+) -> Result<IntegratedResponse, UnservedIntegration> {
+    let Some(selected) = selected_response(integration, answered.status) else {
+        return Err(UnservedIntegration {
+            refusal: API_CONFIGURATION_ERROR,
+            reason: format!(
+                "the integration has no integration response for the {} the backend \
+                 answered, so the call maps to no method response",
+                answered.status
+            ),
+        });
+    };
+    let Some(status) = selected
+        .status_code
+        .as_deref()
+        .and_then(|code| code.parse::<u16>().ok())
+    else {
+        return Err(UnservedIntegration {
+            refusal: API_CONFIGURATION_ERROR,
+            reason: "the integration response this call maps to carries no status code the \
+                     response can be sent with"
+                .to_string(),
+        });
+    };
+    let templated = selected
+        .response_templates
+        .as_ref()
+        .is_some_and(|templates| !templates.is_empty());
+    let (content_type, body) = if templated {
+        // The template reads its payload off what the INTEGRATION answered, which is the
+        // only difference between rendering it here and rendering it for a `MOCK`.
+        let inputs = TemplateInputs {
+            payload: Some(answered.body),
+            ..call.inputs.clone()
+        };
+        response_body(selected, call, &inputs).map_err(|template| UnservedIntegration {
+            refusal: API_CONFIGURATION_ERROR,
+            reason: format!(
+                "the {} response template of {} bytes is not one this emulator renders: {}",
+                template.content_type, template.bytes, template.reason
+            ),
+        })?
+    } else {
+        // No template: the backend's own bytes and content type are the method response's,
+        // which is what passing a response through means.
+        (
+            answered
+                .content_type
+                .unwrap_or_else(|| JSON_CONTENT_TYPE.to_string()),
+            answered.body,
+        )
+    };
+    Ok(IntegratedResponse {
+        status,
+        content_type,
+        body,
+        headers: mapped_response_headers(Some(method), selected, status),
+    })
+}
+
+/// The integration response a backend answer of `status` maps to: the one whose
+/// `selectionPattern` matches that status, and otherwise the one that declares no pattern.
+///
+/// Several patterned responses matching one status is a configuration the api's records
+/// decide, so the choice is made by status code — the key the responses are stored under —
+/// and is therefore the same for every call whatever order the map yields.
+///
+/// The responses are walked IN that order and the walk STOPS at the first match, so a call
+/// compiles no pattern past the one it selects. How many it can compile at all is bounded by
+/// the model rather than by a number chosen here: the responses are keyed by
+/// `IntegrationResponse$statusCode`, whose `@pattern` is `^[1-5]\d\d$`
+/// (`smithy_query(query="shape",shape="StatusCode")`), so one integration holds at most one
+/// response per HTTP status — and each compile is bounded in turn ([`pattern_matches`]).
+fn selected_response(
+    integration: &GetIntegrationOutput,
+    status: u16,
+) -> Option<&GetIntegrationResponseOutput> {
+    let responses = integration.integration_responses.as_ref()?;
+    let answered = status.to_string();
+    let mut ordered: Vec<&GetIntegrationResponseOutput> = responses.values().collect();
+    ordered.sort_by(|left, right| left.status_code.cmp(&right.status_code));
+    ordered
+        .into_iter()
+        .find(|response| {
+            response
+                .selection_pattern
+                .as_deref()
+                .filter(|pattern| !pattern.is_empty())
+                .is_some_and(|pattern| pattern_matches(pattern, &answered))
+        })
+        .or_else(|| default_integration_response(integration))
+}
+
+/// The compiled-program budget one stored `selectionPattern` may take, so a pattern inside
+/// the stored length still cannot compile into an arbitrarily large automaton — the bound is
+/// stated here rather than left to the engine's own default, as the other services that
+/// evaluate a caller-stored pattern state theirs. The subject is three characters and the
+/// pattern selects one of at most 500 responses ([`selected_response`]), so neither factor
+/// of the matching cost is caller-unbounded.
+const COMPILED_PATTERN_LIMIT: usize = 64 * 1024;
+
+/// See [`COMPILED_PATTERN_LIMIT`]: the budget for the lazy DFA the match runs through, so a
+/// pattern cannot thrash that cache either.
+const PATTERN_DFA_LIMIT: usize = 64 * 1024;
+
+/// Whether the `selectionPattern` `pattern` matches `value`, which is the backend status
+/// for an AWS integration.
+///
+/// The pattern is a regular expression a CONTROL-PLANE call stored, not one a request
+/// carries, and the subject is the three characters of a status code: it is matched WHOLE,
+/// so a pattern for a class of statuses (`4\d{2}`) selects exactly that class rather than
+/// every status one of its digits appears in. It is evaluated by the maintained engine,
+/// whose matching is linear in the subject with no backtracking blowup, under the EXPLICIT
+/// compiled-size and DFA budgets above — so a stored pattern cannot make a request to this
+/// stage expensive. A pattern that is not a regular expression this engine builds within
+/// those budgets matches nothing, and is said so.
+fn pattern_matches(pattern: &str, value: &str) -> bool {
+    let anchored = format!("^(?:{pattern})$");
+    match ::regex::RegexBuilder::new(&anchored)
+        .size_limit(COMPILED_PATTERN_LIMIT)
+        .dfa_size_limit(PATTERN_DFA_LIMIT)
+        .build()
+    {
+        Ok(regex) => regex.is_match(value),
+        Err(_) => {
+            ::tracing::warn!(
+                "an integration response's selectionPattern is not a regular expression \
+                 this emulator evaluates within its compiled-size budget, so it selects \
+                 nothing"
+            );
+            false
+        }
+    }
+}
+
+/// What `integration`'s `uri` addresses, when it names an Amazon S3 OBJECT call:
+///
+/// * `None` when the `uri` names no AWS service call this module makes — another
+///   service's action, or no ARN at all — which leaves it to the caller's own refusal;
+/// * `Some(Err(reason))` when it DOES name Amazon S3 and this call cannot be placed
+///   against it, which is a configuration this stage cannot serve;
+/// * `Some(Ok(call))` for the call to make.
+fn addressed_object(
+    integration: &GetIntegrationOutput,
+    default_region: &str,
+    inputs: &TemplateInputs,
+) -> Option<Result<ObjectCall, String>> {
+    let uri = integration.uri.as_deref()?;
+    let arn = ::service_common::arn::parse(uri)?;
+    if arn.vendor != APIGATEWAY_VENDOR || arn.account != S3_SUBDOMAIN {
+        return None;
+    }
+    Some(resolved_object(integration, &arn, default_region, inputs))
+}
+
+/// The call the integration ARN `arn` names, with every `{placeholder}` of its resource
+/// resolved against this request.
+fn resolved_object(
+    integration: &GetIntegrationOutput,
+    arn: &::service_common::arn::Arn<'_>,
+    default_region: &str,
+    inputs: &TemplateInputs,
+) -> Result<ObjectCall, String> {
+    let region = match arn.region.is_empty() {
+        true => default_region,
+        false => arn.region,
+    };
+    let resource = substituted(arn.resource, integration, inputs)?;
+    let (action, bucket, key) = if let Some(path) = resource.strip_prefix(PATH_FORM_PREFIX) {
+        let verb = integration.http_method.as_deref().unwrap_or_default();
+        let action = ObjectAction::of_verb(verb).ok_or_else(|| {
+            format!(
+                "the integration's httpMethod {verb} names no Amazon S3 object action this \
+                 emulator performs"
+            )
+        })?;
+        let (bucket, key) = path.trim_start_matches('/').split_once('/').ok_or_else(|| {
+            "the integration's uri addresses the Amazon S3 path form but names no \
+             {bucket}/{key} under it"
+                .to_string()
+        })?;
+        (action, bucket.to_string(), key.to_string())
+    } else if let Some(named) = resource.strip_prefix(ACTION_FORM_PREFIX) {
+        let mut parts = named.split('&');
+        let name = parts.next().unwrap_or_default();
+        let action = ObjectAction::of_action_name(name).ok_or_else(|| {
+            format!(
+                "the integration's uri names the Amazon S3 action {name}, which this \
+                 emulator does not perform"
+            )
+        })?;
+        let mut bucket = None;
+        let mut key = None;
+        for pair in parts {
+            match pair.split_once('=') {
+                Some((BUCKET_PARAMETER, value)) => bucket = Some(value.to_string()),
+                Some((KEY_PARAMETER, value)) => key = Some(value.to_string()),
+                _ => {}
+            }
+        }
+        let (Some(bucket), Some(key)) = (bucket, key) else {
+            return Err(format!(
+                "the integration's uri names the Amazon S3 action {name} without both a \
+                 {BUCKET_PARAMETER} and a {KEY_PARAMETER} parameter, so it addresses no object"
+            ));
+        };
+        (action, bucket, key)
+    } else {
+        return Err(
+            "the integration's uri addresses neither the path nor the action form of an \
+             Amazon S3 call"
+                .to_string(),
+        );
+    };
+    if bucket.is_empty() || key.is_empty() {
+        return Err(
+            "the integration's uri names an empty bucket or key, so it addresses no object"
+                .to_string(),
+        );
+    }
+    Ok(ObjectCall {
+        partition: arn.partition.to_string(),
+        region: region.to_string(),
+        bucket,
+        key,
+        action,
+    })
+}
+
+/// `resource` with every `{name}` placeholder replaced by the value the integration maps
+/// onto that path parameter of the integration request.
+///
+/// A placeholder the `requestParameters` map nothing onto, and one mapped from a source
+/// this request carries nothing for, leave the `uri` naming no object: the integration
+/// cannot be performed, rather than being addressed at whatever text is left behind. Text
+/// that opens a placeholder and never closes it is not one, and stands as it was stored.
+fn substituted(
+    resource: &str,
+    integration: &GetIntegrationOutput,
+    inputs: &TemplateInputs,
+) -> Result<String, String> {
+    if !resource.contains('{') {
+        return Ok(resource.to_string());
+    }
+    let mut resolved = String::with_capacity(resource.len());
+    let mut rest = resource;
+    while let Some((before, after_open)) = rest.split_once('{') {
+        let Some((name, after)) = after_open.split_once('}') else {
+            break;
+        };
+        let mapped = mapped_path_parameter(name, integration, inputs)?;
+        resolved.push_str(before);
+        resolved.push_str(&mapped);
+        rest = after;
+    }
+    resolved.push_str(rest);
+    Ok(resolved)
+}
+
+/// The value the integration maps onto the integration request's path parameter `name`.
+fn mapped_path_parameter(
+    name: &str,
+    integration: &GetIntegrationOutput,
+    inputs: &TemplateInputs,
+) -> Result<String, String> {
+    let mapping = format!("{INTEGRATION_REQUEST_PATH_PREFIX}{name}");
+    let Some(source) = integration
+        .request_parameters
+        .as_ref()
+        .and_then(|parameters| parameters.get(&mapping))
+    else {
+        return Err(format!(
+            "the integration's uri names the parameter {name}, which its requestParameters \
+             map no value onto"
+        ));
+    };
+    mapped_value(source, inputs).ok_or_else(|| {
+        format!(
+            "the integration maps {mapping} from {source}, which is neither a static value in \
+             single quotes nor a method request parameter this call carries"
+        )
+    })
+}
+
+/// The value a `requestParameters` source names for this call: the literal between the
+/// quotes of a static value, or the method request parameter the expression names — read
+/// off the same inputs a mapping template of this call is rendered from, so a simulated
+/// invocation and a real one resolve one mapping alike.
+fn mapped_value(source: &str, inputs: &TemplateInputs) -> Option<String> {
+    if is_static_mapping_value(source) {
+        return source
+            .strip_prefix('\'')
+            .and_then(|rest| rest.strip_suffix('\''))
+            .map(str::to_string);
+    }
+    if let Some(name) = source.strip_prefix(METHOD_REQUEST_PATH_PREFIX) {
+        return inputs.path.get(name).cloned();
+    }
+    if let Some(name) = source.strip_prefix(METHOD_REQUEST_QUERY_PREFIX) {
+        return inputs.querystring.get(name).cloned();
+    }
+    if let Some(name) = source.strip_prefix(METHOD_REQUEST_HEADER_PREFIX) {
+        return named_header(&inputs.header, name);
+    }
+    None
+}
+
+/// The value `headers` carries under `name`, compared without regard to case as HTTP field
+/// names are: a mapping expression names a header in the case the developer wrote, and the
+/// request carries it in the case the client sent.
+fn named_header(headers: &BTreeMap<String, String>, name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(carried, _)| carried.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    //! What an integration `uri` addresses, which is the one part of this module that
+    //! needs neither a backend nor a role to decide.
+
+    use super::*;
+
+    /// An integration of the `AWS` type with `uri`, `httpMethod` and `requestParameters`.
+    fn integration(
+        uri: &str,
+        verb: &str,
+        parameters: &[(&str, &str)],
+    ) -> GetIntegrationOutput {
+        GetIntegrationOutput {
+            r#type: Some(AWS_SERVICE_INTEGRATION_TYPE.to_string()),
+            http_method: Some(verb.to_string()),
+            uri: Some(uri.to_string()),
+            request_parameters: Some(
+                parameters
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect(),
+            ),
+            ..GetIntegrationOutput::default()
+        }
+    }
+
+    /// The call's inputs, carrying one path parameter and one header.
+    fn inputs() -> TemplateInputs {
+        TemplateInputs {
+            payload: None,
+            path: BTreeMap::from([("item".to_string(), "notes/today.txt".to_string())]),
+            querystring: BTreeMap::from([("name".to_string(), "chosen.txt".to_string())]),
+            header: BTreeMap::from([("x-object".to_string(), "headed.txt".to_string())]),
+            stage_variables: BTreeMap::new(),
+            context: BTreeMap::new(),
+        }
+    }
+
+    /// One row of the table below: the case name, the integration whose `uri` is read, and
+    /// the `(bucket, key, action)` it addresses — `None` for a configuration this stage
+    /// cannot serve.
+    type Row = (
+        &'static str,
+        GetIntegrationOutput,
+        Option<(&'static str, &'static str, ObjectAction)>,
+    );
+
+    #[test]
+    fn the_uri_decides_which_object_call_an_aws_integration_makes() {
+        // Rows differ along what the rule generalises over: the FORM the uri names the
+        // call in, the verb that names the action in the path form, the action the action
+        // form names, and where a placeholder's value is mapped from.
+        let cases: Vec<Row> = vec![
+            (
+                "the path form, read as a GetObject",
+                integration(
+                    "arn:aws:apigateway:us-east-1:s3:path/shelf/plain.txt",
+                    "GET",
+                    &[],
+                ),
+                Some(("shelf", "plain.txt", ObjectAction::Get)),
+            ),
+            (
+                "the path form with a PUT, read as a PutObject",
+                integration(
+                    "arn:aws:apigateway:eu-west-2:s3:path/shelf/written.txt",
+                    "PUT",
+                    &[],
+                ),
+                Some(("shelf", "written.txt", ObjectAction::Put)),
+            ),
+            (
+                "the path form with a DELETE, read as a DeleteObject",
+                integration("arn:aws:apigateway:us-east-1:s3:path/shelf/gone.txt", "DELETE", &[]),
+                Some(("shelf", "gone.txt", ObjectAction::Delete)),
+            ),
+            (
+                "a placeholder mapped from a path parameter, key segments kept",
+                integration(
+                    "arn:aws:apigateway:us-east-1:s3:path/shelf/{object}",
+                    "GET",
+                    &[("integration.request.path.object", "method.request.path.item")],
+                ),
+                Some(("shelf", "notes/today.txt", ObjectAction::Get)),
+            ),
+            (
+                "a placeholder mapped from a query parameter",
+                integration(
+                    "arn:aws:apigateway:us-east-1:s3:path/shelf/{object}",
+                    "GET",
+                    &[(
+                        "integration.request.path.object",
+                        "method.request.querystring.name",
+                    )],
+                ),
+                Some(("shelf", "chosen.txt", ObjectAction::Get)),
+            ),
+            (
+                "a placeholder mapped from a header, named in another case",
+                integration(
+                    "arn:aws:apigateway:us-east-1:s3:path/shelf/{object}",
+                    "HEAD",
+                    &[(
+                        "integration.request.path.object",
+                        "method.request.header.X-Object",
+                    )],
+                ),
+                Some(("shelf", "headed.txt", ObjectAction::Head)),
+            ),
+            (
+                "a placeholder mapped from a static value",
+                integration(
+                    "arn:aws:apigateway:us-east-1:s3:path/{bucket}/fixed.txt",
+                    "GET",
+                    &[("integration.request.path.bucket", "'static-shelf'")],
+                ),
+                Some(("static-shelf", "fixed.txt", ObjectAction::Get)),
+            ),
+            (
+                "the action form, which names the action itself",
+                integration(
+                    "arn:aws:apigateway:us-east-1:s3:action/GetObject&Bucket=shelf&Key=acted.txt",
+                    "GET",
+                    &[],
+                ),
+                Some(("shelf", "acted.txt", ObjectAction::Get)),
+            ),
+            (
+                "the action form naming PutObject against the GET verb: the action wins",
+                integration(
+                    "arn:aws:apigateway:us-east-1:s3:action/PutObject&Bucket=shelf&Key=acted.txt",
+                    "GET",
+                    &[],
+                ),
+                Some(("shelf", "acted.txt", ObjectAction::Put)),
+            ),
+            (
+                "a verb that names no object action",
+                integration("arn:aws:apigateway:us-east-1:s3:path/shelf/plain.txt", "PATCH", &[]),
+                None,
+            ),
+            (
+                "a placeholder nothing is mapped onto",
+                integration("arn:aws:apigateway:us-east-1:s3:path/shelf/{object}", "GET", &[]),
+                None,
+            ),
+            (
+                "a form that is neither path nor action",
+                integration("arn:aws:apigateway:us-east-1:s3:shelf/plain.txt", "GET", &[]),
+                None,
+            ),
+        ];
+        for (case, integration, expected) in &cases {
+            let read = addressed_object(integration, "us-east-1", &inputs());
+            let read = read
+                .unwrap_or_else(|| panic!("case {case:?}: the uri names an Amazon S3 call"));
+            match expected {
+                Some((bucket, key, action)) => {
+                    let call = read
+                        .as_ref()
+                        .unwrap_or_else(|error| panic!("case {case:?}: unplaced: {error}"));
+                    assert_eq!(
+                        (call.bucket.as_str(), call.key.as_str(), call.action),
+                        (*bucket, *key, *action),
+                        "case {case:?}: expected {bucket}/{key} {action:?}, got {call:?}"
+                    );
+                }
+                None => assert!(
+                    read.is_err(),
+                    "case {case:?}: expected a configuration this stage cannot serve, got \
+                     {read:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn an_integration_naming_another_service_or_no_arn_is_not_one_of_these_calls() {
+        // Rows differ along WHY the uri names no Amazon S3 object call: another service's
+        // subdomain, another vendor in the ARN, and a value that is no ARN at all.
+        let cases = [
+            (
+                "another service's action",
+                "arn:aws:apigateway:us-east-1:dynamodb:action/PutItem",
+            ),
+            (
+                "an ARN of another vendor",
+                "arn:aws:s3:us-east-1:123456789012:path/shelf/plain.txt",
+            ),
+            ("a formed URL rather than an ARN", "https://example.test/x"),
+        ];
+        for (case, uri) in &cases {
+            let read = addressed_object(&integration(uri, "GET", &[]), "us-east-1", &inputs());
+            assert!(
+                read.is_none(),
+                "case {case:?}: expected the uri to name none of these calls, got {read:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_selection_pattern_chooses_by_the_status_the_backend_answered() {
+        // Rows differ along the status answered and the patterns stored: a class pattern,
+        // an exact one, one that matches nothing, and the fallback with no pattern.
+        let responses = [("200", None), ("403", Some("4\\d{2}")), ("500", Some("5\\d{2}"))];
+        let integration = GetIntegrationOutput {
+            integration_responses: Some(
+                responses
+                    .iter()
+                    .map(|(status, pattern)| {
+                        (
+                            (*status).to_string(),
+                            GetIntegrationResponseOutput {
+                                status_code: Some((*status).to_string()),
+                                selection_pattern: pattern.map(str::to_string),
+                                ..GetIntegrationResponseOutput::default()
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            ..GetIntegrationOutput::default()
+        };
+        let cases = [
+            ("a 200 answer maps to the response with no pattern", 200_u16, "200"),
+            ("a 403 answer maps to the 4xx class", 403, "403"),
+            ("a 404 answer maps to the same 4xx class", 404, "403"),
+            ("a 503 answer maps to the 5xx class", 503, "500"),
+            ("a 302 answer matches no pattern and falls back", 302, "200"),
+        ];
+        for (case, status, expected) in &cases {
+            let selected = selected_response(&integration, *status)
+                .unwrap_or_else(|| panic!("case {case:?}: expected a selected response"));
+            assert_eq!(
+                selected.status_code.as_deref(),
+                Some(*expected),
+                "case {case:?}: expected the {expected} integration response, got {:?}",
+                selected.status_code
+            );
+        }
+    }
+}

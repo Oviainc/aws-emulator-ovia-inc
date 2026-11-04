@@ -128,7 +128,7 @@ use super::types::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::service::invoke::{
-    matched_path_parameters, perform_integration, refusal_rendering, sent_query_parameters,
+    matched_path_parameters, performed_integration, refusal_rendering, sent_query_parameters,
     with_stage_variables, MethodRequest, JSON_CONTENT_TYPE,
 };
 use crate::service::mapping_template::TemplateInputs;
@@ -340,29 +340,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // `latency` is "the execution latency, in ms, of the test invoke request", so it is
         // MEASURED over the simulation rather than stated: the clock is started before the
         // records are read and read once the response has been computed.
         let started = ::std::time::Instant::now();
-        let state = crate::state::service_state(&*self.engine)
-            .ok_or_else(crate::state::state_unavailable)?;
-        let store = state.lock();
-        let api = store
-            .rest_apis
-            .get(&input.rest_api_id)
-            .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
-        let resource = api
-            .resources
-            .get(&input.resource_id)
-            .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE))?;
-        // The verb is addressed exactly as `GetMethod` addresses it, so a method is
-        // reachable by the spelling it was put under.
-        let verb = super::put_method::method_key(&input.http_method);
-        let method = resource
-            .methods
-            .get(&verb)
-            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
+        // WHAT is simulated, read under ONE read of the store and taken off it as OWNED
+        // records: the api (what a refusal is rendered from), the resource path the
+        // simulated request is bound against, the verb and the method that carries the
+        // integration. The store is released with that read, because an integration naming
+        // another service's action is performed by CALLING that service in process and no
+        // lock of this service's is held while another service answers.
+        let (api, resource_path, verb, method) = {
+            let state = crate::state::service_state(&*self.engine)
+                .ok_or_else(crate::state::state_unavailable)?;
+            let store = state.lock();
+            let api = store
+                .rest_apis
+                .get(&input.rest_api_id)
+                .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
+            let resource = api
+                .resources
+                .get(&input.resource_id)
+                .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE))?;
+            // The verb is addressed exactly as `GetMethod` addresses it, so a method is
+            // reachable by the spelling it was put under.
+            let verb = super::put_method::method_key(&input.http_method);
+            let method = resource
+                .methods
+                .get(&verb)
+                .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
+            (
+                api.clone(),
+                resource.path.clone(),
+                verb,
+                method.clone(),
+            )
+        };
         // The integration is WHAT a simulated invocation invokes. A method that carries
         // none cannot be invoked at all, so this is a precondition of the operation —
         // refused on its error channel before anything is simulated — and not a response
@@ -378,10 +391,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .fmt(::aws_smithy_types::date_time::Format::DateTime)
                 .unwrap_or_default(),
         );
-        log.line(format!(
-            "HTTP Method: {verb}, Resource Path: {}",
-            resource.path
-        ));
+        log.line(format!("HTTP Method: {verb}, Resource Path: {resource_path}"));
         let (path, query) = split_query(input.path_with_query_string.as_deref());
         if let Some(path) = path {
             log.line(format!("Method request path: {path}"));
@@ -455,17 +465,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_bytes()
                     .to_vec(),
             ),
-            path: matched_path_parameters(&resource.path, path.unwrap_or("")),
+            path: matched_path_parameters(&resource_path, path.unwrap_or("")),
             querystring: sent_query_parameters(query.unwrap_or_default()),
             header: simulated_headers(&input),
             stage_variables: simulated_variables.clone(),
             context: BTreeMap::from([
                 ("apiId".to_string(), input.rest_api_id.clone()),
                 ("httpMethod".to_string(), verb.clone()),
-                ("resourcePath".to_string(), resource.path.clone()),
+                ("resourcePath".to_string(), resource_path.clone()),
                 (
                     "path".to_string(),
-                    path.unwrap_or(resource.path.as_str()).to_string(),
+                    path.unwrap_or(resource_path.as_str()).to_string(),
                 ),
             ]),
         };
@@ -474,8 +484,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             simulated_header(&input, ACCEPT),
             inputs,
         );
-        let performed = with_stage_variables(method, &simulated_variables)
-            .and_then(|resolved| perform_integration(Some(&resolved), &call));
+        let performed = match with_stage_variables(&method, &simulated_variables) {
+            // The api's own Region is the endpoint an `AWS` integration naming no Region of
+            // its own is called at.
+            Ok(resolved) => {
+                performed_integration(ctx, api.arn_region(), Some(&resolved), &call).await
+            }
+            Err(unserved) => Err(unserved),
+        };
         let (status, body, headers) = match performed {
             Ok(served) => {
                 let mut headers = served.headers;
@@ -495,7 +511,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "Answered through this API's {} gateway response",
                     unserved.refusal.response_type()
                 ));
-                let (status, body) = refusal_rendering(Some(api), unserved.refusal);
+                let (status, body) = refusal_rendering(Some(&api), unserved.refusal);
                 let headers = BTreeMap::from([(
                     CONTENT_TYPE_HEADER.to_string(),
                     JSON_CONTENT_TYPE.to_string(),

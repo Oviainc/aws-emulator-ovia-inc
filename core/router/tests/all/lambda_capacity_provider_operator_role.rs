@@ -245,18 +245,20 @@ fn rows() -> Vec<Row> {
             accepted: false,
         },
         Row {
-            // "This account's IAM holds no role under that name" IS an answer about the
-            // role the caller named, because the role a provider manages compute as is
-            // part of what the client provisions here — and this operation is recorded
-            // refusing an operator role that does not exist. So it is refused, with the
-            // same fixed sentence as a role whose trust policy withholds the assume,
-            // which is the reading
+            // A name this account's IAM holds no role under is evidence about this
+            // emulator's STORE rather than about the role the caller named — the role a
+            // provider manages compute as is normally provisioned outside the client that
+            // creates the provider — so a refusal has to be grounded in a trust document
+            // IAM answered with. That is the reading
             // `crate::state::capacity_provider::operator_role_is_unassumable` implements
-            // (the shared `service_common::iam_role::role_is_unassumable`) and what
-            // separates it from this service's execution role.
+            // and documents (the shared
+            // `service_common::iam_role::held_role_is_unassumable`, the reading a
+            // function's EXECUTION role takes as well), and that handler names THIS suite
+            // as what pins it: so this row is served, exactly as another account's role
+            // below is.
             case: "a role this account's IAM holds none of",
             role: Role::AbsentFromIam,
-            accepted: false,
+            accepted: true,
         },
         Row {
             // Nothing is KNOWN about another account's role — its IAM is not this

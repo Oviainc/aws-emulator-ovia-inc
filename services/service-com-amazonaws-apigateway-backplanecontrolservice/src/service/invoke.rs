@@ -130,9 +130,15 @@
 //!
 //! Every other integration type names a backend this emulator cannot call:
 //!
-//! * `AWS` / `AWS_PROXY` invoke a Lambda function or another service's action. Lambda's
-//!   own `Invoke` answers `501` for `RequestResponse` and `Event` — this emulator has no
-//!   in-process runtime for a deployment package (see
+//! * an `AWS` integration names ANOTHER SERVICE'S ACTION, and where that action is one this
+//!   emulator serves it is PERFORMED by making the call, in process, over the transport the
+//!   router hands this plane ([`aws_integration`]): the method response is then the answer
+//!   that service gave, mapped through the integration response whose `selectionPattern`
+//!   matches the status it answered with. An action of a service this emulator does not
+//!   make the call to is left to the refusal below;
+//! * `AWS_PROXY` invokes a Lambda function. Lambda's own `Invoke` answers `501` for
+//!   `RequestResponse` and `Event` — this emulator has no in-process runtime for a
+//!   deployment package (see
 //!   `services/service-com-amazonaws-lambda-awsgirapiservice/src/ops/invoke.rs`) — so no
 //!   function's answer exists to map;
 //! * `HTTP`, and an `HTTP_PROXY` whose `uri` names an endpoint outside this emulator,
@@ -197,23 +203,26 @@
 //!
 //! `TestInvokeMethod` simulates "the invocation of a Method in your RestApi" — the same
 //! integration, read out of the same records, for a request that never reached a socket. So
-//! the performing half of this module takes no wire request: [`perform_integration`] reads
-//! what an integration needs through [`MethodRequest`], and [`refusal_rendering`] gives the
-//! status and body a call no integration can serve is answered with. That operation REPORTS
-//! what this module performs FROM THE API'S OWN RECORDS, so neither can answer one stored
-//! configuration differently. Passing a request through is not that: the answer is another
-//! endpoint's response to a request this one forwarded, and a simulated invocation forwards
-//! nothing, so it keeps reporting such an integration as a configuration error. Neither is
-//! the stage's response cache: `TestInvokeMethod` is not a request to the stage, so it
-//! neither reads nor fills what the cluster holds — it reports what the integration answers
-//! for the records as they stand.
+//! the performing half of this module takes no wire request: [`performed_integration`]
+//! reads what an integration needs through [`MethodRequest`], and [`refusal_rendering`]
+//! gives the status and body a call no integration can serve is answered with. That
+//! operation REPORTS what this module performs FROM THE API'S OWN RECORDS — including the
+//! call an `AWS` integration makes to another service, which it is handed the same
+//! transport for — so neither can answer one stored configuration differently. Passing a
+//! request through is not that: the answer is another endpoint's response to a request this
+//! one forwarded, and a simulated invocation forwards nothing, so it keeps reporting such
+//! an integration as a configuration error. Neither is the stage's response cache:
+//! `TestInvokeMethod` is not a request to the stage, so it neither reads nor fills what the
+//! cluster holds — it reports what the integration answers for the records as they stand.
+
+pub mod aws_integration;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
-use smithy_server_runtime::http;
+use smithy_server_runtime::{http, BoxFuture, OperationContext};
 
 use crate::ops::put_integration::{
     DEFAULT_CONNECTION_TYPE, HTTP_PROXY_INTEGRATION_TYPE, MOCK_INTEGRATION_TYPE,
@@ -1073,9 +1082,12 @@ fn addresses_connections(path: &str) -> bool {
 /// own records.
 ///
 /// Free-standing and reached with the ONE shared engine, from the one seam that serves
-/// this data plane — `Service::override_routing_error`, which the router reaches before it
-/// authenticates anything — so every invoke of a deployed stage is answered from the same
-/// records, whatever credential it carries.
+/// this data plane — the operation `Service::override_operation` names for a claimed
+/// invoke, which declares no auth scheme so the router serves it whatever credential it
+/// carries — so every invoke of a deployed stage is answered from the same records.
+///
+/// `ctx` is what the router hands that operation: the IN-PROCESS transport an integration
+/// naming another emulated service's action is performed over ([`aws_integration`]).
 ///
 /// Every response leaves here NAMING THE REQUEST it answered, in the header API Gateway
 /// reports a request id in: this is the one funnel every outcome reaches, so a served
@@ -1083,8 +1095,14 @@ fn addresses_connections(path: &str) -> bool {
 /// a client can correlate the response it holds with the request the API processed.
 /// `service_common` owns both the minting and the header, so this data plane reports the
 /// id in the one spelling the rest of the emulator reports it in.
-pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
-    ::service_common::query_error_envelope::with_request_id_header(serve_resolved(engine, req, 0))
+pub async fn serve<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    req: &RtRequest,
+    ctx: &OperationContext<'_>,
+) -> RtResponse {
+    ::service_common::query_error_envelope::with_request_id_header(
+        serve_resolved(engine, req, ctx, 0).await,
+    )
 }
 
 /// The response this data plane's own records compute for `req`, before the request id is
@@ -1093,10 +1111,23 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
 ///
 /// `hop` counts the passed-through integrations already followed to get here: a proxy
 /// integration is served by passing the request on to this same function, so the count is
-/// what bounds a chain of them ([`MAX_PASSED_THROUGH_HOPS`]).
-fn serve_resolved<Eng: Send + Sync + 'static>(
+/// what bounds a chain of them ([`MAX_PASSED_THROUGH_HOPS`]). The future is BOXED for
+/// exactly that reason: a function that awaits itself has no sized future.
+fn serve_resolved<'a, 'c: 'a, Eng: Send + Sync + 'static>(
+    engine: &'a Eng,
+    req: &'a RtRequest,
+    ctx: &'a OperationContext<'c>,
+    hop: u8,
+) -> BoxFuture<'a, RtResponse> {
+    Box::pin(async move { serving(engine, req, ctx, hop).await })
+}
+
+/// [`serve_resolved`]'s body, written as an ordinary `async fn` so only the recursion
+/// above pays for a box.
+async fn serving<Eng: Send + Sync + 'static>(
     engine: &Eng,
     req: &RtRequest,
+    ctx: &OperationContext<'_>,
     hop: u8,
 ) -> RtResponse {
     let Some(state) = crate::state::service_state(engine) else {
@@ -1334,6 +1365,7 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
             stage: stage.stage_name.clone(),
             path: matched_path.to_string(),
             verb: verb.to_string(),
+            region: api.arn_region().to_string(),
             // The private connection a passed-through integration is carried over is this
             // service's own record, so it is resolved here, under the one lock that read
             // the integration itself — off the configuration the stage's variables have
@@ -1432,10 +1464,17 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
         }
         match passed_on {
             PassedThrough::Unserved(unserved) => return refuse(unserved),
-            PassedThrough::Request(onward) => serve_resolved(engine, &onward, hop + 1),
+            PassedThrough::Request(onward) => serve_resolved(engine, &onward, ctx, hop + 1).await,
         }
     } else {
-        match perform_integration(integration.method.as_ref(), &integration.call) {
+        match performed_integration(
+            ctx,
+            &integration.region,
+            integration.method.as_ref(),
+            &integration.call,
+        )
+        .await
+        {
             Ok(served) => served_response(served),
             Err(unserved) => return refuse(unserved),
         }
@@ -1688,6 +1727,9 @@ struct ResolvedIntegration {
     path: String,
     /// The verb the method is addressed by, for that same log.
     verb: String,
+    /// The api's OWN Region, read off its ARN: the Region an integration naming another
+    /// service's action is made at when its own ARN names none ([`aws_integration`]).
+    region: String,
     /// The LIVE method the deployed one names, which carries the integration; `None` when
     /// the deployment holds a method the api no longer carries, which is an integration
     /// there is nothing to call.
@@ -3018,6 +3060,32 @@ fn unusable_vpc_link(
     }
 }
 
+/// Perform the call through the method's integration, through the IN-PROCESS transport
+/// `ctx` carries where the integration names another emulated service's action.
+///
+/// The one entry point both sides of this module's work reach — the data plane above and
+/// `TestInvokeMethod`, which reports what this performs — so one stored configuration is
+/// performed one way whichever side drives it. An `AWS` integration naming a service call
+/// this emulator makes is performed by MAKING that call ([`aws_integration`]); every other
+/// integration is performed from the api's own records alone ([`perform_integration`]),
+/// which needs no transport and is therefore still reachable on its own.
+///
+/// `region` is the api's own, which is the endpoint an integration ARN that names no Region
+/// of its own is called at.
+pub async fn performed_integration(
+    ctx: &OperationContext<'_>,
+    region: &str,
+    method: Option<&MethodEntry>,
+    call: &MethodRequest,
+) -> Result<IntegratedResponse, UnservedIntegration> {
+    if let Some(method) = method {
+        if let Some(served) = aws_integration::performed(ctx, region, method, call).await {
+            return served;
+        }
+    }
+    perform_integration(method, call)
+}
+
 /// Perform the call through the method's integration, answering the response the API's
 /// records produce for it.
 ///
@@ -3031,9 +3099,11 @@ fn unusable_vpc_link(
 ///
 /// Every other type names a backend whose answer is not this api's records to produce: an
 /// `HTTP_PROXY` naming an endpoint of this emulator is served by passing the request on
-/// ([`passed_through`], which [`serve_resolved`] reaches before this), and every other one
-/// is an integration this call cannot perform rather than one whose answer is invented —
-/// see the module docs.
+/// ([`passed_through`], which [`serve_resolved`] reaches before this), an `AWS` integration
+/// naming an action this emulator serves is served by MAKING that call
+/// ([`aws_integration`], which [`performed_integration`] reaches before this), and every
+/// other one is an integration this call cannot perform rather than one whose answer is
+/// invented — see the module docs.
 pub fn perform_integration(
     method: Option<&MethodEntry>,
     call: &MethodRequest,

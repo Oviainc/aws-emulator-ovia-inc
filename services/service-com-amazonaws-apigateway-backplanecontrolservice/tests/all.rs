@@ -29,6 +29,9 @@ mod stage_web_acl_edge;
 // Declared here, at the head, for the reason the entry above records.
 #[path = "all/stage_web_acl_association_report.rs"]
 mod stage_web_acl_association_report;
+// Declared here, at the head, for the reason the entry above records.
+#[path = "all/aws_service_integration.rs"]
+mod aws_service_integration;
 
 #[path = "all/account_settings.rs"]
 mod account_settings;

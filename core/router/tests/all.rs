@@ -186,6 +186,11 @@ mod ecr_public_action_scoped_iam_identity;
 #[path = "all/apigateway_private_vpce_invoke.rs"]
 mod apigateway_private_vpce_invoke;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `a…` span (where the other apigateway suites land) are both regions
+// concurrently landing suites add their line to.
+#[path = "all/apigateway_s3_service_integration.rs"]
+mod apigateway_s3_service_integration;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `b…` span (where the other bedrock suites land) are both regions concurrently
 // landing suites add their line to.
 #[path = "all/bedrock_model_customization_pass_role.rs"]

@@ -27,7 +27,7 @@
 //!   it and, ahead of that, answers a query value that cannot be converted to its
 //!   member's modelled type through [`query_coercion`] — a deserialization failure, not
 //!   a constraint violation. A request addressed to a stage invoke URL is served by
-//!   [`invoke::serve`] instead, which the model's routing key cannot
+//!   [`StageDataPlane`] instead, which the model's routing key cannot
 //!   name.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
@@ -79,13 +79,15 @@
 //!
 //! - [`Service::can_handle`] also claims a request addressed to a deployed stage of an api
 //!   this service HOLDS ([`invoke::claims_parts`]), which is what routes it here at all;
-//! - [`Service::override_routing_error`] serves EVERY invoke, whatever credential it
-//!   carries. An invoke names no modelled operation by construction (`/{stage}/{path}` is
-//!   not in the model), so the router reaches exactly this seam for it, and reaches it
-//!   BEFORE authentication — which is what lets the stage answer the request at all.
+//! - [`Service::override_operation`] serves EVERY invoke, as an [`ErasedOperation`]
+//!   ([`StageDataPlane`]) so the handler is handed the in-process transport an `AWS`
+//!   integration's call to another emulated service is made over. An invoke names no
+//!   modelled operation by construction (`/{stage}/{path}` is not in the model), so that
+//!   operation is named only for a request the data plane claims, and every modelled
+//!   request keeps resolving through the generated table.
 //!
-//! Why the signed invoke is NOT named as an operation, which is how a service asks the
-//! router to verify a credential before anything is served: the router verifies a named
+//! Why that operation declares NO auth scheme, which is what the router reads as "served
+//! unsigned": the router verifies a named
 //! operation's SigV4 credential against the signing name of the service that CLAIMED the
 //! request, and this service's is its control plane's (`apigateway`). An invoke of a
 //! deployed stage is signed under the data plane's own signing name instead — the
@@ -94,7 +96,7 @@
 //! before the stage is reached, whatever the api's records say. The emulator's own
 //! signature verification cannot be pointed at a second signing name from here, so the
 //! choice is between refusing every correctly signed invoke and serving it: AWS serves it,
-//! so the one seam above serves it. What a method's `authorizationType` requires of the
+//! so the operation above declares none. What a method's `authorizationType` requires of the
 //! request is unchanged — `AWS_IAM` still admits only a request that CARRIES a SigV4
 //! credential ([`invoke::carries_sigv4_credential`]), and refuses one that carries none.
 //!
@@ -157,11 +159,14 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
     /// The SAME shared engine the generated entry threads into every operation.
     ///
-    /// Held here because the `execute-api` data plane ([`invoke`]) is served from
-    /// [`Service::override_routing_error`], which is not an operation and so has no
-    /// `self.engine` of its own; it must read the one store the control-plane operations
-    /// write, not a second copy.
+    /// Held here because the `execute-api` data plane ([`invoke`]) is CLAIMED in
+    /// [`Service::can_handle`], which is handed no operation of its own; it must read the
+    /// one store the control-plane operations write, not a second copy.
     engine: Arc<Eng>,
+    /// The `execute-api` data plane, as an operation, so the router hands it an
+    /// [`OperationContext`] — the in-process transport an `AWS` integration's call to
+    /// another service is made over.
+    data_plane: StageDataPlane<Eng>,
     /// The same modelled operations the generated table holds, each wrapped in
     /// [`StatedPerOperation`] so a refused request names the violated member by its path
     /// from THAT operation's input shape. Keyed by the routing key the protocol resolves
@@ -328,9 +333,59 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         );
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            data_plane: StageDataPlane {
+                engine: Arc::clone(&engine),
+            },
             engine,
             stated,
         }
+    }
+}
+
+/// The `execute-api` data plane as an [`ErasedOperation`], so the router hands it the
+/// [`OperationContext`] carrying the in-process transport an `AWS` integration's call to
+/// another emulated service goes over ([`invoke::aws_integration`]).
+///
+/// It holds the SAME shared engine the generated entry threads into every operation, so the
+/// data plane reads the one store the control-plane operations write.
+struct StageDataPlane<Eng> {
+    engine: Arc<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for StageDataPlane<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            if invoke::claims_request(&*self.engine, req) {
+                return invoke::serve(&*self.engine, req, ctx).await;
+            }
+            // Unreachable: `override_operation` names this only for a request the data
+            // plane claims.
+            svc.definition().routing_error_response(req)
+        })
+    }
+
+    /// NO auth scheme, which is what the router reads as "served unsigned".
+    ///
+    /// An invoke of a deployed stage is not a modelled operation of this service, and the
+    /// credential it carries is not this service's to verify: the router verifies a named
+    /// operation's SigV4 credential against the signing name of the service that CLAIMED
+    /// the request, and this service's is its control plane's (`apigateway`), while an
+    /// invoke is signed under the data plane's own (`execute-api`, the service AWS
+    /// publishes the invoke endpoint and the `execute-api:Invoke` action under). Declaring
+    /// no scheme is what lets the stage answer a correctly signed invoke at all, and it
+    /// leaves the modelled operations untouched: the router reads the schemes off the
+    /// MODELLED operation first, and every control-plane request resolves one.
+    ///
+    /// What a method's `authorizationType` requires of the request is unchanged — `AWS_IAM`
+    /// still admits only a request that CARRIES a SigV4 credential
+    /// ([`invoke::carries_sigv4_credential`]), and refuses one that carries none.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
     }
 }
 
@@ -492,23 +547,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // An invoke of a deployed stage is named here for NO credential state: it is left
-        // unnamed on purpose, signed or not, and answered by `override_routing_error`
-        // below, which the router reaches before authentication. Naming an operation is
-        // how a service asks the router to verify a credential, and the router verifies it
-        // against THIS service's own signing name, which is its control plane's; an invoke
-        // is signed under the data plane's own, so naming an operation for it refuses every
-        // correctly signed invoke before the stage is reached (see the module docs).
-        //
-        // NOT a re-route: the key is the one the generated table's own protocol
-        // resolves, and the operation it names is the one served — wrapped in
+        // NOT a re-route for a modelled request: the key is the one the generated table's
+        // own protocol resolves, and the operation it names is the one served — wrapped in
         // `StatedPerOperation` so a refused request names the violated member by its
         // path from that operation's input shape, the way this service names it, and so
         // that a query value it cannot convert is answered by `query_coercion` ahead of
-        // that. A key the model does not name resolves to `None` here exactly as it does
-        // in the generated table, so the router's routing-error path is unchanged.
-        let key = self.entry.protocol().routing_key(req).ok()?;
-        self.stated.get(key)
+        // that.
+        if let Some(stated) = self
+            .entry
+            .protocol()
+            .routing_key(req)
+            .ok()
+            .and_then(|key| self.stated.get(key))
+        {
+            return Some(stated);
+        }
+        // An invoke of a deployed stage names no modelled operation by construction
+        // (`/{stage}/{path}` is not in the model), so it is served here, by the one
+        // operation that is not the model's: `StageDataPlane`, which the router hands the
+        // in-process transport an `AWS` integration's call to another service is made over.
+        // It declares no auth scheme, so the router serves the invoke whatever credential
+        // it carries — see that operation's own `auth_schemes`.
+        invoke::claims_request(&*self.engine, req)
+            .then_some(&self.data_plane as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -530,17 +591,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. An invoke of a deployed stage is exactly that case by
-        // construction (no modelled operation is bound at `/{stage}/{path}`), so this is
-        // where EVERY invoke is served — signed or anonymous, and BEFORE authentication,
-        // which is what lets the stage answer it at all.
-        //
-        // Anything else keeps the protocol-correct default for this service's envelope
-        // (query -> 400 InvalidAction text/xml, awsJson -> 404, rpcv2Cbor -> 404,
+        // routing table resolved it. An invoke of a deployed stage is named by
+        // `override_operation` above, so what is left here is a request this service
+        // serves nothing for: it keeps the protocol-correct default for this service's
+        // envelope (query -> 400 InvalidAction text/xml, awsJson -> 404, rpcv2Cbor -> 404,
         // rest -> 501) by returning `None`.
-        if invoke::claims_request(&*self.engine, req) {
-            return Some(invoke::serve(&*self.engine, req));
-        }
+        let _ = req;
         None
     }
 
