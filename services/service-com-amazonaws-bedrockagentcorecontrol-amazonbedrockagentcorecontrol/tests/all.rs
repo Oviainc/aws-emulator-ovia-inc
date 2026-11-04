@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/agent_runtime_endpoint_lifecycle.rs"]
 mod agent_runtime_endpoint_lifecycle;
+#[path = "all/agent_runtime_endpoint_listing.rs"]
+mod agent_runtime_endpoint_listing;
 #[path = "all/agent_runtime_lifecycle.rs"]
 mod agent_runtime_lifecycle;
 #[path = "all/browser_lifecycle.rs"]

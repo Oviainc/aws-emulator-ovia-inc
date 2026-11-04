@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAgentRuntimeEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAgentRuntimeEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAgentRuntimeEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the endpoints PERSISTED on one agent runtime in [`crate::state`], in the
+//! name order the store holds them in, one modelled page at a time.
+//!
+//! An endpoint is addressed only THROUGH its runtime, so this listing reads the
+//! runtime's own endpoint map rather than a map of its own: it reports exactly what
+//! `CreateAgentRuntimeEndpoint` stored and what `GetAgentRuntimeEndpoint` reports for
+//! each endpoint, including the `CREATING` -> `READY` transition the clock owes it.
+//! Reporting only: nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +152,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAgentRuntimeEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAgentRuntimeEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAgentRuntimeEndpoints"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAgentRuntimeEndpointsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the agent runtime store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // An endpoint is addressed only through its runtime, so a listing for a
+        // runtime this account does not hold is refused — never an empty page, which
+        // would say the runtime is there and holds nothing. This operation models no
+        // not-found error, so the refusal is its modelled `ValidationException`,
+        // carrying the one sentence the endpoint family words an agent it could not
+        // resolve in.
+        let runtime = store
+            .agent_runtimes
+            .get(&input.agent_runtime_id)
+            .ok_or_else(|| {
+                ListAgentRuntimeEndpointsErrorModeled::ValidationException(unresolvable_runtime(
+                    &input.agent_runtime_id,
+                ))
+            })?;
+
+        // The token is opaque on the wire: it carries the endpoint name the previous
+        // page ended on, and the next page starts strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListAgentRuntimeEndpointsErrorModeled::ValidationException(
+                    crate::state::field_validation_failed(
+                        NEXT_TOKEN_MEMBER,
+                        "must be a nextToken returned by a previous ListAgentRuntimeEndpoints call",
+                    ),
+                )
+            })?),
+        };
+
+        // `maxResults` has the modelled range 1..100; absent, a page holds that same
+        // documented maximum. The page walk is `crate::state`'s, so every listing of
+        // this service pages by one rule, and the endpoints are keyed by name, so the
+        // order is the same on every call.
+        let page_size = crate::state::page_size(input.max_results, MAX_PAGE_SIZE);
+        let (runtime_endpoints, next_token) = crate::state::page_over(
+            &runtime.endpoints,
+            resume_after.as_deref(),
+            page_size,
+            |endpoint| Some(summary(runtime, endpoint, now)),
+        );
+
+        Ok(ListAgentRuntimeEndpointsOutput {
+            runtime_endpoints,
+            next_token,
+        })
+    }
+}
+
+/// The modelled upper bound of `maxResults` (range 1..100), used as the page size
+/// when the caller names none.
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// The request member a refused page token is reported against.
+const NEXT_TOKEN_MEMBER: &str = "nextToken";
+
+/// The request member that named a runtime this account does not hold.
+const AGENT_RUNTIME_ID_MEMBER: &str = "agentRuntimeId";
+
+/// The modelled refusal of a listing whose `agentRuntimeId` names no runtime of
+/// this account.
+///
+/// The sentence is `crate::state`'s one sentence for an agent an endpoint operation
+/// could not resolve, so a caller naming an absent runtime reads the same wording
+/// here as from the endpoint reads that do model a not-found error; the member that
+/// failed is reported in the `fieldList` the shape declares for exactly that.
+fn unresolvable_runtime(agent_runtime_id: &str) -> ValidationException {
+    ValidationException {
+        message: crate::state::agent_not_found_for_endpoint(agent_runtime_id)
+            .message
+            .unwrap_or_default(),
+        reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: AGENT_RUNTIME_ID_MEMBER.to_string(),
+            message: "must name an agent runtime of this account".to_string(),
+        }]),
+    }
+}
+
+/// One endpoint's `AgentRuntimeEndpoint` list entry.
+///
+/// Rendered from the stored record and from the runtime that holds it — the runtime's
+/// ARN is the runtime's own, never re-derived here — so this listing cannot report an
+/// endpoint differently from `GetAgentRuntimeEndpoint`.
+fn summary(
+    runtime: &crate::state::AgentRuntimeRecord,
+    endpoint: &crate::state::AgentRuntimeEndpointRecord,
+    now: ::std::time::SystemTime,
+) -> AgentRuntimeEndpoint {
+    AgentRuntimeEndpoint {
+        name: endpoint.endpoint_name.clone(),
+        // The version the endpoint is SERVING: the one it pins once the clock-owed
+        // transition onto it is due, and until then whatever it served before —
+        // nothing at all for an endpoint that was only just created.
+        live_version: endpoint.live_version_at(now),
+        target_version: Some(endpoint.target_version_string()),
+        agent_runtime_endpoint_arn: endpoint.endpoint_arn.clone(),
+        agent_runtime_arn: runtime.agent_runtime_arn.clone(),
+        status: endpoint.status_at(now).to_string(),
+        id: endpoint.endpoint_id.clone(),
+        description: endpoint.description.clone(),
+        created_at: crate::state::timestamp(endpoint.created_at),
+        last_updated_at: crate::state::timestamp(endpoint.last_updated_at),
     }
 }
