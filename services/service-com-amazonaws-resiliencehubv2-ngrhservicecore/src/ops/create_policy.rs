@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a resilience policy and STORES it, so every later `GetPolicy` reads what
+//! this call wrote. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +155,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // `clientToken` is an @idempotencyToken: a repeat of the same call returns the
+        // policy the first one created rather than creating a second one.
+        if let Some(policy) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.policy_idempotency.get(token))
+            .cloned()
+            .and_then(|policy_arn| store.policy_view(&policy_arn))
+        {
+            return Ok(CreatePolicyOutput { policy });
+        }
+
+        // A policy name identifies one policy within the account — `EntityName` is
+        // "Resource name (used in ARN — no spaces allowed)" — so a second policy under a
+        // name already taken is a conflict, not a second policy.
+        if let Some(existing) = store.policy_named(&input.name) {
+            return Err(CreatePolicyErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "A resilience policy named {} already exists in this account: {}",
+                    input.name, existing.policy_arn
+                ),
+            })
+            .into());
+        }
+
+        // The store is BOUNDED before it is written: every create grows `policies` by one
+        // entry carrying caller-supplied payload, so a caller that repeats this call
+        // would otherwise grow the process's memory without limit. At the ceiling the
+        // create is refused with the quota error this operation models. The two secondary
+        // indexes are bounded by the same ceiling — `policy_names` holds exactly one
+        // entry per stored policy and `policy_idempotency` at most one (a replayed token
+        // returns above instead of inserting).
+        if store.policies.len() >= crate::state::MAX_POLICIES {
+            return Err(CreatePolicyErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The maximum number of resilience policies for this account has \
+                         been reached: {}. Delete a policy before creating another.",
+                        crate::state::MAX_POLICIES
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The call is a create: mint the ARN and take the next creation-order position.
+        let policy_arn = crate::state::mint_policy_arn(&region);
+        let sequence = store.next_sequence();
+        let record = crate::state::PolicyRecord {
+            policy_arn: policy_arn.clone(),
+            name: input.name,
+            description: input.description,
+            // Every target block is optional in the model and is stored exactly as the
+            // caller set it: a policy that sets none has no targets, not zeroed ones.
+            availability_slo: input.availability_slo,
+            multi_az: input.multi_az,
+            multi_region: input.multi_region,
+            data_recovery: input.data_recovery,
+            // Omitted means cross-account sharing is off for the new policy.
+            sharing_enabled: input.sharing_enabled.unwrap_or(false),
+            kms_key_id: input.kms_key_id,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at: now,
+            updated_at: now,
+            sequence,
+        };
+
+        store
+            .policy_names
+            .insert(record.name.clone(), policy_arn.clone());
+        if let Some(token) = input.client_token {
+            store.policy_idempotency.insert(token, policy_arn.clone());
+        }
+        // `associatedServiceCount` is counted from the services that reference this ARN —
+        // zero for a just-minted one — through the same projection every later read
+        // answers from.
+        let policy = record.to_policy(store.associated_service_count(&policy_arn));
+        store.policies.insert(policy_arn, record);
+        Ok(CreatePolicyOutput { policy })
     }
 }

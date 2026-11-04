@@ -16,6 +16,16 @@
 //! [`ServiceRecord::to_service`] for the full `Service` shape and
 //! [`ServiceRecord::to_summary`] for the `ServiceSummary` `ListServices` emits — so the
 //! two readers cannot drift from one another or from what was stored.
+//!
+//! The store's other resource lives in its own module beside this one:
+//! [`policies`] holds the `Policy` lifecycle's records and projection. The state STRUCT
+//! stays single ([`ComAmazonawsResiliencehubv2NgrhservicecoreState`]), so one lock
+//! covers the whole store and a policy can be counted against the services that
+//! reference it.
+
+mod policies;
+
+pub use policies::{mint_policy_arn, PolicyRecord, MAX_POLICIES, POLICY_RESOURCE};
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -274,15 +284,7 @@ impl ServiceRecord {
     /// `TagMap` is constrained `len 1..50`, so an untagged service reports no `tags`
     /// member at all rather than an empty map.
     fn tags_view(&self) -> Option<HashMap<String, String>> {
-        if self.tags.is_empty() {
-            return None;
-        }
-        Some(
-            self.tags
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        )
+        tag_map_view(&self.tags)
     }
 
     /// Apply a caller-set `dependencyDiscovery` value.
@@ -399,6 +401,15 @@ pub struct ComAmazonawsResiliencehubv2NgrhservicecoreState {
     /// `clientToken` -> `serviceArn`, so a replayed `@idempotencyToken` returns the
     /// service the first call created instead of creating a second one.
     pub idempotency: BTreeMap<String, String>,
+    /// Every created resilience policy, keyed by its ARN. See [`policies`].
+    pub policies: BTreeMap<String, PolicyRecord>,
+    /// `name` -> `policyArn`, so `CreatePolicy` can refuse a duplicate name with
+    /// `ConflictException` without scanning every record.
+    pub policy_names: BTreeMap<String, String>,
+    /// `clientToken` -> `policyArn`, so a replayed `CreatePolicy`
+    /// `@idempotencyToken` returns the policy the first call created instead of
+    /// creating a second one.
+    pub policy_idempotency: BTreeMap<String, String>,
     /// Monotonic creation counter handed out by [`Self::next_sequence`].
     next_sequence: u64,
 }
@@ -443,6 +454,22 @@ impl ComAmazonawsResiliencehubv2NgrhservicecoreState {
 /// A stored instant as the modelled `Timestamp` the wire carries.
 pub fn to_date_time(instant: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(instant)
+}
+
+/// Stored tags as the modelled `TagMap` the wire carries.
+///
+/// `TagMap` is constrained `len 1..50`, so an untagged resource reports no `tags` member
+/// at all rather than an empty map. Shared by every tagged resource in this store, so
+/// one rule covers them all.
+pub(crate) fn tag_map_view(tags: &BTreeMap<String, String>) -> Option<HashMap<String, String>> {
+    if tags.is_empty() {
+        return None;
+    }
+    Some(
+        tags.iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
 }
 
 /// Mint a fresh service ARN: `arn:aws:resiliencehub:<region>:<account>:service/<uuid>`.
