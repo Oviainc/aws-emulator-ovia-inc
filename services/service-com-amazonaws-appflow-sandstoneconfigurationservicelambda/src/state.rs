@@ -40,13 +40,15 @@ pub const TRIGGER_TYPE_SCHEDULED: &str = "Scheduled";
 /// (`smithy_query(query="shape", shape="TriggerType")`).
 pub const TRIGGER_TYPE_EVENT: &str = "Event";
 
-/// How long after `StartFlow` a run stops being `InProgress`.
+/// How long a run stays in a non-terminal status: how long after `StartFlow` it stops
+/// being `InProgress`, and how long after `CancelFlowExecutions` it stops being
+/// `CancelStarted`.
 ///
-/// CHOSEN, not documented: AppFlow publishes no duration for a flow run, so this is
-/// the emulator's own span — long enough that a caller which polls straight after
-/// `StartFlow` still observes the `InProgress` run (and the state errors that go with
-/// it), short enough that a test need not wait. The instant is stored on the run and
-/// materialised by whichever call reads it next; nothing sleeps.
+/// CHOSEN, not documented: AppFlow publishes no duration for a flow run or for the
+/// cancellation of one, so this is the emulator's own span — long enough that a caller
+/// which polls straight after either call still observes the non-terminal run (and the
+/// state errors that go with it), short enough that a test need not wait. The instant is
+/// stored on the run and materialised by whichever call reads it next; nothing sleeps.
 pub const EXECUTION_SETTLES_AFTER: Duration = Duration::from_millis(500);
 
 /// Why a flow run cannot succeed in the emulator.
@@ -184,6 +186,63 @@ impl FlowExecution {
             metadata_catalog_details: None,
         }
     }
+
+    /// `true` while this run has not reached a terminal status: it is still in
+    /// progress, or its cancellation has started and has not completed yet.
+    ///
+    /// It is also exactly the window in which the run can be cancelled: a run may be
+    /// cancelled "only when the run is in progress", never one that "has already
+    /// completed or failed" nor one "that's scheduled to occur but hasn't started yet"
+    /// (`smithy_query(query="doc", shape="CancelFlowExecutions")`), and a run whose
+    /// cancellation is already under way is that same request repeated rather than an
+    /// ineligible run.
+    ///
+    /// Call [`Flow::settle_due_executions`] first, or a run the clock has already
+    /// finished still reads as active.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self.execution_status,
+            ExecutionStatus::InProgress | ExecutionStatus::CancelStarted
+        )
+    }
+
+    /// Begin cancelling this run, answering whether it was eligible at all.
+    ///
+    /// "When you send your request, the status for each run becomes CancelStarted. When
+    /// the cancellation completes, the status becomes Canceled."
+    /// (`smithy_query(query="doc", shape="CancelFlowExecutions")`) — so this call only
+    /// starts the cancellation and the clock owes the run its `Canceled` status, which
+    /// [`Flow::settle_due_executions`] materialises. A run whose cancellation had
+    /// already started keeps the instant the FIRST request set, so repeating the
+    /// request cannot postpone it.
+    pub fn begin_cancellation(&mut self, now: SystemTime) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        if self.execution_status == ExecutionStatus::InProgress {
+            self.execution_status = ExecutionStatus::CancelStarted;
+            self.last_updated_at = now;
+            self.settles_at = Some(now + EXECUTION_SETTLES_AFTER);
+        }
+        true
+    }
+}
+
+/// The `executionResult` of a run that transferred nothing: every counter a true zero
+/// rather than an invented volume, plus whatever that run has to say for itself.
+///
+/// No transfer ever happens in this emulator (see [`EXECUTION_NOT_PERFORMED_MESSAGE`]),
+/// so every run that reaches a terminal status reports its outcome through this one
+/// shape and no two of them can describe the same non-transfer differently.
+fn nothing_transferred(error_info: Option<ErrorInfo>) -> ExecutionResult {
+    ExecutionResult {
+        error_info,
+        bytes_processed: Some(0),
+        bytes_written: Some(0),
+        records_processed: Some(0),
+        num_parallel_processes: None,
+        max_page_size: None,
+    }
 }
 
 /// A flow: the definition `CreateFlow` persisted, plus its run history.
@@ -264,6 +323,10 @@ impl Flow {
     /// `settles_at` whether or not anybody called, so materialising it on read reports
     /// the state the clock had already reached — it never moves a status because
     /// something was read.
+    ///
+    /// WHICH terminal status is owed follows from the status the run is leaving: a run
+    /// whose cancellation had started completes as `Canceled`, and any other pending
+    /// run ends in the service's modelled failure state.
     pub fn settle_due_executions(&mut self, now: SystemTime) {
         for execution in &mut self.executions {
             let Some(due) = execution.settles_at else {
@@ -273,23 +336,22 @@ impl Flow {
                 continue;
             }
             execution.settles_at = None;
-            execution.execution_status = ExecutionStatus::Error;
             execution.last_updated_at = due;
             // No data was pulled, so there is no data-pull window to report: both
             // instants stay `None` rather than describing a transfer that never ran.
-            execution.execution_result = Some(ExecutionResult {
-                error_info: Some(ErrorInfo {
-                    put_failures_count: Some(0),
-                    execution_message: Some(EXECUTION_NOT_PERFORMED_MESSAGE.to_string()),
-                }),
-                // Nothing was transferred, so every counter is a true zero rather
-                // than an invented volume.
-                bytes_processed: Some(0),
-                bytes_written: Some(0),
-                records_processed: Some(0),
-                num_parallel_processes: None,
-                max_page_size: None,
-            });
+            if execution.execution_status == ExecutionStatus::CancelStarted {
+                // The cancellation this run was already undergoing has completed, so it
+                // ends cancelled rather than failed, and nothing went wrong for an
+                // `errorInfo` to report.
+                execution.execution_status = ExecutionStatus::Canceled;
+                execution.execution_result = Some(nothing_transferred(None));
+                continue;
+            }
+            execution.execution_status = ExecutionStatus::Error;
+            execution.execution_result = Some(nothing_transferred(Some(ErrorInfo {
+                put_failures_count: Some(0),
+                execution_message: Some(EXECUTION_NOT_PERFORMED_MESSAGE.to_string()),
+            })));
         }
     }
 
@@ -309,14 +371,38 @@ impl Flow {
             .find(|execution| execution.client_token.as_deref() == Some(client_token))
     }
 
-    /// `true` while one of this flow's runs is still in progress.
+    /// `true` while one of this flow's runs has not finished — see
+    /// [`FlowExecution::is_active`].
     ///
     /// Call [`Flow::settle_due_executions`] first, or a run the clock has already
     /// finished still reads as running.
     pub fn has_running_execution(&self) -> bool {
+        self.executions.iter().any(FlowExecution::is_active)
+    }
+
+    /// Begin cancelling the run `execution_id`, answering whether this flow could
+    /// cancel it: a run that belongs to some OTHER flow, or to no flow at all, is not
+    /// this flow's to cancel, and nor is one that has already finished.
+    ///
+    /// Call [`Flow::settle_due_executions`] first, so the judgement is made against the
+    /// statuses the clock has already reached.
+    pub fn begin_cancelling_execution(&mut self, execution_id: &str, now: SystemTime) -> bool {
         self.executions
-            .iter()
-            .any(|execution| execution.execution_status == ExecutionStatus::InProgress)
+            .iter_mut()
+            .find(|execution| execution.execution_id == execution_id)
+            .is_some_and(|execution| execution.begin_cancellation(now))
+    }
+
+    /// Begin cancelling every unfinished run of this flow, answering how many were
+    /// eligible — what a cancellation that names no run at all does.
+    pub fn begin_cancelling_all_executions(&mut self, now: SystemTime) -> usize {
+        let mut cancelling = 0;
+        for execution in &mut self.executions {
+            if execution.begin_cancellation(now) {
+                cancelling += 1;
+            }
+        }
+        cancelling
     }
 
     /// This flow's runs, most recent first — the order `DescribeFlowExecutionRecords`

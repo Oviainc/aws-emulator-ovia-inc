@@ -34,7 +34,7 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 ///
 /// Waited with `std::thread::sleep`, not `tokio::time::sleep`: this workspace enables
 /// tokio's `macros`/`rt` features only, so the timer driver is not compiled in.
-const AFTER_RUN_SETTLES: Duration = Duration::from_millis(900);
+pub(crate) const AFTER_RUN_SETTLES: Duration = Duration::from_millis(900);
 
 /// One AppFlow service on one shared engine, with the engine handed back so a case can
 /// seed the store directly instead of driving a thousand requests to reach a bound.
@@ -1237,7 +1237,7 @@ async fn a_value_outside_a_modelled_constraint_is_refused() {
 
 /// A stored flow with nothing but its identity filled in — enough to exercise the
 /// bounds the store keeps on a flow's run history.
-fn stored_flow(flow_name: &str) -> Flow {
+pub(crate) fn stored_flow(flow_name: &str) -> Flow {
     use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::ops::types::{
         SourceFlowConfig, TriggerConfig,
     };
@@ -1267,7 +1267,7 @@ fn stored_flow(flow_name: &str) -> Flow {
     }
 }
 
-fn stored_execution(execution_id: &str, started_at: SystemTime) -> FlowExecution {
+pub(crate) fn stored_execution(execution_id: &str, started_at: SystemTime) -> FlowExecution {
     FlowExecution {
         execution_id: execution_id.to_string(),
         client_token: None,
