@@ -45,7 +45,10 @@ use super::object_storage::{list_objects_v2, listing_of, sorted_keys, store_keys
 
 /// `GET /<bucket>[?…]` — `ListObjects`, with whatever query parameters the case under test
 /// carries and no `list-type`, which is what separates it from `ListObjectsV2`.
-async fn list_objects(router: &MultiServiceRouter, bucket: &str, query: &str) -> Answer {
+///
+/// `pub(crate)`: the resume-marker suite ([`super::listing_resume_markers`]) sends this
+/// revision's listing through this one helper rather than keeping a second copy.
+pub(crate) async fn list_objects(router: &MultiServiceRouter, bucket: &str, query: &str) -> Answer {
     list_objects_with(router, bucket, query, &[]).await
 }
 

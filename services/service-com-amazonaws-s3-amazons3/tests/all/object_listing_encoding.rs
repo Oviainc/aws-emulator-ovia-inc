@@ -41,7 +41,11 @@ const PATH_LITERAL: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'/');
 
 /// `key` as a request path carries it.
-fn in_path(key: &str) -> String {
+///
+/// `pub(crate)`: the set this leaves literal — RFC 3986's unreserved characters plus `/` —
+/// is legal in a query VALUE too, so the suites that hand a key back as a query parameter
+/// ([`super::listing_resume_markers`]) escape it through this one helper.
+pub(crate) fn in_path(key: &str) -> String {
     utf8_percent_encode(key, PATH_LITERAL).to_string()
 }
 

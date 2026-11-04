@@ -83,7 +83,10 @@ fn in_path(key: &str) -> String {
 
 /// `POST /<bucket>/<key>?uploads` — `CreateMultipartUpload`, answering the upload id the
 /// store minted.
-async fn initiate(
+///
+/// `pub(crate)`: the resume-marker suite ([`super::listing_resume_markers`]) initiates its
+/// uploads through this one helper rather than keeping a second copy.
+pub(crate) async fn initiate(
     router: &MultiServiceRouter,
     name: &str,
     key: &str,
@@ -110,7 +113,7 @@ async fn initiate(
 }
 
 /// `GET /<bucket>?uploads<query>` — `ListMultipartUploads`.
-async fn list_uploads(
+pub(crate) async fn list_uploads(
     router: &MultiServiceRouter,
     name: &str,
     query: &str,
@@ -146,7 +149,7 @@ async fn list_parts(router: &MultiServiceRouter, name: &str, key: &str, upload_i
 /// elements, one map per `Upload` entry, and the `CommonPrefixes` prefixes, each in
 /// document order.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct UploadListing {
+pub(crate) struct UploadListing {
     /// The elements directly under the result: `Bucket`, `IsTruncated`, `MaxUploads`, the
     /// markers and the echoed request parameters.
     top: BTreeMap<String, String>,
@@ -160,7 +163,7 @@ struct UploadListing {
 impl UploadListing {
     /// A top-level element's text, or the empty string when the response carries none —
     /// which is what "absent" looks like to a client reading a bound member.
-    fn field(&self, name: &str) -> String {
+    pub(crate) fn field(&self, name: &str) -> String {
         self.top.get(name).cloned().unwrap_or_default()
     }
 
@@ -170,7 +173,7 @@ impl UploadListing {
     }
 
     /// Every reported upload as `(key, upload id)`, in response order.
-    fn entries(&self) -> Vec<(String, String)> {
+    pub(crate) fn entries(&self) -> Vec<(String, String)> {
         self.uploads
             .iter()
             .map(|entry| (Self::entry(entry, "Key"), Self::entry(entry, "UploadId")))
@@ -181,7 +184,7 @@ impl UploadListing {
 /// Read an upload listing with an XML reader rather than by slicing the body — the same
 /// accumulate-per-element walk [`super::object_versioning::version_listing_of`] does for
 /// `ListObjectVersions`, over this operation's `Upload` container.
-fn upload_listing_of(answer: &Answer) -> UploadListing {
+pub(crate) fn upload_listing_of(answer: &Answer) -> UploadListing {
     let body = String::from_utf8_lossy(&answer.body).into_owned();
     let mut reader = Reader::from_str(&body);
 

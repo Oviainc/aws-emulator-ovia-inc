@@ -137,6 +137,8 @@ mod list_buckets;
 mod listing_encoding_type;
 #[path = "all/listing_optional_members.rs"]
 mod listing_optional_members;
+#[path = "all/listing_resume_markers.rs"]
+mod listing_resume_markers;
 #[path = "all/multipart_checksum_type.rs"]
 mod multipart_checksum_type;
 #[path = "all/multipart_part_checksums.rs"]
