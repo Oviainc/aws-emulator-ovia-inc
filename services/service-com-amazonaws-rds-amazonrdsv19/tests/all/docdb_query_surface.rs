@@ -565,10 +565,13 @@ async fn an_engine_version_reports_the_certificates_it_can_be_launched_with() {
             .collect()
     };
     let every_authority: Vec<String> = published("aurora-mysql");
+    let rsa_only: Vec<String> = published("mysql");
     assert!(
-        every_authority.len() < reported.len(),
-        "the catalogue must hold an expired certificate too, or this rule tests nothing: \
-         reported {reported:?}, still valid {every_authority:?}"
+        rsa_only.len() < every_authority.len() && every_authority.len() == reported.len(),
+        "the catalogue publishes no expired authority, so an Aurora engine is offered all \
+         of it and an engine serving an RSA certificate fewer, or this rule tests nothing: \
+         reported {reported:?}, offered to Aurora {every_authority:?}, offered to an \
+         RSA-only engine {rsa_only:?}"
     );
     assert!(
         every_authority.contains(&DEFAULT_CA_CERTIFICATE_IDENTIFIER.to_string()),

@@ -248,7 +248,13 @@ impl Fixture {
         age_point(&engine, &aged, AGED_DAYS);
         // Every fixture point's backup has finished before a hold is placed, as
         // it has in the flow a hold is placed in.
-        std::thread::sleep(PAST_SETTLE);
+        //
+        // The wait also carries the fixture past the SECOND the fresh points were
+        // created in: a `DateRange` bound is sent as whole epoch seconds, so a
+        // bound built from "now" is truncated DOWN, and a window reaching "up to
+        // now" covers a point created at `12:00:00.4` only once the clock has
+        // reached `12:00:01`.
+        std::thread::sleep(PAST_SETTLE + Duration::from_secs(1));
         Self {
             router,
             aged,

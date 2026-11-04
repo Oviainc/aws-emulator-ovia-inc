@@ -104,8 +104,7 @@ async fn an_override_is_set_read_back_and_removed() {
     let router = emulator();
 
     // (case, the spelling of the identifier the override is set with, the published
-    // identifier it names). Every published certificate is a row — including the one
-    // whose validity has passed, which an account may still pin — under its own spelling
+    // identifier it names). Every published certificate is a row, under its own spelling
     // and under an upper-cased one, because `CertificateIdentifier` "isn't
     // case-sensitive".
     let mut rows: Vec<(String, String, &'static str)> = Vec::new();
@@ -122,7 +121,7 @@ async fn an_override_is_set_read_back_and_removed() {
         ));
     }
     assert!(
-        rows.len() >= 8,
+        rows.len() >= 6,
         "the published catalog must carry several certificates for this table to span \
          anything, got {} rows",
         rows.len()

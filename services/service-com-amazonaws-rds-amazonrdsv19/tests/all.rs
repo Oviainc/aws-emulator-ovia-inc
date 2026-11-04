@@ -15,6 +15,8 @@
 mod account_attributes;
 #[path = "all/already_exists_refusal_sentences.rs"]
 mod already_exists_refusal_sentences;
+#[path = "all/ca_certificate_material.rs"]
+mod ca_certificate_material;
 #[path = "all/certificate_override.rs"]
 mod certificate_override;
 #[path = "all/cluster_parameter_groups.rs"]

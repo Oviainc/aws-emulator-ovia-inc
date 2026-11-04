@@ -1779,8 +1779,11 @@ pub enum CertificateKey {
 /// Source: the certificate authorities AWS publishes for this front door ("Updating your
 /// Amazon DocumentDB TLS certificates", Amazon DocumentDB Developer Guide, and the
 /// certificate-authority table of "Using SSL/TLS to encrypt a connection to a DB
-/// instance"), with the validity instants that table states — to the second where it
-/// states a time, and at midnight UTC where it publishes only the date.
+/// instance"), each row carrying the `notBefore`/`notAfter` instants and the SHA-1
+/// fingerprint of the certificate that row NAMES. A validity endpoint is the
+/// certificate's own instant, to the second: the window belongs to the certificate
+/// material, so it is never a calendar day with the clock zeroed, and two authorities
+/// signed at different moments report different windows.
 #[derive(Debug, Clone, Copy)]
 pub struct CaCertificate {
     /// `Certificate$CertificateIdentifier` — "The unique key that identifies a
@@ -1805,10 +1808,13 @@ pub struct CaCertificate {
 
 /// Every certificate authority `DescribeCertificates` reports, in the order this front
 /// door publishes them: the strongest authority first — every elliptic-curve authority
-/// before every RSA one, and within a kind the longest key first — and an authority whose
-/// validity has passed after the ones a cluster can still be launched with. The retired
-/// `rds-ca-2019` is published because AWS still reports it, and a cluster cannot be
-/// launched under it ([`supported_ca_certificate_identifiers`]).
+/// before every RSA one, and within a kind the longest key first.
+///
+/// The rows are the authorities the service PROVIDES, each carrying its own certificate's
+/// `notBefore`/`notAfter` and SHA-1 fingerprint. An authority whose certificate has
+/// expired is no longer provided for a cluster's TLS endpoint and so is not published at
+/// all — the retired 2019 authority, whose certificate expired in August 2024, is not a
+/// row here; an authority AWS publishes or retires is a row added or removed.
 pub const CA_CERTIFICATES: &[CaCertificate] = &[
     CaCertificate {
         identifier: "rds-ca-ecc384-g1",
@@ -1819,23 +1825,16 @@ pub const CA_CERTIFICATES: &[CaCertificate] = &[
     },
     CaCertificate {
         identifier: "rds-ca-rsa4096-g1",
-        valid_from: "2021-05-24T00:00:00Z",
-        valid_till: "2121-05-24T00:00:00Z",
-        thumbprint: "",
+        valid_from: "2021-05-24T22:03:20Z",
+        valid_till: "2121-05-24T23:03:20Z",
+        thumbprint: "19da4f2af579a8ae1f6a0fa77aa5befd874b4cab",
         key: CertificateKey::Rsa(4096),
     },
     CaCertificate {
         identifier: "rds-ca-rsa2048-g1",
-        valid_from: "2021-05-24T00:00:00Z",
-        valid_till: "2061-05-24T00:00:00Z",
-        thumbprint: "",
-        key: CertificateKey::Rsa(2048),
-    },
-    CaCertificate {
-        identifier: "rds-ca-2019",
-        valid_from: "2019-08-22T00:00:00Z",
-        valid_till: "2024-08-22T00:00:00Z",
-        thumbprint: "",
+        valid_from: "2021-05-24T21:59:00Z",
+        valid_till: "2061-05-24T22:59:00Z",
+        thumbprint: "7c40cb42714b6fdb2b296f9bbd0e8bb364436a76",
         key: CertificateKey::Rsa(2048),
     },
 ];

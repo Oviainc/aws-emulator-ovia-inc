@@ -124,11 +124,6 @@ async fn describe_certificates_reports_the_published_ca_catalog() {
             vec!["rds-ca-ecc384-g1"],
         ),
         (
-            "a CA whose validity has passed is still published",
-            vec![("CertificateIdentifier", "rds-ca-2019")],
-            vec!["rds-ca-2019"],
-        ),
-        (
             "MaxRecords at its documented minimum",
             vec![("MaxRecords", "20")],
             state::CA_CERTIFICATES
@@ -185,18 +180,25 @@ async fn describe_certificates_reports_the_published_ca_catalog() {
         }
     }
 
-    // A value outside the published set: the modelled 404, not an empty list.
-    expect_error(
-        "an identifier no published CA carries",
-        call(
-            &router,
-            "DescribeCertificates",
-            &[("CertificateIdentifier", "rds-ca-2042")],
-        )
-        .await,
-        404,
-        "CertificateNotFound",
-    );
+    // A value outside the published set: the modelled 404, not an empty list. An authority
+    // the service has retired — its certificate expired, so it is no longer provided — is
+    // outside that set exactly like an identifier that never named one.
+    for (case, identifier) in [
+        ("an identifier no published CA carries", "rds-ca-2042"),
+        ("an authority whose certificate has expired", "rds-ca-2019"),
+    ] {
+        expect_error(
+            case,
+            call(
+                &router,
+                "DescribeCertificates",
+                &[("CertificateIdentifier", identifier)],
+            )
+            .await,
+            404,
+            "CertificateNotFound",
+        );
+    }
 
     // `Filters` is documented as "not currently supported", so a filter is refused
     // rather than dropped.

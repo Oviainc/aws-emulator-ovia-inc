@@ -14,11 +14,9 @@
 //!
 //! * the certificate catalog is published strongest authority first — every
 //!   elliptic-curve authority before every RSA one, and within a kind the longest key
-//!   first — with an authority whose validity has passed after the ones a database can
-//!   still be launched with, and each entry reports its identifier, its `CA` type, its
-//!   service-owned ARN, its published validity window and its published SHA-1 fingerprint
-//!   as `Thumbprint`, with no `Thumbprint` member at all for an authority whose
-//!   fingerprint the published catalog does not state;
+//!   first — holding only the authorities the service still provides, and each entry
+//!   reports its identifier, its `CA` type, its service-owned ARN, its published validity
+//!   window and its published SHA-1 fingerprint as `Thumbprint`;
 //! * the same projection answers the mutation path: the certificate `ModifyCertificates`
 //!   pins is reported with the fingerprint and validity window the catalog publishes for
 //!   it, and `DescribeCertificates` reads the same row back;
@@ -27,10 +25,10 @@
 //!   signed region holds — including the parameter-group quotas and the integration quota.
 //!
 //! The rows span what those rules generalise over: every entry of the certificate catalog
-//! (elliptic-curve and RSA, a 2048-bit and a 4096-bit modulus, an authority still valid
-//! and one whose validity has passed, a fingerprint published and one not), each read
-//! whole and one at a time, and three quotas whose usage is a count of a different record
-//! kind, at zero, one and two records.
+//! (elliptic-curve and RSA, a 2048-bit and a 4096-bit modulus, a validity that runs for
+//! forty years and one that runs for a hundred), each read whole and one at a time, and
+//! three quotas whose usage is a count of a different record kind, at zero, one and two
+//! records.
 //!
 //! Every call goes over the wire through the harness in `db_instances.rs`, so the
 //! assertions read the XML the emulator itself answered with.
@@ -67,8 +65,8 @@ struct PublishedCertificate {
 }
 
 /// The published CA certificate catalog, in the order the service publishes it: the
-/// elliptic-curve authority, then the RSA ones from the longest modulus to the shortest,
-/// then the authority whose validity has passed.
+/// elliptic-curve authority, then the RSA ones from the longest modulus to the shortest.
+/// An authority whose certificate has expired is no longer provided, so it is no row.
 const PUBLISHED_CERTIFICATES: &[PublishedCertificate] = &[
     PublishedCertificate {
         identifier: "rds-ca-ecc384-g1",
@@ -78,21 +76,15 @@ const PUBLISHED_CERTIFICATES: &[PublishedCertificate] = &[
     },
     PublishedCertificate {
         identifier: "rds-ca-rsa4096-g1",
-        valid_from: "2021-05-24T00:00:00Z",
-        valid_till: "2121-05-24T00:00:00Z",
-        thumbprint: "",
+        valid_from: "2021-05-24T22:03:20Z",
+        valid_till: "2121-05-24T23:03:20Z",
+        thumbprint: "19da4f2af579a8ae1f6a0fa77aa5befd874b4cab",
     },
     PublishedCertificate {
         identifier: "rds-ca-rsa2048-g1",
-        valid_from: "2021-05-24T00:00:00Z",
-        valid_till: "2061-05-24T00:00:00Z",
-        thumbprint: "",
-    },
-    PublishedCertificate {
-        identifier: "rds-ca-2019",
-        valid_from: "2019-08-22T00:00:00Z",
-        valid_till: "2024-08-22T00:00:00Z",
-        thumbprint: "",
+        valid_from: "2021-05-24T21:59:00Z",
+        valid_till: "2061-05-24T22:59:00Z",
+        thumbprint: "7c40cb42714b6fdb2b296f9bbd0e8bb364436a76",
     },
 ];
 

@@ -180,8 +180,9 @@ async fn describe_certificates_serves_the_published_authority_catalogue() {
 async fn the_published_authorities_carry_their_real_validity_instants() {
     // The catalogue's rule, asserted over every entry: a validity instant is a real
     // second-resolution instant the published authority carries, `ValidFrom` precedes
-    // `ValidTill`, and an authority whose validity has passed is still published (AWS keeps
-    // reporting a retired authority) but is NOT offered to an engine version.
+    // `ValidTill`, and a published authority's validity has NOT passed — an authority whose
+    // certificate expired is no longer provided for a cluster's TLS endpoint, so it is
+    // published nowhere.
     let offered = state::supported_ca_certificate_identifiers();
     let now = state::now();
     for certificate in state::CA_CERTIFICATES {
@@ -194,11 +195,11 @@ async fn the_published_authorities_carry_their_real_validity_instants() {
             certificate.valid_from,
             certificate.valid_till
         );
-        let expired = !certificate.is_valid_at(&now);
         assert!(
-            !(expired && offered.contains(&certificate.identifier.to_string())),
-            "case {case:?}: an authority whose validity has passed must not be offered to an \
-             engine version, got {offered:?}"
+            certificate.is_valid_at(&now),
+            "case {case:?}: an authority whose certificate has expired is no longer \
+             provided, so it is not published, got ValidTill {}",
+            certificate.valid_till
         );
     }
 

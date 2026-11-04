@@ -6414,9 +6414,11 @@ pub fn paginate<T>(
 ///
 /// Source: the certificate authorities Amazon RDS publishes in "Using SSL/TLS to
 /// encrypt a connection to a DB instance" (Amazon RDS User Guide) and reports through
-/// `DescribeCertificates`, with the validity instants and fingerprint the published
-/// catalogue carries for an authority where it states them and the published validity
-/// DATE at midnight UTC where only the date is published.
+/// `DescribeCertificates`, each row carrying the `notBefore`/`notAfter` instants and the
+/// SHA-1 fingerprint of the certificate that row NAMES. A validity endpoint is the
+/// certificate's own instant, to the second: the window belongs to the certificate
+/// material, so it is never a calendar day with the clock zeroed, and two authorities
+/// signed at different moments report different windows.
 #[derive(Debug, Clone, Copy)]
 pub struct CaCertificate {
     /// `Certificate$CertificateIdentifier` — "The unique key that identifies a
@@ -6424,9 +6426,11 @@ pub struct CaCertificate {
     pub identifier: &'static str,
     /// `Certificate$CertificateType` — the type AWS reports for every published CA.
     pub certificate_type: &'static str,
-    /// `Certificate$ValidFrom`, as an ISO-8601 instant.
+    /// `Certificate$ValidFrom` — "The starting date from which the certificate is valid":
+    /// the `notBefore` of the certificate this row names, as an ISO-8601 instant.
     pub valid_from: &'static str,
-    /// `Certificate$ValidTill`, as an ISO-8601 instant.
+    /// `Certificate$ValidTill` — "The final date that the certificate continues to be
+    /// valid": the `notAfter` of the certificate this row names, as an ISO-8601 instant.
     pub valid_till: &'static str,
     /// `Certificate$Thumbprint` — "The thumbprint of the certificate", the SHA-1
     /// fingerprint of the published authority's certificate, as the published catalogue
@@ -6528,9 +6532,13 @@ pub fn ca_certificate(identifier: &str) -> Option<&'static CaCertificate> {
 
 /// Every CA certificate `DescribeCertificates` reports, in the order the service
 /// publishes them: the strongest authority first — every elliptic-curve authority before
-/// every RSA one, and within a kind the longest key first ([`CertificateKey`]) — and an
-/// authority whose validity has passed after the ones a database can still be launched
-/// with. The expired `rds-ca-2019` is published because AWS still reports it.
+/// every RSA one, and within a kind the longest key first ([`CertificateKey`]).
+///
+/// The rows are the authorities the service PROVIDES, each carrying its own certificate's
+/// `notBefore`/`notAfter` and SHA-1 fingerprint. An authority whose certificate has
+/// expired is no longer provided for a database's TLS endpoint and so is not published at
+/// all — the retired 2019 authority, whose certificate expired in August 2024, is not a
+/// row here; an authority AWS publishes or retires is a row added or removed.
 pub const CA_CERTIFICATES: &[CaCertificate] = &[
     CaCertificate {
         identifier: "rds-ca-ecc384-g1",
@@ -6543,25 +6551,17 @@ pub const CA_CERTIFICATES: &[CaCertificate] = &[
     CaCertificate {
         identifier: "rds-ca-rsa4096-g1",
         certificate_type: "CA",
-        valid_from: "2021-05-24T00:00:00Z",
-        valid_till: "2121-05-24T00:00:00Z",
-        thumbprint: "",
+        valid_from: "2021-05-24T22:03:20Z",
+        valid_till: "2121-05-24T23:03:20Z",
+        thumbprint: "19da4f2af579a8ae1f6a0fa77aa5befd874b4cab",
         key: CertificateKey::Rsa(4096),
     },
     CaCertificate {
         identifier: "rds-ca-rsa2048-g1",
         certificate_type: "CA",
-        valid_from: "2021-05-24T00:00:00Z",
-        valid_till: "2061-05-24T00:00:00Z",
-        thumbprint: "",
-        key: CertificateKey::Rsa(2048),
-    },
-    CaCertificate {
-        identifier: "rds-ca-2019",
-        certificate_type: "CA",
-        valid_from: "2019-08-22T00:00:00Z",
-        valid_till: "2024-08-22T00:00:00Z",
-        thumbprint: "",
+        valid_from: "2021-05-24T21:59:00Z",
+        valid_till: "2061-05-24T22:59:00Z",
+        thumbprint: "7c40cb42714b6fdb2b296f9bbd0e8bb364436a76",
         key: CertificateKey::Rsa(2048),
     },
 ];
