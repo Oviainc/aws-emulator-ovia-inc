@@ -32,7 +32,10 @@
 //!   leaves the cursor where it was, so the same batch is read again — "The default value
 //!   is infinite (-1). When set to infinite (-1), failed records are retried until the
 //!   record expires" (`MaximumRetryAttempts`) — and what the attempt came to is reported as
-//!   the mapping's own `LastProcessingResult`.
+//!   the mapping's own `LastProcessingResult`. A mapping whose `FunctionResponseTypes` asks
+//!   for its function's report of which records of the batch failed is checkpointed past
+//!   only the records at the head of the batch that report leaves out, so the first record
+//!   it names is where the next read starts (see [`super::batch_item_failures`]).
 //!
 //! * NOTHING IS READ FOR A FUNCTION THAT CANNOT BE INVOKED. "Lambda reads items from the
 //!   event source and invokes the function" (`CreateEventSourceMapping`), so a mapping
@@ -217,6 +220,9 @@ struct KinesisSourcedMapping {
     /// How many records one batch holds at most, from `BatchSize`, clamped to what this
     /// emulator reads in one go ([`MAX_RECORDS_PER_BATCH`]).
     batch_size: i32,
+    /// Whether the mapping's `FunctionResponseTypes` asks for the function's report of which
+    /// records of the batch failed to be read (see [`super::batch_item_failures`]).
+    reports_batch_item_failures: bool,
     /// Where the mapping reads next in each shard it has already read from.
     cursors: BTreeMap<String, ShardCursor>,
     /// Where it reads a shard it has not read from yet.
@@ -406,6 +412,9 @@ fn run_of(
         function_name: mapping.function_name.clone(),
         invoke_identity_arn,
         batch_size: mapping.batch_size.clamp(1, MAX_RECORDS_PER_BATCH),
+        reports_batch_item_failures: super::reports_batch_item_failures(
+            &mapping.function_response_types,
+        ),
         cursors: mapping.shard_cursors.clone(),
         initial_cursor: mapping.initial_shard_cursor(),
     })
@@ -460,25 +469,58 @@ async fn move_batches(
         let Some(last) = records.last() else {
             continue;
         };
-        let last_sequence = last.sequence_number().to_string();
+        // Every record of the batch, by the identifier a report of this source names one by:
+        // "the sequence number of the data record in the shard".
+        let sequence_numbers: Vec<String> = records
+            .iter()
+            .map(|record| record.sequence_number().to_string())
+            .collect();
         metrics.publish_iterator_age(
             &run.function_name,
             iterator_age_millis(last.approximate_arrival_timestamp(), SystemTime::now()),
         );
         let payload = kinesis_event(&records, &shard, run);
-        match invoke_function(callback, clients, run, &payload).await {
-            Ok(()) => {
-                // Delivered: the mapping reads on from past this batch, and the attempt is
-                // reported as what the mapping last came to.
-                checkpoint(
-                    state,
-                    uuid,
-                    run,
-                    &shard,
-                    Some(last_sequence),
-                    super::LAST_PROCESSING_RESULT_OK,
-                );
-                delivered = true;
+        match hand_over_batch(callback, clients, run, &payload, &sequence_numbers).await {
+            Ok(processed) => {
+                // The mapping reads on from past the records the attempt processed, and the
+                // attempt is reported as what the mapping last came to. A shard has ONE
+                // position, so what it reads on from is the run of records at the head of
+                // the batch the attempt processed: the first record its function reported it
+                // did not process is where the next read starts, whatever the report says
+                // about the records behind that one.
+                match checkpointed_through(&sequence_numbers, &processed) {
+                    Some(sequence_number) => {
+                        checkpoint(
+                            state,
+                            uuid,
+                            run,
+                            &shard,
+                            Some(sequence_number),
+                            super::LAST_PROCESSING_RESULT_OK,
+                        );
+                        delivered = true;
+                    }
+                    None => {
+                        // The report named the batch's own first record, so the cursor stays
+                        // where it was and the whole batch is read again: an attempt that
+                        // moved the shard's position not at all is one that did not process
+                        // the batch, which is what it reports and what the poller backs off
+                        // after.
+                        checkpoint(
+                            state,
+                            uuid,
+                            run,
+                            &shard,
+                            None,
+                            super::LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED,
+                        );
+                        failure = Some(format!(
+                            "{} reported the first record of the batch it was handed as one \
+                             it did not process, so {shard} reads the same batch again",
+                            run.function_arn
+                        ));
+                    }
+                }
             }
             Err(detail) => {
                 // Not delivered: the cursor stays where it was, so this batch is read
@@ -646,13 +688,57 @@ async fn records_at(
     Ok(answer.records)
 }
 
-/// Hand one batch to the function, synchronously, as a stream event source's invocation is.
+/// Hand one batch to the function and read what became of the records it held: the ones the
+/// attempt PROCESSED, or why none of them was.
+///
+/// Every record of a batch an invocation accepted was processed unless the mapping asks for
+/// its function's report of which of them failed to be read, which is what
+/// `FunctionResponseTypes` says (see [`super::batch_item_failures`]).
+async fn hand_over_batch(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    clients: &mut Clients,
+    run: &KinesisSourcedMapping,
+    payload: &Value,
+    sequence_numbers: &[String],
+) -> Result<Vec<String>, String> {
+    let answered = invoke_function(callback, clients, run, payload).await?;
+    if !run.reports_batch_item_failures {
+        return Ok(sequence_numbers.to_vec());
+    }
+    match super::read_batch_item_failures(answered.as_deref(), sequence_numbers) {
+        super::BatchReport::WholeBatchFailed(detail) => Err(format!(
+            "{} reported no record of the batch as processed: {detail}",
+            run.function_arn
+        )),
+        report => Ok(super::processed_records(&report, sequence_numbers).unwrap_or_default()),
+    }
+}
+
+/// The sequence number a shard reads on from after an attempt that processed `processed` of
+/// the batch `sequence_numbers`, or `None` when the attempt did not process the batch's own
+/// first record and so moved the shard's position not at all.
+///
+/// A shard has ONE position, so the records it can be read on from past are the run at the
+/// HEAD of the batch that were processed: the first record the attempt did not process is
+/// the one the next read must start at.
+fn checkpointed_through(sequence_numbers: &[String], processed: &[String]) -> Option<String> {
+    let consumed: ::std::collections::BTreeSet<&str> =
+        processed.iter().map(String::as_str).collect();
+    sequence_numbers
+        .iter()
+        .take_while(|sequence_number| consumed.contains(sequence_number.as_str()))
+        .last()
+        .cloned()
+}
+
+/// Hand one batch to the function, synchronously, as a stream event source's invocation is,
+/// and answer with the response document it returned.
 async fn invoke_function(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
     run: &KinesisSourcedMapping,
     payload: &Value,
-) -> Result<(), String> {
+) -> Result<Option<Vec<u8>>, String> {
     let answer = clients
         .lambda(callback, &run.region)
         .invoke()
@@ -678,7 +764,9 @@ async fn invoke_function(
             run.function_arn
         ));
     }
-    Ok(())
+    // "The response from the function, or an error object" (`InvocationResponse$Payload`):
+    // the document a mapping that reads a batch item failure report reads it out of.
+    Ok(answer.payload.map(::aws_smithy_types::Blob::into_inner))
 }
 
 /// The event one batch is handed over as: the Kinesis record envelopes Lambda builds for a
@@ -797,7 +885,10 @@ mod tests {
 
     use ::base64::Engine as _;
 
-    use super::{iterator_age_millis, kinesis_event, KinesisSourcedMapping, MAX_RECORDS_PER_BATCH};
+    use super::{
+        checkpointed_through, iterator_age_millis, kinesis_event, KinesisSourcedMapping,
+        MAX_RECORDS_PER_BATCH,
+    };
     use crate::state::ShardCursor;
 
     /// A mapping configuration the envelope rows below are built against.
@@ -809,8 +900,45 @@ mod tests {
             function_name: "consume".to_string(),
             invoke_identity_arn: Some("arn:aws:iam::000000000000:role/consume".to_string()),
             batch_size: MAX_RECORDS_PER_BATCH,
+            reports_batch_item_failures: false,
             cursors: std::collections::BTreeMap::new(),
             initial_cursor: ShardCursor::TrimHorizon,
+        }
+    }
+
+    #[test]
+    fn a_shard_reads_on_from_the_processed_run_at_the_head_of_the_batch() {
+        // A shard has ONE position, so what it reads on from is the run of records at the
+        // head of the batch the attempt processed. The rows differ along where in the batch
+        // the first unprocessed record is: nowhere (every record processed), the head, the
+        // middle, the tail, and a batch none of which was processed.
+        let batch: Vec<String> = ["49-1", "49-2", "49-3"]
+            .iter()
+            .map(|sequence_number| (*sequence_number).to_string())
+            .collect();
+        let rows: [(&str, Vec<&str>, Option<&str>); 5] = [
+            (
+                "every record processed",
+                vec!["49-1", "49-2", "49-3"],
+                Some("49-3"),
+            ),
+            ("the first record failed", vec!["49-2", "49-3"], None),
+            ("the middle record failed", vec!["49-1", "49-3"], Some("49-1")),
+            ("the last record failed", vec!["49-1", "49-2"], Some("49-2")),
+            ("no record processed", Vec::new(), None),
+        ];
+        for (case, processed, expected) in rows {
+            let processed: Vec<String> = processed
+                .iter()
+                .map(|sequence_number| (*sequence_number).to_string())
+                .collect();
+            let through = checkpointed_through(&batch, &processed);
+            assert_eq!(
+                through.as_deref(),
+                expected,
+                "case {case:?}: a shard whose attempt processed {processed:?} of {batch:?} \
+                 must read on from {expected:?}, got {through:?}"
+            );
         }
     }
 

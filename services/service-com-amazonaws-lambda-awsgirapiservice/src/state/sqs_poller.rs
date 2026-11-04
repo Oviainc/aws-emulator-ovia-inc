@@ -35,7 +35,13 @@
 //!   succeeded. A batch whose invocation did not succeed is left exactly where it was: its
 //!   messages come back when their visibility timeout lapses, which is precisely the case a
 //!   queue's `RedrivePolicy` exists for, and the mapping reports what the attempt came to as
-//!   its `LastProcessingResult`.
+//!   its `LastProcessingResult`. A mapping whose `FunctionResponseTypes` asks for its
+//!   function's report of which messages of the batch failed deletes only the messages that
+//!   report leaves out, and leaves the rest where they were — so one message of a batch can
+//!   be retried without the ones beside it being delivered again (see
+//!   [`super::batch_item_failures`]). On a FIFO source a message is held back by a retry of
+//!   an earlier message of its own group too, because that group's messages are handed over
+//!   "one at a time, in strict order" (see [`processed_in_group_order`]).
 //! * METER. While the mapping's `MetricsConfig` selects `EventCount`, what the pass did with
 //!   its events — how many it polled, how many the filter rejected, how many an invocation
 //!   accepted and how many it deleted — is published for that mapping to CloudWatch (see
@@ -60,13 +66,16 @@
 //! runtime to spawn onto there is no task, and [`poll_due`] — which is the whole of one
 //! wake-up's work and takes the instant it is working at — can be awaited directly instead.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::serde_json::{json, Value};
 use ::service_com_amazonaws_sqs_amazonsqs as sqs;
 
+use super::batch_item_failures::{
+    processed_records, read_batch_item_failures, reports_batch_item_failures, BatchReport,
+};
 use super::event_source_poller::Clients;
 use super::metrics::{EventCounts, FunctionMetrics};
 use super::{
@@ -137,6 +146,9 @@ struct PollTarget {
     batch_size: usize,
     /// The `Pattern` of each of the mapping's `FilterCriteria` filters, as stored.
     filters: Vec<String>,
+    /// Whether the mapping's `FunctionResponseTypes` asks for the function's report of which
+    /// messages of the batch failed to be read (see [`super::batch_item_failures`]).
+    reports_batch_item_failures: bool,
     /// Whether the mapping's `MetricsConfig` selects the event-count family.
     meters_event_counts: bool,
 }
@@ -146,6 +158,10 @@ struct PollTarget {
 struct PolledMessage {
     /// The id the queue holds the message under, which is what a delete names it by.
     message_id: String,
+    /// The `MessageGroupId` the message carries, when it has one: the group a FIFO queue
+    /// hands over "one at a time, in strict order", which is what makes one message of a
+    /// batch ordered against another.
+    message_group_id: Option<String>,
     /// The record envelope, as the function receives it.
     record: Value,
 }
@@ -284,13 +300,32 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
             record_attempt(&mappings, &target, LAST_PROCESSING_RESULT_OK);
         } else {
             let payload = queue_event(&invoking, &polled);
-            match invoke_function(callback, session, &target, &payload).await {
-                Ok(()) => {
-                    // The batch was processed, so its messages leave the queue — that is
-                    // what a consumer of a queue does with a message it has handled.
+            // What the attempt came to for the batch's messages: the ones it PROCESSED, or
+            // why it processed none of them. A batch of a FIFO source is cut down to the
+            // messages its group order lets this attempt consume, and an attempt left with
+            // none is one that processed nothing, which is the failure case below.
+            let attempt = hand_over_batch(callback, session, &target, &payload, &invoking)
+                .await
+                .and_then(|processed| {
+                    let processed = processed_in_group_order(&polled, &invoking, &processed);
+                    if processed.is_empty() {
+                        return Err(format!(
+                            "{} processed no message of the batch it was handed",
+                            target.function_arn
+                        ));
+                    }
+                    Ok(processed)
+                });
+            match attempt {
+                Ok(processed) => {
+                    // The messages the attempt PROCESSED leave the queue — that is what a
+                    // consumer of a queue does with a message it has handled — and the ones
+                    // its function reported it did not process stay exactly where they were,
+                    // so each comes back when its visibility timeout lapses and is handed
+                    // over again.
                     counts.invoked = count_of(invoking.len());
-                    delete_messages(&queues, &target, &invoking);
-                    counts.deleted = counts.deleted.saturating_add(counts.invoked);
+                    delete_messages(&queues, &target, &processed);
+                    counts.deleted = counts.deleted.saturating_add(count_of(processed.len()));
                     session.failures.remove(&target.uuid);
                     record_attempt(&mappings, &target, LAST_PROCESSING_RESULT_OK);
                 }
@@ -405,6 +440,7 @@ fn take_batch(
             let message = queue.messages.get(*index)?;
             Some(PolledMessage {
                 message_id: delivered.message_id.clone(),
+                message_group_id: message.message_group_id.clone(),
                 record: queue_record(message, &delivered.receipt_handle, &target.queue_arn, &region),
             })
         })
@@ -574,13 +610,77 @@ fn queue_record(
     })
 }
 
-/// Hand one batch to the function, synchronously, as a queue event source's invocation is.
+/// The messages of `processed` this attempt may consume, given the order their queue hands
+/// them over in.
+///
+/// A FIFO queue hands the messages of one `MessageGroupId` over "one at a time, in strict
+/// order", so a message cannot be consumed while an EARLIER message of its own group is
+/// going back for another attempt: deleting it would leave the retry of that earlier message
+/// to be processed after it, which is the order the group exists to keep. A message the
+/// attempt did not process therefore holds back every later message of its group as well,
+/// whatever the report said about those. A message carrying no group id is ordered against
+/// nothing, so nothing holds it back.
+fn processed_in_group_order(
+    polled: &[PolledMessage],
+    invoking: &[String],
+    processed: &[String],
+) -> Vec<String> {
+    let handed: BTreeSet<&str> = invoking.iter().map(String::as_str).collect();
+    let consumed: BTreeSet<&str> = processed.iter().map(String::as_str).collect();
+    let mut held_back: BTreeSet<&str> = BTreeSet::new();
+    let mut consumable: Vec<String> = Vec::new();
+    for message in polled
+        .iter()
+        .filter(|message| handed.contains(message.message_id.as_str()))
+    {
+        let group = message.message_group_id.as_deref();
+        let behind_a_retry = group.is_some_and(|group| held_back.contains(group));
+        if !behind_a_retry && consumed.contains(message.message_id.as_str()) {
+            consumable.push(message.message_id.clone());
+            continue;
+        }
+        if let Some(group) = group {
+            held_back.insert(group);
+        }
+    }
+    consumable
+}
+
+/// Hand one batch to the function and read what became of the messages it held: the ids of
+/// the ones the attempt PROCESSED, or why none of them was.
+///
+/// Every message of a batch an invocation accepted was processed unless the mapping asks for
+/// its function's report of which of them failed to be read, which is what
+/// `FunctionResponseTypes` says (see [`super::batch_item_failures`]): a report that names
+/// messages leaves exactly those behind, and one that cannot be read leaves the whole batch.
+async fn hand_over_batch(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    session: &mut PollSession,
+    target: &PollTarget,
+    payload: &Value,
+    invoking: &[String],
+) -> Result<Vec<String>, String> {
+    let answered = invoke_function(callback, session, target, payload).await?;
+    if !target.reports_batch_item_failures {
+        return Ok(invoking.to_vec());
+    }
+    match read_batch_item_failures(answered.as_deref(), invoking) {
+        BatchReport::WholeBatchFailed(detail) => Err(format!(
+            "{} reported no message of the batch as processed: {detail}",
+            target.function_arn
+        )),
+        report => Ok(processed_records(&report, invoking).unwrap_or_default()),
+    }
+}
+
+/// Hand one batch to the function, synchronously, as a queue event source's invocation is,
+/// and answer with the response document it returned.
 async fn invoke_function(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     session: &mut PollSession,
     target: &PollTarget,
     payload: &Value,
-) -> Result<(), String> {
+) -> Result<Option<Vec<u8>>, String> {
     let answer = session
         .clients
         .lambda(callback, &target.region)
@@ -607,7 +707,9 @@ async fn invoke_function(
             target.function_arn
         ));
     }
-    Ok(())
+    // "The response from the function, or an error object" (`InvocationResponse$Payload`):
+    // the document a mapping that reads a batch item failure report reads it out of.
+    Ok(answer.payload.map(::aws_smithy_types::Blob::into_inner))
 }
 
 /// Delete the messages `message_ids` names from `target`'s queue.
@@ -729,6 +831,9 @@ fn polling_targets(store: &ComAmazonawsLambdaAwsgirapiserviceState) -> Vec<PollT
                             .collect()
                     })
                     .unwrap_or_default(),
+                reports_batch_item_failures: reports_batch_item_failures(
+                    &mapping.function_response_types,
+                ),
                 meters_event_counts: super::metrics::publishes_event_counts(
                     mapping.metrics_config.as_ref(),
                 ),
@@ -817,15 +922,345 @@ fn polling_wanted_or_release(
 
 #[cfg(test)]
 mod tests {
-    use ::serde_json::json;
+    use std::collections::BTreeMap;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{filter_event, invisible_for_seconds, minute_of, queue_event, PolledMessage};
+    use ::serde_json::json;
+    use ::service_com_amazonaws_sqs_amazonsqs as sqs;
+    use ::service_com_amazonaws_sqs_amazonsqs::ops::types::shared_types::MessageAttributeValue;
+
+    use super::{
+        filter_event, invisible_for_seconds, minute_of, processed_in_group_order, queue_event,
+        queue_record, PolledMessage,
+    };
+
+    /// The queue every envelope row below is built for, and the Region it lives in.
+    const QUEUE_ARN: &str = "arn:aws:sqs:us-east-1:000000000000:orders";
+    /// See [`QUEUE_ARN`].
+    const REGION: &str = "us-east-1";
+    /// The receipt handle the delivery that built the envelope minted.
+    const RECEIPT_HANDLE: &str = "AQEBh-handle";
+
+    /// When every row's message was sent, in epoch milliseconds — the units a record's
+    /// `SentTimestamp` and `ApproximateFirstReceiveTimestamp` carry.
+    const SENT_AT_MILLIS: u64 = 1_761_000_000_123;
+    /// When it was first handed to a consumer, which a REDELIVERY of it keeps.
+    const FIRST_RECEIVED_AT_MILLIS: u64 = 1_761_000_000_456;
+
+    /// `millis` epoch milliseconds as an instant.
+    fn at_millis(millis: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(millis)
+    }
+
+    /// One message a standard queue holds, delivered once: the base each envelope row below
+    /// changes one thing of.
+    fn stored_message() -> sqs::state::StoredMessage {
+        sqs::state::StoredMessage {
+            message_id: "11111111-2222-4333-8444-555555555555".to_string(),
+            body: "hello".to_string(),
+            md5_of_body: "5d41402abc4b2a76b9719d911017c592".to_string(),
+            message_attributes: BTreeMap::new(),
+            message_system_attributes: BTreeMap::new(),
+            message_group_id: None,
+            message_deduplication_id: None,
+            sequence_number: None,
+            sent_at: at_millis(SENT_AT_MILLIS),
+            retention_from: at_millis(SENT_AT_MILLIS),
+            sender_id: "AIDACKCEVSQ6C2EXAMPLE".to_string(),
+            available_at: at_millis(SENT_AT_MILLIS),
+            invisible_until: None,
+            receive_count: 1,
+            queue_receive_count: 1,
+            first_received_at: Some(at_millis(FIRST_RECEIVED_AT_MILLIS)),
+            last_received_at: Some(at_millis(FIRST_RECEIVED_AT_MILLIS)),
+            dead_letter_source_arn: None,
+        }
+    }
+
+    /// One message attribute of `data_type` carrying `string_value`.
+    fn string_attribute(data_type: &str, string_value: &str) -> MessageAttributeValue {
+        MessageAttributeValue {
+            data_type: data_type.to_string(),
+            string_value: Some(string_value.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// One `Binary` message attribute carrying `bytes`.
+    fn binary_attribute(bytes: &[u8]) -> MessageAttributeValue {
+        MessageAttributeValue {
+            data_type: "Binary".to_string(),
+            binary_value: Some(bytes.to_vec()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_record_carries_the_message_the_queue_holds() {
+        // The rows differ along what the message IS: what its body holds, whether it carries
+        // message attributes and of which data types, whether its queue is FIFO (and so
+        // whether the record carries the group, deduplication id and sequence number the
+        // queue assigned), how many times it has been delivered, and whether the queue
+        // recorded a first delivery of it at all.
+        type Row = (
+            &'static str,
+            fn(&mut sqs::state::StoredMessage),
+            ::serde_json::Value,
+        );
+        let rows: [Row; 6] = [
+            (
+                "a plain body, delivered once, no message attributes",
+                |_message| {},
+                json!({
+                    "SenderId": "AIDACKCEVSQ6C2EXAMPLE",
+                    "SentTimestamp": "1761000000123",
+                    "ApproximateReceiveCount": "1",
+                    "ApproximateFirstReceiveTimestamp": "1761000000456",
+                }),
+            ),
+            (
+                "a redelivered message keeps the instant of its FIRST delivery",
+                |message| {
+                    message.receive_count = 4;
+                    message.queue_receive_count = 2;
+                    message.last_received_at = Some(at_millis(1_761_000_009_999));
+                },
+                json!({
+                    "SenderId": "AIDACKCEVSQ6C2EXAMPLE",
+                    "SentTimestamp": "1761000000123",
+                    "ApproximateReceiveCount": "4",
+                    "ApproximateFirstReceiveTimestamp": "1761000000456",
+                }),
+            ),
+            (
+                "a message its queue recorded no first delivery of",
+                |message| {
+                    message.first_received_at = None;
+                    message.last_received_at = None;
+                    message.receive_count = 0;
+                },
+                json!({
+                    "SenderId": "AIDACKCEVSQ6C2EXAMPLE",
+                    "SentTimestamp": "1761000000123",
+                    "ApproximateReceiveCount": "0",
+                }),
+            ),
+            (
+                "a message of a FIFO queue",
+                |message| {
+                    message.message_group_id = Some("group-a".to_string());
+                    message.message_deduplication_id = Some("dedup-a".to_string());
+                    message.sequence_number = Some("18849496460467696128".to_string());
+                },
+                json!({
+                    "SenderId": "AIDACKCEVSQ6C2EXAMPLE",
+                    "SentTimestamp": "1761000000123",
+                    "ApproximateReceiveCount": "1",
+                    "ApproximateFirstReceiveTimestamp": "1761000000456",
+                    "MessageGroupId": "group-a",
+                    "MessageDeduplicationId": "dedup-a",
+                    "SequenceNumber": "18849496460467696128",
+                }),
+            ),
+            (
+                "a message sent by an anonymous caller",
+                |message| {
+                    message.sender_id = String::new();
+                },
+                json!({
+                    "SentTimestamp": "1761000000123",
+                    "ApproximateReceiveCount": "1",
+                    "ApproximateFirstReceiveTimestamp": "1761000000456",
+                }),
+            ),
+            (
+                "a non-ascii body",
+                |message| {
+                    message.body = "ünïcödé ⚑ body".to_string();
+                    message.md5_of_body = "0a3f0c1e5bdbd4fbb4b1a6c9f7a06b7e".to_string();
+                },
+                json!({
+                    "SenderId": "AIDACKCEVSQ6C2EXAMPLE",
+                    "SentTimestamp": "1761000000123",
+                    "ApproximateReceiveCount": "1",
+                    "ApproximateFirstReceiveTimestamp": "1761000000456",
+                }),
+            ),
+        ];
+        for (case, change, attributes) in rows {
+            let mut message = stored_message();
+            change(&mut message);
+            let record = queue_record(&message, RECEIPT_HANDLE, QUEUE_ARN, REGION);
+            let expected = json!({
+                "messageId": message.message_id.clone(),
+                "receiptHandle": RECEIPT_HANDLE,
+                "body": message.body.clone(),
+                "attributes": attributes,
+                "messageAttributes": {},
+                "md5OfBody": message.md5_of_body.clone(),
+                "eventSource": "aws:sqs",
+                "eventSourceARN": QUEUE_ARN,
+                "awsRegion": REGION,
+            });
+            assert_eq!(
+                record, expected,
+                "case {case:?}: expected the record {expected}, got {record}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_keeps_each_message_attribute_s_data_type_and_value() {
+        // The rows differ along the data type of the attribute and the form its value takes:
+        // the three types `SendMessage` documents ("String, Number, and Binary"), a custom
+        // type ("You can also append custom labels"), and the bytes of a binary one, which
+        // travel as base64 in a JSON event.
+        let rows: [(&str, &str, MessageAttributeValue, ::serde_json::Value); 5] = [
+            (
+                "a String attribute",
+                "kind",
+                string_attribute("String", "order"),
+                json!({ "dataType": "String", "stringValue": "order" }),
+            ),
+            (
+                "a Number attribute",
+                "count",
+                string_attribute("Number", "17"),
+                json!({ "dataType": "Number", "stringValue": "17" }),
+            ),
+            (
+                "a custom data type",
+                "shade",
+                string_attribute("String.colour", "crimson"),
+                json!({ "dataType": "String.colour", "stringValue": "crimson" }),
+            ),
+            (
+                "a Binary attribute",
+                "payload",
+                binary_attribute(&[0x00, 0x01, 0xfe, 0xff]),
+                json!({ "dataType": "Binary", "binaryValue": "AAH+/w==" }),
+            ),
+            (
+                "a Binary attribute carrying no bytes",
+                "payload",
+                binary_attribute(&[]),
+                json!({ "dataType": "Binary", "binaryValue": "" }),
+            ),
+        ];
+        for (case, name, attribute, expected) in rows {
+            let mut message = stored_message();
+            message
+                .message_attributes
+                .insert(name.to_string(), attribute);
+            let record = queue_record(&message, RECEIPT_HANDLE, QUEUE_ARN, REGION);
+            let reported = record["messageAttributes"][name].clone();
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected the attribute {name:?} to be reported as {expected}, \
+                 got {reported} in {record}"
+            );
+        }
+    }
 
     /// One polled message carrying `body`, under the id `id`.
     fn polled(id: &str, body: &str) -> PolledMessage {
         PolledMessage {
             message_id: id.to_string(),
+            message_group_id: None,
             record: json!({ "messageId": id, "body": body }),
+        }
+    }
+
+    /// One polled message of the message group `group`, under the id `id`.
+    fn polled_in_group(id: &str, group: &str) -> PolledMessage {
+        PolledMessage {
+            message_group_id: Some(group.to_string()),
+            ..polled(id, "body")
+        }
+    }
+
+    #[test]
+    fn a_message_behind_a_retry_of_its_own_group_is_not_consumed() {
+        // The rows differ along how the batch is grouped and which of it the report left
+        // behind: a batch with no groups at all (a standard queue, where nothing is ordered
+        // against anything), one group whose first, middle and last message failed, two
+        // groups where only one has a failure, and a grouped message beside an ungrouped one.
+        // One row: the case, the batch as it was handed over, the messages the attempt
+        // processed, and the messages it may then consume.
+        type Row = (
+            &'static str,
+            Vec<PolledMessage>,
+            Vec<&'static str>,
+            Vec<&'static str>,
+        );
+        let rows: [Row; 6] = [
+            (
+                "no message groups, the middle message failed",
+                vec![polled("m-1", "a"), polled("m-2", "b"), polled("m-3", "c")],
+                vec!["m-1", "m-3"],
+                vec!["m-1", "m-3"],
+            ),
+            (
+                "one group, its first message failed",
+                vec![
+                    polled_in_group("m-1", "g-a"),
+                    polled_in_group("m-2", "g-a"),
+                    polled_in_group("m-3", "g-a"),
+                ],
+                vec!["m-2", "m-3"],
+                Vec::new(),
+            ),
+            (
+                "one group, its middle message failed",
+                vec![
+                    polled_in_group("m-1", "g-a"),
+                    polled_in_group("m-2", "g-a"),
+                    polled_in_group("m-3", "g-a"),
+                ],
+                vec!["m-1", "m-3"],
+                vec!["m-1"],
+            ),
+            (
+                "one group, its last message failed",
+                vec![
+                    polled_in_group("m-1", "g-a"),
+                    polled_in_group("m-2", "g-a"),
+                    polled_in_group("m-3", "g-a"),
+                ],
+                vec!["m-1", "m-2"],
+                vec!["m-1", "m-2"],
+            ),
+            (
+                "two groups, only one of them with a failure",
+                vec![
+                    polled_in_group("m-1", "g-a"),
+                    polled_in_group("m-2", "g-b"),
+                    polled_in_group("m-3", "g-a"),
+                    polled_in_group("m-4", "g-b"),
+                ],
+                vec!["m-2", "m-3", "m-4"],
+                vec!["m-2", "m-4"],
+            ),
+            (
+                "a grouped message beside an ungrouped one",
+                vec![polled_in_group("m-1", "g-a"), polled("m-2", "b")],
+                vec!["m-2"],
+                vec!["m-2"],
+            ),
+        ];
+        for (case, batch, processed, expected) in rows {
+            let invoking: Vec<String> = batch
+                .iter()
+                .map(|message| message.message_id.clone())
+                .collect();
+            let processed: Vec<String> = processed.iter().map(|id| (*id).to_string()).collect();
+            let consumable = processed_in_group_order(&batch, &invoking, &processed);
+            let expected: Vec<String> = expected.iter().map(|id| (*id).to_string()).collect();
+            assert_eq!(
+                consumable, expected,
+                "case {case:?}: an attempt that processed {processed:?} may consume \
+                 {expected:?}, got {consumable:?}"
+            );
         }
     }
 

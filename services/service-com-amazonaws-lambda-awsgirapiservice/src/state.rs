@@ -224,6 +224,17 @@ pub use metrics::{invoked_resource, publish_invocation};
 pub mod sqs_poller;
 pub use sqs_poller::{drive_sqs_pollers, poll_due, PollSession, POLL_INTERVAL};
 
+/// Which records of a batch the function it was handed to reported it did not process — the
+/// ONE reading of a partial batch response, which both pollers above decide what to consume
+/// by — lives in [`batch_item_failures`], beside them. It is re-exported here for the same
+/// reason as [`capacity_provider`]: the mapping record carrying the `FunctionResponseTypes`
+/// that asks for the report to be read stays in this module.
+pub mod batch_item_failures;
+pub use batch_item_failures::{
+    processed_records, read_batch_item_failures, reports_batch_item_failures, BatchReport,
+    REPORT_BATCH_ITEM_FAILURES,
+};
+
 /// Whether the execution role of the function a mapping invokes may READ the event source
 /// that mapping names — the gate every call that wires the two together passes through —
 /// lives in [`event_source_authorization`], beside the pollers that make those reads. It is

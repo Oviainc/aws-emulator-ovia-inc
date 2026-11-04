@@ -79,6 +79,8 @@ mod durable_execution_refusals;
 mod durable_execution_start;
 #[path = "all/durable_execution_stop.rs"]
 mod durable_execution_stop;
+#[path = "all/event_source_mapping_batch_item_failures.rs"]
+mod event_source_mapping_batch_item_failures;
 #[path = "all/event_source_mapping_delete_in_use.rs"]
 mod event_source_mapping_delete_in_use;
 #[path = "all/event_source_mapping_deletion.rs"]
