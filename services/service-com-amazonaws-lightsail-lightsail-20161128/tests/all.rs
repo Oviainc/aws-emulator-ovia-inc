@@ -231,6 +231,8 @@ mod instance_metric_data;
 mod instance_public_ports;
 #[path = "all/instance_reboot.rs"]
 mod instance_reboot;
+#[path = "all/instance_restore_from_auto_snapshot.rs"]
+mod instance_restore_from_auto_snapshot;
 #[path = "all/instance_restore_from_snapshot.rs"]
 mod instance_restore_from_snapshot;
 #[path = "all/instance_snapshot_create.rs"]

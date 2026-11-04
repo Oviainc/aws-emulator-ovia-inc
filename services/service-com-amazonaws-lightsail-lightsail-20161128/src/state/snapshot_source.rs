@@ -37,12 +37,6 @@ pub enum RequestedSnapshotSource {
     },
 }
 
-/// How a sentence names the automatic snapshot a request asked for without
-/// naming a date, worded as the modelled `useLatestRestorableAutoSnapshot`
-/// documentation words what such a request asks for ("the latest available
-/// automatic snapshot").
-pub const LATEST_RESTORABLE_AUTO_SNAPSHOT: &str = "the latest restorable automatic snapshot";
-
 /// What one door's wording of [`requested_snapshot_source`]'s refusals needs
 /// from that door: the names of the two source members the CALLER sent, and how
 /// this operation's own documentation words what it does with the snapshot.

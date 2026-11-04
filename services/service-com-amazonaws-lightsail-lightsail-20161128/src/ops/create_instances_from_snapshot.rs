@@ -2,9 +2,10 @@
 
 //! @op CreateInstancesFromSnapshot
 //! Inserts one instance record per requested name into this service's store, as a
-//! copy of the instance an instance snapshot captured, together with one block
-//! storage disk per entry of the requested attached-disk mapping, and answers the
-//! operation-log entry each new instance appended.
+//! copy of the instance the snapshot the request names captured — a manual
+//! instance snapshot, or an automatic snapshot of an instance — together with one
+//! block storage disk per entry of the requested attached-disk mapping, and
+//! answers the operation-log entry each new instance appended.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -306,90 +307,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
 
-            // The snapshotted instance the new instances are copies of. The
-            // snapshot's own record is the source of truth for the blueprint,
-            // the system volume's size and the block storage disks it captured;
-            // nothing here reads the instance the snapshot was taken of, which
-            // may have been changed or deleted since.
-            let (snapshot_name, snapshot_blueprint_id, snapshot_size_in_gb, captured_disks) =
-                match &source {
-                    RequestedSource::Snapshot(requested) => {
-                        let snapshot = store.instance_snapshot(requested).ok_or_else(|| {
-                            not_found(crate::state::RESOURCE_TYPE_INSTANCE_SNAPSHOT, requested)
-                        })?;
-                        // A snapshot belongs to the region it was taken in, and
-                        // only that region's Lightsail endpoint can restore it:
-                        // moving one between regions is what `CopySnapshot` is
-                        // for.
-                        if snapshot.location.region_name != region {
-                            return Err(invalid(format!(
-                                "instanceSnapshotName '{}' is a snapshot of region {}, which \
-                                 cannot be restored into availabilityZone '{}' of region \
-                                 {region}",
-                                snapshot.name,
-                                snapshot.location.region_name,
-                                input.availability_zone
-                            )));
-                        }
-                        // A snapshot is restorable only once every block it
-                        // captures is captured: while Lightsail is still taking
-                        // it the snapshot reports `pending`
-                        // (`InstanceSnapshot$state`), and there is nothing
-                        // complete to restore from yet. That is a well-formed
-                        // request the resources' state does not allow, which is
-                        // what the modelled `OperationFailureException` is for.
-                        if snapshot.state != crate::state::INSTANCE_SNAPSHOT_STATE_AVAILABLE {
-                            return Err(operation_failure(format!(
-                                "The instance snapshot {} is {}: an instance can be restored \
-                                 only from a snapshot that is {}.",
-                                snapshot.name,
-                                snapshot.state,
-                                crate::state::INSTANCE_SNAPSHOT_STATE_AVAILABLE
-                            )));
-                        }
-                        (
-                            snapshot.name.clone(),
-                            snapshot.from_blueprint_id.clone(),
-                            snapshot.size_in_gb,
-                            snapshot.from_attached_disks.clone(),
-                        )
-                    }
-                    // An AUTOMATIC snapshot is one the `AutoSnapshot` add-on
-                    // takes on the daily schedule an instance carries. This
-                    // store holds none — the add-on records the hour it would run
-                    // at and nothing takes a copy — so, once the source instance
-                    // is known to exist, there is no automatic snapshot of it to
-                    // restore from and the request is refused with the service's
-                    // `DoesNotExist` envelope rather than answered with an
-                    // instance restored from nothing.
-                    RequestedSource::AutoSnapshot {
-                        resource_name: instance_name,
-                        date,
-                    } => {
-                        store.instance(instance_name).ok_or_else(|| {
-                            not_found(crate::state::RESOURCE_TYPE_INSTANCE, instance_name)
-                        })?;
-                        let date = date
-                            .as_deref()
-                            .unwrap_or(crate::state::LATEST_RESTORABLE_AUTO_SNAPSHOT);
-                        return Err(crate::scaffolded::Scaffolded::does_not_exist(format!(
-                            "no automatic snapshot of the Instance {instance_name} is \
-                             available to restore ({date}): this account has taken none"
-                        )));
-                    }
-                };
+            // The snapshotted instance the new instances are copies of,
+            // resolved from the one source the request named and held to what a
+            // restore of it needs.
+            let snapshotted =
+                snapshotted_instance(store, &source, region, &input.availability_zone)?;
 
             // A restored system volume holds every block the snapshot captured,
             // so the plan it is restored onto cannot carry a smaller SSD than
             // the volume that was snapshotted; a larger plan is accepted and the
             // extra space is the new instance's.
-            if bundle.disk_size_in_gb < snapshot_size_in_gb {
+            if bundle.disk_size_in_gb < snapshotted.size_in_gb {
                 return Err(invalid(format!(
-                    "bundleId '{}' provides a {} GB SSD, smaller than the {snapshot_size_in_gb} \
-                     GB system volume instance snapshot '{snapshot_name}' captured: an \
-                     instance restored from a snapshot must be created on a bundle at least \
-                     as large as the snapshotted volume",
-                    input.bundle_id, bundle.disk_size_in_gb
+                    "bundleId '{}' provides a {} GB SSD, smaller than the {} GB system volume \
+                     {} captured: an instance restored from a snapshot must be created on a \
+                     bundle at least as large as the snapshotted volume",
+                    input.bundle_id,
+                    bundle.disk_size_in_gb,
+                    snapshotted.size_in_gb,
+                    snapshotted.described
                 )));
             }
 
@@ -400,18 +336,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut new_disks = 0usize;
             for instance in planned.iter_mut() {
                 for disk in instance.disks.iter_mut() {
-                    let captured = captured_disks
+                    let captured = snapshotted
+                        .attached_disks
                         .iter()
                         .find(|captured| {
                             captured.path.as_deref() == Some(disk.original_disk_path.as_str())
                         })
                         .ok_or_else(|| {
                             invalid(format!(
-                                "attachedDiskMapping names originalDiskPath '{}', which \
-                                 instance snapshot '{snapshot_name}' did not capture: it \
-                                 captured [{}]",
+                                "attachedDiskMapping names originalDiskPath '{}', which {} did \
+                                 not capture: it captured [{}]",
                                 disk.original_disk_path,
-                                captured_disks
+                                snapshotted.described,
+                                snapshotted
+                                    .attached_disks
                                     .iter()
                                     .filter_map(|captured| captured.path.clone())
                                     .collect::<Vec<String>>()
@@ -454,7 +392,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     tags: tags.clone(),
                     // The image is the snapshot's, not the request's: this input
                     // models no blueprint.
-                    blueprint_id: snapshot_blueprint_id.clone(),
+                    blueprint_id: snapshotted.blueprint_id.clone(),
                     // The plan is the request's: a restore is where a caller
                     // moves a snapshotted instance onto another bundle.
                     bundle_id: input.bundle_id.clone(),
@@ -478,7 +416,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // one does, and the public-ports operations make of them
                     // whatever a caller asks next.
                     ports: crate::state::default_port_rules(
-                        &snapshot_blueprint_id,
+                        &snapshotted.blueprint_id,
                         &ip_address_type,
                     ),
                     state: crate::state::PENDING,
@@ -705,6 +643,144 @@ fn requested_source(
     .map_err(invalid)
 }
 
+/// The snapshotted instance a restore makes its copies of, once the source the
+/// request named is known to hold one this account can restore.
+struct SnapshottedInstance {
+    /// The image the snapshotted instance ran, which every instance restored
+    /// from it runs: this input models no blueprint, so a snapshot of a
+    /// since-retired image still restores.
+    blueprint_id: String,
+    /// The size of the system volume the snapshot captured, in GB: the floor
+    /// under the SSD of the plan the instances are restored onto.
+    size_in_gb: i32,
+    /// The block storage disks the snapshot captured, whole — what
+    /// `attachedDiskMapping` addresses by the device path each was exposed at.
+    attached_disks: Vec<crate::state::StoredDisk>,
+    /// How a refusal names the snapshot that captured all of that. A manual
+    /// snapshot is a resource with a name of its own, while an automatic one
+    /// has neither name nor ARN and is named by the instance it was taken of
+    /// and the date it was taken on (`AutoSnapshotDetails$date`,
+    /// `DeleteAutoSnapshot$date`).
+    described: String,
+}
+
+/// The instance the ONE source `source` names captured, or the refusal that
+/// source earns against this store's own state.
+///
+/// Both forms of source answer the same three questions — does this account hold
+/// it, is it in the Region the new instances are being created in, and has the
+/// service finished taking it — because a restore needs a complete copy of an
+/// instance of this Region whichever way the request addressed it. What differs
+/// is where each is held: a manual snapshot is a record of its own, and so the
+/// source of truth for the image, the system volume and the captured disks it
+/// holds, while an automatic snapshot is a copy held beside the schedule that
+/// took it ([`crate::state::ComAmazonawsLightsailLightsail20161128State::auto_snapshot`]),
+/// whose image and system volume are the source instance's own — this service
+/// models no call that changes either — and whose captured disks are the ones
+/// that copy itself recorded, which is the same resolution `CopySnapshot` makes
+/// of the same source form.
+fn snapshotted_instance(
+    store: &crate::state::ComAmazonawsLightsailLightsail20161128State,
+    source: &RequestedSource,
+    region: &str,
+    availability_zone: &str,
+) -> Result<SnapshottedInstance, CreateInstancesFromSnapshotError> {
+    match source {
+        RequestedSource::Snapshot(requested) => {
+            let snapshot = store.instance_snapshot(requested).ok_or_else(|| {
+                not_found(crate::state::RESOURCE_TYPE_INSTANCE_SNAPSHOT, requested)
+            })?;
+            // A snapshot belongs to the region it was taken in, and only that
+            // region's Lightsail endpoint can restore it: moving one between
+            // regions is what `CopySnapshot` is for.
+            if snapshot.location.region_name != region {
+                return Err(invalid(format!(
+                    "instanceSnapshotName '{}' is a snapshot of region {}, which cannot be \
+                     restored into availabilityZone '{availability_zone}' of region {region}",
+                    snapshot.name, snapshot.location.region_name
+                )));
+            }
+            // A snapshot is restorable only once every block it captures is
+            // captured: while Lightsail is still taking it the snapshot reports
+            // `pending` (`InstanceSnapshot$state`), and there is nothing
+            // complete to restore from yet. That is a well-formed request the
+            // resources' state does not allow, which is what the modelled
+            // `OperationFailureException` is for.
+            if snapshot.state != crate::state::INSTANCE_SNAPSHOT_STATE_AVAILABLE {
+                return Err(operation_failure(format!(
+                    "The instance snapshot {} is {}: an instance can be restored only from a \
+                     snapshot that is {}.",
+                    snapshot.name,
+                    snapshot.state,
+                    crate::state::INSTANCE_SNAPSHOT_STATE_AVAILABLE
+                )));
+            }
+            Ok(SnapshottedInstance {
+                blueprint_id: snapshot.from_blueprint_id.clone(),
+                size_in_gb: snapshot.size_in_gb,
+                attached_disks: snapshot.from_attached_disks.clone(),
+                described: format!("instance snapshot '{}'", snapshot.name),
+            })
+        }
+        // An AUTOMATIC snapshot is one the `AutoSnapshot` add-on took of the
+        // instance on the daily schedule that instance carries, addressed by
+        // that instance plus the date the copy was taken on — or, where the
+        // request asked for the latest restorable copy, by the instance alone.
+        // The image and the system volume it captured are the instance's own,
+        // while the block storage disks it captured are the ones attached when
+        // the copy was taken.
+        RequestedSource::AutoSnapshot {
+            resource_name: instance_name,
+            date,
+        } => {
+            let instance = store
+                .instance(instance_name)
+                .ok_or_else(|| not_found(crate::state::RESOURCE_TYPE_INSTANCE, instance_name))?;
+            if instance.location.region_name != region {
+                return Err(invalid(format!(
+                    "sourceInstanceName '{}' names an instance of region {}, whose automatic \
+                     snapshots cannot be restored into availabilityZone '{availability_zone}' \
+                     of region {region}",
+                    instance.name, instance.location.region_name
+                )));
+            }
+            let copy = store
+                .auto_snapshot(
+                    crate::state::RESOURCE_TYPE_INSTANCE,
+                    instance_name,
+                    date.as_deref(),
+                )
+                .ok_or_else(|| auto_snapshot_not_found(instance_name, date.as_deref()))?;
+            // The same rule the manual source is held to: a copy the service
+            // has not finished taking holds no complete instance to restore
+            // from. A request for the latest RESTORABLE copy never reaches
+            // this, the lookup answering it with a copy that is finished.
+            if copy.status != crate::state::AUTO_SNAPSHOT_STATUS_SUCCESS {
+                return Err(operation_failure(format!(
+                    "The automatic snapshot of the {} {instance_name} dated {} is {}: an \
+                     instance can be restored only from a snapshot that is {}.",
+                    crate::state::RESOURCE_TYPE_INSTANCE,
+                    copy.date,
+                    copy.status,
+                    crate::state::AUTO_SNAPSHOT_STATUS_SUCCESS
+                )));
+            }
+            Ok(SnapshottedInstance {
+                blueprint_id: instance.blueprint_id.clone(),
+                // The system volume is the instance plan's own SSD, the disk
+                // `GetInstance` reports as the instance's system disk.
+                size_in_gb: instance.bundle.disk_size_in_gb,
+                attached_disks: copy.from_attached_disks.clone().unwrap_or_default(),
+                described: format!(
+                    "the automatic snapshot of the {} {instance_name} dated {}",
+                    crate::state::RESOURCE_TYPE_INSTANCE,
+                    copy.date
+                ),
+            })
+        }
+    }
+}
+
 /// Lightsail's refusal of a well-formed request its resources' state does not
 /// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
 /// this exception when an operation fails to execute" — whose message names the
@@ -734,6 +810,23 @@ fn invalid(message: String) -> CreateInstancesFromSnapshotError {
 /// resource type and the requested name.
 fn not_found(resource_type: &str, name: &str) -> CreateInstancesFromSnapshotError {
     crate::scaffolded::Scaffolded::resource_does_not_exist(resource_type, name)
+}
+
+/// The instance holds no automatic snapshot the request addressed — no copy
+/// taken on the date it named, or no finished copy at all where it asked for the
+/// latest restorable one: the same `DoesNotExist` envelope, in the one wording
+/// every operation that addresses such a copy refuses a missing one with
+/// ([`crate::state::no_such_auto_snapshot`]).
+fn auto_snapshot_not_found(
+    instance_name: &str,
+    date: Option<&str>,
+) -> CreateInstancesFromSnapshotError {
+    crate::scaffolded::Scaffolded::does_not_exist(crate::state::no_such_auto_snapshot(
+        crate::state::INSTANCE_RESTORE_SOURCE_MEMBERS,
+        crate::state::RESOURCE_TYPE_INSTANCE,
+        instance_name,
+        date,
+    ))
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

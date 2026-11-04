@@ -17477,7 +17477,7 @@ pub mod snapshot_source;
 pub use snapshot_source::{
     no_such_auto_snapshot, requested_snapshot_source, RequestedSnapshotSource,
     SnapshotSourceMembers, COPY_SNAPSHOT_SOURCE_MEMBERS, DISK_RESTORE_SOURCE_MEMBERS,
-    INSTANCE_RESTORE_SOURCE_MEMBERS, LATEST_RESTORABLE_AUTO_SNAPSHOT,
+    INSTANCE_RESTORE_SOURCE_MEMBERS,
 };
 
 /// Whether `value` is a daily automatic-snapshot hour an `AutoSnapshot` add-on
