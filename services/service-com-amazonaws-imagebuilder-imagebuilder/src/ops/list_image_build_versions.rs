@@ -199,7 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::IMAGE_BUILD_VERSION_FILTER_NAMES.contains(&name) {
                 return Err(ListImageBuildVersionsErrorModeled::InvalidRequestException(
                     InvalidRequestException {
-                        message: Some(crate::state::unsupported_filter_message(name)),
+                        message: Some(crate::state::unsupported_filter_message(
+                            name,
+                            crate::state::IMAGE_BUILD_VERSION_FILTER_NAMES,
+                        )),
                     },
                 )
                 .into());

@@ -15,6 +15,8 @@
 mod arn_parameter_refusals;
 #[path = "all/component_image_recipe.rs"]
 mod component_image_recipe;
+#[path = "all/component_listing.rs"]
+mod component_listing;
 #[path = "all/component_policy.rs"]
 mod component_policy;
 #[path = "all/image_packages.rs"]

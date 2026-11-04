@@ -216,7 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::IMAGE_RECIPE_FILTER_NAMES.contains(&name) {
                 return Err(ListImageRecipesErrorModeled::InvalidRequestException(
                     InvalidRequestException {
-                        message: Some(crate::state::unsupported_filter_message(name)),
+                        message: Some(crate::state::unsupported_filter_message(
+                            name,
+                            crate::state::IMAGE_RECIPE_FILTER_NAMES,
+                        )),
                     },
                 )
                 .into());

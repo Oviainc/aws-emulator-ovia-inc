@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComponents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComponents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComponents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The components this service holds, one entry per component version — or, when the
+//! request asks for them by name, one entry per name with every version of it aggregated.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +177,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComponents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComponentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The `Ownership` enum, the `maxResults` 1..25 range, the filter list's 1..10
+        // bound and the token's length have all been refused past by the centralized walk
+        // before this body runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListComponentsErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // Each filter names one member and the values it admits. An unnamed filter, one
+        // with no values, and a name this operation does not filter on are all refused
+        // rather than ignored: a filter nothing applies would answer with components the
+        // caller did not ask for.
+        for filter in input.filters.iter().flatten() {
+            let Some(name) = filter.name.as_deref() else {
+                return Err(ListComponentsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::incomplete_filter_message()),
+                    },
+                )
+                .into());
+            };
+            if filter.values.as_ref().is_none_or(|values| values.is_empty()) {
+                return Err(ListComponentsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::incomplete_filter_message()),
+                    },
+                )
+                .into());
+            }
+            if !crate::state::COMPONENT_FILTER_NAMES.contains(&name) {
+                return Err(ListComponentsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::unsupported_filter_message(
+                            name,
+                            crate::state::COMPONENT_FILTER_NAMES,
+                        )),
+                    },
+                )
+                .into());
+            }
+            // "You can't combine this option with the version filter" (`byName`): an
+            // entry that aggregates every version of a name cannot also stand for one
+            // version, so the pair is refused rather than answered one way or the other.
+            if input.by_name && name == crate::state::COMPONENT_VERSION_FILTER_NAME {
+                return Err(ListComponentsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::by_name_with_version_filter_message()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Which listing this page belongs to: the owner, `byName` and the filters, so a
+        // token issued for one listing is refused for another.
+        let mut cursor = crate::state::PageCursor {
+            operation: crate::state::LIST_COMPONENTS_OPERATION.to_string(),
+            region: region.clone(),
+            query: crate::state::component_query_fingerprint(
+                input.owner.as_deref(),
+                input.by_name,
+                input.filters.as_deref(),
+            ),
+            after: String::new(),
+        };
+        let after = match input.next_token.as_deref() {
+            None => String::new(),
+            Some(token) => match crate::state::decode_page_token(token, &cursor) {
+                Some(after) => after,
+                None => {
+                    return Err(ListComponentsErrorModeled::InvalidPaginationTokenException(
+                        InvalidPaginationTokenException {
+                            message: Some(crate::state::invalid_pagination_token_message()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // "By default, this request returns a list of components that your account owns",
+        // and the only components this store holds are the ones a caller created — so a
+        // request for any other type of owner reports none of them, without walking the
+        // store at all.
+        let owned_by_caller = input
+            .owner
+            .as_deref()
+            .unwrap_or(crate::state::OWNERSHIP_SELF)
+            == crate::state::OWNERSHIP_SELF;
+        if !owned_by_caller {
+            return Ok(ListComponentsOutput {
+                request_id: Some(crate::state::new_request_id()),
+                component_version_list: Some(Vec::new()),
+                next_token: None,
+            });
+        }
+
+        // A page carries at most `maxResults` entries, and at most the modelled maximum
+        // when the request names none.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(crate::state::MAX_COMPONENTS_PER_PAGE)
+            .clamp(1, crate::state::MAX_COMPONENTS_PER_PAGE);
+
+        // A pure read: the guard is taken, this page is copied out as modelled entries,
+        // and nothing is written.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComponents"))
+        // The store holds one record per BUILD version, while this listing reports one
+        // entry per version — or per name, with "all versions of each component
+        // aggregated" (`byName`). So the stored build versions are grouped under the ARN
+        // their entry reports, and the entry is read from the LATEST build version in its
+        // group, which is the one a reference to that version or name resolves to. The
+        // grouping is ordered by that ARN, so the listing has one order and a token's
+        // position in it is stable.
+        //
+        // "By default, the response doesn't include components in the DEPRECATED state. To
+        // list deprecated components, use the status filter with the value DEPRECATED":
+        // every component this store holds reports `ACTIVE` (the record has never changed
+        // state), so that default leaves out none of them and the `status` filter is what
+        // selects on it.
+        let store = state.lock();
+        let mut grouped: ::std::collections::BTreeMap<String, &crate::state::ComponentRecord> =
+            ::std::collections::BTreeMap::new();
+        for record in store.components.values() {
+            if record.region != region {
+                continue;
+            }
+            let admitted = input.filters.iter().flatten().all(|filter| {
+                filter.name.as_deref().is_some_and(|name| {
+                    record.admits_filter(name, filter.values.as_deref().unwrap_or_default())
+                })
+            });
+            if !admitted {
+                continue;
+            }
+            grouped
+                .entry(record.listed_arn(input.by_name))
+                .and_modify(|latest| {
+                    if record.version_order() > latest.version_order() {
+                        *latest = record;
+                    }
+                })
+                .or_insert(record);
+        }
+
+        let mut matching = grouped
+            .iter()
+            .filter(|(arn, _)| arn.as_str() > after.as_str());
+        let page: Vec<ComponentVersion> = matching
+            .by_ref()
+            .take(page_size)
+            .map(|(_, latest)| latest.version_entry(input.by_name))
+            .collect();
+        // A `nextToken` is answered only when an entry this page did not carry remains.
+        let remaining = matching.next().is_some();
+        let next_token = page
+            .last()
+            .filter(|_| remaining)
+            .and_then(|last| last.arn.clone())
+            .map(|last| {
+                cursor.after = last;
+                crate::state::encode_page_token(&cursor)
+            });
+        drop(store);
+
+        Ok(ListComponentsOutput {
+            request_id: Some(crate::state::new_request_id()),
+            component_version_list: Some(page),
+            next_token,
+        })
     }
 }

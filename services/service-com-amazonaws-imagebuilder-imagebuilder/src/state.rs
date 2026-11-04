@@ -83,7 +83,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AdditionalInstanceConfiguration, Component, ComponentConfiguration, ComponentParameterDetail,
-    ComponentState, CreateComponentInput, CreateImagePipelineInput, CreateImageRecipeInput,
+    ComponentState, ComponentVersion, CreateComponentInput, CreateImagePipelineInput,
+    CreateImageRecipeInput,
     CreateInfrastructureConfigurationInput, Filter, ImagePipeline, ImageRecipe, ImageRecipeSummary,
     ImageScanningConfiguration, ImageState, ImageSummary, ImageTestsConfiguration,
     InfrastructureConfiguration, InstanceBlockDeviceMapping, InstanceMetadataOptions,
@@ -154,6 +155,9 @@ pub const LIST_IMAGE_PACKAGES_OPERATION: &str = "ListImagePackages";
 /// See [`LIST_IMAGE_RECIPES_OPERATION`].
 pub const LIST_IMAGE_BUILD_VERSIONS_OPERATION: &str = "ListImageBuildVersions";
 
+/// See [`LIST_IMAGE_RECIPES_OPERATION`].
+pub const LIST_COMPONENTS_OPERATION: &str = "ListComponents";
+
 /// How many nodes of a semantic version a caller assigns.
 ///
 /// From `semanticVersion`'s own documentation, which `CreateComponent` and
@@ -212,6 +216,16 @@ pub const PLATFORM_LINUX: &str = "Linux";
 /// positions".
 pub const WILDCARD_VERSION_NODE: &str = "x";
 
+/// The version a NAME ARN carries: three [`WILDCARD_VERSION_NODE`] nodes.
+///
+/// From the note on `ComponentVersion`'s `arn`: "Versionless ARNs and Name ARNs do not
+/// include specific values in any of the nodes. The nodes are either left off entirely, or
+/// they are specified as wildcards, for example: x.x.x", beside "Version ARNs have only
+/// the first three nodes" — so a listing entry that aggregates every version of one name
+/// is reported under this version, and an entry that stands for one version under its own
+/// three assigned nodes.
+pub const WILDCARD_VERSION: &str = "x.x.x";
+
 /// The ownership a caller's own resources carry, from the modelled `Ownership` enum.
 /// `ListImageRecipes`' `owner` documents "By default, this request will only show image
 /// recipes owned by your account", so this is also the value an omitted `owner` means.
@@ -238,6 +252,28 @@ pub const MAX_IMAGE_BUILD_VERSIONS_PER_PAGE: usize = 25;
 /// type, version."
 pub const IMAGE_BUILD_VERSION_FILTER_NAMES: &[&str] =
     &["name", "osVersion", "platform", "type", "version"];
+
+/// The filter names `ListComponents` accepts, from the `filters` member's own list:
+/// "Use the following filters to streamline results: description, name, platform,
+/// productCodes, status, supportedOsVersion, type, version."
+pub const COMPONENT_FILTER_NAMES: &[&str] = &[
+    "description",
+    "name",
+    "platform",
+    "productCodes",
+    "status",
+    "supportedOsVersion",
+    "type",
+    "version",
+];
+
+/// The one filter a `ListComponents` request may not carry beside `byName`: "You can't
+/// combine this option with the version filter" (the modelled `byName` member).
+pub const COMPONENT_VERSION_FILTER_NAME: &str = "version";
+
+/// The most items one `ListComponents` page carries when the request names no
+/// `maxResults`: the modelled `maxResults` range's own maximum (1..25).
+pub const MAX_COMPONENTS_PER_PAGE: usize = 25;
 
 /// The most tags one resource carries.
 ///
@@ -576,6 +612,97 @@ impl ComponentRecord {
     pub fn version_order(&self) -> [u64; ASSIGNED_VERSION_NODES + 1] {
         let [major, minor, patch] = parse_semantic_version(&self.version).unwrap_or_default();
         [major, minor, patch, self.build_version]
+    }
+
+    /// The version a LISTING entry this record stands for reports: its own three assigned
+    /// nodes, or [`WILDCARD_VERSION`] when the entry aggregates every version of one name.
+    #[must_use]
+    pub fn listed_version(&self, aggregated_by_name: bool) -> &str {
+        if aggregated_by_name {
+            WILDCARD_VERSION
+        } else {
+            self.version.as_str()
+        }
+    }
+
+    /// The ARN a LISTING entry this record stands for reports: the version ARN of its
+    /// three assigned nodes, or the name ARN when the entry aggregates every version of
+    /// one name. Neither carries the build number — an entry stands for a version or for a
+    /// name, not for one build ([`ComponentVersion`]'s `arn`).
+    #[must_use]
+    pub fn listed_arn(&self, aggregated_by_name: bool) -> String {
+        component_version_arn(
+            &self.region,
+            &self.name,
+            self.listed_version(aggregated_by_name),
+        )
+    }
+
+    /// This record as the modelled `ComponentVersion` a listing reports for the version,
+    /// or for the name, its entry stands for.
+    #[must_use]
+    pub fn version_entry(&self, aggregated_by_name: bool) -> ComponentVersion {
+        ComponentVersion {
+            arn: Some(self.listed_arn(aggregated_by_name)),
+            name: Some(self.name.clone()),
+            version: Some(self.listed_version(aggregated_by_name).to_string()),
+            description: self.description.clone(),
+            platform: Some(self.platform.clone()),
+            supported_os_versions: self.supported_os_versions.clone(),
+            r#type: Some(self.component_type.clone()),
+            owner: Some(self.owner.clone()),
+            date_created: Some(self.date_created.clone()),
+            status: Some(COMPONENT_STATUS_ACTIVE.to_string()),
+            // See [`Self::view`]: a component a caller created here carries no Marketplace
+            // product codes.
+            product_codes: None,
+        }
+    }
+
+    /// The value of the member `filter_name` filters on, or `None` when this record
+    /// reports none. See [`COMPONENT_FILTER_NAMES`].
+    #[must_use]
+    pub fn filterable(&self, filter_name: &str) -> Option<&str> {
+        match filter_name {
+            "description" => self.description.as_deref(),
+            "name" => Some(self.name.as_str()),
+            "platform" => Some(self.platform.as_str()),
+            "status" => Some(COMPONENT_STATUS_ACTIVE),
+            "type" => Some(self.component_type.as_str()),
+            "version" => Some(self.version.as_str()),
+            // `supportedOsVersion` is a LIST and `version` admits wildcards, so both are
+            // read by [`Self::admits_filter`] instead; a stored component reports no
+            // product codes (see [`Self::view`]), so a filter on them matches none.
+            _ => None,
+        }
+    }
+
+    /// Whether the filter `filter_name` carrying `values` admits this record.
+    ///
+    /// A filter admits a record when one of its values IS the value the record reports for
+    /// the member the filter names \u2014 "Filter values are case-sensitive" (the modelled
+    /// `values`) \u2014 with two members read differently because of what they hold:
+    ///
+    /// * `supportedOsVersion` names one entry of a LIST, so a value admits the record when
+    ///   the record supports that OS version;
+    /// * `version` admits wildcard nodes: "You can assign values for the first three, and
+    ///   can filter on all of them \u2026 You can use wildcards (x) to specify the most recent
+    ///   versions or nodes" (`ListComponents`), so `1.0.x` admits every patch of `1.0`.
+    #[must_use]
+    pub fn admits_filter(&self, filter_name: &str, values: &[String]) -> bool {
+        match filter_name {
+            "supportedOsVersion" => self
+                .supported_os_versions
+                .iter()
+                .flatten()
+                .any(|supported| values.iter().any(|value| value == supported)),
+            COMPONENT_VERSION_FILTER_NAME => values
+                .iter()
+                .any(|value| version_pattern_admits(value, &self.version)),
+            _ => self
+                .filterable(filter_name)
+                .is_some_and(|reported| values.iter().any(|value| value == reported)),
+        }
     }
 }
 
@@ -1616,6 +1743,18 @@ pub fn component_build_version_arn(
     )
 }
 
+/// The ARN of the component `name` names at `version` in `region`, carrying no build
+/// number: the VERSION ARN of three assigned nodes, or the name ARN when `version` is
+/// [`WILDCARD_VERSION`].
+#[must_use]
+pub fn component_version_arn(region: &str, name: &str, version: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{COMPONENT_ARN_PREFIX}{}/{version}", normalized_name(name)),
+    )
+}
+
 /// The ARN of the image recipe `name` names at `version` in `region`.
 #[must_use]
 pub fn image_recipe_arn(region: &str, name: &str, version: &str) -> String {
@@ -1831,36 +1970,9 @@ impl VersionedReference {
             return None;
         }
 
-        let mut nodes = [VersionNode::Any; ASSIGNED_VERSION_NODES];
-        let mut submitted = version.split('.');
-        for node in &mut nodes {
-            *node = match submitted.next()? {
-                "x" => VersionNode::Any,
-                assigned => VersionNode::Exact(
-                    assigned
-                        .parse()
-                        .ok()
-                        .filter(|value| *value <= MAX_VERSION_NODE)?,
-                ),
-            };
-        }
-        if submitted.next().is_some() {
-            return None;
-        }
-        // Trailing positions only: once a node is a wildcard, every later one is too.
-        let wildcard_from = nodes
-            .iter()
-            .position(|node| *node == VersionNode::Any)
-            .unwrap_or(ASSIGNED_VERSION_NODES);
-        if nodes
-            .iter()
-            .skip(wildcard_from)
-            .any(|node| *node != VersionNode::Any)
-        {
-            return None;
-        }
+        let nodes = parse_version_pattern(version)?;
         // A build version ARN names an exact version: `1.x.x/2` reaches no single build.
-        if build_version.is_some() && wildcard_from != ASSIGNED_VERSION_NODES {
+        if build_version.is_some() && nodes.contains(&VersionNode::Any) {
             return None;
         }
 
@@ -1871,6 +1983,52 @@ impl VersionedReference {
             build_version,
         })
     }
+}
+
+/// The three version nodes `value` carries, each assigned or wildcard, or `None` when it
+/// is not three such nodes with every wildcard in a TRAILING position.
+///
+/// The ONE reading of a version pattern, so the version a reference ARN carries
+/// ([`VersionedReference::parse`]) and the version a listing's filter names admit the same
+/// stored versions. A wildcard is admitted only in a trailing position: "The version can
+/// use the `x` wildcard in trailing positions" (`GetComponent`'s
+/// `componentBuildVersionArn`), which `ListComponents` states as "When you use a wildcard
+/// in any node, all nodes to the right of the first wildcard must also be wildcards".
+#[must_use]
+pub fn parse_version_pattern(value: &str) -> Option<[VersionNode; ASSIGNED_VERSION_NODES]> {
+    let mut nodes = [VersionNode::Any; ASSIGNED_VERSION_NODES];
+    let mut submitted = value.split('.');
+    for node in &mut nodes {
+        *node = match submitted.next()? {
+            WILDCARD_VERSION_NODE => VersionNode::Any,
+            assigned => VersionNode::Exact(
+                assigned
+                    .parse()
+                    .ok()
+                    .filter(|value| *value <= MAX_VERSION_NODE)?,
+            ),
+        };
+    }
+    if submitted.next().is_some() {
+        return None;
+    }
+    // Trailing positions only: once a node is a wildcard, every later one is too.
+    let wildcard_from = nodes
+        .iter()
+        .position(|node| *node == VersionNode::Any)
+        .unwrap_or(ASSIGNED_VERSION_NODES);
+    nodes
+        .iter()
+        .skip(wildcard_from)
+        .all(|node| *node == VersionNode::Any)
+        .then_some(nodes)
+}
+
+/// Whether the version `pattern` a filter names admits the `assigned` version of a stored
+/// record. A value that is not a version pattern at all admits nothing.
+#[must_use]
+pub fn version_pattern_admits(pattern: &str, assigned: &str) -> bool {
+    parse_version_pattern(pattern).is_some_and(|nodes| version_admits(&nodes, assigned))
 }
 
 /// Whether the three nodes a reference carries admit the `assigned` version of a stored
@@ -2285,25 +2443,30 @@ fn page_token_digest(payload: &str) -> String {
 /// pages.
 #[must_use]
 pub fn image_recipe_query_fingerprint(owner: Option<&str>, filters: Option<&[Filter]>) -> String {
-    let rendered_filters = filters.map_or_else(
-        || ABSENT.to_string(),
-        |filters| {
-            group(
-                &filters
-                    .iter()
-                    .map(|filter| {
-                        group(&[
-                            text(filter.name.as_deref()),
-                            list(filter.values.as_deref()),
-                        ])
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        },
-    );
     format!(
-        "owner={};filters={rendered_filters};",
-        text(Some(owner.unwrap_or(OWNERSHIP_SELF)))
+        "owner={};filters={};",
+        text(Some(owner.unwrap_or(OWNERSHIP_SELF))),
+        filter_list(filters)
+    )
+}
+
+/// A deterministic rendering of which components one `ListComponents` request asked for,
+/// so a token issued for one query is refused for another.
+///
+/// `byName` is part of it: it decides whether an entry stands for one version or for a
+/// whole name, so the two listings are keyed differently and a token issued for one cannot
+/// be spent on the other. `maxResults` is deliberately NOT part of it, for the reason
+/// [`image_recipe_query_fingerprint`] states.
+#[must_use]
+pub fn component_query_fingerprint(
+    owner: Option<&str>,
+    by_name: bool,
+    filters: Option<&[Filter]>,
+) -> String {
+    format!(
+        "owner={};byName={by_name};filters={};",
+        text(Some(owner.unwrap_or(OWNERSHIP_SELF))),
+        filter_list(filters)
     )
 }
 
@@ -2317,25 +2480,10 @@ pub fn image_build_version_query_fingerprint(
     image_version_arn: Option<&str>,
     filters: Option<&[Filter]>,
 ) -> String {
-    let rendered_filters = filters.map_or_else(
-        || ABSENT.to_string(),
-        |filters| {
-            group(
-                &filters
-                    .iter()
-                    .map(|filter| {
-                        group(&[
-                            text(filter.name.as_deref()),
-                            list(filter.values.as_deref()),
-                        ])
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        },
-    );
     format!(
-        "imageVersionArn={};filters={rendered_filters};",
-        text(image_version_arn)
+        "imageVersionArn={};filters={};",
+        text(image_version_arn),
+        filter_list(filters)
     )
 }
 
@@ -2881,6 +3029,27 @@ fn list(values: Option<&[String]>) -> String {
     )
 }
 
+/// The `filters` member of a list request, as every listing's fingerprint renders it: a
+/// filter's name beside its values, in the order the request carried them.
+fn filter_list(filters: Option<&[Filter]>) -> String {
+    filters.map_or_else(
+        || ABSENT.to_string(),
+        |filters| {
+            group(
+                &filters
+                    .iter()
+                    .map(|filter| {
+                        group(&[
+                            text(filter.name.as_deref()),
+                            list(filter.values.as_deref()),
+                        ])
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        },
+    )
+}
+
 /// One map member, in key order — a map carries no order of its own, so the rendering
 /// imposes one and two orderings of the same pairs render alike.
 fn tag_map(values: Option<&HashMap<String, String>>) -> String {
@@ -3174,13 +3343,28 @@ pub fn too_many_resource_tags_message(arn: &str, merged: usize) -> String {
 
 /// Why a list naming an unsupported filter is refused.
 ///
-/// The supported names are the `filters` member's own list
-/// ([`IMAGE_RECIPE_FILTER_NAMES`]).
+/// The `supported` names are the `filters` member's own list, of the operation the request
+/// called ([`IMAGE_RECIPE_FILTER_NAMES`], [`COMPONENT_FILTER_NAMES`]) — each operation
+/// filters on the members of the resource it lists, so the wording names the ones the
+/// caller may ask for rather than any one operation's.
 #[must_use]
-pub fn unsupported_filter_message(name: &str) -> String {
+pub fn unsupported_filter_message(name: &str, supported: &[&str]) -> String {
     format!(
         "The filter name {name} is not supported. The supported filter names are {}.",
-        IMAGE_RECIPE_FILTER_NAMES.join(", ")
+        supported.join(", ")
+    )
+}
+
+/// Why a `ListComponents` request carrying both `byName` and the version filter is
+/// refused.
+///
+/// The rule is the `byName` member's own: "You can't combine this option with the version
+/// filter."
+#[must_use]
+pub fn by_name_with_version_filter_message() -> String {
+    format!(
+        "The request must not specify byName together with the \
+         {COMPONENT_VERSION_FILTER_NAME} filter."
     )
 }
 
