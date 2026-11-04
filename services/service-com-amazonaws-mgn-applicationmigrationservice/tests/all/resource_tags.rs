@@ -48,12 +48,12 @@ const NOT_FOUND_MESSAGE: &str = "Resource was not found";
 /// carries that a URI reads as structure — the field separator `:` and the resource
 /// separator `/` — travel escaped, exactly as an SDK sends them. Every other character
 /// the values below use is unreserved, so nothing else needs escaping here.
-fn label(value: &str) -> String {
+pub(crate) fn label(value: &str) -> String {
     value.replace(':', "%3A").replace('/', "%2F")
 }
 
 /// `GET /tags/{resourceArn}` — `ListTagsForResource`.
-async fn list_tags(mgn: &Mgn, resource_arn: &str) -> (u16, Value) {
+pub(crate) async fn list_tags(mgn: &Mgn, resource_arn: &str) -> (u16, Value) {
     let (status, _, body) = mgn
         .call_http("GET", &format!("/tags/{}", label(resource_arn)), None)
         .await;
@@ -61,7 +61,7 @@ async fn list_tags(mgn: &Mgn, resource_arn: &str) -> (u16, Value) {
 }
 
 /// `POST /tags/{resourceArn}` with the pairs in the body — `TagResource`.
-async fn tag_resource(
+pub(crate) async fn tag_resource(
     mgn: &Mgn,
     resource_arn: &str,
     tags: &BTreeMap<String, String>,
@@ -78,7 +78,11 @@ async fn tag_resource(
 
 /// `DELETE /tags/{resourceArn}?tagKeys=…` — `UntagResource`. `tagKeys` is an
 /// `@httpQuery` list, so one parameter per key.
-async fn untag_resource(mgn: &Mgn, resource_arn: &str, tag_keys: &[String]) -> (u16, Value) {
+pub(crate) async fn untag_resource(
+    mgn: &Mgn,
+    resource_arn: &str,
+    tag_keys: &[String],
+) -> (u16, Value) {
     let query = tag_keys
         .iter()
         .map(|key| format!("tagKeys={}", label(key)))
@@ -130,7 +134,7 @@ async fn reported_tags(mgn: &Mgn, case: &str, resource_arn: &str) -> BTreeMap<St
 }
 
 /// A tag map from `(key, value)` pairs.
-fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(crate) fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -140,7 +144,7 @@ fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 /// Which kind of resource a row addresses — the three kinds this service mints an ARN
 /// for, so the ARN a tag operation names can resolve to any of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Application,
     SourceServer,
     NetworkMigrationDefinition,
@@ -148,15 +152,15 @@ enum Kind {
 
 /// One taggable resource: its kind, its ARN and the id its own reader takes.
 #[derive(Debug, Clone)]
-struct Resource {
-    kind: Kind,
-    arn: String,
-    id: String,
+pub(crate) struct Resource {
+    pub(crate) kind: Kind,
+    pub(crate) arn: String,
+    pub(crate) id: String,
 }
 
 /// An emulator holding one resource of every taggable kind, each created (or, for a
 /// source server, registered) the way this service's own operations do.
-async fn emulator_with_one_of_each_kind() -> (Mgn, Vec<Resource>) {
+pub(crate) async fn emulator_with_one_of_each_kind() -> (Mgn, Vec<Resource>) {
     let mgn = Mgn::new();
     mgn.initialize().await;
 
@@ -277,7 +281,7 @@ async fn tags_through_the_resource_reader(
 /// carrying spaces and punctuation. The bounds are the model's
 /// (`smithy_query(query="shape",shape="TagsMap")`: `@length` 0..50 entries, key and
 /// value `@length` 0..256).
-fn write_cases() -> Vec<(&'static str, BTreeMap<String, String>)> {
+pub(crate) fn write_cases() -> Vec<(&'static str, BTreeMap<String, String>)> {
     vec![
         ("one pair", tags(&[("stage", "test")])),
         (
@@ -324,8 +328,8 @@ async fn tags_written_by_arn_round_trip_through_both_readers() {
 
             let (status, body) = tag_resource(&mgn, &resource.arn, &write).await;
             assert_eq!(
-                status, 200,
-                "case {case:?}: TagResource expected 200, got {status} with {body:?}"
+                status, 204,
+                "case {case:?}: TagResource expected 204, got {status} with {body:?}"
             );
 
             let mut expected = before.clone();
@@ -353,8 +357,8 @@ async fn tags_written_by_arn_round_trip_through_both_readers() {
             overwrite.insert("added-later".to_string(), "yes".to_string());
             let (status, body) = tag_resource(&mgn, &resource.arn, &overwrite).await;
             assert_eq!(
-                status, 200,
-                "case {case:?}: the second TagResource expected 200, got {status} with \
+                status, 204,
+                "case {case:?}: the second TagResource expected 204, got {status} with \
                  {body:?}"
             );
             expected.extend(overwrite.clone());
@@ -376,8 +380,8 @@ async fn tags_written_by_arn_round_trip_through_both_readers() {
             for attempt in 1..=2 {
                 let (status, body) = untag_resource(&mgn, &resource.arn, &keys).await;
                 assert_eq!(
-                    status, 200,
-                    "case {case:?}: UntagResource attempt {attempt} expected 200, got \
+                    status, 204,
+                    "case {case:?}: UntagResource attempt {attempt} expected 204, got \
                      {status} with {body:?}"
                 );
             }
@@ -416,8 +420,8 @@ async fn a_tag_write_touches_only_the_resource_its_arn_names() {
         let write = tags(&[("touched", &format!("{:?}", target.kind))]);
         let (status, body) = tag_resource(&mgn, &target.arn, &write).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: TagResource expected 200, got {status} with {body:?}"
+            status, 204,
+            "case {case:?}: TagResource expected 204, got {status} with {body:?}"
         );
 
         for resource in &resources {
@@ -577,8 +581,8 @@ async fn a_tag_write_past_the_per_resource_maximum_is_refused() {
     )]);
     let (status, body) = tag_resource(&mgn, &arn, &last).await;
     assert_eq!(
-        status, 200,
-        "case {case:?}: a write reaching the bound expected 200, got {status} with {body:?}"
+        status, 204,
+        "case {case:?}: a write reaching the bound expected 204, got {status} with {body:?}"
     );
     let mut at_the_bound = created.clone();
     at_the_bound.extend(last);
@@ -618,8 +622,8 @@ async fn a_tag_write_past_the_per_resource_maximum_is_refused() {
     let case = "overwriting a key the resource already carries, at the bound";
     let (status, body) = tag_resource(&mgn, &arn, &tags(&[("key-00", "rewritten")])).await;
     assert_eq!(
-        status, 200,
-        "case {case:?}: expected 200 — an overwrite grows nothing — got {status} with {body:?}"
+        status, 204,
+        "case {case:?}: expected 204 — an overwrite grows nothing — got {status} with {body:?}"
     );
     at_the_bound.insert("key-00".to_string(), "rewritten".to_string());
     let reported = reported_tags(&mgn, case, &arn).await;

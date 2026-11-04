@@ -102,6 +102,43 @@ impl Mgn {
         path: &str,
         body: Option<&Value>,
     ) -> (u16, Option<String>, Value) {
+        let (status, error_type, raw) = self.call_http_raw(method, path, body).await;
+        let parsed = if raw.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&raw).unwrap_or_else(|error| {
+                panic!("{method} {path} answered a body that is not JSON: {error}")
+            })
+        };
+        (status, error_type, parsed)
+    }
+
+    /// As [`Mgn::call_http`], answering the response body as the RAW bytes it arrived in,
+    /// for a rule about the body's presence rather than its contents — an answer that
+    /// carries no entity must carry no bytes either.
+    pub(crate) async fn call_http_raw(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> (u16, Option<String>, Vec<u8>) {
+        let (status, headers, raw) = self.call_http_stating_headers(method, path, body).await;
+        let error_type = headers
+            .iter()
+            .find(|(name, _)| name == "x-amzn-errortype")
+            .map(|(_, value)| value.clone());
+        (status, error_type, raw)
+    }
+
+    /// As [`Mgn::call_http_raw`], answering every response header as a lowercase
+    /// name/value pair, for a rule about what an answer STATES about itself — the
+    /// framing of an answer that carries no content, say.
+    pub(crate) async fn call_http_stating_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> (u16, Vec<(String, String)>, Vec<u8>) {
         let payload = body
             .map(|body| serde_json::to_vec(body).expect("the request body serializes"))
             .unwrap_or_default();
@@ -121,20 +158,18 @@ impl Mgn {
 
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
-        let error_type = response
+        let headers = response
             .headers()
-            .get("x-amzn-errortype")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let raw = response.into_body();
-        let parsed = if raw.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&raw).unwrap_or_else(|error| {
-                panic!("{method} {path} answered a body that is not JSON: {error}")
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
             })
-        };
-        (status, error_type, parsed)
+            .collect();
+        let raw = response.into_body();
+        (status, headers, raw.to_vec())
     }
 
     /// `InitializeService` for the caller's own account.

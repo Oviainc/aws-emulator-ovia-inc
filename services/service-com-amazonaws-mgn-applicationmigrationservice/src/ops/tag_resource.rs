@@ -157,7 +157,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // A successful tag write answers 204 No Content: this operation's output is
+    // `smithy.api#Unit` — the model declares no response shape for it at all — so the
+    // response carries no entity and the status is what tells a client (or an
+    // intermediary) there is nothing to read. The `@http` code is left defaulted here, so
+    // the protocol's fallback 200 is not a status the model states; every one of this
+    // service's other output-less operations answers 204 as well (`DeleteConnector` and
+    // `DeleteVcenterClient`, whose code the model does state, and `UntagResource`, the
+    // other tag mutation). An operation whose model names a response shape, empty or not,
+    // keeps the status stated for it.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,
