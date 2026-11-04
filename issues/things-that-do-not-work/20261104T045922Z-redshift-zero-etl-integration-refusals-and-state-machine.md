@@ -1,0 +1,55 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: redshift.integration-create-delete-lifecycle redshift.server-side-resource-policy-enforcement redshift.integration-duplicate-create-rejected redshift.integration-lifecycle-state-transitions redshift.integration-concurrent-conflict-operation-blocked redshift.concurrency-integration-conflict-operation
+Issue-Shape-Id: com.amazonaws.redshift#RedshiftServiceVersion20121201
+Issue-Key: redshift.integration-create-delete-lifecycle|run#27|AssertionError|assert code == "InvalidParameterValue", (
+Issue-Key: redshift.server-side-resource-policy-enforcement|run#17|AssertionError|assert denied_code == "InvalidParameterValue", (
+Issue-Key: redshift.integration-duplicate-create-rejected|run#35|AssertionError|assert message == (
+Issue-Key: redshift.integration-lifecycle-state-transitions|run#42|AssertionError|assert message == "The requested integration doesn't exist.", (
+Issue-Key: redshift.integration-concurrent-conflict-operation-blocked|_error#39|AssertionError|raise AssertionError(f"expected the call to be rejected, but it SUCCEEDED and returned {result!r}")
+Issue-Key: redshift|DescribeIntegrations|IntegrationNotFoundFault
+Issue-Commit: f099a2d3bf6bcdb075a9bf115e0dc86bb75f03d7
+
+# Redshift zero-ETL integration refusals and state machine diverge: wrong fault classes, emulator-authored messages, no target-policy authorization and a delete accepted mid-create (5 causes)
+
+> _Note: this issue was identified against the code base at commit `f099a2d3bf6bcdb075a9bf115e0dc86bb75f03d7`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateIntegration
+
+## Description
+Five net-new root causes on the zero-ETL integration surface (CreateIntegration/DeleteIntegration/DescribeIntegrations). The open issue 20261024T115115Z-redshift-zero-etl-integration-error-semantics-unreachable-dynamodb.md and the fixed 20261028T124505Z-redshift-createintegration-resolves-targetarn-only-against-provisioned-clusters-a.md touch this surface but carry none of the failing checks below.
+
+Cause 1 of 5 — CreateIntegration classifies a nonexistent target namespace as IntegrationTargetNotFoundFault instead of InvalidParameterValue with the zero-ETL access message. AWS: a TargetArn that is well-formed but names a namespace that does not exist is refused 400 'InvalidParameterValue' with the fixed text "You don't have access to zero-ETL integrations because the Amazon Redshift data warehouse doesn't exist or you don't have the required permissions. Check the resource policy of the data warehouse and make sure your user or role is specified as an authorized principal." — no variable part (Smithy: CreateIntegration models IntegrationTargetNotFoundFault among its errors, but AWS does not use it for this case; the InvalidParameterValue classification and wording are recorded behavior). Emulator: 400 'IntegrationTargetNotFoundFault'. Why: the two refusals mean different things to a client — a 404-style target-not-found is retried while a permissions/existence refusal is surfaced to the operator — so error handling and the operator-facing remediation text are both wrong. Fix: the CreateIntegration target-resolution branch's error classification and message. Traces: redshift.integration-create-delete-lifecycle.
+
+Cause 2 of 5 — CreateIntegration performs no authorization check against the target namespace's resource policy. AWS: when the target namespace's resource policy does not authorize the caller for redshift:CreateInboundIntegration on that source, CreateIntegration is refused SYNCHRONOUSLY with 400 'InvalidParameterValue' and the same fixed data-warehouse-access text quoted in cause 1 (recorded behavior only). Emulator: the call is refused with 'IntegrationConflictOperationFault' instead — a conflict class, not an authorization class — so the authorization decision is never made. Why: a client cannot distinguish "your resource policy doesn't allow this" from "something else is in flight"; a provisioning flow retries a call that can never succeed, and the negative control of a resource-policy-protected target silently passes/fails for the wrong reason. Fix: CreateIntegration must evaluate the target namespace's resource policy and refuse with InvalidParameterValue and that message. Traces: redshift.server-side-resource-policy-enforcement.
+
+Cause 3 of 5 — the IntegrationAlreadyExistsFault message is emulator-authored and states the wrong uniqueness rule. AWS: re-using an integration NAME in the account is refused 400 IntegrationAlreadyExistsFault with "A zero-ETL integration named <IntegrationName> already exists in account <account-id>. Integration names must be unique within an account. Specify a different name for your integration, or delete the existing integration." — fixed text with the requested IntegrationName and the caller's account id substituted. Emulator: "An integration from source <SourceArn> to target <TargetArn> already exists. Only one integration is allowed." — a different (source/target) uniqueness rule and different wording. Why: the remediation the message gives is wrong (the client is told to drop the pair, not to rename), and a client keyed on the name-uniqueness wording mis-handles the conflict. Fix: the CreateIntegration duplicate check must key on integration name within the account and emit AWS's message. Traces: redshift.integration-duplicate-create-rejected.
+
+Cause 4 of 5 — the IntegrationNotFoundFault message is emulator-authored. AWS: an IntegrationArn that does not resolve is refused 404 IntegrationNotFoundFault with the fixed text "The requested integration doesn't exist." — no variable part (Smithy: IntegrationNotFoundFault, httpError 404, on DeleteIntegration and DescribeIntegrations). Emulator: "Integration not found: <IntegrationArn>" — different wording, and it leaks the ARN into the message. Fix: the integration not-found refusal message, shared by the DeleteIntegration and DescribeIntegrations handlers. Traces: redshift.integration-lifecycle-state-transitions.
+
+Cause 5 of 5 — DeleteIntegration is accepted while the integration is still 'creating', and DescribeIntegrations then refuses instead of reporting the integration. AWS: DeleteIntegration against an integration whose target data warehouse is not yet active is refused 400 'IntegrationConflictOperationFault' with "Unable to perform delete operation on the specified zero-ETL integration because its target Redshift data warehouse is not active. Wait until the data warehouse is active and try again." (fixed text, no variable part), and the integration stays describable with a Status that is NOT 'deleting'. After an accepted delete, DescribeIntegrations keeps answering 200 with the integration in 'deleting' until it is gone. Emulator: the premature DeleteIntegration returns HTTP 200 with Status 'deleting', and in the concurrent modify/delete race DescribeIntegrations on the same ARN raises IntegrationNotFoundFault instead of returning the record. Why: a client that relies on the service to serialize integration operations destroys an integration mid-create, and its follow-up read fails with a not-found it has no reason to handle, so the delete's effect can never be observed. Fix: the DeleteIntegration state-machine precondition (status/target readiness) plus the DescribeIntegrations read path for an integration in a terminal-delete transition. Traces: redshift.integration-concurrent-conflict-operation-blocked, redshift.concurrency-integration-conflict-operation.
+
+## Evidence
+Replay of simparity-behavioral-aws-v1 against the emulator.
+
+Cause 1: redshift.integration-create-delete-lifecycle — "expected InvalidParameterValue for a nonexistent target namespace, got 'IntegrationTargetNotFoundFault'" (check asserts the data-warehouse-access message quoted above).
+
+Cause 2: redshift.server-side-resource-policy-enforcement — "expected a synchronous InvalidParameterValue rejection for the unauthorized source table, got success=None code='IntegrationConflictOperationFault'".
+
+Cause 3: redshift.integration-duplicate-create-rejected — "unexpected IntegrationAlreadyExistsFault message 'An integration from source arn:aws:s3:::<bucket> to target arn:aws:redshift-serverless:<region>:<account>:namespace/<uuid> already exists. Only one integration is allowed.'"; expected "A zero-ETL integration named <name> already exists in account <account>. Integration names must be unique within an account. Specify a different name for your integration, or delete the existing integration."
+
+Cause 4: redshift.integration-lifecycle-state-transitions — "unexpected IntegrationNotFoundFault message 'Integration not found: arn:aws:redshift:<region>:<account>:integration:<uuid>'"; expected "The requested integration doesn't exist."
+
+Cause 5: redshift.integration-concurrent-conflict-operation-blocked — "expected the call to be rejected, but it SUCCEEDED and returned {... 'Status': 'deleting', 'HTTPStatusCode': 200}" for a DeleteIntegration issued while the integration was not yet active; expected 400 IntegrationConflictOperationFault with the "target Redshift data warehouse is not active" message and the integration still not 'deleting'. redshift.concurrency-integration-conflict-operation — uncaught botocore.errorfactory.IntegrationNotFoundFault "An error occurred (IntegrationNotFoundFault) when calling the DescribeIntegrations operation: Integration not found: arn:aws:redshift:<region>:<account>:integration:<uuid>" on a DescribeIntegrations the check issues for an integration it just created/raced.
+
+The ARNs, uuids, names and account ids are this run's environment; the requirements are the status, the error code, the message templates and the state-machine preconditions.
+
+## Steps to Reproduce
+1. CreateIntegration with a real DynamoDB/S3 SourceArn and a TargetArn naming a namespace uuid that was never created: observe 400 IntegrationTargetNotFoundFault instead of 400 InvalidParameterValue with the data-warehouse-access message.
+2. Create a namespace whose resource policy does NOT authorize the caller for redshift:CreateInboundIntegration from the source table, then CreateIntegration: observe IntegrationConflictOperationFault instead of a synchronous InvalidParameterValue.
+3. CreateIntegration twice with the same IntegrationName (different source/target): compare the IntegrationAlreadyExistsFault message against AWS's name-uniqueness wording.
+4. DeleteIntegration/DescribeIntegrations with an integration ARN that does not exist: compare the message against "The requested integration doesn't exist."
+5. CreateIntegration and, while Status is 'creating', call DeleteIntegration: observe 200/'deleting' instead of IntegrationConflictOperationFault; then race ModifyIntegration against DeleteIntegration on an active integration and call DescribeIntegrations by ARN — observe IntegrationNotFoundFault instead of the record.
+6. Re-replay the behavioral checks listed in trace_ids.
