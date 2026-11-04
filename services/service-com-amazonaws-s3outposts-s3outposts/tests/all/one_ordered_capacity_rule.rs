@@ -63,7 +63,10 @@ struct Configuration {
     vcpus: i64,
     /// The Amazon S3 storage capacity, in bytes, one unit of it carries.
     s3_bytes: i64,
-    /// The largest size of each instance family it publishes EC2 capacity of.
+    /// The largest size of each instance family it publishes EC2 capacity of, as the
+    /// INSTANCE TYPE it names: a published capacity reports its family and the bare
+    /// size separately, so the type is the join of the two
+    /// ([`outposts_state::capacity_instance_type`]).
     max_sizes: Vec<String>,
 }
 
@@ -132,7 +135,7 @@ impl Catalog {
                         .ec2_capacities
                         .iter()
                         .flatten()
-                        .filter_map(|capacity| capacity.max_size.clone())
+                        .filter_map(outposts_state::capacity_instance_type)
                         .collect(),
                 })
             })

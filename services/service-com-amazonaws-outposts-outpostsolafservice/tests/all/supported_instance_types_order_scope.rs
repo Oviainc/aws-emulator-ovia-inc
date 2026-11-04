@@ -167,9 +167,12 @@ fn ordered_capacity(catalog: &[Value], configurations: &[&Value]) -> Vec<(String
             .flatten()
         {
             let (family, max_size) = (text(capacity, "Family"), text(capacity, "MaxSize"));
-            let max_vcpus = published_vcpus(catalog, &max_size).unwrap_or_else(|| {
+            // `Family` names the family and `MaxSize` the size alone, so the instance
+            // type the capacity names is the join of the two.
+            let instance_type = format!("{family}.{max_size}");
+            let max_vcpus = published_vcpus(catalog, &instance_type).unwrap_or_else(|| {
                 panic!(
-                    "the published catalog must carry {max_size:?}, the maximum size of \
+                    "the published catalog must carry {instance_type:?}, the maximum size of \
                      {family:?} a configuration carries capacity of"
                 )
             });
@@ -346,11 +349,16 @@ async fn an_order_scopes_the_report_to_the_capacity_its_configurations_carry() {
             hardware_type,
         )
         .await;
-        let unscoped = report(&outposts, &outpost_id, "").await;
+        // What an order narrows: the catalog this Outpost's form factor offers, which
+        // is what an order recording no hardware fact answers. The Outpost's OWN
+        // report is about the hardware installed on it — nothing is, here — so the
+        // comparison is against this computed scope and not against that report (see
+        // [`crate::supported_instance_types`]).
+        let unscoped = expected(&catalog, &Scope::ordered(hardware_type, Vec::new()));
         assert!(
             !unscoped.is_empty(),
-            "case {hardware_type:?}: the Outpost itself must support something to narrow, \
-             got {unscoped:?}"
+            "case {hardware_type:?}: the form factor must offer something to narrow, got \
+             {unscoped:?}"
         );
 
         let mut answers: Vec<Vec<(String, i64)>> = Vec::new();
@@ -465,9 +473,11 @@ async fn what_an_order_is_for_is_its_published_line_items_and_nothing_else() {
     ];
 
     // Every row is read on ONE Outpost, so what differs between the answers is the
-    // order each one names and nothing else.
+    // order each one names and nothing else. What an order narrows is the catalog this
+    // Outpost's form factor offers, which is what an order recording no hardware fact
+    // answers.
     let outpost_id = an_outpost(&outposts, "order-shapes", Some("RACK")).await;
-    let unscoped = report(&outposts, &outpost_id, "").await;
+    let unscoped = expected(&catalog, &Scope::ordered(Some("RACK"), Vec::new()));
     let mut answers: Vec<Vec<(String, i64)>> = Vec::new();
     for row in rows {
         let case = row.case;
@@ -510,7 +520,7 @@ async fn what_an_order_is_for_is_its_published_line_items_and_nothing_else() {
             assert_eq!(
                 want, unscoped,
                 "case {case:?}: an order of no published configuration must expect the \
-                 report the Outpost itself answers"
+                 catalog this Outpost's form factor offers"
             );
         } else {
             assert!(

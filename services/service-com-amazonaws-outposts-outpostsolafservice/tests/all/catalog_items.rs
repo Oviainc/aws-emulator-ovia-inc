@@ -328,19 +328,22 @@ async fn every_catalog_item_reports_modelled_hardware() {
                 is_family(&family),
                 "case {case:?}: {family:?} must be a modelled Family, got {entry:?}"
             );
-            assert_eq!(
-                max_size.split_once('.').map(|(family, _)| family),
-                Some(family.as_str()),
-                "case {case:?}: MaxSize must be a size of its own family, got {entry:?}"
+            // `Family` names the family and `MaxSize` the SIZE alone, so neither
+            // repeats the other and the instance type is the join of the two.
+            assert!(
+                !max_size.contains('.'),
+                "case {case:?}: MaxSize must be the bare size suffix, not a whole instance \
+                 type, got {entry:?}"
             );
+            let instance_type = format!("{family}.{max_size}");
             let vcpus = instance_types
                 .iter()
-                .find(|(instance_type, _)| *instance_type == max_size)
+                .find(|(published, _)| *published == instance_type)
                 .map(|(_, vcpus)| *vcpus);
             assert!(
                 vcpus.is_some_and(|vcpus| vcpus > 0),
-                "case {case:?}: MaxSize {max_size:?} must be an instance type this service \
-                 publishes as orderable, got {entry:?}"
+                "case {case:?}: Family and MaxSize must join into {instance_type:?}, an \
+                 instance type this service publishes as orderable, got {entry:?}"
             );
             assert!(
                 quantity.parse::<i64>().is_ok_and(|quantity| quantity >= 1),

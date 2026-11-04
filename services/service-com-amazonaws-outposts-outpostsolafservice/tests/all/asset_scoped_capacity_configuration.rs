@@ -155,15 +155,19 @@ fn expected(catalog: &[Value], want: &[String]) -> Vec<(String, Option<i64>)> {
 }
 
 /// The largest size of each instance family one published configuration carries EC2
-/// capacity of, in the order the configuration publishes them: the configuration the
-/// hardware it describes arrives carrying.
+/// capacity of, as the INSTANCE TYPE it names — `Family` carries the family and
+/// `MaxSize` the size alone, so the type is the join of the two — in the order the
+/// configuration publishes them: the configuration the hardware it describes arrives
+/// carrying.
 fn max_sizes(item: &Value) -> Vec<String> {
     item.get("EC2Capacities")
         .and_then(Value::as_array)
         .map(|capacities| {
             let mut sizes: Vec<String> = Vec::new();
             for capacity in capacities {
-                push_once(&mut sizes, &text(capacity, "MaxSize"));
+                let instance_type =
+                    format!("{}.{}", text(capacity, "Family"), text(capacity, "MaxSize"));
+                push_once(&mut sizes, &instance_type);
             }
             sizes
         })

@@ -54,10 +54,12 @@ const MODELLED_MESSAGE: &str = "Message";
 /// declares (`range(1..1000)`), which every list here is far inside.
 const WHOLE_LIST: usize = 1000;
 
-/// How many pages a walk may take before the case gives up rather than looping: no list
-/// below holds anywhere near this many items, so a token that failed to advance stops
-/// here with the pages it collected instead of running forever.
-const PAGE_LIMIT: usize = 64;
+/// How many pages a walk may take before the case gives up rather than looping: the
+/// longest list below is the instance types an Outpost's hardware supports, which is
+/// the published catalog narrowed to one form factor, so this is well clear of it and
+/// a token that failed to advance still stops here with the pages it collected
+/// instead of running forever.
+const PAGE_LIMIT: usize = 256;
 
 /// One site and one Outpost on it carrying `form_factor`, as that Outpost's
 /// `OutpostId`. An Outpost belongs to a site, so the site comes first — the same order a

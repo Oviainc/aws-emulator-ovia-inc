@@ -701,29 +701,55 @@ async fn an_outstanding_order_is_read_by_the_operations_that_name_one() {
 
     // The scoping half: an `OrderId` of the Outpost is an order the report knows and
     // is scoped by — these line items name SKUs this service publishes no
-    // configuration under, so they record no hardware fact and narrow nothing (what an
-    // order of published configurations scopes the report to is
+    // configuration under, so they record no hardware fact and narrow nothing, which
+    // on an Outpost that recorded no hardware type is the whole published catalog
+    // (what an order of published configurations scopes the report to is
     // [`crate::supported_instance_types_order_scope`]); one of another Outpost, or one
     // nothing holds, names no hardware here.
-    let unscoped = outposts
+    //
+    // The Outpost's OWN report is about the hardware INSTALLED on it, and nothing is
+    // installed on this one, so it supports nothing — the rule
+    // [`crate::supported_instance_types`] states.
+    let installed = outposts
         .ok(
             "GET",
             &format!("/outposts/{}/supportedInstanceTypes", segment(&ordered)),
             None,
         )
         .await;
+    assert_eq!(
+        installed["InstanceTypes"],
+        json!([]),
+        "an Outpost holding no compute hardware supports no instance type, got {installed}"
+    );
     let scoped = outposts
         .ok(
             "GET",
             &format!(
-                "/outposts/{}/supportedInstanceTypes?OrderId={order_id}",
+                "/outposts/{}/supportedInstanceTypes?OrderId={order_id}&MaxResults=1000",
                 segment(&ordered)
             ),
             None,
         )
         .await;
+    let published = outposts
+        .ok("GET", "/instanceTypes?MaxResults=1000", None)
+        .await;
+    let catalog: Vec<Value> = published["InstanceTypes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| {
+            json!({
+                "InstanceType": entry.get("InstanceType"),
+                "VCPUs": entry.get("VCPUs"),
+            })
+        })
+        .collect();
     assert_eq!(
-        scoped, unscoped,
+        scoped["InstanceTypes"],
+        json!(catalog),
         "an order whose line items name no published configuration records no hardware \
          fact, so it narrows the report by nothing"
     );

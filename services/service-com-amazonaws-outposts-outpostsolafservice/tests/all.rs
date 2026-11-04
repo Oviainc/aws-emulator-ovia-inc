@@ -39,6 +39,8 @@ mod capacity_task_order_outpost;
 mod capacity_task_order_region;
 #[path = "all/capacity_task_outcome.rs"]
 mod capacity_task_outcome;
+#[path = "all/catalog_item_specification.rs"]
+mod catalog_item_specification;
 #[path = "all/catalog_items.rs"]
 mod catalog_items;
 #[path = "all/configured_instance_types.rs"]

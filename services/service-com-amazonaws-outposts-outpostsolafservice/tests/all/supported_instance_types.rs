@@ -10,6 +10,10 @@
 //!    (the one `ListOrderableInstanceTypes` reports, which every expectation below is
 //!    computed from rather than spelled out) narrowed by every hardware fact the store
 //!    records about the scope the request names, and nothing else:
+//!    * the hardware INSTALLED on the Outpost is what the Outpost itself can support,
+//!      so an entry is supported when one of its installed compute units can host it;
+//!      an Outpost holding no compute hardware supports nothing and reports no entry
+//!      at all;
 //!    * the Outpost's `SupportedHardwareType` is the form factor its hardware has, so
 //!      an entry is supported only where its `FormFactorConfigs` offers it in that
 //!      form factor; an Outpost that recorded no hardware type narrows nothing;
@@ -127,52 +131,77 @@ fn family(entry: &Value) -> String {
         .to_string()
 }
 
+/// The hardware facts one COMPUTE unit in scope records: what the rule narrows the
+/// catalog by for that unit.
+#[derive(Debug, Clone, Copy, Default)]
+struct ComputeScope<'a> {
+    /// The instance families the unit records, or `None` when it recorded none.
+    families: Option<&'a [&'a str]>,
+    /// The unit's `MaxVcpus`, or `None` when none is recorded.
+    max_vcpus: Option<i64>,
+}
+
 /// The hardware facts a row records about the scope it asks about: what the rule
 /// narrows the catalog by.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Scope<'a> {
     /// The Outpost's `SupportedHardwareType`, or `None` for an Outpost that recorded
     /// none.
     form_factor: Option<&'a str>,
-    /// The instance families the scoped asset records, or `None` when the scope is the
-    /// Outpost itself or the asset recorded none.
-    families: Option<&'a [&'a str]>,
-    /// The scoped asset's `MaxVcpus`, or `None` when none is recorded.
-    max_vcpus: Option<i64>,
-    /// Whether the scope is an asset that is NOT compute hardware, which can host no
-    /// instance at all.
-    not_compute: bool,
+    /// The COMPUTE hardware in scope: the one asset a request named, or every compute
+    /// unit installed on the Outpost when it named none. EMPTY for a scope that holds
+    /// no compute hardware at all — an Outpost nothing is installed on, or an asset
+    /// that is not compute hardware — which can host no instance.
+    hardware: Vec<ComputeScope<'a>>,
 }
 
 impl<'a> Scope<'a> {
-    /// The Outpost itself, whose only recorded hardware fact is its form factor.
-    fn outpost(form_factor: Option<&'a str>) -> Self {
+    /// The Outpost itself: its form factor, and the compute units installed on it.
+    fn outpost(form_factor: Option<&'a str>, hardware: &[ComputeScope<'a>]) -> Self {
         Self {
             form_factor,
-            families: None,
-            max_vcpus: None,
-            not_compute: false,
+            hardware: hardware.to_vec(),
+        }
+    }
+
+    /// ONE asset of it, which is compute hardware recording `families` and
+    /// `max_vcpus`.
+    fn asset(
+        form_factor: Option<&'a str>,
+        families: Option<&'a [&'a str]>,
+        max_vcpus: Option<i64>,
+    ) -> Self {
+        Self {
+            form_factor,
+            hardware: vec![ComputeScope {
+                families,
+                max_vcpus,
+            }],
+        }
+    }
+
+    /// A scope that is not compute hardware at all, which supports nothing.
+    fn not_compute(form_factor: Option<&'a str>) -> Self {
+        Self {
+            form_factor,
+            hardware: Vec::new(),
         }
     }
 }
 
 /// What rule 1 requires for `scope`, computed from the published catalog.
-fn expected(catalog: &[Value], scope: Scope<'_>) -> Vec<(String, i64)> {
-    if scope.not_compute {
-        return Vec::new();
-    }
+fn expected(catalog: &[Value], scope: &Scope<'_>) -> Vec<(String, i64)> {
     catalog
         .iter()
         .filter(|entry| {
             scope
                 .form_factor
                 .is_none_or(|form_factor| offered_in(entry, form_factor))
-                && scope
-                    .families
-                    .is_none_or(|families| families.contains(&family(entry).as_str()))
-                && scope
-                    .max_vcpus
-                    .is_none_or(|max| vcpus(entry) <= max)
+                && scope.hardware.iter().any(|unit| {
+                    unit.families
+                        .is_none_or(|families| families.contains(&family(entry).as_str()))
+                        && unit.max_vcpus.is_none_or(|max| vcpus(entry) <= max)
+                })
         })
         .map(|entry| (text(entry, "InstanceType"), vcpus(entry)))
         .collect()
@@ -272,12 +301,13 @@ async fn walk(
     collected
 }
 
-/// Rule 1's form-factor half: over every hardware type an Outpost in this store can
-/// carry, the report is exactly the catalog entries offered in that form factor, with
-/// the catalog's own `VCPUs` — and the whole catalog for an Outpost that recorded no
-/// hardware type.
+/// Rule 1's Outpost half: the report is the catalog narrowed to the hardware
+/// INSTALLED on the Outpost and to its form factor — over every hardware type an
+/// Outpost in this store can carry, and over installations that differ along what the
+/// rule generalises over: none at all, one compute unit, two of them (the report is
+/// their union), and hardware that hosts no instance.
 #[tokio::test]
-async fn an_outpost_supports_the_catalog_offered_in_its_form_factor() {
+async fn an_outpost_supports_the_hardware_installed_on_it() {
     let outposts = Outposts::new();
     let catalog = catalog(&outposts).await;
     assert!(
@@ -285,45 +315,131 @@ async fn an_outpost_supports_the_catalog_offered_in_its_form_factor() {
         "the published catalog must hold entries to narrow, got {catalog:?}"
     );
 
+    // Each case is one installation: the units recorded on the Outpost, and the
+    // compute facts the expectation narrows the catalog by. The `AssetId` of each
+    // unit is a value the modelled `AssetIdInput` (`^\d{10}$`) accepts.
+    let installations: Vec<(&str, Vec<AssetInfo>, Vec<ComputeScope<'_>>)> = vec![
+        ("nothing installed", Vec::new(), Vec::new()),
+        (
+            "one compute unit, no facts recorded",
+            vec![asset("3000000001", "COMPUTE", Some(compute(None, None)))],
+            vec![ComputeScope::default()],
+        ),
+        (
+            "one compute unit, one family and a ceiling",
+            vec![asset(
+                "3000000002",
+                "COMPUTE",
+                Some(compute(Some(&["c5"]), Some(48))),
+            )],
+            vec![ComputeScope {
+                families: Some(&["c5"]),
+                max_vcpus: Some(48),
+            }],
+        ),
+        (
+            "two compute units: the report is their union",
+            vec![
+                asset(
+                    "3000000003",
+                    "COMPUTE",
+                    Some(compute(Some(&["c5"]), Some(16))),
+                ),
+                asset(
+                    "3000000004",
+                    "COMPUTE",
+                    Some(compute(Some(&["m5", "r5"]), None)),
+                ),
+            ],
+            vec![
+                ComputeScope {
+                    families: Some(&["c5"]),
+                    max_vcpus: Some(16),
+                },
+                ComputeScope {
+                    families: Some(&["m5", "r5"]),
+                    max_vcpus: None,
+                },
+            ],
+        ),
+        (
+            "only hardware that hosts no instance",
+            vec![
+                asset("3000000005", "STORAGE", None),
+                asset("3000000006", "POWERSHELF", None),
+            ],
+            Vec::new(),
+        ),
+    ];
+
     for hardware_type in HARDWARE_TYPES {
-        let case = format!("{hardware_type:?}");
-        let (outpost_id, outpost_arn) =
-            an_outpost(&outposts, &format!("hw-{}", hardware_type.unwrap_or("none")), *hardware_type)
-                .await;
-        let want = expected(&catalog, Scope::outpost(*hardware_type));
+        for (installation, units, scope) in &installations {
+            let case = format!("{installation} on {hardware_type:?}");
+            let (outpost_id, outpost_arn) = an_outpost(
+                &outposts,
+                &format!(
+                    "hw-{}-{}",
+                    hardware_type.unwrap_or("none"),
+                    installation.len()
+                ),
+                *hardware_type,
+            )
+            .await;
+            record(&outposts, &outpost_id, units, &case);
+            let want = expected(&catalog, &Scope::outpost(*hardware_type, scope));
+            let answer = supported(&outposts, &outpost_id, "").await;
+            assert_eq!(
+                reported(&answer),
+                want,
+                "case {case:?}: expected the catalog narrowed to the installed hardware, got \
+                 {answer:?}"
+            );
+            assert!(
+                answer.get("NextToken").is_none(),
+                "case {case:?}: a page that exhausts the report issues no NextToken, got \
+                 {answer:?}"
+            );
+            // Rule 3's identifier half: the ARN form names the same Outpost.
+            assert_eq!(
+                reported(&supported(&outposts, &outpost_arn, "").await),
+                want,
+                "case {case:?}: the ARN form must answer the same report as the bare id"
+            );
+        }
+    }
+
+    // Hardware is what makes an entry supported: an Outpost holding none supports
+    // nothing, and one holding a compute unit that records no narrowing fact supports
+    // everything its form factor offers.
+    for hardware_type in HARDWARE_TYPES {
         assert!(
-            !want.is_empty(),
-            "case {case:?}: every form factor the catalog names must offer something"
+            expected(&catalog, &Scope::not_compute(*hardware_type)).is_empty(),
+            "case {hardware_type:?}: hardware that hosts no instance supports no instance type"
         );
-        let answer = supported(&outposts, &outpost_id, "").await;
-        assert_eq!(
-            reported(&answer),
-            want,
-            "case {case:?}: expected the catalog entries offered in that form factor, got \
-             {answer:?}"
+        let whole = expected(
+            &catalog,
+            &Scope::outpost(*hardware_type, &[ComputeScope::default()]),
         );
         assert!(
-            answer.get("NextToken").is_none(),
-            "case {case:?}: a page that exhausts the report issues no NextToken, got {answer:?}"
-        );
-        // Rule 3's identifier half: the ARN form names the same Outpost.
-        assert_eq!(
-            reported(&supported(&outposts, &outpost_arn, "").await),
-            want,
-            "case {case:?}: the ARN form must answer the same report as the bare id"
+            !whole.is_empty(),
+            "case {hardware_type:?}: every form factor the catalog names must offer something"
         );
     }
 
     // The form factors narrow rather than widen: each one is a strict subset of what
-    // an Outpost with no recorded hardware type reports.
-    let whole = expected(&catalog, Scope::outpost(None));
+    // an Outpost with no recorded hardware type reports off the same hardware.
+    let unnarrowed = expected(&catalog, &Scope::outpost(None, &[ComputeScope::default()]));
     for form_factor in ["RACK", "SERVER"] {
-        let narrowed = expected(&catalog, Scope::outpost(Some(form_factor)));
+        let narrowed = expected(
+            &catalog,
+            &Scope::outpost(Some(form_factor), &[ComputeScope::default()]),
+        );
         assert!(
-            narrowed.len() < whole.len() && narrowed.iter().all(|entry| whole.contains(entry)),
+            narrowed.len() < unnarrowed.len()
+                && narrowed.iter().all(|entry| unnarrowed.contains(entry)),
             "case {form_factor:?}: a form factor must narrow the catalog, got {} of {} entries",
             narrowed.len(),
-            whole.len()
+            unnarrowed.len()
         );
     }
 }
@@ -443,15 +559,13 @@ async fn an_asset_scope_narrows_to_the_hardware_that_asset_recorded() {
 
         for row in &rows {
             let case = format!("{} on {form_factor:?}", row.case);
-            let want = expected(
-                &catalog,
-                Scope {
-                    form_factor,
-                    families: row.families,
-                    max_vcpus: row.max_vcpus,
-                    not_compute: row.hardware.is_none(),
-                },
-            );
+            let want = match row.hardware.is_none() {
+                true => expected(&catalog, &Scope::not_compute(form_factor)),
+                false => expected(
+                    &catalog,
+                    &Scope::asset(form_factor, row.families, row.max_vcpus),
+                ),
+            };
             let answer = supported(
                 &outposts,
                 &outpost_id,
@@ -467,8 +581,16 @@ async fn an_asset_scope_narrows_to_the_hardware_that_asset_recorded() {
         }
 
         // Scoping to an asset never widens the report: every asset's answer is part of
-        // what the Outpost itself reports.
-        let whole = expected(&catalog, Scope::outpost(form_factor));
+        // what the Outpost itself reports off the same installation.
+        let units: Vec<ComputeScope<'_>> = rows
+            .iter()
+            .filter(|row| row.hardware.is_some())
+            .map(|row| ComputeScope {
+                families: row.families,
+                max_vcpus: row.max_vcpus,
+            })
+            .collect();
+        let whole = expected(&catalog, &Scope::outpost(form_factor, &units));
         for row in &rows {
             let answer = reported(
                 &supported(
@@ -512,11 +634,16 @@ async fn an_asset_scope_narrows_to_the_hardware_that_asset_recorded() {
 async fn paging_covers_every_supported_instance_type_exactly_once() {
     let outposts = Outposts::new();
     let (outpost_id, _) = an_outpost(&outposts, "paging", Some("RACK")).await;
-    let installed = vec![asset(
-        "2000000001",
-        "COMPUTE",
-        Some(compute(Some(&["c5", "m5", "r5"]), Some(48))),
-    )];
+    // Two compute units, so the Outpost-wide report is strictly larger than the
+    // report scoped to one of them and both are worth paging.
+    let installed = vec![
+        asset(
+            "2000000001",
+            "COMPUTE",
+            Some(compute(Some(&["c5", "m5", "r5"]), Some(48))),
+        ),
+        asset("2000000002", "COMPUTE", Some(compute(None, None))),
+    ];
     record(&outposts, &outpost_id, &installed, "paging");
 
     let before = supported(&outposts, &outpost_id, "").await;

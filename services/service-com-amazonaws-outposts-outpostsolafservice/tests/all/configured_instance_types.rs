@@ -662,9 +662,15 @@ async fn an_outpost_no_capacity_task_has_touched_is_configured_by_its_orders() {
                         .into_iter()
                         .flatten()
                     {
-                        let max_size = text(capacity, "MaxSize");
-                        if !want.contains(&max_size) {
-                            want.push(max_size);
+                        // `Family` names the family and `MaxSize` the size alone, so
+                        // the instance type the capacity names is the join of them.
+                        let instance_type = format!(
+                            "{}.{}",
+                            text(capacity, "Family"),
+                            text(capacity, "MaxSize")
+                        );
+                        if !want.contains(&instance_type) {
+                            want.push(instance_type);
                         }
                     }
                 }

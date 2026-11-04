@@ -8,12 +8,23 @@
 //!
 //! The rule, stated once here and applied by [`supports`] below: an instance type the
 //! scope the request names can support is a catalog entry that every hardware fact the
-//! store records about that scope admits —
+//! store records about that scope admits. WHICH hardware a request scopes the report
+//! to is the narrowest one it names — one asset of the Outpost, the hardware an order
+//! of it is for, or, naming neither, the hardware INSTALLED on the Outpost — and the
+//! facts are:
 //!
 //! * the Outpost's recorded `SupportedHardwareType` is the form factor its hardware
 //!   has, so an entry whose `FormFactorConfigs` does not offer it in that form factor
 //!   is not one this Outpost can support; an Outpost that recorded no hardware type
 //!   narrows nothing;
+//! * the hardware INSTALLED on the Outpost is what the Outpost ITSELF can support, so
+//!   an entry is one it supports when one of its installed compute assets can host it
+//!   — narrowed by the instance families that asset records and by its recorded
+//!   `MaxVcpus`, exactly as a named asset is below. An Outpost holding no compute
+//!   hardware (one whose ordered hardware is not installed yet, or one nobody has
+//!   ordered any for) can support nothing, so it reports no instance type at all:
+//!   capacity is supported ON hardware, and a report of what hardware that is not
+//!   there would support is a claim this service has no record for;
 //! * an `AssetId` scopes the report to ONE of that Outpost's assets. An asset that
 //!   recorded no `ComputeAttributes` is not compute hardware, so it can host no
 //!   instance at all; one that did is narrowed by the instance families it records
@@ -27,7 +38,11 @@
 //!   ([`crate::state::FamilyCapacity`]), so an entry of a family none of them carries
 //!   capacity of — or one larger than the largest size of its family they do — is not
 //!   hardware that order brings. An order whose line items name no configuration this
-//!   service publishes records no hardware fact, so it narrows nothing.
+//!   service publishes records no hardware fact, so it narrows nothing. An order is
+//!   hardware the Outpost is TO HAVE rather than hardware it holds, which is why an
+//!   order scope is answered about that order's own hardware whether or not it has
+//!   been installed, and the installed hardware narrows only a report nothing else
+//!   scoped.
 //!
 //! What is reported is the CAPABILITY of that hardware, not its current
 //! configuration: "this will generally include instance types that are not currently
@@ -285,15 +300,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             },
                         )
                     })?;
-                store.ordered_ec2_capacity(&order.order)
+                Some(store.ordered_ec2_capacity(&order.order))
             }
-            None => Vec::new(),
+            None => None,
         };
-        // The hardware the request scopes the report to: one named asset of this
-        // Outpost, or the Outpost itself. An `AssetId` is resolved among the assets
-        // of the Outpost in hand, and one that names none of them is the not-found
-        // error, worded as every refusal about an asset this service holds none of
-        // is.
+        // The hardware the request scopes the report to: the narrowest one it names.
+        // One named asset of this Outpost, or — naming none — the hardware the order
+        // it named is for, or the hardware installed on the Outpost itself when it
+        // named neither. An `AssetId` is resolved among the assets of the Outpost in
+        // hand, and one that names none of them is the not-found error, worded as
+        // every refusal about an asset this service holds none of is.
         let hardware = match input.asset_id.as_deref().filter(|id| !id.is_empty()) {
             Some(asset_id) => {
                 let asset = store
@@ -307,8 +323,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })?;
                 Hardware::Asset(asset.compute_attributes.as_ref())
             }
-            None => Hardware::Outpost,
+            // An order the request NAMED is the hardware in scope whether or not this
+            // service publishes a capacity fact about it: the scope is that order's
+            // hardware either way, and one it holds no fact about narrows nothing.
+            None => match ordered.is_some() {
+                true => Hardware::Ordered,
+                false => Hardware::Installed(record.assets.as_slice()),
+            },
         };
+        let ordered = ordered.unwrap_or_default();
         let form_factor = record.outpost.supported_hardware_type.as_deref();
 
         // The boundary a page of this report stops at is the catalog entry's own
@@ -347,9 +370,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The hardware of an Outpost a request scopes this report to.
 #[derive(Debug, Clone, Copy)]
 enum Hardware<'a> {
-    /// The Outpost itself — the request named no asset of it, so the only hardware
-    /// fact in scope is the Outpost's own form factor.
-    Outpost,
+    /// The Outpost ITSELF — the request named neither an asset nor an order, so the
+    /// hardware in scope is every unit INSTALLED on it, and what it supports is what
+    /// any one of those units can host.
+    Installed(&'a [AssetInfo]),
+    /// The hardware ONE ORDER of it is for, which the order's own published capacity
+    /// is what narrows: hardware the Outpost is to have rather than hardware it
+    /// holds, so nothing about what is installed narrows it.
+    Ordered,
     /// ONE asset of it, with the `ComputeAttributes` that asset recorded (`None` for
     /// an asset that recorded none, which is therefore not compute hardware).
     Asset(Option<&'a ComputeAttributes>),
@@ -389,7 +417,21 @@ fn supports(
         return false;
     }
     match hardware {
-        Hardware::Outpost => true,
+        // What the Outpost itself supports is what the hardware installed on it can
+        // host: one of its compute units running the entry is what makes the Outpost
+        // support it, and an Outpost holding no compute unit supports nothing. Each
+        // unit is asked the same question a named asset is asked below, so the
+        // Outpost-wide report and the per-asset one cannot disagree.
+        Hardware::Installed(assets) => assets
+            .iter()
+            .filter_map(|asset| asset.compute_attributes.as_ref())
+            .any(|compute| {
+                crate::state::compute_runs(compute, instance_family(entry), entry.vcp_us)
+            }),
+        // The hardware the order is for, which the order's published capacity has
+        // already narrowed above: there is no second fact about hardware that is not
+        // installed yet.
+        Hardware::Ordered => true,
         // Not compute hardware: a storage server, a powershelf, a switch or a
         // networking asset hosts no instance, so it supports no instance type.
         Hardware::Asset(None) => false,
