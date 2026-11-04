@@ -195,6 +195,37 @@ pub fn namespace_already_exists(name: &str) -> String {
     format!("The namespace {name} already exists.")
 }
 
+/// How this service states that a namespace carries no compute to take a snapshot through.
+///
+/// The sentence the recorded `CreateSnapshot` refusal carries is entirely FIXED: it ends at
+/// "namespace." and names no resource, because the resource the refusal is about travels in
+/// the modelled `ResourceNotFoundException$resourceName` member ("the name of the resource
+/// that could not be found") rather than inside the message. So the wording is a constant
+/// here, not a template.
+pub const NAMESPACE_HAS_NO_WORKGROUP: &str =
+    "You can't create a snapshot because there isn't a workgroup created for the namespace.";
+
+/// How this service states that a `resourceArn` naming the resource a usage limit is taken
+/// out over resolves to nothing.
+///
+/// The recorded `CreateUsageLimit` refusal is HTTP **400** carrying the modelled
+/// `ValidationException` shape — the ARN is the input that is wrong, not a resource the
+/// call addressed — and its sentence has ONE variable slot: the id segment the submitted
+/// ARN ends in, which the service read the resource's id off. Everything else is fixed.
+pub fn resource_arn_does_not_resolve(arn: &str) -> String {
+    format!(
+        "The Resource ARN is not valid as the workgroup ID {}.",
+        arn_resource_id(arn)
+    )
+}
+
+/// The id segment of `arn`: what follows the last `/`, which is where every ARN this
+/// service mints carries the resource's id (`namespace/<id>`, `workgroup/<id>`). A value
+/// with no `/` at all carries its id nowhere else, so it stands in for its own id segment.
+fn arn_resource_id(arn: &str) -> &str {
+    arn.rsplit_once('/').map_or(arn, |(_, id)| id)
+}
+
 /// `arn:aws:redshift-serverless:<region>:<account>:namespace/<namespaceId>`.
 pub fn namespace_arn(region: &str, namespace_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("namespace/{namespace_id}"))

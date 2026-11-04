@@ -191,11 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.holds_resource_arn(&input.resource_arn) {
             return Err(CreateUsageLimitErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
-                        "resourceArn {} does not name a namespace or workgroup in this \
-                         account and Region",
-                        input.resource_arn
-                    ),
+                    // The sentence is the service's own for this error class, with its one
+                    // variable slot filled from the submitted ARN's id segment. See
+                    // [`crate::state::resource_arn_does_not_resolve`].
+                    message: crate::state::resource_arn_does_not_resolve(&input.resource_arn),
                 },
             )
             .into());

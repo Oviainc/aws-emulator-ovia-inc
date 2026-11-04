@@ -15,6 +15,8 @@
 mod namespace_response_fidelity;
 #[path = "all/namespace_workgroup_lifecycle.rs"]
 mod namespace_workgroup_lifecycle;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/snapshot_and_usage_limit.rs"]
 mod snapshot_and_usage_limit;
 #[path = "all/snapshot_restore.rs"]

@@ -233,11 +233,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if workgroups.is_empty() {
                 return Err(CreateSnapshotErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "You can't create a snapshot because there isn't a workgroup \
-                             created for the namespace {}.",
-                            input.namespace_name
-                        ),
+                        // The refusal's wording is the service's own for this error class
+                        // and carries no name; the namespace travels in `resourceName`,
+                        // which is the member modelled for it. See
+                        // [`crate::state::NAMESPACE_HAS_NO_WORKGROUP`].
+                        message: crate::state::NAMESPACE_HAS_NO_WORKGROUP.to_string(),
                         resource_name: Some(input.namespace_name.clone()),
                     },
                 )
