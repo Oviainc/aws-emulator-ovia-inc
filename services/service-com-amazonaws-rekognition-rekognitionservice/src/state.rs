@@ -275,10 +275,10 @@ pub struct Project {
     /// `CreateProject.AutoUpdate`, carried through unchanged — absent when the create
     /// named none, since nothing else decides whether a project auto-updates.
     pub auto_update: Option<String>,
-    /// The tags the create attached to the project. Stored because `CreateProject`
-    /// attaches them, so the record is what the caller asked for; the operations that
-    /// report and change a resource's tags resolve collection ARNs only so far, so
-    /// extending them to project ARNs belongs to those operations.
+    /// The tags the create attached to the project, and the set the operations that
+    /// report and change a resource's tags work on when the ARN they are given is this
+    /// project's: a tag set belongs to the resource it was attached to, whatever kind of
+    /// resource that is.
     pub tags: BTreeMap<String, String>,
 }
 
@@ -338,19 +338,40 @@ pub struct ComAmazonawsRekognitionRekognitionserviceState {
 }
 
 impl ComAmazonawsRekognitionRekognitionserviceState {
-    /// The collection `resource_arn` names, in either form of its ARN (see [`arn_names`]),
-    /// or `None` when no live collection carries it.
-    pub fn collection_by_arn(&self, resource_arn: &str) -> Option<&Collection> {
-        self.collections
+    /// The tag set of the resource `resource_arn` names, in either form of its ARN (see
+    /// [`arn_names`]), or `None` when no live resource of this store carries that ARN.
+    ///
+    /// Every taggable resource this store holds carries its own tag set, and one ARN
+    /// names at most one resource, so an ARN is resolved across every kind of resource
+    /// the store holds rather than one of them: that is what lets the tagging operations
+    /// report and change the tags of whichever resource the caller named.
+    pub fn tags_by_arn(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        if let Some(collection) = self
+            .collections
             .values()
             .find(|collection| arn_names(&collection.arn, resource_arn))
+        {
+            return Some(&collection.tags);
+        }
+        self.projects
+            .values()
+            .find(|project| arn_names(&project.arn, resource_arn))
+            .map(|project| &project.tags)
     }
 
-    /// The same resolution, for the operations that CHANGE what the collection holds.
-    pub fn collection_by_arn_mut(&mut self, resource_arn: &str) -> Option<&mut Collection> {
-        self.collections
+    /// The same resolution, for the operations that CHANGE the resource's tags.
+    pub fn tags_by_arn_mut(&mut self, resource_arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        if let Some(collection) = self
+            .collections
             .values_mut()
             .find(|collection| arn_names(&collection.arn, resource_arn))
+        {
+            return Some(&mut collection.tags);
+        }
+        self.projects
+            .values_mut()
+            .find(|project| arn_names(&project.arn, resource_arn))
+            .map(|project| &mut project.tags)
     }
 }
 

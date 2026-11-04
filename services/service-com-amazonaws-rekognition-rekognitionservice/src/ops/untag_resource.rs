@@ -8,7 +8,8 @@
 //! carries stays, so a key the resource does not carry leaves the set as it was rather
 //! than being an error — removing a tag twice removes it once. The ARN is resolved the way
 //! every tagging operation of this service resolves one, in either of the two forms a
-//! caller holds it in (`CreateCollection`'s answer omits the `arn:` label).
+//! caller holds it in (`CreateCollection`'s answer omits the `arn:` label) and across every
+//! kind of taggable resource this store holds (a collection, a project).
 //!
 //! ## Shape of an operation
 //!
@@ -157,8 +158,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
-        let collection = state
-            .collection_by_arn_mut(&input.resource_arn)
+        let tags = state
+            .tags_by_arn_mut(&input.resource_arn)
             .ok_or_else(|| {
                 UntagResourceErrorModeled::ResourceNotFoundException(
                     crate::state::modeled_error::resource_arn_not_found(&input.resource_arn),
@@ -166,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         for key in &input.tag_keys {
-            collection.tags.remove(key);
+            tags.remove(key);
         }
         Ok(UntagResourceOutput {})
     }

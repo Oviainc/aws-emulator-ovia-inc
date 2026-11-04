@@ -22,10 +22,9 @@
 //! the region the call is signed in — which is where the ARN's region comes from — and
 //! the page size (both published `ProjectsPageSize` bounds and one past each).
 //!
-//! What is NOT asserted here: the tags a create attaches. The operations that report a
-//! resource's tags resolve collection ARNs only so far, so a project's tags have no
-//! reader to read them back through yet; the rows below still create projects with and
-//! without tags, so the create path is exercised either way.
+//! What is NOT asserted here: the tags a create attaches, which the tagging suite asserts
+//! through the operations that report and change them; the rows below still create
+//! projects with and without tags, so the create path is exercised either way.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_rekognition_rekognitionservice::state;

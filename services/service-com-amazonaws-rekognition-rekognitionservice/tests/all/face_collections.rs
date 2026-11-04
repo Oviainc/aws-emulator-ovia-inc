@@ -196,7 +196,7 @@ pub(crate) fn bytes_image(content: &[u8]) -> Value {
 /// The ARN a collection created in `region` is STORED and described under, per the format
 /// the bootstrap issue and the service's `arnNamespace` give:
 /// `arn:aws:rekognition:<region>:<account>:collection/<id>`.
-fn expected_arn(region: &str, collection_id: &str) -> String {
+pub(crate) fn expected_arn(region: &str, collection_id: &str) -> String {
     format!(
         "arn:aws:rekognition:{region}:{}:collection/{collection_id}",
         engine::emulator_account_id()
@@ -206,8 +206,13 @@ fn expected_arn(region: &str, collection_id: &str) -> String {
 /// The ARN `CreateCollection`'s own answer reports: the same ARN without the leading
 /// `arn:` label, which is the form that operation reports it in.
 fn expected_created_arn(region: &str, collection_id: &str) -> String {
-    expected_arn(region, collection_id)
-        .strip_prefix("arn:")
+    label_less(&expected_arn(region, collection_id))
+}
+
+/// An ARN without its leading `arn:` label — the form `CreateCollection` reports a
+/// collection's ARN in, and one a caller holds any of this service's ARNs in.
+pub(crate) fn label_less(arn: &str) -> String {
+    arn.strip_prefix("arn:")
         .expect("the stored ARN carries the label")
         .to_string()
 }

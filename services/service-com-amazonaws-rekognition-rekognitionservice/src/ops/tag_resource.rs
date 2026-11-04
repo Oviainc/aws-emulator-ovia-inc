@@ -9,7 +9,8 @@
 //! value and every other tag it carries stays, so tagging adds and updates and never
 //! replaces the set. The ARN is resolved the way every tagging operation of this service
 //! resolves one, in either of the two forms a caller holds it in
-//! (`CreateCollection`'s answer omits the `arn:` label). Rekognition also tags stream
+//! (`CreateCollection`'s answer omits the `arn:` label) and across every kind of taggable
+//! resource this store holds (a collection, a project). Rekognition also tags stream
 //! processors and Custom Labels models; neither resource exists in this store yet, so an
 //! ARN naming one is not found like any other unknown ARN.
 //!
@@ -167,8 +168,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
-        let collection = state
-            .collection_by_arn_mut(&input.resource_arn)
+        let tags = state
+            .tags_by_arn_mut(&input.resource_arn)
             .ok_or_else(|| {
                 TagResourceErrorModeled::ResourceNotFoundException(
                     crate::state::modeled_error::resource_arn_not_found(&input.resource_arn),
@@ -178,11 +179,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // How many tags the resource would end up carrying: a key it already has takes
         // the new value rather than counting twice. Past the limit nothing is written, so
         // a refused request leaves the resource's tags as they were.
-        let after: ::std::collections::BTreeSet<&String> = collection
-            .tags
-            .keys()
-            .chain(input.tags.keys())
-            .collect();
+        let after: ::std::collections::BTreeSet<&String> =
+            tags.keys().chain(input.tags.keys()).collect();
         if after.len() > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException::with_message(format!(
@@ -195,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         for (key, value) in input.tags {
-            collection.tags.insert(key, value);
+            tags.insert(key, value);
         }
         Ok(TagResourceOutput {})
     }
