@@ -4,10 +4,8 @@
 //!
 //! Put a new suite at `tests/all/<name>.rs` and declare it below, keeping the list
 //! sorted.
-//!
 //! A suite that is not declared here compiles nowhere and its tests never run. A
 //! suite left at the top level of `tests/` fails the build.
-
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/describe_vpcs.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
@@ -62,8 +60,6 @@ mod describe_ipam_pools;
 // The entries (rules) of a network ACL: what `CreateNetworkAclEntry` stores on a stored ACL
 // and in which order, what `DeleteNetworkAclEntry` takes off it, and the not-found answer
 // every read of a `DeleteNetworkAcl`-ed ACL gets. Declared beside `prefix_lists` for the
-// reason the note above gives: the sorted neighbourhood and the tail of this file are where
-// every new ec2 suite inserts its lines.
 #[path = "all/network_acl_entries.rs"]
 mod network_acl_entries;
 // What `CancelCapacityReservation` releases: the reservation's own `cancelled` state in every
@@ -110,7 +106,6 @@ mod fast_snapshot_restore_lifecycle;
 // What `CopySnapshot` mints from a stored snapshot, which members it reads off the source and
 // which off the request, and what it refuses. Declared beside `prefix_lists` for the reason
 // the note above gives: the sorted neighbourhood and the tail of this file are where every new
-// ec2 suite inserts its lines.
 #[path = "all/copy_snapshot.rs"]
 mod copy_snapshot;
 // What `ModifyVerifiedAccessInstanceLoggingConfiguration` sets on one Verified Access
@@ -118,7 +113,6 @@ mod copy_snapshot;
 // `DescribeVerifiedAccessInstanceLoggingConfigurations` reports, narrows, pages and refuses.
 // Declared HERE rather than in sorted position or beside `prefix_lists`: both of those are the
 // contended regions the note at the top of this file describes, and this fix lost two
-// serialized squash merges to the lines just below `prefix_lists`.
 #[path = "all/verified_access_instance_logging.rs"]
 mod verified_access_instance_logging;
 // How the interruptible-allocation pair screens a Capacity Reservation id: the shape it reads
@@ -136,15 +130,11 @@ mod interruptible_allocation_capacity_reservation_ids;
 #[path = "all/create_transit_gateway_connect.rs"]
 mod create_transit_gateway_connect;
 // What `DeleteVpnConcentrator` takes away, what it refuses and what it leaves alone.
-// Declared beside `prefix_lists` for the reason the note above gives: the sorted
-// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/delete_vpn_concentrator.rs"]
 mod delete_vpn_concentrator;
 // What `DisassociateSubnetCidrBlock` lets go of: the association it names, wherever in the
 // account's subnets it is held, the transient state it answers, the clock-owed terminal
 // state, and what it refuses. Declared beside `prefix_lists` for the reason the note above
-// gives: the sorted neighbourhood and the tail of this file are where every new ec2 suite
-// inserts its lines.
 #[path = "all/disassociate_subnet_cidr_block.rs"]
 mod disassociate_subnet_cidr_block;
 // The sentence this service refuses a request with, per refusal CLASS: the resource named in
@@ -155,24 +145,18 @@ mod disassociate_subnet_cidr_block;
 mod per_resource_refusal_wording;
 // What `ModifyTransitGateway` applies to a stored transit gateway, what it leaves alone,
 // what it refuses, and the `modifying` -> `available` move the clock owes the gateway.
-// Declared beside `prefix_lists` for the reason the note above gives: the sorted
-// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/modify_transit_gateway.rs"]
 mod modify_transit_gateway;
 // The primary network interface a launch gives its instance, the subnet and VPC it puts the
 // instance in, and the filters that select on them. Declared beside `prefix_lists` for the
-// reason the note above gives: the sorted neighbourhood and the tail of this file are where
-// every new ec2 suite inserts its lines.
 #[path = "all/instance_network_interfaces.rs"]
 mod instance_network_interfaces;
 // How `DescribeInstances` pages: the instances `MaxResults` caps and the token that walks to
 // the full set, over stores whose instances are spread differently over reservations.
-// Declared beside `prefix_lists` for the reason the note above gives.
 #[path = "all/describe_instances_pages.rs"]
 mod describe_instances_pages;
 // The EBS-optimized performance, the NVMe-for-EBS answer and the hibernation support
 // `DescribeInstanceTypes` reports, across families, generations and sizes. Declared beside
-// `prefix_lists` for the reason the note above gives.
 #[path = "all/instance_type_ebs_and_hibernation.rs"]
 mod instance_type_ebs_and_hibernation;
 // The deprecated images of the published AMI catalog: their age, when they were deprecated,
@@ -181,26 +165,20 @@ mod instance_type_ebs_and_hibernation;
 #[path = "all/deprecated_catalog_images.rs"]
 mod deprecated_catalog_images;
 // The code and the request id a refusal of the instance read and write paths carries.
-// Declared beside `prefix_lists` for the reason the note above gives.
 #[path = "all/instance_read_path_refusals.rs"]
 mod instance_read_path_refusals;
 // What EC2 refuses about a REQUEST before it reads any state: a page size beside an id
 // selection, a Capacity Block search that names both dimensions or neither, an idempotency
 // token replayed with different parameters, and an AMI id a launch could not have been
 // issued. Declared beside `prefix_lists` for the reason the note above gives: the sorted
-// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/request_validation_before_state.rs"]
 mod request_validation_before_state;
 // What `DeleteCapacityManagerDataExport` takes out of the account's Capacity Manager data
 // export configurations, what the reader then counts, and what the delete refuses. Declared
-// beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood and
-// the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/capacity_manager_data_exports.rs"]
 mod capacity_manager_data_exports;
 // The form an Amazon FPGA Image id is read in before any lookup, and the two answers an id
 // outside and inside it gets. Declared beside `prefix_lists` for the reason the note above
-// gives: the sorted neighbourhood and the tail of this file are where every new ec2 suite
-// inserts its lines.
 #[path = "all/fpga_image_id_form.rs"]
 mod fpga_image_id_form;
 // The buckets the rules-per-security-group quota is counted in — one per group, direction
@@ -212,7 +190,6 @@ mod security_group_rule_quota_buckets;
 // What `AcceptReservedInstancesExchangeQuote` exchanges: which Convertible Reserved Instances
 // it retires, the purchases of the target offerings it mints in their place, and what it
 // refuses. Declared beside `prefix_lists` for the reason the note above gives: the sorted
-// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/reserved_instances_exchanges.rs"]
 mod reserved_instances_exchanges;
 // What `ModifyCapacityReservationFleet` changes about a stored Capacity Reservation Fleet,
@@ -222,56 +199,37 @@ mod reserved_instances_exchanges;
 #[path = "all/modify_capacity_reservation_fleet.rs"]
 mod modify_capacity_reservation_fleet;
 // What `RevokeSecurityGroupEgress` removes from a group, which requests it admits and
-// refuses. Declared beside `prefix_lists` for the reason the note above gives: the sorted
-// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/revoke_security_group_egress.rs"]
 mod revoke_security_group_egress;
 // The one sentence every `Invalid<Kind>.Malformed` of this service words an unreadable
 // resource id with, across the id kinds and the operations that resolve them. Declared
-// beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood and
-// the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/malformed_id_message_template.rs"]
 mod malformed_id_message_template;
 // What `AttachVolume` records on a volume, which requests it admits and refuses, and the
 // `attaching` -> `attached` move the clock owes the attachment. Declared beside
-// `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail
-// of this file are where every new ec2 suite inserts its lines.
 #[path = "all/attach_volume.rs"]
 mod attach_volume;
 // The ancestry chain `GetImageAncestry` walks over the parent link of the stored AMIs, and
-// what it refuses. Declared beside `prefix_lists` for the reason the note above gives: the
-// sorted neighbourhood and the tail of this file are where every new ec2 suite inserts its
-// lines.
 #[path = "all/image_ancestry.rs"]
 mod image_ancestry;
 // What `AssociateIpamResourceDiscovery` links, what the IPAM then counts, and what the
 // associate refuses. Declared beside `prefix_lists` for the reason the note above gives: the
-// sorted neighbourhood and the tail of this file are where every new ec2 suite inserts its
-// lines.
 #[path = "all/ipam_resource_discovery_associations.rs"]
 mod ipam_resource_discovery_associations;
 // What `SendDiagnosticInterrupt` delivers to one instance, which states it can be sent
 // from, and what it refuses. Declared beside `prefix_lists` for the reason the note above
-// gives: the sorted neighbourhood and the tail of this file are where every new ec2 suite
-// inserts its lines.
 #[path = "all/send_diagnostic_interrupt.rs"]
 mod send_diagnostic_interrupt;
 // Which suppression `DisableApplicationStatusCheckSuppression` lifts, what a reader then
 // reports for that instance, and what the call refuses. Declared beside `prefix_lists` for
-// the reason the note above gives: the sorted neighbourhood and the tail of this file are
-// where every new ec2 suite inserts its lines.
 #[path = "all/disable_application_status_check_suppression.rs"]
 mod disable_application_status_check_suppression;
 // What `CreateLocalGatewayRoute` writes into one local gateway route table, what the clock
 // then owes the route, and what the create refuses. Declared beside `prefix_lists` for the
-// reason the note above gives: the sorted neighbourhood and the tail of this file are where
-// every new ec2 suite inserts its lines.
 #[path = "all/create_local_gateway_route.rs"]
 mod create_local_gateway_route;
 // The IAM instance profile an instance runs as: what the associate records, what the two
 // describes report of it, and what the disassociate takes away. Declared beside
-// `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail
-// of this file are where every new ec2 suite inserts its lines.
 #[path = "all/iam_instance_profile_associations.rs"]
 mod iam_instance_profile_associations;
 // What `DeleteVolume` removes, what it refuses, and what a dry run of it performs. Declared
@@ -286,8 +244,6 @@ mod delete_volume;
 mod vpc_endpoint_services;
 // The `domain-name` attribute of an Elastic IP address: what `ResetAddressAttribute` starts
 // on one address's reverse DNS record, what it refuses, and what the report reads back.
-// Declared beside `prefix_lists` for the reason the note above gives: the sorted
-// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/address_attribute_reset.rs"]
 mod address_attribute_reset;
 // What `AllocateHosts` writes: how many hosts one call mints, the configuration each of them
@@ -384,7 +340,6 @@ mod vpn_gateways;
 mod client_vpn_target_networks;
 // What `ResetInstanceAttribute` resets, to what, from which instance states, and what it
 // refuses. Declared beside `prefix_lists` for the same reason: the sorted region is where
-// every new ec2 suite inserts its lines.
 #[path = "all/instance_attribute_reset.rs"]
 mod instance_attribute_reset;
 // The root volume replacement slice: create a task, then read it back. Declared beside the
@@ -442,7 +397,6 @@ mod create_transit_gateway_route_table_announcement;
 // What `RebootInstances` queues, which instances it can be queued for, and what it
 // refuses. Declared beside the suites above rather than in sorted position or at the tail,
 // for the reason this file's header note gives: both are contended regions where a
-// serialized squash merge is lost.
 #[path = "all/reboot_instances.rs"]
 mod reboot_instances;
 #[path = "all/ec2_query_error_envelope.rs"]
@@ -545,14 +499,12 @@ mod carrier_gateways;
 // instance ids, the documented filters and the page size narrow it. Declared in the MIDDLE
 // of the list rather than at either end: the head and the tail are both where concurrent ec2
 // landings insert their two lines, and these two lost repeated serialized squash merges at
-// the tail.
 #[path = "all/classic_link_instances.rs"]
 mod classic_link_instances;
 // What `DeleteVpnConnection` starts on the Site-to-Site VPN connection it names, what it
 // refuses, and what the clock then owes it. Declared in the MIDDLE of the list for the
 // reason the suite above gives: the head and the tail are both where concurrent ec2
 // landings insert their two lines, and these two already lost a serialized squash merge at
-// the tail.
 #[path = "all/delete_vpn_connection.rs"]
 mod delete_vpn_connection;
 // What `CreateSnapshots` makes of the volumes one instance holds — one snapshot each, the
@@ -657,8 +609,6 @@ mod describe_vpcs;
 // What `DetachNetworkInterface` takes down and what it refuses: the `detaching` state and the
 // completion the clock owes it, the malformed/not-found split on an `AttachmentId`, and the
 // attachments that cannot be detached at all. Declared HERE, in sorted position inside the
-// long-settled block rather than at the head of the file, where every new ec2 suite inserts
-// its lines and merges contend.
 #[path = "all/detach_network_interface.rs"]
 mod detach_network_interface;
 // What `DetachVolume` refuses and what it writes beyond the detach path in
@@ -1058,7 +1008,6 @@ mod capacity_reservation_topology;
 // Stopping the advertisement of a BYOIP address range, and what that refuses.
 #[path = "all/withdraw_byoip_cidr.rs"]
 mod withdraw_byoip_cidr;
-
 // Declared LAST rather than in sorted position, for the reason the header gives: the
 // sorted neighbourhood of these two suites is where other ec2 landings insert their lines,
 // and the head of the list has become contended too. What `DescribeSecurityGroupRules`
@@ -1079,12 +1028,10 @@ mod traffic_mirror_filters;
 // the note at the top of this file records: a new ec2 suite lands every few minutes and
 // inserts its two lines in sorted order, so the sorted neighbourhood of this suite is the
 // contended region of this file — and these two lines have already lost repeated
-// serialized squash merges there.
 #[path = "all/capacity_reservations.rs"]
 mod capacity_reservations;
 // What `CancelExportTask` cancels, what it refuses and what it leaves alone. Declared LAST
 // rather than in sorted position, for the reason the header records: a suite's own sorted
-// neighbourhood is where every new ec2 suite inserts its lines.
 #[path = "all/export_task_cancellation.rs"]
 mod export_task_cancellation;
 // Declared LAST for the same reason as the two suites above: the sorted region of this file
@@ -1126,12 +1073,10 @@ mod ipam_byoasns;
 // associating a route server with a VPC, and reading one route server's associations back.
 #[path = "all/route_server_associations.rs"]
 mod route_server_associations;
-// Declared LAST for the reason the header gives: the sorted region of this file is where
 // every new ec2 suite inserts its lines. What `DeleteTrafficMirrorSession` deletes out of
 // the Traffic Mirror session store, and what it refuses.
 #[path = "all/traffic_mirror_sessions.rs"]
 mod traffic_mirror_sessions;
-// Declared LAST for the reason the header gives: the sorted region of this file is where
 // every new ec2 suite inserts its lines. What `DescribeClientVpnEndpoints` reports out of the
 // Client VPN endpoint store, and how the ids, the documented filters and the page size narrow
 // it.
@@ -1141,10 +1086,8 @@ mod client_vpn_endpoints;
 // logging on for a resource, reading the flow logs back, and deleting them in batches.
 #[path = "all/flow_logs.rs"]
 mod flow_logs;
-// Declared LAST for the reason the header gives: the sorted region of this file is where
 // every new ec2 suite inserts its lines. What `DescribeTransitGatewayPolicyTables` reports
 // out of the policy table store, and how the id list, the filters and the page size narrow
-// it.
 #[path = "all/transit_gateway_policy_tables.rs"]
 mod transit_gateway_policy_tables;
 // Declared LAST for the same reason: what `DescribeTransitGatewayPeeringAttachments` reports
@@ -1152,32 +1095,26 @@ mod transit_gateway_policy_tables;
 // narrow it.
 #[path = "all/transit_gateway_peering_attachments.rs"]
 mod transit_gateway_peering_attachments;
-// Declared LAST for the reason the header gives: the sorted region of this file is where
 // every new ec2 suite inserts its lines. What `CreateNetworkInsightsAccessScope` persists —
 // the scope and the content it was given — and what `GetNetworkInsightsAccessScopeContent`
 // reports back out of that store.
 #[path = "all/network_insights_access_scope_content.rs"]
 mod network_insights_access_scope_content;
-// Declared LAST for the reason the header gives: the sorted region of this file is where
 // every new ec2 suite inserts its lines. What `CreateFpgaImage` refuses — the design
 // checkpoint it reads, which this emulator holds no Amazon S3 object for — and what it
 // answers ahead of that read.
 #[path = "all/create_fpga_image.rs"]
 mod create_fpga_image;
-// Declared LAST for the reason the header gives: the sorted region of this file is where
 // every new ec2 suite inserts its lines. Which ONE member of `FpgaImageAttribute`
 // `DescribeFpgaImageAttribute` reports out of the stored AFI, and what it refuses.
 #[path = "all/describe_fpga_image_attribute.rs"]
 mod describe_fpga_image_attribute;
-// Declared LAST for the reason the header gives: the sorted region of this file is where
 // every new ec2 suite inserts its lines. The Verified Access INSTANCE slice: what
 // `CreateVerifiedAccessInstance` mints and persists, and the group create that resolves it.
 #[path = "all/verified_access_instances.rs"]
 mod verified_access_instances;
-// Declared LAST for the reason the header gives: the sorted region of this file is where
 // every new ec2 suite inserts its lines. What `ValidateSecurityGroupQuotasForInterface`
 // answers every caller of this emulator, and what it leaves the store holding.
-// Declared LAST for the reason the header gives: the sorted region of this file is where
 // every new ec2 suite inserts its lines. The managed prefix list slice: what
 // `CreateManagedPrefixList` stores and refuses, and what `DescribeManagedPrefixLists`
 // reports back — the account's own lists and the ones a Region publishes.
@@ -1185,7 +1122,6 @@ mod verified_access_instances;
 mod managed_prefix_lists;
 #[path = "all/validate_security_group_quotas_for_interface.rs"]
 mod validate_security_group_quotas_for_interface;
-// Declared LAST for the reason the header gives: the sorted region of this file is where
 // every new ec2 suite inserts its lines. The account's *block public access for AMIs*
 // setting: what the enable puts in effect, what the disable takes back out, and what
 // `GetImageBlockPublicAccessState` reports out of each Region's own setting.
@@ -1233,13 +1169,11 @@ mod network_acls;
 // holding, what the clock then decides the release ended as, and what it refuses.
 #[path = "all/ipam_byoasn_deprovisioning.rs"]
 mod ipam_byoasn_deprovisioning;
-// Appended at the END of this file, for the reason the header gives. What
 // `DescribeTransitGatewayVpcAttachments` reports out of the attachment store, how the id list,
 // the documented filters and the page size narrow it, and that an acceptance's write and the
 // move the clock owes it are both visible through it.
 #[path = "all/transit_gateway_vpc_attachments.rs"]
 mod transit_gateway_vpc_attachments;
-// Appended at the END of this file, for the reason the header gives. What
 // `CreateLocalGatewayRouteTable` mints and persists for the local gateway it names, the move
 // the clock then owes the new table, and what it refuses.
 #[path = "all/create_local_gateway_route_table.rs"]
@@ -1249,29 +1183,24 @@ mod create_local_gateway_route_table;
 // documented filters and the page size narrow it.
 #[path = "all/get_coip_pool_usage.rs"]
 mod get_coip_pool_usage;
-// Appended at the END of this file, for the reason the header gives. What
 // `DescribeTransitGatewayConnects` reports out of the attachment store, and how the id list,
 // the documented filters and the page size narrow it.
 #[path = "all/describe_transit_gateway_connects.rs"]
 mod describe_transit_gateway_connects;
-// Appended at the END of this file, for the reason the header gives. What
 // `DescribeTransitGatewayRouteTables` reports out of the transit gateway route table store,
 // how the id list, the documented filters and the page size narrow it, and that the tables
 // the implemented creates store — with the moves the clock owes them — read back through it.
 #[path = "all/transit_gateway_route_tables.rs"]
 mod transit_gateway_route_tables;
-// Appended at the END of this file, for the reason the header gives. What
 // `DescribeTransitGatewayAttachments` reports out of the attachment store — every kind of
 // attachment, as the kind-independent shape — how the id list, the documented filters and the
 // page size narrow it, and that the association a writer stored reads back through it.
 #[path = "all/describe_transit_gateway_attachments.rs"]
 mod describe_transit_gateway_attachments;
-// Appended at the END of this file, for the reason the header gives. What
 // `ModifyVerifiedAccessInstance` applies to a stored Verified Access instance, what it leaves
 // as it was, what it refuses, and how one `ClientToken` bounds it to one modification.
 #[path = "all/modify_verified_access_instance.rs"]
 mod modify_verified_access_instance;
-// Appended at the END of this file, for the reason the header gives. What
 // `AssociateTrunkInterface` answers a caller whose account may not use interface trunking —
 // one refusal for every shape of request, in any Region, with nothing stored.
 #[path = "all/trunk_interface_associations.rs"]
@@ -1281,22 +1210,18 @@ mod trunk_interface_associations;
 // the word `GetManagedResourceVisibility` reports out of the account's own setting.
 #[path = "all/managed_resource_visibility.rs"]
 mod managed_resource_visibility;
-// Appended at the END of this file, for the reason the header gives. What
 // `CreateTransitGatewayMeteringPolicy` mints and persists for the transit gateway it names,
 // the move the clock then owes the new policy, and what it refuses.
 #[path = "all/create_transit_gateway_metering_policy.rs"]
 mod create_transit_gateway_metering_policy;
-// Appended at the END of this file, for the reason the header gives. What
 // `AssociateTransitGatewayRouteTable` stores for the (route table, attachment) pair it names,
 // the move the clock then owes the new association, what it refuses, and how both reports of
 // an association — the route table's own and the attachment's — answer with that one record.
 #[path = "all/transit_gateway_route_table_associations.rs"]
 mod transit_gateway_route_table_associations;
-// Appended at the END of this file, for the reason the header gives. What
 // `CreateTransitGatewayVpcAttachment` computes a VPC attachment from — the gateway, the VPC and
 // the subnets the request names, the VPC's stored owner, and the options it asked for or
 // inherited from the gateway — the `pending` -> `available` move the clock owes it, and what it
-// refuses.
 #[path = "all/create_transit_gateway_vpc_attachment.rs"]
 mod create_transit_gateway_vpc_attachment;
 // Appended at the END of this file, for the reason the header gives. The entries (rules) of a
@@ -1312,23 +1237,26 @@ mod transit_gateway_metering_policy_entries;
 // a purchase stored is what the report answers with.
 #[path = "all/describe_reserved_instances.rs"]
 mod describe_reserved_instances;
-// Appended at the END of this file, for the reason the header gives: the sorted region of this
 // file is where every new ec2 suite inserts its lines. What `DeleteVerifiedAccessInstance`
 // removes — the Verified Access instance the request names and the logging configuration kept
 // beside it — what it answers, what still naming the instance refuses it, and how one
 // `ClientToken` bounds it to one delete.
 #[path = "all/delete_verified_access_instance.rs"]
 mod delete_verified_access_instance;
-// Appended at the END of this file, for the reason the header gives: the sorted region of this
 // file is where every new ec2 suite inserts its lines. The accepting half of the Elastic IP
 // address transfer handshake: what `AcceptAddressTransfer` takes out of a standing offer, what
 // it refuses for an address nothing has on offer, and where the tags it carries land.
 #[path = "all/accept_address_transfer.rs"]
 mod accept_address_transfer;
-// Appended at the END of this file, for the reason the header gives: the sorted region of this
 // file is where every new ec2 suite inserts its lines. What `UnmonitorInstances` turns off: the
 // `disabling` -> `disabled` move it starts for every distinct instance it names, read back
 // through `DescribeInstances`, the instance it leaves where it was, and the states, ids, batch
 // sizes and dry run it refuses without changing any instance's monitoring.
 #[path = "all/unmonitor_instances.rs"]
 mod unmonitor_instances;
+// What `DescribeFpgaImages` reports out of the Amazon FPGA Image store: every AFI available to
+// the caller (its own, the public ones and those shared with it) as the store holds it, how the
+// id list, the `Owners` terms, the documented filters and the page size narrow the report, what
+// it refuses, and the minting outcome the clock owes an AFI it is read through. Declared beside
+#[path = "all/describe_fpga_images.rs"]
+mod describe_fpga_images;

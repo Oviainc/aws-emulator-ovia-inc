@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeFpgaImages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeFpgaImages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeFpgaImages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Amazon FPGA Images (AFIs) [`crate::state`] holds that are "available to
+//! you" — "public AFIs, private AFIs that you own, and AFIs owned by other Amazon Web
+//! Services accounts for which you have load permissions" (`DescribeFpgaImages`) — every
+//! one of them by default, or the subset the request's `FpgaImageIds`, `Owners` and
+//! `Filters` select, one `MaxResults`-sized page at a time.
+//!
+//! A reporting operation: it writes NOTHING. The published AFIs it reports beside the
+//! account's own ([`published_fpga_images`]) are computed per report rather than laid down in
+//! the account's store, and an AFI's own clock-owed move is derived from its stored due
+//! instant on every report of it — so two calls answer the same AFI and this read cannot
+//! change what a later caller sees.
+//!
+//! An `FpgaImageIds` entry this report cannot resolve to an AFI the caller can see is refused
+//! with ONE answer, whatever made it unresolvable
+//! ([`unresolvable_fpga_image_id`]); `Owners`, `Filters`, `MaxResults` and `NextToken` are
+//! each refused with EC2's own code for their own fault, and `DryRun` is answered once the
+//! request's own members have been read.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +161,604 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeFpgaImages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeFpgaImagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget, PageTokenRule,
+            decode_page_token, dry_run_operation, fpga_image_id_is_well_formed,
+            invalid_pagination_token_for, invalid_user_id_malformed, page_from_cursor,
+            require_service_state,
+        };
+
+        // An AFI carries no Region member of its own, so nothing here depends on the Region
+        // the request was signed for; the store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+
+        let requested_ids: &[String] = input.fpga_image_ids.as_deref().unwrap_or_default();
+        let owners: &[String] = input.owners.as_deref().unwrap_or_default();
+
+        // Neither list is bounded by the model and each one costs a comparison per stored
+        // AFI, so the request-controlled factors are capped before any work proportional to
+        // them is done.
+        for (member, values) in [("FpgaImageIds", requested_ids), ("Owners", owners)] {
+            if values.len() > MAX_RESOURCE_IDS {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "{member} carries {} values, above the maximum of {MAX_RESOURCE_IDS}",
+                    values.len()
+                )));
+            }
+        }
+
+        // "Filters the AFI by owner. Specify an Amazon Web Services account ID, self (owner
+        // is the sender of the request), or an Amazon Web Services owner alias (valid values
+        // are amazon | aws-marketplace)" (`DescribeFpgaImagesRequest$Owners`): a term that
+        // names none of those is refused before anything is looked up, the way every owner
+        // term of this service is, rather than read as a narrowing nothing matches.
+        for owner in owners {
+            if !is_owner_term(owner) {
+                return Err(invalid_user_id_malformed(owner));
+            }
+        }
+
+        // Matching cost is filters x values x held values x stored AFIs and the model bounds
+        // none of them, so the request-controlled factors are capped here, before any work
+        // proportional to them is done — and their PRODUCT is charged to one [`MatchBudget`]
+        // below, which is the bound the per-factor caps cannot give.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any AFI
+        // would have matched it, so an unsupported filter can never read as "no results".
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                Scaffolded::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(canonical.to_string(), values.to_vec()));
+        }
+
+        // "The AFI IDs" (`DescribeFpgaImagesRequest$FpgaImageIds`): a value that is not an
+        // AFI id at all cannot be read as one, so it is refused BEFORE any lookup — and with
+        // the SAME answer an id this report cannot resolve gets below, for the reason
+        // [`unresolvable_fpga_image_id`] records.
+        for fpga_image_id in requested_ids {
+            if !fpga_image_id_is_well_formed(fpga_image_id) {
+                return Err(unresolvable_fpga_image_id(fpga_image_id));
+            }
+        }
+
+        // "The token to retrieve the next page of results" (`NextToken`) — anything else is
+        // refused rather than read as an id.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        // `DryRun` asks whether the CALLER MAY make this request — "checks whether you have
+        // the required permissions for the action, without actually making the request"
+        // (`DescribeFpgaImagesRequest$DryRun`) — which is a question about the caller and not
+        // about any AFI, so it is answered once the request's own members have been read and
+        // BEFORE an AFI is resolved, the order every FPGA-image operation of this crate
+        // keeps.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        // A read, and only a read: nothing here writes to the store, so two calls answer the
+        // same report.
+        let store = state.lock();
+        let account = ::engine::emulator_account_id();
+
+        // "Describes the Amazon FPGA Images (AFIs) available to you. These include public
+        // AFIs, private AFIs that you own, and AFIs owned by other Amazon Web Services
+        // accounts for which you have load permissions": the stored AFIs this caller may see
+        // ([`account_can_see_fpga_image`]), and the public AFIs AWS publishes
+        // ([`published_fpga_images`]), which no operation of this API creates and every
+        // account can see.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeFpgaImages"))
+        // Both are projected before any narrowing, bounded by what the store holds
+        // ([`crate::state::MAX_FPGA_IMAGES`]) plus the fixed catalog, and sorted into
+        // `FpgaImageId` order — the order this report pages in, which the cursor below names
+        // a position in.
+        let now = ::std::time::Instant::now();
+        let mut available: Vec<FpgaImage> = store
+            .fpga_images
+            .values()
+            .filter(|record| account_can_see_fpga_image(record, account))
+            .map(|record| reported_fpga_image(record, now))
+            .collect();
+        available.extend(published_fpga_images());
+        available.sort_by(|left, right| left.fpga_image_id.cmp(&right.fpga_image_id));
+
+        // An AFI id this report cannot resolve to an AFI available to the caller is refused,
+        // not reported as an absent row — with the one answer [`unresolvable_fpga_image_id`]
+        // gives, whatever made it unresolvable.
+        for fpga_image_id in requested_ids {
+            if !available
+                .iter()
+                .any(|fpga_image| fpga_image.fpga_image_id.as_deref() == Some(fpga_image_id.as_str()))
+            {
+                return Err(unresolvable_fpga_image_id(fpga_image_id));
+            }
+        }
+
+        // What is available, narrowed by each member the request carries, every one of which
+        // must hold ("If you specify multiple filters, the filters are joined with an AND" —
+        // `Filter`).
+        //
+        // Every FILTER comparison is charged to ONE budget, so the PRODUCT of available AFIs,
+        // filters, values, held values and value length is bounded however the caller combines
+        // them — which is also what bounds how long this holds the state lock. The id and
+        // owner narrowings below are bounded by their own per-factor cap
+        // ([`MAX_RESOURCE_IDS`], applied above) against what the store can hold.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<FpgaImage> = Vec::new();
+        for fpga_image in available {
+            if budget.exhausted() {
+                break;
+            }
+            if !requested_ids.is_empty()
+                && !requested_ids
+                    .iter()
+                    .any(|id| fpga_image.fpga_image_id.as_deref() == Some(id.as_str()))
+            {
+                continue;
+            }
+            if !owners.is_empty()
+                && !owners
+                    .iter()
+                    .any(|owner| owner_matches(&fpga_image, owner, account))
+            {
+                continue;
+            }
+            // The AND/OR evaluation of EC2's `Filters`, through the one definition the crate
+            // holds ([`crate::state::matches_every_filter`]); only the per-attribute lookup
+            // is this operation's, so it is what gets passed in — and it reads the REPORTED
+            // AFI, so a filter compares against the values the caller is shown.
+            let selected_by_filters =
+                crate::state::matches_every_filter(&selectors, &mut budget, &|name| {
+                    filter_values(&fpga_image, name)
+                });
+            if selected_by_filters {
+                selected.push(fpga_image);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // "The maximum number of results to return in a single call" (`MaxResults`), whose
+        // modelled range is 5..1000 — a `@range` the request walk enforces BEFORE this handler
+        // runs, so every value reaching here is one the range admits and is served as asked.
+        // A request naming none asks for no page size at all and gets the largest page this
+        // service serves, which is that range's own maximum ([`MAX_PAGE_SIZE`]); the clamp is
+        // the safety net that keeps the page size positive whatever reaches it.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // The page and the token that follows it, through the one definition of EC2 paging
+        // ([`crate::state::page_from_cursor`]): the cursor names the AFI this page ends at,
+        // and "this value is null when there are no more results to return"
+        // (`DescribeFpgaImagesResult$NextToken`) is a token only while a further AFI follows
+        // the page.
+        let (page, next_token) = page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            PageTokenRule::WhenAnotherItemFollows,
+            |fpga_image| fpga_image.fpga_image_id.as_deref().unwrap_or_default(),
+        );
+
+        Ok(DescribeFpgaImagesOutput {
+            fpga_images: Some(page.to_vec()),
+            next_token,
+        })
+    }
+}
+
+/// Refuse an `FpgaImageIds` entry this report cannot resolve: HTTP 400
+/// `InvalidFpgaImageID.Malformed`, naming the id the request carried.
+///
+/// ONE answer for every unresolvable entry — a value that is not an AFI id at all, and a
+/// well-formed one naming no AFI available to the caller alike — which is the reading
+/// `CopyFpgaImage` already gives an AFI id it cannot resolve
+/// (`crate::ops::copy_fpga_image::unresolvable_source_fpga_image_id`): a report of "the AFIs
+/// available to you" judges the ids it is given rather than resolving one resource of the
+/// account, so an id naming nothing it can report is an id it cannot read. The
+/// malformed-before-not-found PAIR belongs to the operations that act on ONE named AFI —
+/// `DeleteFpgaImage`, `DescribeFpgaImageAttribute` and `ResetFpgaImageAttribute`, which
+/// answer `InvalidFpgaImageID.NotFound` for a well-formed id of their own account that names
+/// nothing.
+///
+/// The wording is the one [`crate::state::invalid_fpga_image_id_malformed`] holds for the
+/// FPGA-image id kind, so this path words an unreadable AFI id exactly as every other does.
+fn unresolvable_fpga_image_id(fpga_image_id: &str) -> DescribeFpgaImagesError {
+    crate::state::invalid_fpga_image_id_malformed(fpga_image_id)
+}
+
+/// The owner aliases `Owners` accepts beside an account id and `self`: "an Amazon Web
+/// Services owner alias (valid values are `amazon` | `aws-marketplace`)"
+/// (`DescribeFpgaImagesRequest$Owners`), which is also what `FpgaImage$OwnerAlias` reports
+/// ("possible values include `self`, `amazon`, and `aws-marketplace`").
+const FPGA_IMAGE_OWNER_ALIASES: [&str; 2] = ["amazon", "aws-marketplace"];
+
+/// "The name of the group" a PUBLIC AFI's load permission names (`LoadPermission$Group`):
+/// the `PermissionGroup` enum's only member (the generated catalog
+/// [`PERMISSION_GROUP_VALUES`]). DEFINED as the term this service already selects public
+/// resources with ([`crate::state::EXECUTABLE_BY_ALL`]), so the group a load permission
+/// carries and the term that reads it cannot drift apart.
+const LOAD_PERMISSION_GROUP_ALL: &str = crate::state::EXECUTABLE_BY_ALL;
+
+/// Is `term` something `Owners` may carry — "an Amazon Web Services account ID, self (owner
+/// is the sender of the request), or an Amazon Web Services owner alias"
+/// (`DescribeFpgaImagesRequest$Owners`)?
+fn is_owner_term(term: &str) -> bool {
+    term == crate::state::OWNER_SELF
+        || FPGA_IMAGE_OWNER_ALIASES.contains(&term)
+        || crate::state::aws_account_id_is_well_formed(term)
+}
+
+/// Does `fpga_image` belong to the owner `term` names — the calling account for `self`, the
+/// aliased publisher for an alias, and that account for an account id?
+fn owner_matches(fpga_image: &FpgaImage, term: &str, account: &str) -> bool {
+    if term == crate::state::OWNER_SELF {
+        return fpga_image.owner_id.as_deref() == Some(account);
+    }
+    if FPGA_IMAGE_OWNER_ALIASES.contains(&term) {
+        return fpga_image.owner_alias.as_deref() == Some(term);
+    }
+    fpga_image.owner_id.as_deref() == Some(term)
+}
+
+/// May `account` see this AFI at all?
+///
+/// "Describes the Amazon FPGA Images (AFIs) available to you. These include public AFIs,
+/// private AFIs that you own, and AFIs owned by other Amazon Web Services accounts for which
+/// you have load permissions" (`DescribeFpgaImages`) — the three cases, read off the stored
+/// record: the `all` group in its load permissions makes it public
+/// ([`fpga_image_is_public`]), the owner is the AFI's own `OwnerId`, and a load permission
+/// naming an account is what gives that account access.
+///
+/// This is also what decides whether a `FpgaImageIds` entry resolves at all, so an AFI the
+/// caller may not see is refused by [`unresolvable_fpga_image_id`] — the same one answer every
+/// unresolvable entry gets — rather than reported as a row it could read by naming the id.
+fn account_can_see_fpga_image(record: &crate::state::FpgaImageRecord, account: &str) -> bool {
+    fpga_image_is_public(record)
+        || record.view.owner_id.as_deref() == Some(account)
+        || record
+            .load_permissions
+            .iter()
+            .any(|permission| permission.user_id.as_deref() == Some(account))
+}
+
+/// Is this AFI public — "indicates whether the AFI is public" (`FpgaImage$Public`)?
+///
+/// An AFI is loadable by its owner alone until a load permission says otherwise, and the one
+/// permission that names every account is the `all` group ([`LOAD_PERMISSION_GROUP_ALL`]), so
+/// being public IS carrying that group. DERIVED from the permissions rather than stored
+/// beside them, the way `DescribeImageAttribute` derives an AMI's launch permissions from its
+/// `Public` member: one fact has one writer, so the member a report carries cannot disagree
+/// with the permissions `DescribeFpgaImageAttribute` reports for the same AFI.
+fn fpga_image_is_public(record: &crate::state::FpgaImageRecord) -> bool {
+    record
+        .load_permissions
+        .iter()
+        .any(|permission| permission.group.as_deref() == Some(LOAD_PERMISSION_GROUP_ALL))
+}
+
+/// `record` as this operation reports it at `now`: the stored AFI with the two members that
+/// are facts of something else the store holds, rather than values of their own.
+///
+/// `State` is the one the clock has reached, through the one definition the crate holds
+/// ([`crate::state::FpgaImageRecord::view_at`]) — "the view holds no `State`", so a stored
+/// AFI's state is always derived from its due instant and this report can never freeze a move
+/// the clock has made. `Public` is derived from the load permissions
+/// ([`fpga_image_is_public`]). Both are computed per report, so a filter below compares
+/// against exactly what the caller is shown.
+fn reported_fpga_image(record: &crate::state::FpgaImageRecord, now: ::std::time::Instant) -> FpgaImage {
+    let mut reported = record.view_at(now);
+    reported.public = Some(fpga_image_is_public(record));
+    reported
+}
+
+/// `FpgaImageStateCode`'s `available` — "the AFI is available for use"
+/// (`FpgaImageState$Code`), one of the generated catalog
+/// [`FPGA_IMAGE_STATE_CODE_VALUES`].
+const FPGA_IMAGE_STATE_AVAILABLE: &str = "available";
+
+/// The `Owners` term, and the `FpgaImage$OwnerAlias`, of an AFI Amazon itself published:
+/// `amazon`, the first of [`FPGA_IMAGE_OWNER_ALIASES`].
+const FPGA_IMAGE_OWNER_ALIAS_AMAZON: &str = FPGA_IMAGE_OWNER_ALIASES[0];
+
+/// The instance types a published AFI of this catalog supports (`FpgaImage$InstanceTypes`):
+/// the FPGA-accelerated family an AFI is deployed on — "you can securely deploy an AFI on
+/// multiple FPGA-accelerated instances" (`CreateFpgaImage`) — whose members are the `f1.`
+/// entries of the model's own `InstanceType` catalog
+/// (`smithy_query(query="shape",shape="InstanceType")`).
+const FPGA_ACCELERATED_INSTANCE_TYPES: [&str; 3] = ["f1.2xlarge", "f1.4xlarge", "f1.16xlarge"];
+
+/// The PCI vendor id an Amazon FPGA device reports on the PCI bus (`PciId$VendorId`): the
+/// vendor id allocated to Amazon, which every AFI of this catalog is attached to the bus
+/// under. The device and subsystem ids beside it are the ones the AWS FPGA Hardware
+/// Development Kit's example custom logic reports for a loaded AFI.
+const AMAZON_PCI_VENDOR_ID: &str = "0x1d0f";
+const FPGA_PCI_DEVICE_ID: &str = "0xf000";
+const FPGA_PCI_SUBSYSTEM_ID: &str = "0x1d51";
+const FPGA_PCI_SUBSYSTEM_VENDOR_ID: &str = "0xfedc";
+
+/// The version of the AWS Shell the published AFIs of this catalog were built against
+/// (`FpgaImage$ShellVersion`): one version string, because a shell version names the
+/// developer-kit release an AFI's bitstream was generated with and a catalog built from one
+/// release carries one of them.
+const PUBLISHED_FPGA_IMAGE_SHELL_VERSION: &str = "0x04261818";
+
+/// How long before the catalog is materialised its AFIs were published.
+///
+/// CHOSEN, and relative rather than a calendar date, for the reason the published AMI
+/// catalog's dates are relative: a published AFI must always read as published in the PAST,
+/// whatever this emulator's clock says, and a fixed date either has not been reached yet or
+/// recedes without bound as the clock advances.
+const PUBLISHED_FPGA_IMAGE_AGE_DAYS: u64 = 365;
+
+/// The seconds in a day, for the age above.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// The instant [`PUBLISHED_FPGA_IMAGE_AGE_DAYS`] days before now, truncated to the start of
+/// that UTC day.
+///
+/// TRUNCATED so the catalog is stable: every report within one day of this process's life
+/// carries the same instant to the second, rather than one that moves with the clock a read
+/// happened to be made at. The published AMI catalog truncates its own rolling dates the same
+/// way; that helper is private to `crate::state`, so this reads the age it was given here.
+fn published_fpga_image_date() -> ::std::time::SystemTime {
+    let seconds = ::std::time::SystemTime::now()
+        .duration_since(::std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(PUBLISHED_FPGA_IMAGE_AGE_DAYS.saturating_mul(SECONDS_PER_DAY));
+    ::std::time::SystemTime::UNIX_EPOCH
+        + ::std::time::Duration::from_secs(seconds - seconds % SECONDS_PER_DAY)
+}
+
+/// One AFI of the published catalog: what AWS publishes about it, and the two identifiers it
+/// is published UNDER.
+///
+/// A published AFI's ids are FIXED, not minted: the catalog is the same catalog in every
+/// account, so a published AFI is named by the identifier it was published under rather than
+/// by one this store's counter happened to reach. The values are CHOSEN — no recording is
+/// involved — and sit far above the range this store's monotonic counter reaches
+/// ([`crate::state::ComAmazonawsEc2Amazonec2State::next_id`] counts from one), so a published
+/// id can never collide with a minted one.
+struct PublishedFpgaImage {
+    /// "The FPGA image identifier (AFI ID)" (`FpgaImage$FpgaImageId`).
+    fpga_image_id: &'static str,
+    /// "The global FPGA image identifier (AGFI ID)" (`FpgaImage$FpgaImageGlobalId`).
+    fpga_image_global_id: &'static str,
+    /// "The name of the AFI" (`FpgaImage$Name`).
+    name: &'static str,
+    /// "The description of the AFI" (`FpgaImage$Description`).
+    description: &'static str,
+}
+
+/// The public AFIs a fresh account can already see.
+///
+/// Each row is one example custom logic design the AWS FPGA Hardware Development Kit
+/// publishes — the kit `CreateFpgaImage` points at ("for more information, see the Amazon Web
+/// Services FPGA Hardware Development Kit") — published by Amazon itself under the `amazon`
+/// owner alias, loadable by every account and ready for use. Nothing in this API creates
+/// them, so they are part of what a fresh account can see the same way the published AMI
+/// catalog is, and they are the AFIs a report of "public AFIs" has to carry.
+const PUBLISHED_FPGA_IMAGES: [PublishedFpgaImage; 2] = [
+    PublishedFpgaImage {
+        fpga_image_id: "afi-0c2b7c9d4e5f6a8b1",
+        fpga_image_global_id: "agfi-0d4f3a2b1c9e8d7f6",
+        name: "cl_hello_world",
+        description: "AWS FPGA Hardware Development Kit example: hello world custom logic",
+    },
+    PublishedFpgaImage {
+        fpga_image_id: "afi-0f1e2d3c4b5a69788",
+        fpga_image_global_id: "agfi-0a1b2c3d4e5f60718",
+        name: "cl_dram_dma",
+        description: "AWS FPGA Hardware Development Kit example: DRAM DMA custom logic",
+    },
+];
+
+/// The published catalog of [`PUBLISHED_FPGA_IMAGES`] as this operation reports it.
+///
+/// COMPUTED per report and stored NOWHERE, for two reasons that agree: a report does not
+/// write, and a published AFI is NOT an AFI of the account — so an operation that acts on one
+/// AFI of the account (a delete, an attribute read or reset, a copy) resolves none of these
+/// ids, which is what the recorded behaviour of an attribute read against a catalogued AFI
+/// shows. That is the difference from the published AMI catalog
+/// ([`crate::state::ComAmazonawsEc2Amazonec2State::insert_published_images`]), which is laid
+/// down in the store because an account's own operations DO act on a public AMI.
+///
+/// A published AFI is minted by nobody and owned by Amazon, so it carries Amazon's own
+/// publishing account as its `OwnerId` with the `amazon` alias beside it, is `public` (every
+/// account may load it), and is in the terminal `available` state a ready resource stays in.
+fn published_fpga_images() -> Vec<FpgaImage> {
+    let published_at =
+        crate::state::system_time_to_date_time(published_fpga_image_date());
+    PUBLISHED_FPGA_IMAGES
+        .iter()
+        .map(|published| FpgaImage {
+            fpga_image_id: Some(published.fpga_image_id.to_string()),
+            fpga_image_global_id: Some(published.fpga_image_global_id.to_string()),
+            name: Some(published.name.to_string()),
+            description: Some(published.description.to_string()),
+            shell_version: Some(PUBLISHED_FPGA_IMAGE_SHELL_VERSION.to_string()),
+            pci_id: Some(PciId {
+                device_id: Some(FPGA_PCI_DEVICE_ID.to_string()),
+                vendor_id: Some(AMAZON_PCI_VENDOR_ID.to_string()),
+                subsystem_id: Some(FPGA_PCI_SUBSYSTEM_ID.to_string()),
+                subsystem_vendor_id: Some(FPGA_PCI_SUBSYSTEM_VENDOR_ID.to_string()),
+            }),
+            state: Some(FpgaImageState {
+                code: Some(FPGA_IMAGE_STATE_AVAILABLE.to_string()),
+                message: None,
+            }),
+            create_time: Some(published_at),
+            update_time: Some(published_at),
+            owner_id: Some(crate::state::AMAZON_IMAGE_OWNER_ID.to_string()),
+            owner_alias: Some(FPGA_IMAGE_OWNER_ALIAS_AMAZON.to_string()),
+            product_codes: Some(Vec::new()),
+            tags: Some(Vec::new()),
+            public: Some(true),
+            data_retention_support: Some(false),
+            instance_types: Some(
+                FPGA_ACCELERATED_INSTANCE_TYPES
+                    .iter()
+                    .map(|instance_type| (*instance_type).to_string())
+                    .collect(),
+            ),
+        })
+        .collect()
+}
+
+/// The filter names this operation documents, from `DescribeFpgaImagesRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeFpgaImagesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather than
+/// listed here. Every entry must be answered by [`filter_values`].
+///
+/// The modelled-contract header of this file CLIPS that member's doc at ` …`, so it stops at
+/// `tag:`; the names below are the whole set, read from the query above — `tag-key` ("the key
+/// of a tag assigned to the resource … regardless of the tag value") and `update-time` ("the
+/// time of the most recent update") are the two the clip drops.
+const FPGA_IMAGE_FILTERS: [&str; 10] = [
+    "create-time",
+    "fpga-image-global-id",
+    "fpga-image-id",
+    "name",
+    "owner-id",
+    "product-code",
+    "shell-version",
+    "state",
+    "tag-key",
+    "update-time",
+];
+
+/// The prefix of the tag filter: "Use the tag key in the filter name and the tag value as the
+/// filter value" (`DescribeFpgaImagesRequest$Filters`). The one definition is
+/// [`crate::state::TAG_FILTER_PREFIX`], aliased here under the name this file reads it by,
+/// the way the sibling describes do.
+const TAG_FILTER_PREFIX: &str = crate::state::TAG_FILTER_PREFIX;
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
+/// `tag:` prefix with no key names no tag, so it is as undocumented as any other misspelling.
+/// The `tag:<key>` family keeps its whole name, the key being part of what it selects on.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    if name
+        .strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return Some(name);
+    }
+    FPGA_IMAGE_FILTERS.contains(&name).then_some(name)
+}
+
+/// The values the EC2 filter `name` compares against this AFI.
+///
+/// The per-attribute half of [`crate::state::matches_every_filter`], which holds EC2's AND/OR
+/// evaluation itself: a filter naming an attribute this AFI does not carry compares against
+/// NO values, so it selects nothing — which is the answer for `shell-version` on an AFI whose
+/// bitstream was never built, and for `product-code` on a free AFI. `name` is a name
+/// [`canonical_filter_name`] resolved.
+fn filter_values<'a>(fpga_image: &'a FpgaImage, name: &str) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return fpga_image
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        // Rendered the way every describe of this crate renders a timestamp filter value,
+        // which is the wire format the caller was shown it in.
+        "create-time" => crate::state::timestamp_filter_values(fpga_image.create_time),
+        "fpga-image-global-id" => text(fpga_image.fpga_image_global_id.as_deref()),
+        "fpga-image-id" => text(fpga_image.fpga_image_id.as_deref()),
+        "name" => text(fpga_image.name.as_deref()),
+        "owner-id" => text(fpga_image.owner_id.as_deref()),
+        "product-code" => fpga_image
+            .product_codes
+            .iter()
+            .flatten()
+            .filter_map(|code| code.product_code_id.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "shell-version" => text(fpga_image.shell_version.as_deref()),
+        // "`state` - The state of the AFI (`pending` | `failed` | `available` |
+        // `unavailable`)" (`DescribeFpgaImagesRequest$Filters`): the code of the state the
+        // AFI is reported in, not the message beside it.
+        "state" => text(
+            fpga_image
+                .state
+                .as_ref()
+                .and_then(|state| state.code.as_deref()),
+        ),
+        "tag-key" => fpga_image
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "update-time" => crate::state::timestamp_filter_values(fpga_image.update_time),
+        // Unreachable: `canonical_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
     }
 }
