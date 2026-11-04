@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataEndpoint
-//! Reports the data-plane base URL for a stored stream. Reporting only: the single
+//! Reports the base URL of the data plane that serves the requested `APIName`, for a
+//! stored stream — see [`crate::state::data_endpoint`] for which plane serves what and
+//! why that is not this service's own endpoint. Reporting only: the single
 //! write it performs is
 //! [`crate::state::ComAmazonawsKinesisvideoKinesisvideo20170930State::settle_clock`],
 //! which materialises status moves the clock already owed.
@@ -165,8 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `APIName` is a modeled enum, so the boundary already refuses a value outside
-        // its set; this re-states the same rule from the one list the model publishes.
-        if !A_P_I_NAME_VALUES.contains(&input.api_name.as_str()) {
+        // its set; placing it on a data plane re-states the same rule from the one list
+        // the model publishes ([`crate::state::data_plane_of`] is keyed on exactly the
+        // values of `A_P_I_NAME_VALUES`) AND names the plane that serves the API, which
+        // is what the caller asked this operation for.
+        let Some(plane) = crate::state::data_plane_of(input.api_name.as_str()) else {
             return Err(GetDataEndpointErrorModeled::InvalidArgumentException(
                 InvalidArgumentException {
                     message: Some(format!(
@@ -176,20 +181,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
+        };
 
         let region = crate::state::request_region(ctx.parts());
 
         let mut store = state.lock();
         store.settle_clock();
 
-        // The endpoint is reported only for a stream that is actually in the store.
-        store
+        // The endpoint is reported only for a stream that is actually in the store, and
+        // it is THAT stream's: the identity the endpoint is derived from is the stored
+        // record's ARN, so both forms of identifier resolve to one endpoint.
+        let stream = store
             .resolve(input.stream_name.as_deref(), input.stream_arn.as_deref())
             .map_err(lookup_error)?;
 
         Ok(GetDataEndpointOutput {
-            data_endpoint: Some(crate::state::request_endpoint(ctx.parts(), &region)),
+            data_endpoint: Some(crate::state::data_endpoint(
+                plane,
+                &region,
+                &stream.stream_arn,
+            )),
         })
     }
 }

@@ -9,6 +9,12 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// What a stream's media APIs are addressed at, which is not this service's own
+/// endpoint — see the module's own header.
+pub mod data_endpoint;
+
+pub use data_endpoint::{data_endpoint, data_plane_of, service_host, DataPlane};
+
 use crate::ops::types::{
     ChannelInfo, EdgeConfig, ImageGenerationConfiguration, MappedResourceConfigurationListItem,
     MediaStorageConfiguration, NotificationConfiguration, SingleMasterConfiguration, StreamInfo,
@@ -777,24 +783,13 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// The base URL a data-plane client should send this stream's media calls to.
+/// The authority this request arrived on, falling back to the service's own regional
+/// host form when the request carries none.
 ///
-/// It is the emulator's OWN endpoint — the authority this request arrived on —
-/// because the endpoint has to be reachable: the model notes "The returned
-/// endpoint does not have the API name appended. The client needs to add the API
-/// name to the returned endpoint", so a client appends `/putMedia` and must land
-/// back on this emulator.
-pub fn request_endpoint(parts: &::http::request::Parts, region: &str) -> String {
-    format!("https://{}", request_authority(parts, region))
-}
-
-/// The authority a data-plane client should address this emulator at — the authority
-/// this request arrived on, falling back to the service's real host form when the
-/// request carries none.
-///
-/// [`request_endpoint`] is this under `https://`; the signaling-channel endpoints
-/// report the same authority under the scheme each `ChannelProtocol` names, so every
-/// endpoint this service hands out is the one emulator a client can actually reach.
+/// It is NOT where a stream's media planes live: those are resolved per access mode by
+/// [`data_endpoint`], which is the whole point of `GetDataEndpoint`. The
+/// signaling-channel endpoints report this authority under the scheme each
+/// `ChannelProtocol` names.
 pub fn request_authority(parts: &::http::request::Parts, region: &str) -> String {
     let authority = parts
         .headers
@@ -805,6 +800,6 @@ pub fn request_authority(parts: &::http::request::Parts, region: &str) -> String
         .or_else(|| parts.uri.authority().map(ToString::to_string));
     match authority {
         Some(authority) => authority,
-        None => format!("kinesisvideo.{region}.amazonaws.com"),
+        None => service_host(region),
     }
 }

@@ -29,8 +29,9 @@ fn harness() -> MultiServiceRouter {
     router
 }
 
-/// The emulator endpoint every case addresses. Also the authority `GetDataEndpoint`
-/// has to hand back, so a data-plane client lands on this emulator again.
+/// The control-plane endpoint every case addresses. `GetDataEndpoint` resolves a
+/// stream's media calls to a DATA host instead of this one — the plane-by-plane rule
+/// `stream_data_endpoint.rs` covers.
 const ENDPOINT_HOST: &str = "kinesisvideo.us-east-1.amazonaws.com";
 
 /// POST one restJson1 call and return its status and parsed JSON body.
@@ -250,10 +251,11 @@ async fn a_stream_is_created_read_listed_endpointed_and_deleted() {
     )
     .await;
     assert_eq!(status, 200, "GetDataEndpoint: {body:?}");
-    assert_eq!(
+    assert_ne!(
         body.get("DataEndpoint").and_then(serde_json::Value::as_str),
         Some(format!("https://{ENDPOINT_HOST}").as_str()),
-        "the data endpoint must point back at this emulator: {body:?}"
+        "the data endpoint is the stream's ingest plane, not the control plane the call \
+         was made to: {body:?}"
     );
 
     let (status, body) = call(
@@ -587,10 +589,11 @@ async fn get_data_endpoint_serves_every_modeled_api_name() {
             status, 200,
             "case {api_name:?}: expected HTTP 200, got {status} with {body:?}"
         );
-        assert_eq!(
+        assert_ne!(
             body.get("DataEndpoint").and_then(serde_json::Value::as_str),
             Some(format!("https://{ENDPOINT_HOST}").as_str()),
-            "case {api_name:?}: got {body:?}"
+            "case {api_name:?}: the data endpoint must not be the control-plane one: \
+             {body:?}"
         );
     }
 
