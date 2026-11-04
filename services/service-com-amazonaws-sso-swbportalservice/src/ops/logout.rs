@@ -166,7 +166,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // UNREACHABLE with the engine the router mounts (see `ListAccounts` for the
             // full note): answered rather than panicked, and the 429 is the only
@@ -181,8 +180,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Invalidating the sign-in session is what this operation DOES. The role
         // credentials already minted for it are deliberately left alone: the model's own
         // documentation says role sessions created through a permission set "continue
-        // based on the duration configured in the permission set" after logout.
-        if !state.lock().invalidate_session(&input.access_token, now) {
+        // based on the duration configured in the permission set" after logout. What the
+        // sweep ends is only the credentials whose own duration has ALREADY run out, this
+        // session's and every other's alike (see
+        // `crate::state::end_expired_credentials`), which the clock owed anyway.
+        let mut state = state.lock();
+        crate::state::end_expired_credentials(&mut state, ctx.credential_store(), now);
+        if !state.invalidate_session(&input.access_token, now) {
             // One gate, one refusal (see `crate::state::unauthorized_session`).
             return Err(LogoutErrorModeled::UnauthorizedException(
                 crate::state::unauthorized_session(),

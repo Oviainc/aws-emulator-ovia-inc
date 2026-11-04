@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/bearer_token_gate.rs"]
 mod bearer_token_gate;
+#[path = "all/credential_expiry.rs"]
+mod credential_expiry;
 #[path = "all/endpoint_agnostic_routing.rs"]
 mod endpoint_agnostic_routing;
 #[path = "all/page_bound_clamp.rs"]

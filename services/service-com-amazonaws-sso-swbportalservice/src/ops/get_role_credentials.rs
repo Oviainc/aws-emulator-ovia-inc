@@ -7,7 +7,10 @@
 //! short-term credentials, so minting here is the operation's own job; the id and both
 //! secrets come from the emulator's credential store, and the record is kept in
 //! [`crate::state`] so the same session asking again sees the same credential until it
-//! expires.
+//! expires. At that expiration the credential is ended — in this store and in the
+//! emulator's credential store — by [`crate::state::end_expired_credentials`], which
+//! every operation of this service runs, so the instant this response advertises is the
+//! instant the emulator stops accepting what it minted.
 //!
 //! ## Shape of an operation
 //!
@@ -163,6 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
+        // Every credential whose advertised expiration has passed is spent, so it ends
+        // here before anything else is read or minted.
+        crate::state::end_expired_credentials(&mut state, ctx.credential_store(), now);
 
         // Resolve the session, then the assignment, before anything is minted. Both
         // answers are read out as plain values so the shared borrow of the store ends
@@ -198,20 +204,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.account_id.clone(),
             input.role_name.clone(),
         );
-        let held = state
-            .issued_credentials
-            .get(&key)
-            .filter(|record| record.is_valid_at(now))
-            .cloned();
+        // Whatever record this key still holds is one inside its own duration: the sweep
+        // above already ended every record the clock had made spent, so the same session
+        // asking again sees the credential it was given, and a session whose credential
+        // has run out is minted a fresh one.
+        let held = state.issued_credentials.get(&key).cloned();
         let record = match held {
             Some(record) => record,
             None => {
-                // A record that is present but past its expiration is spent: forget the
-                // credential it names before minting its replacement, so the emulator
-                // stops accepting it.
-                if let Some(spent) = state.issued_credentials.remove(&key) {
-                    let _ = ctx.credential_store().delete(&spent.access_key_id);
-                }
                 // The emulator mints every id and secret: a handler never invents one.
                 let minted = ctx
                     .credential_store()
@@ -237,9 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     access_key_id: minted.id.clone(),
                     secret_access_key: secret_access_key.to_string(),
                     session_token: session_token.to_string(),
-                    expiration_millis: crate::state::epoch_millis(
-                        now + crate::state::ROLE_SESSION_DURATION,
-                    ),
+                    expiration_millis: crate::state::epoch_millis(crate::state::expiry_after(
+                        now,
+                        crate::state::ROLE_SESSION_DURATION,
+                    )),
                 };
                 state.issued_credentials.insert(key, record.clone());
                 record

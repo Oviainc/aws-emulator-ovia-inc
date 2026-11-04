@@ -148,7 +148,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // UNREACHABLE with the engine the router mounts (see `ListAccounts` for the
             // full note): answered rather than panicked, and the 429 is the only
@@ -162,7 +161,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let state = state.lock();
+        let mut state = state.lock();
+        // The one write a listing makes, and only what the clock already owed (see
+        // `crate::state::end_expired_credentials`): nothing reported below depends on it.
+        crate::state::end_expired_credentials(&mut state, ctx.credential_store(), now);
         let Some(session) = state.session(&input.access_token, now) else {
             // One gate, one refusal (see `crate::state::unauthorized_session`).
             return Err(ListAccountRolesErrorModeled::UnauthorizedException(

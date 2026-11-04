@@ -13,8 +13,10 @@
 //! resolving a presented access token to a usable session
 //! ([`ComAmazonawsSsoSwbportalserviceState::session`]), wording the refusal when it
 //! resolves to nothing ([`unauthorized_session`], and [`unauthorized_response`] for the
-//! gate in [`crate::service`] that runs before any handler), and cutting a sorted
-//! listing into a page with an opaque cursor ([`page_of`]).
+//! gate in [`crate::service`] that runs before any handler), stamping an expiry without
+//! risking an overflow panic ([`expiry_after`]), ending the minted role credentials the
+//! clock has made spent ([`end_expired_credentials`]), and cutting a sorted listing into
+//! a page with an opaque cursor ([`page_of`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -167,6 +169,18 @@ fn furthest_representable_expiry() -> SystemTime {
     UNIX_EPOCH.checked_add(CENTURY).unwrap_or(UNIX_EPOCH)
 }
 
+/// `at` advanced by `duration` — the ONE way this service stamps an expiry.
+///
+/// `SystemTime + Duration` PANICS on a sum the platform's clock type cannot represent,
+/// so every expiry is computed here instead: the sign-in session's (whose ttl is the
+/// seeding caller's value) and the minted role credential's alike. An unrepresentable
+/// sum saturates at the furthest instant the clock can hold, which is "not expired" for
+/// every request anyway, and never earlier than `at` itself.
+pub fn expiry_after(at: SystemTime, duration: Duration) -> SystemTime {
+    at.checked_add(duration)
+        .unwrap_or_else(|| furthest_representable_expiry().max(at))
+}
+
 /// Per-service state for com-amazonaws-sso-swbportalservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSsoSwbportalserviceState {
@@ -219,12 +233,7 @@ impl ComAmazonawsSsoSwbportalserviceState {
             subject: subject.into(),
             accounts: accounts.into_iter().map(Into::into).collect(),
             active: true,
-            // `SystemTime + Duration` PANICS on a ttl the platform's clock type cannot
-            // represent, and `ttl` is the seeding caller's value, so saturate instead:
-            // an unrepresentable expiry is "not expired" for every request anyway.
-            expires_at: SystemTime::now()
-                .checked_add(ttl)
-                .unwrap_or_else(furthest_representable_expiry),
+            expires_at: expiry_after(SystemTime::now(), ttl),
         };
         self.sessions.insert(access_token.into(), session);
     }
@@ -271,6 +280,27 @@ impl ComAmazonawsSsoSwbportalserviceState {
         }
     }
 
+    /// Forget every role credential whose advertised expiration has passed at `now`, and
+    /// answer the access key id of each, so the caller can end it in the emulator's
+    /// credential store too (that is what [`end_expired_credentials`] does).
+    ///
+    /// A credential's expiration is the instant the CLOCK makes it spent, so ending it is
+    /// owed then — whether or not anyone ever asks for that role again, and whether or
+    /// not its sign-in session is still alive. Nothing about the shape of the request
+    /// that happens to materialise it enters into which records end: every record the
+    /// clock has made due does.
+    pub fn expire_credentials(&mut self, now: SystemTime) -> Vec<String> {
+        let mut ended = Vec::new();
+        self.issued_credentials.retain(|_, record| {
+            let valid = record.is_valid_at(now);
+            if !valid {
+                ended.push(record.access_key_id.clone());
+            }
+            valid
+        });
+        ended
+    }
+
     /// Who the role credential `access_key_id` speaks for: the subject of the sign-in
     /// session this portal issued that credential to, while the credential itself is
     /// still usable at `now`.
@@ -314,6 +344,36 @@ impl ComAmazonawsSsoSwbportalserviceState {
             .contains(account_id)
             .then(|| self.accounts.get(account_id))
             .flatten()
+    }
+}
+
+/// End every minted role credential the clock has made spent at `now`: drop its record
+/// here and forget the credential it names in the emulator's credential store, so the
+/// emulator stops accepting it for signing at exactly the `expiration` the response that
+/// minted it advertised.
+///
+/// Every handler calls this before it serves, because the expiration is due at its
+/// instant and not at the next request for the same role: a credential nobody asks about
+/// again has still run out. It materialises only what the clock already owed, so no
+/// response changes because this ran, and a credential still inside its own duration is
+/// untouched (the sign-in session having ended does not shorten it \u2014 see
+/// [`ComAmazonawsSsoSwbportalserviceState::invalidate_session`]).
+///
+/// A store that no longer holds the credential is already in the state this asks for, so
+/// the delete's error is nothing to report.
+pub fn end_expired_credentials(
+    state: &mut ComAmazonawsSsoSwbportalserviceState,
+    credential_store: &::emulator_server::CredentialStore,
+    now: SystemTime,
+) {
+    for access_key_id in state.expire_credentials(now) {
+        let _ = credential_store.delete(&access_key_id);
+        // The role session ended on its own duration: a state change no response
+        // carries. The access key id is a credential id, so it is not recorded.
+        tracing::debug!(
+            target: "sso.portal",
+            "a minted role credential reached its expiration and was ended"
+        );
     }
 }
 

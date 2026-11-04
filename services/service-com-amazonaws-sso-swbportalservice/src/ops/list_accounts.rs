@@ -149,7 +149,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // UNREACHABLE with the engine the router mounts: `service_state` answers
             // `None` only when the service was built on something that is not the shared
@@ -167,9 +166,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let state = state.lock();
-        // Reporting only: a listing writes nothing, so an expired session is simply not
-        // usable here rather than being swept.
+        let mut state = state.lock();
+        // The one write a listing makes, and only what the clock already owed: a minted
+        // role credential past its expiration is ended here, so it stops being accepted
+        // at that instant rather than at the next request for the same role. Nothing in
+        // the listing below changes because of it. An expired SESSION is left as it is:
+        // it is simply not usable, and `Logout` is what ends a session.
+        crate::state::end_expired_credentials(&mut state, ctx.credential_store(), now);
         let Some(session) = state.session(&input.access_token, now) else {
             // One gate, one refusal: the message comes from `crate::state`, so it is the
             // same constant every portal operation answers with.
