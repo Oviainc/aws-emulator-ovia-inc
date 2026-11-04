@@ -251,6 +251,11 @@ fn rows() -> Vec<Row> {
 /// `GetMetricData` query selects on. `vpc` appears under `EC2` because the VPC
 /// resource counts are published by the EC2 API.
 ///
+/// A service code may appear MORE THAN ONCE: `AWS/Usage` publishes some services'
+/// resource counts and their API call counts under different display names, and each is
+/// the value a query for that series has to name. Every entry of a code is accepted for
+/// a row of that service.
+///
 /// Restated here so a row that drifts back to a service's SDK/model id fails.
 const USAGE_METRIC_SERVICE_NAMES: &[(&str, &str)] = &[
     ("acm", "Certificate Manager"),
@@ -262,10 +267,12 @@ const USAGE_METRIC_SERVICE_NAMES: &[(&str, &str)] = &[
     ("dynamodb", "DynamoDB"),
     ("ec2", "EC2"),
     ("events", "EventBridge"),
-    // `AWS/Usage` publishes Amazon Data Firehose's usage under the service's current
-    // display name, which the recorded default-quota listing of `firehose` carries on
-    // every metered row — not the former "Kinesis Data Firehose" product name.
+    // `AWS/Usage` publishes Amazon Data Firehose's API call counts under the service's
+    // current display name, which the recorded default-quota listing of `firehose`
+    // carries on every metered rate row — not the former "Kinesis Data Firehose"
+    // product name — and its delivery-stream RESOURCE count under the short one.
     ("firehose", "Kinesis Firehose"),
+    ("firehose", "Firehose"),
     ("fms", "Firewall Manager"),
     ("fsx", "FSx"),
     ("gamelift", "GameLift"),
@@ -422,7 +429,10 @@ async fn every_usage_metric_names_the_service_as_aws_usage_publishes_it() {
     let engine = emulator();
     let client = client(&engine, "eu-west-1");
 
-    let published: BTreeMap<&str, &str> = USAGE_METRIC_SERVICE_NAMES.iter().copied().collect();
+    let mut published: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (service_code, usage_service) in USAGE_METRIC_SERVICE_NAMES {
+        published.entry(service_code).or_default().push(usage_service);
+    }
     let catalog = whole_catalog(&client).await;
     let mut metered = 0_usize;
 
@@ -449,9 +459,10 @@ async fn every_usage_metric_names_the_service_as_aws_usage_publishes_it() {
                 .get("Service")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            assert_eq!(
-                dimension, *expected,
-                "case {case}: expected the AWS/Usage service name, got {dimension:?}"
+            assert!(
+                expected.contains(&dimension),
+                "case {case}: expected an AWS/Usage service name of {expected:?}, got \
+                 {dimension:?}"
             );
             assert_ne!(
                 dimension,
@@ -464,7 +475,7 @@ async fn every_usage_metric_names_the_service_as_aws_usage_publishes_it() {
     }
 
     assert!(
-        metered >= USAGE_METRIC_SERVICE_NAMES.len(),
+        metered >= published.len(),
         "case catalog: the catalog must publish usage metrics for the metered quotas, got \
          {metered} rows"
     );

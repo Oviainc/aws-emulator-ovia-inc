@@ -45,6 +45,8 @@ mod default_quota_catalog_fidelity;
 mod default_quota_code_binding;
 #[path = "all/default_quota_published_codes.rs"]
 mod default_quota_published_codes;
+#[path = "all/default_quota_recorded_bindings.rs"]
+mod default_quota_recorded_bindings;
 #[path = "all/default_quota_row_text.rs"]
 mod default_quota_row_text;
 #[path = "all/default_quota_rows_under_aws_codes.rs"]

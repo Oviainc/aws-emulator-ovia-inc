@@ -132,16 +132,16 @@ const BOUND_ROWS: &[Bound] = &[
     Bound {
         service_code: "events",
         quota_code: "L-CB72B930",
-        quota_name: "DescribeRule throttle limit in transactions per second",
-        value: 50.0,
+        quota_name: "CreateEndpoint throttle limit in transactions per second",
+        value: 5.0,
         unit: "None",
         adjustable: false,
         description: Some(
-            "The maximum number of DescribeRule requests you can make per second in this \
+            "The maximum number of CreateEndpoint requests you can make per second in this \
              account in the current Region.",
         ),
         period: Some((1, "SECOND")),
-        metric: call_count("EventBridge", "DescribeRule"),
+        metric: call_count("EventBridge", "CreateEndpoint"),
     },
     // firehose — the rate rows, which this service publishes as not adjustable, under
     // the `AWS/Usage` display name its usage is published with.
@@ -176,7 +176,7 @@ const BOUND_ROWS: &[Bound] = &[
     Bound {
         service_code: "firehose",
         quota_code: "L-14BB0BE7",
-        quota_name: "Delivery streams per account",
+        quota_name: "Delivery streams",
         value: 5000.0,
         unit: "None",
         adjustable: true,
@@ -188,7 +188,7 @@ const BOUND_ROWS: &[Bound] = &[
         metric: Some((
             "ResourceCount",
             "Maximum",
-            "Kinesis Firehose",
+            "Firehose",
             "DeliveryStreams",
             "Resource",
         )),
@@ -405,8 +405,8 @@ const BOUND_ROWS: &[Bound] = &[
     Bound {
         service_code: "glue",
         quota_code: "L-4F4B522D",
-        quota_name: "Global S3 path max length",
-        value: 700.0,
+        quota_name: "Global s3 path max length",
+        value: 2000.0,
         unit: "None",
         adjustable: true,
         description: Some("Catalog: global s3 path max length"),
@@ -519,7 +519,7 @@ const BOUND_ROWS: &[Bound] = &[
     Bound {
         service_code: "guardduty",
         quota_code: "L-373487E5",
-        quota_name: "Finding retention",
+        quota_name: "Finding retention period",
         value: 90.0,
         unit: "None",
         adjustable: false,
@@ -549,7 +549,7 @@ const BOUND_ROWS: &[Bound] = &[
     Bound {
         service_code: "imagebuilder",
         quota_code: "L-1DF98342",
-        quota_name: "Infrastructure configurations",
+        quota_name: "Image recipes",
         value: 1000.0,
         unit: "None",
         adjustable: true,
