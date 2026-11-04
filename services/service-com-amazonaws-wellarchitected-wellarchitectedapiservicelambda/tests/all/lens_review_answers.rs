@@ -20,8 +20,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 
 use super::workload_harness::{
-    answered, answered_over, created_id, framework_choice_ids, minimal_create, official_lens_arn,
-    Answer, Client,
+    answered, answered_over, assert_field_validation, created_id, framework_choice_ids,
+    minimal_create, official_lens_arn, Answer, Client,
 };
 
 /// The published question numbering of the AWS Well-Architected Framework lens, pillar
@@ -320,9 +320,10 @@ async fn every_question_of_the_attached_lens_is_reported_unanswered() {
     );
 }
 
-/// `PillarId` and `QuestionPriority` FILTER the question set: each pillar reports its own
-/// published question count, a pillar the lens does not have reports nothing, and the
-/// priority filter selects by the `QuestionType` the questions carry.
+/// `PillarId` SELECTS the questions of one pillar of the lens and `QuestionPriority`
+/// filters by the `QuestionType` the questions carry: each pillar reports its own
+/// published question count, and a `PillarId` the lens does not define is refused rather
+/// than selecting nothing — the pillars are the lens's own content.
 #[tokio::test]
 async fn the_filters_narrow_the_question_set() {
     let client = Client::new();
@@ -336,18 +337,6 @@ async fn the_filters_narrow_the_question_set() {
             count,
         ));
     }
-    // A pillar id the lens does not have matches no question; so does the right pillar
-    // in the wrong case, because a `PillarId` is matched exactly.
-    cases.push((
-        "pillar-absent".to_string(),
-        vec!["PillarId=notapillar".to_string()],
-        0,
-    ));
-    cases.push((
-        "pillar-wrong-case".to_string(),
-        vec!["PillarId=SECURITY".to_string()],
-        0,
-    ));
     // `QuestionPriority` publishes PRIORITIZED | NONE (smithy_query: QuestionPriority).
     // Every question here is NON_PRIORITIZED, so NONE selects them all and PRIORITIZED
     // none of them.
@@ -407,6 +396,41 @@ async fn the_filters_narrow_the_question_set() {
                 );
             }
         }
+    }
+
+    // A `PillarId` the lens does not define is refused rather than selecting nothing —
+    // including the right pillar in the wrong case, because a `PillarId` is matched
+    // exactly.
+    for (case, pillar) in [
+        ("pillar-absent", "notapillar"),
+        ("pillar-wrong-case", "SECURITY"),
+    ] {
+        let answer = list_answers(
+            &client,
+            &workload_id,
+            FRAMEWORK_LENS,
+            &[format!("PillarId={pillar}")],
+        )
+        .await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: a pillar the lens does not define is refused, got {answer:?}"
+        );
+        assert_eq!(
+            answer.error_code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {answer:?}"
+        );
+        assert_eq!(
+            answer
+                .body
+                .get("Fields")
+                .and_then(Value::as_array)
+                .and_then(|fields| fields.first())
+                .and_then(|field| field.get("Name"))
+                .and_then(Value::as_str),
+            Some("PillarId"),
+            "case {case:?}: the finding must name PillarId, got {answer:?}"
+        );
     }
 }
 
@@ -517,8 +541,10 @@ struct MissingReview {
     message: String,
 }
 
-/// The review that is read must exist: the workload is resolved, the milestone is
-/// resolved when one is named, and the lens must be associated with the workload. An
+/// The review that is read must exist: the workload is RESOLVED — so an id nothing is
+/// stored under, and a milestone the workload never recorded, are each the modelled 404 —
+/// while the lens is a VALUE of the request, so a lens the workload does not review is the
+/// modelled 400 naming `LensAlias`. An
 /// associated lens this emulator ships no question set for asks nothing, so its review
 /// is empty rather than missing.
 #[tokio::test]
@@ -546,28 +572,6 @@ async fn a_review_that_does_not_exist_is_a_not_found() {
             resource_type: "WORKLOAD",
             resource_id: ABSENT_HEX_ID.to_string(),
             message: not_found_message(&format!("workload with ID {ABSENT_HEX_ID}")),
-        },
-        MissingReview {
-            case: "lens-not-associated",
-            workload_id: workload_id.clone(),
-            lens: UNSHIPPED_LENS,
-            filters: Vec::new(),
-            resource_type: "LENS_REVIEW",
-            resource_id: format!("{workload_id}.{UNSHIPPED_LENS}"),
-            message: not_found_message(&format!(
-                "review of lens {UNSHIPPED_LENS} in a workload with ID {workload_id}"
-            )),
-        },
-        MissingReview {
-            case: "framework-lens-not-associated",
-            workload_id: unshipped_id.clone(),
-            lens: FRAMEWORK_LENS,
-            filters: Vec::new(),
-            resource_type: "LENS_REVIEW",
-            resource_id: format!("{unshipped_id}.{FRAMEWORK_LENS}"),
-            message: not_found_message(&format!(
-                "review of lens {FRAMEWORK_LENS} in a workload with ID {unshipped_id}"
-            )),
         },
         MissingReview {
             case: "milestone-not-recorded",
@@ -626,6 +630,21 @@ async fn a_review_that_does_not_exist_is_a_not_found() {
             member(&answer, "Message"),
             message,
             "case {case:?}: expected the resource/account not-found message, got {answer:?}"
+        );
+    }
+
+    // A lens the workload does not review names no review of it, whichever workload of the
+    // two is asked and whichever lens it is: the value is refused as input.
+    for (case, host, lens) in [
+        ("lens-not-associated", &workload_id, UNSHIPPED_LENS),
+        ("framework-lens-not-associated", &unshipped_id, FRAMEWORK_LENS),
+    ] {
+        let answer = list_answers(&client, host, lens, &[]).await;
+        assert_field_validation(
+            case,
+            &answer,
+            "LensAlias",
+            &format!("No lens review for lens alias {lens} was found in workload {host}."),
         );
     }
 

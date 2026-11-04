@@ -284,18 +284,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // handler has already bounded, and before the template quota below, so a caller
         // learns that its request named no lens rather than that the account is full.
         let now = std::time::SystemTime::now();
-        match store.unapplicable_lenses_refusal(&lenses, crate::state::LENSES_MEMBER) {
-            Some(crate::state::LensesRefusal::NotFound(exception)) => {
-                return Err(
-                    CreateReviewTemplateErrorModeled::ResourceNotFoundException(exception).into(),
-                );
-            }
-            Some(crate::state::LensesRefusal::Unapplicable(exception)) => {
-                return Err(
-                    CreateReviewTemplateErrorModeled::ValidationException(exception).into(),
-                );
-            }
-            None => {}
+        if let Some(refusal) = store.unapplicable_lenses_refusal(&lenses, crate::state::LENSES_MEMBER)
+        {
+            return Err(CreateReviewTemplateErrorModeled::ValidationException(
+                crate::service::lens_content_validation::unapplicable_lenses(refusal),
+            )
+            .into());
         }
 
         // A review template's name identifies it within the account, so a request naming

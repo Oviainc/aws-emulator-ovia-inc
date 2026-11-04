@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::AnswerRecord;
 
 use super::workload_harness::{
-    answered, created_id, encode_path_segment, framework_answer,
+    answered, assert_field_validation, created_id, encode_path_segment, framework_answer,
     framework_answer_that_does_not_apply, minimal_create, official_lens_arn, Answer, Client,
     InPlace,
 };
@@ -552,10 +552,11 @@ async fn a_review_of_a_lens_without_content_reports_no_pillars() {
     }
 }
 
-/// The review that is read must exist: the workload is resolved, the lens has to be one
-/// the workload carries and a milestone has to have been recorded. Each miss is the
-/// modelled 404; a `MilestoneNumber` outside the modelled range is the modelled 400,
-/// checked at each published bound and one past it.
+/// The review that is read must exist: the workload is RESOLVED — so an id nothing is
+/// stored under, and a milestone nothing recorded, are each the modelled 404 — while the
+/// lens is a VALUE of the request, so a lens the workload does not carry is the modelled
+/// 400 naming `LensAlias`. A `MilestoneNumber` outside the modelled range is the modelled
+/// 400, checked at each published bound and one past it.
 #[tokio::test]
 async fn a_review_that_does_not_exist_does_not_resolve() {
     let client = Client::new();
@@ -572,18 +573,6 @@ async fn a_review_that_does_not_exist_does_not_resolve() {
 
     for (case, workload, lens, milestone) in [
         ("absent-workload", ABSENT_HEX_ID, FRAMEWORK_LENS, None),
-        (
-            "lens-not-attached",
-            workload_id.as_str(),
-            UNSHIPPED_LENS,
-            None,
-        ),
-        (
-            "custom-lens-not-attached",
-            workload_id.as_str(),
-            "arn:aws:wellarchitected:us-west-2:000000000000:lens/0123456789abcdef0123456789abcdef",
-            None,
-        ),
         (
             "milestone-not-recorded",
             workload_id.as_str(),
@@ -606,11 +595,29 @@ async fn a_review_that_does_not_exist_does_not_resolve() {
         let answer = get_lens_review(&client, workload, lens, milestone).await;
         assert_eq!(
             answer.status, 404,
-            "case {case:?}: a review that does not exist is a 404, got {answer:?}"
+            "case {case:?}: a resource that does not exist is a 404, got {answer:?}"
         );
         assert_eq!(
             answer.error_code, "ResourceNotFoundException",
             "case {case:?}: the miss must be the modelled error, got {answer:?}"
+        );
+    }
+
+    // A lens the workload does not carry names no review of it, under either spelling of
+    // the name: the value is refused as input.
+    for (case, lens) in [
+        ("lens-not-attached", UNSHIPPED_LENS),
+        (
+            "custom-lens-not-attached",
+            "arn:aws:wellarchitected:us-west-2:000000000000:lens/0123456789abcdef0123456789abcdef",
+        ),
+    ] {
+        let answer = get_lens_review(&client, &workload_id, lens, None).await;
+        assert_field_validation(
+            case,
+            &answer,
+            "LensAlias",
+            &format!("No lens review for lens alias {lens} was found in workload {workload_id}."),
         );
     }
 

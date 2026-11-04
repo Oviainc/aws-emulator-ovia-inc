@@ -183,11 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // A lens review of a template exists only while that lens is applied to it, so a
-        // lens the template does not carry has no review to report.
+        // lens the template does not carry names no review to report — a value of
+        // `LensAlias` this service refuses rather than a resource it could not find
+        // (`crate::service::lens_content_validation`).
         if !template.applies_lens(&input.lens_alias) {
             return Err(
-                GetReviewTemplateLensReviewErrorModeled::ResourceNotFoundException(
-                    crate::state::review_template_lens_review_not_found(
+                GetReviewTemplateLensReviewErrorModeled::ValidationException(
+                    crate::service::lens_content_validation::no_review_template_lens_review(
                         &template.template_arn,
                         &input.lens_alias,
                     ),

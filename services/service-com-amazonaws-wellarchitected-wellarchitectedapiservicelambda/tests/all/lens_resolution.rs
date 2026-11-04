@@ -12,8 +12,9 @@
 //! CreateLensVersion", `ImportLens` doc). A create whose list carries an entry that names
 //! no such lens records NOTHING and is refused:
 //!
-//! * a `404 ResourceNotFoundException` over the `LENS` resource type, carrying the entry AS
-//!   SENT, when the name resolves to no lens at all;
+//! * a `400 ValidationException` naming the lens the service could not get, carrying the
+//!   entry AS SENT, when the name resolves to no lens at all — the name is a VALUE of the
+//!   request, so it is refused as input and not reported as a missing resource;
 //! * a `400 ValidationException` naming `Lenses`, when the entry names a custom lens that
 //!   exists and has no published version — the lens resolved, so what the request got wrong
 //!   is the member value.
@@ -35,7 +36,9 @@ use super::custom_lens_import::{
     import, imported_arn, lens_document, member, wait_for_the_import_to_land, ABSENT_LENS_ARN,
 };
 use super::custom_lens_versions::create_version;
-use super::workload_harness::{minimal_create, official_lens_arn, Answer, Client};
+use super::workload_harness::{
+    assert_unresolvable_lens, minimal_create, official_lens_arn, Answer, Client,
+};
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
 
@@ -188,8 +191,8 @@ async fn every_lens_of_the_official_catalog_can_be_applied() {
     }
 }
 
-/// A `Lenses` entry that names no lens is a 404 and records nothing — on both the operations
-/// that apply lenses.
+/// A `Lenses` entry that names no lens is the modelled 400 naming the lens the service
+/// could not get, and records nothing — on both the operations that apply lenses.
 ///
 /// The rows differ along WHAT the name is: a bare word no catalog alias carries, a near
 /// miss of one, a catalog alias in another case (catalog membership is exact — AWS's
@@ -257,24 +260,7 @@ async fn a_lenses_entry_that_names_no_lens_is_refused_and_stores_nothing() {
                         .await,
                 ),
             ] {
-                assert_eq!(
-                    answer.status, 404,
-                    "case {case:?}: {operation} must not find the lens {entry:?}, got {answer:?}"
-                );
-                assert_eq!(
-                    answer.error_code, "ResourceNotFoundException",
-                    "case {case:?}: {operation} expected ResourceNotFoundException, got {answer:?}"
-                );
-                assert_eq!(
-                    member(&answer, "ResourceType"),
-                    "LENS",
-                    "case {case:?}: {operation} must name the missing resource's type, got {answer:?}"
-                );
-                assert_eq!(
-                    member(&answer, "ResourceId"),
-                    entry.as_str(),
-                    "case {case:?}: {operation} must name the entry as sent, got {answer:?}"
-                );
+                assert_unresolvable_lens(&format!("{case}/{operation}"), &answer, entry);
             }
 
             assert_eq!(

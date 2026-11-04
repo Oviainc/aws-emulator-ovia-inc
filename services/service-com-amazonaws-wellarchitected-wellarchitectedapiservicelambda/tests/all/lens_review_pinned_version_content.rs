@@ -555,14 +555,15 @@ async fn a_lens_review_reports_the_content_of_the_version_it_is_against() {
             .await;
 
             // A question only the published version asks belongs to no answer of this
-            // review, and every question the pinned version asks still does.
+            // review — a value of `QuestionId` this service refuses — and every question the
+            // pinned version asks still resolves.
             let pinned_ids = expected_question_ids(row.pinned);
             for question_id in expected_question_ids(shape) {
                 let answer = get_answer(&client, &workload_id, &arn, &question_id).await;
                 let expected = if pinned_ids.contains(&question_id) {
                     200
                 } else {
-                    404
+                    400
                 };
                 assert_eq!(
                     answer.status, expected,

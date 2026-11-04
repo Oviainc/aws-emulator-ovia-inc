@@ -40,7 +40,9 @@ use super::custom_lens_review_answers::{
     expected_questions, import_shape, publish, reported_choices, string_member, ExpectedQuestion,
     Shape,
 };
-use super::workload_harness::{assert_not_found, member, review_template, Answer, Client};
+use super::workload_harness::{
+    assert_field_validation, member, review_template, Answer, Client,
+};
 
 /// The `LensVersion` every row publishes its imported lens as, which is also the version a
 /// review of it is against.
@@ -56,10 +58,6 @@ const UNANSWERED: &str = "UNANSWERED";
 /// records as in place, and of one it does not.
 const SELECTED: &str = "SELECTED";
 const UNSELECTED: &str = "UNSELECTED";
-
-/// `ResourceNotFoundException$ResourceType` for a question of a lens review, as this
-/// service's lookup refusals word it.
-const QUESTION_RESOURCE_TYPE: &str = "QUESTION";
 
 /// A `QuestionId` of the AWS Well-Architected Framework lens, as this emulator's own stable
 /// ids spell it (pinned by `super::question_choice_catalog`): a question no imported
@@ -478,14 +476,13 @@ async fn a_write_reaches_the_same_review_however_it_spells_the_imported_lens() {
                 json!({ "Notes": "nothing to record" }),
             )
             .await;
-        assert_not_found(
+        assert_field_validation(
             &format!("unasked-question/{label}"),
             &refused,
-            QUESTION_RESOURCE_TYPE,
-            &format!("{template_arn}.{spelling}.{FRAMEWORK_QUESTION}"),
+            "QuestionId",
             &format!(
-                "question with ID {FRAMEWORK_QUESTION} in the review of lens {spelling} in a \
-                 review template with ARN {template_arn}"
+                "No question with ID {FRAMEWORK_QUESTION} was found in the lens with alias \
+                 {spelling}."
             ),
         );
     }

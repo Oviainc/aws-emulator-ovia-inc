@@ -247,10 +247,23 @@ async fn repeated_reads_report_the_same_review_and_change_nothing() {
     }
 }
 
+/// One row of the label table: the case, the `TemplateArn` and the `LensAlias` the request
+/// carries, the status it must answer, the member its `Message` must name, and the member a
+/// `Fields` finding must name — `None` where the refusal carries no finding.
+type LabelRow<'row> = (
+    &'row str,
+    &'row str,
+    &'row str,
+    u16,
+    Option<&'row str>,
+    Option<&'row str>,
+);
+
 /// Each `@httpLabel` is judged against its own published constraints before anything is
-/// looked up: outside them the answer is the modelled 400 naming that member, inside them
-/// a label that names nothing stored is the modelled 404 — and either way nothing is
-/// stored.
+/// looked up: outside them the answer is the modelled 400 naming that member, inside them a
+/// `TemplateArn` that names nothing stored is the modelled 404 and a `LensAlias` that names
+/// no lens review of the stored template is the modelled 400 whose `Fields` names it — and
+/// either way nothing is stored.
 ///
 /// Rows differ along which member is at fault, which constraint it breaks (`@length` at
 /// each published bound and one past it, the ARN `@pattern` in its resource type, its
@@ -294,20 +307,21 @@ async fn a_label_outside_its_published_constraints_is_refused_before_any_lookup(
         "z".repeat(32)
     );
 
-    // (case, TemplateArn, LensAlias, expected status, the member the refusal must name)
-    let rows: [(&str, &str, &str, u16, Option<&str>); 11] = [
+    let rows: [LabelRow<'_>; 11] = [
         (
             "arn-under-the-published-minimum",
             under_the_arn_minimum.as_str(),
             FRAMEWORK_LENS,
             400,
             Some("templateArn"),
+            None,
         ),
         (
             "arn-one-under-the-published-maximum",
             one_under_the_arn_maximum.as_str(),
             FRAMEWORK_LENS,
             404,
+            None,
             None,
         ),
         (
@@ -316,6 +330,7 @@ async fn a_label_outside_its_published_constraints_is_refused_before_any_lookup(
             FRAMEWORK_LENS,
             404,
             None,
+            None,
         ),
         (
             "arn-one-past-the-published-maximum",
@@ -323,6 +338,7 @@ async fn a_label_outside_its_published_constraints_is_refused_before_any_lookup(
             FRAMEWORK_LENS,
             400,
             Some("templateArn"),
+            None,
         ),
         (
             "arn-of-another-resource-type",
@@ -330,6 +346,7 @@ async fn a_label_outside_its_published_constraints_is_refused_before_any_lookup(
             FRAMEWORK_LENS,
             400,
             Some("templateArn"),
+            None,
         ),
         (
             "arn-with-an-11-digit-account",
@@ -337,6 +354,7 @@ async fn a_label_outside_its_published_constraints_is_refused_before_any_lookup(
             FRAMEWORK_LENS,
             400,
             Some("templateArn"),
+            None,
         ),
         (
             "arn-with-a-non-hex-resource-id",
@@ -344,20 +362,26 @@ async fn a_label_outside_its_published_constraints_is_refused_before_any_lookup(
             FRAMEWORK_LENS,
             400,
             Some("templateArn"),
+            None,
         ),
+        // Inside its published constraints, so the handler judges it: the alias names no
+        // lens review of the stored template, which is a value of the request and so a 400
+        // whose `Fields` names the member that carried it.
         (
             "alias-on-the-published-minimum",
             stored_arn.as_str(),
             shortest_alias.as_str(),
-            404,
-            None,
+            400,
+            Some("lens alias"),
+            Some("LensAlias"),
         ),
         (
             "alias-on-the-published-maximum",
             stored_arn.as_str(),
             longest_alias.as_str(),
-            404,
-            None,
+            400,
+            Some("lens alias"),
+            Some("LensAlias"),
         ),
         (
             "alias-one-past-the-published-maximum",
@@ -365,20 +389,22 @@ async fn a_label_outside_its_published_constraints_is_refused_before_any_lookup(
             too_long_alias.as_str(),
             400,
             Some("lensAlias"),
+            None,
         ),
         // BOTH labels break their published constraints and neither names anything
-        // stored: the answer is the 400 and not the 404, so the constraint check runs
-        // before the lookup rather than after it.
+        // stored: the answer is the boundary's 400 naming the ARN, so the constraint check
+        // runs before the lookup rather than after it.
         (
             "malformed-arn-beside-a-malformed-lens",
             non_hex_resource_id.as_str(),
             too_long_alias.as_str(),
             400,
             Some("templateArn"),
+            None,
         ),
     ];
 
-    for (case, template_arn, lens_alias, expected, member) in rows {
+    for (case, template_arn, lens_alias, expected, member, fields_member) in rows {
         let answer = client
             .get_review_template_lens_review(template_arn, lens_alias)
             .await;
@@ -412,18 +438,39 @@ async fn a_label_outside_its_published_constraints_is_refused_before_any_lookup(
             "case {case:?}: Message is @required on every modelled error of this \
              operation, got {answer:?}"
         );
-        if expected == 400 {
+        match fields_member {
             // A member value refused while the request is still being read as a shape is
             // not classified: the modelled `ValidationExceptionReason` and `Fields`
             // describe a rule the service ran over a request it could read, and no rule
             // ran here. This is the envelope `super::validation_envelopes` pins for the
             // same constraint classes reached through a body member.
-            assert_eq!(
+            None if expected == 400 => assert_eq!(
                 (answer.body.get("Reason"), answer.body.get("Fields")),
                 (None, None),
                 "case {case:?}: a label outside its shape's constraints carries the \
                  Message alone, got {answer:?}"
-            );
+            ),
+            // A value the handler judged against the lens content IS classified, and the
+            // finding names the member that carried it.
+            Some(named) => {
+                assert_eq!(
+                    answer.body.get("Reason").and_then(Value::as_str),
+                    Some("FIELD_VALIDATION_FAILED"),
+                    "case {case:?}: a refused value is classified, got {answer:?}"
+                );
+                assert_eq!(
+                    answer
+                        .body
+                        .get("Fields")
+                        .and_then(Value::as_array)
+                        .and_then(|fields| fields.first())
+                        .and_then(|field| field.get("Name"))
+                        .and_then(Value::as_str),
+                    Some(named),
+                    "case {case:?}: the finding must name {named}, got {answer:?}"
+                );
+            }
+            None => {}
         }
     }
 

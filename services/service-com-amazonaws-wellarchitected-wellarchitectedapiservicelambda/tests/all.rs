@@ -523,3 +523,8 @@ mod regional_resource_scope;
 // position for a check suite falls beside the two check suites it spans.
 #[path = "all/check_best_practice_agreement.rs"]
 mod check_best_practice_agreement;
+
+// Appended at the end of this list for the same reason as the declaration above: modules
+// are appended here so a new suite does not collide with another insertion.
+#[path = "all/lens_content_validation.rs"]
+mod lens_content_validation;

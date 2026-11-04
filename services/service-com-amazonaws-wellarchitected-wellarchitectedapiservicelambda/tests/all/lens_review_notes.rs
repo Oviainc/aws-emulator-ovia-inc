@@ -37,7 +37,8 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use super::workload_harness::{
-    answered, created_id, encode_path_segment, minimal_create, official_lens_arn, Answer, Client,
+    answered, assert_field_validation, created_id, encode_path_segment, minimal_create,
+    official_lens_arn, Answer, Client,
 };
 
 /// The pillars of the AWS Well-Architected Framework lens, in the order the framework
@@ -833,31 +834,52 @@ async fn a_milestone_freezes_the_notes_it_recorded() {
     );
 }
 
-/// The review that is written has to exist: the workload is resolved and the lens has to
-/// be one the workload carries. Each miss is the modelled 404, and nothing is stored.
+/// The review that is written has to exist: the workload is RESOLVED, so an id nothing is
+/// stored under is the modelled 404, while the lens is a VALUE of the request, so a lens
+/// the workload does not carry is the modelled 400 naming `LensAlias`. Nothing is stored
+/// either way.
 #[tokio::test]
 async fn a_review_that_does_not_exist_cannot_be_written() {
     let client = Client::new();
     let workload_id = workload_with_lens(&client, "write-lookup", FRAMEWORK_LENS).await;
 
-    for (case, workload, lens) in [
-        ("absent-workload", ABSENT_HEX_ID, FRAMEWORK_LENS),
-        ("lens-not-attached", workload_id.as_str(), UNSHIPPED_LENS),
+    let absent = update_lens_review(
+        &client,
+        ABSENT_HEX_ID,
+        FRAMEWORK_LENS,
+        json!({ "LensNotes": "nowhere" }),
+    )
+    .await;
+    assert_eq!(
+        absent.status, 404,
+        "case \"absent-workload\": expected HTTP 404, got {absent:?}"
+    );
+    assert_eq!(
+        absent.error_code, "ResourceNotFoundException",
+        "case \"absent-workload\": expected a ResourceNotFoundException, got {absent:?}"
+    );
+
+    // The rows differ along how the unattached lens is named, because what the request asks
+    // for does not depend on the spelling.
+    for (case, lens) in [
+        ("lens-not-attached", UNSHIPPED_LENS),
         (
             "lens-not-attached-by-arn",
-            workload_id.as_str(),
             "arn:aws:wellarchitected:us-west-2::lens/serverless",
         ),
     ] {
-        let answer =
-            update_lens_review(&client, workload, lens, json!({ "LensNotes": "nowhere" })).await;
-        assert_eq!(
-            answer.status, 404,
-            "case {case:?}: expected HTTP 404, got {answer:?}"
-        );
-        assert_eq!(
-            answer.error_code, "ResourceNotFoundException",
-            "case {case:?}: expected a ResourceNotFoundException, got {answer:?}"
+        let answer = update_lens_review(
+            &client,
+            &workload_id,
+            lens,
+            json!({ "LensNotes": "nowhere" }),
+        )
+        .await;
+        assert_field_validation(
+            case,
+            &answer,
+            "LensAlias",
+            &format!("No lens review for lens alias {lens} was found in workload {workload_id}."),
         );
     }
 

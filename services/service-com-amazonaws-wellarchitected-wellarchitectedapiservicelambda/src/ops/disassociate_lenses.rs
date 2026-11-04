@@ -211,14 +211,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // while that lens is associated with the workload, so a lens the workload does not
         // review has no review to disassociate, whatever the lens catalog says about the
         // name. The walk stops at the first lens it refuses and costs one scan of the
-        // attached lenses per name, over a list the quota above has already bounded.
+        // attached lenses per name, over a list the quota above has already bounded. A lens
+        // the workload does not review is a value of `LensAliases` this service refuses
+        // rather than a resource it could not find
+        // (`crate::service::lens_content_validation`).
         if let Some(unreviewed) = input
             .lens_aliases
             .iter()
             .find(|lens| !workload.reviews_lens(lens))
         {
-            return Err(DisassociateLensesErrorModeled::ResourceNotFoundException(
-                crate::state::lens_review_not_found(&input.workload_id, unreviewed),
+            return Err(DisassociateLensesErrorModeled::ValidationException(
+                crate::service::lens_content_validation::no_lens_review(
+                    &input.workload_id,
+                    unreviewed,
+                ),
             )
             .into());
         }

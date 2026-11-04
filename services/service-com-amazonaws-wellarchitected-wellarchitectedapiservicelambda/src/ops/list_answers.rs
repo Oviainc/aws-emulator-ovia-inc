@@ -217,12 +217,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The answers of a lens review exist only while that lens is associated with the
-        // workload, so a lens the workload does not carry has no review to report.
+        // workload, so a lens the workload does not carry names no review to report — a
+        // value of `LensAlias` this service refuses rather than a resource it could not
+        // find (`crate::service::lens_content_validation`).
         if !workload.reviews_lens(&input.lens_alias) {
-            return Err(ListAnswersErrorModeled::ResourceNotFoundException(
-                crate::state::lens_review_not_found(&input.workload_id, &input.lens_alias),
+            return Err(ListAnswersErrorModeled::ValidationException(
+                crate::service::lens_content_validation::no_lens_review(
+                    &input.workload_id,
+                    &input.lens_alias,
+                ),
             )
             .into());
+        }
+
+        // `PillarId` names a pillar OF THE LENS under review, and the pillars of a lens are
+        // what that lens's content defines, so a value naming none of them belongs to no
+        // pillar of this review: it is refused through the one place this service words that
+        // refusal (`crate::service::lens_content_validation`) rather than silently filtering
+        // the answer set down to nothing.
+        if let Some(exception) = crate::service::lens_content_validation::undefined_pillar(
+            &input.lens_alias,
+            &store.lens_content_at(
+                &input.lens_alias,
+                workload.lens_review_version(&input.lens_alias),
+            ),
+            input.pillar_id.as_deref(),
+        ) {
+            return Err(ListAnswersErrorModeled::ValidationException(exception).into());
         }
 
         // The lens's questions, in the lens's own order, narrowed by the request's
@@ -230,9 +251,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is the LENS's own content — an AWS-official lens's catalog entry or a custom
         // lens's imported document — which is what
         // `crate::state::...::lens_review_questions` resolves, for the lens VERSION this
-        // review is against. `PillarId` and
-        // `QuestionPriority` FILTER that set rather than resolving anything, so a value
-        // that matches no question is an empty page.
+        // review is against. `PillarId` was resolved against that content above, so what it
+        // does here is SELECT the pillar's questions; `QuestionPriority` filters rather than
+        // resolving anything, so a priority no question carries is an empty page.
         //
         // Every question of a workload lens review here carries
         // `crate::state::DEFAULT_QUESTION_TYPE`, so the priority filter selects all of

@@ -7,8 +7,10 @@
 //! template's lens review reports one `ReviewTemplateAnswerSummary` per question the
 //! applied lens asks, in the lens's own order, narrowed by the request's `PillarId`
 //! filter and paged by `MaxResults`/`NextToken`; each summary carries the answer the
-//! TEMPLATE stores for that question and `UNANSWERED` where it stores none, and a
-//! `TemplateArn` or a lens the template does not apply resolves to a modelled 404.
+//! TEMPLATE stores for that question and `UNANSWERED` where it stores none; a
+//! `TemplateArn` nothing is stored under is a modelled 404, while a lens the template does
+//! not apply and a `PillarId` the lens does not define are each the modelled 400 naming
+//! the member that carried the value.
 //!
 //! Requests go through the real `MultiServiceRouter`, so routing, restJson1
 //! (de)serialization, boundary constraint validation and the handler all run as they do
@@ -22,7 +24,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
 
 use super::workload_harness::{
-    answered, answered_over, framework_choice_ids, review_template as template, Answer, Client,
+    answered, answered_over, assert_field_validation, framework_choice_ids,
+    review_template as template, Answer, Client,
 };
 
 /// The published question numbering of the AWS Well-Architected Framework lens, pillar
@@ -474,9 +477,9 @@ async fn a_stored_answer_is_reported_on_its_question() {
     }
 }
 
-/// `PillarId` narrows the question set and resolves nothing: each pillar of the catalog
-/// is a row — including the pillars no issue cited — and a pillar the lens does not ask
-/// about is an EMPTY page rather than a failure.
+/// `PillarId` SELECTS the questions of one pillar of the lens: each pillar of the catalog
+/// is a row — including the pillars no issue cited — and a value naming no pillar of the
+/// lens is refused, because the pillars are the lens's own content.
 #[tokio::test]
 async fn the_pillar_filter_narrows_the_page() {
     let client = Client::new();
@@ -507,7 +510,8 @@ async fn the_pillar_filter_narrows_the_page() {
         );
     }
 
-    // A pillar this lens asks nothing about matches no question.
+    // A pillar this lens does not define belongs to no pillar of the review, so the value
+    // is refused rather than selecting nothing.
     let answer = list_answers(
         &client,
         &template_arn,
@@ -516,16 +520,23 @@ async fn the_pillar_filter_narrows_the_page() {
     )
     .await;
     assert_eq!(
-        answer.status, 200,
-        "case \"unknown-pillar\": a filter that matches nothing is an empty page, got {answer:?}"
+        answer.status, 400,
+        "case \"unknown-pillar\": a pillar the lens does not define is refused, got {answer:?}"
     );
-    assert!(
-        summaries_of(&answer).is_empty(),
-        "case \"unknown-pillar\": expected no summaries, got {answer:?}"
+    assert_eq!(
+        answer.error_code, "ValidationException",
+        "case \"unknown-pillar\": expected ValidationException, got {answer:?}"
     );
-    assert!(
-        answer.body.get("NextToken").is_none(),
-        "case \"unknown-pillar\": a last page carries no NextToken, got {answer:?}"
+    assert_eq!(
+        answer
+            .body
+            .get("Fields")
+            .and_then(Value::as_array)
+            .and_then(|fields| fields.first())
+            .and_then(|field| field.get("Name"))
+            .and_then(Value::as_str),
+        Some("PillarId"),
+        "case \"unknown-pillar\": the finding must name PillarId, got {answer:?}"
     );
 }
 
@@ -664,58 +675,53 @@ async fn an_unissued_next_token_is_refused() {
 }
 
 /// The lens review is resolved from the TEMPLATE's own state: a `TemplateArn` that names
-/// no stored template, and a lens the stored template does not apply, are each the
-/// modelled 404 carrying the identifier as sent and the missing resource's type.
+/// no stored template is the modelled 404 carrying the ARN as sent and the missing
+/// resource's type, and a lens the stored template does not apply is the modelled 400
+/// naming `LensAlias` — the lens is a VALUE of the request, not a resource it identifies.
 #[tokio::test]
-async fn an_unresolvable_template_or_lens_review_is_a_404() {
+async fn an_unresolvable_template_or_lens_review_is_refused() {
     let client = Client::new();
     let template_arn = template(&client, "resolved-template", &[FRAMEWORK_LENS]).await;
     let deleted_template = absent_template_arn("0123456789abcdef0123456789abcdef");
 
-    // (case, template ARN, lens, expected ResourceType, expected ResourceId)
-    let cases: Vec<(&str, String, &str, &str, String)> = vec![
-        (
-            "absent-template",
-            deleted_template.clone(),
-            FRAMEWORK_LENS,
-            "REVIEW_TEMPLATE",
-            deleted_template,
-        ),
-        (
-            "lens-not-applied",
-            template_arn.clone(),
-            UNSHIPPED_LENS,
-            "LENS_REVIEW",
-            format!("{template_arn}.{UNSHIPPED_LENS}"),
-        ),
+    let absent = list_answers(&client, &deleted_template, FRAMEWORK_LENS, &[]).await;
+    assert_eq!(
+        absent.status, 404,
+        "case \"absent-template\": an unresolvable template is a 404, got {absent:?}"
+    );
+    assert_eq!(
+        absent.error_code, "ResourceNotFoundException",
+        "case \"absent-template\": expected ResourceNotFoundException, got {absent:?}"
+    );
+    assert_eq!(
+        absent.body.get("ResourceType").and_then(Value::as_str),
+        Some("REVIEW_TEMPLATE"),
+        "case \"absent-template\": expected ResourceType REVIEW_TEMPLATE, got {absent:?}"
+    );
+    assert_eq!(
+        absent.body.get("ResourceId").and_then(Value::as_str),
+        Some(deleted_template.as_str()),
+        "case \"absent-template\": expected the ARN as sent, got {absent:?}"
+    );
+
+    // The rows differ along how the unapplied lens is named, because what the request asks
+    // for does not depend on the spelling.
+    for (case, lens) in [
+        ("lens-not-applied", UNSHIPPED_LENS),
         (
             "lens-not-applied-by-arn",
-            template_arn.clone(),
             "arn:aws:wellarchitected:us-east-1::lens/softwareasaservice",
-            "LENS_REVIEW",
-            format!("{template_arn}.arn:aws:wellarchitected:us-east-1::lens/softwareasaservice"),
         ),
-    ];
-
-    for (case, arn, lens, resource_type, resource_id) in cases {
-        let answer = list_answers(&client, &arn, lens, &[]).await;
-        assert_eq!(
-            answer.status, 404,
-            "case {case:?}: an unresolvable lookup is a 404, got {answer:?}"
-        );
-        assert_eq!(
-            answer.error_code, "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
-        );
-        assert_eq!(
-            answer.body.get("ResourceType").and_then(Value::as_str),
-            Some(resource_type),
-            "case {case:?}: expected ResourceType {resource_type:?}, got {answer:?}"
-        );
-        assert_eq!(
-            answer.body.get("ResourceId").and_then(Value::as_str),
-            Some(resource_id.as_str()),
-            "case {case:?}: expected ResourceId {resource_id:?}, got {answer:?}"
+    ] {
+        let answer = list_answers(&client, &template_arn, lens, &[]).await;
+        assert_field_validation(
+            case,
+            &answer,
+            "LensAlias",
+            &format!(
+                "No lens review for lens alias {lens} was found in review template \
+                 {template_arn}."
+            ),
         );
     }
 }

@@ -228,8 +228,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .find(|lens| !template.applies_lens(lens))
         {
-            return Err(UpdateReviewTemplateErrorModeled::ResourceNotFoundException(
-                crate::state::review_template_lens_review_not_found(
+            return Err(UpdateReviewTemplateErrorModeled::ValidationException(
+                crate::service::lens_content_validation::no_review_template_lens_review(
                     &input.template_arn,
                     unapplied,
                 ),
@@ -268,16 +268,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for. It runs over the whole list the request named rather than only the fresh
         // ones, so a name that resolves to nothing is refused whether or not the template
         // already applies that lens.
-        match store.unapplicable_lenses_refusal(&to_associate, LENSES_TO_ASSOCIATE_MEMBER) {
-            Some(crate::state::LensesRefusal::NotFound(exception)) => {
-                return Err(
-                    UpdateReviewTemplateErrorModeled::ResourceNotFoundException(exception).into(),
-                );
-            }
-            Some(crate::state::LensesRefusal::Unapplicable(exception)) => {
-                return Err(UpdateReviewTemplateErrorModeled::ValidationException(exception).into());
-            }
-            None => {}
+        if let Some(refusal) =
+            store.unapplicable_lenses_refusal(&to_associate, LENSES_TO_ASSOCIATE_MEMBER)
+        {
+            return Err(UpdateReviewTemplateErrorModeled::ValidationException(
+                crate::service::lens_content_validation::unapplicable_lenses(refusal),
+            )
+            .into());
         }
 
         // A review template carries at most `MAX_LENSES_PER_REVIEW_TEMPLATE` lenses — the

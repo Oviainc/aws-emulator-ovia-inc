@@ -29,8 +29,8 @@ use serde_json::{json, Value};
 use super::custom_lens_import::{import, imported_arn, lens_document, wait_for_the_import_to_land};
 use super::custom_lens_versions::create_version;
 use super::workload_harness::{
-    assert_not_found, created_id, encode_path_segment, member, minimal_create, review_template,
-    Answer, Client,
+    assert_field_validation, created_id, encode_path_segment, member, minimal_create,
+    review_template, Answer, Client,
 };
 
 /// The shape of one lens document: `(pillar id, questions in it, choices per question)`,
@@ -42,10 +42,6 @@ type Shape = &'static [(&'static str, usize, usize)];
 /// own ids spell it (`tests/all/answer_updates.rs` answers the same question).
 const FRAMEWORK_LENS: &str = "wellarchitected";
 const FRAMEWORK_QUESTION: &str = "ops-01";
-
-/// `ResourceNotFoundException$ResourceType` for a question of a lens review, as the
-/// service's lookup refusals word it.
-const QUESTION_RESOURCE_TYPE: &str = "QUESTION";
 
 /// The documents under test: the rows differ along the number of pillars, the number of
 /// questions a pillar asks and the number of choices a question offers — including a
@@ -545,7 +541,8 @@ async fn an_answer_to_an_imported_lenss_question_records_every_member() {
 }
 
 /// What a write to a custom lens's review still refuses: a `QuestionId` that lens's
-/// document does not define — including one another lens does — is a 404, and a `ChoiceId`
+/// document does not define — including one another lens does — is the modelled 400 naming
+/// `QuestionId`, and a `ChoiceId`
 /// that is not a choice of the question being answered is a 400; neither records anything.
 #[tokio::test]
 async fn a_question_an_imported_lens_does_not_define_is_refused() {
@@ -592,22 +589,11 @@ async fn a_question_an_imported_lens_does_not_define_is_refused() {
         )
         .await;
         let case = format!("unasked-{unasked}");
-        assert_not_found(
-            &case,
-            &refused,
-            QUESTION_RESOURCE_TYPE,
-            &format!("{workload_id}.{lens_arn}.{unasked}"),
-            &format!(
-                "question with ID {unasked} in a review of lens {lens_arn} in a workload with ID \
-                 {workload_id}"
-            ),
-        );
+        let sentence =
+            format!("No question with ID {unasked} was found in the lens with alias {lens_arn}.");
+        assert_field_validation(&case, &refused, "QuestionId", &sentence);
         let read = get_answer(&client, &workload_id, &lens_arn, unasked).await;
-        assert_eq!(
-            read.status, 404,
-            "case {case:?}: a question the lens does not ask has no answer to read either, got \
-             {read:?}"
-        );
+        assert_field_validation(&format!("{case}-read"), &read, "QuestionId", &sentence);
     }
 
     // A `ChoiceId` of ANOTHER question of the same document is not a choice of the question
@@ -812,14 +798,13 @@ async fn a_review_templates_imported_lens_review_can_be_answered() {
             json!({ "Notes": "nothing to record" }),
         )
         .await;
-    assert_not_found(
+    assert_field_validation(
         "template-unasked",
         &refused,
-        QUESTION_RESOURCE_TYPE,
-        &format!("{template_arn}.{lens_arn}.{FRAMEWORK_QUESTION}"),
+        "QuestionId",
         &format!(
-            "question with ID {FRAMEWORK_QUESTION} in the review of lens {lens_arn} in a review \
-             template with ARN {template_arn}"
+            "No question with ID {FRAMEWORK_QUESTION} was found in the lens with alias \
+             {lens_arn}."
         ),
     );
 }

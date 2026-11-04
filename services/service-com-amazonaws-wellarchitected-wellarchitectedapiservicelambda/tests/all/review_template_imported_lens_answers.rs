@@ -38,7 +38,7 @@ use super::custom_lens_review_answers::{
     expected_questions, import_shape, publish, question_count, reported_choices, string_member,
     ExpectedQuestion, Shape,
 };
-use super::workload_harness::{assert_not_found, member, review_template, Answer, Client};
+use super::workload_harness::{assert_field_validation, member, review_template, Answer, Client};
 
 /// The alias of the AWS-official lens this emulator ships a question set for, and how many
 /// questions that lens asks: the published Well-Architected Framework numbering (OPS 1-11,
@@ -61,10 +61,6 @@ const UNANSWERED: &str = "UNANSWERED";
 /// `smithy_query(query="shape", shape="QuestionType")` publishes (`NON_PRIORITIZED` |
 /// `PRIORITIZED`): nothing prioritizes a review-template question.
 const QUESTION_TYPE: &str = "NON_PRIORITIZED";
-
-/// `ResourceNotFoundException$ResourceType` for a lens review, as this service's lookup
-/// refusals word it.
-const LENS_REVIEW_RESOURCE_TYPE: &str = "LENS_REVIEW";
 
 /// The documents under test: the rows differ along the number of pillars, the number of
 /// questions a pillar asks and the number of choices a question offers — from the smallest
@@ -373,20 +369,27 @@ async fn the_pillar_filter_narrows_a_templates_imported_question_set() {
             &[format!("PillarId={pillar_id}")],
         )
         .await;
+        // The pillars of an imported lens are the ones its DOCUMENT defines, so a pillar
+        // outside them — including one the framework lens defines — is a value this review
+        // has no pillar for, and is refused rather than selecting nothing.
         assert_eq!(
-            answer.status, 200,
-            "case {case:?}: a filter that selects nothing is an empty page, not a refusal, got \
-             {answer:?}"
+            answer.status, 400,
+            "case {case:?}: a pillar the document does not define is refused, got {answer:?}"
         );
         assert_eq!(
-            summaries_of(&answer),
-            Vec::<Value>::new(),
-            "case {case:?}: a pillar the document does not define selects nothing, got {answer:?}"
+            answer.error_code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {answer:?}"
         );
         assert_eq!(
-            answer.body.get("NextToken"),
-            None,
-            "case {case:?}: an empty selection has no further page, got {answer:?}"
+            answer
+                .body
+                .get("Fields")
+                .and_then(Value::as_array)
+                .and_then(|fields| fields.first())
+                .and_then(|field| field.get("Name"))
+                .and_then(Value::as_str),
+            Some("PillarId"),
+            "case {case:?}: the finding must name PillarId, got {answer:?}"
         );
     }
 }
@@ -636,13 +639,13 @@ async fn each_lens_review_of_a_template_lists_its_own_lens() {
     let refused = client
         .list_review_template_answers(&template_arn, &unapplied_arn, "")
         .await;
-    assert_not_found(
+    assert_field_validation(
         "unapplied-lens",
         &refused,
-        LENS_REVIEW_RESOURCE_TYPE,
-        &format!("{template_arn}.{unapplied_arn}"),
+        "LensAlias",
         &format!(
-            "review of lens {unapplied_arn} in a review template with ARN {template_arn}"
+            "No lens review for lens alias {unapplied_arn} was found in review template \
+             {template_arn}."
         ),
     );
 }

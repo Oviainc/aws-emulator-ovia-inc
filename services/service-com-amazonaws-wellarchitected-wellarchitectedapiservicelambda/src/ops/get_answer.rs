@@ -197,10 +197,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The answers of a lens review exist only while that lens is associated with the
-        // workload, so a lens the workload does not carry has no review to report.
+        // workload, so a lens the workload does not carry names no review to report — a
+        // value of `LensAlias` this service refuses rather than a resource it could not
+        // find (`crate::service::lens_content_validation`).
         if !workload.reviews_lens(&input.lens_alias) {
-            return Err(GetAnswerErrorModeled::ResourceNotFoundException(
-                crate::state::lens_review_not_found(&input.workload_id, &input.lens_alias),
+            return Err(GetAnswerErrorModeled::ValidationException(
+                crate::service::lens_content_validation::no_lens_review(
+                    &input.workload_id,
+                    &input.lens_alias,
+                ),
             )
             .into());
         }
@@ -208,7 +213,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A question belongs to the LENS under review — the questions that lens's own
         // content defines (`crate::state::...::lens_review_question`), as of the lens
         // VERSION this review is against — so a `QuestionId`
-        // that lens does not ask names no answer of this lens review to report.
+        // that lens does not ask is a value of that member this service refuses, judged
+        // against the lens's content exactly as a pillar or a choice of a review is.
         let question = store
             .lens_review_question(
                 &input.lens_alias,
@@ -216,11 +222,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.question_id,
             )
             .ok_or_else(|| {
-                GetAnswerErrorModeled::ResourceNotFoundException(crate::state::question_not_found(
-                    &input.workload_id,
-                    &input.lens_alias,
-                    &input.question_id,
-                ))
+                GetAnswerErrorModeled::ValidationException(
+                    crate::service::lens_content_validation::no_question(
+                        &input.lens_alias,
+                        &input.question_id,
+                    ),
+                )
             })?;
 
         Ok(GetAnswerOutput {

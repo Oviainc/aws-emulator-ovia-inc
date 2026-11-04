@@ -21,10 +21,10 @@
 //! * every member a request can write here is optional, so a request that supplies NONE of
 //!   them asks for no change: it answers nothing and leaves the question as it stands,
 //!   while a member it DOES supply is a write however empty the value it carries;
-//! * a `TemplateArn` nothing is stored under, a lens the template does not apply and a
-//!   `QuestionId` that lens does not ask are each a modelled 404; a `ChoiceId` the
+//! * a `TemplateArn` nothing is stored under is a modelled 404, while a lens the template
+//!   does not apply, a `QuestionId` that lens does not ask, a `ChoiceId` the
 //!   question does not offer and a value outside a modelled enum's value set are each a
-//!   modelled 400, and nothing is stored.
+//!   modelled 400 naming the member that carried the value, and nothing is stored.
 //!
 //! Requests go through the real `MultiServiceRouter`, so routing, restJson1
 //! (de)serialization, boundary constraint validation and the handler all run as they do
@@ -35,7 +35,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use super::workload_harness::{review_template as template, Answer, Client};
+use super::workload_harness::{
+    assert_field_validation, review_template as template, Answer, Client,
+};
 
 /// The alias of the AWS Well-Architected Framework lens.
 const FRAMEWORK_LENS: &str = "wellarchitected";
@@ -933,8 +935,9 @@ async fn the_question_rollups_follow_the_recorded_answers() {
     }
 }
 
-/// An unresolvable answer is a modelled 404 and a refused value a modelled 400 — and
-/// neither writes: the question each row names is still `UNANSWERED` afterwards. The rows
+/// A template nothing is stored under is a modelled 404, and every value the request got
+/// wrong a modelled 400 — and neither writes: the question each row names is still
+/// `UNANSWERED` afterwards. The rows
 /// are a template nothing is stored under, a lens the template does not apply, a lens it
 /// applies that this emulator ships no question set for, a question the lens does not ask,
 /// a `ChoiceId` the question does not offer through each member that carries one, and a
@@ -971,8 +974,8 @@ async fn an_unresolvable_or_refused_update_writes_nothing() {
             "arn:aws:wellarchitected:us-east-1::lens/serverless",
             question_id.to_string(),
             json!({ "Notes": "nothing to answer" }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "lens-without-questions",
@@ -980,8 +983,8 @@ async fn an_unresolvable_or_refused_update_writes_nothing() {
             UNSHIPPED_LENS,
             question_id.to_string(),
             json!({ "Notes": "nothing to answer" }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "unknown-question",
@@ -989,8 +992,8 @@ async fn an_unresolvable_or_refused_update_writes_nothing() {
             FRAMEWORK_LENS,
             "ops-99".to_string(),
             json!({ "Notes": "nothing to answer" }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "undefined-selected-choice",
@@ -1091,79 +1094,92 @@ async fn an_unresolvable_or_refused_update_writes_nothing() {
     }
 }
 
-/// The 404 an unresolvable answer carries names the resource that was looked for: the
-/// identifier AS SENT and the type of the missing resource. The rows are the three
-/// resources an answer is reached through — the template, its lens review and the lens's
-/// question — read through `GetReviewTemplateAnswer` and written through
-/// `UpdateReviewTemplateAnswer`, which resolve them identically.
+/// What an answer that cannot be resolved is refused with: the TEMPLATE is a resource, so
+/// an ARN nothing is stored under is the 404 naming it and its type, while the lens review
+/// and the lens's question are VALUES of the request, so each is the modelled 400 whose
+/// `Fields` names the member that carried it. Each row is read through
+/// `GetReviewTemplateAnswer` and written through `UpdateReviewTemplateAnswer`, which
+/// resolve them identically.
 #[tokio::test]
 async fn an_unresolvable_answer_names_the_missing_resource() {
     let client = Client::new();
     let template_arn = template(&client, "missing-template", &[FRAMEWORK_LENS]).await;
     let absent = absent_template_arn();
 
-    // (case, template ARN, lens, question, expected ResourceType, expected ResourceId)
-    let rows: Vec<(&str, String, &str, &str, &str, String)> = vec![
+    for (verb, answer) in [
         (
-            "absent-template",
-            absent.clone(),
-            FRAMEWORK_LENS,
-            "ops-01",
-            "REVIEW_TEMPLATE",
-            absent.clone(),
+            "read",
+            client
+                .get_review_template_answer(&absent, FRAMEWORK_LENS, "ops-01")
+                .await,
         ),
         (
+            "write",
+            client
+                .update_review_template_answer(&absent, FRAMEWORK_LENS, "ops-01", json!({}))
+                .await,
+        ),
+    ] {
+        let case = format!("absent-template/{verb}");
+        assert_eq!(
+            answer.status, 404,
+            "case {case:?}: an unresolvable template is a 404, got {answer:?}"
+        );
+        assert_eq!(
+            answer.error_code, "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
+        );
+        assert_eq!(
+            answer.body.get("ResourceType").and_then(Value::as_str),
+            Some("REVIEW_TEMPLATE"),
+            "case {case:?}: expected ResourceType REVIEW_TEMPLATE, got {answer:?}"
+        );
+        assert_eq!(
+            answer.body.get("ResourceId").and_then(Value::as_str),
+            Some(absent.as_str()),
+            "case {case:?}: expected the ARN as sent, got {answer:?}"
+        );
+    }
+
+    // (case, lens, question, the member the finding names, its sentence)
+    let rows: Vec<(&str, &str, &str, &str, String)> = vec![
+        (
             "lens-not-applied",
-            template_arn.clone(),
             UNSHIPPED_LENS,
             "ops-01",
-            "LENS_REVIEW",
-            format!("{template_arn}.{UNSHIPPED_LENS}"),
+            "LensAlias",
+            format!(
+                "No lens review for lens alias {UNSHIPPED_LENS} was found in review template \
+                 {template_arn}."
+            ),
         ),
         (
             "unknown-question",
-            template_arn.clone(),
             FRAMEWORK_LENS,
             "ops-99",
-            "QUESTION",
-            format!("{template_arn}.{FRAMEWORK_LENS}.ops-99"),
+            "QuestionId",
+            format!(
+                "No question with ID ops-99 was found in the lens with alias {FRAMEWORK_LENS}."
+            ),
         ),
     ];
 
-    for (case, arn, lens, question_id, resource_type, resource_id) in rows {
+    for (case, lens, question_id, named, sentence) in rows {
         for (verb, answer) in [
             (
                 "read",
                 client
-                    .get_review_template_answer(&arn, lens, question_id)
+                    .get_review_template_answer(&template_arn, lens, question_id)
                     .await,
             ),
             (
                 "write",
                 client
-                    .update_review_template_answer(&arn, lens, question_id, json!({}))
+                    .update_review_template_answer(&template_arn, lens, question_id, json!({}))
                     .await,
             ),
         ] {
-            let case = format!("{case}/{verb}");
-            assert_eq!(
-                answer.status, 404,
-                "case {case:?}: an unresolvable lookup is a 404, got {answer:?}"
-            );
-            assert_eq!(
-                answer.error_code, "ResourceNotFoundException",
-                "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
-            );
-            assert_eq!(
-                answer.body.get("ResourceType").and_then(Value::as_str),
-                Some(resource_type),
-                "case {case:?}: expected ResourceType {resource_type:?}, got {answer:?}"
-            );
-            assert_eq!(
-                answer.body.get("ResourceId").and_then(Value::as_str),
-                Some(resource_id.as_str()),
-                "case {case:?}: expected ResourceId {resource_id:?}, got {answer:?}"
-            );
+            assert_field_validation(&format!("{case}/{verb}"), &answer, named, &sentence);
         }
     }
 }

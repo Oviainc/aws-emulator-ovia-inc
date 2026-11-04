@@ -37,8 +37,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::workload_harness::{
-    age_workload, assert_not_found, created_id, encode_path_segment, member, minimal_create,
-    official_lens_arn, updated_at_of, Answer, Client,
+    age_workload, assert_field_validation, assert_not_found, created_id, encode_path_segment,
+    member, minimal_create, official_lens_arn, updated_at_of, Answer, Client,
 };
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
@@ -553,8 +553,9 @@ async fn a_milestone_scoped_read_reports_the_review_the_milestone_recorded() {
     }
 }
 
-/// A read that resolves nothing is a 404 over the modelled resource type of whatever was
-/// missing, and records nothing.
+/// A read that resolves nothing is refused: a 404 over the modelled resource type of the
+/// RESOURCE that was missing, and the modelled 400 naming the member that carried a value
+/// the lens content does not define. Either way it records nothing.
 ///
 /// The rows differ along WHICH part of the `(WorkloadId, LensAlias, QuestionId,
 /// MilestoneNumber)` identity fails to resolve: a workload id no workload carries, a lens
@@ -586,34 +587,30 @@ async fn a_read_that_resolves_nothing_is_refused_over_the_resource_that_was_miss
         &format!("workload with ID {ABSENT_HEX_ID}"),
     );
 
-    // The lens names no review OF this workload, under either spelling of its name.
+    // The lens names no review OF this workload, under either spelling of its name: the
+    // lens review is a VALUE of the request, so it is refused as input.
     for named in [
         unreviewed_lens.to_string(),
         official_lens_arn(SENT_ARN_REGION, unreviewed_lens),
     ] {
-        assert_not_found(
+        assert_field_validation(
             &format!("unreviewed-lens-{named}"),
             &get_answer(&client, &workload_id, &named, unreviewed_lens_question, None).await,
-            state::LENS_REVIEW_RESOURCE_TYPE,
-            &state::lens_review_resource_id(&workload_id, &named),
-            &format!("review of lens {named} in a workload with ID {workload_id}"),
+            "LensAlias",
+            &format!(
+                "No lens review for lens alias {named} was found in workload {workload_id}."
+            ),
         );
     }
 
-    // The question is not one the reviewed lens asks.
+    // The question is not one the reviewed lens asks: the questions are the LENS's content,
+    // so the finding names `QuestionId` and the lens it was looked for in.
     for unasked in ["not-a-question", unreviewed_lens_question] {
-        assert_not_found(
+        assert_field_validation(
             &format!("unasked-question-{unasked}"),
             &get_answer(&client, &workload_id, lens, unasked, None).await,
-            state::QUESTION_RESOURCE_TYPE,
-            &format!(
-                "{}.{unasked}",
-                state::lens_review_resource_id(&workload_id, lens)
-            ),
-            &format!(
-                "question with ID {unasked} in a review of lens {lens} in a workload with ID \
-                 {workload_id}"
-            ),
+            "QuestionId",
+            &format!("No question with ID {unasked} was found in the lens with alias {lens}."),
         );
     }
 

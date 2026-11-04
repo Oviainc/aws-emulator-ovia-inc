@@ -10,7 +10,7 @@
 //! recorded under that review, and reports the change through `Workload$UpdatedAt`. Both
 //! identifiers are resolved before anything is removed, so a workload that is not stored is
 //! a modelled 404 over the `WORKLOAD` resource type and a lens the workload does not review
-//! is a modelled 404 over the `LENS_REVIEW` type, each removing nothing. Two refusals bound
+//! is the modelled 400 naming `LensAlias`, each removing nothing. Two refusals bound
 //! it: "Up to 10 lenses can be disassociated from a workload in a single API operation"
 //! bounds ONE request, checked before any per-entry work since the member publishes no
 //! modelled maximum, and "The Amazon Web Services Well-Architected Framework lens
@@ -33,17 +33,15 @@ use super::custom_lens_import::{
 use super::custom_lens_versions::create_version;
 use super::lens_resolution::field_names;
 use super::workload_harness::{
-    age_workload, assert_not_found, created_id, encode_path_segment, member, minimal_create,
-    official_lens_arn, Answer, Client,
+    age_workload, assert_field_validation, assert_not_found, created_id, encode_path_segment,
+    member, minimal_create, official_lens_arn, Answer, Client,
 };
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
 
-/// The modelled `ResourceType` of a workload and of a lens review
-/// (`state::WORKLOAD_RESOURCE_TYPE` / `state::LENS_REVIEW_RESOURCE_TYPE`), as the wire
-/// carries them on a failure about one.
+/// The modelled `ResourceType` of a workload (`state::WORKLOAD_RESOURCE_TYPE`), as the wire
+/// carries it on a failure about one.
 const WORKLOAD_TYPE: &str = "WORKLOAD";
-const LENS_REVIEW_TYPE: &str = "LENS_REVIEW";
 
 /// How far back a workload's `UpdatedAt` is moved before a request under test, so a write
 /// the handler makes to it is observable whatever the clock's granularity between two
@@ -351,11 +349,12 @@ async fn disassociate_lenses_drops_the_review_of_every_distinct_lens_named() {
         );
 
         // Every lens the request named — including one named twice, and one named by a
-        // spelling the association did not use — has no review left to read.
+        // spelling the association did not use — has no review left to read: the read of it
+        // is refused as a value naming no lens review of the workload.
         for lens in &row.disassociated {
             let answer = get_lens_review(&client, &workload_id, lens).await;
             assert_eq!(
-                answer.status, 404,
+                answer.status, 400,
                 "case {:?}: the review of {lens:?} must be gone, got {answer:?}",
                 row.case
             );
@@ -372,8 +371,8 @@ async fn disassociate_lenses_drops_the_review_of_every_distinct_lens_named() {
     }
 }
 
-/// A lens the workload does not review is the modelled 404 over the `LENS_REVIEW` resource
-/// type and removes nothing — whether that name resolves to a lens at all, since a lens
+/// A lens the workload does not review is the modelled 400 naming `LensAlias` and removes
+/// nothing — whether that name resolves to a lens at all, since a lens
 /// review exists exactly while the lens is associated with the workload. A workload that is
 /// not stored is a 404 over the `WORKLOAD` type, resolved first.
 #[tokio::test]
@@ -425,12 +424,13 @@ async fn a_lens_the_workload_does_not_review_is_refused_and_removes_nothing() {
             let (before, updated_before) = stored_lenses(&client, &workload_id, &case).await;
 
             let answer = disassociate_lenses(&client, &workload_id, &lenses).await;
-            assert_not_found(
+            assert_field_validation(
                 &case,
                 &answer,
-                LENS_REVIEW_TYPE,
-                &format!("{workload_id}.{entry}"),
-                &format!("review of lens {entry} in a workload with ID {workload_id}"),
+                "LensAlias",
+                &format!(
+                    "No lens review for lens alias {entry} was found in workload {workload_id}."
+                ),
             );
 
             let (after, updated_after) = stored_lenses(&client, &workload_id, &case).await;
@@ -706,9 +706,11 @@ async fn a_custom_lens_is_disassociated_by_its_arn() {
         "dropping the custom lens must move UpdatedAt, got {after} after {before}"
     );
     let review = get_lens_review(&client, &workload_id, &lens_arn).await;
-    assert_eq!(
-        review.status, 404,
-        "the review of the custom lens must be gone, got {review:?}"
+    assert_field_validation(
+        "custom",
+        &review,
+        "LensAlias",
+        &format!("No lens review for lens alias {lens_arn} was found in workload {workload_id}."),
     );
 
     // The lens itself still exists — only the workload's review of it was dropped — so it
@@ -801,9 +803,11 @@ async fn disassociating_a_lens_drops_the_answers_and_notes_of_its_review() {
     );
 
     let dropped = get_answer(&client, &workload_id, "serverless", question_id).await;
-    assert_eq!(
-        dropped.status, 404,
-        "a dropped review has no answer to read, got {dropped:?}"
+    assert_field_validation(
+        "dropped-review",
+        &dropped,
+        "LensAlias",
+        &format!("No lens review for lens alias serverless was found in workload {workload_id}."),
     );
 
     // The milestone still reports the lens it froze: it holds the workload as it stood.

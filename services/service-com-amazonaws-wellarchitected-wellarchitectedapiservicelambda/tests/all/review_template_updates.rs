@@ -15,8 +15,9 @@
 //! 3. The Well-Architected Framework lens cannot be unapplied
 //!    (`LensesToDisassociate` doc), so a request naming it is refused whole and revises
 //!    nothing.
-//! 4. A lens the template does not apply has no review to unapply (404), and a lens name
-//!    that resolves to no lens cannot be applied (404) — each resolved before anything is
+//! 4. A lens the template does not apply has no review to unapply (400 naming `LensAlias`),
+//!    and a lens name that resolves to no lens cannot be applied (400 naming the lens the
+//!    service could not get) — each resolved before anything is
 //!    written, so a request naming one good and one bad lens revises nothing.
 //! 5. A revision is bounded by the lens ceiling a stored template carries, and a
 //!    `TemplateArn` naming no stored template is a 404.
@@ -416,7 +417,7 @@ async fn applying_and_unapplying_lenses_moves_the_templates_lens_set() {
             let expected_status = if applied_aliases.contains(state::lens_alias(lens)) {
                 200
             } else {
-                404
+                400
             };
             assert_eq!(
                 review.status, expected_status,
@@ -488,7 +489,7 @@ async fn unapplying_a_lens_drops_the_answers_recorded_under_it() {
         .get_review_template_answer(&template_arn, SECOND_LENS, &question_id)
         .await;
     assert_eq!(
-        gone.status, 404,
+        gone.status, 400,
         "case \"unapply\": an unapplied lens has no answer to read, got {gone:?}"
     );
 
@@ -565,32 +566,32 @@ async fn a_lens_that_cannot_be_resolved_refuses_the_whole_revision() {
         (
             "unapply-a-lens-the-template-does-not-apply",
             json!({ "LensesToDisassociate": [THIRD_LENS] }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "unapply-one-applied-and-one-unapplied-lens",
             json!({ "LensesToDisassociate": [SECOND_LENS, THIRD_LENS] }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "unapply-a-lens-nothing-publishes",
             json!({ "LensesToDisassociate": ["notalens"] }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "apply-a-lens-nothing-publishes",
             json!({ "LensesToAssociate": ["notalens"] }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "apply-one-published-and-one-unpublished-lens",
             json!({ "LensesToAssociate": [THIRD_LENS, "notalens"] }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "apply-a-custom-lens-arn-no-import-minted",
@@ -601,8 +602,8 @@ async fn a_lens_that_cannot_be_resolved_refuses_the_whole_revision() {
                     "0".repeat(32)
                 )]
             }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
     ];
 

@@ -43,7 +43,8 @@ use super::custom_lens_review_answers::{
     Shape,
 };
 use super::workload_harness::{
-    answered, assert_not_found, official_lens_arn, review_template as template, Answer, Client,
+    answered, assert_field_validation, official_lens_arn, review_template as template, Answer,
+    Client,
     SIGNED_REGION,
 };
 
@@ -77,11 +78,6 @@ const NOT_APPLICABLE: &str = "NOT_APPLICABLE";
 /// `smithy_query(query="shape", shape="AnswerReason")` — "the reason why the question is
 /// not applicable to your review template".
 const OUT_OF_SCOPE: &str = "OUT_OF_SCOPE";
-
-/// The modelled `ResourceType` of a question that is no question of the lens review a
-/// request names, as `super::review_template_answer_updates` pins it for both the read and
-/// the write.
-const QUESTION_RESOURCE_TYPE: &str = "QUESTION";
 
 /// The state an answer is stored in before the read — what a row varies, because the
 /// report follows the stored answer and nothing else.
@@ -568,18 +564,16 @@ async fn every_question_of_an_imported_lens_review_reports_the_stored_answer() {
     }
 
     // A question belongs to the LENS under review: one lens review's question is no
-    // question of the other review of the same template.
+    // question of the other review of the same template, so the value is refused as input.
     let crossed = defined[0].question_id.clone();
-    assert_not_found(
+    assert_field_validation(
         "imported-question-under-the-official-lens",
         &client
             .get_review_template_answer(&template_arn, FRAMEWORK_LENS, &crossed)
             .await,
-        QUESTION_RESOURCE_TYPE,
-        &format!("{template_arn}.{FRAMEWORK_LENS}.{crossed}"),
+        "QuestionId",
         &format!(
-            "question with ID {crossed} in the review of lens {FRAMEWORK_LENS} in a review \
-             template with ARN {template_arn}"
+            "No question with ID {crossed} was found in the lens with alias {FRAMEWORK_LENS}."
         ),
     );
 }

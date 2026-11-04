@@ -1101,6 +1101,77 @@ pub(crate) fn assert_not_found(
     );
 }
 
+/// The refusal a request that NAMES lens content the service cannot resolve gets — a lens
+/// review, a question of one, a pillar of one — : `400 ValidationException` whose `Reason`
+/// is `FIELD_VALIDATION_FAILED`, whose `Fields` carries ONE entry naming the member the
+/// value came in, and whose `Message` is that entry's sentence behind this service's
+/// `[Validation]` tag.
+///
+/// The counterpart of [`assert_not_found`] for the values a request carries, as opposed to
+/// the resources it identifies; the one validation-envelope assertion this crate's suites
+/// share.
+pub(crate) fn assert_field_validation(
+    case: &str,
+    answer: &Answer,
+    member_name: &str,
+    sentence: &str,
+) {
+    assert_eq!(
+        answer.status, 400,
+        "case {case:?}: expected HTTP 400, got {answer:?}"
+    );
+    assert_eq!(
+        answer.error_code, "ValidationException",
+        "case {case:?}: expected ValidationException, got {answer:?}"
+    );
+    assert_eq!(
+        member(answer, "Reason"),
+        "FIELD_VALIDATION_FAILED",
+        "case {case:?}: expected Reason FIELD_VALIDATION_FAILED, got {answer:?}"
+    );
+    assert_eq!(
+        member(answer, "Message"),
+        format!("[Validation] {sentence}"),
+        "case {case:?}: unexpected Message, got {answer:?}"
+    );
+    assert_eq!(
+        answer.body.get("Fields").cloned().unwrap_or(Value::Null),
+        json!([{ "Name": member_name, "Message": sentence }]),
+        "case {case:?}: Fields must name the member that carried the value, got {answer:?}"
+    );
+}
+
+/// The refusal a request that asks to APPLY a lens the catalog does not resolve gets: `400
+/// ValidationException` naming the lens as sent, with `Reason` carried and carrying no
+/// per-member finding.
+pub(crate) fn assert_unresolvable_lens(case: &str, answer: &Answer, lens: &str) {
+    assert_eq!(
+        answer.status, 400,
+        "case {case:?}: expected HTTP 400, got {answer:?}"
+    );
+    assert_eq!(
+        answer.error_code, "ValidationException",
+        "case {case:?}: expected ValidationException, got {answer:?}"
+    );
+    assert_eq!(
+        member(answer, "Message"),
+        format!(
+            "[Validation] Failed to get lenses {lens}. User might be not authorized to \
+             access lens."
+        ),
+        "case {case:?}: unexpected Message, got {answer:?}"
+    );
+    assert_eq!(
+        answer.body.get("Reason").cloned(),
+        Some(Value::String(String::new())),
+        "case {case:?}: Reason must be carried without a classification, got {answer:?}"
+    );
+    assert!(
+        answer.body.get("Fields").is_none(),
+        "case {case:?}: this refusal carries no per-member finding, got {answer:?}"
+    );
+}
+
 /// A minimal valid `CreateReviewTemplate` request; callers override the members their
 /// case varies. The one review-template request builder this crate's suites share.
 pub(crate) fn minimal_template(name: &str, token: &str) -> Value {

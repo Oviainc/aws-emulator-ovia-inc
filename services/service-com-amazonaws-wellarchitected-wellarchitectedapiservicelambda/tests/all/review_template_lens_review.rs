@@ -19,9 +19,10 @@
 //!   name, version and status, one pillar summary per pillar of the lens in the lens's
 //!   own order, and the answered/unanswered roll-ups of the lens's and each pillar's
 //!   questions from the template's stored answers;
-//! * a lens review exists exactly while the lens is applied to the template, so a lens
-//!   the template does not apply, and a `TemplateArn` nothing is stored under, both
-//!   resolve to a modelled 404 — from the write as well as from the read.
+//! * a lens review exists exactly while the lens is applied to the template, so a
+//!   `TemplateArn` nothing is stored under resolves to a modelled 404 and a lens the
+//!   template does not apply is the modelled 400 naming `LensAlias` — from the write as
+//!   well as from the read.
 //!
 //! Requests go through the real `MultiServiceRouter`, so routing, restJson1
 //! (de)serialization, boundary constraint validation and the handler all run as they do
@@ -33,7 +34,8 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use super::workload_harness::{
-    answered, official_lens_arn, review_template as template, Answer, Client,
+    answered, assert_field_validation, official_lens_arn, review_template as template, Answer,
+    Client,
 };
 
 /// The pillars of the AWS Well-Architected Framework lens, in the order the framework
@@ -716,40 +718,61 @@ async fn a_lens_without_shipped_content_reports_an_empty_review() {
     }
 }
 
-/// A lens the template does not apply, and a `TemplateArn` nothing is stored under, both
-/// resolve to a modelled 404 — from the write as well as from the read.
+/// A `TemplateArn` nothing is stored under resolves to a modelled 404, while a lens the
+/// template does not apply is the modelled 400 naming `LensAlias` — from the write as well
+/// as from the read.
 #[tokio::test]
-async fn an_unresolvable_review_is_a_modelled_404() {
+async fn an_unresolvable_review_is_refused() {
     let client = Client::new();
     let template_arn = template(&client, "not-found", &[FRAMEWORK_LENS]).await;
     let absent = absent_template_arn();
 
-    let cases: [(&str, &str, &str); 3] = [
-        ("absent-template", absent.as_str(), FRAMEWORK_LENS),
-        ("unapplied-lens", template_arn.as_str(), UNSHIPPED_LENS),
+    for (case, request) in [
+        (
+            "absent-template-read",
+            client
+                .get_review_template_lens_review(&absent, FRAMEWORK_LENS)
+                .await,
+        ),
+        (
+            "absent-template-write",
+            client
+                .update_review_template_lens_review(
+                    &absent,
+                    FRAMEWORK_LENS,
+                    json!({ "LensNotes": "x" }),
+                )
+                .await,
+        ),
+    ] {
+        assert_eq!(
+            (request.status, request.error_code.as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: an unresolvable template must answer a modelled 404, got {request:?}"
+        );
+    }
+
+    // The rows differ along how the unapplied lens is named, because what the request asks
+    // for does not depend on the spelling.
+    for (case, lens) in [
+        ("unapplied-lens", UNSHIPPED_LENS),
         (
             "unapplied-lens-by-arn",
-            template_arn.as_str(),
             "arn:aws:wellarchitected:us-west-2::lens/serverless",
         ),
-    ];
-
-    for (case, arn, lens) in cases {
-        let read = client.get_review_template_lens_review(arn, lens).await;
-        assert_eq!(
-            (read.status, read.error_code.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: the read must answer a modelled 404, got {read:?}"
+    ] {
+        let sentence = format!(
+            "No lens review for lens alias {lens} was found in review template {template_arn}."
         );
+        let read = client
+            .get_review_template_lens_review(&template_arn, lens)
+            .await;
+        assert_field_validation(&format!("{case}-read"), &read, "LensAlias", &sentence);
 
         let written = client
-            .update_review_template_lens_review(arn, lens, json!({ "LensNotes": "x" }))
+            .update_review_template_lens_review(&template_arn, lens, json!({ "LensNotes": "x" }))
             .await;
-        assert_eq!(
-            (written.status, written.error_code.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: the write must answer a modelled 404, got {written:?}"
-        );
+        assert_field_validation(&format!("{case}-write"), &written, "LensAlias", &sentence);
     }
 }
 

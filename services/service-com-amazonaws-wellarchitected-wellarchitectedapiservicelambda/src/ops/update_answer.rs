@@ -214,8 +214,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // The resource is resolved BEFORE the request's values are judged, so a request
-        // that names a workload, a lens review or a question that does not exist is
-        // answered with that 404 whatever else it carries.
+        // that names a workload that does not exist is answered with that 404 whatever else
+        // it carries; the lens review and the question it names are values of the request,
+        // judged below.
         let workload = store.workloads.get_mut(&input.workload_id).ok_or_else(|| {
             UpdateAnswerErrorModeled::ResourceNotFoundException(crate::state::workload_not_found(
                 &input.workload_id,
@@ -223,20 +224,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // The answers of a lens review exist only while that lens is associated with the
-        // workload, so a lens the workload does not carry has no review to answer in.
+        // workload, so a lens the workload does not carry names no review to answer in — a
+        // value of `LensAlias` this service refuses rather than a resource it could not
+        // find (`crate::service::lens_content_validation`).
         if !workload.reviews_lens(&input.lens_alias) {
-            return Err(UpdateAnswerErrorModeled::ResourceNotFoundException(
-                crate::state::lens_review_not_found(&input.workload_id, &input.lens_alias),
+            return Err(UpdateAnswerErrorModeled::ValidationException(
+                crate::service::lens_content_validation::no_lens_review(
+                    &input.workload_id,
+                    &input.lens_alias,
+                ),
             )
             .into());
         }
 
+        // A `QuestionId` the lens under review does not ask is judged the same way: the
+        // questions are the LENS's own content, so the value names no question of it.
         let question = question.ok_or_else(|| {
-            UpdateAnswerErrorModeled::ResourceNotFoundException(crate::state::question_not_found(
-                &input.workload_id,
-                &input.lens_alias,
-                &input.question_id,
-            ))
+            UpdateAnswerErrorModeled::ValidationException(
+                crate::service::lens_content_validation::no_question(
+                    &input.lens_alias,
+                    &input.question_id,
+                ),
+            )
         })?;
 
         // `AnswerReason` and `ChoiceStatus` / `ChoiceReason` are modelled enums, whose
@@ -252,8 +261,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `ChoiceId` is a choice of THIS question (`Answer$Choices` is the only place a
         // client discovers them), so one that names no choice of it belongs to no answer
-        // of this question and is refused rather than stored.
-        if let Some(exception) = crate::state::undefined_choice_refusal(
+        // of this question and is refused rather than stored, with the question's own
+        // choice catalog as the valid values.
+        if let Some(exception) = crate::service::lens_content_validation::undefined_choices(
             &question,
             input.selected_choices.as_deref(),
             input.choice_updates.as_ref(),

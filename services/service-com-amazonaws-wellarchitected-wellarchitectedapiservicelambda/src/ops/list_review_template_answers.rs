@@ -198,12 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // The answers of a lens review exist only while that lens is applied to the
-        // review template, so a lens the template does not carry has no review to
-        // report.
+        // review template, so a lens the template does not carry names no review to
+        // report — a value of `LensAlias` this service refuses rather than a resource it
+        // could not find (`crate::service::lens_content_validation`).
         if !template.applies_lens(&input.lens_alias) {
             return Err(
-                ListReviewTemplateAnswersErrorModeled::ResourceNotFoundException(
-                    crate::state::review_template_lens_review_not_found(
+                ListReviewTemplateAnswersErrorModeled::ValidationException(
+                    crate::service::lens_content_validation::no_review_template_lens_review(
                         &template.template_arn,
                         &input.lens_alias,
                     ),
@@ -212,14 +213,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // `PillarId` names a pillar OF THE LENS under review, and the pillars of a lens are
+        // what that lens's content defines, so a value naming none of them belongs to no
+        // pillar of this review: it is refused through the one place this service words that
+        // refusal (`crate::service::lens_content_validation`) rather than silently selecting
+        // nothing.
+        if let Some(exception) = crate::service::lens_content_validation::undefined_pillar(
+            &input.lens_alias,
+            &store.lens_content_at(
+                &input.lens_alias,
+                template.lens_review_version(&input.lens_alias),
+            ),
+            input.pillar_id.as_deref(),
+        ) {
+            return Err(
+                ListReviewTemplateAnswersErrorModeled::ValidationException(exception).into(),
+            );
+        }
+
         // The lens's questions, in the lens's own order, narrowed by the request's
         // filter and paged through the service's shared question cursor. The question set
         // is the LENS's own content — an AWS-official lens's catalog entry or a custom
         // lens's imported document — which is what
         // `crate::state::...::lens_review_questions` resolves, for the lens VERSION this
-        // review is against. `PillarId` FILTERS that
-        // set rather than resolving anything, so a value that matches no question is an
-        // empty page.
+        // review is against. `PillarId` was resolved against that content above, so what it
+        // does here is SELECT the pillar's questions.
         let questions = store.lens_review_questions(
             &input.lens_alias,
             template.lens_review_version(&input.lens_alias),

@@ -431,16 +431,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with the original request's result, and over a list the lens quota above has
         // already bounded, so the work it costs is bounded too.
         let now = std::time::SystemTime::now();
-        match store.unapplicable_lenses_refusal(&lenses, crate::state::LENSES_MEMBER) {
-            Some(crate::state::LensesRefusal::NotFound(exception)) => {
-                return Err(
-                    CreateWorkloadErrorModeled::ResourceNotFoundException(exception).into(),
-                );
-            }
-            Some(crate::state::LensesRefusal::Unapplicable(exception)) => {
-                return Err(CreateWorkloadErrorModeled::ValidationException(exception).into());
-            }
-            None => {}
+        if let Some(refusal) = store.unapplicable_lenses_refusal(&lenses, crate::state::LENSES_MEMBER)
+        {
+            return Err(CreateWorkloadErrorModeled::ValidationException(
+                crate::service::lens_content_validation::unapplicable_lenses(refusal),
+            )
+            .into());
         }
 
         // "The name must be unique within an account within an Amazon Web Services Region.

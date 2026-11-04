@@ -589,8 +589,9 @@ struct Refusal {
 
 /// What an update that names something the review does not hold is refused with, and that
 /// a refusal records nothing. The rows span each identifier the request resolves and each
-/// value class the handler enforces: a lookup that resolves nothing is a 404, a value the
-/// request got wrong is a 400 naming the member.
+/// value class the handler enforces: the workload is RESOLVED, so an id nothing is stored
+/// under is a 404, while every other value — the lens review, the question, a choice, an
+/// enum member — is a value of the request, so it is a 400 naming the member.
 #[tokio::test]
 async fn an_update_naming_nothing_the_review_holds_is_refused() {
     let client = Client::new();
@@ -622,9 +623,9 @@ async fn an_update_naming_nothing_the_review_holds_is_refused() {
             lens: UNSHIPPED_LENS,
             question_id,
             body: json!({}),
-            status: 404,
-            code: "ResourceNotFoundException",
-            member: None,
+            status: 400,
+            code: "ValidationException",
+            member: Some("LensAlias"),
         },
         Refusal {
             case: "question-the-lens-does-not-ask",
@@ -632,9 +633,9 @@ async fn an_update_naming_nothing_the_review_holds_is_refused() {
             lens: FRAMEWORK_LENS,
             question_id: "ops-99",
             body: json!({}),
-            status: 404,
-            code: "ResourceNotFoundException",
-            member: None,
+            status: 400,
+            code: "ValidationException",
+            member: Some("QuestionId"),
         },
         Refusal {
             case: "choice-no-question-asks",

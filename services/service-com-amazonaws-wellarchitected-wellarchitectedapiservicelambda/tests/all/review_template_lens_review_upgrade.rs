@@ -24,7 +24,7 @@
 //!    which carries exactly one version here, and for a lens this emulator holds no
 //!    content for, which has no version to be at.
 //! 3. A template ARN or a `LensAlias` that names no lens review of a stored template is
-//!    the modelled 404, and the refused request writes nothing.
+//!    the modelled refusal, and the refused request writes nothing.
 //! 4. The upgrade is idempotent per `ClientRequestToken`: the same token with the same
 //!    parameters answers the original request's result WITHOUT moving the review again,
 //!    and with different parameters is the modelled 409.
@@ -398,9 +398,9 @@ async fn upgrading_an_official_lens_review_answers_without_moving_it() {
 }
 
 /// Rule 3. The upgrade resolves a lens review of a stored template: a template ARN nothing
-/// is stored under, and a lens the stored template does not apply, are both the modelled
-/// 404, and a `LensAlias` outside its published `@length(1, 128)` is refused as a label
-/// before any lookup. Either way nothing is written.
+/// is stored under is the modelled 404, a lens the stored template does not apply is the
+/// modelled 400 naming `LensAlias`, and a `LensAlias` outside its published `@length(1,
+/// 128)` is refused as a label before any lookup. Either way nothing is written.
 ///
 /// Rows differ along which label is at fault and why.
 #[tokio::test]
@@ -432,15 +432,15 @@ async fn an_upgrade_that_resolves_no_lens_review_is_refused_and_writes_nothing()
             "official-lens-not-applied",
             template_arn.as_str(),
             UNSHIPPED_LENS,
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "custom-lens-that-does-not-exist",
             template_arn.as_str(),
             ABSENT_LENS_ARN,
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "alias-one-past-the-published-maximum",

@@ -226,8 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // The resource is resolved BEFORE the request's values are judged, so a request
-        // that names a template, a lens review or a question that does not exist is
-        // answered with that 404 whatever else it carries.
+        // that names a template that does not exist is answered with that 404 whatever else
+        // it carries; the lens review and the question it names are values of the request,
+        // judged below.
         let template = store
             .review_templates
             .get_mut(&input.template_arn)
@@ -238,11 +239,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // The answers of a lens review exist only while that lens is applied to the
-        // review template, so a lens the template does not carry has no review to answer.
+        // review template, so a lens the template does not carry names no review to answer
+        // — a value of `LensAlias` this service refuses rather than a resource it could not
+        // find (`crate::service::lens_content_validation`).
         if !template.applies_lens(&input.lens_alias) {
             return Err(
-                UpdateReviewTemplateAnswerErrorModeled::ResourceNotFoundException(
-                    crate::state::review_template_lens_review_not_found(
+                UpdateReviewTemplateAnswerErrorModeled::ValidationException(
+                    crate::service::lens_content_validation::no_review_template_lens_review(
                         &template.template_arn,
                         &input.lens_alias,
                     ),
@@ -251,10 +254,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // A `QuestionId` the lens under review does not ask is judged the same way: the
+        // questions are the LENS's own content, so the value names no question of it.
         let question = question.ok_or_else(|| {
-            UpdateReviewTemplateAnswerErrorModeled::ResourceNotFoundException(
-                crate::state::review_template_answer_not_found(
-                    &template.template_arn,
+            UpdateReviewTemplateAnswerErrorModeled::ValidationException(
+                crate::service::lens_content_validation::no_question(
                     &input.lens_alias,
                     &input.question_id,
                 ),
@@ -276,8 +280,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `ChoiceId` is a choice of THIS question (`ReviewTemplateAnswer$Choices` is the
         // only place a client discovers them), so one that names no choice of it belongs
-        // to no answer of this question and is refused rather than stored.
-        if let Some(exception) = crate::state::undefined_choice_refusal(
+        // to no answer of this question and is refused rather than stored, with the
+        // question's own choice catalog as the valid values.
+        if let Some(exception) = crate::service::lens_content_validation::undefined_choices(
             &question,
             input.selected_choices.as_deref(),
             input.choice_updates.as_ref(),

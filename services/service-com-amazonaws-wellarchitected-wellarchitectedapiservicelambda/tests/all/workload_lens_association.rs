@@ -8,8 +8,9 @@
 //! `LensAliases` name — a lens is one lens however it is spelled, so an alias and that
 //! lens's ARN name the same review — leaving the lenses the workload already reviews as
 //! they stand, and reports the change through `Workload$UpdatedAt`. Both identifiers are
-//! resolved before anything is written, so a workload that is not stored and an alias that
-//! names no lens are each a modelled 404 `ResourceNotFoundException` that records nothing,
+//! resolved before anything is written, so a workload that is not stored is a modelled 404
+//! `ResourceNotFoundException` and an alias that names no lens is the modelled 400
+//! `ValidationException` naming the lens it could not get, each recording nothing,
 //! and an alias naming a custom lens with no published version is the modelled 400
 //! `ValidationException` naming `LensAliases` — the same resolution a create that applies
 //! lenses runs. Two ceilings bound it: "Up to 10 lenses can be specified" (`LensAliases`
@@ -33,17 +34,15 @@ use super::custom_lens_import::{
 use super::custom_lens_versions::create_version;
 use super::lens_resolution::field_names;
 use super::workload_harness::{
-    age_workload, assert_not_found, created_id, member, minimal_create, official_lens_arn, Answer,
-    Client,
+    age_workload, assert_field_validation, assert_not_found, assert_unresolvable_lens, created_id,
+    member, minimal_create, official_lens_arn, Answer, Client,
 };
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
 
-/// The modelled `ResourceType` of a workload and of a lens
-/// (`state::WORKLOAD_RESOURCE_TYPE` / `state::LENS_RESOURCE_TYPE`), as the wire carries them
-/// on a failure about one.
+/// The modelled `ResourceType` of a workload (`state::WORKLOAD_RESOURCE_TYPE`), as the wire
+/// carries it on a failure about one.
 const WORKLOAD_TYPE: &str = "WORKLOAD";
-const LENS_TYPE: &str = "LENS";
 
 /// How far back a workload's `UpdatedAt` is moved before a request under test, so a write
 /// the handler makes to it is observable whatever the clock's granularity between two
@@ -373,8 +372,9 @@ async fn re_associating_a_lens_the_workload_already_reviews_changes_nothing() {
     }
 }
 
-/// A `LensAliases` entry that names no lens is a 404 over the `LENS` resource type and
-/// records nothing; a workload that is not stored is a 404 over the `WORKLOAD` type.
+/// A `LensAliases` entry that names no lens is the modelled 400 naming the lens it could
+/// not get and records nothing; a workload that is not stored is a 404 over the `WORKLOAD`
+/// type, resolved first.
 #[tokio::test]
 async fn an_alias_that_names_no_lens_is_refused_and_records_nothing() {
     // The rows differ along WHAT the name is: a bare word no catalog alias carries, a near
@@ -430,13 +430,7 @@ async fn an_alias_that_names_no_lens_is_refused_and_records_nothing() {
             let (before, updated_before) = stored_lenses(&client, &workload_id, &case).await;
 
             let answer = associate_lenses(&client, &workload_id, &lenses).await;
-            assert_not_found(
-                &case,
-                &answer,
-                LENS_TYPE,
-                entry,
-                &format!("lens with alias {entry}"),
-            );
+            assert_unresolvable_lens(&case, &answer, entry);
 
             let (after, updated_after) = stored_lenses(&client, &workload_id, &case).await;
             assert_eq!(
@@ -745,9 +739,11 @@ async fn the_per_workload_ceiling_bounds_the_lenses_a_workload_reviews() {
          {updated_before}"
     );
     let review = get_lens_review(&client, &workload_id, &extra).await;
-    assert_eq!(
-        review.status, 404,
-        "the refused lens must have no review, got {review:?}"
+    assert_field_validation(
+        "one-past-the-ceiling",
+        &review,
+        "LensAlias",
+        &format!("No lens review for lens alias {extra} was found in workload {workload_id}."),
     );
 }
 

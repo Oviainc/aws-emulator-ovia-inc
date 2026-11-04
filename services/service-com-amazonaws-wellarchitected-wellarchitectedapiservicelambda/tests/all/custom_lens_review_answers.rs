@@ -396,9 +396,10 @@ async fn every_question_an_imported_lens_defines_is_reported_unanswered() {
     }
 }
 
-/// `PillarId` and `QuestionPriority` filter the custom lens's question set: each pillar the
-/// DOCUMENT defines reports its own questions, a pillar it does not define reports nothing,
-/// and the priority filter selects by the `QuestionType` the questions carry.
+/// `PillarId` SELECTS one pillar of the custom lens's question set and `QuestionPriority`
+/// filters by the `QuestionType` the questions carry: each pillar the DOCUMENT defines
+/// reports its own questions, and a `PillarId` the document does not define is refused
+/// rather than selecting nothing — the pillars are that lens's own content.
 #[tokio::test]
 async fn the_filters_narrow_an_imported_lenss_question_set() {
     const SHAPE: Shape = &[("operations", 1, 2), ("security", 4, 1), ("cost", 2, 3)];
@@ -417,18 +418,6 @@ async fn the_filters_narrow_an_imported_lenss_question_set() {
             *questions,
         ));
     }
-    // A pillar the document does not define matches no question, and so does one of its
-    // pillars in another case: a `PillarId` is matched exactly.
-    cases.push((
-        "pillar-absent".to_string(),
-        vec!["PillarId=notapillar".to_string()],
-        0,
-    ));
-    cases.push((
-        "pillar-wrong-case".to_string(),
-        vec!["PillarId=SECURITY".to_string()],
-        0,
-    ));
     // `QuestionPriority` publishes PRIORITIZED | NONE
     // (`smithy_query(query="shape", shape="QuestionPriority")`). Every question of a lens
     // review here is NON_PRIORITIZED, so NONE selects them all and PRIORITIZED none.
@@ -472,6 +461,41 @@ async fn the_filters_narrow_an_imported_lenss_question_set() {
                 );
             }
         }
+    }
+
+    // A pillar the document does not define is refused rather than selecting nothing —
+    // including one of its own pillars in another case, because a `PillarId` is matched
+    // exactly.
+    for (case, pillar) in [
+        ("pillar-absent", "notapillar"),
+        ("pillar-wrong-case", "SECURITY"),
+    ] {
+        let answer = list_answers(
+            &client,
+            &workload_id,
+            &lens_arn,
+            &[format!("PillarId={pillar}")],
+        )
+        .await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: a pillar the document does not define is refused, got {answer:?}"
+        );
+        assert_eq!(
+            answer.error_code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {answer:?}"
+        );
+        assert_eq!(
+            answer
+                .body
+                .get("Fields")
+                .and_then(Value::as_array)
+                .and_then(|fields| fields.first())
+                .and_then(|field| field.get("Name"))
+                .and_then(Value::as_str),
+            Some("PillarId"),
+            "case {case:?}: the finding must name PillarId, got {answer:?}"
+        );
     }
 }
 

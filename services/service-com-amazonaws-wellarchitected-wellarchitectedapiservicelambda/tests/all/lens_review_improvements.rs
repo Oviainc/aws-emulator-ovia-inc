@@ -26,9 +26,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::AnswerRecord;
 
 use super::workload_harness::{
-    created_id, encode_path_segment, framework_answer, framework_answer_that_does_not_apply,
-    framework_choice_ids, minimal_create, official_lens_arn, stored_workload, Answer, Client,
-    InPlace,
+    assert_field_validation, created_id, encode_path_segment, framework_answer,
+    framework_answer_that_does_not_apply, framework_choice_ids, minimal_create, official_lens_arn,
+    stored_workload, Answer, Client, InPlace,
 };
 
 /// The AWS Well-Architected Framework lens's pillars: the `PillarId` each is named by on
@@ -561,9 +561,10 @@ async fn the_plan_selects_the_answers_rated_at_an_identified_risk() {
     }
 }
 
-/// `PillarId` and `QuestionPriority` FILTER the plan: each pillar reports its own
-/// risk-bearing questions, a pillar the lens does not have reports nothing, and the
-/// priority filter selects by the `QuestionType` the questions carry.
+/// `PillarId` SELECTS the plan of one pillar of the lens and `QuestionPriority` filters by
+/// the `QuestionType` the questions carry: each pillar reports its own risk-bearing
+/// questions, and a `PillarId` the lens does not define is refused rather than selecting
+/// nothing — the pillars are the lens's own content.
 #[tokio::test]
 async fn the_filters_narrow_the_improvement_plan() {
     let client = Client::new();
@@ -586,18 +587,6 @@ async fn the_filters_narrow_the_improvement_plan() {
             at_risk(Some(pillar)),
         ));
     }
-    // A pillar id the lens does not have matches no question; so does the right pillar in
-    // the wrong case, because a `PillarId` is matched exactly.
-    cases.push((
-        "pillar-absent".to_string(),
-        vec!["PillarId=notapillar".to_string()],
-        0,
-    ));
-    cases.push((
-        "pillar-wrong-case".to_string(),
-        vec!["PillarId=SECURITY".to_string()],
-        0,
-    ));
     // `QuestionPriority` publishes PRIORITIZED | NONE (`smithy_query(query="shape",
     // shape="QuestionPriority")`). Every question here is NON_PRIORITIZED, so NONE selects
     // them all and PRIORITIZED none of them.
@@ -666,6 +655,41 @@ async fn the_filters_narrow_the_improvement_plan() {
                 );
             }
         }
+    }
+
+    // A `PillarId` the lens does not define is refused rather than selecting nothing —
+    // including the right pillar in the wrong case, because a `PillarId` is matched
+    // exactly.
+    for (case, pillar) in [
+        ("pillar-absent", "notapillar"),
+        ("pillar-wrong-case", "SECURITY"),
+    ] {
+        let answer = list_improvements(
+            &client,
+            &workload_id,
+            FRAMEWORK_LENS,
+            &[format!("PillarId={pillar}")],
+        )
+        .await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: a pillar the lens does not define is refused, got {answer:?}"
+        );
+        assert_eq!(
+            answer.error_code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {answer:?}"
+        );
+        assert_eq!(
+            answer
+                .body
+                .get("Fields")
+                .and_then(Value::as_array)
+                .and_then(|fields| fields.first())
+                .and_then(|field| field.get("Name"))
+                .and_then(Value::as_str),
+            Some("PillarId"),
+            "case {case:?}: the finding must name PillarId, got {answer:?}"
+        );
     }
 }
 
@@ -836,8 +860,10 @@ struct MissingReview {
     resource_id: String,
 }
 
-/// The review whose plan is read must exist: the workload is resolved, the milestone is
-/// resolved when one is named, and the lens must be associated with the workload. An
+/// The review whose plan is read must exist: the workload is RESOLVED — so an id nothing
+/// is stored under, and a milestone the workload never recorded, are each the modelled 404
+/// — while the lens is a VALUE of the request, so a lens the workload does not review is
+/// the modelled 400 naming `LensAlias`. An
 /// associated lens this emulator ships no question set for asks nothing, so its plan is
 /// empty rather than missing.
 #[tokio::test]
@@ -857,22 +883,6 @@ async fn a_review_that_does_not_exist_is_a_not_found() {
             filters: Vec::new(),
             resource_type: "WORKLOAD",
             resource_id: ABSENT_HEX_ID.to_string(),
-        },
-        MissingReview {
-            case: "lens-not-associated",
-            workload_id: workload_id.clone(),
-            lens: UNSHIPPED_LENS,
-            filters: Vec::new(),
-            resource_type: "LENS_REVIEW",
-            resource_id: format!("{workload_id}.{UNSHIPPED_LENS}"),
-        },
-        MissingReview {
-            case: "framework-lens-not-associated",
-            workload_id: unshipped_id.clone(),
-            lens: FRAMEWORK_LENS,
-            filters: Vec::new(),
-            resource_type: "LENS_REVIEW",
-            resource_id: format!("{unshipped_id}.{FRAMEWORK_LENS}"),
         },
         MissingReview {
             case: "milestone-not-recorded",
@@ -919,6 +929,21 @@ async fn a_review_that_does_not_exist_is_a_not_found() {
             member(&answer, "ResourceId"),
             resource_id,
             "case {case:?}: expected ResourceId {resource_id}, got {answer:?}"
+        );
+    }
+
+    // A lens the workload does not review names no review of it, whichever workload of the
+    // two is asked and whichever lens it is: the value is refused as input.
+    for (case, host, lens) in [
+        ("lens-not-associated", &workload_id, UNSHIPPED_LENS),
+        ("framework-lens-not-associated", &unshipped_id, FRAMEWORK_LENS),
+    ] {
+        let answer = list_improvements(&client, host, lens, &[]).await;
+        assert_field_validation(
+            case,
+            &answer,
+            "LensAlias",
+            &format!("No lens review for lens alias {lens} was found in workload {host}."),
         );
     }
 

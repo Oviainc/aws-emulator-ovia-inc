@@ -67,6 +67,11 @@ use smithy_server_runtime::{
     Refused, ServerHttpProtocol, Service,
 };
 
+/// How this service words a request that NAMES lens content it cannot resolve — the
+/// other half of the refusal envelope described above, raised by the HANDLERS rather
+/// than by the boundary walk, and shared by every operation that resolves such a value.
+pub mod lens_content_validation;
+
 /// The `com-amazonaws-wellarchitected-wellarchitectedapiservicelambda` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///

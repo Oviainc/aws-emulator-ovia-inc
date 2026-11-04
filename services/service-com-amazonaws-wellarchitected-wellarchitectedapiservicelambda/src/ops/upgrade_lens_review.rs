@@ -264,10 +264,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         // A lens review exists only while that lens is associated with the workload, so a
-        // lens the workload does not carry has no review to upgrade.
+        // lens the workload does not carry names no review to upgrade — a value of
+        // `LensAlias` this service refuses rather than a resource it could not find
+        // (`crate::service::lens_content_validation`).
         if !workload.reviews_lens(&input.lens_alias) {
-            return Err(UpgradeLensReviewErrorModeled::ResourceNotFoundException(
-                crate::state::lens_review_not_found(&input.workload_id, &input.lens_alias),
+            return Err(UpgradeLensReviewErrorModeled::ValidationException(
+                crate::service::lens_content_validation::no_lens_review(
+                    &input.workload_id,
+                    &input.lens_alias,
+                ),
             )
             .into());
         }
