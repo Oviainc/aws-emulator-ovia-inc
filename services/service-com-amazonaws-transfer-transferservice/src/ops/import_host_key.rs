@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // fingerprint and no algorithm to report, and neither may be invented, so the
         // import is refused with the modelled `InvalidRequestException` (HTTP 400) the
         // model documents as "thrown when the client submits a malformed request".
-        let Some((fingerprint, key_type)) = st::read_host_key(&input.host_key_body) else {
+        let Some(imported) = st::read_host_key(&input.host_key_body) else {
             return Err(ImportHostKeyErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     message: "HostKeyBody must be a private key in OpenSSH format".to_string(),
@@ -215,14 +215,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // key under a second id.
         if let Some(held) = guard
             .host_keys_of(&input.server_id)
-            .find(|held| held.fingerprint == fingerprint)
+            .find(|held| held.fingerprint == imported.fingerprint)
         {
             let host_key_id = held.host_key_id.clone();
             return Err(ImportHostKeyErrorModeled::ResourceExistsException(
                 ResourceExistsException {
                     message: format!(
                         "Server {} already holds host key {} with fingerprint {}",
-                        input.server_id, host_key_id, fingerprint
+                        input.server_id, host_key_id, imported.fingerprint
                     ),
                     resource: host_key_id,
                     resource_type: st::RESOURCE_TYPE_HOST_KEY.to_string(),
@@ -257,8 +257,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let host_key = st::HostKey {
             host_key_id: host_key_id.clone(),
             arn,
-            fingerprint,
-            key_type,
+            fingerprint: imported.fingerprint,
+            key_type: imported.key_type,
+            public_key: imported.public_key,
             description: input.description,
             date_imported: ::std::time::SystemTime::now(),
             // Resolved once, by the write, so a reader reports the storage the key has

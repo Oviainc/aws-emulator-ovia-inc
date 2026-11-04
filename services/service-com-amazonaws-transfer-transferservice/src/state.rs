@@ -25,10 +25,12 @@
 //! stored ARN and reads or rewrites that resource's own `tags` — which is why a tag
 //! written through `TagResource` is at once what the resource's own reader reports.
 //!
-//! The verdict `TestConnection` reports on a stored SFTP connector is built here as
-//! well ([`TEST_CONNECTION_STATUS_ERROR`], [`sftp_connection_status_message`]): it is
-//! decided from that connector's stored configuration alone, so the rule for what
-//! counts as a usable configuration lives beside the configuration itself.
+//! The verdict `TestConnection` reports on a stored SFTP connector STARTS here
+//! ([`TEST_CONNECTION_STATUS_ERROR`], [`sftp_configuration_defect`]) — the defects that
+//! connector's stored configuration carries on its own — and is decided in
+//! [`sftp_target`], which resolves the endpoint the connector's `Url` names against
+//! this same store and answers for the connection to it. [`connector_delivery`] is the
+//! other half of that endpoint: it carries an accepted transfer out against it.
 //!
 //! `UserCount` and `SshPublicKeyCount` are DERIVED at read time ([`
 //! ComAmazonawsTransferTransferserviceState::user_count`],
@@ -57,6 +59,8 @@
 //! lives in `crate::service`.
 
 pub mod authorization;
+pub mod connector_delivery;
+pub mod sftp_target;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -178,15 +182,18 @@ pub const WEB_APP_ENDPOINT_TYPE_PUBLIC: &str = "PUBLIC";
 /// `WebAppEndpointType`'s VPC-hosted value — see [`WEB_APP_ENDPOINT_TYPE_PUBLIC`].
 pub const WEB_APP_ENDPOINT_TYPE_VPC: &str = "VPC";
 
-/// `Protocols`' default: SFTP alone, the only protocol a `PUBLIC`,
-/// `SERVICE_MANAGED` server can serve.
-pub const DEFAULT_PROTOCOL: &str = "SFTP";
-
-/// The `Protocol` enum values whose documentation states a requirement on another
-/// member of the server (the enum is `[SFTP, FTP, FTPS, AS2]`).
+/// The `Protocol` enum values this service names (the enum is
+/// `[SFTP, FTP, FTPS, AS2]`): `SFTP`, the one a connector speaks and the one
+/// `Protocols` defaults to, and the three whose documentation states a requirement on
+/// another member of the server.
+pub const PROTOCOL_SFTP: &str = "SFTP";
 pub const PROTOCOL_FTP: &str = "FTP";
 pub const PROTOCOL_FTPS: &str = "FTPS";
 pub const PROTOCOL_AS2: &str = "AS2";
+
+/// `Protocols`' default: SFTP alone, the only protocol a `PUBLIC`,
+/// `SERVICE_MANAGED` server can serve.
+pub const DEFAULT_PROTOCOL: &str = PROTOCOL_SFTP;
 
 /// `HomeDirectoryType`'s value that makes `HomeDirectoryMappings` the user's home
 /// directory (the enum is `[PATH, LOGICAL]`).
@@ -325,7 +332,8 @@ pub const SERVER_STATE_START_FAILED: &str = "START_FAILED";
 /// [`SERVER_STATE_START_FAILED`], on the same basis.
 pub const SERVER_STATE_STOP_FAILED: &str = "STOP_FAILED";
 
-/// The HTTP status AWS Transfer Family answers `ResourceNotFoundException` with.
+/// The HTTP status AWS Transfer Family answers `ResourceNotFoundException` with for a
+/// RESOURCE REFERENCE it cannot resolve.
 ///
 /// The model puts `@httpError(404)` on the shape, but the recorded Transfer wire
 /// answers an unknown server or user with HTTP **400** and `__type`
@@ -333,6 +341,12 @@ pub const SERVER_STATE_STOP_FAILED: &str = "STOP_FAILED";
 /// `httpError` does not describe the service. Handlers return it through
 /// [`not_found`], which keeps the body the model's own and changes only the status
 /// line.
+///
+/// The override's scope is the operations that were recorded answering it:
+/// `SendWorkflowStepState`'s callback — a different component of the service, whose
+/// recorded answer to a callback resolving to no running execution is the modelled
+/// 404 — returns the error WITHOUT this override, so each operation answers the status
+/// it was recorded answering.
 pub const RESOURCE_NOT_FOUND_HTTP_STATUS: u16 = 400;
 
 /// `ResourceType` for the server resource: the resource name capitalized, as the
@@ -522,6 +536,25 @@ pub const EXECUTION_STATUS_EXCEPTION: &str = "EXCEPTION";
 /// step.
 pub const CUSTOM_STEP_STATUS_SUCCESS: &str = "SUCCESS";
 pub const CUSTOM_STEP_STATUS_FAILURE: &str = "FAILURE";
+
+/// How many executions ONE workflow holds before an upload starts no further one.
+///
+/// The emulator's OWN bound on the store, chosen on the same basis as
+/// [`MAX_TRANSFERS_PER_CONNECTOR`] — not a claim about any account's quota. Each record
+/// is itself bounded by what it holds: one file location, one set of session details,
+/// and one pending-step entry per `CUSTOM` step of a workflow whose `Steps` the model
+/// bounds. See [`ComAmazonawsTransferTransferserviceState::take_execution_capacity`]
+/// for how room is made, and `DeleteWorkflow` for what releases a workflow's records.
+pub const MAX_EXECUTIONS_PER_WORKFLOW: usize = 100;
+
+/// How many executions the whole store holds, across every workflow, before an upload
+/// starts no further one.
+///
+/// The per-workflow bound alone would let a caller that keeps creating workflows (or
+/// recycling identifiers) grow the store without end, so the store is bounded in total
+/// as well — the same two-level bound [`MAX_STORED_WORKFLOWS`] and
+/// [`MAX_USERS_PER_SERVER`] give the workflow and user maps.
+pub const MAX_STORED_EXECUTIONS: usize = 1_000;
 
 /// How many workflows the store holds before `CreateWorkflow` refuses with the
 /// modelled `ServiceUnavailableException` instead of growing.
@@ -797,8 +830,8 @@ pub fn identity_provider_endpoint(server: &Server) -> String {
 /// The `Message` a test of `server`'s identity provider reports: "a message that
 /// indicates whether the test was successful or not".
 ///
-/// Decided from the server's STORED configuration alone, like the verdict
-/// [`sftp_connection_status_message`] gives a connector: each text is fixed for the
+/// Decided from the server's STORED configuration alone, like the configuration
+/// verdict [`sftp_configuration_defect`] gives a connector: each text is fixed for the
 /// condition it states and carries no request data, and none of them claims an outcome
 /// for an authentication request nothing made.
 pub fn identity_provider_test_message(server: &Server) -> &'static str {
@@ -1513,11 +1546,14 @@ pub struct SshKey {
 
 /// One stored host key of a server, keyed by `(ServerId, HostKeyId)`.
 ///
-/// The private material the import carried is NOT kept: nothing in this emulator can
+/// The PRIVATE material the import carried is NOT kept: nothing in this emulator can
 /// use it (it serves no SSH transport) and no modelled member returns it. What the
 /// readers report is derived from that material once, at import time — the genuine
 /// OpenSSH fingerprint and algorithm name [`read_host_key`] parses out of it — so a
-/// read reports a real property of a real key rather than an echo of the request.
+/// read reports a real property of a real key rather than an echo of the request. The
+/// PUBLIC half is kept, because it is what a client that connects to the server is
+/// shown: it is the key the server presents on the host-key exchange, which
+/// [`sftp_target`] reports as the host key observed on a connection to it.
 #[derive(Debug, Clone)]
 pub struct HostKey {
     /// The minted `hostkey-` + 17 hex-digit identifier (`^hostkey-[0-9a-f]{17}$`).
@@ -1537,6 +1573,10 @@ pub struct HostKey {
     pub date_imported: SystemTime,
     /// The resolved `HostKeyStorageType` (see [`DEFAULT_HOST_KEY_STORAGE_TYPE`]).
     pub storage_type: String,
+    /// The public half of this key, in the `key-type key-body` form `ssh-keygen` writes
+    /// — the key a client connecting to the server is presented with, computed from the
+    /// key's own material by [`read_host_key`]/[`mint_host_key`] and never invented.
+    pub public_key: String,
     pub tags: Vec<Tag>,
 }
 
@@ -1821,28 +1861,31 @@ pub fn resolve_sftp_connector_config(requested: SftpConnectorConfig) -> SftpConn
 // succeeded ... Or, ... a descriptive error message if the test fails", and
 // `SftpConnectionDetails.HostKey` is "the SSH public key of the remote SFTP server ...
 // returned during the initial connection attempt". The three texts below each state
-// one defect the STORED configuration carries, decided from that configuration alone;
-// the fourth states that the connection itself was never verified. Each is a FIXED
-// text per condition carrying no request data, for the reason this module's docs give.
+// one defect the STORED configuration carries, decided from that configuration alone,
+// before any connection is attempted; what the attempt itself answers is decided in
+// [`sftp_target`]. Each is a FIXED text per condition carrying no request data, for the
+// reason this module's docs give.
 
 /// `TestConnection`'s `Status` for a test that succeeded.
 ///
 /// `Status` is modelled as a plain string, so the two values the operation documents
 /// ("Returns OK for successful test, or ERROR if the test fails") live here as
-/// constants. NOTHING in this emulator reports this one — see
-/// [`TEST_CONNECTION_STATUS_ERROR`].
+/// constants. Reported for a connection to an SFTP endpoint this emulator SERVES that
+/// was established with the connector's own stored credentials and trusted host key —
+/// see [`sftp_target`], which is where a test's attempt is made.
 pub const TEST_CONNECTION_STATUS_OK: &str = "OK";
 
-/// `TestConnection`'s `Status` for a test that did not succeed, and the status every
-/// test in this emulator reports.
+/// `TestConnection`'s `Status` for a test that did not succeed.
 ///
-/// `OK` is documented as a "successful test" and `SftpConnectionDetails.HostKey` as a
-/// key "returned during the initial connection attempt": both are properties of a
-/// session with the partner's SFTP server that really happened. This emulator opens no
-/// outbound connection, so no attempt can run and nothing here can report that one
-/// succeeded — the test ends in the operation's own documented failure state, with
-/// [`sftp_connection_status_message`] saying why, and reports no observed host key.
+/// The operation's own documented failure state: the stored configuration carries a
+/// defect ([`sftp_configuration_defect`]), or the attempt on the endpoint the `Url`
+/// names did not establish a session ([`sftp_target`]). The `StatusMessage` that
+/// travels with it says which.
 pub const TEST_CONNECTION_STATUS_ERROR: &str = "ERROR";
+
+/// `StatusMessage` for a test that succeeded: the model's own words for that outcome
+/// ("Returns Connection succeeded if the test is successful"), and the whole of them.
+pub const TEST_CONNECTION_SUCCESS_MESSAGE: &str = "Connection succeeded";
 
 /// `StatusMessage` for an SFTP configuration that names no secret to authenticate
 /// with. `UserSecretId` is "the identifier for the secret ... that contains the SFTP
@@ -1858,8 +1901,9 @@ const SFTP_NO_USER_SECRET: &str = "The connector configuration names no UserSecr
 /// `TrustedHostKeys` is "the public portion of the host key, or keys, that are used to
 /// identify the external server to which you are connecting", and is "optional for
 /// `CreateConnector` [because] you can use `TestConnection` to retrieve the server host
-/// key during the initial connection attempt" — an attempt this emulator cannot make,
-/// so a connector that trusts none has nothing to identify the remote server by.
+/// key during the initial connection attempt" — so a connector that trusts none has
+/// nothing to identify the remote server by, and the test that says so is the very call
+/// that reports the host key to pin.
 const SFTP_NO_TRUSTED_HOST_KEY: &str = "The connector configuration carries no \
      TrustedHostKeys, so the remote server cannot be identified. Verify that the \
      trusted host key in the connector configuration matches the ssh-keyscan output.";
@@ -1875,14 +1919,6 @@ const SFTP_UNREADABLE_TRUSTED_HOST_KEY: &str = "A TrustedHostKeys entry in the \
      it can never match the remote server's host key. Verify that the trusted host key \
      in the connector configuration matches the ssh-keyscan output.";
 
-/// `StatusMessage` for an SFTP configuration that carries no defect this emulator can
-/// decide from stored state: the test got as far as the connection itself, which is
-/// what this emulator does not make.
-const SFTP_CONNECTION_NOT_VERIFIED: &str = "The stored connector configuration is \
-     complete, but the connection to the remote SFTP server could not be verified: \
-     this emulator opens no outbound connection, so no SFTP session was established \
-     and no remote host key was observed.";
-
 /// Whether `material` is an SSH PUBLIC key this service can read.
 ///
 /// Asks [`ssh_key`] — the crate that implements the OpenSSH key formats — rather than
@@ -1892,38 +1928,38 @@ const SFTP_CONNECTION_NOT_VERIFIED: &str = "The stored connector configuration i
 /// model documents as one a caller must NOT paste into `TrustedHostKeys`.
 ///
 /// Crate-private: the rule a handler needs is the whole verdict
-/// ([`sftp_connection_status_message`]), not this one predicate.
+/// ([`sftp_target::probe`]), not this one predicate.
 pub(crate) fn is_readable_ssh_public_key(material: &str) -> bool {
     ::ssh_key::PublicKey::from_openssh(material).is_ok()
 }
 
-/// The `StatusMessage` a test of the SFTP configuration `config` reports: the FIRST
-/// defect it carries that makes an SFTP session impossible, or
-/// [`SFTP_CONNECTION_NOT_VERIFIED`] when it carries none.
+/// The `StatusMessage` for the FIRST defect the SFTP configuration `config` carries
+/// that makes an SFTP session impossible — `None` when it carries none, which is when
+/// the connection itself decides the verdict ([`sftp_target::probe`]).
 ///
 /// Every branch is decided from the stored configuration alone — no request data
 /// reaches the text, and nothing here claims an outcome for a session nothing opened.
-pub fn sftp_connection_status_message(config: &SftpConnectorConfig) -> &'static str {
+pub fn sftp_configuration_defect(config: &SftpConnectorConfig) -> Option<&'static str> {
     let names_secret = config
         .user_secret_id
         .as_deref()
         .is_some_and(|secret| !secret.trim().is_empty());
     if !names_secret {
-        return SFTP_NO_USER_SECRET;
+        return Some(SFTP_NO_USER_SECRET);
     }
 
     let trusted_host_keys = config.trusted_host_keys.as_deref().unwrap_or_default();
     if trusted_host_keys.is_empty() {
-        return SFTP_NO_TRUSTED_HOST_KEY;
+        return Some(SFTP_NO_TRUSTED_HOST_KEY);
     }
     if trusted_host_keys
         .iter()
         .any(|key| !is_readable_ssh_public_key(key))
     {
-        return SFTP_UNREADABLE_TRUSTED_HOST_KEY;
+        return Some(SFTP_UNREADABLE_TRUSTED_HOST_KEY);
     }
 
-    SFTP_CONNECTION_NOT_VERIFIED
+    None
 }
 
 /// `TestConnection`'s refusal for a connector that configures no SFTP connection.
@@ -1999,20 +2035,42 @@ pub fn merge_connector_egress_config(
 //
 // `StartFileTransfer` and `StartRemoteMove` are ASYNCHRONOUS: each one accepts the
 // request and answers an identifier for it, and the work itself then happens against
-// the partner's remote AS2 or SFTP endpoint — an outbound connection this emulator
-// never makes. So each accepted request is RECORDED here, under the identifier it was
-// answered with, and `ListFileTransferResults` reports the per-file status of the
-// record: `QUEUED`, the `TransferTableStatus` for a file whose transfer has not run.
-// Nothing here ever reports a file as transferred, because nothing transferred it.
+// the remote AS2 or SFTP endpoint the connector's `Url` names. So each accepted request
+// is RECORDED here, under the identifier it was answered with, and
+// `ListFileTransferResults` reports the per-file status of the record.
+//
+// An endpoint this emulator SERVES is one it can carry the work out against:
+// [`connector_delivery`] performs such a transfer and records what the attempt did to
+// each file, which is what the record then reports once the transfer's span has
+// elapsed. An endpoint outside the emulator is one nothing can connect to, so no
+// attempt is made and its files stay `QUEUED` — a status that claims nothing about
+// bytes nobody moved.
 
 /// `TransferTableStatus`' value for a file whose transfer has been accepted and has
 /// not run (the enum is `[QUEUED, IN_PROGRESS, COMPLETED, FAILED]`).
-///
-/// The only status this emulator reports for a queued file: `IN_PROGRESS`, `COMPLETED`
-/// and `FAILED` are each a claim about a transfer that was attempted against the
-/// partner's remote endpoint, and no attempt is made here, so none of them could be
-/// true of a file this service holds.
 pub const TRANSFER_STATUS_QUEUED: &str = "QUEUED";
+
+/// `TransferTableStatus`' value for a file the attempt transferred.
+///
+/// Reported only for a file whose bytes really were written to the destination the
+/// request named ([`connector_delivery`]), never for one nothing attempted.
+pub const TRANSFER_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// `TransferTableStatus`' value for a file the attempt could not transfer.
+///
+/// Reported only for an attempt that was MADE and failed, with the `FailureCode` and
+/// `FailureMessage` the storage the attempt addressed answered — never a code this
+/// service invented for work it did not try.
+pub const TRANSFER_STATUS_FAILED: &str = "FAILED";
+
+/// How long an accepted transfer takes before its per-file outcome is reported.
+///
+/// A transfer is asynchronous: "begins a file transfer" is what the call does, and the
+/// result of each file is read back afterwards, so a caller reading results straight
+/// after the call sees the accepted-and-not-yet-reported state (`QUEUED`) rather than a
+/// terminal one. Nothing SLEEPS for this: the record carries the instant its outcome
+/// becomes due and [`ConnectorTransfer::results`] compares the clock against it.
+pub const CONNECTOR_TRANSFER_SPAN: Duration = Duration::from_secs(3);
 
 /// `ResourceType` for one accepted connector operation, addressed by its
 /// `TransferId`. Same convention as [`RESOURCE_TYPE_SERVER`].
@@ -2042,11 +2100,50 @@ pub fn unknown_transfer(transfer_id: &str) -> ResourceNotFoundException {
 /// a connector's.
 pub const MAX_TRANSFERS_PER_CONNECTOR: usize = 100;
 
+/// What the attempt on ONE file of a transfer did to it.
+///
+/// Recorded by [`connector_delivery`] after the attempt, so a status this carries is
+/// always a statement about work that ran: `FailureCode`/`FailureMessage` are "for
+/// transfers that fail" and carry what the storage the attempt addressed answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorFileOutcome {
+    /// The `TransferTableStatus` the attempt reached: [`TRANSFER_STATUS_COMPLETED`] or
+    /// [`TRANSFER_STATUS_FAILED`].
+    pub status_code: String,
+    /// The error code the failed attempt was answered with, as the service that
+    /// answered it named the error.
+    pub failure_code: Option<String>,
+    /// That answer's own message.
+    pub failure_message: Option<String>,
+}
+
+impl ConnectorFileOutcome {
+    /// The outcome of a file the attempt transferred.
+    pub fn completed() -> Self {
+        Self {
+            status_code: TRANSFER_STATUS_COMPLETED.to_string(),
+            failure_code: None,
+            failure_message: None,
+        }
+    }
+
+    /// The outcome of a file the attempt could not transfer, with the error the
+    /// storage it addressed answered.
+    pub fn failed(code: &str, message: &str) -> Self {
+        Self {
+            status_code: TRANSFER_STATUS_FAILED.to_string(),
+            failure_code: Some(code.to_string()),
+            failure_message: Some(message.to_string()),
+        }
+    }
+}
+
 /// One accepted connector operation, keyed by `(ConnectorId, TransferId)`.
 ///
 /// The paths are held in the caller's OWN order — the order the request named the files
 /// in is the order their results are reported in, which is the only order the request
-/// states — so this is a `Vec`, not a set.
+/// states — so this is a `Vec`, not a set, and the outcomes are a `Vec` positioned
+/// against it.
 #[derive(Debug, Clone)]
 pub struct ConnectorTransfer {
     /// The minted identifier this operation was answered with (`TransferId`/`MoveId`
@@ -2056,22 +2153,39 @@ pub struct ConnectorTransfer {
     pub file_paths: Vec<String>,
     /// When the request was accepted.
     pub requested_at: SystemTime,
+    /// What the attempt did to each named file, by that file's position in
+    /// [`Self::file_paths`] — `None` for a file no attempt has reported on.
+    pub outcomes: Vec<Option<ConnectorFileOutcome>>,
+    /// When this transfer's reported outcome comes due: accepted + the span the
+    /// transfer takes ([`CONNECTOR_TRANSFER_SPAN`]).
+    pub reported_at: Instant,
 }
 
 impl ConnectorTransfer {
     /// The per-file results of this operation, in submission order: one result per file
-    /// the request named, each `QUEUED`.
+    /// the request named.
     ///
-    /// `FailureCode` and `FailureMessage` are "for transfers that fail": nothing here
-    /// failed — nothing ran — so neither is reported.
-    pub fn results(&self) -> Vec<ConnectorFileTransferResult> {
+    /// A file is `QUEUED` until this transfer's span has elapsed and the attempt has
+    /// reported on it; after that it carries the outcome the attempt recorded.
+    pub fn results(&self, now: Instant) -> Vec<ConnectorFileTransferResult> {
         self.file_paths
             .iter()
-            .map(|file_path| ConnectorFileTransferResult {
-                file_path: file_path.clone(),
-                status_code: TRANSFER_STATUS_QUEUED.to_string(),
-                failure_code: None,
-                failure_message: None,
+            .enumerate()
+            .map(|(index, file_path)| {
+                let reported = (now >= self.reported_at)
+                    .then(|| self.outcomes.get(index).cloned().flatten())
+                    .flatten();
+                ConnectorFileTransferResult {
+                    file_path: file_path.clone(),
+                    status_code: reported
+                        .as_ref()
+                        .map_or_else(
+                            || TRANSFER_STATUS_QUEUED.to_string(),
+                            |outcome| outcome.status_code.clone(),
+                        ),
+                    failure_code: reported.as_ref().and_then(|o| o.failure_code.clone()),
+                    failure_message: reported.and_then(|o| o.failure_message),
+                }
             })
             .collect()
     }
@@ -2152,16 +2266,42 @@ impl ComAmazonawsTransferTransferserviceState {
         &mut self,
         connector_id: &str,
         file_paths: Vec<String>,
+        now: Instant,
     ) -> String {
         let transfer_id = self.mint_transfer_id();
         let transfer = ConnectorTransfer {
+            outcomes: vec![None; file_paths.len()],
             file_paths,
             requested_at: SystemTime::now(),
+            reported_at: now + CONNECTOR_TRANSFER_SPAN,
             transfer_id: transfer_id.clone(),
         };
         self.connector_transfers
             .insert((connector_id.to_string(), transfer_id.clone()), transfer);
         transfer_id
+    }
+
+    /// Record what the attempt did to the file at `index` of one accepted transfer.
+    ///
+    /// Written by [`connector_delivery`] once the attempt on that file has finished;
+    /// the record reports it when its span has elapsed
+    /// ([`ConnectorTransfer::results`]). A transfer the store no longer holds — its
+    /// connector was deleted while the attempt ran — takes no outcome, which is why
+    /// this resolves the record rather than holding a handle to it.
+    pub fn record_transfer_outcome(
+        &mut self,
+        connector_id: &str,
+        transfer_id: &str,
+        index: usize,
+        outcome: ConnectorFileOutcome,
+    ) {
+        if let Some(slot) = self
+            .connector_transfers
+            .get_mut(&(connector_id.to_string(), transfer_id.to_string()))
+            .and_then(|transfer| transfer.outcomes.get_mut(index))
+        {
+            *slot = Some(outcome);
+        }
     }
 }
 
@@ -2382,45 +2522,66 @@ fn normalised_openssh_private_key(material: &str) -> Option<String> {
     Some(normalised)
 }
 
-/// The genuine fingerprint and SSH algorithm name of private key MATERIAL a caller
-/// supplied, when the material is a key the emulator can read.
+/// What this service keeps of ONE host key: the three properties it reports about the
+/// key, every one of them computed from the key's own material.
+///
+/// The private half is never part of it — nothing in this emulator can use it and no
+/// modelled member returns it — while the public half is, because that is the half a
+/// client connecting to the server is shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostKeyMaterial {
+    /// The Base64 SHA256 fingerprint, in the `SHA256:<base64>` form `ssh-keygen -l`
+    /// prints.
+    pub fingerprint: String,
+    /// The SSH algorithm name (`ssh-rsa`, `ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`).
+    pub key_type: String,
+    /// The public half, in the `key-type key-body` form `ssh-keygen` writes.
+    pub public_key: String,
+}
+
+/// The genuine properties of private key MATERIAL a caller supplied, when the material
+/// is a key the emulator can read.
 ///
 /// The material is read through [`normalised_openssh_private_key`], so whichever way
 /// the tool that wrote it wrapped the container's armour, the same key reads the same
 /// way.
 ///
 /// `None` for material in a format the emulator cannot read: it implements no
-/// private-key format other than OpenSSH's (what `ssh-keygen` writes) and serves no
-/// SSH transport, so there is nothing to compute a fingerprint or an algorithm name
-/// from — and neither may be invented for material nothing parsed.
-pub fn read_host_key(material: &str) -> Option<(String, String)> {
+/// private-key format other than OpenSSH's (what `ssh-keygen` writes), so there is
+/// nothing to compute a fingerprint, an algorithm name or a public half from — and none
+/// of them may be invented for material nothing parsed.
+pub fn read_host_key(material: &str) -> Option<HostKeyMaterial> {
     let normalised = normalised_openssh_private_key(material)?;
     let key = ::ssh_key::PrivateKey::from_openssh(&normalised).ok()?;
-    Some((
-        key.fingerprint(::ssh_key::HashAlg::Sha256).to_string(),
-        key.algorithm().as_str().to_string(),
-    ))
+    Some(host_key_material(&key))
 }
 
-/// Mint a host key for a new server: its Base64 SHA256 fingerprint and its SSH
-/// algorithm name, the two properties this service reports about a host key.
+/// Mint a host key for a new server.
 ///
 /// AWS generates a host key for a server whose host key it manages, and reports that
 /// key's fingerprint — "equivalent to the output of the `ssh-keygen -l -f` command",
 /// i.e. OpenSSH's `SHA256:<base64 of the SHA256 of the public key blob>`. So this
 /// GENERATES a real Ed25519 SSH host key and asks `ssh-key` — the crate that
-/// implements the OpenSSH key formats — for that key's fingerprint and algorithm; both
-/// values are computed from real key material rather than invented. The key itself is
-/// per-server and per-run, like the real service's, and its private half is not kept:
-/// the emulator serves no SSH transport, so nothing can use it, and nothing may return
-/// it.
-pub fn mint_host_key() -> (String, String) {
+/// implements the OpenSSH key formats — for that key's own properties; every value is
+/// computed from real key material rather than invented. The key is per-server and
+/// per-run, like the real service's, and its private half is not kept: the emulator
+/// serves no SSH transport, so nothing can use it, and nothing may return it.
+pub fn mint_host_key() -> HostKeyMaterial {
     let keypair = ::ssh_key::private::Ed25519Keypair::random(&mut ::ssh_key::rand_core::OsRng);
-    let key = ::ssh_key::PrivateKey::from(keypair);
-    (
-        key.fingerprint(::ssh_key::HashAlg::Sha256).to_string(),
-        key.algorithm().as_str().to_string(),
-    )
+    host_key_material(&::ssh_key::PrivateKey::from(keypair))
+}
+
+/// The three properties this service keeps of one parsed private key. The ONE place
+/// they are read off a key, so a minted key and an imported one are described alike.
+fn host_key_material(key: &::ssh_key::PrivateKey) -> HostKeyMaterial {
+    HostKeyMaterial {
+        fingerprint: key.fingerprint(::ssh_key::HashAlg::Sha256).to_string(),
+        key_type: key.algorithm().as_str().to_string(),
+        // An OpenSSH public key encodes from the key data alone; the fallback is the
+        // empty string, which no reader can mistake for a key, rather than a value this
+        // service made up for a key that would not encode.
+        public_key: key.public_key().to_openssh().unwrap_or_default(),
+    }
 }
 
 // =============================================================================
@@ -3266,8 +3427,15 @@ pub struct ComAmazonawsTransferTransferserviceState {
     /// Directory access grants by `(ServerId, ExternalId)`, so one server's grants are
     /// a contiguous, ordered range for `ListAccesses`.
     pub accesses: BTreeMap<(String, String), Access>,
-    /// Running workflow executions by `(WorkflowId, ExecutionId)`, so one workflow's
+    /// Workflow executions by `(WorkflowId, ExecutionId)`, so one workflow's
     /// executions are a contiguous, ordered range for `ListExecutions`.
+    ///
+    /// BOUNDED by [`MAX_EXECUTIONS_PER_WORKFLOW`] per workflow and by
+    /// [`MAX_STORED_EXECUTIONS`] in total, which
+    /// [`Self::take_execution_capacity`] is the predicate for: an upload that finds no
+    /// room starts no execution. `DeleteWorkflow` releases a workflow's records, and a
+    /// run whose callbacks have FINISHED is reclaimable at the bound, because nothing
+    /// addresses a finished run any more.
     pub workflow_executions: BTreeMap<(String, String), WorkflowExecution>,
     /// Web apps by `WebAppId` (`"webapp-" + 17 hex`). `BTreeMap` so `ListWebApps` pages
     /// in a stable, resumable order.
@@ -3337,6 +3505,32 @@ impl ComAmazonawsTransferTransferserviceState {
         format!("{:032x}", self.next_id_seq)
     }
 
+    /// Mint the identifier of one workflow execution.
+    ///
+    /// `ExecutionId` is `len 36..36` with the UUID pattern
+    /// `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`,
+    /// so the counter is rendered into that shape: the version and variant nibbles are
+    /// the fixed middle groups and the counter fills the first and last, which keeps
+    /// ascending runs ascending ids — the order `ListExecutions` pages in.
+    pub fn mint_execution_id(&mut self) -> String {
+        self.next_id_seq += 1;
+        format!(
+            "{:08x}-0000-4000-8000-{:012x}",
+            self.next_id_seq, self.next_id_seq
+        )
+    }
+
+    /// Mint the callback token ONE pending custom step of an execution is handed.
+    ///
+    /// `CallbackToken` is `len 1..64`, pattern `^\w+$`, and "used to distinguish
+    /// between multiple callbacks for multiple Lambda steps within the same execution",
+    /// so it is the bare counter in 32 lowercase hex digits — unique across this store,
+    /// like every other minted value, and distinct per step.
+    pub fn mint_callback_token(&mut self) -> String {
+        self.next_id_seq += 1;
+        format!("{:032x}", self.next_id_seq)
+    }
+
     /// The users stored for `server_id`, in `ListUsers` paging order.
     ///
     /// A RANGE scan, not a filter over the whole map: the key is
@@ -3381,6 +3575,47 @@ impl ComAmazonawsTransferTransferserviceState {
             .map(|(_, execution)| execution)
     }
 
+    /// Whether `workflow_id` can take another execution, RECLAIMING finished runs when
+    /// a bound has been reached.
+    ///
+    /// The execution store is bounded twice — per workflow
+    /// ([`MAX_EXECUTIONS_PER_WORKFLOW`]) and in total ([`MAX_STORED_EXECUTIONS`]) — so
+    /// a caller that keeps uploading cannot grow it without end. At a bound, the runs
+    /// whose custom-step callbacks have FINISHED are released first: `DescribeExecution`
+    /// "only returns details for in-progress workflows", so a finished run is a record
+    /// nothing addresses any more, and releasing it is what lets the next upload run.
+    /// `false` when even that leaves no room, and then no execution is started: a
+    /// record the store cannot hold is not written, exactly as every other `MAX_*` bound
+    /// in this module refuses rather than growing.
+    ///
+    /// Called by the one writer that starts a run
+    /// ([`connector_delivery`]), under the same lock the record is
+    /// inserted through.
+    pub fn take_execution_capacity(&mut self, workflow_id: &str) -> bool {
+        if !self.has_execution_capacity(workflow_id) {
+            self.workflow_executions
+                .retain(|_, execution| execution.reported_status() == EXECUTION_STATUS_IN_PROGRESS);
+        }
+        self.has_execution_capacity(workflow_id)
+    }
+
+    /// Whether both execution bounds have room for one more run of `workflow_id`.
+    fn has_execution_capacity(&self, workflow_id: &str) -> bool {
+        self.workflow_executions.len() < MAX_STORED_EXECUTIONS
+            && self.executions_of(workflow_id).count() < MAX_EXECUTIONS_PER_WORKFLOW
+    }
+
+    /// Release every execution of `workflow_id`.
+    ///
+    /// A deleted workflow has no runs: an execution is addressed by its
+    /// `(WorkflowId, ExecutionId)` pair, so once the workflow is gone nothing can
+    /// resolve one of its records, and `DeleteWorkflow` releases them with it — the
+    /// same rule `DeleteConnector` follows for a connector's accepted transfers.
+    pub fn release_executions_of(&mut self, workflow_id: &str) {
+        self.workflow_executions
+            .retain(|(wid, _), _| wid != workflow_id);
+    }
+
     /// Whether `server_id` can take another host key, i.e. is below
     /// [`MAX_HOST_KEYS_PER_SERVER`].
     pub fn server_has_host_key_capacity(&self, server_id: &str) -> bool {
@@ -3413,12 +3648,11 @@ impl ComAmazonawsTransferTransferserviceState {
         &mut self,
         region: &str,
         server_id: &str,
-        fingerprint: &str,
-        key_type: &str,
+        key: &HostKeyMaterial,
     ) -> String {
         let held = self
             .host_keys_of(server_id)
-            .find(|host_key| host_key.fingerprint == fingerprint)
+            .find(|host_key| host_key.fingerprint == key.fingerprint)
             .map(|host_key| host_key.host_key_id.clone());
         if let Some(host_key_id) = held {
             return host_key_id;
@@ -3426,8 +3660,9 @@ impl ComAmazonawsTransferTransferserviceState {
         let host_key_id = self.mint_id("hostkey");
         let host_key = HostKey {
             arn: host_key_arn(region, server_id, &host_key_id),
-            fingerprint: fingerprint.to_string(),
-            key_type: key_type.to_string(),
+            fingerprint: key.fingerprint.clone(),
+            key_type: key.key_type.clone(),
+            public_key: key.public_key.clone(),
             // The service generated or adopted this key for the server itself: no
             // caller described it and no caller tagged it, so neither member is
             // invented for it.
@@ -3440,6 +3675,21 @@ impl ComAmazonawsTransferTransferserviceState {
         self.host_keys
             .insert((server_id.to_string(), host_key_id.clone()), host_key);
         host_key_id
+    }
+
+    /// The PUBLIC half of the host key `server_id` is serving with — the key a client
+    /// that connects to that server is presented with on the host-key exchange.
+    ///
+    /// Resolved through the server's own `HostKeyFingerprint` against that server's
+    /// host-key resources, the rule [`Self::materialise_host_key`] states, so this is
+    /// the key the server reports rather than whichever one was imported last. `None`
+    /// for a `ServerId` the store does not hold, and for a key that did not encode.
+    pub fn active_host_key_public(&self, server_id: &str) -> Option<String> {
+        let fingerprint = &self.servers.get(server_id)?.host_key_fingerprint;
+        self.host_keys_of(server_id)
+            .find(|host_key| &host_key.fingerprint == fingerprint)
+            .map(|host_key| host_key.public_key.clone())
+            .filter(|public_key| !public_key.is_empty())
     }
 
     /// `UserCount`: the live number of users assigned to `server_id`.

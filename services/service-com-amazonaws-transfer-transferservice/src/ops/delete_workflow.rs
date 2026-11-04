@@ -2,11 +2,12 @@
 
 //! @op DeleteWorkflow
 //!
-//! Releases one stored workflow by `WorkflowId`. A workflow a server still attaches
-//! through its `WorkflowDetails` is IN USE, so the delete is refused with the modelled
-//! `InvalidRequestException` naming those servers rather than leaving them pointing at
-//! a workflow that no longer exists; an unknown id answers the modelled
-//! `ResourceNotFoundException`.
+//! Releases one stored workflow by `WorkflowId`, and with it the executions of that
+//! workflow — nothing can address a run of a workflow that no longer exists. A workflow
+//! a server still attaches through its `WorkflowDetails` is IN USE, so the delete is
+//! refused with the modelled `InvalidRequestException` naming those servers rather than
+//! leaving them pointing at a workflow that no longer exists; an unknown id answers the
+//! modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -197,6 +198,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         guard.workflows.remove(&input.workflow_id);
+        // A deleted workflow has no runs: an execution is addressed by its
+        // `(WorkflowId, ExecutionId)` pair, so nothing can resolve one of this
+        // workflow's records once the workflow is gone, and they are released with it
+        // rather than held for the life of the process.
+        guard.release_executions_of(&input.workflow_id);
         drop(guard);
 
         Ok(DeleteWorkflowOutput {})

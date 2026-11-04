@@ -212,7 +212,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The file the move addresses is the source path: that is the one file this
         // operation acts on ("you can only specify one path per call to this
         // operation"), so it is the one file whose status the record carries.
-        let move_id = guard.accept_connector_transfer(&input.connector_id, vec![input.source_path]);
+        let move_id = guard.accept_connector_transfer(
+            &input.connector_id,
+            vec![input.source_path],
+            ::std::time::Instant::now(),
+        );
         drop(guard);
 
         Ok(StartRemoteMoveOutput { move_id })

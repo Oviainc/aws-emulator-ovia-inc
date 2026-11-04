@@ -123,3 +123,8 @@ mod connector_deletion;
 // where every concurrent change inserts. Fold it into the list once the churn settles.
 #[path = "all/certificate_import.rs"]
 mod certificate_import;
+// `connector_gated_workflow` is declared HERE rather than beside the other
+// `connector_*` suites, for the reason the notes above record: the sorted list is where
+// every concurrent change inserts. Fold it into the list once the churn settles.
+#[path = "all/connector_gated_workflow.rs"]
+mod connector_gated_workflow;

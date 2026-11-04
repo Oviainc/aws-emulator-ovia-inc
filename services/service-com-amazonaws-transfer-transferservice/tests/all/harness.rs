@@ -86,6 +86,14 @@ pub(crate) struct Emulator {
     engine: Arc<engine::InMemoryEngine>,
 }
 
+/// Another emulated service a suite needs mounted beside the transfer one, because the
+/// transfer handlers CALL it over the in-process callback.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Peer {
+    SecretsManager,
+    S3,
+}
+
 /// One HTTP answer, decoded.
 pub(crate) struct Answer {
     pub(crate) status: u16,
@@ -118,6 +126,21 @@ pub(crate) fn member_of<'a>(value: &'a Value, member: &str) -> &'a Value {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
+        Self::mounting(&[])
+    }
+
+    /// One emulator that also mounts the two services the CONNECTOR DATA PLANE reaches
+    /// over the in-process callback: Secrets Manager, which holds the credentials an
+    /// SFTP connector's session authenticates with, and Amazon S3, which holds the
+    /// files an accepted transfer moves. A suite that drives a connector against an
+    /// emulated server needs both to be the real emulated services, since that is what
+    /// the handlers call.
+    pub(crate) fn with_connector_peers() -> Self {
+        Self::mounting(&[Peer::SecretsManager, Peer::S3])
+    }
+
+    /// The transfer service, plus each `peers` entry, over ONE shared engine.
+    fn mounting(peers: &[Peer]) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -126,7 +149,31 @@ impl Emulator {
                 &engine,
             )),
         );
+        for peer in peers {
+            match peer {
+                Peer::SecretsManager => {
+                    router.register_service(
+                        service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService::new(
+                            Arc::clone(&engine),
+                        ),
+                    );
+                }
+                Peer::S3 => {
+                    router.register_service(
+                        service_com_amazonaws_s3_amazons3::EmulatedService::new(Arc::clone(
+                            &engine,
+                        )),
+                    );
+                }
+            }
+        }
         Self { router, engine }
+    }
+
+    /// A callback into this same emulator, for a suite that drives one of the mounted
+    /// peers through its own SDK client — the very seam the handlers call them over.
+    pub(crate) fn callback(&self) -> smithy_server_runtime::EmbeddedEmulator {
+        smithy_server_runtime::EmbeddedEmulator::from_router(self.router.clone())
     }
 
     /// This emulator's store — the SAME one the handlers reach through

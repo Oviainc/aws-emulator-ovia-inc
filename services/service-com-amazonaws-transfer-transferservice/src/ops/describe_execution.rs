@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE run of a workflow, addressed by the pair that identifies it: the
+//! `WorkflowId` and the `ExecutionId`.
+//!
+//! "This API call only returns details for in-progress workflows. If you provide an ID
+//! for an execution that is not in progress, or if the execution doesn't match the
+//! specified workflow ID, you receive a ResourceNotFound exception" — so a run whose
+//! custom-step callbacks have taken it to a terminal status is no longer described, and
+//! neither is one of another workflow. Everything reported comes off the stored record:
+//! the file the run started on, the session details of the upload that started it, the
+//! status its callbacks make due, one step result per custom step that has reported,
+//! and the execution role and logging role the SERVER the upload arrived on attaches
+//! for that workflow.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +158,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeExecution"))
+        use crate::state as st;
+
+        // A pure read: it reports a stored record and writes nothing. It reads no
+        // request metadata either; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            DescribeExecutionErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let guard = state.lock();
+
+        // The run is addressed by the PAIR: a record under another workflow's id is not
+        // this workflow's run, which is what "if the execution doesn't match the
+        // specified workflow ID" states.
+        let key = (input.workflow_id.clone(), input.execution_id.clone());
+        let not_found = || {
+            st::not_found(DescribeExecutionErrorModeled::ResourceNotFoundException(
+                st::unknown_execution(&input.execution_id),
+            ))
+        };
+        let execution = guard.workflow_executions.get(&key).ok_or_else(not_found)?;
+
+        // "This API call only returns details for in-progress workflows": a run its
+        // callbacks have finished is reported by `ListExecutions`, not here.
+        let status = execution.reported_status();
+        if status != st::EXECUTION_STATUS_IN_PROGRESS {
+            return Err(not_found());
+        }
+
+        // The role the run was started with and the logging it publishes under belong
+        // to the SERVER the upload arrived on: its `WorkflowDetails` is what attached
+        // this workflow, and the attachment carries the `ExecutionRole`. A run whose
+        // session details name a server the store no longer holds reports neither,
+        // rather than a role nothing attached.
+        let server = execution
+            .service_metadata
+            .as_ref()
+            .and_then(|metadata| guard.servers.get(&metadata.user_details.server_id));
+        let execution_role = server
+            .and_then(|server| server.workflow_details.as_ref())
+            .and_then(|details| details.on_upload.as_ref())
+            .into_iter()
+            .flatten()
+            .find(|detail| detail.workflow_id == input.workflow_id)
+            .map(|detail| detail.execution_role.clone());
+        let logging_configuration =
+            server
+                .and_then(|server| server.logging_role.clone())
+                .map(|logging_role| LoggingConfiguration {
+                    logging_role: Some(logging_role),
+                    // `LogGroupName` is the group structured logging publishes to,
+                    // which is configured on the server as a whole and not per run; a
+                    // server that configures none reports none.
+                    log_group_name: None,
+                });
+
+        // "A structure that describes the execution results. This includes a list of
+        // the steps along with the details of each step": one result per CUSTOM step
+        // that has REPORTED — a step still pending has no result yet, and `Outputs` is
+        // "only applicable if the step type is TAG", so a custom step reports none.
+        let steps: Vec<ExecutionStepResult> = execution
+            .step_states
+            .values()
+            .flatten()
+            .map(|_| ExecutionStepResult {
+                step_type: Some(st::WORKFLOW_STEP_TYPE_CUSTOM.to_string()),
+                outputs: None,
+                error: None,
+            })
+            .collect();
+
+        Ok(DescribeExecutionOutput {
+            workflow_id: input.workflow_id.clone(),
+            execution: DescribedExecution {
+                execution_id: Some(execution.execution_id.clone()),
+                // Both containers are reported exactly as the record holds them, the
+                // way `ListExecutions` projects them: a run recorded without a file
+                // location or session details reports none rather than an empty
+                // structure whose required members nothing filled.
+                initial_file_location: execution.initial_file_location.clone(),
+                service_metadata: execution.service_metadata.clone(),
+                execution_role,
+                logging_configuration,
+                // `PosixProfile` is the POSIX identity an EFS upload ran under; the
+                // record holds none, and one is not invented.
+                posix_profile: None,
+                status: Some(status.to_string()),
+                results: Some(ExecutionResults {
+                    steps: Some(steps),
+                    // `OnExceptionSteps` run only after an exception, and a run this
+                    // operation describes is in progress, so none has run.
+                    on_exception_steps: None,
+                }),
+            },
+        })
     }
 }

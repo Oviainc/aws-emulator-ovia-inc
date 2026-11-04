@@ -13,9 +13,12 @@
 //! no `InvalidNextTokenException`, so a token this service did not issue is the
 //! modelled `InvalidRequestException`.
 //!
-//! Every file is `QUEUED`: the transfer runs against the partner's remote endpoint, an
-//! outbound connection this emulator never makes, so no file here can be reported
-//! transferred, failed or in progress — see `crate::state::ConnectorTransfer`.
+//! A file is `QUEUED` until the transfer's span has elapsed and the attempt on that
+//! file has reported, and then carries what the attempt did to it — `COMPLETED` for a
+//! file whose bytes really were written, `FAILED` with the `FailureCode` and
+//! `FailureMessage` the storage answered for one that could not be. A file nothing
+//! attempted stays `QUEUED`, because nothing transferred it — see
+//! `crate::state::ConnectorTransfer` and `crate::state::connector_delivery`.
 //!
 //! ## Shape of an operation
 //!
@@ -208,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        let results = transfer.results();
+        let results = transfer.results(::std::time::Instant::now());
         let after = match input.next_token.as_deref() {
             Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
                 ListFileTransferResultsErrorModeled::InvalidRequestException(

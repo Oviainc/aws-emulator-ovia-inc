@@ -38,6 +38,16 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # carries, so the serial and validity period a certificate reader reports are the
 # certificate's own (see `src/state.rs`).
 x509-cert = { version = "0.2", features = ["pem"] }
+# The SFTP user's credentials an SFTP connector's `UserSecretId` names: read over the
+# in-process callback when a connection on that connector is tested or run
+# (see `src/state/sftp_target.rs`).
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The storage an accepted connector transfer reads from and writes to
+# (see `src/state/connector_delivery.rs`).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The Lambda function a workflow's CUSTOM step names as its `Target`, invoked with that
+# step's callback token (see `src/state/connector_delivery.rs`).
+aws-sdk-lambda = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -54,6 +64,12 @@ tokio = { workspace = true, features = ["time"] }
 # serial and validity window it expects back come from the certificate rather than from
 # the code under test. TEST-ONLY.
 rcgen = "0.13"
+# The two services the connector data plane reaches over the in-process callback: the
+# suite mounts them on the same router, so the secret a connector's session
+# authenticates with and the storage its transfer moves bytes through are the real
+# emulated ones. TEST-ONLY.
+service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

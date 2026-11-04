@@ -14,6 +14,13 @@
 //! `Token` is matched against the run's pending steps and the reported `Status` is
 //! recorded on the step it addresses.
 //!
+//! A callback token is consumed ONCE. Once the step it addresses has reported, that
+//! token addresses no pending step of any running execution any more, so a REPLAY of it
+//! is answered the way a reference that resolves to nothing is: the modelled
+//! `ResourceNotFoundException`, with this service's fixed text for an execution it is
+//! not running. The outcome already recorded is left exactly as it stands, so a replay
+//! changes nothing a reader sees.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -189,15 +196,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The workflow resolved, so the rest is domain validation: an execution that
-        // workflow is not running is reported as not found, like every other resource
-        // of this service that cannot be resolved.
+        // workflow is not running is reported as not found.
+        //
+        // At the status the MODEL puts on the shape (404), not this service's 400
+        // override: that override records the status the Transfer wire was recorded
+        // answering for an unknown server or user, and the recorded answer of THIS
+        // operation to a callback that resolves to no running execution is the modelled
+        // 404 (see `crate::state::RESOURCE_NOT_FOUND_HTTP_STATUS`, which states the
+        // override's scope). The body is the model's own either way.
         let key = (input.workflow_id.clone(), input.execution_id.clone());
         let Some(execution) = guard.workflow_executions.get_mut(&key) else {
-            return Err(st::not_found(
+            return Err(
                 SendWorkflowStepStateErrorModeled::ResourceNotFoundException(
                     st::unknown_execution(&input.execution_id),
-                ),
-            ));
+                )
+                .into(),
+            );
         };
 
         // `Token` is "used to distinguish between multiple callbacks for multiple
@@ -213,17 +227,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A callback is consumed once: the step it addresses has already reported, so a
-        // second one would overwrite a completed step's outcome.
-        if let Some(reported) = step_state {
-            return Err(SendWorkflowStepStateErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: format!(
-                        "the custom step this Token addresses already reported {reported}"
-                    ),
-                },
-            )
-            .into());
+        // A callback is consumed once: the step this token addresses has already
+        // reported, so the token no longer addresses a pending step of a running
+        // execution and the callback resolves to nothing. That is the modelled
+        // `ResourceNotFoundException` — the recorded answer for a replayed token — at
+        // the status the model puts on the shape, and the outcome already recorded
+        // stays exactly as it is.
+        if step_state.is_some() {
+            return Err(
+                SendWorkflowStepStateErrorModeled::ResourceNotFoundException(
+                    st::unknown_execution(&input.execution_id),
+                )
+                .into(),
+            );
         }
 
         *step_state = Some(input.status);

@@ -26,10 +26,14 @@
 //!    for an absent grant, `StartFileTransfer` on an absent connector,
 //!    `SendWorkflowStepState` for an execution a resolved workflow is not running),
 //!    with `ResourceType` the resource name capitalized and `Resource` the identifier
-//!    the request named.
+//!    the request named — at the status that operation answers it with (this service's
+//!    recorded 400, and the modelled 404 for `SendWorkflowStepState`'s callback; see
+//!    `state::RESOURCE_NOT_FOUND_HTTP_STATUS`).
 //! 4. A resource that IS stored is acted on: `DeleteAccess` removes the grant (and a
 //!    second delete then cannot find it), and `SendWorkflowStepState` records the
-//!    reported `Status` on the custom step its `Token` addresses, once.
+//!    reported `Status` on the custom step its `Token` addresses, ONCE — a replay of a
+//!    token whose step has reported addresses no running execution any more, so it is
+//!    refused as not found and changes nothing.
 //!
 //! The rows differ along what each rule generalises over — the identity-provider type,
 //! the id's value, which optional members the request carries, the reported status, the
@@ -190,13 +194,20 @@ fn test_identity_provider_requests(server_id: &str) -> Vec<(String, Value)> {
     ]
 }
 
-/// Assert one answer is the modelled not-found for `resource_type`/`resource`: this
-/// service answers `ResourceNotFoundException` with HTTP 400 (see
-/// `state::RESOURCE_NOT_FOUND_HTTP_STATUS`).
-fn assert_not_found(case: &str, answer: &Answer, resource_type: &str, resource: &str) {
+/// Assert one answer is the modelled not-found for `resource_type`/`resource` at
+/// `status`: this service answers `ResourceNotFoundException` with HTTP 400 (see
+/// `state::RESOURCE_NOT_FOUND_HTTP_STATUS`) everywhere its recorded wire did, and with
+/// the modelled 404 from `SendWorkflowStepState`'s callback.
+fn assert_not_found_at(
+    case: &str,
+    answer: &Answer,
+    status: u16,
+    resource_type: &str,
+    resource: &str,
+) {
     assert_eq!(
-        answer.status, 400,
-        "case {case:?}: expected HTTP 400, got {} with body {}",
+        answer.status, status,
+        "case {case:?}: expected HTTP {status}, got {} with body {}",
         answer.status, answer.body
     );
     assert_eq!(
@@ -215,6 +226,25 @@ fn assert_not_found(case: &str, answer: &Answer, resource_type: &str, resource: 
         member_of(&answer.body, "Resource").as_str(),
         Some(resource),
         "case {case:?}: expected Resource {resource:?}, got {}",
+        answer.body
+    );
+}
+
+/// Assert one answer is the modelled not-found for `resource_type`/`resource` at this
+/// service's recorded 400.
+fn assert_not_found(case: &str, answer: &Answer, resource_type: &str, resource: &str) {
+    assert_not_found_at(case, answer, 400, resource_type, resource);
+}
+
+/// Assert one answer is `SendWorkflowStepState`'s refusal of a callback that resolves
+/// to no running execution: the modelled 404, the fixed `Message` this service answers
+/// for an execution reference it cannot resolve, and the `ExecutionId` in `Resource`.
+fn assert_callback_not_found(case: &str, answer: &Answer, execution_id: &str) {
+    assert_not_found_at(case, answer, 404, "Execution", execution_id);
+    assert_eq!(
+        member_of(&answer.body, "Message").as_str(),
+        Some(st::NOT_FOUND_EXECUTION.message),
+        "case {case:?}: expected the fixed execution not-found message, got {}",
         answer.body
     );
 }
@@ -541,16 +571,17 @@ async fn send_workflow_step_state_cannot_find_an_execution_the_workflow_is_not_r
                 );
                 let answer =
                     callback(&emulator, &workflow_id, execution_id, token, status).await;
-                assert_not_found(&case, &answer, "Execution", execution_id);
+                assert_callback_not_found(&case, &answer, execution_id);
             }
         }
     }
 }
 
 /// RULE 4 (`SendWorkflowStepState`): the callback records the reported `Status` on the
-/// custom step its `Token` addresses, exactly once — a token addressing no pending
-/// step, and a second callback for a step that already reported, are refused 400
-/// `InvalidRequestException`, and no other step is touched.
+/// custom step its `Token` addresses, exactly once — a token that addresses no pending
+/// step of the execution is refused 400 `InvalidRequestException`, a REPLAY of a token
+/// whose step has reported is refused as a callback that resolves to no running
+/// execution, and no other step is touched.
 #[tokio::test]
 async fn send_workflow_step_state_records_each_pending_step_once() {
     let emulator = Emulator::new();
@@ -594,8 +625,9 @@ async fn send_workflow_step_state_records_each_pending_step_once() {
              got {recorded:?}"
         );
 
-        // The callback is consumed: a second one for the same token is refused, and the
-        // recorded outcome stays the first one.
+        // The callback is consumed ONCE: a replay of the same token addresses no
+        // pending step of a running execution any more, so it is refused as not found,
+        // and the recorded outcome stays the first one.
         let repeat = callback(
             &emulator,
             workflow_id,
@@ -604,16 +636,11 @@ async fn send_workflow_step_state_records_each_pending_step_once() {
             CUSTOM_STEP_STATUSES[1],
         )
         .await;
-        let message = assert_invalid_request(&format!("{case}, repeated"), &repeat);
-        assert!(
-            message.contains(status),
-            "case {case:?}: expected the refusal to name the outcome already reported, \
-             got {message:?}"
-        );
+        assert_callback_not_found(&format!("{case}, replayed"), &repeat, execution_id);
         let recorded = reported_step_states(&emulator, workflow_id, execution_id);
         assert_eq!(
             recorded, expected,
-            "case {case:?}: a refused repeat must change nothing, got {recorded:?}"
+            "case {case:?}: a refused replay must change nothing, got {recorded:?}"
         );
     }
 }

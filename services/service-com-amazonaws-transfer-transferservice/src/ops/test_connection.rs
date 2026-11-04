@@ -2,25 +2,21 @@
 
 //! @op TestConnection
 //!
-//! Resolves the `ConnectorId` against stored state and reports the verdict that
-//! connector's stored configuration earns:
+//! Resolves the `ConnectorId` against stored state and reports the verdict a
+//! connection on that connector's stored configuration earns:
 //!
 //! * a `ConnectorId` the store does not hold is not found;
 //! * a connector that configures no SFTP connection (an AS2 one) has no connection for
 //!   this call to test, so it is refused with the modelled `InvalidRequestException`;
-//! * otherwise the verdict travels in the modelled `Status`/`StatusMessage` pair, at
-//!   this operation's own documented failure state `ERROR`, with the message naming the
-//!   first defect the stored SFTP configuration carries — no secret to authenticate
-//!   with, no trusted host key, or a trusted host key that is not a key — or, when it
-//!   carries none, saying that the connection itself was never verified.
+//! * otherwise the verdict travels in the modelled `Status`/`StatusMessage` pair, with
+//!   `SftpConnectionDetails.HostKey` carrying the key the endpoint presented.
 //!
-//! `Status` `OK` and `SftpConnectionDetails.HostKey` are properties of a session with
-//! the partner's SFTP server that really happened ("successful test"; a host key
-//! "returned during the initial connection attempt"). This emulator opens no outbound
-//! connection, so no session can run here: both would report a connection nothing made,
-//! and this handler reports neither. See [`crate::state::TEST_CONNECTION_STATUS_ERROR`]
-//! and [`crate::state::sftp_connection_status_message`], where the verdict and every
-//! text it carries are built.
+//! The verdict is the ATTEMPT's, made by [`crate::state::sftp_target::probe`] against
+//! the endpoint the connector's `Url` names in this emulator: the host key the server
+//! serves with, the credentials its `UserSecretId` holds and the host keys it trusts
+//! all come from persisted state, so `OK` is reported for a session that really was
+//! established and `ERROR` names the first condition that stopped one. A test is a pure
+//! READ: it writes nothing a later caller can see.
 //!
 //! ## Shape of an operation
 //!
@@ -173,26 +169,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state as st;
 
         // A pure read: this operation reports a verdict on the stored connector and
-        // writes nothing, so a test leaves the next caller exactly what it found. It
-        // reads no request metadata either; the engine comes from `self`.
-        let _ = ctx;
+        // writes nothing a caller can see, so a test leaves the next caller exactly
+        // what it found. `ctx` is read for the request's Region — where the connector's
+        // secret is looked up — and for the in-process callback the lookup travels over.
         let state = st::service_state(&*self.engine).ok_or_else(|| {
             TestConnectionErrorModeled::InternalServiceError(InternalServiceError {
                 message: "the transfer service state is unavailable".to_string(),
             })
         })?;
 
-        let guard = state.lock();
-
         // The connector is the resource the request is addressed at, so it is resolved
         // FIRST: a `ConnectorId` the store does not hold is not found — never a service
-        // fault, and never a failed test.
-        let Some(connector) = guard.connectors.get(&input.connector_id) else {
-            return Err(st::not_found(
-                TestConnectionErrorModeled::ResourceNotFoundException(st::unknown_connector(
-                    &input.connector_id,
-                )),
-            ));
+        // fault, and never a failed test. The record is taken out from under the lock,
+        // which the attempt below must not hold.
+        let connector = {
+            let guard = state.lock();
+            let Some(connector) = guard.connectors.get(&input.connector_id) else {
+                return Err(st::not_found(
+                    TestConnectionErrorModeled::ResourceNotFoundException(
+                        st::unknown_connector(&input.connector_id),
+                    ),
+                ));
+            };
+            connector.clone()
         };
 
         // What this operation tests is an SFTP connection; a connector that configures
@@ -204,16 +203,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let probe = st::sftp_target::probe(
+            ctx.callback(),
+            &state,
+            &st::request_region(ctx.parts()),
+            connector.url.as_deref(),
+            sftp_config,
+        )
+        .await;
+
         Ok(TestConnectionOutput {
             // "Returns the identifier of the connector object that you are testing" —
             // the connector this verdict is about, read back out of the store.
             connector_id: Some(connector.connector_id.clone()),
-            status: Some(st::TEST_CONNECTION_STATUS_ERROR.to_string()),
-            status_message: Some(st::sftp_connection_status_message(sftp_config).to_string()),
-            // The remote server's host key is observed ON the connection attempt. None
-            // was made, so none was observed, and an invented key would name a server
-            // nothing talked to.
-            sftp_connection_details: None,
+            status: Some(probe.status.to_string()),
+            status_message: Some(probe.message.to_string()),
+            // The remote server's host key is observed ON the connection attempt, so it
+            // is reported for an attempt that reached a server and omitted for one that
+            // reached none: an invented key would name a server nothing talked to.
+            sftp_connection_details: probe.host_key.map(|host_key| {
+                SftpConnectorConnectionDetails {
+                    host_key: Some(host_key),
+                }
+            }),
         })
     }
 }

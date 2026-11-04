@@ -374,10 +374,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `InvalidRequestException`, as it is for an import past the same bound, and the
         // capacity is released by `DeleteHostKey`.
         let rotation = input.host_key.as_deref().and_then(st::read_host_key);
-        if let Some((fingerprint, _)) = rotation.as_ref() {
+        if let Some(rotating_to) = rotation.as_ref() {
             let holds_it = guard
                 .host_keys_of(&input.server_id)
-                .any(|host_key| &host_key.fingerprint == fingerprint);
+                .any(|host_key| host_key.fingerprint == rotating_to.fingerprint);
             if guard.servers.contains_key(&input.server_id)
                 && !holds_it
                 && !guard.server_has_host_key_capacity(&input.server_id)
@@ -542,15 +542,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the rule `state::materialise_host_key` states, so a client enumerating them
         // still finds the one the server serves with. The room for it was checked above,
         // before anything was written.
-        let rotated = rotation.map(|(fingerprint, key_type)| {
-            stored.host_key_fingerprint = fingerprint.clone();
-            (fingerprint, key_type)
+        let rotated = rotation.inspect(|key| {
+            stored.host_key_fingerprint = key.fingerprint.clone();
         });
 
         let server_id = stored.server_id.clone();
-        if let Some((fingerprint, key_type)) = rotated {
+        if let Some(key) = rotated {
             let region = st::request_region(ctx.parts());
-            guard.materialise_host_key(&region, &server_id, &fingerprint, &key_type);
+            guard.materialise_host_key(&region, &server_id, &key);
         }
         drop(guard);
 

@@ -418,11 +418,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The server's HOST KEY, resolved once, here: the key the request supplied when
         // the emulator can read it, otherwise one minted for this server, as the
-        // service does for a server whose host key it manages. Both halves — the
-        // fingerprint the server reports and the algorithm a host-key reader reports —
-        // come from REAL key material (`state::read_host_key` /
+        // service does for a server whose host key it manages. Every property the
+        // server reports about it — the fingerprint, the algorithm a host-key reader
+        // reports and the public half a client connecting to the server is presented
+        // with — comes from REAL key material (`state::read_host_key` /
         // `state::mint_host_key`), never from the request's text.
-        let (host_key_fingerprint, host_key_type) = input
+        let host_key = input
             .host_key
             .as_deref()
             .and_then(st::read_host_key)
@@ -447,7 +448,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             security_policy_name,
             pre_authentication_login_banner: input.pre_authentication_login_banner,
             post_authentication_login_banner: input.post_authentication_login_banner,
-            host_key_fingerprint: host_key_fingerprint.clone(),
+            host_key_fingerprint: host_key.fingerprint.clone(),
             structured_log_destinations: st::configured_log_destinations(
                 input.structured_log_destinations,
             ),
@@ -469,7 +470,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // key the server is actually serving with, under the same fingerprint the
         // server reports. Written under the SAME lock as the server itself, so no read
         // can see one without the other.
-        guard.materialise_host_key(&region, &server_id, &host_key_fingerprint, &host_key_type);
+        guard.materialise_host_key(&region, &server_id, &host_key);
         drop(guard);
 
         Ok(CreateServerOutput { server_id })

@@ -14,11 +14,16 @@
 //! and one or more SendFilePaths" — outbound only), or the connector already holds the
 //! maximum number of accepted operations this emulator stores for one connector.
 //!
-//! What this emulator does NOT do is move the bytes: the transfer runs against the
-//! partner's REMOTE AS2 or SFTP endpoint, an outbound connection the emulator never
-//! makes. So each accepted file stays `QUEUED` — the `TransferTableStatus` for a
-//! transfer that has not run — and nothing here ever reports a file as transferred,
-//! failed or in progress, because nothing attempted it.
+//! What this emulator then DOES with an accepted transfer depends on the endpoint the
+//! connector's `Url` names. An SFTP endpoint this emulator SERVES — a server of this
+//! account at its own endpoint host — is one it can carry the transfer out against, so
+//! the outbound files are delivered on a task of their own
+//! ([`crate::state::connector_delivery`]): each one is read from the storage the
+//! request named and written where it lands on that server, its per-file outcome is
+//! recorded, and the arrival starts the workflows the server's
+//! `WorkflowDetails.OnUpload` attaches. An endpoint outside this emulator is one
+//! nothing can connect to, so nothing is attempted for it and its files stay `QUEUED`
+//! — the `TransferTableStatus` for a transfer that has not run.
 //!
 //! ## Shape of an operation
 //!
@@ -186,13 +191,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
-        // This operation reads no request metadata; the engine comes from `self`.
-        let _ = ctx;
+        // `ctx` is read for the request's Region — where the storage, the secret and a
+        // workflow step's function are addressed — and for the in-process callback the
+        // delivery travels over.
         let state = st::service_state(&*self.engine).ok_or_else(|| {
             StartFileTransferErrorModeled::InternalServiceError(InternalServiceError {
                 message: "the transfer service state is unavailable".to_string(),
             })
         })?;
+        let now = ::std::time::Instant::now();
 
         let mut guard = state.lock();
 
@@ -206,7 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             ));
         };
-        let configures_sftp = connector.sftp_config.is_some();
+        let sftp_config = connector.sftp_config.clone();
+        let connector_url = connector.url.clone();
+        let configures_sftp = sftp_config.is_some();
 
         // The direction of the transfer comes from which paths the request names:
         // "you specify one or more RetrieveFilePaths to identify the files you want to
@@ -255,10 +264,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // transfer the store does not hold. The files are kept in the order the request
         // named them — outbound first, as the request lists them — which is the order
         // their results are reported in.
+        let outbound_count = send_file_paths.len();
         let mut file_paths = send_file_paths;
         file_paths.extend(retrieve_file_paths);
-        let transfer_id = guard.accept_connector_transfer(&input.connector_id, file_paths);
+        // The outbound files, each with the POSITION its result is reported at, which is
+        // how the delivery records that file's outcome.
+        let outbound_files: Vec<(usize, String)> = file_paths
+            .iter()
+            .take(outbound_count)
+            .cloned()
+            .enumerate()
+            .collect();
+        let transfer_id = guard.accept_connector_transfer(&input.connector_id, file_paths, now);
         drop(guard);
+
+        // The transfer itself runs against the endpoint the connector names, on a task
+        // of its own: this call "begins a file transfer" and answers the identifier its
+        // results are read back through, so it does not wait for the files to land.
+        // Only an SFTP connector's outbound files have an endpoint this emulator can
+        // serve; an AS2 connector speaks a protocol nothing here serves, and an inbound
+        // transfer reads from the partner, whose files this emulator does not hold.
+        if let Some(sftp_config) = sftp_config {
+            st::connector_delivery::spawn(
+                ctx,
+                state.clone(),
+                st::connector_delivery::Outbound {
+                    region: st::request_region(ctx.parts()),
+                    connector_id: input.connector_id,
+                    transfer_id: transfer_id.clone(),
+                    url: connector_url,
+                    sftp_config,
+                    remote_directory_path: input.remote_directory_path,
+                    files: outbound_files,
+                },
+            );
+        }
 
         Ok(StartFileTransferOutput { transfer_id })
     }
