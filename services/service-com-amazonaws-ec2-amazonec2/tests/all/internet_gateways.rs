@@ -27,6 +27,10 @@
 //!    further gateway follows the page; a token this service did not issue is refused.
 //! 6. A `DryRun` of either operation answers `DryRunOperation` and changes nothing.
 //! 7. A tag specification naming any other resource type is refused, with nothing stored.
+//! 8. The tag payload a create may assign is BOUNDED: a request one step past a published
+//!    bound — the number of tags per resource, a key's length, a value's length — or past a
+//!    documented tag rule is refused and stores nothing, where a request exactly ON those
+//!    bounds (rule 1's last two rows) succeeds.
 //!
 //! Every table row is a distinct input along what those rules generalise over — how many tags
 //! a gateway carries and what they spell, how many gateways the account holds, which selector
@@ -35,7 +39,7 @@
 
 use ec2::state::{
     INTERNET_GATEWAY_ID_PREFIX, INTERNET_GATEWAY_TAGGABLE_RESOURCE, MAX_TAGS_PER_RESOURCE,
-    MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS,
+    MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, RESERVED_TAG_PREFIX,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -728,6 +732,130 @@ async fn a_tag_specification_for_another_resource_type_is_refused() {
         assert!(
             all_ids(&router, other).await.is_empty(),
             "case {other:?}: a refused create must store nothing"
+        );
+    }
+}
+
+/// One row of the refusal table: a tag payload a create may not assign, and the answer it
+/// draws.
+#[derive(Debug)]
+struct RefusedTagCase {
+    case: &'static str,
+    /// The request fields of the create, already flattened as ec2Query carries them.
+    params: Vec<(String, String)>,
+    code: &'static str,
+    message: String,
+}
+
+/// The refusal table: each row is one step past a published bound or one documented tag rule
+/// broken, so between it and rule 1's on-the-bound rows the create is pinned on BOTH sides of
+/// every bound.
+///
+/// The bounds are this crate's shared tag bounds, each taken from the member that documents it
+/// — `MAX_TAGS_PER_RESOURCE`, and `MAX_TAG_KEY_CHARS` / `MAX_TAG_VALUE_CHARS` from `Tag$Key`
+/// and `Tag$Value` ("accept a maximum of 127 / 256 Unicode characters") — and the rules are
+/// that tag keys are unique per resource, are not empty, and do not sit in the reserved
+/// `aws:` namespace (`RESERVED_TAG_PREFIX`).
+fn refused_tag_cases() -> Vec<RefusedTagCase> {
+    let one_past_the_count: Vec<(String, String)> = (0..=MAX_TAGS_PER_RESOURCE)
+        .map(|index| (format!("key-{index}"), format!("value-{index}")))
+        .collect();
+    let long_key = "k".repeat(MAX_TAG_KEY_CHARS + 1);
+    let long_value = "v".repeat(MAX_TAG_VALUE_CHARS + 1);
+    let reserved_key = format!("{RESERVED_TAG_PREFIX}cloudformation:stack-name");
+
+    vec![
+        RefusedTagCase {
+            case: "one tag more than a resource holds",
+            params: tag_params(
+                &one_past_the_count
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str()))
+                    .collect::<Vec<_>>(),
+            ),
+            code: "TagLimitExceeded",
+            message: format!(
+                "The request carries {count} tags, above the maximum of \
+                 {MAX_TAGS_PER_RESOURCE} per resource",
+                count = MAX_TAGS_PER_RESOURCE + 1,
+            ),
+        },
+        RefusedTagCase {
+            case: "a key one character past its published length",
+            params: tag_params(&[(long_key.as_str(), "edge")]),
+            code: "InvalidParameterValue",
+            message: format!("A tag key accepts at most {MAX_TAG_KEY_CHARS} characters"),
+        },
+        RefusedTagCase {
+            case: "a value one character past its published length",
+            params: tag_params(&[("Name", long_value.as_str())]),
+            code: "InvalidParameterValue",
+            message: format!(
+                "The value of tag key 'Name' accepts at most {MAX_TAG_VALUE_CHARS} characters"
+            ),
+        },
+        RefusedTagCase {
+            case: "the same key given twice",
+            params: tag_params(&[("Name", "edge"), ("Name", "core")]),
+            code: "InvalidParameterValue",
+            message: "Tag key 'Name' is given more than once; tag keys must be unique"
+                .to_string(),
+        },
+        RefusedTagCase {
+            case: "a key in the reserved namespace",
+            params: tag_params(&[(reserved_key.as_str(), "edge")]),
+            code: "InvalidParameterValue",
+            message: format!(
+                "Tag key '{reserved_key}' is invalid: the '{RESERVED_TAG_PREFIX}' prefix is \
+                 reserved"
+            ),
+        },
+        RefusedTagCase {
+            case: "an empty key",
+            params: tag_params(&[("", "edge")]),
+            code: "InvalidParameterValue",
+            message: "A tag key cannot be empty".to_string(),
+        },
+        RefusedTagCase {
+            case: "a specification that names no resource type",
+            params: vec![
+                param("TagSpecification.1.Tag.1.Key", "Name"),
+                param("TagSpecification.1.Tag.1.Value", "edge"),
+            ],
+            code: "MissingParameter",
+            message: "Tag specification resource type must have a value".to_string(),
+        },
+    ]
+}
+
+/// RULE 8: a tag payload past a published bound, or past a documented tag rule, is refused
+/// with HTTP 400 and stores nothing — no gateway is minted on the way to the refusal.
+#[tokio::test]
+async fn a_tag_payload_past_a_published_bound_is_refused_and_stores_nothing() {
+    let (router, _engine) = super::ec2_query::emulator();
+
+    for row in refused_tag_cases() {
+        let case = row.case;
+        let (status, body) = create(&router, &row.params).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            row.code,
+            "case {case:?}: expected the {code} refusal, got body {body}",
+            code = row.code,
+        );
+        assert_eq!(
+            error_message(&body),
+            row.message,
+            "case {case:?}: expected the wording naming what the request broke, got body {body}"
+        );
+        assert!(
+            all_ids(&router, case).await.is_empty(),
+            "case {case:?}: a refused create must store nothing, got {:?}",
+            all_ids(&router, case).await
         );
     }
 }
