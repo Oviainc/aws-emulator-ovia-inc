@@ -147,7 +147,10 @@ async fn create_job(emulator: &Emulator, row: &Row) -> String {
 
 /// `StopProcessingJob` for `name` in `region`, as the raw (status, body) pair, so a test
 /// can assert on a refusal as well as on a stopped job.
-async fn stop(emulator: &Emulator, region: &str, name: &str) -> (u16, Value) {
+///
+/// `pub(crate)` so the sibling suite that adds the stop-target axes this one does not cover
+/// drives the same request rather than a second copy of it.
+pub(crate) async fn stop(emulator: &Emulator, region: &str, name: &str) -> (u16, Value) {
     emulator
         .call_in(
             region,
@@ -158,7 +161,9 @@ async fn stop(emulator: &Emulator, region: &str, name: &str) -> (u16, Value) {
 }
 
 /// `DescribeProcessingJob` for `name` in `region`, as the raw (status, body) pair.
-async fn describe(emulator: &Emulator, region: &str, name: &str) -> (u16, Value) {
+///
+/// `pub(crate)` for the same reason [`stop`] is.
+pub(crate) async fn describe(emulator: &Emulator, region: &str, name: &str) -> (u16, Value) {
     emulator
         .call_in(
             region,

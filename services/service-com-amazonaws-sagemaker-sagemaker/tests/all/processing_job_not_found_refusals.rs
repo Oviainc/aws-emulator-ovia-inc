@@ -31,7 +31,7 @@ const PAST_JOB_END_DUE: Duration = Duration::from_millis(700);
 /// A `RoleArn` matching the modelled pattern
 /// `^arn:aws[a-z\-]*:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`
 /// (smithy_query operation=CreateProcessingJob).
-const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/SageMakerProcessingRole";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/SageMakerProcessingRole";
 
 /// The two processing-job calls that take a `ProcessingJobName` as their target, with the
 /// fixed text each one's refusal carries: the service words an unresolvable target
@@ -45,7 +45,10 @@ const CALLS: [(&str, &str); 2] = [
 ];
 
 /// A minimal `CreateProcessingJob` body: every required member and nothing else.
-fn minimal_create(name: &str) -> Value {
+///
+/// `pub(crate)` so the sibling suite that exercises the stop target against a store this
+/// one does not build keeps using this one body rather than a second copy of it.
+pub(crate) fn minimal_create(name: &str) -> Value {
     json!({
         "ProcessingJobName": name,
         "RoleArn": ROLE_ARN,
