@@ -150,7 +150,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The model: deleting a load balancer that is not there succeeds, so the
         // answer does not depend on whether this removed anything.
-        state.lock().remove_load_balancer(&input.load_balancer_arn);
+        let mut guard = state.lock();
+        guard.remove_load_balancer(&input.load_balancer_arn);
+        // A load balancer that is gone presents no certificate, so every reference its
+        // listeners held is given up — the service holding those certificates reads that
+        // from the shared directory, and until the teardown falls due it still counts as
+        // in use.
+        crate::state::record_certificate_consumers(
+            &*self.engine,
+            &guard,
+            &input.load_balancer_arn,
+            ::std::time::SystemTime::now(),
+        );
 
         Ok(DeleteLoadBalancerOutput {})
     }

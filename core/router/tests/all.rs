@@ -532,6 +532,10 @@ mod elbv2_subnet_and_elastic_ip_resolution;
 // appended at the tail of this file, for the reason the notes above give.
 #[path = "all/elbv2_subnet_vpc_membership.rs"]
 mod elbv2_subnet_vpc_membership;
+// Declared beside its sibling ELBv2 suites, in this span of the sorted list rather than
+// appended at the tail of this file, for the reason the notes above give.
+#[path = "all/elbv2_certificate_in_use_by_acm.rs"]
+mod elbv2_certificate_in_use_by_acm;
 // Declared beside the Classic/ELBv2 suites above, in this span of the sorted list rather
 // than in the appended tail, for the same reason: the tail is where every concurrently
 // landing router suite puts its line.

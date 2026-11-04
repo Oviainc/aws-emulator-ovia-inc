@@ -335,8 +335,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .listeners
             .get(&input.listener_arn)
             .expect("the listener just written");
+        let listeners = vec![stored.to_shape()];
+        // And the listener's certificates decide which certificates this load balancer
+        // presents, so a modification that replaced or dropped one is recorded where the
+        // service holding the certificate reads it: the certificate it moved off is given
+        // up and the one it moved onto is taken up.
+        crate::state::record_certificate_consumers(
+            &*self.engine,
+            &guard,
+            &load_balancer_arn,
+            ::std::time::SystemTime::now(),
+        );
         Ok(ModifyListenerOutput {
-            listeners: Some(vec![stored.to_shape()]),
+            listeners: Some(listeners),
         })
     }
 }

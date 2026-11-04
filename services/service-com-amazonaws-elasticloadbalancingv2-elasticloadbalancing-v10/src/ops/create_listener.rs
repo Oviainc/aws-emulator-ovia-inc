@@ -21,6 +21,10 @@
 //! cleartext HTTP on a listener that terminates TLS is
 //! `InvalidLoadBalancerActionException`.
 //!
+//! A listener that presents a certificate also makes its LOAD BALANCER a consumer of
+//! that certificate, which is recorded where the service holding the certificate reads
+//! it ([`crate::state::record_certificate_consumers`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -391,8 +395,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let stored = guard.listeners.get(&arn).expect("the listener just inserted");
+        let listeners = vec![stored.to_shape()];
+        // This load balancer now PRESENTS the certificates its listeners name, which is a
+        // fact the service holding those certificates has to know: it cannot see this
+        // store, it reports the resources using a certificate, and it may not let one be
+        // deleted or revoked while a load balancer is serving it.
+        crate::state::record_certificate_consumers(
+            &*self.engine,
+            &guard,
+            &input.load_balancer_arn,
+            now,
+        );
         Ok(CreateListenerOutput {
-            listeners: Some(vec![stored.to_shape()]),
+            listeners: Some(listeners),
         })
     }
 }

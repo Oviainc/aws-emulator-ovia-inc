@@ -147,13 +147,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_listener_arn(&input.listener_arn)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
-        if !state.lock().remove_listener(&input.listener_arn) {
+        let mut guard = state.lock();
+        // The load balancer the listener belonged to, read before the removal: what it
+        // presents is recomputed from the listeners that remain, so the ARN has to be
+        // taken while the listener is still there.
+        let load_balancer_arn = guard
+            .listeners
+            .get(&input.listener_arn)
+            .map(|listener| listener.load_balancer_arn.clone());
+        if !guard.remove_listener(&input.listener_arn) {
             return Err(DeleteListenerErrorModeled::ListenerNotFoundException(
                 ListenerNotFoundException {
                     message: Some(crate::state::listener_not_found_message(&input.listener_arn)),
                 },
             )
             .into());
+        }
+        // A listener that is gone presents nothing, so the certificates only it served
+        // are given up — which the service holding them has to see, because it is what
+        // decides whether a certificate may be deleted or revoked.
+        if let Some(load_balancer_arn) = load_balancer_arn {
+            crate::state::record_certificate_consumers(
+                &*self.engine,
+                &guard,
+                &load_balancer_arn,
+                ::std::time::SystemTime::now(),
+            );
         }
 
         Ok(DeleteListenerOutput {})

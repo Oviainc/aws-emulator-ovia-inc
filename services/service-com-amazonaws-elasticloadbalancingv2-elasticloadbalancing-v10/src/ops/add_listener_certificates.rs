@@ -236,17 +236,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Information about the certificates in the certificate list": the list this
         // call leaves behind, each entry flagged as what it is — a list certificate, not
         // the listener's default one.
+        let certificates: Vec<Certificate> = listener
+            .list_certificate_arns
+            .iter()
+            .map(|arn| Certificate {
+                certificate_arn: Some(arn.clone()),
+                is_default: Some(false),
+            })
+            .collect();
+        // A certificate added to the list is one this listener now presents, so its load
+        // balancer is a consumer of it — recorded where the service holding the
+        // certificate reads it.
+        let load_balancer_arn = listener.load_balancer_arn.clone();
+        crate::state::record_certificate_consumers(
+            &*self.engine,
+            &guard,
+            &load_balancer_arn,
+            ::std::time::SystemTime::now(),
+        );
+
         Ok(AddListenerCertificatesOutput {
-            certificates: Some(
-                listener
-                    .list_certificate_arns
-                    .iter()
-                    .map(|arn| Certificate {
-                        certificate_arn: Some(arn.clone()),
-                        is_default: Some(false),
-                    })
-                    .collect(),
-            ),
+            certificates: Some(certificates),
         })
     }
 }

@@ -219,6 +219,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         listener
             .list_certificate_arns
             .retain(|held| !requested.contains(held.as_str()));
+        // A certificate off the list is one this listener no longer presents, so what the
+        // load balancer consumes is rewritten: a certificate nothing else of it presents
+        // is given up, and the service holding it sees that.
+        let load_balancer_arn = listener.load_balancer_arn.clone();
+        crate::state::record_certificate_consumers(
+            &*self.engine,
+            &guard,
+            &load_balancer_arn,
+            ::std::time::SystemTime::now(),
+        );
 
         Ok(RemoveListenerCertificatesOutput {})
     }

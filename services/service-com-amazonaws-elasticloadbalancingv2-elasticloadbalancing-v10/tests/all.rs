@@ -17,6 +17,8 @@ mod alb_data_plane;
 mod capacity_reservation;
 #[path = "all/catalog_reads.rs"]
 mod catalog_reads;
+#[path = "all/certificate_consumer_registry.rs"]
+mod certificate_consumer_registry;
 #[path = "all/certificate_resolution_and_redirect_protocol.rs"]
 mod certificate_resolution_and_redirect_protocol;
 #[path = "all/declared_action_set.rs"]

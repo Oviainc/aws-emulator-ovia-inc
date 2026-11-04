@@ -15,11 +15,22 @@
 //! One set of facts a request is resolved against is NOT this service's: the account's
 //! VPCs, subnets, security groups and instances. [`network`] resolves those against EC2,
 //! which owns them.
+//!
+//! And one fact this service's resources create is read by ANOTHER service: a
+//! TLS-terminating listener presents a certificate Certificate Manager holds, so which
+//! certificates a load balancer presents is recorded in the shared directory that service
+//! reads ([`certificate_consumers`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 pub mod network;
+
+/// Which Certificate Manager certificates a load balancer presents, recorded where the
+/// service that holds those certificates can read it.
+mod certificate_consumers;
+
+pub use certificate_consumers::{certificate_association_directory, record_certificate_consumers};
 
 /// The unit tests of [`network`]'s pure half — where an address falls relative to a VPC.
 #[cfg(test)]
