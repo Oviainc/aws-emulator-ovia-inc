@@ -68,6 +68,9 @@ mod profile_revocation_is_recorded_once;
 #[path = "all/profile_subresource_not_found_code.rs"]
 mod profile_subresource_not_found_code;
 
+#[path = "all/published_platform_rows.rs"]
+mod published_platform_rows;
+
 #[path = "all/put_profile_image_format_override.rs"]
 mod put_profile_image_format_override;
 

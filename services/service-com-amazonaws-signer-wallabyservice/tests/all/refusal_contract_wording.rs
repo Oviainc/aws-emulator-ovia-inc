@@ -925,7 +925,8 @@ async fn a_tagging_arn_that_does_not_parse_is_refused_without_echoing_it() {
 /// `code` naming the status that forbade it, the profile stays `Revoked`, and a
 /// profile in any other status is canceled.
 ///
-/// Rows differ in the platform the revoked profile is on and in the reason the
+/// Rows differ in the platform the revoked profile is on — among the platforms
+/// whose catalog entry publishes the revocation capability — and in the reason the
 /// revocation carried, so the refusal is about the status rather than about one
 /// recorded profile.
 #[tokio::test]
@@ -933,7 +934,7 @@ async fn a_revoked_profile_cannot_be_canceled() {
     for (ordinal, (platform, reason)) in [
         (LAMBDA_PLATFORM, "key-compromise"),
         (CONTAINER_PLATFORM, "r"),
-        ("AWSIoTDeviceManagement-SHA256-ECDSA", "rotate-signing-key"),
+        (LAMBDA_PLATFORM, "rotate-signing-key"),
     ]
     .iter()
     .enumerate()

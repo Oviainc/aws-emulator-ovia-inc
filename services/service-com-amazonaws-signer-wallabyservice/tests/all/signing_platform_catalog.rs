@@ -10,9 +10,13 @@
 //!   target, the category, the algorithm and image-format options, the maximum
 //!   payload size and whether its signatures can be revoked — and a platform's
 //!   `defaultValue` / `defaultFormat` is always one of the values it allows;
-//! * a published id decomposes: it is the `partner` that owns the platform and
-//!   the `target` validation template, joined by `-`, and where the id spells out
-//!   its algorithms those are the ones the platform signs under by default;
+//! * every member of a published row is PUBLISHED DATA, never derived from
+//!   another member: a row's `partner` and `target` are whatever the catalog
+//!   publishes for it, which need not be segments of its `platformId`, its
+//!   `displayName` is served verbatim including any surrounding whitespace, its
+//!   `category` is served as published even when the model's enum does not name
+//!   that value, and a member the catalog publishes for no value at all is
+//!   absent rather than filled in;
 //! * a `platformId` the service publishes NO platform for is a 404
 //!   `ResourceNotFoundException` naming that condition in the modelled `code`;
 //! * a platform is a published fact, not a stored resource: reading one (or
@@ -35,7 +39,7 @@ use service_com_amazonaws_signer_wallabyservice::ops::types::{
 };
 use service_com_amazonaws_signer_wallabyservice::state::{
     ERROR_CODE_PLATFORM_NOT_FOUND, PLATFORM_CATEGORY_AWS, PLATFORM_CATEGORY_AWS_IOT,
-    SIGNING_PLATFORM_CATALOG,
+    PLATFORM_CATEGORY_EXTERNAL, SIGNING_PLATFORM_CATALOG,
 };
 use service_com_amazonaws_signer_wallabyservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -219,24 +223,16 @@ async fn every_published_platform_is_reported_with_its_full_contract() {
         );
         assert_eq!(
             got.str_member("target"),
-            entry.target(),
+            entry.target,
             "case {case:?}: expected target {:?}, got {:?}",
-            entry.target(),
+            entry.target,
             got.body["target"]
-        );
-        // The id a platform is published under is its partner and its target
-        // joined by `-`, so the three members cannot contradict each other.
-        assert_eq!(
-            format!("{}-{}", got.str_member("partner"), got.str_member("target")),
-            got.str_member("platformId"),
-            "case {case:?}: expected platformId to be <partner>-<target>, got {:?}",
-            got.body
         );
 
         // The category the catalog publishes the platform in. The model's
-        // `Category` enum names only the IoT one, and the recorded
-        // `GetSigningPlatform` answers `AWS` for the Lambda platform, so the
-        // category is a per-platform fact with two published values.
+        // `Category` enum names only the IoT one, while the catalog publishes
+        // `AWS` and `External` beside it, so the category is a per-platform fact
+        // served as published rather than clamped to the enum.
         let category = got.str_member("category");
         assert_eq!(
             category, entry.category,
@@ -244,7 +240,12 @@ async fn every_published_platform_is_reported_with_its_full_contract() {
             entry.category, got.body["category"]
         );
         assert!(
-            [PLATFORM_CATEGORY_AWS_IOT, PLATFORM_CATEGORY_AWS].contains(&category.as_str()),
+            [
+                PLATFORM_CATEGORY_AWS_IOT,
+                PLATFORM_CATEGORY_AWS,
+                PLATFORM_CATEGORY_EXTERNAL
+            ]
+            .contains(&category.as_str()),
             "case {case:?}: expected a category the service publishes, got {category:?}"
         );
 
@@ -284,14 +285,25 @@ async fn every_published_platform_is_reported_with_its_full_contract() {
             "defaultValue",
             entry.hash_algorithms,
         );
-        assert_option_set(
-            case,
-            "signingImageFormat",
-            &got.body["signingImageFormat"],
-            "supportedFormats",
-            "defaultFormat",
-            entry.image_formats,
-        );
+        // A platform the catalog publishes no image format for reports no
+        // `signingImageFormat` member at all, rather than an empty one.
+        if entry.image_formats.is_empty() {
+            assert!(
+                got.body["signingImageFormat"].is_null(),
+                "case {case:?}: expected no signingImageFormat for a platform published without \
+                 one, got {:?}",
+                got.body["signingImageFormat"]
+            );
+        } else {
+            assert_option_set(
+                case,
+                "signingImageFormat",
+                &got.body["signingImageFormat"],
+                "supportedFormats",
+                "defaultFormat",
+                entry.image_formats,
+            );
+        }
 
         // Every encryption algorithm and image format is one the model names;
         // the hash algorithm is whichever one the platform id spells out, which

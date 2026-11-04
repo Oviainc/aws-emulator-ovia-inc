@@ -260,11 +260,11 @@ fn cases() -> Vec<Case> {
             // The revoke is seeded on this platform, so it is one that publishes
             // the revocation capability; the writes that follow it name platforms
             // that do not, which the revocation already recorded outlives.
-            platform: "AWSIoTDeviceManagement-SHA256-ECDSA",
+            platform: "AWSLambda-SHA384-ECDSA",
             reputs: &[
                 "AmazonFreeRTOS-Default",
                 "AmazonFreeRTOS-TI-CC3220SF",
-                "AWSLambda-SHA384-ECDSA",
+                "AWSIoTDeviceManagement-SHA256-ECDSA",
             ],
             reason: "y".repeat(500),
             effective_epoch_secs: 1_600_000_000,
@@ -273,7 +273,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "Revoked_Then_Reput_Future_Effective",
             region: "ap-southeast-1",
-            platform: "AWSIoTDeviceManagement-SHA256-ECDSA",
+            platform: "AWSLambda-SHA384-ECDSA",
             reputs: &["Notation-OCI-SHA384-ECDSA"],
             reason: "certificate material leaked".to_string(),
             effective_epoch_secs: 4_000_000_000,

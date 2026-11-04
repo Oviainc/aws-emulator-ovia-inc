@@ -210,7 +210,7 @@ async fn walk_profiles(router: &MultiServiceRouter, filters: &str, page_size: i3
 /// A profile shape to put and read back. The rows differ along what the rule
 /// generalises over: how many optional members the request carries, the length and
 /// form of the name, the validity-period unit, and which published platform the
-/// profile is bound to (including one published with no display name).
+/// profile is bound to (including the one published in a category of its own).
 struct ProfileCase {
     name: &'static str,
     /// The request body, minus nothing: exactly what the client sends.
@@ -237,7 +237,7 @@ fn profile_cases() -> Vec<ProfileCase> {
                 "platformId": "Notation-OCI-SHA384-ECDSA",
                 "signingMaterial": { "certificateArn": CERTIFICATE_ARN },
             }),
-            platform_display_name: None,
+            platform_display_name: Some("Notation for container registries"),
         },
         // Signing material, a DAYS validity period, parameters and tags.
         ProfileCase {
@@ -252,7 +252,7 @@ fn profile_cases() -> Vec<ProfileCase> {
                 "signingParameters": { "env": "prod", "team": "iot" },
                 "tags": { "owner": "platform", "tier": "gold" },
             }),
-            platform_display_name: Some("AWS IoT Device Management SHA256-ECDSA"),
+            platform_display_name: Some("AWS IoT Device Management SHA256-ECDSA "),
         },
         // A name at `ProfileName`'s `@length` maximum of 64, platform overrides, and
         // a MONTHS validity period.
@@ -758,7 +758,7 @@ async fn start_signing_job_is_idempotent_and_describe_reports_the_stored_job() {
         ("platformId", json!("AWSIoTDeviceManagement-SHA256-ECDSA")),
         (
             "platformDisplayName",
-            json!("AWS IoT Device Management SHA256-ECDSA"),
+            json!("AWS IoT Device Management SHA256-ECDSA "),
         ),
         (
             "signingMaterial",

@@ -273,19 +273,18 @@ fn revocation_cases() -> Vec<RevocationCase> {
         // Its @length maximum of 500.
         RevocationCase {
             name: "Revoked_Longest_Reason",
-            platform_id: "AWSIoTDeviceManagement-SHA256-ECDSA",
+            platform_id: "AWSLambda-SHA384-ECDSA",
             reason: "r".repeat(500),
             job_owner: None,
         },
         // `jobOwner` naming the account that owns the job.
         RevocationCase {
             name: "Revoked_With_Job_Owner",
-            platform_id: "AWSIoTDeviceManagement-SHA256-ECDSA",
+            platform_id: "AWSLambda-SHA384-ECDSA",
             reason: "certificate material leaked".to_string(),
             job_owner: Some(ACCOUNT_ID),
         },
-        // A reason carrying the whole printable range a client can send, on a
-        // third published platform.
+        // A reason carrying the whole printable range a client can send.
         RevocationCase {
             name: "Revoked_Verbose_Reason",
             platform_id: "AWSLambda-SHA384-ECDSA",

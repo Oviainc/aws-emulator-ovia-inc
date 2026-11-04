@@ -40,7 +40,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_signer_wallabyservice::state::{
-    PlatformListing, PLATFORM_CATEGORY_AWS, PLATFORM_CATEGORY_AWS_IOT, SIGNING_PLATFORM_CATALOG,
+    PlatformListing, PLATFORM_CATEGORY_AWS, PLATFORM_CATEGORY_AWS_IOT, PLATFORM_CATEGORY_EXTERNAL,
+    SIGNING_PLATFORM_CATALOG,
 };
 use service_com_amazonaws_signer_wallabyservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -234,7 +235,7 @@ impl Filter {
             .filter(|entry| {
                 self.category.is_none_or(|wanted| wanted == entry.category)
                     && self.partner.is_none_or(|wanted| wanted == entry.partner)
-                    && self.target.is_none_or(|wanted| wanted == entry.target())
+                    && self.target.is_none_or(|wanted| wanted == entry.target)
             })
             .map(|entry| entry.platform_id.to_string())
             .collect()
@@ -264,6 +265,30 @@ fn filter_cases() -> Vec<FilterCase> {
             case: "the IoT device category",
             filter: Filter {
                 category: Some(PLATFORM_CATEGORY_AWS_IOT),
+                ..Filter::default()
+            },
+            expect_platforms: true,
+        },
+        FilterCase {
+            case: "the category of a platform AWS does not own",
+            filter: Filter {
+                category: Some(PLATFORM_CATEGORY_EXTERNAL),
+                ..Filter::default()
+            },
+            expect_platforms: true,
+        },
+        FilterCase {
+            case: "a partner that is not a segment of its platform's id",
+            filter: Filter {
+                partner: Some("Notary"),
+                ..Filter::default()
+            },
+            expect_platforms: true,
+        },
+        FilterCase {
+            case: "a target that is not the whole suffix of its platform's id",
+            filter: Filter {
+                target: Some("OCI"),
                 ..Filter::default()
             },
             expect_platforms: true,
@@ -338,7 +363,7 @@ fn filter_cases() -> Vec<FilterCase> {
         FilterCase {
             case: "a category and a partner published in the other one",
             filter: Filter {
-                category: Some(PLATFORM_CATEGORY_AWS_IOT),
+                category: Some(PLATFORM_CATEGORY_EXTERNAL),
                 partner: Some("AWSLambda"),
                 ..Filter::default()
             },

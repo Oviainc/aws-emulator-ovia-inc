@@ -1265,24 +1265,32 @@ pub fn signed_object_of(destination: &Destination, job_id: &str) -> SignedObject
     }
 }
 
-/// The `category` the IoT device platforms report: the IoT/FreeRTOS platforms
-/// whose signatures a device verifies.
+/// The `category` the AWS-owned code-signing platforms are published in — the
+/// IoT device-management and Lambda ones.
 ///
 /// `Category` is modelled as an enum with exactly ONE value, `AWSIoT`
 /// (`smithy_query(query="shape", shape="Category")`, mirrored in
-/// [`crate::ops::types::CATEGORY_VALUES`]) — but the recorded
-/// `GetSigningPlatform` answers [`PLATFORM_CATEGORY_AWS`] for the AWS Lambda
-/// platform, so the enum does not name every category the service reports and the
-/// category is a per-platform fact of the catalog rather than a constant.
-pub const PLATFORM_CATEGORY_AWS_IOT: &str = "AWSIoT";
-
-/// The `category` AWS's own (non-device) platforms report — Lambda code signing
-/// and container images.
-///
-/// Recorded behaviour: the `GetSigningPlatform` recording for the AWS Lambda
-/// platform reports `AWS`, a value this model's `Category` enum predates (see
-/// [`PLATFORM_CATEGORY_AWS_IOT`]).
+/// [`crate::ops::types::CATEGORY_VALUES`]) — but the recorded catalog reports
+/// `AWS` for the IoT device-management and Lambda platforms and
+/// [`PLATFORM_CATEGORY_EXTERNAL`] for the container-registry one, so the enum
+/// does not name every category the service publishes, the category is a
+/// per-platform fact of the catalog, and a published value outside the enum is
+/// served as published rather than clamped to a value the enum happens to name.
 pub const PLATFORM_CATEGORY_AWS: &str = "AWS";
+
+/// The `category` a platform owned by a party OTHER than AWS is published in —
+/// the container-registry platform, whose partner is the notary project rather
+/// than an AWS service.
+///
+/// Recorded behaviour, like [`PLATFORM_CATEGORY_AWS`]: a value outside this
+/// model's `Category` enum, published verbatim.
+pub const PLATFORM_CATEGORY_EXTERNAL: &str = "External";
+
+/// The `category` the device-signing platforms are published in — the value
+/// this model's `Category` enum names, which the catalog publishes BESIDE
+/// [`PLATFORM_CATEGORY_AWS`] and [`PLATFORM_CATEGORY_EXTERNAL`] rather than
+/// instead of them.
+pub const PLATFORM_CATEGORY_AWS_IOT: &str = "AWSIoT";
 
 /// Which of AWS Signer's two signing workflows a platform's profiles are signed
 /// through.
@@ -1325,18 +1333,23 @@ impl SigningWorkflow {
 pub struct SigningPlatformEntry {
     /// The `platformId` a `PutSigningProfile` names.
     pub platform_id: &'static str,
-    /// The `displayName` AWS Signer publishes for it, or `None` for a platform it
-    /// publishes none for (the recorded profile responses report no
-    /// `platformDisplayName` for the container-image platform).
+    /// The `displayName` AWS Signer publishes for it, verbatim — including any
+    /// surrounding whitespace the published value carries — or `None` for a
+    /// platform it publishes none for.
     pub display_name: Option<&'static str>,
     /// The `category` the platform is published in — one of
-    /// [`PLATFORM_CATEGORY_AWS_IOT`] / [`PLATFORM_CATEGORY_AWS`], which is where
-    /// the per-platform split is explained.
+    /// [`PLATFORM_CATEGORY_AWS`] / [`PLATFORM_CATEGORY_EXTERNAL`], which is
+    /// where the per-platform split is explained.
     pub category: &'static str,
-    /// The `partner` entity that uses the platform — the leading segment(s) of
-    /// [`Self::platform_id`], the rest of which is the platform's `target` (see
-    /// [`Self::target`]).
+    /// The `partner` entity that uses the platform, as the catalog publishes it:
+    /// a published fact, NOT a segment of [`Self::platform_id`] — the
+    /// container-registry platform is published under a partner its id does not
+    /// spell (and see [`Self::target`]).
     pub partner: &'static str,
+    /// The `target` validation template the platform signs for, as the catalog
+    /// publishes it — again a published fact rather than the remainder of
+    /// [`Self::platform_id`] after [`Self::partner`].
+    pub target: &'static str,
     /// The `EncryptionAlgorithm`s a signature on this platform may be produced
     /// under, MOST PREFERRED FIRST: the head is the platform's `defaultValue`
     /// and the whole slice is its `allowedValues`, so a default outside the
@@ -1345,7 +1358,9 @@ pub struct SigningPlatformEntry {
     /// The `HashAlgorithm`s, same convention: head is the default.
     pub hash_algorithms: &'static [&'static str],
     /// The `ImageFormat`s the platform's signing image may take, head first: the
-    /// head is `defaultFormat` and the slice is `supportedFormats`.
+    /// head is `defaultFormat` and the slice is `supportedFormats`. EMPTY for a
+    /// platform the catalog publishes no `signingImageFormat` for at all, whose
+    /// readers report no such member (see [`Self::signing_image_format`]).
     pub image_formats: &'static [&'static str],
     /// The largest payload (in MB) the platform signs.
     pub max_size_in_mb: i32,
@@ -1365,21 +1380,6 @@ pub struct SigningPlatformEntry {
 }
 
 impl SigningPlatformEntry {
-    /// The `target` validation template the platform signs for: the part of
-    /// [`Self::platform_id`] after the [`Self::partner`] that owns it.
-    ///
-    /// Not a per-entry fact but a decomposition of the id: the recorded
-    /// `GetSigningPlatform` reports a platform whose id is `AWSLambda-SHA384-ECDSA`
-    /// with `partner` `AWSLambda` and `target` `SHA384-ECDSA`, i.e. the id is the
-    /// partner and the target joined by `-`. Deriving it here is what keeps the
-    /// three members from contradicting each other.
-    pub fn target(&self) -> &'static str {
-        self.platform_id
-            .strip_prefix(self.partner)
-            .and_then(|rest| rest.strip_prefix('-'))
-            .unwrap_or(self.platform_id)
-    }
-
     /// The platform's `signingConfiguration`: which algorithms a signature on it
     /// may use, and which one it uses when the profile overrides nothing.
     ///
@@ -1399,12 +1399,17 @@ impl SigningPlatformEntry {
     }
 
     /// The platform's `signingImageFormat`, with `defaultFormat` always one of
-    /// `supportedFormats` ([`Self::image_formats`]).
-    pub fn signing_image_format(&self) -> SigningImageFormat {
-        SigningImageFormat {
+    /// `supportedFormats` ([`Self::image_formats`]) — or `None` for a platform
+    /// the catalog publishes no image format for, whose readers report no
+    /// `signingImageFormat` member rather than an empty one.
+    pub fn signing_image_format(&self) -> Option<SigningImageFormat> {
+        if self.image_formats.is_empty() {
+            return None;
+        }
+        Some(SigningImageFormat {
             supported_formats: to_owned_values(self.image_formats),
             default_format: default_value(self.image_formats),
-        }
+        })
     }
 
     /// The `SigningPlatform` summary a platform listing reports for this entry.
@@ -1417,10 +1422,10 @@ impl SigningPlatformEntry {
             platform_id: Some(self.platform_id.to_string()),
             display_name: self.display_name.map(str::to_string),
             partner: Some(self.partner.to_string()),
-            target: Some(self.target().to_string()),
+            target: Some(self.target.to_string()),
             category: Some(self.category.to_string()),
             signing_configuration: Some(self.signing_configuration()),
-            signing_image_format: Some(self.signing_image_format()),
+            signing_image_format: self.signing_image_format(),
             max_size_in_mb: self.max_size_in_mb,
             revocation_supported: self.revocation_supported,
         }
@@ -1443,17 +1448,27 @@ fn default_value(values: &[&'static str]) -> String {
 /// profile/job slice resolves a platform's display name and signing-material
 /// rule against.
 ///
-/// Source: the code-signing platforms AWS Signer publishes — AWS IoT Device
-/// Management, AWS Lambda, the two FreeRTOS platforms and the Notation
-/// container-image platform — with the `platformId`, `displayName`, `partner`,
-/// algorithm options, image formats, `maxSizeInMB` and `revocationSupported` AWS
-/// reports for each; `target` is not stated per entry but derived from the id
-/// (see [`SigningPlatformEntry::target`]). A platform id spells out the
-/// algorithms it signs under (`…-SHA384-ECDSA`), and
+/// Source: the signing platforms AWS Signer publishes, in the order it publishes
+/// them — AWS IoT Device Management, the container-registry platform, AWS Lambda
+/// and the two FreeRTOS ones — each with the `platformId`, `displayName`,
+/// `partner`, `target`, `category`, algorithm options, image formats,
+/// `maxSizeInMB` and `revocationSupported` the service reports for it. The model
+/// defines the `SigningPlatform` shape and this operation's pagination but NOT
+/// which rows the service publishes, so every member of a row (including its
+/// position in the catalog, its exact `displayName` down to surrounding
+/// whitespace, and a `category` wider than the model's `Category` enum) is
+/// published data held verbatim here, never derived from another member: no
+/// member of a row is computed from its `platform_id`, because a platform's
+/// `partner` and `target` are not segments of its id. A platform id that spells
+/// out the algorithms it signs under (`…-SHA384-ECDSA`) agrees with its
+/// `signingConfiguration` because the published row says so, and
 /// `hashAlgorithmOptions.allowedValues` is what tells a client which algorithm it
 /// may override to, so a platform that signs under SHA384 reports SHA384 even
 /// though this model's `HashAlgorithm` enum
 /// ([`crate::ops::types::HASH_ALGORITHM_VALUES`]) predates it and cannot name it.
+/// A member the service publishes for no platform at all — the container-registry
+/// row carries no `signingImageFormat` — is left out of that row rather than
+/// filled in with a plausible value.
 ///
 /// `requires_signing_material` is a SEPARATE fact from publishing a platform,
 /// stated per entry rather than inferred from membership: a profile is signed
@@ -1479,22 +1494,38 @@ fn default_value(values: &[&'static str]) -> String {
 pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
     SigningPlatformEntry {
         platform_id: "AWSIoTDeviceManagement-SHA256-ECDSA",
-        display_name: Some("AWS IoT Device Management SHA256-ECDSA"),
-        category: PLATFORM_CATEGORY_AWS_IOT,
+        display_name: Some("AWS IoT Device Management SHA256-ECDSA "),
+        category: PLATFORM_CATEGORY_AWS,
         partner: "AWSIoTDeviceManagement",
+        target: "SHA256-ECDSA",
         encryption_algorithms: &["ECDSA"],
         hash_algorithms: &["SHA256"],
         image_formats: &["JSONDetached"],
         max_size_in_mb: 2048,
-        revocation_supported: true,
+        revocation_supported: false,
         requires_signing_material: true,
         workflow: SigningWorkflow::CodeSigningJob,
+    },
+    SigningPlatformEntry {
+        platform_id: "Notation-OCI-SHA384-ECDSA",
+        display_name: Some("Notation for container registries"),
+        category: PLATFORM_CATEGORY_EXTERNAL,
+        partner: "Notary",
+        target: "OCI",
+        encryption_algorithms: &["ECDSA"],
+        hash_algorithms: &["SHA384"],
+        image_formats: &[],
+        max_size_in_mb: 1,
+        revocation_supported: true,
+        requires_signing_material: false,
+        workflow: SigningWorkflow::ContainerImage,
     },
     SigningPlatformEntry {
         platform_id: "AWSLambda-SHA384-ECDSA",
         display_name: Some("AWS Lambda"),
         category: PLATFORM_CATEGORY_AWS,
         partner: "AWSLambda",
+        target: "SHA384-ECDSA",
         encryption_algorithms: &["ECDSA"],
         hash_algorithms: &["SHA384"],
         image_formats: &["JSONDetached"],
@@ -1508,6 +1539,7 @@ pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
         display_name: Some("AmazonFreeRTOS SHA256-ECDSA"),
         category: PLATFORM_CATEGORY_AWS_IOT,
         partner: "AmazonFreeRTOS",
+        target: "Default",
         encryption_algorithms: &["ECDSA"],
         hash_algorithms: &["SHA256"],
         image_formats: &["JSON"],
@@ -1521,6 +1553,7 @@ pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
         display_name: Some("AmazonFreeRTOS SHA1-RSA CC3220SF-Format"),
         category: PLATFORM_CATEGORY_AWS_IOT,
         partner: "AmazonFreeRTOS",
+        target: "TI-CC3220SF",
         encryption_algorithms: &["RSA"],
         hash_algorithms: &["SHA1"],
         image_formats: &["JSON"],
@@ -1528,19 +1561,6 @@ pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
         revocation_supported: false,
         requires_signing_material: true,
         workflow: SigningWorkflow::CodeSigningJob,
-    },
-    SigningPlatformEntry {
-        platform_id: "Notation-OCI-SHA384-ECDSA",
-        display_name: None,
-        category: PLATFORM_CATEGORY_AWS,
-        partner: "Notation",
-        encryption_algorithms: &["ECDSA"],
-        hash_algorithms: &["SHA384"],
-        image_formats: &["JSONDetached"],
-        max_size_in_mb: 16,
-        revocation_supported: true,
-        requires_signing_material: false,
-        workflow: SigningWorkflow::ContainerImage,
     },
 ];
 
@@ -2244,7 +2264,7 @@ impl PlatformListing {
         }
         kept(self.category.as_deref(), entry.category)
             && kept(self.partner.as_deref(), entry.partner)
-            && kept(self.target.as_deref(), entry.target())
+            && kept(self.target.as_deref(), entry.target)
     }
 
     /// The platforms this listing enumerates, in the order the catalog publishes

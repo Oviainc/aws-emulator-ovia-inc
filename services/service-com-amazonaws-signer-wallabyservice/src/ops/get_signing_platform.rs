@@ -178,16 +178,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetSigningPlatformOutput {
-            // The id the catalog publishes the platform under, not the request's
-            // own spelling of it.
+            // Every member is the catalog's published value for the platform,
+            // read off the row rather than derived from the id the request
+            // carried: the id the catalog publishes the platform under, and the
+            // partner, target, category, options, bound and revocation support
+            // published beside it.
             platform_id: Some(platform.platform_id.to_string()),
             // Absent for a platform AWS Signer publishes no display name for.
             display_name: platform.display_name.map(str::to_string),
             partner: Some(platform.partner.to_string()),
-            target: Some(platform.target().to_string()),
+            target: Some(platform.target.to_string()),
             category: Some(platform.category.to_string()),
             signing_configuration: Some(platform.signing_configuration()),
-            signing_image_format: Some(platform.signing_image_format()),
+            // Absent for a platform the catalog publishes no image format for.
+            signing_image_format: platform.signing_image_format(),
             max_size_in_mb: platform.max_size_in_mb,
             revocation_supported: platform.revocation_supported,
         })

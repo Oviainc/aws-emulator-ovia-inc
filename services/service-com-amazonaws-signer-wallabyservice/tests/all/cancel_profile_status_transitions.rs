@@ -287,7 +287,9 @@ const CASES: &[Case] = &[
     Case {
         name: "Already_Revoked",
         region: "ap-southeast-1",
-        platform: "AWSIoTDeviceManagement-SHA256-ECDSA",
+        // Seeded through a revoke, so the platform has to publish the revocation
+        // capability (see `profile_revocation_capability.rs`).
+        platform: "AWSLambda-SHA384-ECDSA",
         setup: Setup::Revoked,
         // A revocation is already-final: the cancel is refused for it rather
         // than moving the profile to the weaker status.

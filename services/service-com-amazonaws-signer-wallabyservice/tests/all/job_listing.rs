@@ -51,6 +51,8 @@ const OTHER_REGION: &str = "eu-west-1";
 const PLATFORM_ID: &str = "AWSLambda-SHA384-ECDSA";
 
 /// A second such platform, so a listing can be narrowed to a subset of the jobs.
+/// Its catalog entry publishes no revocation capability, so no seed on it is
+/// revoked.
 const OTHER_PLATFORM_ID: &str = "AWSIoTDeviceManagement-SHA256-ECDSA";
 
 /// A platform id this service publishes no entry for, so no job can be on it.
@@ -264,9 +266,11 @@ struct Seed {
 }
 
 /// The jobs every case in this suite lists over: enough to truncate a page at
-/// every page size under test, spread across two platforms, with revoked
-/// signatures on both of them so a revocation filter and a platform filter can be
-/// crossed in either direction.
+/// every page size under test, spread across two platforms, with a revoked
+/// signature on the one whose catalog entry publishes the revocation capability
+/// so a revocation filter and a platform filter can be crossed in either
+/// direction (the cross with the other platform selects nothing, which is the
+/// answer a well-formed filter pair that matches no job must get).
 const SEEDS: &[Seed] = &[
     Seed {
         label: "Listed_Job_A",
@@ -286,7 +290,7 @@ const SEEDS: &[Seed] = &[
     Seed {
         label: "Listed_Job_D",
         platform_id: OTHER_PLATFORM_ID,
-        revoked: true,
+        revoked: false,
     },
     Seed {
         label: "Listed_Job_E",
