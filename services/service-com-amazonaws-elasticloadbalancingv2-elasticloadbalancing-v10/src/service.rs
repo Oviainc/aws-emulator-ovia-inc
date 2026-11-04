@@ -40,7 +40,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
-//! Three of those seams are taken here, for three reasons.
+//! Four of those seams are taken here, for four reasons.
 //!
 //! The first: this model's `endpointPrefix` and SigV4 signing name are the ones the Classic
 //! Elastic Load Balancing model publishes too, so the claim cannot come from the model
@@ -65,7 +65,11 @@
 //! [`override_routing_error`](Service::override_routing_error) answers it out of that load
 //! balancer's listener configuration; [`data_plane`] is what resolves and serves it.
 //!
-//! A fourth thing this file does is not a seam but a property of serving a call at all:
+//! The fourth: this API answers every request it refuses before a handler ran under ONE
+//! error code, which the framework's two pre-dispatch layers do not agree on, so
+//! [`override_refusal`](Service::override_refusal) states it.
+//!
+//! A fifth thing this file does is not a seam but a property of serving a call at all:
 //! every control-plane call of an account is a CloudTrail management event, so this
 //! service's definition routes through its operations wrapped in the shared
 //! management-event recorder ([`management_events`]) — one code path for all of them,
@@ -233,16 +237,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) before any handler ran.
+        //
+        // Elastic Load Balancing answers EVERY such refusal under ONE code,
+        // `ValidationError` (`crate::scaffolded::VALIDATION_ERROR`) — the code its
+        // handlers answer a value they cannot accept with, and the code the framework
+        // already picks for a value outside a modelled bound on the query protocols. The
+        // framework parts the two layers it finds a refusal in: a member it could not
+        // READ at all (an absent required one travels as a codec failure) renders as
+        // `MalformedInput`, a code this API does not answer and no client branches on, so
+        // one logical failure answered under two codes. Naming the one code here is what
+        // closes that.
+        //
+        // The MESSAGE is the framework's own envelope over the same violations, so the
+        // sentence a caller reads is unchanged and the two layers cannot drift: only the
+        // code is restated. `None` when there is nothing to state, and for an
+        // authentication refusal, which keeps the framework's 403 and its wording.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: crate::scaffolded::VALIDATION_ERROR.to_string(),
+                message: aws_smithy_schema_server::envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

@@ -40,6 +40,10 @@ const INVALID_ACTION: &str = "InvalidAction";
 /// The error code this service answers an input its own documented rules refuse with.
 const VALIDATION_ERROR: &str = "ValidationError";
 
+/// The awsQuery code of `TooManyCertificatesException`, which `CreateListener` models
+/// (`smithy_query(query="operation",operation="CreateListener")`).
+const TOO_MANY_CERTIFICATES: &str = "TooManyCertificates";
+
 /// Every value of this model's `ProtocolEnum`, from
 /// `src/ops/types/shared_types.rs`'s `PROTOCOL_ENUM_VALUES` (generated from
 /// `smithy_query(query="shape",shape="ProtocolEnum")`). The table below crosses ALL of
@@ -327,10 +331,18 @@ async fn the_default_certificate_is_bracketed_to_tls_terminating_protocols() {
                 certificates: case.certificates.len(),
             });
         } else {
+            // A list carrying more certificate ARNs than one call may name is the
+            // modelled certificate-count refusal, whatever protocol the listener names;
+            // every other break of the bracket is this service's input-validation code.
+            let expected_code = if case.certificates.len() > 1 {
+                TOO_MANY_CERTIFICATES
+            } else {
+                VALIDATION_ERROR
+            };
             assert_eq!(
                 (reply.status, reply.error_code().as_str()),
-                (400, VALIDATION_ERROR),
-                "case {:?}: expected 400 {VALIDATION_ERROR}, got {} {}",
+                (400, expected_code),
+                "case {:?}: expected 400 {expected_code}, got {} {}",
                 case.case,
                 reply.status,
                 reply.body

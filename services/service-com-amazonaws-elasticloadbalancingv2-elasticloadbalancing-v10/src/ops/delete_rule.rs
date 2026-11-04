@@ -152,10 +152,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if rule.is_default.unwrap_or(false) {
             return Err(DeleteRuleErrorModeled::OperationNotPermittedException(
                 OperationNotPermittedException {
-                    message: Some(format!(
-                        "Rule '{}' is the default rule of its listener and cannot be \
-                         deleted; it is released with the listener",
-                        input.rule_arn
+                    message: Some(crate::state::default_rule_deletion_message(
+                        &input.rule_arn,
                     )),
                 },
             )

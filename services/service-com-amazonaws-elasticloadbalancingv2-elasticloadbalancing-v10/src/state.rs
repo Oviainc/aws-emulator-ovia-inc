@@ -583,14 +583,54 @@ pub fn rule_not_found_message(arn: &str) -> String {
 }
 
 /// The message Elastic Load Balancing answers a `PriorityInUse` with: the priority the
-/// request asked for, and the listener whose rules already evaluate at it.
+/// request asked for, and nothing else.
 ///
 /// One message for every operation that places a rule at a priority — `CreateRule` and
 /// `SetRulePriorities` — because "a listener can't have multiple rules with the same
-/// priority" is ONE rule of the service, and the listener is named because the priority
-/// lives in that listener's own namespace: the same number on another listener is free.
-pub fn priority_in_use_message(priority: i32, listener_arn: &str) -> String {
-    format!("Priority '{priority}' is in use on listener '{listener_arn}'")
+/// priority" is ONE rule of the service. The listener is NOT named: the only value the
+/// refusal states is the one the request chose and has to change.
+pub fn priority_in_use_message(priority: i32) -> String {
+    format!("Priority '{priority}' is currently in use")
+}
+
+/// The message a request that asks to DELETE a listener's default rule is refused with,
+/// naming the rule from the request.
+///
+/// A listener's default rule is created and released with the listener, so the three
+/// operations that address a rule state the one thing a caller can act on: that the rule
+/// it named is a default rule, and which of this rule's properties it may therefore not
+/// change (see [`default_rule_modification_message`] and
+/// [`DEFAULT_RULE_PRIORITY_MESSAGE`]).
+pub fn default_rule_deletion_message(arn: &str) -> String {
+    format!("Default rule '{arn}' cannot be deleted")
+}
+
+/// The message a request that asks to MODIFY a listener's default rule is refused with,
+/// naming the rule from the request — the default rule's actions are the listener's own
+/// default actions, which `ModifyListener` owns.
+pub fn default_rule_modification_message(arn: &str) -> String {
+    format!("Default rule '{arn}' cannot be modified")
+}
+
+/// The message a request that asks to move a listener's default rule to another priority
+/// is refused with.
+///
+/// A default rule has no numeric priority to move — it is reported as `default` — so the
+/// refusal states the rule of the service and names no rule: it is the same whichever
+/// default rule the request listed.
+pub const DEFAULT_RULE_PRIORITY_MESSAGE: &str =
+    "The priority of a default rule cannot be changed";
+
+/// The message a `DuplicateListener` states: the load balancer whose port the request
+/// asked for is already taken on.
+///
+/// One message for `CreateListener` and for a `ModifyListener` that moves a listener onto
+/// a taken port, because "one listener per port of a load balancer" is ONE rule of the
+/// service. The PORT is not named — the request carries it — and neither is the listener
+/// that holds it: the identifier of the resource that happens to hold the port is not
+/// part of the refusal.
+pub fn duplicate_listener_message(load_balancer_arn: &str) -> String {
+    format!("A listener already exists on this port for this load balancer '{load_balancer_arn}'")
 }
 
 /// The published maximum length of a load balancer name, from `CreateLoadBalancer`'s
@@ -720,6 +760,23 @@ pub fn terminates_tls(protocol: Option<&str>) -> bool {
 /// The emulator's own bound, as [`LOAD_BALANCER_QUOTA`]: the list lives on the listener
 /// record, so it is released with the listener.
 pub const CERTIFICATES_PER_LISTENER: usize = 25;
+
+/// How many certificate ARNs ONE request may carry, which the model fixes at one for
+/// every operation that takes a `Certificates` list: `CreateListenerInput$Certificates`
+/// and `ModifyListenerInput$Certificates` are "The default certificate for the listener.
+/// You must provide exactly one certificate", and
+/// `AddListenerCertificatesInput$Certificates` is "The certificate to add. You can
+/// specify one certificate per call."
+pub const CERTIFICATES_PER_CALL: usize = 1;
+
+/// The message a request carrying more certificate ARNs than one call may name is refused
+/// with: the limit the model fixes, and how many the request carried.
+///
+/// Both halves are stated because a caller has to fix the request from this text alone,
+/// and the count is the request's own rather than one recorded call's.
+pub fn certificate_count_message(limit: usize, requested: usize) -> String {
+    format!("Up to '{limit}' certificate ARNs can be specified, but '{requested}' were specified")
+}
 
 /// A server certificate uploaded to IAM, `arn:aws:iam::<account>:server-certificate/<name>`
 /// — the second place the certificates a TLS-terminating listener serves live, beside
@@ -1695,42 +1752,48 @@ pub fn check_subnet_mapping(
     mapping: &SubnetMapping,
 ) -> Result<(), String> {
     let internal = scheme == INTERNAL_SCHEME;
-    // (what the member pins, whether the request pins it, whether this load balancer
-    // carries it) — the plural the refusal names the member by is the one the
-    // documentation uses for it.
-    let pinned: [(&str, bool, bool); 4] = [
+    // (how a refusal about the SCHEME names what the member pins — the opening of that
+    // sentence, so it is capitalised — how a refusal about the load balancer's TYPE names
+    // it, whether the request pins it, and whether this load balancer carries it).
+    let pinned: [(&str, &str, bool, bool); 4] = [
         (
+            "Elastic IPs",
             "Elastic IP addresses",
             mapping.allocation_id.is_some(),
             family == LoadBalancerFamily::Network && !internal,
         ),
         (
+            "Private IPv4 addresses",
             "private IP addresses",
             mapping.private_i_pv4_address.is_some(),
             family == LoadBalancerFamily::Network && internal,
         ),
         (
             "IPv6 addresses",
+            "IPv6 addresses",
             mapping.i_pv6_address.is_some(),
             family == LoadBalancerFamily::Network && !internal,
         ),
         (
             "IPv6 source NAT prefixes",
+            "IPv6 source NAT prefixes",
             mapping.source_nat_ipv6_prefix.is_some(),
             family == LoadBalancerFamily::Network,
         ),
     ];
-    for (what, requested, carried) in pinned {
+    for (by_scheme, by_type, requested, carried) in pinned {
         if !requested || carried {
             continue;
         }
         // WHICH of the two the caller has to fix: a family that carries the member for no
         // scheme at all, or the scheme of a family that carries it for the other one.
+        // The scheme half is worded as AWS words it — what is not supported, and the
+        // scheme of the load balancer it was asked for.
         return Err(if family == LoadBalancerFamily::Network {
-            format!("You cannot specify {what} with an {scheme} load balancer")
+            format!("{by_scheme} are not supported for load balancers with scheme '{scheme}'")
         } else {
             format!(
-                "You cannot specify {what} with a load balancer of type '{}'",
+                "You cannot specify {by_type} with a load balancer of type '{}'",
                 family_type_name(family)
             )
         });
@@ -2993,18 +3056,21 @@ pub fn check_rule_conditions(conditions: &[RuleCondition]) -> Result<(), String>
         }
         if SINGLE_USE_CONDITION_FIELDS.contains(&field) {
             if single_use_seen.contains(&field) {
-                return Err(format!(
-                    "A rule carries at most one '{field}' condition"
-                ));
+                // AWS's own wording for this refusal, built from the field the request
+                // repeated: "A rule can only have one '<field>' condition".
+                return Err(format!("A rule can only have one '{field}' condition"));
             }
             single_use_seen.push(field);
         }
         values += condition_values(condition);
     }
     if values > CONDITION_VALUES_PER_RULE {
+        // AWS's own wording for this refusal, which states the published limit and names
+        // neither the count the request carried nor the condition it sat in: "A rule can
+        // only have '<limit>' condition values and regex values".
         return Err(format!(
-            "A rule's conditions carry at most {CONDITION_VALUES_PER_RULE} values in \
-             total, got {values}"
+            "A rule can only have '{CONDITION_VALUES_PER_RULE}' condition values and \
+             regex values"
         ));
     }
     Ok(())

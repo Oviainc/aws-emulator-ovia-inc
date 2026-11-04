@@ -63,6 +63,10 @@ const OPERATION_NOT_PERMITTED: &str = "OperationNotPermitted";
 /// The awsQuery code of `DuplicateListenerException`.
 const DUPLICATE_LISTENER: &str = "DuplicateListener";
 
+/// The awsQuery code of `TooManyCertificatesException`, which `CreateListener` and
+/// `ModifyListener` model for a request carrying more certificate ARNs than one call may.
+const TOO_MANY_CERTIFICATES: &str = "TooManyCertificates";
+
 /// The awsQuery code of `TargetGroupNotFoundException`.
 const TARGET_GROUP_NOT_FOUND: &str = "TargetGroupNotFound";
 
@@ -744,7 +748,7 @@ async fn modify_listener_refuses_a_configuration_the_model_rules_out() {
                 p("Certificates.member.1.CertificateArn", CERT_ONE),
                 p("Certificates.member.2.CertificateArn", CERT_TWO),
             ],
-            VALIDATION_ERROR,
+            TOO_MANY_CERTIFICATES,
         ),
         (
             "a certificate on a listener that terminates no TLS",
@@ -841,9 +845,10 @@ async fn the_certificate_list_round_trips_through_add_describe_and_remove() {
         described.body
     );
 
-    // Rows differ along how many certificates one call adds and whether they are
-    // already in the list: adding a certificate twice leaves one entry, because the list
-    // is a set.
+    // Rows differ along which certificate one call adds and whether it is already in the
+    // list: adding a certificate twice leaves one entry, because the list is a set. One
+    // call adds ONE certificate — `Certificates` is "The certificate to add. You can
+    // specify one certificate per call" — so growing the list is a call per certificate.
     let rows: Vec<(&str, Vec<&str>, Vec<&str>)> = vec![
         ("one certificate", vec![CERT_ONE], vec![CERT_ONE]),
         (
@@ -851,14 +856,15 @@ async fn the_certificate_list_round_trips_through_add_describe_and_remove() {
             vec![CERT_ONE],
             vec![CERT_ONE],
         ),
+        ("a second one", vec![CERT_TWO], vec![CERT_ONE, CERT_TWO]),
         (
-            "two more in one call",
-            vec![CERT_TWO, CERT_THREE],
+            "a third one",
+            vec![CERT_THREE],
             vec![CERT_ONE, CERT_TWO, CERT_THREE],
         ),
         (
-            "one already held beside a new one",
-            vec![CERT_TWO, CERT_DEFAULT],
+            "the listener's own default certificate",
+            vec![CERT_DEFAULT],
             vec![CERT_ONE, CERT_TWO, CERT_THREE, CERT_DEFAULT],
         ),
     ];
@@ -1024,12 +1030,14 @@ async fn the_certificate_list_round_trips_through_add_describe_and_remove() {
         reply.body
     );
 
-    // One call cannot name more certificates than a listener's list holds (25 here), and
-    // the bound is read off the list the request carried before anything is stored, so
-    // neither operation can be made to do work that grows with the request.
+    // One call cannot name more certificates than it may carry, and the bound is read off
+    // the list the request carried before anything is stored, so neither operation can be
+    // made to do work that grows with the request. `AddListenerCertificates` takes one
+    // certificate per call and `RemoveListenerCertificates` at most a whole list (25
+    // here), so 26 is past both.
     let before = describe_certificates(&router, &listener, None, None).await;
     for (case, operation, expected_code) in [
-        ("adding", "AddListenerCertificates", "TooManyCertificates"),
+        ("adding", "AddListenerCertificates", VALIDATION_ERROR),
         ("removing", "RemoveListenerCertificates", VALIDATION_ERROR),
     ] {
         let mut form = action(operation);

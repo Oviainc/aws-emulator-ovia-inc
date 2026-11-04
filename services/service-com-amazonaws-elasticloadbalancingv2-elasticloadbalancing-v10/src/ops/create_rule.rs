@@ -249,10 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateRuleErrorModeled::PriorityInUseException(
                 PriorityInUseException {
-                    message: Some(crate::state::priority_in_use_message(
-                        input.priority,
-                        &input.listener_arn,
-                    )),
+                    message: Some(crate::state::priority_in_use_message(input.priority)),
                 },
             )
             .into());

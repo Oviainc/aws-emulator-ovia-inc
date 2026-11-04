@@ -292,16 +292,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && other.port == updated.port
             });
             if clash {
-                // The refusal says WHAT conflicts — the port, on this listener's own
-                // load balancer — and not which other listener holds it: the identifier
-                // of the resource that happens to hold a reference is not part of the
-                // message, exactly as `CreateListener` words the same refusal.
+                // The refusal names the load balancer whose port is already taken and
+                // nothing else — not the port, which the request carries, and not the
+                // listener that holds it: exactly as `CreateListener` words the same
+                // refusal ([`crate::state::duplicate_listener_message`]).
                 return Err(ModifyListenerErrorModeled::DuplicateListenerException(
                     DuplicateListenerException {
-                        message: Some(format!(
-                            "A listener already exists on port {} of load balancer '{}'",
-                            updated.port.unwrap_or_default(),
-                            updated.load_balancer_arn
+                        message: Some(crate::state::duplicate_listener_message(
+                            &updated.load_balancer_arn,
                         )),
                     },
                 )
@@ -363,9 +361,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// policy and default certificate properties"; `Certificates`: "You must provide exactly
 /// one certificate").
 ///
-/// The model declares no error shape for breaking either, so the refusal is this
-/// service's own input validation (`400` `ValidationError`) with a message naming the
-/// member and the protocol it was judged against.
+/// A list carrying MORE certificates than one call may name is the modelled
+/// `TooManyCertificatesException`, stated as
+/// [`crate::state::certificate_count_message`] words it, exactly as `CreateListener`
+/// states it. The model declares no error shape for the rest of the bracket, so those
+/// refusals are this service's own input validation (`400` `ValidationError`) with a
+/// message naming the member and the protocol it was judged against.
 fn apply_certificate_rules(
     listener: &mut crate::state::ListenerRecord,
     certificates: Option<&[Certificate]>,
@@ -377,6 +378,21 @@ fn apply_certificate_rules(
         Some(value) => format!("{value} listeners"),
         None => "a listener with no protocol".to_string(),
     };
+
+    // The COUNT is judged before the protocol bracket: how many certificate ARNs one
+    // call may carry does not depend on which listener the request is for, exactly as
+    // `CreateListener` judges it.
+    if requested.len() > crate::state::CERTIFICATES_PER_CALL {
+        return Err(ModifyListenerErrorModeled::TooManyCertificatesException(
+            TooManyCertificatesException {
+                message: Some(crate::state::certificate_count_message(
+                    crate::state::CERTIFICATES_PER_CALL,
+                    requested.len(),
+                )),
+            },
+        )
+        .into());
+    }
 
     if !listener.terminates_tls() {
         if !requested.is_empty() {
@@ -394,12 +410,6 @@ fn apply_certificate_rules(
         return Ok(());
     }
 
-    if requested.len() > 1 {
-        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-            "You must provide exactly one certificate for {named}, got {}",
-            requested.len()
-        )));
-    }
     if let Some(certificate) = requested.first() {
         let Some(arn) = certificate
             .certificate_arn

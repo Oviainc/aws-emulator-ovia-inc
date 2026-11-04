@@ -331,12 +331,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .await
         {
             // The subnets are EC2's resources: one the account does not hold is a
-            // placement EC2 itself refuses, so the modelled `SubnetNotFound` carries the
-            // code EC2 answered rather than a sentence restating it.
+            // placement EC2 itself refuses, so the modelled `SubnetNotFound` states the
+            // sentence that refusal was worded with, which names the subnet at fault.
             crate::state::network::SubnetLookup::Absent(refusal) => {
                 return Err(CreateLoadBalancerErrorModeled::SubnetNotFoundException(
                     SubnetNotFoundException {
-                        message: Some(refusal.code),
+                        message: Some(refusal.relayed_message()),
                     },
                 )
                 .into())
@@ -352,13 +352,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .filter_map(|mapping| mapping.allocation_id.clone())
             .collect();
-        if let Some(code) =
+        if let Some(refusal) =
             crate::state::network::absent_allocation_id(ctx, &region, &allocation_ids).await
         {
             return Err(
                 CreateLoadBalancerErrorModeled::AllocationIdNotFoundException(
                     AllocationIdNotFoundException {
-                        message: Some(code),
+                        message: Some(refusal.relayed_message()),
                     },
                 )
                 .into(),

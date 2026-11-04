@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/alb_data_plane.rs"]
 mod alb_data_plane;
+#[path = "all/aws_error_wording.rs"]
+mod aws_error_wording;
 #[path = "all/capacity_reservation.rs"]
 mod capacity_reservation;
 #[path = "all/catalog_reads.rs"]

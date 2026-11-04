@@ -160,6 +160,8 @@ pub struct NetworkRefusal {
     pub code: String,
     /// The sentence EC2 worded the refusal with, or `None` when it answered none.
     pub message: Option<String>,
+    /// The HTTP status EC2 answered, when its answer reached this service at all.
+    pub status: Option<u16>,
 }
 
 impl NetworkRefusal {
@@ -169,25 +171,73 @@ impl NetworkRefusal {
         Self {
             code: code.into(),
             message: None,
+            status: None,
         }
     }
 
     /// The refusal EC2 answered, with the sentence it worded (when it worded one).
     pub fn worded(code: impl Into<String>, message: Option<String>) -> Self {
+        Self::answered(code, message, None)
+    }
+
+    /// The refusal EC2 ANSWERED on the wire: its sentence and the status it came with,
+    /// which a caller relaying the failure states beside the code
+    /// ([`NetworkRefusal::relayed_message`]).
+    pub fn answered(code: impl Into<String>, message: Option<String>, status: Option<u16>) -> Self {
         Self {
             code: code.into(),
             message,
+            status,
         }
     }
 
     /// What a caller states as the MESSAGE of its own refusal: EC2's sentence when EC2
     /// worded one, because it names the id at fault, and the code it answered otherwise.
+    ///
+    /// A refusal a caller REPORTS to its own client is built with a sentence of its own
+    /// ([`unresolved_ids_message`]) for the case EC2 worded none, so the code fallback
+    /// here is the last resort for a refusal nobody worded: an error message is a
+    /// sentence about the request, and a bare error code states nothing a caller can act
+    /// on.
     pub fn reported_message(&self) -> String {
         self.message
             .clone()
             .unwrap_or_else(|| self.code.clone())
     }
+
+    /// [`NetworkRefusal::reported_message`] in the form AWS reports a failure of a call a
+    /// service made to ANOTHER service on the caller's behalf: the inner service's own
+    /// sentence, then the service it was, the status and error code it answered, the id of
+    /// the call that was made, and the proxy it went through — there is none, so that
+    /// field is `null`.
+    ///
+    /// The tail is what a caller (or its tooling) correlates this refusal with the call
+    /// behind it by, so it is part of the message rather than an addition to it. A request
+    /// id names one call for correlation and is never a credential, so it is drawn afresh
+    /// per refusal and derived from nothing in the request
+    /// ([`::service_common::query_error_envelope::new_request_id`]).
+    ///
+    /// Which of the two forms a service states is the service's own: this one is what the
+    /// Elastic Load Balancing v2 API answers for an EC2-owned resource it could not
+    /// resolve, while the Classic API states the inner sentence alone
+    /// ([`NetworkRefusal::reported_message`]).
+    pub fn relayed_message(&self) -> String {
+        let status = self
+            .status
+            .map_or_else(String::new, |status| format!("Status Code: {status}; "));
+        let request_id = ::service_common::query_error_envelope::new_request_id();
+        format!(
+            "{} (Service: {RELAYED_SERVICE}; {status}Error Code: {}; Request ID: {request_id}; \
+             Proxy: null)",
+            self.reported_message(),
+            self.code,
+        )
+    }
 }
+
+/// The service a refusal relayed from one of these reads names: the one this service made
+/// the call to.
+const RELAYED_SERVICE: &str = "AmazonEC2";
 
 /// What EC2 says about the subnets a request named.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,11 +281,16 @@ pub async fn resolve_subnets(
             let reported: Vec<SubnetFacts> = output.subnets().iter().map(subnet_facts).collect();
             // A read that resolved but reports no subnet for an id the request named says
             // the same thing the refusal below does.
-            if subnet_ids
+            let unresolved: Vec<&str> = subnet_ids
                 .iter()
-                .any(|id| !reported.iter().any(|subnet| &subnet.subnet_id == id))
-            {
-                return SubnetLookup::Absent(NetworkRefusal::new(SUBNET_ID_NOT_FOUND));
+                .filter(|id| !reported.iter().any(|subnet| &&subnet.subnet_id == id))
+                .map(String::as_str)
+                .collect();
+            if !unresolved.is_empty() {
+                return SubnetLookup::Absent(NetworkRefusal::worded(
+                    SUBNET_ID_NOT_FOUND,
+                    Some(unresolved_ids_message(SUBNET_ID_NOUN, &unresolved)),
+                ));
             }
             return SubnetLookup::Resolved(reported);
         }
@@ -249,10 +304,20 @@ pub async fn resolve_subnets(
     if code.starts_with(SUBNET_ID_REFUSAL_PREFIX) {
         // EC2 worded this refusal around the subnet id it would not resolve, so the
         // sentence is carried along with the code: it is what names that id to the caller.
-        let message = refused
+        // EC2 refused the read for the ids it was given as a whole, so when it worded no
+        // sentence of its own the refusal states them.
+        let detail = refused
             .and_then(ProvideErrorMetadata::message)
-            .map(str::to_string);
-        return SubnetLookup::Absent(NetworkRefusal::worded(code, message));
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                let named: Vec<&str> = subnet_ids.iter().map(String::as_str).collect();
+                unresolved_ids_message(SUBNET_ID_NOUN, &named)
+            });
+        return SubnetLookup::Absent(NetworkRefusal::answered(
+            code,
+            Some(detail),
+            error.raw_response().map(|response| response.status().as_u16()),
+        ));
     }
     ::tracing::debug!(
         error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
@@ -270,6 +335,27 @@ const SUBNET_ID_REFUSAL_PREFIX: &str = "InvalidSubnetID.";
 /// resolved without reporting one of the ids ran into.
 const SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetID.NotFound";
 
+/// What a refusal CALLS a subnet id, for the sentence it states when EC2 worded none.
+const SUBNET_ID_NOUN: &str = "subnet ID";
+
+/// What a refusal CALLS an Elastic IP allocation id, for the same sentence.
+const ALLOCATION_ID_NOUN: &str = "allocation ID";
+
+/// The sentence a refusal for ids the account holds no resource for states: the kind of
+/// id, and every id of that kind the read could not resolve.
+///
+/// An error reply's message is a SENTENCE about the request — it is what tells a caller
+/// which of the values it sent was refused — so a refusal reported to a client never
+/// states a bare error code. The ids come from the REQUEST, and the clause agrees in
+/// number with how many of them were refused.
+fn unresolved_ids_message(noun: &str, ids: &[&str]) -> String {
+    let quoted: Vec<String> = ids.iter().map(|id| format!("'{id}'")).collect();
+    match quoted.as_slice() {
+        [one] => format!("The {noun} {one} does not exist"),
+        many => format!("The {noun}s {} do not exist", many.join(", ")),
+    }
+}
+
 /// The prefix of every EC2 error code that says a value names no Elastic IP allocation of
 /// the account: `InvalidAllocationID.NotFound` and `InvalidAllocationID.Malformed`.
 const ALLOCATION_ID_REFUSAL_PREFIX: &str = "InvalidAllocationID.";
@@ -283,12 +369,13 @@ const ALLOCATION_ID_NOT_FOUND: &str = "InvalidAllocationID.NotFound";
 ///
 /// An Elastic IP address is EC2's resource, and its allocation id is what names it, so
 /// whether an address exists to pin on a load balancer's subnet is EC2's to say. The value
-/// is the error CODE EC2 answered, for the caller to state in its own refusal.
+/// is the refusal EC2 answered — its error CODE, and the sentence that names the
+/// allocation id at fault — for the caller to state in its own refusal.
 pub async fn absent_allocation_id(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     allocation_ids: &[String],
-) -> Option<String> {
+) -> Option<NetworkRefusal> {
     use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
     if allocation_ids.is_empty() {
@@ -306,20 +393,40 @@ pub async fn absent_allocation_id(
                 .iter()
                 .filter_map(::aws_sdk_ec2::types::Address::allocation_id)
                 .collect();
-            return allocation_ids
+            let unresolved: Vec<&str> = allocation_ids
                 .iter()
-                .any(|id| !reported.contains(&id.as_str()))
-                .then(|| ALLOCATION_ID_NOT_FOUND.to_string());
+                .map(String::as_str)
+                .filter(|id| !reported.contains(id))
+                .collect();
+            return (!unresolved.is_empty()).then(|| {
+                NetworkRefusal::worded(
+                    ALLOCATION_ID_NOT_FOUND,
+                    Some(unresolved_ids_message(ALLOCATION_ID_NOUN, &unresolved)),
+                )
+            });
         }
         Err(error) => error,
     };
-    let code = error
-        .as_service_error()
+    let refused = error.as_service_error();
+    let code = refused
         .and_then(ProvideErrorMetadata::code)
         .unwrap_or_default()
         .to_string();
     if code.starts_with(ALLOCATION_ID_REFUSAL_PREFIX) {
-        return Some(code);
+        // EC2's own sentence names the allocation id it would not resolve; when it worded
+        // none, the refusal states the ids the read named.
+        let detail = refused
+            .and_then(ProvideErrorMetadata::message)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                let named: Vec<&str> = allocation_ids.iter().map(String::as_str).collect();
+                unresolved_ids_message(ALLOCATION_ID_NOUN, &named)
+            });
+        return Some(NetworkRefusal::answered(
+            code,
+            Some(detail),
+            error.raw_response().map(|response| response.status().as_u16()),
+        ));
     }
     ::tracing::debug!(
         error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),

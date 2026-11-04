@@ -200,10 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if reported.is_default.unwrap_or(false) {
             return Err(ModifyRuleErrorModeled::OperationNotPermittedException(
                 OperationNotPermittedException {
-                    message: Some(format!(
-                        "Rule '{}' is the default rule of its listener and cannot be \
-                         modified; its actions are the listener's default actions",
-                        input.rule_arn
+                    message: Some(crate::state::default_rule_modification_message(
+                        &input.rule_arn,
                     )),
                 },
             )

@@ -212,10 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if rule.is_default.unwrap_or(false) {
                 return Err(SetRulePrioritiesErrorModeled::OperationNotPermittedException(
                     OperationNotPermittedException {
-                        message: Some(format!(
-                            "Rule '{rule_arn}' is the default rule of its listener and its \
-                             priority cannot be set"
-                        )),
+                        message: Some(crate::state::DEFAULT_RULE_PRIORITY_MESSAGE.to_string()),
                     },
                 )
                 .into());
@@ -253,10 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if taken.contains(&priority) {
                     return Err(SetRulePrioritiesErrorModeled::PriorityInUseException(
                         PriorityInUseException {
-                            message: Some(crate::state::priority_in_use_message(
-                                priority,
-                                listener_arn,
-                            )),
+                            message: Some(crate::state::priority_in_use_message(priority)),
                         },
                     )
                     .into());

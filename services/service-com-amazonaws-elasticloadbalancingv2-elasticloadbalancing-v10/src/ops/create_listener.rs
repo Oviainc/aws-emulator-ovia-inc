@@ -346,10 +346,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             return Err(CreateListenerErrorModeled::DuplicateListenerException(
                 DuplicateListenerException {
-                    message: Some(format!(
-                        "A listener already exists on port {} of load balancer '{}'",
-                        candidate.port.unwrap_or_default(),
-                        candidate.load_balancer_arn
+                    message: Some(crate::state::duplicate_listener_message(
+                        &candidate.load_balancer_arn,
                     )),
                 },
             )
@@ -416,10 +414,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// listener is created with EXACTLY ONE certificate, carrying the ARN that names it,
 /// and a listener that terminates no TLS is created with none.
 ///
-/// The model states the rule in the member's documentation and declares no error shape
-/// for breaking it, so the refusal is this service's own input-validation code
-/// (`400` `ValidationError`) with a message naming the member and the protocol it was
-/// judged against — the only thing the caller can act on.
+/// A list carrying MORE certificates than one call may name is the modelled
+/// `TooManyCertificatesException`, stated as
+/// [`crate::state::certificate_count_message`] words it. The rest of the bracket the
+/// model states in the member's documentation and declares no error shape for, so those
+/// refusals are this service's own input-validation code (`400` `ValidationError`) with a
+/// message naming the member and the protocol it was judged against — the only thing the
+/// caller can act on.
 fn check_default_certificate(
     protocol: Option<&str>,
     certificates: Option<&[Certificate]>,
@@ -432,6 +433,22 @@ fn check_default_certificate(
         Some(value) => format!("{value} listeners"),
         None => "a listener with no protocol".to_string(),
     };
+
+    // The COUNT is judged before the protocol bracket and before the entries: how many
+    // certificate ARNs one call may carry does not depend on which listener the request
+    // is for, so a request carrying more than that is refused on the count whatever
+    // protocol it named.
+    if certificates.len() > crate::state::CERTIFICATES_PER_CALL {
+        return Err(CreateListenerErrorModeled::TooManyCertificatesException(
+            TooManyCertificatesException {
+                message: Some(crate::state::certificate_count_message(
+                    crate::state::CERTIFICATES_PER_CALL,
+                    certificates.len(),
+                )),
+            },
+        )
+        .into());
+    }
 
     if !terminates_tls {
         if certificates.is_empty() {
@@ -449,12 +466,6 @@ fn check_default_certificate(
         // named: "A certificate must be specified for HTTPS listeners".
         return Err(crate::scaffolded::Scaffolded::validation_error(format!(
             "A certificate must be specified for {listener}"
-        )));
-    }
-    if certificates.len() > 1 {
-        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-            "You must provide exactly one certificate for {listener}, got {}",
-            certificates.len()
         )));
     }
     if certificates[0]

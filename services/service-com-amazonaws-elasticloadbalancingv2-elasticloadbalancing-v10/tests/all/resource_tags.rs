@@ -569,10 +569,11 @@ async fn one_call_names_between_one_and_twenty_resources() {
 
     // Naming no resource at all is refused rather than reported as nothing. `ResourceArns`
     // is modelled required and awsQuery cannot carry an empty list, so this refusal comes
-    // from the boundary validator (code `MalformedInput`) before the handler runs; the
-    // handler refuses an empty list for the callers that can express one. Only the status
-    // and the fact that nothing was reported are asserted, because the code of a boundary
-    // refusal is the framework's, not this operation's.
+    // from the boundary before the handler runs — answered under this service's own
+    // input-refusal code, as `src/service.rs` states it; the handler refuses an empty list
+    // for the callers that can express one. Only the status and the fact that nothing was
+    // reported are asserted here, because the wording of a boundary refusal belongs to
+    // `all/aws_error_wording.rs` and not to this operation.
     let empty = describe_tags(&router, &[]).await;
     assert_eq!(
         empty.status, 400,

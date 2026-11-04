@@ -7,8 +7,9 @@
 //! owns what those name: a subnet and an Elastic IP allocation are EC2's resources. So each
 //! resolves them against EC2 through the in-process callback and answers the modelled
 //! refusal — `SubnetNotFound` for an id the account holds no subnet for,
-//! `AllocationIdNotFound` for one it holds no Elastic IP for — carrying the code EC2
-//! answered, rather than placing a load balancer in a subnet that does not exist.
+//! `AllocationIdNotFound` for one it holds no Elastic IP for — stating the SENTENCE EC2
+//! answered in the form AWS reports an inner service's failure in, rather than placing a
+//! load balancer in a subnet that does not exist.
 //!
 //! That needs both services on one engine, which is why this suite lives here beside
 //! `elbv2_network_resolution.rs`, whose request plumbing it reuses; the rules that need
@@ -25,11 +26,14 @@ use crate::elbv2_network_resolution::{ec2_ok, elbv2, Answer, BOOT_STACK_SIZE};
 use crate::query_wire::{element, opt_element};
 
 /// The EC2 code for an id the account holds no subnet for, which is what Elastic Load
-/// Balancing reports when a placement names one.
-const SUBNET_NOT_FOUND_MESSAGE: &str = "InvalidSubnetID.NotFound";
+/// Balancing names in the refusal it reports when a placement names one.
+const SUBNET_NOT_FOUND_CODE: &str = "InvalidSubnetID.NotFound";
 
 /// The EC2 code for an id the account holds no Elastic IP allocation for.
-const ALLOCATION_NOT_FOUND_MESSAGE: &str = "InvalidAllocationID.NotFound";
+const ALLOCATION_NOT_FOUND_CODE: &str = "InvalidAllocationID.NotFound";
+
+/// The EC2 code for a value that is not an allocation id at all.
+const ALLOCATION_MALFORMED_CODE: &str = "InvalidAllocationID.Malformed";
 
 /// An id of the right form that names no subnet of the account.
 const ABSENT_SUBNET: &str = "subnet-00000000000000000";
@@ -37,13 +41,59 @@ const ABSENT_SUBNET: &str = "subnet-00000000000000000";
 /// An id of the right form that names no Elastic IP allocation of the account.
 const ABSENT_ALLOCATION: &str = "eipalloc-00000000000000000";
 
-/// Assert one refusal: the status, the awsQuery code and the message.
-fn assert_refused(case: &str, answer: &Answer, code: &str, message: &str) {
+/// Assert one refusal Elastic Load Balancing RELAYED from the EC2 call it made on the
+/// caller's behalf: the status, the modelled awsQuery code, and a message that states
+/// EC2's own sentence wrapped in the form AWS reports an inner service's failure in —
+/// `<sentence> (Service: AmazonEC2; Status Code: 400; Error Code: <code>; Request ID:
+/// <id>; Proxy: null)`.
+///
+/// The request id is a per-call value, so it is checked for its SHAPE rather than compared
+/// to a literal; everything around it is the requirement.
+fn assert_relayed_refusal(case: &str, answer: &Answer, code: &str, detail: &str, inner: &str) {
     assert_eq!(
-        (answer.status, answer.code(), answer.message()),
-        (400, code.to_string(), message.to_string()),
-        "case {case:?}: expected 400 {code} {message:?}, got {answer:?}"
+        (answer.status, answer.code()),
+        (400, code.to_string()),
+        "case {case:?}: expected 400 {code}, got {answer:?}"
     );
+    let message = answer.message();
+    let head =
+        format!("{detail} (Service: AmazonEC2; Status Code: 400; Error Code: {inner}; Request ID: ");
+    let tail = "; Proxy: null)";
+    assert!(
+        message.starts_with(&head) && message.ends_with(tail),
+        "case {case:?}: expected the relayed refusal {head:?}…{tail:?}, got {message:?}"
+    );
+    let request_id = &message[head.len()..message.len() - tail.len()];
+    assert!(
+        request_id.len() == 36
+            && request_id.matches('-').count() == 4
+            && request_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b'-'),
+        "case {case:?}: the relayed refusal must name the inner call's request id, \
+         got {request_id:?} in {message:?}"
+    );
+}
+
+/// The sentence EC2 refuses a read naming an id it holds no subnet for with.
+fn absent_subnet_sentence(subnet_id: &str) -> String {
+    format!("The subnet ID '{subnet_id}' does not exist")
+}
+
+/// The refusal EC2 answered for an id it would not resolve: the sentence it worded and the
+/// error code it came under, which is what the relaying refusal states.
+struct InnerRefusal {
+    sentence: String,
+    code: &'static str,
+}
+
+/// One row of the Elastic IP table: the case, the allocation id the mapping pins, and the
+/// refusal EC2 answers for it — `None` where EC2 holds the allocation and the create is
+/// accepted.
+struct AllocationRow {
+    case: &'static str,
+    pinned: String,
+    refused: Option<InnerRefusal>,
 }
 
 #[test]
@@ -94,30 +144,33 @@ fn a_placement_naming_a_resource_ec2_does_not_hold_is_refused() {
             // -----------------------------------------------------------------
             // The subnets a create names must be subnets EC2 holds.
             // -----------------------------------------------------------------
-            // (case, the two subnet ids the request names, whether it is accepted)
-            let subnet_rows: Vec<(&str, [&str; 2], bool)> = vec![
+            // (case, the two subnet ids the request names, the id EC2 refuses the read
+            // for — `None` when it resolves every one of them)
+            let subnet_rows: Vec<(&str, [&str; 2], Option<&str>)> = vec![
                 (
                     "two subnets EC2 holds",
                     [subnets[0].as_str(), subnets[1].as_str()],
-                    true,
+                    None,
                 ),
                 (
                     "an id EC2 holds no subnet for",
                     [subnets[0].as_str(), ABSENT_SUBNET],
-                    false,
+                    Some(ABSENT_SUBNET),
                 ),
                 (
                     "a value that is not a subnet id at all",
                     [subnets[0].as_str(), "not-a-subnet"],
-                    false,
+                    Some("not-a-subnet"),
                 ),
                 (
                     "two ids EC2 holds no subnet for",
                     [ABSENT_SUBNET, "subnet-00000000000000001"],
-                    false,
+                    // EC2 refuses the whole read on the FIRST id it cannot resolve, so
+                    // that is the one its sentence names.
+                    Some(ABSENT_SUBNET),
                 ),
             ];
-            for (index, (case, named, accepted)) in subnet_rows.iter().enumerate() {
+            for (index, (case, named, unresolved)) in subnet_rows.iter().enumerate() {
                 let name = format!("subnet-resolution-{index}");
                 let answer = elbv2(
                     &router,
@@ -130,21 +183,14 @@ fn a_placement_naming_a_resource_ec2_does_not_hold_is_refused() {
                         ("Subnets.member.2", named[1]),
                     ],
                 );
-                if *accepted {
-                    assert_eq!(
-                        answer.status, 200,
-                        "case {case:?}: expected the create to be accepted, got {answer:?}"
+                if let Some(unresolved) = unresolved {
+                    assert_relayed_refusal(
+                        case,
+                        &answer,
+                        "SubnetNotFound",
+                        &absent_subnet_sentence(unresolved),
+                        SUBNET_NOT_FOUND_CODE,
                     );
-                    // The VPC comes from the subnets EC2 resolved, so an accepted create
-                    // really did resolve them.
-                    assert_eq!(
-                        opt_element(&answer.text, "VpcId").as_deref(),
-                        Some(vpc.as_str()),
-                        "case {case:?}: expected the VPC of its subnets, got {}",
-                        answer.text
-                    );
-                } else {
-                    assert_refused(case, &answer, "SubnetNotFound", SUBNET_NOT_FOUND_MESSAGE);
                     // A refused create stores nothing: the name is still free.
                     let read = elbv2(
                         &router,
@@ -156,6 +202,19 @@ fn a_placement_naming_a_resource_ec2_does_not_hold_is_refused() {
                         (read.status, read.code()),
                         (400, "LoadBalancerNotFound".to_string()),
                         "case {case:?}: a refused create must store nothing, got {read:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        answer.status, 200,
+                        "case {case:?}: expected the create to be accepted, got {answer:?}"
+                    );
+                    // The VPC comes from the subnets EC2 resolved, so an accepted create
+                    // really did resolve them.
+                    assert_eq!(
+                        opt_element(&answer.text, "VpcId").as_deref(),
+                        Some(vpc.as_str()),
+                        "case {case:?}: expected the VPC of its subnets, got {}",
+                        answer.text
                     );
                 }
             }
@@ -180,11 +239,12 @@ fn a_placement_naming_a_resource_ec2_does_not_hold_is_refused() {
                     ("Subnets.member.2", ABSENT_SUBNET),
                 ],
             );
-            assert_refused(
+            assert_relayed_refusal(
                 "replacing a placement with an id EC2 holds no subnet for",
                 &reconfigured,
                 "SubnetNotFound",
-                SUBNET_NOT_FOUND_MESSAGE,
+                &absent_subnet_sentence(ABSENT_SUBNET),
+                SUBNET_NOT_FOUND_CODE,
             );
             // And the load balancer is still in the subnets it was created in.
             let after = elbv2(
@@ -203,24 +263,34 @@ fn a_placement_naming_a_resource_ec2_does_not_hold_is_refused() {
             // -----------------------------------------------------------------
             // An Elastic IP a mapping pins must be one EC2 allocated.
             // -----------------------------------------------------------------
-            // (case, the allocation id the mapping pins, the EC2 code the refusal carries
-            // when it is not one EC2 holds)
-            let allocation_rows: Vec<(&str, &str, Option<&str>)> = vec![
-                ("an allocation EC2 holds", allocation.as_str(), None),
-                (
-                    "an id EC2 holds no allocation for",
-                    ABSENT_ALLOCATION,
-                    Some(ALLOCATION_NOT_FOUND_MESSAGE),
-                ),
-                (
-                    "a value that is not an allocation id",
-                    "not-an-eip",
+            let allocation_rows: Vec<AllocationRow> = vec![
+                AllocationRow {
+                    case: "an allocation EC2 holds",
+                    pinned: allocation.clone(),
+                    refused: None,
+                },
+                AllocationRow {
+                    case: "an id EC2 holds no allocation for",
+                    pinned: ABSENT_ALLOCATION.to_string(),
+                    refused: Some(InnerRefusal {
+                        sentence: format!("The allocation ID '{ABSENT_ALLOCATION}' does not exist"),
+                        code: ALLOCATION_NOT_FOUND_CODE,
+                    }),
+                },
+                AllocationRow {
+                    case: "a value that is not an allocation id",
+                    pinned: "not-an-eip".to_string(),
                     // EC2 tells a value that is no allocation id apart from one that names
-                    // no allocation, and the refusal reports the code it answered.
-                    Some("InvalidAllocationID.Malformed"),
-                ),
+                    // no allocation, and the refusal relays the sentence and the code it
+                    // answered.
+                    refused: Some(InnerRefusal {
+                        sentence: "Invalid id: \"not-an-eip\"".to_string(),
+                        code: ALLOCATION_MALFORMED_CODE,
+                    }),
+                },
             ];
-            for (index, (case, pinned, refusal)) in allocation_rows.iter().enumerate() {
+            for (index, row) in allocation_rows.iter().enumerate() {
+                let case = row.case;
                 let name = format!("eip-resolution-{index}");
                 let answer = elbv2(
                     &router,
@@ -231,11 +301,17 @@ fn a_placement_naming_a_resource_ec2_does_not_hold_is_refused() {
                         ("Type", "network"),
                         ("Scheme", "internet-facing"),
                         ("SubnetMappings.member.1.SubnetId", subnets[0].as_str()),
-                        ("SubnetMappings.member.1.AllocationId", pinned),
+                        ("SubnetMappings.member.1.AllocationId", row.pinned.as_str()),
                     ],
                 );
-                if let Some(message) = refusal {
-                    assert_refused(case, &answer, "AllocationIdNotFound", message);
+                if let Some(refused) = &row.refused {
+                    assert_relayed_refusal(
+                        case,
+                        &answer,
+                        "AllocationIdNotFound",
+                        &refused.sentence,
+                        refused.code,
+                    );
                     let read = elbv2(
                         &router,
                         &runtime,
@@ -261,7 +337,7 @@ fn a_placement_naming_a_resource_ec2_does_not_hold_is_refused() {
                     );
                     assert_eq!(
                         opt_element(&read.text, "AllocationId").as_deref(),
-                        Some(*pinned),
+                        Some(row.pinned.as_str()),
                         "case {case:?}: expected the pinned allocation to be reported, got {}",
                         read.text
                     );

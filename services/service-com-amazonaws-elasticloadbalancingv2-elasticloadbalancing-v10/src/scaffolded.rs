@@ -197,6 +197,15 @@ static VALIDATION_ERROR_MESSAGE: Schema = Schema::new_member(
 )
 .with_xml_name("Message");
 
+/// The wire error code Elastic Load Balancing answers a request it cannot accept with.
+///
+/// ONE code for every layer that refuses an input: the handlers, through
+/// [`Scaffolded::validation_error`] below, and the framework's own pre-dispatch refusal,
+/// which `crate::service`'s `override_refusal` states under this same code — an absent
+/// required parameter and a value outside a modelled bound are the same class of failure
+/// to a caller, and the code is what a client branches on.
+pub const VALIDATION_ERROR: &str = "ValidationError";
+
 /// Schema for the synthetic `ValidationError` error shape.
 ///
 /// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the
@@ -342,7 +351,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
-            Self::ValidationError(_) => "ValidationError",
+            Self::ValidationError(_) => VALIDATION_ERROR,
         }
     }
 

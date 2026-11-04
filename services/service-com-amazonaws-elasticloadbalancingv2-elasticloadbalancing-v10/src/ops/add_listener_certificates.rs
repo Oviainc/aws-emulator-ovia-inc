@@ -9,6 +9,11 @@
 //! Adding a certificate already in the list changes nothing: the list is a set of
 //! certificates, so a repeat of the same call is the same list.
 //!
+//! One call carries at most the certificate ARNs the model lets it name
+//! (`Certificates`: "You can specify one certificate per call"), and that count is
+//! judged before anything else: a call carrying more is refused on the count whatever
+//! listener it names.
+//!
 //! An ARN this store holds no listener for is the modelled `ListenerNotFoundException`,
 //! and a list past this store's own bound on it is `TooManyCertificatesException`. A
 //! `CertificateArn` that names no certificate resolves to none of the account's, which is
@@ -164,11 +169,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         // The REQUEST is read, bounded and deduplicated before the store is reached: one
-        // call cannot name more certificates than a listener's list holds, the
+        // call cannot name more certificates than the model lets it carry, the
         // membership test is a set rather than a scan, and the shared state guard is
         // taken only once there is a bounded set of certificates to add.
-        if input.certificates.len() > crate::state::CERTIFICATES_PER_LISTENER {
-            return Err(too_many_certificates());
+        //
+        // The COUNT is judged first — before the listener is resolved and before the
+        // protocol bracket below — because how many certificate ARNs one call may carry
+        // is a rule of the REQUEST and does not depend on which listener it names.
+        if input.certificates.len() > crate::state::CERTIFICATES_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::certificate_count_message(
+                    crate::state::CERTIFICATES_PER_CALL,
+                    input.certificates.len(),
+                ),
+            ));
         }
         let mut requested: Vec<String> = Vec::with_capacity(input.certificates.len());
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -273,8 +287,7 @@ fn certificate_not_found(arn: &str) -> AddListenerCertificatesError {
 }
 
 /// The modelled refusal for a call that would take a listener's certificate list past
-/// the bound this store holds it to — whether the request alone names more certificates
-/// than the list can hold, or the ones it adds would.
+/// the bound this store holds it to.
 fn too_many_certificates() -> AddListenerCertificatesError {
     AddListenerCertificatesErrorModeled::TooManyCertificatesException(
         TooManyCertificatesException {
