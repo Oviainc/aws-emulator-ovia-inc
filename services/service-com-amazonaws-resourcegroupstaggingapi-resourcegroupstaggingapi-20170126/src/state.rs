@@ -604,6 +604,15 @@ pub fn decode_pagination_token(token: &str, scope: &[&str]) -> Result<String, To
 /// empty a page: an item costing more than the whole budget is served alone
 /// rather than stalling pagination, because the service "does not split a
 /// resource and its associated tags across pages".
+///
+/// A walk ends on an EMPTY page, never on a full one: a page that reached
+/// `max_items` carries a resume token even when it consumed the last item, so
+/// the client makes one more call and gets an empty page with no token. Only a
+/// page holding fewer than `max_items` items ends the walk at once, because that
+/// is the only page the server can tell is short of matches rather than short of
+/// room. A page the cost budget cut short is therefore tokened only while items
+/// really remain: it is under-full by count, and the budget never trims a page
+/// that had nothing left to trim.
 pub fn page<T>(
     items: Vec<(String, T)>,
     after: Option<&str>,
@@ -632,9 +641,14 @@ pub fn page<T>(
         taken += 1;
     }
 
+    // A page is resumable when it was filled to its item cap — whether or not
+    // more matches are known to remain — or when it was cut short with matches
+    // still unreached. Either way the cursor is the last key the page served, so
+    // `rest` is never empty when a token is minted.
+    let filled = taken == max_items;
     let truncated = rest.len() > taken;
     rest.truncate(taken);
-    let next = truncated
+    let next = (filled || truncated)
         .then(|| {
             rest.last()
                 .map(|(key, _)| encode_pagination_token(scope, key))

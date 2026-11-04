@@ -36,3 +36,6 @@ mod sfn_tagged_resource_index;
 
 #[path = "all/arn_parameter_refusal_wording.rs"]
 mod arn_parameter_refusal_wording;
+
+#[path = "all/pagination_termination.rs"]
+mod pagination_termination;

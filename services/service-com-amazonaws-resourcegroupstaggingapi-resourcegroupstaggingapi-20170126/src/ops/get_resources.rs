@@ -413,8 +413,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         Ok(GetResourcesOutput {
-            // Present but empty when the page is the last one: the token "indicates
-            // that there is more data available than this response contains".
+            // Present but empty only on a page that did not fill its item cap:
+            // the token "indicates that there is more data available than this
+            // response contains", and a page filled to the cap carries one even
+            // when it took the last match — the walk ends on the empty page that
+            // token serves, not on a full one.
             pagination_token: Some(next.unwrap_or_default()),
             resource_tag_mapping_list: Some(
                 entries.iter().map(|entry| entry.mapping()).collect(),

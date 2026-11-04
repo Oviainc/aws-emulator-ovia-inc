@@ -619,7 +619,10 @@ async fn resources_per_page_walks_every_resource_exactly_once() {
             seen, expected,
             "case ResourcesPerPage={per_page}: expected every ARN once, got {seen:?}"
         );
-        let expected_pages = arns.len().div_ceil(per_page);
+        // A full page is never the last one: the walk ends on the empty page the
+        // full page's token serves, so an evenly dividing size costs one extra
+        // call and an under-full page ends the walk where it is.
+        let expected_pages = arns.len() / per_page + 1;
         assert_eq!(
             pages, expected_pages,
             "case ResourcesPerPage={per_page}: expected {expected_pages} pages, got {pages}"
