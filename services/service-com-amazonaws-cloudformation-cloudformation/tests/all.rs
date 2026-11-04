@@ -95,6 +95,8 @@ mod ecs_elbv2_stack_outputs;
 mod error_envelope;
 #[path = "all/estimate_template_cost.rs"]
 mod estimate_template_cost;
+#[path = "all/extension_registrations.rs"]
+mod extension_registrations;
 #[path = "all/extension_registry.rs"]
 mod extension_registry;
 #[path = "all/failed_create_rollback.rs"]

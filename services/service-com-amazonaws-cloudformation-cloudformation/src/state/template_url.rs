@@ -35,8 +35,8 @@
 //!
 //! A member whose own model admits the direct `s3://<bucket>/<key>` form beside those two
 //! ([`addressed_object`]) reads its object through the SAME addressing, so no operation
-//! spells an Amazon S3 address of its own; [`read`] is likewise the one read of a
-//! caller-addressed object, bounded by what that object is for.
+//! spells an Amazon S3 address of its own; [`read_bytes`] is likewise the one read of a
+//! caller-addressed object ([`read`] is its text form), bounded by what that object is for.
 //!
 //! ## What the read refuses
 //!
@@ -137,6 +137,25 @@ pub async fn read(
     max_bytes: usize,
     too_long: &str,
 ) -> Result<String, String> {
+    let body = read_bytes(ctx, region, object, max_bytes, too_long).await?;
+    // What the reference addressed is TEXT; an object that is not valid UTF-8 carries none, so
+    // it is not what this reference addressed.
+    String::from_utf8(body).map_err(|_| unreadable_object(object, UNIDENTIFIED_FAILURE))
+}
+
+/// The BYTES of one Amazon S3 object, read the same way [`read`] reads its text, for a member
+/// whose object is not text at all: the ZIP archive an extension's schema handler package is.
+///
+/// Bounded by the same ceiling, and refused with the same wording, as every other read of a
+/// caller-addressed object: the object is the caller's, so the caller's own purpose for it
+/// says what it may weigh.
+pub async fn read_bytes(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    object: &Object,
+    max_bytes: usize,
+    too_long: &str,
+) -> Result<Vec<u8>, String> {
     use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
     let read = super::provisioner::s3_client(ctx, region)
@@ -168,9 +187,7 @@ pub async fn read(
     if body.len() > max_bytes {
         return Err(too_long.to_string());
     }
-    // What the reference addressed is TEXT; an object that is not valid UTF-8 carries none, so
-    // it is not what this reference addressed.
-    String::from_utf8(body.to_vec()).map_err(|_| unreadable_object(object, UNIDENTIFIED_FAILURE))
+    Ok(body.to_vec())
 }
 
 /// The bucket, key and object version a `TemplateURL` addresses.

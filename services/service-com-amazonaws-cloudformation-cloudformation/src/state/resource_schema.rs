@@ -106,14 +106,7 @@ fn document(type_name: &str, published: &[&str]) -> Value {
 /// says.
 pub fn schema_handler_permissions(schema: Option<&str>) -> Vec<String> {
     let mut permissions: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
-    let handlers = schema
-        .and_then(|schema| ::serde_json::from_str::<Value>(schema).ok())
-        .as_ref()
-        .and_then(|document| document.get("handlers"))
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    for handler in handlers.values() {
+    for handler in handlers_object(schema).values() {
         let declared = handler
             .get("permissions")
             .and_then(Value::as_array)
@@ -127,6 +120,97 @@ pub fn schema_handler_permissions(schema: Option<&str>) -> Vec<String> {
     }
     permissions.into_iter().collect()
 }
+
+/// The `handlers` member of a provider definition schema: one entry per handler the extension
+/// declares (`create`, `read`, `update`, `delete`, `list`), each with what that handler
+/// declares about itself. The ONE reading of that member, since both what the handlers REQUIRE
+/// ([`schema_handler_permissions`]) and WHICH of them exist
+/// ([`declared_provisioning_type`]) are read out of it.
+///
+/// Empty for a schema that declares no handler and for text that is no such document at all.
+fn handlers_object(schema: Option<&str>) -> Map<String, Value> {
+    schema
+        .and_then(|schema| ::serde_json::from_str::<Value>(schema).ok())
+        .as_ref()
+        .and_then(|document| document.get("handlers"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The extension a provider definition schema DECLARES, under the `typeName` member the
+/// meta-schema [`PROVIDER_DEFINITION_META_SCHEMA`] fixes — the member every schema this
+/// registry holds carries ([`document`] writes it, and [`super::registry::type_tests_outcome`]
+/// requires it of a version being tested).
+///
+/// `None` for text that is not such a document at all, which declares no extension.
+pub fn declared_type_name(schema: &str) -> Option<String> {
+    ::serde_json::from_str::<Value>(schema)
+        .ok()?
+        .get("typeName")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The `description` a provider definition schema carries — prose about the extension the
+/// document defines, which is what `DescribeType` reports as the version's `Description`.
+///
+/// `None` where the document carries none, since the registry holds no description of its own
+/// for a version beside the one its schema states.
+pub fn declared_description(schema: &str) -> Option<String> {
+    ::serde_json::from_str::<Value>(schema)
+        .ok()?
+        .get("description")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The handlers a provider definition schema declares, by name (`create`, `read`, `update`,
+/// `delete`, `list`): the keys of the same `handlers` member
+/// [`schema_handler_permissions`] reads the permissions out of.
+fn declared_handlers(schema: Option<&str>) -> ::std::collections::BTreeSet<String> {
+    handlers_object(schema).keys().cloned().collect()
+}
+
+/// The provisioning behaviour a REGISTRATION determines for the resource type it registers:
+/// "CloudFormation determines the provisioning type during registration, based on the types
+/// of handlers in the schema handler package submitted"
+/// (`smithy_query(query="doc", shape="DescribeTypeOutput", member="ProvisioningType")`).
+///
+/// That member states the rule handler by handler, and this is it: a type that does not
+/// declare all of `create`, `read` and `delete` "can't actually be provisioned"
+/// (`NON_PROVISIONABLE`); one that declares those and an `update` handler "includes an update
+/// handler to process updates to the type during stack update operations"
+/// (`FULLY_MUTABLE`); one that declares them without an `update` handler "can't be updated
+/// and must instead be replaced during stack update operations" (`IMMUTABLE`).
+///
+/// A package carrying no schema for the extension declares no handler, so it is
+/// `NON_PROVISIONABLE` — what a registration can say about a type whose handlers are nowhere
+/// to be read.
+pub fn declared_provisioning_type(schema: Option<&str>) -> &'static str {
+    use super::registry::provisioning_type;
+
+    let handlers = declared_handlers(schema);
+    if !PROVISIONING_HANDLERS
+        .iter()
+        .all(|required| handlers.contains(*required))
+    {
+        return provisioning_type::NON_PROVISIONABLE;
+    }
+    if handlers.contains(UPDATE_HANDLER) {
+        provisioning_type::FULLY_MUTABLE
+    } else {
+        provisioning_type::IMMUTABLE
+    }
+}
+
+/// The handlers a resource type must declare to be provisionable at all: without all of them
+/// the type "doesn't include all the following handlers, and therefore can't actually be
+/// provisioned: create, read, delete".
+const PROVISIONING_HANDLERS: &[&str] = &["create", "read", "delete"];
+
+/// The handler whose presence separates `FULLY_MUTABLE` from `IMMUTABLE`.
+const UPDATE_HANDLER: &str = "update";
 
 /// Define one published property under `into`.
 ///

@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTypeRegistration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTypeRegistration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Monitoring ONE extension registration request: the status it holds, and the extension and
+//! version it registered.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTypeRegistration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What the operation does
+//!
+//! "When you initiate a registration request using RegisterType, you can then use
+//! DescribeTypeRegistration to monitor the progress of that registration request" — so this
+//! is a pure REPORT, served from the request record `RegisterType` wrote
+//! ([`crate::state::registry::StoredTypeRegistration`]) and addressed by the registration
+//! token that call answered with. A token this account and Region holds no request under
+//! names nothing to monitor, which is the registry's own modelled `CFNRegistryException`
+//! (400).
+//!
+//! A registration is asynchronous, so the status reported is the one the clock has ALREADY
+//! made due (the `settle` walk every operation makes first installs it) — never a conclusion
+//! moved because the request was read. `TypeArn` and `TypeVersionArn` follow the status the
+//! way the model states: "for registration requests with a ProgressStatus of other than
+//! COMPLETE, this will be null".
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +93,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::registry::registration_status;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,18 +163,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTypeRegistration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTypeRegistrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTypeRegistration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there are no registration requests to read,
+            // so this answers 501 rather than a truthful-looking "no such request".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeTypeRegistration",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // The settle walk every operation makes first. A registration is asynchronous, so
+        // this is what installs the conclusion the clock had ALREADY made due — the read
+        // reports a status that was owed at this instant whether or not anybody called,
+        // rather than moving a status because it was read.
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(registration) = store.type_registration(&region, &input.registration_token)
+        else {
+            return Err(registry_exception(no_such_registration(
+                &input.registration_token,
+            )));
+        };
+        // "For registration requests with a ProgressStatus of other than COMPLETE, this will
+        // be null": the extension and the version a request registered are reported once the
+        // registration has concluded, and not while it is still running.
+        let complete = registration.status == registration_status::COMPLETE;
+
+        Ok(DescribeTypeRegistrationOutput {
+            progress_status: Some(registration.status.clone()),
+            // "The description of the extension registration request": what the registry
+            // holds about a request beside its status is why it could not register the
+            // version, so a request that FAILED is described by that reason and one that is
+            // still running or completed carries no description to report.
+            description: (registration.status == registration_status::FAILED)
+                .then(|| registration.failure_reason.clone())
+                .flatten(),
+            type_arn: complete.then(|| registration.type_arn.clone()),
+            type_version_arn: complete.then(|| registration.type_version_arn()).flatten(),
+        })
     }
+}
+
+/// The registry's own modelled refusal: HTTP 400 `CFNRegistryException`, "an error occurred
+/// during a CloudFormation registry operation".
+fn registry_exception(message: String) -> DescribeTypeRegistrationError {
+    DescribeTypeRegistrationErrorModeled::CFNRegistryException(CFNRegistryException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The message answered a token this account and Region holds no registration request under —
+/// one nothing issued, or one whose request the registry no longer keeps.
+///
+/// The token the request named is the message's only variable part, bracketed as the other
+/// "this id resolves to nothing" messages of this service are
+/// ([`crate::state::drift_detection_does_not_exist`]).
+fn no_such_registration(registration_token: &str) -> String {
+    format!("Extension registration request [{registration_token}] does not exist")
 }

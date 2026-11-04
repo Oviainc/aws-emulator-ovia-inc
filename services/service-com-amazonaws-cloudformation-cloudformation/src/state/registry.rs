@@ -33,15 +33,15 @@
 //! [`StoredExtension::deactivate`]), `TestType` (`TypeTestsStatus`) and `PublishType` (which
 //! publishes one version of a private record as the PUBLIC extension record
 //! [`published_record`] is).
-//! `RegisterType` is the one writer above still a scaffold stub with an issue of its own;
-//! every other one is implemented, so the records `src/` adds to this registry are an
-//! activation's and a publication's public one. A publication adds at most one RECORD per
-//! private record it publishes, and
+//! Every one of those writers is implemented, so the records `src/` adds to this registry
+//! are a registration's private one, an activation's and a publication's public one. A
+//! publication adds at most one RECORD per private record it publishes, and
 //! the versions it then adds to that record are bounded at [`MAX_PUBLISHED_VERSIONS`],
-//! oldest reclaimed first — the registry's one caller-counted growth site (the writer that
-//! adds a REGISTRATION is where RegisterType's documented "maximum of 50 resource extension
-//! versions registered at a time" belongs). The record shape below is what those writers
-//! fill in and what every registry READ is served from.
+//! oldest reclaimed first; a registration adds at most one version per call, bounded at
+//! [`MAX_REGISTERED_VERSIONS`] — RegisterType's documented "maximum of 50 resource extension
+//! versions registered at a time", which is also what it refuses a registration past. The
+//! record shape below is what those writers fill in and what every registry READ is served
+//! from.
 //!
 //! ## The status transitions the clock owes here
 //!
@@ -215,6 +215,20 @@ pub const MAX_TYPE_CONFIGURATIONS: usize = 50;
 /// while keeping the registry's size bounded.
 pub const MAX_EXTENSIONS: usize = 200;
 
+/// Add one record to the registry, keeping it bounded at [`MAX_EXTENSIONS`] with the oldest
+/// records reclaimed first.
+///
+/// The ONE bounded push every registry writer that adds a RECORD makes — a registration
+/// (`RegisterType`), an activation (`ActivateType`) and a publication — since each adds a
+/// record under a name its caller chose, so none of them spells the bound itself.
+pub fn record_extension(extensions: &mut Vec<StoredExtension>, record: StoredExtension) {
+    let over_the_bound = (extensions.len() + 1).saturating_sub(MAX_EXTENSIONS);
+    if over_the_bound > 0 {
+        extensions.drain(..over_the_bound);
+    }
+    extensions.push(record);
+}
+
 /// One account-level CONFIGURATION of an extension: the configuration data
 /// `SetTypeConfiguration` persisted, the alias it was set under, the ARN that write
 /// answered, and when it was written.
@@ -272,11 +286,33 @@ pub struct StoredTypeRegistration {
     pub type_kind: String,
     /// `TypeName`, "the name of the extension being registered".
     pub type_name: String,
+    /// The `TypeVersionId` of the version this request registers, which is what makes the
+    /// request's own ARN of "this specific version of the extension being registered"
+    /// ([`Self::type_version_arn`]) readable from the record. `None` for a request that
+    /// concludes `FAILED`: a registration that cannot register a version does not reserve
+    /// one.
+    pub version_id: Option<String>,
+    /// `ClientRequestToken`, the idempotency key the registration was submitted under, where
+    /// it carried one: "specifying a client request token prevents CloudFormation from
+    /// generating more than one version of an extension from the same registration request,
+    /// even if the request is submitted multiple times", so a resubmission under a token this
+    /// Region already holds a request for IS that request.
+    pub client_request_token: Option<String>,
     /// The ARN of the extension being registered ([`type_arn`]): what a request narrowing a
     /// listing by `TypeArn` resolves against.
     pub type_arn: String,
     /// [`registration_status`], "the current status of the extension registration request".
     pub status: String,
+    /// The status this request CONCLUDES in once the clock has made the conclusion due:
+    /// `COMPLETE` for a registration that registered its version, `FAILED` for one that
+    /// could not. The conclusion is computed by the call that STARTS the request — it follows
+    /// from the handler package that call read — and [`Self::settle`] only installs it, so no
+    /// read invents a conclusion and nothing sleeps for one.
+    pub conclusion: String,
+    /// Why the registration could not register a version, for a request whose conclusion is
+    /// `FAILED`: `DescribeTypeRegistration`'s `Description`, "the description of the
+    /// extension registration request".
+    pub failure_reason: Option<String>,
     /// The instant this request's conclusion becomes due, while it is still running: a
     /// registration is asynchronous — `RegisterType` is answered with a token to monitor it
     /// by — so the request holds `IN_PROGRESS` until the clock has made the conclusion due
@@ -286,9 +322,47 @@ pub struct StoredTypeRegistration {
 }
 
 impl StoredTypeRegistration {
-    /// A registration request that has just started: `IN_PROGRESS`, concluding at
-    /// `concluded_at`.
-    pub fn started(
+    /// A registration request that has just started and REGISTERS the version `version_id`
+    /// when the clock makes its conclusion due: `IN_PROGRESS` until `concluded_at`, then
+    /// `COMPLETE`.
+    pub fn registering(
+        region: impl Into<String>,
+        type_kind: impl Into<String>,
+        type_name: impl Into<String>,
+        version_id: impl Into<String>,
+        registration_token: impl Into<String>,
+        concluded_at: SystemTime,
+    ) -> Self {
+        Self {
+            version_id: Some(version_id.into()),
+            conclusion: registration_status::COMPLETE.to_string(),
+            ..Self::started(region, type_kind, type_name, registration_token, concluded_at)
+        }
+    }
+
+    /// A registration request that has just started and FAILS when the clock makes its
+    /// conclusion due, for `reason`: registering an extension "includes validating the
+    /// extension schema", so a request whose handler package the registration can read no
+    /// schema of the extension out of registers no version at all — the request is still a
+    /// record, and the reason is what a read of it reports.
+    pub fn failing(
+        region: impl Into<String>,
+        type_kind: impl Into<String>,
+        type_name: impl Into<String>,
+        registration_token: impl Into<String>,
+        reason: impl Into<String>,
+        concluded_at: SystemTime,
+    ) -> Self {
+        Self {
+            conclusion: registration_status::FAILED.to_string(),
+            failure_reason: Some(reason.into()),
+            ..Self::started(region, type_kind, type_name, registration_token, concluded_at)
+        }
+    }
+
+    /// The record both constructors above fill in: a request still running, concluding at
+    /// `concluded_at` in whichever status its conclusion is.
+    fn started(
         region: impl Into<String>,
         type_kind: impl Into<String>,
         type_name: impl Into<String>,
@@ -303,19 +377,31 @@ impl StoredTypeRegistration {
             region,
             type_kind,
             type_name,
+            version_id: None,
+            client_request_token: None,
             registration_token: registration_token.into(),
             status: registration_status::IN_PROGRESS.to_string(),
+            conclusion: registration_status::COMPLETE.to_string(),
+            failure_reason: None,
             concluded_at,
         }
     }
 
+    /// The ARN of "this specific version of the extension being registered", which is the
+    /// version id this request registers under the extension's own ARN
+    /// ([`type_version_arn`]); `None` for a request that registers no version.
+    pub fn type_version_arn(&self) -> Option<String> {
+        self.version_id
+            .as_deref()
+            .map(|version_id| type_version_arn(&self.type_arn, version_id))
+    }
+
     /// Materialise the conclusion the clock has already made due: a request still running
-    /// past [`Self::concluded_at`] has finished registering its version, which is
-    /// `COMPLETE`. A request that already concluded is left exactly as it is — a conclusion
-    /// is a request's last status.
+    /// past [`Self::concluded_at`] has reached [`Self::conclusion`]. A request that already
+    /// concluded is left exactly as it is — a conclusion is a request's last status.
     pub fn settle(&mut self, now: SystemTime) {
         if self.status == registration_status::IN_PROGRESS && now >= self.concluded_at {
-            self.status = registration_status::COMPLETE.to_string();
+            self.status = self.conclusion.clone();
         }
     }
 
@@ -484,6 +570,67 @@ const TYPE_NAME_MAX_LEN: usize = 204;
 const TYPE_NAME_SEGMENT_MIN_LEN: usize = 2;
 const TYPE_NAME_SEGMENT_MAX_LEN: usize = 64;
 
+/// The organization namespaces an extension name a caller registers may NOT open with: "the
+/// following organization namespaces are reserved and can't be used in your extension names:
+/// Alexa AMZN Amazon AWS Custom Dev"
+/// (`smithy_query(query="doc", shape="RegisterTypeInput", member="TypeName")`), which is why
+/// no registration of this account can own a name the registry's own published records carry.
+pub const RESERVED_NAMESPACES: &[&str] = &["Alexa", "AMZN", "Amazon", "AWS", "Custom", "Dev"];
+
+/// The reserved namespace `type_name` belongs to, where it belongs to one.
+///
+/// An extension name's FIRST `::`-separated segment is its organization namespace ("for
+/// resource types, `company_or_organization::service::type`"), so only that whole segment is
+/// reserved: a name whose namespace merely starts with one of them is another organization's.
+/// Compared without regard to case, since the namespace a name claims does not depend on how
+/// it is spelled.
+pub fn reserved_namespace(type_name: &str) -> Option<&'static str> {
+    let namespace = type_name.split("::").next().unwrap_or_default();
+    RESERVED_NAMESPACES
+        .iter()
+        .copied()
+        .find(|reserved| reserved.eq_ignore_ascii_case(namespace))
+}
+
+/// The message a registration in one of those namespaces is refused with: the name the
+/// request spelled, and the namespace it claimed, which is the only other variable part.
+pub fn restricted_namespace(type_name: &str, reserved: &str) -> String {
+    format!(
+        "Type name {type_name} is using a restricted namespace {}",
+        reserved.to_ascii_lowercase()
+    )
+}
+
+/// How many extension versions this account and Region may have REGISTERED at one time:
+/// "you can have a maximum of 50 resource extension versions registered at a time. This
+/// maximum is per account and per Region" (`RegisterType`), which is both the quota a
+/// registration past it is refused by and the bound on how many versions one record keeps.
+pub const MAX_REGISTERED_VERSIONS: usize = 50;
+
+/// How long one registration request takes to conclude.
+///
+/// Chosen (CloudFormation publishes no duration for a registration): registering an
+/// extension validates its schema and readies its handlers, which is why the call is
+/// answered with a token to monitor instead of with the registered version, so the span is
+/// longer than the status transitions of this service's own records
+/// ([`crate::state::STATUS_TRANSITION_DELAY`]) — long enough that a caller that starts a
+/// registration and then reads or lists its request still sees it running, and short enough
+/// that nothing waits long for the conclusion. The instant is stored and nothing sleeps for
+/// it.
+pub const REGISTRATION_SPAN: Duration = Duration::from_secs(3);
+
+/// Mint the token one registration request is addressed by: "the identifier for this
+/// registration request. Use this registration token when calling DescribeTypeRegistration"
+/// (`RegisterTypeOutput$RegistrationToken`).
+///
+/// The same minted identifier every other one this service hands out is built from
+/// ([`crate::state::new_identifier_digits`] behind it), in the 8-4-4-4-12 form — 36
+/// characters of hexadecimal and `-`, inside the modelled `RegistrationToken` length (1..128)
+/// and pattern (`^[a-zA-Z0-9][-a-zA-Z0-9]*$`).
+pub fn new_registration_token() -> String {
+    super::new_identifier("type-registration")
+}
+
 /// The message the registry refuses a request naming an extension by a name that is no
 /// extension type name at all with — including the name an ARN carries, which CloudFormation
 /// reads out of it itself. Entirely fixed text: no part of it comes from the request or from
@@ -506,12 +653,21 @@ pub const PUBLIC_VERSION_NUMBER_IN_ARN: &str = "You cannot specify public versio
 /// adds a version to the record, so the one growth site a caller counts up has a bound.
 pub const MAX_PUBLISHED_VERSIONS: usize = 50;
 
-/// The `TypeVersionId` the next version published onto a public extension record carries:
-/// one past the highest id the record already holds, in the zero-padded form the registry's
-/// version ids take (`@pattern("^[A-Za-z0-9-]+$")`).
+/// The `TypeVersionId` the next version of a record carries: one past the highest id the
+/// record already holds, in the zero-padded form the registry's version ids take
+/// (`@pattern("^[A-Za-z0-9-]+$")`).
+///
+/// The registry's ONE version-id minting rule, for a record of either visibility: a
+/// publication adds a version to a public record and a registration adds one to a private
+/// record, and both ids are read back the same way ("the version ID is the value at the end
+/// of the ARN assigned to the extension version when it is registered"), so there is one
+/// rule rather than one per record kind. (The name says `public` because publication was the
+/// first writer to need it; `next_version_id` would read better, and renaming it means
+/// touching `src/state.rs`, which the file-length rule puts out of reach.)
 ///
 /// Counted from the ids rather than from the number of versions, so the id of a version the
-/// [`MAX_PUBLISHED_VERSIONS`] bound reclaimed is never handed to a second version.
+/// record's own bound reclaimed ([`MAX_PUBLISHED_VERSIONS`],
+/// [`MAX_REGISTERED_VERSIONS`]) is never handed to a second version.
 pub fn next_public_version_id(versions: &[StoredTypeVersion]) -> String {
     let highest = versions
         .iter()
@@ -1069,6 +1225,31 @@ impl StoredExtension {
             None => self
                 .default_version()
                 .is_some_and(|version| version.version_id == version_id),
+        }
+    }
+
+    /// Record one freshly registered version on this record, keeping the versions it holds
+    /// bounded at [`MAX_REGISTERED_VERSIONS`].
+    ///
+    /// The oldest version is reclaimed past that bound — except the record's DEFAULT version,
+    /// which is the one a request naming no version resolves to
+    /// ([`Self::default_version`]), so reclaiming it would leave the record readable by
+    /// version id and unreadable without one. A record every version of which is the default
+    /// cannot happen (there is one), so the walk always has a version to reclaim while it is
+    /// past the bound.
+    pub fn record_version(&mut self, version: StoredTypeVersion) {
+        self.versions.push(version);
+        while self.versions.len() > MAX_REGISTERED_VERSIONS {
+            let oldest_reclaimable = self
+                .versions
+                .iter()
+                .position(|held| !self.is_default_version(&held.version_id));
+            match oldest_reclaimable {
+                Some(at) => {
+                    self.versions.remove(at);
+                }
+                None => break,
+            }
         }
     }
 }

@@ -309,18 +309,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 record.latest_public_version = version.public_version_number.clone();
                 record.versions.push(version);
                 // An activation names the extension by a CALLER-CHOSEN local name (its
-                // `TypeNameAlias`), so this is the one site at which a caller adds registry
-                // records: the oldest is reclaimed past the registry's ceiling, exactly as
-                // the versions of one record are, so the store cannot grow without limit.
-                let over_the_bound =
-                    (store.extensions.len() + 1).saturating_sub(registry::MAX_EXTENSIONS);
-                if over_the_bound > 0 {
-                    store.extensions.drain(..over_the_bound);
-                }
-                store.extensions.push(record);
-                store
-                    .extension_by_arn_mut(&region, &arn)
-                    .expect("the record pushed just above")
+                // `TypeNameAlias`), so this is one of the sites at which a caller adds
+                // registry records: the bounded push the registry owns
+                // ([`registry::record_extension`]) reclaims the oldest past its ceiling,
+                // exactly as the versions of one record are, so the store cannot grow
+                // without limit.
+                registry::record_extension(&mut store.extensions, record);
+                let Some(pushed) = store.extension_by_arn_mut(&region, &arn) else {
+                    // Unreachable: the record was pushed just above, under this lock, and
+                    // the bounded push reclaims only records older than it. Answered as the
+                    // registry's modelled 400 rather than with a panic, which would leave
+                    // the shared store poisoned for every other caller — the same shape the
+                    // sibling registry writer answers an unreachable re-lookup with.
+                    return Err(registry_exception(ACTIVATION_NOT_RECORDED.to_string()));
+                };
+                pushed
             }
         };
         // "Whether to automatically update the extension in this account and Region when a
@@ -464,6 +467,11 @@ impl PublicExtension {
 /// account's behalf, so there has to be a role for it to invoke them under. Entirely fixed
 /// text: no part of it comes from the request or from the store.
 const NO_EXECUTION_ROLE: &str = "Please provide execution role to activate the Resource type";
+
+/// The refusal for an activation whose record could not be reached for the activation to be
+/// written onto it, which is an activation this emulator did not perform.
+const ACTIVATION_NOT_RECORDED: &str =
+    "The extension could not be activated in this account and Region.";
 
 /// The registry's own modelled refusal: HTTP 400 `CFNRegistryException`, "an error occurred
 /// during a CloudFormation registry operation".

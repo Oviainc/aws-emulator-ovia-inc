@@ -67,6 +67,10 @@ service-common = { path = "../common" }
 # trust policy lets cloudformation.amazonaws.com assume it before the stack is written.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
+# Reads the ZIP archive an extension's schema handler package arrives as, so the schema
+# `RegisterType` registers is the one the package carries (`ops::register_type`).
+zip = { version = "9", default-features = false, features = ["deflate"] }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 

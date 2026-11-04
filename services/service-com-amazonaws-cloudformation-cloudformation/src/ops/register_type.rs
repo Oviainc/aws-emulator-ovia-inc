@@ -1,15 +1,46 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Registering a private extension in this account and Region: the version the registration
+//! adds to the registry, and the token the request is monitored by.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What the operation does
+//!
+//! "Registering an extension makes it available for use in CloudFormation templates in your
+//! Amazon Web Services account, and includes: validating the extension schema; determining
+//! which handlers, if any, have been specified for the extension; making the extension
+//! available for use in your account" — so the call WRITES one version onto this Region's
+//! registry record for the extension it names (creating that record, `PRIVATE`, when the
+//! Region holds none: "CloudFormation marks any extensions you register as PRIVATE"), and
+//! the first version registered is the record's default version until
+//! `SetTypeDefaultVersion` moves it.
+//!
+//! What the version carries is read out of the SCHEMA HANDLER PACKAGE the request addresses
+//! in Amazon S3 ([`handler_package`]), which is the only place the extension's own schema
+//! exists: the package is a ZIP archive, the schema is the provider definition document in
+//! it that declares the extension being registered, and the provisioning behaviour is the
+//! one that document's handlers give the type
+//! ([`crate::state::resource_schema::declared_provisioning_type`]). Validating that package
+//! is part of REGISTERING rather than of accepting the registration, so an object Amazon S3
+//! will not hand over, one that is not a ZIP archive, and an archive carrying no schema of
+//! this extension each leave the registration with nothing to register: the request is
+//! accepted, and it concludes `FAILED` with the reason instead of registering a version.
+//! Text that addresses no Amazon S3 object at all names no package, which is a rule about the
+//! REQUEST and is refused with the registry's own modelled `CFNRegistryException` (400).
+//!
+//! Registration is ASYNCHRONOUS: the request is answered with a registration token, and the
+//! request itself is a record of its own ([`crate::state::registry::StoredTypeRegistration`])
+//! holding `IN_PROGRESS` until the clock makes its conclusion due — which is what
+//! `DescribeTypeRegistration` and `ListTypeRegistrations` report. The operation is
+//! `@idempotent`: "specifying a client request token prevents CloudFormation from generating
+//! more than one version of an extension from the same registration request, even if the
+//! request is submitted multiple times", so a resubmission under a token this Region already
+//! holds a request for is answered with THAT request's token and adds no second version.
+//!
+//! Two rules of the registry refuse a registration before any of that: the organization
+//! namespaces AWS reserves ([`crate::state::registry::reserved_namespace`]) cannot be
+//! registered in, and an account may have "a maximum of 50 resource extension versions
+//! registered at a time" ([`crate::state::registry::MAX_REGISTERED_VERSIONS`]).
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +146,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::registry;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -184,18 +216,357 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterType"))
+        // "The kind of extension": the kinds the model admits are `RESOURCE`, `MODULE` and
+        // `HOOK`, and a request that names none registers the resource type its quota — "a
+        // maximum of 50 resource extension versions" — is stated in terms of.
+        let type_kind = input
+            .r#type
+            .clone()
+            .unwrap_or_else(|| registry::registry_type::RESOURCE.to_string());
+        // The namespaces AWS reserves, refused on the request alone and before anything is
+        // read or written: a name in one of them is not a name this account may register.
+        if let Some(reserved) = registry::reserved_namespace(&input.type_name) {
+            return Err(registry_exception(registry::restricted_namespace(
+                &input.type_name,
+                reserved,
+            )));
+        }
+        let region = crate::state::request_region(ctx.parts());
+        // The member must address an Amazon S3 object at all — a request-shape rule, so it is
+        // refused on the request like the namespace above.
+        let object = crate::state::template_url::addressed_object(&input.schema_handler_package)
+            .ok_or_else(|| registry_exception(NOT_A_READABLE_PACKAGE.to_string()))?;
+        // The package is read BEFORE the store is reached: it is the one awaited call of this
+        // handler. Whatever that read finds decides whether the registration can register a
+        // version — it does not refuse the REQUEST, because validating the package is part of
+        // registering rather than of accepting the registration.
+        let schema = handler_package(ctx, &region, &input.type_name, &object).await;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no registry to register an extension
+            // in, so this answers 501 rather than a token nothing recorded.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("RegisterType"));
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The settle walk every operation makes first, so this call reads and writes a
+        // registry in which every transition the clock had already made due is installed.
+        store.settle(now);
+
+        // "Specifying a client request token prevents CloudFormation from generating more
+        // than one version of an extension from the same registration request, even if the
+        // request is submitted multiple times": a resubmission of a registration this Region
+        // already holds IS that registration, answered with its own token.
+        if let Some(client_request_token) = input.client_request_token.as_deref() {
+            let held = store
+                .type_registrations_in(&region)
+                .find(|registration| {
+                    registration.client_request_token.as_deref() == Some(client_request_token)
+                        && registration.is_of_extension_named(&type_kind, &input.type_name)
+                })
+                .map(|registration| registration.registration_token.clone());
+            if let Some(registration_token) = held {
+                return Ok(RegisterTypeOutput {
+                    registration_token: Some(registration_token),
+                });
+            }
+        }
+
+        // "You can have a maximum of 50 resource extension versions registered at a time.
+        // This maximum is per account and per Region. Use DeregisterType to deregister
+        // specific extension versions if necessary": a deregistered version is out of active
+        // use, so it is the LIVE versions of this Region's registrations that the quota
+        // counts. AWS states the ceiling for resource extension versions and publishes none
+        // for a module's or a Hook's, so this emulator holds every registered version of the
+        // Region to that one ceiling rather than leaving the other kinds unbounded.
+        let registered: usize = store
+            .extensions_in(&region)
+            .filter(|extension| extension.is_private())
+            .map(|extension| extension.live_versions().count())
+            .sum();
+        if registered >= registry::MAX_REGISTERED_VERSIONS {
+            return Err(registry_exception(version_quota_exhausted()));
+        }
+
+        // The REQUEST's own record, which is what the registration token addresses:
+        // `IN_PROGRESS` until the clock makes its conclusion due, nothing sleeping for it.
+        // Registering "includes validating the extension schema", so a package the
+        // registration cannot read a schema of this extension out of registers NO version:
+        // the request is still a record, and it concludes `FAILED` with the reason a read of
+        // it reports.
+        let registration_token = registry::new_registration_token();
+        let concluded_at = now + registry::REGISTRATION_SPAN;
+        let schema = match schema {
+            Ok(schema) => schema,
+            Err(reason) => {
+                let mut registration = registry::StoredTypeRegistration::failing(
+                    &region,
+                    &type_kind,
+                    &input.type_name,
+                    &registration_token,
+                    reason,
+                    concluded_at,
+                );
+                registration.client_request_token = input.client_request_token.clone();
+                store.record_type_registration(registration);
+                return Ok(RegisterTypeOutput {
+                    registration_token: Some(registration_token),
+                });
+            }
+        };
+
+        // The record this registration adds a version to: the one this account registered
+        // under that kind and name, else a fresh `PRIVATE` record for it. A name a
+        // publication has also written a PUBLIC record for carries its own account-less ARN,
+        // so the registration's own ARN resolves the private record either way.
+        let arn = registry::type_arn(&region, &type_kind, &input.type_name);
+        if store.extension_by_arn(&region, &arn).is_none() {
+            // A registration names the extension itself, so this is one of the sites at
+            // which a caller adds registry records: the bounded push the registry owns
+            // ([`registry::record_extension`]) reclaims the oldest past its ceiling, exactly
+            // as the versions of one record are, so the store cannot grow without limit.
+            registry::record_extension(
+                &mut store.extensions,
+                registry::StoredExtension::new(&region, &type_kind, &input.type_name),
+            );
+        }
+        let Some(record) = store.extension_by_arn_mut(&region, &arn) else {
+            // Unreachable: the record was resolved or pushed just above, under this lock.
+            // Answered as the registry's modelled 400 rather than with a panic, which would
+            // leave the shared store poisoned for every other caller.
+            return Err(registry_exception(VERSION_NOT_RECORDED.to_string()));
+        };
+
+        let version_id = registry::next_public_version_id(&record.versions);
+        let mut version = registry::StoredTypeVersion::new(&record.arn, &version_id, now);
+        version.description = crate::state::resource_schema::declared_description(&schema);
+        // "For resource type extensions, the provisioning behavior of the resource type":
+        // only a resource type has one, so a module's and a Hook's version carries none.
+        version.provisioning_type = (type_kind == registry::registry_type::RESOURCE).then(|| {
+            crate::state::resource_schema::declared_provisioning_type(Some(&schema)).to_string()
+        });
+        version.schema = Some(schema);
+        // "The ARN of the IAM role for CloudFormation to assume when invoking the extension",
+        // and the logging configuration the registration was given, both recorded on the
+        // version it registered — where `DescribeType` reports them.
+        version.execution_role_arn = input.execution_role_arn.clone();
+        version.logging_config = input
+            .logging_config
+            .as_ref()
+            .map(|logging| registry::StoredLoggingConfig {
+                log_role_arn: logging.log_role_arn.clone(),
+                log_group_name: logging.log_group_name.clone(),
+            });
+        // Bounded by the same quota the refusal above states: a record keeps no more versions
+        // than an account may have registered, the oldest reclaimed first, so the deregistered
+        // versions of one record cannot grow without limit either.
+        record.record_version(version);
+        // The FIRST version registered is the one a request naming no version resolves to;
+        // a later registration leaves the default where it is, since moving it is what
+        // `SetTypeDefaultVersion` is for.
+        if record.default_version_id.is_none() {
+            record.set_default_version(&version_id);
+        }
+
+        // The request's own record, with the version it registered on it.
+        let mut registration = registry::StoredTypeRegistration::registering(
+            &region,
+            &type_kind,
+            &input.type_name,
+            &version_id,
+            &registration_token,
+            concluded_at,
+        );
+        registration.client_request_token = input.client_request_token.clone();
+        store.record_type_registration(registration);
+
+        Ok(RegisterTypeOutput {
+            registration_token: Some(registration_token),
+        })
     }
+}
+
+/// The schema the handler package addressed by `object` carries for the extension
+/// `type_name`, or `Err(reason)` — the reason the REGISTRATION fails — for a package no schema
+/// of that extension can be read out of.
+///
+/// "A URL to the S3 bucket that contains the extension project package that contains the
+/// necessary files for the extension you want to register": the object is read through the
+/// in-process callback into this same emulator's Amazon S3, exactly as a `TemplateURL` is
+/// ([`crate::state::template_url`]), so the package a client staged with its own `PutObject`
+/// is the one the registration reads. NOTHING here opens a socket or leaves the host.
+///
+/// Every failure here is the registration's rather than the request's: an object Amazon S3
+/// will not hand over, an object that is not a ZIP archive, and an archive carrying no
+/// provider definition schema of the extension being registered all leave the registration
+/// with nothing to register, which is what "validating the extension schema" concludes.
+async fn handler_package(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    type_name: &str,
+    object: &crate::state::template_url::Object,
+) -> Result<String, String> {
+    let archive = crate::state::template_url::read_bytes(
+        ctx,
+        region,
+        object,
+        MAX_PACKAGE_BYTES,
+        PACKAGE_TOO_LONG,
+    )
+    .await?;
+    schema_in(&archive, type_name).await
+}
+
+/// The provider definition schema an extension's handler package carries for `type_name`, or
+/// `Err(reason)` for an archive none can be read out of.
+///
+/// Reading the archive FORMAT is the `zip` crate's job, not this emulator's: an object that is
+/// not a ZIP archive is not an extension project package, which is what the package being a
+/// `.zip` means. What this function owns is the BOUNDS, because the archive is caller
+/// content: no more entries than it reads ([`MAX_PACKAGE_ENTRIES`]), no more bytes out of one
+/// entry than a schema document may weigh ([`MAX_SCHEMA_BYTES`]) and no more decompressed in
+/// TOTAL than [`MAX_PACKAGE_READ_BYTES`] — the PRODUCT of the two, since a small archive can
+/// carry many entries that each expand — so a compressed stream can neither expand into this
+/// process nor keep it busy. The total is charged for whatever an entry PRODUCED, including
+/// an entry whose stream failed part way through, since those bytes were decompressed too,
+/// and the walk stops the moment it is spent.
+///
+/// Decompressing and parsing is CPU work on the worker serving the request, so the walk
+/// yields once per entry: a timeout, a cancellation or a health check has somewhere to land
+/// while a caller-sized archive is being read.
+///
+/// The schema is the archive's JSON document that DECLARES the extension being registered
+/// (`typeName`, the member the provider definition meta-schema fixes), so which file in the
+/// package holds it is the package's business rather than a name this emulator fixes.
+async fn schema_in(archive: &[u8], type_name: &str) -> Result<String, String> {
+    let mut archive = ::zip::ZipArchive::new(::std::io::Cursor::new(archive))
+        .map_err(|why| not_a_zip_package(&why.to_string()))?;
+    let mut budget = MAX_PACKAGE_READ_BYTES;
+    for index in 0..archive.len().min(MAX_PACKAGE_ENTRIES) {
+        ::tokio::task::yield_now().await;
+        let Ok(mut entry) = archive.by_index(index) else {
+            continue;
+        };
+        // An entry whose name is not valid UTF-8 names no file this reading can be about, and
+        // a directory entry carries no document at all.
+        let Ok(name) = entry.name().map(|name| name.to_string()) else {
+            continue;
+        };
+        if name.ends_with('/') || !name.ends_with(JSON_SUFFIX) {
+            continue;
+        }
+        // The bound is applied to what is DECOMPRESSED, one byte past the allowance at most:
+        // `take` is what stops a stream that claims to be small and is not. The allowance is
+        // what one document may weigh or what is left of the whole read, whichever is
+        // smaller.
+        let allowance = MAX_SCHEMA_BYTES.min(budget);
+        let mut document: Vec<u8> = Vec::new();
+        let read = ::std::io::Read::read_to_end(
+            &mut ::std::io::Read::take(&mut entry, allowance as u64 + 1),
+            &mut document,
+        );
+        // Charged on EVERY path, before anything else is decided: a stream that failed part
+        // way through still decompressed what it emitted, so entries that each break mid-way
+        // cannot decompress more in total than this read is allowed.
+        budget = budget.saturating_sub(document.len());
+        if budget == 0 {
+            // Spent: an archive carrying more document data than the schema is read from is
+            // not one this registration can validate a schema out of, and nothing further is
+            // decompressed looking for it.
+            return Err(PACKAGE_DOCUMENTS_TOO_LONG.to_string());
+        }
+        if read.is_err() || document.len() > allowance {
+            continue;
+        }
+        let Ok(document) = String::from_utf8(document) else {
+            continue;
+        };
+        if crate::state::resource_schema::declared_type_name(&document).as_deref()
+            == Some(type_name)
+        {
+            return Ok(document);
+        }
+    }
+    Err(no_schema_for(type_name))
+}
+
+/// The suffix the JSON documents of a handler package carry, which is where its schema is.
+const JSON_SUFFIX: &str = ".json";
+
+/// How many bytes of a schema handler package this registration reads.
+///
+/// Chosen (CloudFormation publishes no ceiling on a package's size): the package is a
+/// caller-staged object, so the read of it is bounded like every other read of one, and this
+/// is well past the schema document and handler code a package carries.
+const MAX_PACKAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// How many entries of the package the registration looks through for that schema, how many
+/// bytes it reads out of one of them, and how many it decompresses across all of them.
+/// Chosen for the same reason, and because what is being looked for is ONE JSON document.
+const MAX_PACKAGE_ENTRIES: usize = 4_096;
+const MAX_SCHEMA_BYTES: usize = 1024 * 1024;
+const MAX_PACKAGE_READ_BYTES: usize = 8 * 1024 * 1024;
+
+/// The refusal for a `SchemaHandlerPackage` whose text addresses no Amazon S3 object at all,
+/// so no package was even named. Entirely fixed text: no part of it comes from the request or
+/// from the store.
+const NOT_A_READABLE_PACKAGE: &str =
+    "SchemaHandlerPackage must reference a valid S3 object to which you have access.";
+
+/// The reason a registration whose package is past [`MAX_PACKAGE_BYTES`] fails: this
+/// registration will not read an object that large at all.
+const PACKAGE_TOO_LONG: &str = "SchemaHandlerPackage exceeds the maximum package size.";
+
+/// The reason a registration fails when the package's own documents decompress to more than
+/// [`MAX_PACKAGE_READ_BYTES`], so the schema could not be looked for across all of them.
+const PACKAGE_DOCUMENTS_TOO_LONG: &str =
+    "The schema handler package contains more document data than the extension schema is read \
+     from.";
+
+/// The reason a registration whose object is not a ZIP archive fails, so it is not an
+/// extension project package: the reason the archive could not be read is quoted, since that
+/// is what is wrong with the caller's own object.
+fn not_a_zip_package(why: &str) -> String {
+    format!("The schema handler package artifact is not a valid ZIP file: {why}")
+}
+
+/// The refusal for a registration past the account's version quota, worded from the sentence
+/// `RegisterType` states that quota in: "You can have a maximum of 50 resource extension
+/// versions registered at a time. This maximum is per account and per Region. Use
+/// DeregisterType to deregister specific extension versions if necessary."
+///
+/// The limit is the one the registry holds itself to
+/// ([`registry::MAX_REGISTERED_VERSIONS`]), read from that constant rather than spelled in
+/// the text, so the message states the limit actually enforced.
+fn version_quota_exhausted() -> String {
+    format!(
+        "You can have a maximum of {} extension versions registered at a time. This maximum \
+         is per account and per Region. Use DeregisterType to deregister specific extension \
+         versions.",
+        registry::MAX_REGISTERED_VERSIONS
+    )
+}
+
+/// The refusal for a registry record that could not be reached for the version to be written
+/// onto it, which is a registration this emulator did not perform.
+const VERSION_NOT_RECORDED: &str =
+    "The extension version could not be registered in this account and Region.";
+
+/// The reason a registration whose package carries no schema for the extension CONCLUDES as
+/// failed: registering "includes validating the extension schema", and there is no schema of
+/// this extension in the package to validate.
+fn no_schema_for(type_name: &str) -> String {
+    format!(
+        "The schema handler package contains no schema defining {type_name}, so the extension \
+         schema could not be validated"
+    )
+}
+
+/// The registry's own modelled refusal: HTTP 400 `CFNRegistryException`, "an error occurred
+/// during a CloudFormation registry operation".
+fn registry_exception(message: String) -> RegisterTypeError {
+    RegisterTypeErrorModeled::CFNRegistryException(CFNRegistryException {
+        message: Some(message),
+    })
+    .into()
 }

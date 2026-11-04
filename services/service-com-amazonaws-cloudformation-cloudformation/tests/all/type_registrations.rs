@@ -21,10 +21,12 @@
 //! (`RESOURCE`, `MODULE`, `HOOK`), the Region a request is signed for, extensions with
 //! several requests and extensions with none, the page size asked for, and the clock.
 //!
-//! `RegisterType`, the registry writer that STARTS a registration, is a scaffold stub with an
-//! issue of its own, so the requests below are seeded straight into the store through
-//! `state::record_type_registration` — the same device `handler_progress_reports.rs` and
-//! `type_deregistration.rs` use for records whose writer is not available. Every READ goes
+//! `RegisterType`, the registry writer that STARTS a registration, writes ONE request per
+//! call, and one case below seeds a bound's worth of them, so the requests here are seeded
+//! straight into the store through `state::record_type_registration` — the same device
+//! `handler_progress_reports.rs` and `type_deregistration.rs` use for records a case needs
+//! more of than it could drive over the wire. (`extension_registrations.rs` is the suite that
+//! drives `RegisterType` itself.) Every READ goes
 //! through the real request path (form-encoded body in, XML envelope out), so what is
 //! asserted is what a client sees.
 
@@ -86,6 +88,11 @@ fn already_due() -> SystemTime {
     SystemTime::now() - Duration::from_secs(1)
 }
 
+/// The `TypeVersionId` a seeded request registered: the registry's version ids are
+/// zero-padded and the first version of a record carries this one. No case here is about
+/// WHICH version a request registered, so every seeded request names that first version.
+const FIRST_VERSION: &str = "00000001";
+
 /// One registration request of `region` for `type_name`, holding `status`.
 fn registration(
     region: &str,
@@ -95,8 +102,14 @@ fn registration(
     status: &str,
     concluded_at: SystemTime,
 ) -> StoredTypeRegistration {
-    let mut request =
-        StoredTypeRegistration::started(region, type_kind, type_name, token, concluded_at);
+    let mut request = StoredTypeRegistration::registering(
+        region,
+        type_kind,
+        type_name,
+        FIRST_VERSION,
+        token,
+        concluded_at,
+    );
     request.status = status.to_string();
     request
 }
@@ -483,10 +496,11 @@ async fn a_request_is_reported_under_the_status_the_clock_has_made_due() {
     ] {
         store(&engine)
             .lock()
-            .record_type_registration(StoredTypeRegistration::started(
+            .record_type_registration(StoredTypeRegistration::registering(
                 REGION,
                 registry_type::RESOURCE,
                 RESOURCE_TYPE_NAME,
+                FIRST_VERSION,
                 token,
                 concluded_at,
             ));
@@ -561,10 +575,11 @@ async fn the_listing_is_paged_by_the_maximum_the_request_asks_for() {
     for index in 0..seeded {
         store(&engine)
             .lock()
-            .record_type_registration(StoredTypeRegistration::started(
+            .record_type_registration(StoredTypeRegistration::registering(
                 REGION,
                 registry_type::RESOURCE,
                 RESOURCE_TYPE_NAME,
+                FIRST_VERSION,
                 format!("registration-{index:04}"),
                 still_running(),
             ));
@@ -642,10 +657,11 @@ async fn the_store_keeps_a_bounded_number_of_registration_requests() {
     for index in 0..seeded {
         store(&engine)
             .lock()
-            .record_type_registration(StoredTypeRegistration::started(
+            .record_type_registration(StoredTypeRegistration::registering(
                 REGION,
                 registry_type::RESOURCE,
                 RESOURCE_TYPE_NAME,
+                FIRST_VERSION,
                 format!("registration-{index:05}"),
                 still_running(),
             ));

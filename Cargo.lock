@@ -7434,6 +7434,7 @@ dependencies = [
  "tracing",
  "url",
  "yaml-rust2",
+ "zip",
 ]
 
 [[package]]
