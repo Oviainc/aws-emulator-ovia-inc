@@ -1214,14 +1214,19 @@ pub fn access_point_not_found_message(access_point_id: &str) -> String {
     does_not_exist(ACCESS_POINT_NOUN, access_point_id)
 }
 
-/// `ReplicationNotFound`'s message — "Returned if the specified file system does not
-/// have a replication configuration": the file system the request named, rendered by
-/// [`quoted`] as every other message of this service renders a requested id.
-pub fn replication_not_found_message(file_system_id: &str) -> String {
-    format!(
-        "{FILE_SYSTEM_NOUN} {} does not have a replication configuration.",
-        quoted(file_system_id)
-    )
+/// `ReplicationNotFound`'s message on the replication READ
+/// (`DescribeReplicationConfigurations`) — the refusal reports that the request's filter
+/// matched no replication configuration, so the sentence is FIXED text: it interpolates
+/// nothing from the request or from state (no file-system id, no member name), and is
+/// terminated with a period.
+pub const NO_REPLICATIONS_FOUND_MESSAGE: &str = "No replications found.";
+
+/// `ReplicationNotFound`'s message on `DeleteReplicationConfiguration` — the refusal
+/// names the file system whose configuration could not be found, so the sentence is
+/// "Cannot find a replication configuration for file system " plus the `FileSystemId`
+/// the REQUEST named (bare, not [`quoted`]), terminated with a period.
+pub fn replication_configuration_not_found_message(file_system_id: &str) -> String {
+    format!("Cannot find a replication configuration for file system {file_system_id}.")
 }
 
 /// `FileSystemAlreadyExists`' message — "Returned if the file system you are trying to

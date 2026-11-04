@@ -35,6 +35,8 @@ mod mutation_results;
 mod provisioned_throughput_required;
 #[path = "all/replication_configuration.rs"]
 mod replication_configuration;
+#[path = "all/replication_refusals.rs"]
+mod replication_refusals;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

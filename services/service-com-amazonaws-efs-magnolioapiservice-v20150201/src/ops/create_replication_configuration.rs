@@ -107,6 +107,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// This operation's not-found refusals carry the SENTENCE ALONE, with the error shape
+// named in `x-amzn-errortype` and no `ErrorCode` member in the body. These explicit
+// imports shadow the glob above, so the two variants below take that body instead of
+// the generated shape; the rule lives on `crate::service::wire::MessageOnly`.
+use crate::service::wire::{FileSystemNotFound, ReplicationNotFound};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -511,10 +517,9 @@ fn conflict(message: impl Into<String>) -> CreateReplicationConfigurationError {
 /// requester's Amazon Web Services account", with the one sentence every entry point
 /// that resolves a `FileSystemId` renders.
 fn file_system_not_found(file_system_id: &str) -> CreateReplicationConfigurationError {
-    CreateReplicationConfigurationErrorModeled::FileSystemNotFound(FileSystemNotFound {
-        error_code: "FileSystemNotFound".to_string(),
-        message: Some(crate::state::file_system_not_found_message(file_system_id)),
-    })
+    CreateReplicationConfigurationErrorModeled::FileSystemNotFound(FileSystemNotFound::new(
+        crate::state::file_system_not_found_message(file_system_id),
+    ))
     .into()
 }
 

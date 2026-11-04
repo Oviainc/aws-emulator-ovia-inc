@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! How this service's `restJson1` ERROR document carries a modelled error's `Message`
-//! member.
+//! How this service's `restJson1` ERROR document carries a modelled error's members.
 //!
 //! RULE: every error document Amazon EFS answers with CARRIES the error shape's
 //! `Message` member — when no rule produces a sentence for that error class the member
 //! is written with JSON `null` rather than left out — so a client can tell "this class
 //! carries no sentence" from "the sentence is the empty string".
+//!
+//! RULE: the operations that WRITE a replication configuration answer a not-found
+//! refusal with a document holding the SENTENCE ALONE, naming the error shape in the
+//! `x-amzn-errortype` header instead of in an `ErrorCode` member. [`MessageOnly`] is
+//! that body, and its own documentation states the rule; the handlers reach it through
+//! the [`FileSystemNotFound`] / [`ReplicationNotFound`] aliases.
 //!
 //! Every error shape in this service's model is a structure with a required `ErrorCode`
 //! and an OPTIONAL `Message` (target `ErrorMessage`, a plain string with no HTTP
@@ -36,6 +41,8 @@
 //! routing, request deserialization, success bodies (where an absent optional member
 //! stays absent, as in every AWS JSON response), and an error whose `Message` IS
 //! supplied — is the framework's own restJson1 protocol, delegated to unchanged.
+
+use std::marker::PhantomData;
 
 use aws_smithy_runtime_api::http::{Request, Response};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeDeserializer, ShapeSerializer};
@@ -72,13 +79,115 @@ fn message_member(error_schema: &Schema) -> Option<&Schema> {
     })
 }
 
+/// A modelled error shape whose refusal body this service answers with as the SENTENCE
+/// ALONE — see [`MessageOnly`], which renders it.
+pub trait MessageOnlyShape {
+    /// The shape's own schema, as this crate's generated types declare it. The member
+    /// written is that schema's message member, so the key on the wire stays the
+    /// model's.
+    const SCHEMA: &'static Schema;
+    /// The shape name the error document's `__type` and the `x-amzn-errortype` header
+    /// carry: with no `ErrorCode` member in the body, this is where a client of these
+    /// operations reads the error class.
+    const SHAPE_NAME: &'static str;
+}
+
+/// `FileSystemNotFound`, as the replication-write path renders it.
+#[derive(Debug)]
+pub struct FileSystemNotFoundShape;
+
+impl MessageOnlyShape for FileSystemNotFoundShape {
+    const SCHEMA: &'static Schema = &crate::ops::types::SCHEMA_FILE_SYSTEM_NOT_FOUND;
+    const SHAPE_NAME: &'static str = "FileSystemNotFound";
+}
+
+/// `ReplicationNotFound`, as the replication-write path renders it.
+#[derive(Debug)]
+pub struct ReplicationNotFoundShape;
+
+impl MessageOnlyShape for ReplicationNotFoundShape {
+    const SCHEMA: &'static Schema = &crate::ops::types::SCHEMA_REPLICATION_NOT_FOUND;
+    const SHAPE_NAME: &'static str = "ReplicationNotFound";
+}
+
+/// The body of a refusal that carries the SENTENCE ALONE: the message member of `S` and
+/// nothing else of the shape, in particular no `ErrorCode`.
+///
+/// RULE: on the operations that WRITE a replication configuration
+/// (`CreateReplicationConfiguration`, `DeleteReplicationConfiguration`) Amazon EFS
+/// answers a not-found refusal with a document holding only the message, and names the
+/// error shape in the `x-amzn-errortype` header (and the `__type` discriminator) rather
+/// than in an `ErrorCode` member — unlike the replication READ, whose document carries
+/// `ErrorCode` as well. The status, the shape name and the sentence are unchanged by
+/// this type; only the member is left out.
+///
+/// It is used as the PAYLOAD of those operations' `FileSystemNotFound` /
+/// `ReplicationNotFound` error variants (as [`FileSystemNotFound`] and
+/// [`ReplicationNotFound`]): `#[operation_error]` names a variant's payload type after
+/// the variant, so an operation chooses this rendering by importing the alias, which
+/// shadows the generated shape of the same name.
+pub struct MessageOnly<S: MessageOnlyShape> {
+    message: String,
+    shape: PhantomData<S>,
+}
+
+/// Written by hand rather than derived: a derive would bound the marker `S` on `Debug`,
+/// and the marker carries no data to print. The shape name comes from `S` instead.
+impl<S: MessageOnlyShape> std::fmt::Debug for MessageOnly<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(S::SHAPE_NAME)
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
+impl<S: MessageOnlyShape> MessageOnly<S> {
+    /// The refusal body carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            shape: PhantomData,
+        }
+    }
+
+    /// The wire error code, which the generated `OperationError::shape_name` reads off
+    /// the variant's payload type.
+    pub fn shape_name() -> &'static str {
+        S::SHAPE_NAME
+    }
+}
+
+impl<S: MessageOnlyShape> std::fmt::Display for MessageOnly<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", S::SHAPE_NAME, self.message)
+    }
+}
+
+impl<S: MessageOnlyShape> std::error::Error for MessageOnly<S> {}
+
+impl<S: MessageOnlyShape> SerializableStruct for MessageOnly<S> {
+    fn serialize_members(&self, serializer: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        // The shape's own message member, so `@jsonName` and the model's casing are
+        // honoured; a shape that declares none has no sentence to write.
+        match message_member(S::SCHEMA) {
+            Some(message) => serializer.write_string(message, self.message.as_str()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// `FileSystemNotFound` with a body carrying the sentence alone; see [`MessageOnly`].
+pub type FileSystemNotFound = MessageOnly<FileSystemNotFoundShape>;
+
+/// `ReplicationNotFound` with a body carrying the sentence alone; see [`MessageOnly`].
+pub type ReplicationNotFound = MessageOnly<ReplicationNotFoundShape>;
+
 /// An error structure serialized with its own members, plus its message member as JSON
 /// `null` when it supplied none.
 struct MessageAlwaysPresent<'a> {
     inner: &'a dyn SerializableStruct,
     message: &'a Schema,
 }
-
 impl SerializableStruct for MessageAlwaysPresent<'_> {
     fn serialize_members(&self, serializer: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
         // The borrow of `serializer` ends with the tracker, so the null below is

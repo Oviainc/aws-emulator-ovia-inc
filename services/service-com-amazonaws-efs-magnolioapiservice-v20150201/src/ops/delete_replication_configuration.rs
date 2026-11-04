@@ -65,6 +65,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// This operation's not-found refusals carry the SENTENCE ALONE, with the error shape
+// named in `x-amzn-errortype` and no `ErrorCode` member in the body. These explicit
+// imports shadow the glob above, so the two variants below take that body instead of
+// the generated shape; the rule lives on `crate::service::wire::MessageOnly`.
+use crate::service::wire::{FileSystemNotFound, ReplicationNotFound};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -200,20 +206,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// requester's Amazon Web Services account", with the one sentence every entry point
 /// that resolves a `FileSystemId` renders.
 fn file_system_not_found(file_system_id: &str) -> DeleteReplicationConfigurationError {
-    DeleteReplicationConfigurationErrorModeled::FileSystemNotFound(FileSystemNotFound {
-        error_code: "FileSystemNotFound".to_string(),
-        message: Some(crate::state::file_system_not_found_message(file_system_id)),
-    })
+    DeleteReplicationConfigurationErrorModeled::FileSystemNotFound(FileSystemNotFound::new(
+        crate::state::file_system_not_found_message(file_system_id),
+    ))
     .into()
 }
 
 /// A 404 `ReplicationNotFound`: "the specified file system does not have a replication
-/// configuration".
+/// configuration" — this delete's refusal names the source file system whose
+/// configuration it could not find, through
+/// [`crate::state::replication_configuration_not_found_message`].
 fn replication_not_found(file_system_id: &str) -> DeleteReplicationConfigurationError {
-    DeleteReplicationConfigurationErrorModeled::ReplicationNotFound(ReplicationNotFound {
-        error_code: Some("ReplicationNotFound".to_string()),
-        message: Some(crate::state::replication_not_found_message(file_system_id)),
-    })
+    DeleteReplicationConfigurationErrorModeled::ReplicationNotFound(ReplicationNotFound::new(
+        crate::state::replication_configuration_not_found_message(file_system_id),
+    ))
     .into()
 }
 

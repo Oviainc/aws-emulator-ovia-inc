@@ -251,7 +251,7 @@ async fn replication_configuration_lifecycle_round_trips_through_state() {
     );
     assert_eq!(
         gone.string("Message"),
-        format!("File system '{source_id}' does not have a replication configuration."),
+        state::NO_REPLICATIONS_FOUND_MESSAGE,
         "DescribeReplicationConfigurations after the delete: unexpected Message construction, \
          got {:?}",
         gone.get("Message")
@@ -268,6 +268,12 @@ async fn replication_configuration_lifecycle_round_trips_through_state() {
         deleted_twice.status, 404,
         "DeleteReplicationConfiguration twice: expected 404, got {} {:?}",
         deleted_twice.status, deleted_twice.body
+    );
+    assert_eq!(
+        deleted_twice.string("Message"),
+        state::replication_configuration_not_found_message(&source_id),
+        "DeleteReplicationConfiguration twice: unexpected Message construction, got {:?}",
+        deleted_twice.get("Message")
     );
 }
 
@@ -969,8 +975,8 @@ async fn describe_replication_configurations_pages_consistently_from_its_next_to
         stray.error_type
     );
 
-    // A file system that holds no configuration is a 404, and an unknown one names the
-    // file system rather than the configuration.
+    // A file system that holds no configuration is a 404, and so is an id that names no
+    // file system at all: this read reports replications, not file systems.
     let without = efs.available_file_system("no-replication").await;
     let missing = efs
         .describe_replication_configurations(&format!("FileSystemId={without}"))
@@ -991,7 +997,7 @@ async fn describe_replication_configurations_pages_consistently_from_its_next_to
         .await;
     assert_eq!(
         unknown.error_type.as_deref(),
-        Some("FileSystemNotFound"),
+        Some("ReplicationNotFound"),
         "an unknown file system: unexpected error type, got {:?}",
         unknown.error_type
     );

@@ -158,11 +158,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the file system on either side of the configuration.
         let wanted = input.file_system_id.as_deref().map(efs::file_system_id_of);
         if let Some(id) = wanted {
-            if !state.file_systems.contains_key(id) {
-                return Err(file_system_not_found(id));
-            }
+            // This read reports replication configurations, not file systems: a filter
+            // that matches none of them is `ReplicationNotFound`, whether the id names
+            // a file system without a configuration or no file system at all. Nothing
+            // on this path raises `FileSystemNotFound`.
             if state.replication_of(id).is_none() {
-                return Err(replication_not_found(id));
+                return Err(replication_not_found());
             }
         }
 
@@ -214,24 +215,14 @@ fn bad_request(message: impl Into<String>) -> DescribeReplicationConfigurationsE
     .into()
 }
 
-/// A 404 `FileSystemNotFound`: "the specified FileSystemId value doesn't exist in the
-/// requester's Amazon Web Services account", with the one sentence every entry point
-/// that resolves a `FileSystemId` renders.
-fn file_system_not_found(file_system_id: &str) -> DescribeReplicationConfigurationsError {
-    DescribeReplicationConfigurationsErrorModeled::FileSystemNotFound(FileSystemNotFound {
-        error_code: "FileSystemNotFound".to_string(),
-        message: Some(crate::state::file_system_not_found_message(file_system_id)),
-    })
-    .into()
-}
-
 /// A 404 `ReplicationNotFound`: "the specified file system does not have a replication
-/// configuration" — the file system the request named, quoted as every message of this
-/// service renders a requested id.
-fn replication_not_found(file_system_id: &str) -> DescribeReplicationConfigurationsError {
+/// configuration" — this read's refusal reports that the request's filter matched no
+/// replication configuration, so it carries the fixed sentence
+/// [`crate::state::NO_REPLICATIONS_FOUND_MESSAGE`] and names no id.
+fn replication_not_found() -> DescribeReplicationConfigurationsError {
     DescribeReplicationConfigurationsErrorModeled::ReplicationNotFound(ReplicationNotFound {
         error_code: Some("ReplicationNotFound".to_string()),
-        message: Some(crate::state::replication_not_found_message(file_system_id)),
+        message: Some(crate::state::NO_REPLICATIONS_FOUND_MESSAGE.to_string()),
     })
     .into()
 }
