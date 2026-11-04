@@ -79,6 +79,8 @@ mod in_flight_control_drift_reporting;
 mod in_flight_teardown_drift;
 #[path = "all/inherited_enabled_baselines.rs"]
 mod inherited_enabled_baselines;
+#[path = "all/inherited_enabled_controls.rs"]
+mod inherited_enabled_controls;
 #[path = "all/landing_zone_decommission.rs"]
 mod landing_zone_decommission;
 #[path = "all/landing_zone_decommission_cascade.rs"]

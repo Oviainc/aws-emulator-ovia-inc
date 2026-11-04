@@ -859,10 +859,19 @@ pub struct EnabledControl {
     pub control_identifier: String,
     pub target_identifier: String,
     /// `EnabledControlSummary$parentIdentifier` — "the ARN of the parent enabled control
-    /// from which this control inherits its configuration, if applicable". A control
-    /// `EnableControl` applied directly to its target inherits from nothing, and this
-    /// service stores no organizational hierarchy to derive inheritance from, so it is
-    /// `None` for every control this emulator enables.
+    /// from which this control inherits its configuration, if applicable". The one fact
+    /// that makes an enablement a CHILD of another: the reporting operations read the
+    /// member off here, and [`listed_enabled_controls`] decides from these links alone
+    /// which enablements a listing's `includeChildren` widens it by.
+    ///
+    /// A control `EnableControl` applied directly to its target inherits from nothing, so
+    /// it is `None` for every control a caller enables here: a child enablement is one
+    /// Control Tower derives from the organization's membership — a deployment into a
+    /// member account or child unit of a target organizational unit — and no call this
+    /// service serves states that one target contains another, nor does any rule derive
+    /// containment from a unit's opaque identifier.
+    ///
+    /// [`listed_enabled_controls`]: ComAmazonawsControltowerAwscontroltowerapisState::listed_enabled_controls
     pub parent_identifier: Option<String>,
     /// `EnabledControlParameter`s as supplied, in order.
     pub parameters: Vec<(String, ::aws_smithy_types::Document)>,
@@ -1849,6 +1858,85 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
                     && enabled.target_identifier == target_identifier
             })
             .min_by(|a, b| a.arn.cmp(&b.arn))
+    }
+
+    /// The enabled controls one listing reports, as the set of their ARNs: the
+    /// enablements the request SCOPES the listing to, plus — only when `include_children`
+    /// is set — the ones that inherited their configuration from one of those, directly or
+    /// through a chain of inheritance.
+    ///
+    /// `ListEnabledControls` lists the controls enabled "on the specified organizational
+    /// unit and the accounts it contains", and `includeChildren` "specifies whether to
+    /// include enabled controls from child organizational units and child accounts in the
+    /// response" (model docs, default false). What makes an enablement one of those
+    /// children is the enablement it reports as its `parentIdentifier` — "the ARN of the
+    /// parent enabled control from which this control inherits its configuration" — so the
+    /// inheritance a listing widens by is the one the RECORDS state: an enablement whose
+    /// parent chain reaches the scope is a control enabled on something that scope
+    /// contains, and one whose chain does not is not. Nothing else is consulted; no target
+    /// identifier's text is read for a containment it does not carry.
+    ///
+    /// The scope is the enablements on `target` when the request names one — including an
+    /// inherited enablement whose own target that is, which is a control enabled ON the
+    /// named target rather than on a child of it — and, when it names none, the
+    /// enablements that inherit from nothing, so the default listing is the directly
+    /// applied set and the inherited ones are what the flag adds.
+    ///
+    /// Call [`settle`] first, so an enablement the clock has already torn down is not in
+    /// the answer. The widening itself is [`listed_enablements`], which this service's
+    /// other enablement listing answers the same flag through.
+    ///
+    /// [`settle`]: Self::settle
+    pub fn listed_enabled_controls(
+        &self,
+        target: Option<&str>,
+        include_children: bool,
+    ) -> BTreeSet<String> {
+        listed_enablements(
+            &self.enabled_controls,
+            |enabled| &enabled.arn,
+            |enabled| enabled.parent_identifier.as_deref(),
+            |enabled| match target {
+                Some(target) => enabled.target_identifier == target,
+                None => inherits_from_nothing(
+                    &self.enabled_controls,
+                    enabled.parent_identifier.as_deref(),
+                ),
+            },
+            include_children,
+        )
+    }
+
+    /// The enabled baselines one listing reports, as the set of their ARNs: the
+    /// enablements that inherited from nothing, plus — only when `include_children` is set
+    /// — the ones that inherited their configuration from one of those, directly or
+    /// through a chain.
+    ///
+    /// `ListEnabledBaselines`' `includeChildren` is "a value that can be set to include
+    /// the child enabled baselines in responses. The default value is false", and a child
+    /// is an enablement that inherited its configuration from another one
+    /// (`EnabledBaselineDetails$parentIdentifier`) — the same reading
+    /// [`listed_enabled_controls`] gives the control side, and answered through the same
+    /// [`listed_enablements`] walk so one change to the rule narrows both listings. This
+    /// operation's input carries no target to scope the listing to, only filter members,
+    /// and a filter NARROWS what is listed rather than deciding what the inheritance hangs
+    /// off, so the scope here is the whole store's directly applied set.
+    ///
+    /// Call [`settle`] first, so an enablement the clock has already torn down is not in
+    /// the answer.
+    ///
+    /// [`settle`]: Self::settle
+    /// [`listed_enabled_controls`]: Self::listed_enabled_controls
+    pub fn listed_enabled_baselines(&self, include_children: bool) -> BTreeSet<String> {
+        listed_enablements(
+            &self.enabled_baselines,
+            |enabled| &enabled.arn,
+            |enabled| enabled.parent_identifier.as_deref(),
+            |enabled| {
+                inherits_from_nothing(&self.enabled_baselines, enabled.parent_identifier.as_deref())
+            },
+            include_children,
+        )
     }
 
     /// The regions the deployed landing zone governs, read out of its `Manifest`
@@ -4211,6 +4299,65 @@ pub fn latest_available_version(deployed: &str, catalog: &str) -> String {
         }
         _ => deployed.to_string(),
     }
+}
+
+/// The enablements one listing of this service reports, as the set of their ARNs: the
+/// records `scoped` selects, plus — only when `include_children` is set — every record
+/// that inherited its configuration from one of those, directly or through a chain of
+/// inheritance.
+///
+/// The one place this service answers `includeChildren`, for both of the enablement
+/// listings that declare it, so a change to the rule widens both the same way. Which
+/// record is a child of which is read off `parent` alone — the `parentIdentifier` the
+/// records carry — so no containment is inferred from an identifier's text.
+///
+/// Terminates: each round either adds a record the answer did not hold or ends the walk,
+/// and `records` is capped by its store's own bound ([`MAX_ENABLED_CONTROLS`],
+/// [`MAX_ENABLED_BASELINES`]).
+fn listed_enablements<Record>(
+    records: &HashMap<String, Record>,
+    arn: impl Fn(&Record) -> &str,
+    parent: impl Fn(&Record) -> Option<&str>,
+    scoped: impl Fn(&Record) -> bool,
+    include_children: bool,
+) -> BTreeSet<String> {
+    let mut listed: BTreeSet<String> = records
+        .values()
+        .filter(|record| scoped(record))
+        .map(|record| arn(record).to_string())
+        .collect();
+
+    if !include_children {
+        return listed;
+    }
+
+    // One round per level of inheritance: the records whose parent is already in the
+    // answer join it, until a round finds none — so a chain of any depth is included and
+    // no record is added twice.
+    loop {
+        let inherited: Vec<String> = records
+            .values()
+            .filter(|record| {
+                !listed.contains(arn(record))
+                    && parent(record).is_some_and(|parent| listed.contains(parent))
+            })
+            .map(|record| arn(record).to_string())
+            .collect();
+        if inherited.is_empty() {
+            return listed;
+        }
+        listed.extend(inherited);
+    }
+}
+
+/// Whether a record carrying `parent` inherited its configuration from nothing: it names
+/// no parent, or names one `records` does not hold.
+///
+/// A record whose parent is not itself stored counts as inheriting from nothing, so a
+/// record whose parent has been torn down keeps being listed rather than dropping out of
+/// a listing scoped to the directly applied set.
+fn inherits_from_nothing<Record>(records: &HashMap<String, Record>, parent: Option<&str>) -> bool {
+    parent.is_none_or(|parent| !records.contains_key(parent))
 }
 
 /// One `filter` member of a list operation, as a handler matches it: the values the

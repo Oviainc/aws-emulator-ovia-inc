@@ -12,11 +12,13 @@
 //! to include the child enabled baselines in responses. The default value is false", and a
 //! child is an enablement that INHERITED its configuration from another one
 //! (`EnabledBaselineDetails$parentIdentifier`), so the listing holds the enablements
-//! carrying a parent only when the request sets it. The parent an entry reports is read off
-//! its stored record — the same member `GetEnabledBaseline` reports — and `parentIdentifiers`
-//! selects on that value, so a filter on it keeps the enablements inherited from the
-//! enablements it names; an absent value is selected only by an absent filter, so no parent
-//! is invented to match one.
+//! carrying a parent only when the request sets it — resolved by
+//! [`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::listed_enabled_baselines`],
+//! the walk this service's control listing answers the same flag through. The parent an
+//! entry reports is read off its stored record — the same member `GetEnabledBaseline`
+//! reports — and `parentIdentifiers` selects on that value, so a filter on it keeps the
+//! enablements inherited from the enablements it names; an absent value is selected only by
+//! an absent filter, so no parent is invented to match one.
 //!
 //! No enablement this service holds carries a parent, so the flag widens this listing by
 //! nothing today: a child of an enablement on an organizational unit is a deployment into a
@@ -252,15 +254,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // WHAT this call lists: the stored enablements, less the ones that INHERITED their
-        // configuration from another enablement unless the request asked for those
-        // (`includeChildren`). The records are BORROWED, not cloned: only the page this
-        // call returns is materialised.
+        // WHAT this call lists before any `filter` member narrows it: the enablements
+        // applied directly to their targets, plus the ones inherited from those when
+        // `includeChildren` asked for them — the same rule, and the same walk, the control
+        // listing answers that flag through.
+        let listed = store.listed_enabled_baselines(input.include_children);
+
+        // The records are BORROWED, not cloned: only the page this call returns is
+        // materialised.
         let mut enabled: Vec<&crate::state::EnabledBaseline> = store
             .enabled_baselines
             .values()
             .filter(|enabled_baseline| {
-                (input.include_children || enabled_baseline.parent_identifier.is_none())
+                listed.contains(&enabled_baseline.arn)
                     && selected(&target_identifiers, &enabled_baseline.target_identifier)
                     // A baseline is selected by the catalog entry a filter value
                     // resolves to, so an enablement is found by any of the identifiers

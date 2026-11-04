@@ -9,12 +9,25 @@
 //! [`crate::state`], so it is empty before any enablement and every field it reports is
 //! the one the enabling call persisted.
 //!
-//! `includeChildren` asks for the controls enabled on the target's child organizational
-//! units and accounts as well. This service records the target each control was enabled
-//! on and holds no organizational hierarchy — nothing here resolves a target ARN to its
-//! children, and a control `EnableControl` applies directly to its target inherits from
-//! no other enabled control (`parentIdentifier` absent) — so no stored control is a child
-//! of another and the flag widens the listing by nothing.
+//! `targetIdentifier` and `includeChildren` together decide WHICH enablements are listed,
+//! through the one rule
+//! [`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::listed_enabled_controls`]
+//! states: the enablements on the named target — or, with no target named, the ones that
+//! inherited from nothing — plus, only when `includeChildren` is set, every enablement
+//! that inherited its configuration from one of those, directly or through a chain. A
+//! child is read off the `parentIdentifier` the records carry, the same member
+//! `GetEnabledControl` reports, and `filter.parentIdentifiers` selects on that value, so a
+//! filter on it keeps the enablements inherited from the one it names; an absent value is
+//! selected only by an absent filter, so no parent is invented to match one.
+//!
+//! No enablement this service holds carries a parent, so the flag widens this listing by
+//! nothing today: a child of an enablement on an organizational unit is a deployment into
+//! a member account or a child unit of that unit, which takes the organization's
+//! membership — and no call this service serves states that one target contains another,
+//! nor does any rule derive containment from a unit's opaque identifier. The accounts a
+//! landing zone designates (`centralizedLogging.accountId`, `securityRoles.accountId`) are
+//! recorded as members of no particular unit, so attaching them to whichever unit a
+//! request names would report resources this service does not hold.
 //!
 //! Implemented: this operation no longer answers HTTP 501.
 //!
@@ -107,9 +120,9 @@ use super::types::*;
 // The filter-matching rule every list operation of this service shares, so a change to
 // it (normalising a compared identifier, say) narrows every listing the same way; see
 // `crate::state` for how a sent filter member becomes the set it matches against.
-// `parentIdentifiers` is matched with `selected_optional`, because a control
-// `EnableControl` applies directly to its target inherits from nothing and so has no
-// parent value for a filter to match.
+// `parentIdentifiers` is matched with `selected_optional`, because only an enablement
+// that inherited its configuration from another one carries a parent for a filter value
+// to match.
 use crate::state::{filter_set, resolve_control, selected, selected_optional, selected_resolved};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -209,9 +222,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every member that narrows WHAT this call lists, so a `nextToken` minted below is
         // bound to all of them: a position in this selection is a position in no other.
-        // `includeChildren` is one of the parameters a resuming call must repeat even
-        // though it widens nothing here (see the module header: this service stores no
-        // hierarchy for it to reach into).
+        // `includeChildren` is one of them, because it decides whether the enablements that
+        // inherited their configuration from the ones in scope are listed at all.
         let listing_key = crate::state::ListingKey::new()
             .value("targetIdentifier", input.target_identifier.as_deref())
             .flag("includeChildren", input.include_children)
@@ -245,6 +257,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // WHAT this call lists before any `filter` member narrows it: the enablements the
+        // request scoped it to, plus the ones inherited from those when `includeChildren`
+        // asked for them. Resolved in one place for both members, because which
+        // enablements a target contains and which the flag adds are one question.
+        let listed = store.listed_enabled_controls(
+            input.target_identifier.as_deref(),
+            input.include_children,
+        );
+
         // A stable total order over the page boundary, so a `nextToken` resumes where the
         // previous page stopped whatever order the map iterates in. The records are
         // BORROWED, not cloned: only the page this call returns is materialised.
@@ -252,13 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .enabled_controls
             .values()
             .filter(|control| {
-                // The target narrows the listing to the controls enabled on exactly that
-                // target: see the module header on `includeChildren`, which adds nothing
-                // to this set because this service stores no hierarchy to widen it with.
-                input
-                    .target_identifier
-                    .as_deref()
-                    .is_none_or(|target| control.target_identifier == target)
+                listed.contains(&control.arn)
                     // A control is selected by the catalog entry a filter value resolves
                     // to, so an enablement is found by either of the ARN forms that name
                     // its control, not only by the one the enabling call sent.
@@ -312,6 +327,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The same projection `GetEnabledControl` reports the member through, so
                 // the listing and the detail cannot disagree about one stored record.
                 drift_status_summary: Some(control.drift_status_summary()),
+                // The enablement this one inherited its configuration from, read off the
+                // same stored member `GetEnabledControl` reports: absent for a control
+                // applied directly to its target.
                 parent_identifier: control.parent_identifier.clone(),
             })
             .collect();
