@@ -74,6 +74,9 @@ mod read_and_delete_scope_classes;
 #[path = "all/resource_error_messages.rs"]
 mod resource_error_messages;
 
+#[path = "all/resource_name_uniqueness.rs"]
+mod resource_name_uniqueness;
+
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 

@@ -725,9 +725,11 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
         environment_name: &str,
         name: &str,
     ) -> Option<&StoredComponent> {
-        self.components_in(app_id, environment_name)
-            .iter()
-            .find(|component| component.name == name)
+        record_named(
+            self.components_in(app_id, environment_name),
+            name,
+            |component| &component.name,
+        )
     }
 
     /// The component `id` names in one app environment, for a caller that
@@ -944,6 +946,23 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
         Some(removed)
     }
 
+    /// The live form called `name` in one app environment, if there is one.
+    ///
+    /// A form name identifies a form within its app environment exactly as a
+    /// component name identifies a component, so this is what a create (or a
+    /// rename) consults before taking a name; the component counterpart is
+    /// [`Self::component_named`].
+    pub fn form_named(
+        &self,
+        app_id: &str,
+        environment_name: &str,
+        name: &str,
+    ) -> Option<&StoredForm> {
+        record_named(self.forms_in(app_id, environment_name), name, |form| {
+            &form.name
+        })
+    }
+
     /// How many forms the whole store holds — what [`FORM_QUOTA`] bounds.
     pub fn total_forms(&self) -> usize {
         self.forms.values().map(Vec::len).sum()
@@ -1147,6 +1166,23 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
         self.theme_tokens.insert((key, token), id);
     }
 
+    /// The live theme called `name` in one app environment, if there is one.
+    ///
+    /// A theme name identifies a theme within its app environment exactly as a
+    /// component or a form name does, so this is what a create (or a rename)
+    /// consults before taking a name; the component counterpart is
+    /// [`Self::component_named`].
+    pub fn theme_named(
+        &self,
+        app_id: &str,
+        environment_name: &str,
+        name: &str,
+    ) -> Option<&StoredTheme> {
+        record_named(self.themes_in(app_id, environment_name), name, |theme| {
+            &theme.name
+        })
+    }
+
     /// How many themes the whole store holds — what [`THEME_QUOTA`] bounds.
     pub fn total_themes(&self) -> usize {
         self.themes.values().map(Vec::len).sum()
@@ -1344,6 +1380,22 @@ fn id_in_other_scope<T>(
         .iter()
         .filter(|((app, environment), _)| app != app_id || environment != environment_name)
         .any(|(_, records)| records.iter().any(|record| record_id(record) == id))
+}
+
+/// The record called `name` among those one app environment holds, if there is
+/// one.
+///
+/// The one place the name-conflict lookup lives: a resource name identifies a
+/// resource of its kind within its app environment, so the per-kind methods above
+/// ([`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::component_named`] and its
+/// counterparts) differ only in which collection they search and where the record
+/// carries its name.
+fn record_named<'a, T>(
+    records: &'a [T],
+    name: &str,
+    record_name: impl Fn(&T) -> &str,
+) -> Option<&'a T> {
+    records.iter().find(|record| record_name(record) == name)
 }
 
 /// A seed from the operating system, for the ids one store mints.

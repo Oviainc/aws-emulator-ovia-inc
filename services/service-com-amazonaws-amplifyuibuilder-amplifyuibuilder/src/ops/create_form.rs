@@ -191,6 +191,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A form name identifies a form within its app environment, so a name a
+        // live form there already holds is a conflict with that existing resource
+        // rather than a malformed request: `ResourceConflictException` is what the
+        // model declares for it, exactly as it does for a component of the same
+        // name. The constraint is on live state only — deleting the form that
+        // holds a name frees it, and the identical create then succeeds.
+        if store
+            .form_named(&input.app_id, &input.environment_name, &data.name)
+            .is_some()
+        {
+            return Err(CreateFormErrorModeled::ResourceConflictException(
+                crate::state::duplicate_item_name(),
+            )
+            .into());
+        }
+
         let id = store.mint_form_id(&key);
         // The position in the service's one creation order an `ExportForms` page
         // token indexes into, drawn from the counter a component's cursor also

@@ -206,7 +206,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // absent here too, which is how `GetTheme` and `DeleteTheme` report it; see
         // the note in `delete_theme.rs` for why the theme operations keep that
         // classification where a component or a form is refused as wrong-scope.
+        if store
+            .theme(&input.app_id, &input.environment_name, &input.id)
+            .is_none()
+        {
+            return Err(UpdateThemeErrorModeled::ResourceNotFoundException(
+                crate::state::item_not_found(),
+            )
+            .into());
+        }
+
+        // A theme name identifies a theme within its app environment, so a rename
+        // onto a name ANOTHER live theme there holds is refused with the same
+        // `ResourceConflictException` a duplicate create is: the constraint is on
+        // the stored set, not on which call would introduce the duplicate.
+        // Renaming a theme to the name it already has changes nothing and is not a
+        // conflict. `UpdateComponent` and `UpdateForm` apply the same rule.
+        if let Some(name) = patch.name.as_deref() {
+            if store
+                .theme_named(&input.app_id, &input.environment_name, name)
+                .is_some_and(|holder| holder.id != input.id)
+            {
+                return Err(UpdateThemeErrorModeled::ResourceConflictException(
+                    crate::state::duplicate_item_name(),
+                )
+                .into());
+            }
+        }
+
         let Some(theme) = store.theme_mut(&input.app_id, &input.environment_name, &input.id) else {
+            // Unreachable: the lookup above found this id under the same lock.
             return Err(UpdateThemeErrorModeled::ResourceNotFoundException(
                 crate::state::item_not_found(),
             )

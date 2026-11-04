@@ -184,10 +184,14 @@ fn one_entry(key: &str, value: Value) -> Value {
     Value::Object(map)
 }
 
-/// The form every update case starts from: every `UpdateFormData` member carries a value
-/// here, plus the `tags` no update can move, so a patch always replaces something.
-fn baseline() -> Value {
-    json!({
+/// The form every update case starts from, under the name the case gives it: every
+/// `UpdateFormData` member carries a value here, plus the `tags` no update can move, so a
+/// patch always replaces something.
+///
+/// A form name is unique among the live forms of one app environment, so a suite that
+/// creates one form per row names each row's form for itself.
+fn baseline_named(name: &str) -> Value {
+    let mut data = json!({
         "name": "OrderForm",
         "formActionType": "create",
         "dataType": {"dataSourceType": "DataStore", "dataTypeName": "Order"},
@@ -205,7 +209,14 @@ fn baseline() -> Value {
         "cta": {"position": "bottom", "submit": {"children": "Save"}},
         "tags": {"env": "test", "team": "studio"},
         "labelDecorator": "required",
-    })
+    });
+    data["name"] = json!(name);
+    data
+}
+
+/// The baseline form under the one name a case that creates a single form uses.
+fn baseline() -> Value {
+    baseline_named("OrderForm")
 }
 
 /// The patches the merge cases drive, differing along what the rule generalises over:
@@ -353,8 +364,8 @@ fn merged(stored: &Value, patch: &Value) -> Value {
 async fn update_form_replaces_the_patched_members_and_keeps_the_others() {
     let router = emulator();
 
-    for (case, patch) in patch_cases() {
-        let created = create(&router, baseline()).await;
+    for (row, (case, patch)) in patch_cases().into_iter().enumerate() {
+        let created = create(&router, baseline_named(&format!("OrderForm-{row}"))).await;
         assert_eq!(
             created.status, 200,
             "case {case:?}: expected HTTP 200 from CreateForm, got {} with {:?}",
@@ -438,7 +449,7 @@ async fn a_single_member_patch_leaves_every_other_member_alone() {
     ];
 
     for (member, patch) in single_member_patches {
-        let created = create(&router, baseline()).await;
+        let created = create(&router, baseline_named(&format!("OrderForm-{member}"))).await;
         let id = created.id();
         let updated = update(&router, &id, patch.clone()).await;
         assert_eq!(
@@ -507,9 +518,11 @@ async fn repeating_an_update_is_idempotent_and_touches_only_the_form_addressed()
         ),
     ];
 
-    for (case, patch, attempts, token) in cases {
-        let target = create(&router, baseline()).await.id();
-        let bystander = create(&router, baseline()).await;
+    for (row, (case, patch, attempts, token)) in cases.into_iter().enumerate() {
+        let target = create(&router, baseline_named(&format!("Target-{row}")))
+            .await
+            .id();
+        let bystander = create(&router, baseline_named(&format!("Bystander-{row}"))).await;
         let bystander_id = bystander.id();
 
         let mut bodies = Vec::new();

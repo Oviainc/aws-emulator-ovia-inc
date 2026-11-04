@@ -153,8 +153,20 @@ fn epoch_seconds(value: &Value, what: &str) -> f64 {
         .as_secs_f64()
 }
 
-/// The theme the sequences start from: it carries every optional member, so a patch that
-/// leaves one out is visibly keeping a stored value rather than an absence.
+/// The theme the sequences start from, under the name the case gives it: it carries every
+/// optional member, so a patch that leaves one out is visibly keeping a stored value rather
+/// than an absence.
+///
+/// A theme name is unique among the live themes of one app environment, so a suite that
+/// creates one theme per row names each row's theme for itself.
+fn base_theme_named(name: &str) -> Value {
+    let mut data = base_theme();
+    data["name"] = json!(name);
+    data
+}
+
+/// The theme the sequences start from, under the one name a case that creates a single
+/// theme uses.
 fn base_theme() -> Value {
     json!({
         "name": "Base",
@@ -380,10 +392,12 @@ async fn repeating_an_update_leaves_the_same_record() {
         ("a clientToken with punctuation", Some("retry::1/2")),
     ];
 
-    for (case, token) in token_cases {
-        let id = create(&router, base_theme()).await.id();
+    for (row, (case, token)) in token_cases.into_iter().enumerate() {
+        let id = create(&router, base_theme_named(&format!("Base-{row}")))
+            .await
+            .id();
         let patch = json!({
-            "name": "Repeated",
+            "name": format!("Repeated-{row}"),
             "values": [{"key": "primaryColor", "value": {"value": "#ff6600"}}],
             "overrides": [],
         });

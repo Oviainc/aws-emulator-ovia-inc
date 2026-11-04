@@ -309,18 +309,20 @@ fn create_cases() -> Vec<(&'static str, Value)> {
 
     // One row per published value of each enumerated member, so the catalog is covered
     // rather than only the value the recorded request happened to carry.
+    // A form name is unique among the live forms of one app environment, so each row
+    // of a catalog walk names its form after the value it carries.
     for action in FORM_ACTION_TYPES {
-        let mut data = minimal_create("ActionTyped");
+        let mut data = minimal_create(&format!("ActionTyped-{action}"));
         data["formActionType"] = json!(action);
         cases.push(("every formActionType the model admits", data));
     }
     for source in FORM_DATA_SOURCE_TYPES {
-        let mut data = minimal_create("SourceTyped");
+        let mut data = minimal_create(&format!("SourceTyped-{source}"));
         data["dataType"] = json!({"dataSourceType": source, "dataTypeName": "Post"});
         cases.push(("every dataSourceType the model admits", data));
     }
     for decorator in LABEL_DECORATORS {
-        let mut data = minimal_create("Decorated");
+        let mut data = minimal_create(&format!("Decorated-{decorator}"));
         data["labelDecorator"] = json!(decorator);
         cases.push(("every labelDecorator the model admits", data));
     }
@@ -431,10 +433,14 @@ async fn a_repeated_create_with_one_client_token_returns_one_form() {
 
     let router = emulator();
     let mut distinct = Vec::new();
-    for (case, token, attempts) in &cases {
+    for (row, (case, token, attempts)) in cases.iter().enumerate() {
         let mut ids = Vec::new();
+        // Each row mints its own form, and a form name is unique among the live forms
+        // of one app environment, so the rows carry distinct names; the retries within
+        // a row replay the token rather than taking the name a second time.
+        let name = format!("Idempotent-{row}");
         for attempt in 0..*attempts {
-            let answer = create_with_token(&router, minimal_create("Idempotent"), token).await;
+            let answer = create_with_token(&router, minimal_create(&name), token).await;
             assert_eq!(
                 answer.status, 200,
                 "case {case:?}: attempt {attempt} expected HTTP 200, got {} with {:?}",
@@ -450,8 +456,10 @@ async fn a_repeated_create_with_one_client_token_returns_one_form() {
     }
 
     // Two creates with no token at all are two forms.
-    let first = create(&router, minimal_create("Untokened")).await.id();
-    let second = create(&router, minimal_create("Untokened")).await.id();
+    let first = create(&router, minimal_create("Untokened-first")).await.id();
+    let second = create(&router, minimal_create("Untokened-second"))
+        .await
+        .id();
     assert_ne!(
         first, second,
         "a create carrying no clientToken must mint a new form every time, got {first:?} twice"
@@ -668,8 +676,8 @@ async fn field_and_sectional_element_maps_round_trip_whatever_their_keys() {
         ("a non-ascii key", "título"),
     ];
 
-    for (case, key) in keys {
-        let mut data = minimal_create("Keyed");
+    for (row, (case, key)) in keys.into_iter().enumerate() {
+        let mut data = minimal_create(&format!("Keyed-{row}"));
         data["fields"] = one_entry(key, json!({"label": key, "inputType": {"type": "TextField"}}));
         data["sectionalElements"] = one_entry(key, json!({"type": "Heading", "text": key}));
 
@@ -706,7 +714,7 @@ async fn field_and_sectional_element_maps_round_trip_whatever_their_keys() {
             );
             elements.insert(format!("element{index}"), json!({"type": "Divider"}));
         }
-        let mut data = minimal_create("Sized");
+        let mut data = minimal_create(&format!("Sized-{size}"));
         data["fields"] = Value::Object(fields);
         data["sectionalElements"] = Value::Object(elements);
 

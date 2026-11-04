@@ -178,15 +178,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let addressed = store
             .form(&input.app_id, &input.environment_name, &input.id)
             .is_some();
-        if !addressed && store.form_in_other_scope(&input.app_id, &input.environment_name, &input.id)
-        {
-            return Err(UpdateFormErrorModeled::InvalidParameterException(
-                crate::state::item_wrong_scope(),
+        if !addressed {
+            if store.form_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
+                return Err(UpdateFormErrorModeled::InvalidParameterException(
+                    crate::state::item_wrong_scope(),
+                )
+                .into());
+            }
+            return Err(UpdateFormErrorModeled::ResourceNotFoundException(
+                crate::state::item_not_found(),
             )
             .into());
         }
 
+        // A form name identifies a form within its app environment, so a rename
+        // onto a name ANOTHER live form there holds is refused with the same
+        // `ResourceConflictException` a duplicate create is: the constraint is on
+        // the stored set, not on which call would introduce the duplicate.
+        // Renaming a form to the name it already has changes nothing and is not a
+        // conflict. `UpdateComponent` applies the same rule to a component.
+        if let Some(name) = patch.name.as_deref() {
+            if store
+                .form_named(&input.app_id, &input.environment_name, name)
+                .is_some_and(|holder| holder.id != input.id)
+            {
+                return Err(UpdateFormErrorModeled::ResourceConflictException(
+                    crate::state::duplicate_item_name(),
+                )
+                .into());
+            }
+        }
+
         let Some(form) = store.form_mut(&input.app_id, &input.environment_name, &input.id) else {
+            // Unreachable: the lookup above found this id under the same lock.
             return Err(UpdateFormErrorModeled::ResourceNotFoundException(
                 crate::state::item_not_found(),
             )

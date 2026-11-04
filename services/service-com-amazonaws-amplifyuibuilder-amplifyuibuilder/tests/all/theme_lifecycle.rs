@@ -437,10 +437,12 @@ async fn a_name_outside_the_published_bounds_is_refused() {
 #[tokio::test]
 async fn the_client_token_makes_create_theme_idempotent() {
     let router = emulator();
-    let data = json!({
-        "name": "Tokened",
-        "values": [{"key": "primaryColor", "value": {"value": "#047d95"}}],
-    });
+    let theme_named = |name: &str| {
+        json!({
+            "name": name,
+            "values": [{"key": "primaryColor", "value": {"value": "#047d95"}}],
+        })
+    };
 
     let cases = [
         ("an ascii token", "token-1"),
@@ -448,7 +450,10 @@ async fn the_client_token_makes_create_theme_idempotent() {
         ("a token with punctuation", "retry::1/2"),
     ];
 
-    for (case, token) in cases {
+    // A theme name is unique among the live themes of one app environment, so every row
+    // and every create within a row that mints another theme carries its own name.
+    for (row, (case, token)) in cases.into_iter().enumerate() {
+        let data = theme_named(&format!("Tokened-{row}"));
         let first = create_with_token(&router, data.clone(), token).await;
         assert_eq!(
             first.status, 200,
@@ -463,8 +468,14 @@ async fn the_client_token_makes_create_theme_idempotent() {
             retried.body
         );
 
-        // Another token, same payload: a second theme, not the first one again.
-        let other = create_with_token(&router, data.clone(), &format!("{token}-other")).await;
+        // Another token, same payload but its own name: a second theme, not the first one
+        // again.
+        let other = create_with_token(
+            &router,
+            theme_named(&format!("Tokened-{row}-other")),
+            &format!("{token}-other"),
+        )
+        .await;
         assert_ne!(
             other.id(),
             first.id(),

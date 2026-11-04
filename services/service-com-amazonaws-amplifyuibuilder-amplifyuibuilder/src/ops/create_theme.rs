@@ -192,6 +192,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A theme name identifies a theme within its app environment, so a name a
+        // live theme there already holds is a conflict with that existing
+        // resource rather than a malformed request:
+        // `ResourceConflictException` is what the model declares for it, exactly
+        // as it does for a component or a form of the same name. The constraint is
+        // on live state only — deleting the theme that holds a name frees it, and
+        // the identical create then succeeds.
+        if store
+            .theme_named(&input.app_id, &input.environment_name, &data.name)
+            .is_some()
+        {
+            return Err(CreateThemeErrorModeled::ResourceConflictException(
+                crate::state::duplicate_item_name(),
+            )
+            .into());
+        }
+
         let id = store.mint_theme_id(&key);
         // The position this theme takes in its environment's creation order,
         // which is the order `ExportThemes` pages over.
