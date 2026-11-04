@@ -197,19 +197,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.detector_id,
             )));
         };
-        // A set whose delete has already been accepted is no longer one the
-        // account can act on, so it is refused exactly like an id the detector
-        // never held: an update would otherwise walk a record on its way out back
-        // into use.
+        // A set whose delete this service has served is one the detector no longer
+        // has, so it is refused exactly like an id the detector never held: one
+        // absence, reported the way BOTH entity-set families report it
+        // ([`crate::scaffolded::ENTITY_SET_NOT_FOUND_MESSAGE`]) — HTTP 404 under the
+        // `ResourceNotFoundException` class — rather than as a claim about the
+        // value's form or its owner. An update would otherwise walk a deleted
+        // record back into use.
         let Some(set) = detector
             .threat_entity_sets
             .get(&input.threat_entity_set_id)
             .filter(|set| !set.is_deleting())
         else {
-            return Err(bad_request(crate::state::minted_id_rejection(
-                crate::state::THREAT_ENTITY_SET_ID_MEMBER,
-                &input.threat_entity_set_id,
-            )));
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                crate::scaffolded::ENTITY_SET_NOT_FOUND_MESSAGE,
+            ));
         };
 
         // Whether this request changes the set at all is decided HERE, over the

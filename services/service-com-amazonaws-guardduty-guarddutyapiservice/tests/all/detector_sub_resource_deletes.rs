@@ -13,7 +13,7 @@
 //! repeated delete of something already gone, a read) moves it nowhere. The answer
 //! does not depend on WHICH collection the sub-resource lives in, nor on whether its
 //! create minted an id or echoed the caller's name, nor on whether the family's delete
-//! drops the record at once or moves it through a `DELETE_PENDING` status: one rule
+//! drops the record at once or retains it in a terminal `DELETED` status: one rule
 //! covers them all.
 //!
 //! `detector_sub_resource_creates` asserts the other half of the same rule over the
@@ -24,8 +24,8 @@
 //! The rows differ along what the rule generalises over: the family and its collection
 //! segment, how the delete addresses the sub-resource (a minted id or the caller's
 //! name), the `Format` the create carried, whether the caller asked to activate,
-//! whether tags were carried, and whether a repeated delete of the same sub-resource is
-//! accepted or refused. Segments, id members and formats come from
+//! whether tags were carried, and which status the family's own absence refusal
+//! answers. Segments, id members and formats come from
 //! `smithy_query(operation="CreateFilter,CreateIPSet,CreateThreatIntelSet,\
 //! CreateThreatEntitySet,CreateTrustedEntitySet,CreatePublishingDestination")` and
 //! `smithy_query(shape="IpSetFormat,ThreatIntelSetFormat,DestinationType")`.
@@ -62,11 +62,13 @@ struct Family {
     create: Value,
     /// Where the delete's URI label comes from.
     address: Address,
-    /// The status a SECOND delete of the same sub-resource answers. A family whose
-    /// read reports a deleted status accepts it (the label still resolves); a family
-    /// whose record goes at once refuses it (there is nothing left to delete). Either
-    /// way the second call changes which sub-resources the detector holds not at all.
-    repeat_status: u16,
+    /// The HTTP status a delete answers for a label this detector does not hold —
+    /// one no create saved, and one a delete has already taken off the detector,
+    /// which are the same absence. It is the family's own absence refusal: the
+    /// entity-set families answer 404 under `ResourceNotFoundException`, every other
+    /// family 400 under `InvalidInputException`. Either way the second call changes
+    /// which sub-resources the detector holds not at all.
+    absence_status: u16,
     /// A well-formed label of this family that no create here ever saved, so a delete
     /// naming it is refused and removes nothing.
     absent_label: &'static str,
@@ -88,11 +90,11 @@ fn families() -> Vec<Family> {
                 "findingCriteria": {"criterion": {"severity": {"greaterThanOrEqual": 5}}},
             }),
             address: Address::EchoedName("name"),
-            repeat_status: 400,
+            absence_status: 400,
             absent_label: "never.saved-filter_name",
         },
         Family {
-            case: "ip set, TXT, activated, a repeated delete accepted",
+            case: "ip set, TXT, activated, a repeated delete refused",
             segment: "ipset",
             create: json!({
                 "name": "deletes-ip-set",
@@ -101,11 +103,11 @@ fn families() -> Vec<Family> {
                 "activate": true,
             }),
             address: Address::MintedId("ipSetId"),
-            repeat_status: 200,
+            absence_status: 400,
             absent_label: "deadbeefdeadbeefdeadbeefdeadbeef",
         },
         Family {
-            case: "threat intel set, STIX, not activated, tagged, a repeated delete accepted",
+            case: "threat intel set, STIX, not activated, tagged, a repeated delete refused",
             segment: "threatintelset",
             create: json!({
                 "name": "deletes-threat-list",
@@ -115,11 +117,11 @@ fn families() -> Vec<Family> {
                 "tags": {"team": "secops"},
             }),
             address: Address::MintedId("threatIntelSetId"),
-            repeat_status: 200,
+            absence_status: 400,
             absent_label: "feedfacefeedfacefeedfacefeedface",
         },
         Family {
-            case: "threat entity set, OTX_CSV, activated, a repeated delete accepted",
+            case: "threat entity set, OTX_CSV, activated, a repeated delete refused with 404",
             segment: "threatentityset",
             create: json!({
                 "name": "deletes-threat-entities",
@@ -128,11 +130,12 @@ fn families() -> Vec<Family> {
                 "activate": true,
             }),
             address: Address::MintedId("threatEntitySetId"),
-            repeat_status: 200,
+            absence_status: 404,
             absent_label: "0123456789abcdef0123456789abcdef",
         },
         Family {
-            case: "trusted entity set, FIRE_EYE, not activated, tagged, a repeated delete accepted",
+            case: "trusted entity set, FIRE_EYE, not activated, tagged, a repeated delete refused \
+                   with 404",
             segment: "trustedentityset",
             create: json!({
                 "name": "deletes-trusted-entities",
@@ -142,7 +145,7 @@ fn families() -> Vec<Family> {
                 "tags": {"env": "test", "owner": "team-a"},
             }),
             address: Address::MintedId("trustedEntitySetId"),
-            repeat_status: 200,
+            absence_status: 404,
             absent_label: "fedcba9876543210fedcba9876543210",
         },
         Family {
@@ -156,7 +159,7 @@ fn families() -> Vec<Family> {
                 },
             }),
             address: Address::MintedId("destinationId"),
-            repeat_status: 400,
+            absence_status: 400,
             absent_label: "abcdef0123456789abcdef0123456789",
         },
     ]
@@ -256,9 +259,10 @@ async fn taking_any_sub_resource_off_a_detector_moves_its_updated_at() {
         )
         .await;
         assert_eq!(
-            status, 400,
+            status, family.absence_status,
             "case {case:?}: a delete of a sub-resource the detector does not hold must answer \
-             400, got {status} {refusal:?}"
+             {}, got {status} {refusal:?}",
+            family.absence_status
         );
         let after_refusal = detector_updated_at(&router, &detector_id, case).await;
         assert_eq!(
@@ -299,13 +303,14 @@ async fn taking_any_sub_resource_off_a_detector_moves_its_updated_at() {
             settled["createdAt"]
         );
 
-        // A second delete of the same label takes nothing off the detector, whether
-        // this family accepts it or refuses it, so it moves nothing.
+        // A second delete of the same label takes nothing off the detector — the
+        // label names nothing the detector holds any more, so it is refused exactly
+        // like one no create ever saved — so it moves nothing.
         let (status, again) = call(&router, "DELETE", &format!("{collection}/{label}"), None).await;
         assert_eq!(
-            status, family.repeat_status,
+            status, family.absence_status,
             "case {case:?}: expected a repeated delete to answer {}, got {status} {again:?}",
-            family.repeat_status
+            family.absence_status
         );
         let after_repeat = detector_updated_at(&router, &detector_id, case).await;
         assert_eq!(

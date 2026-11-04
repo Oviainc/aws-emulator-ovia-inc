@@ -20,9 +20,9 @@
 //!    than `IpSetIds`'s own `len 0..50` whatever the caller asks for.
 //! 3. It REPORTS: listing changes nothing a later call sees — no status settles early
 //!    and no later list or read differs because something was listed.
-//! 4. An IPSet whose delete has been accepted is no longer one of the detector's
+//! 4. An IPSet whose delete has been served is no longer one of the detector's
 //!    IPSets, so the list stops naming it while `GetIPSet` still reports its
-//!    `DELETE_PENDING`/`DELETED` status; the list is the same set the
+//!    terminal `DELETED` status; the list is the same set the
 //!    `state::IP_SETS_PER_DETECTOR` quota counts.
 //! 5. An IPSet belongs to one detector, which is regional, so a list names only that
 //!    detector's IPSets through the Region's endpoint that created it; a `detectorId`
@@ -37,8 +37,8 @@ use crate::detector_lifecycle::{
 };
 use crate::ip_set_lifecycle::past_the_transition;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    DETECTOR_ID_MEMBER, IP_SETS_PER_DETECTOR, IP_SET_ACTIVATING, IP_SET_DELETED,
-    IP_SET_DELETE_PENDING, IP_SET_INACTIVE, NEXT_TOKEN_MEMBER,
+    DETECTOR_ID_MEMBER, IP_SETS_PER_DETECTOR, IP_SET_ACTIVATING, IP_SET_DELETED, IP_SET_INACTIVE,
+    NEXT_TOKEN_MEMBER,
 };
 
 /// The error class every client rejection on this service carries in the body's
@@ -568,16 +568,17 @@ async fn a_deleted_ip_set_is_no_longer_listed() {
             "case {case:?}: expected the IPSets still live {live:?}, got {listed:?}"
         );
 
-        // The deleted record is still readable on its own id — being readable is not
-        // being part of the collection a list enumerates.
+        // The deleted record is still readable on its own id, in its terminal
+        // status — being readable is not being part of the collection a list
+        // enumerates.
         let deleted_status = status_of(&router, &detector, id, &case).await;
         assert_eq!(
-            deleted_status, IP_SET_DELETE_PENDING,
-            "case {case:?}: expected {IP_SET_DELETE_PENDING} from the reader, got {deleted_status:?}"
+            deleted_status, IP_SET_DELETED,
+            "case {case:?}: expected {IP_SET_DELETED} from the reader, got {deleted_status:?}"
         );
     }
 
-    // Once the clock owes DELETED, the list still names none of them.
+    // The terminal status does not move, and the list still names none of them.
     tokio::time::sleep(past_the_transition()).await;
     let listed = page_ids(&router, &detector, "", "every IPSet deleted").await;
     assert!(

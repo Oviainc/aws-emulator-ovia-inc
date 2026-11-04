@@ -27,9 +27,10 @@
 //!
 //! The rows differ along what the rule generalises over: the operation and the
 //! resource family, which member the request writes back, whether it carries the
-//! activation the resource already has, whether the resource is a sub-resource or the
-//! detector's own configuration, and whether the no-op is an UPDATE repeating the
-//! stored values or a DELETE repeating a deletion already accepted.
+//! activation the resource already has, and whether the resource is a sub-resource or
+//! the detector's own configuration. A delete repeating one already served is not
+//! among them: it is REFUSED rather than accepted, so it is a row of
+//! `refused_mutation_clock` instead.
 
 use serde_json::{json, Value};
 
@@ -65,17 +66,12 @@ struct Row {
     /// operation's `http` binding
     /// (`smithy_query(operation="UpdateIPSet,UpdateTrustedEntitySet,\
     /// UpdateThreatEntitySet,UpdateThreatIntelSet,UpdatePublishingDestination,\
-    /// UpdateMalwareScanSettings,DeleteIPSet,DeleteTrustedEntitySet,\
-    /// DeleteThreatEntitySet,DeleteThreatIntelSet")`).
+    /// UpdateMalwareScanSettings")`).
     segment: &'static str,
     /// The create that seeds the resource, with the output member carrying the id it
     /// mints. `None` for the detector's own scan settings, which no create mints:
     /// that row addresses the segment itself.
     create: Option<(Value, &'static str)>,
-    /// Delete the seeded resource ONCE before the burst, so each call of the burst is
-    /// a REPEATED delete: accepted, because the id still resolves, and asking for the
-    /// state the record is already in.
-    delete_first: bool,
     /// The no-op call: its method and the body it carries, which repeats what the
     /// seeded resource already holds.
     method: &'static str,
@@ -100,7 +96,6 @@ fn rows() -> Vec<Row> {
                 }),
                 "trustedEntitySetId",
             )),
-            delete_first: false,
             method: "POST",
             body: Some(json!({
                 "name": "trusted-entities",
@@ -120,7 +115,6 @@ fn rows() -> Vec<Row> {
                 }),
                 "trustedEntitySetId",
             )),
-            delete_first: false,
             method: "POST",
             // `Activate` asks for the status the set has already settled on, so it
             // starts no transition — the one member this row changes along.
@@ -140,7 +134,6 @@ fn rows() -> Vec<Row> {
                 }),
                 "threatEntitySetId",
             )),
-            delete_first: false,
             method: "POST",
             body: Some(json!({"expectedBucketOwner": BUCKET_OWNER})),
             compare_record: true,
@@ -157,7 +150,6 @@ fn rows() -> Vec<Row> {
                 }),
                 "ipSetId",
             )),
-            delete_first: false,
             method: "POST",
             body: Some(json!({
                 "name": "trusted-addresses",
@@ -177,7 +169,6 @@ fn rows() -> Vec<Row> {
                 }),
                 "threatIntelSetId",
             )),
-            delete_first: false,
             method: "POST",
             body: Some(json!({
                 "location": "s3://guardduty-lists/threat-list.xml",
@@ -198,7 +189,6 @@ fn rows() -> Vec<Row> {
                 }),
                 "destinationId",
             )),
-            delete_first: false,
             method: "POST",
             body: Some(json!({
                 "destinationProperties": {
@@ -214,79 +204,9 @@ fn rows() -> Vec<Row> {
             case: "update malware scan settings, carrying no setting at all",
             segment: "malware-scan-settings",
             create: None,
-            delete_first: false,
             method: "POST",
             body: Some(json!({})),
             compare_record: true,
-        },
-        Row {
-            case: "delete ip set, repeating a deletion already accepted",
-            segment: "ipset",
-            create: Some((
-                json!({
-                    "name": "doomed-addresses",
-                    "format": "TXT",
-                    "location": "s3://guardduty-lists/doomed-addresses.txt",
-                    "activate": false,
-                }),
-                "ipSetId",
-            )),
-            delete_first: true,
-            method: "DELETE",
-            body: None,
-            // The deleted record is on the clock-owed way to DELETED.
-            compare_record: false,
-        },
-        Row {
-            case: "delete trusted entity set, repeating a deletion already accepted",
-            segment: "trustedentityset",
-            create: Some((
-                json!({
-                    "name": "doomed-trusted-entities",
-                    "format": "TXT",
-                    "location": "s3://guardduty-lists/doomed-trusted.txt",
-                    "activate": false,
-                }),
-                "trustedEntitySetId",
-            )),
-            delete_first: true,
-            method: "DELETE",
-            body: None,
-            compare_record: false,
-        },
-        Row {
-            case: "delete threat entity set, repeating a deletion already accepted",
-            segment: "threatentityset",
-            create: Some((
-                json!({
-                    "name": "doomed-threat-entities",
-                    "format": "TXT",
-                    "location": "s3://guardduty-lists/doomed-threat.txt",
-                    "activate": false,
-                }),
-                "threatEntitySetId",
-            )),
-            delete_first: true,
-            method: "DELETE",
-            body: None,
-            compare_record: false,
-        },
-        Row {
-            case: "delete threat intel set, repeating a deletion already accepted",
-            segment: "threatintelset",
-            create: Some((
-                json!({
-                    "name": "doomed-threat-list",
-                    "format": "STIX",
-                    "location": "s3://guardduty-lists/doomed-threat-list.xml",
-                    "activate": false,
-                }),
-                "threatIntelSetId",
-            )),
-            delete_first: true,
-            method: "DELETE",
-            body: None,
-            compare_record: false,
         },
     ]
 }
@@ -324,16 +244,6 @@ async fn accepted_no_op_calls_leave_the_clock_where_the_wall_clock_is() {
             // The detector's own scan settings are addressed by the segment itself.
             None => collection.clone(),
         };
-
-        if row.delete_first {
-            // The deletion the burst then repeats: THIS one writes, so it is the only
-            // call of the row that may move anything.
-            let (status, deleted) = call(&router, "DELETE", &target, None).await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: expected the first delete to answer 200, got {status} {deleted:?}"
-            );
-        }
 
         // What the resource reports before the burst, where that reading is one the
         // clock cannot move on its own.

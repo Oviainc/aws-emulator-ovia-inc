@@ -29,11 +29,14 @@
 //!    writes them, so an update carrying a `Name` outside the documented alphabet or
 //!    a `Location` that is not a valid Amazon S3 URL is refused with HTTP 400 under
 //!    the `InvalidInputException` class, naming the MEMBER, and writes nothing.
-//! 4. An id the store does not resolve is refused the same way, naming the member
-//!    and never echoing the caller's value, and updates nothing — including the id
-//!    of a set whose delete has been accepted, and, a threat entity set being a
-//!    sub-resource of a REGIONAL detector, an id only the Region that created it may
-//!    update.
+//! 4. An id the store does not resolve is refused with the entity-set families'
+//!    absence refusal — HTTP 404 under the `ResourceNotFoundException` class, with
+//!    one fixed sentence that names neither the member nor the caller's value — and
+//!    updates nothing. That covers the id of a set a delete has taken out of the
+//!    detector's holdings, and, a threat entity set being a sub-resource of a
+//!    REGIONAL detector, an id only the Region that created it may update (where the
+//!    detector is what the request fails to resolve, so the refusal is the detector
+//!    family's).
 //! 5. An update touches only the set its id names: a SIBLING threat entity set under
 //!    the same detector, the detector's trusted entity set and another detector's
 //!    sets are untouched, and the detector's own `UpdatedAt` does not move, because
@@ -44,9 +47,10 @@ use serde_json::{json, Value};
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
 };
+use crate::set_delete_terminality::assert_entity_set_absent;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     DETECTOR_ID_MEMBER, ENTITY_SET_ACTIVATING, ENTITY_SET_ACTIVE, ENTITY_SET_DEACTIVATING,
-    ENTITY_SET_INACTIVE, ENTITY_SET_TRANSITION_MILLIS, THREAT_ENTITY_SET_ID_MEMBER,
+    ENTITY_SET_INACTIVE, ENTITY_SET_TRANSITION_MILLIS,
 };
 
 /// The error class every client rejection on this service carries in the body's
@@ -680,37 +684,18 @@ async fn an_unresolvable_id_is_refused_rather_than_answered() {
 
     // Each row is an id no store resolves: a well-formed detector id and a value
     // that cannot be one, then a well-formed set id and a value that cannot be one.
-    let rows: Vec<(&str, String, String, &str)> = vec![
-        (
-            "absent detector",
-            ABSENT_DETECTOR_ID.to_string(),
-            set_id.clone(),
-            DETECTOR_ID_MEMBER,
-        ),
-        (
-            "malformed detector",
-            "not-a-detector".to_string(),
-            set_id.clone(),
-            DETECTOR_ID_MEMBER,
-        ),
-        (
-            "absent set",
-            detector_id.clone(),
-            ABSENT_SET_ID.to_string(),
-            THREAT_ENTITY_SET_ID_MEMBER,
-        ),
-        (
-            "malformed set",
-            detector_id.clone(),
-            "not-a-set".to_string(),
-            THREAT_ENTITY_SET_ID_MEMBER,
-        ),
+    // The set rows are refused with the entity-set families' absence refusal and the
+    // detector rows with the detector family's, because they name different
+    // resources.
+    let detector_rows: Vec<(&str, String)> = vec![
+        ("absent detector", ABSENT_DETECTOR_ID.to_string()),
+        ("malformed detector", "not-a-detector".to_string()),
     ];
-    for (row_case, detector_arg, set_arg, member) in rows {
+    for (row_case, detector_arg) in detector_rows {
         let (status, body) = update_set(
             &router,
             &detector_arg,
-            &set_arg,
+            &set_id,
             json!({"name": "unreachable"}),
         )
         .await;
@@ -718,11 +703,29 @@ async fn an_unresolvable_id_is_refused_rather_than_answered() {
             row_case,
             status,
             &body,
-            member,
-            &[detector_arg.as_str(), set_arg.as_str()],
+            DETECTOR_ID_MEMBER,
+            &[detector_arg.as_str(), set_id.as_str()],
         );
         // The refusal updated nothing: the set that does exist still reports what
         // its create stored.
+        let got = read(&router, &detector_id, &set_id, row_case).await;
+        assert_eq!(
+            got["name"], "base_set-1",
+            "case {row_case:?}: a refused update must not touch the stored set, got {got:?}"
+        );
+    }
+    for (row_case, set_arg) in [
+        ("absent set", ABSENT_SET_ID),
+        ("malformed set", "not-a-set"),
+    ] {
+        let (status, body) = update_set(
+            &router,
+            &detector_id,
+            set_arg,
+            json!({"name": "unreachable"}),
+        )
+        .await;
+        assert_entity_set_absent(row_case, status, &body, set_arg);
         let got = read(&router, &detector_id, &set_id, row_case).await;
         assert_eq!(
             got["name"], "base_set-1",
@@ -754,14 +757,15 @@ async fn an_unresolvable_id_is_refused_rather_than_answered() {
     );
 }
 
-/// A set whose delete has been accepted is no longer one the account can act on, so
+/// A set a delete has taken out of the detector's holdings is no longer there, so
 /// its id is refused exactly like one the detector never held — an update must not
-/// walk a set on its way out back into use.
+/// walk a deleted set back into use. Nothing addresses the id afterwards, so the
+/// refusal is checked against the LISTING and a re-read rather than against a record.
 #[tokio::test]
 async fn a_set_whose_delete_was_accepted_cannot_be_updated() {
     for (case, wait) in [
-        ("while the delete is still DELETE_PENDING", false),
-        ("once the set is DELETED", true),
+        ("straight after the delete", false),
+        ("once every transition would have come due", true),
     ] {
         let (router, detector_id) = detector().await;
         let set_id = created(&router, &detector_id, case, base_create("TXT", false)).await;
@@ -773,7 +777,6 @@ async fn a_set_whose_delete_was_accepted_cannot_be_updated() {
         if wait {
             tokio::time::sleep(past_the_transition()).await;
         }
-        let before = read(&router, &detector_id, &set_id, case).await;
 
         let (status, body) = update_set(
             &router,
@@ -782,14 +785,12 @@ async fn a_set_whose_delete_was_accepted_cannot_be_updated() {
             json!({"name": "revived", "activate": true}),
         )
         .await;
-        assert_classified_refusal(case, status, &body, THREAT_ENTITY_SET_ID_MEMBER, &[&set_id]);
+        assert_entity_set_absent(case, status, &body, &set_id);
 
-        let after = read(&router, &detector_id, &set_id, case).await;
-        assert_eq!(
-            after, before,
-            "case {case:?}: a refused update must not revive a deleted set, got {after:?} after \
-             {before:?}"
-        );
+        // The refused update revived nothing: the id still resolves to no set at
+        // all.
+        let (status, body) = get_set(&router, &detector_id, &set_id).await;
+        assert_entity_set_absent(case, status, &body, &set_id);
     }
 }
 

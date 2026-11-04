@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteThreatEntitySet
-//! IMPLEMENTED: accepts the deletion of the threat entity set the request names
-//! and persists it in [`crate::state`] — the set moves to `DELETE_PENDING`, the clock
-//! owes it `DELETED`, and `GetThreatEntitySet` reports that status afterwards. The
-//! slot it held among the detector's threat entity sets is freed, so a later create
-//! succeeds and `ListThreatEntitySets` stops naming it.
+//! IMPLEMENTED: deletes the threat entity set the request names from
+//! [`crate::state`] — the detector no longer HAS it, so `GetThreatEntitySet` and a
+//! second `DeleteThreatEntitySet` refuse its id with the entity-set families'
+//! absence refusal and `ListThreatEntitySets` stops naming it. The slot it held
+//! among the detector's threat entity sets is freed, so a later create succeeds.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -156,32 +156,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::detector_id_rejection(&input.detector_id),
             ));
         };
-        let Some(set) = detector
+        // An entity-set id this detector does not hold is the absence BOTH
+        // entity-set families report the same way
+        // ([`crate::scaffolded::ENTITY_SET_NOT_FOUND_MESSAGE`]): HTTP 404 under the
+        // `ResourceNotFoundException` class, one fixed sentence, whatever the form
+        // of the id and whoever minted it.
+        //
+        // A set whose delete this service has already served is that same absence:
+        // the detector no longer has it, so there is no second deletion to perform.
+        if detector
             .threat_entity_sets
             .get(&input.threat_entity_set_id)
-        else {
-            // An id this detector does not hold, classified from the REQUEST like
-            // every other id this service refuses: a value that cannot be an
-            // entity-set id at all is a parameter failure, a well-formed one this
-            // detector does not hold an ownership failure.
-            return Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::minted_id_rejection(
-                    crate::state::THREAT_ENTITY_SET_ID_MEMBER,
-                    &input.threat_entity_set_id,
-                ),
+            .is_none_or(crate::state::EntitySetRecord::is_deleting)
+        {
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                crate::scaffolded::ENTITY_SET_NOT_FOUND_MESSAGE,
             ));
-        };
-        // A second delete of the same id asks for the state the set is already in,
-        // so it writes nothing at all: the id still resolves, so the call is
-        // accepted, and it moves neither the record, nor the detector, nor an
-        // instant of this state's "this resource changed now" counter.
-        if set.is_deleting() {
-            return Ok(DeleteThreatEntitySetOutput {});
         }
 
-        // Past the refusals and past that no-op this is a MUTATION, so it advances
-        // this state's clock: the instant it hands out is when the deletion was
-        // accepted, and what the `DELETED` transition is owed from.
+        // Past the refusals this is a MUTATION, so it advances this state's clock:
+        // the instant it hands out is when the deletion happened.
         let now = state.tick_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // The detector resolved above under the same lock, so this cannot be
@@ -195,19 +189,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Deletes the threat entity set that is associated with the specified
-        // threatEntitySetId" (this operation's own documentation): the set moves to
-        // `DELETE_PENDING` and the clock owes it `DELETED` — `GetThreatEntitySet`'s
-        // `Status` is `@required` and its enum carries both
-        // (`smithy_query(operation="GetThreatEntitySet")`), so the status after a
-        // delete is something a read reports rather than a refusal. A second delete
-        // of the same id is accepted and moves nothing: it returned above, before the
-        // clock was read.
-        let accepted = detector
+        // threatEntitySetId" (this operation's own documentation): once the delete
+        // is served the detector no longer HAS the set, so nothing addresses it
+        // afterwards — neither `GetThreatEntitySet`, which refuses its id, nor
+        // `ListThreatEntitySets`, which stops naming it, nor a replayed
+        // `ClientToken`, which mints a new set instead. The record is kept only as
+        // the tombstone that makes the id unresolvable, bounded by the same
+        // retention every deleted entity set is.
+        let deleted = detector
             .delete_threat_entity_set(&input.threat_entity_set_id, now)
             .unwrap_or(false);
-        if accepted {
-            // The detector holds one fewer LIVE sub-resource than before, which is
-            // the same change `CreateThreatEntitySet` records on it in the other
+        if deleted {
+            // The detector holds one fewer sub-resource than before, which is the
+            // same change `CreateThreatEntitySet` records on it in the other
             // direction.
             detector.updated_at_millis = now;
         }

@@ -247,6 +247,8 @@ mod runtime_monitoring_exclusion;
 mod sample_finding_catalog;
 #[path = "all/sample_finding_detector_timestamp.rs"]
 mod sample_finding_detector_timestamp;
+#[path = "all/set_delete_terminality.rs"]
+mod set_delete_terminality;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_map_projection.rs"]

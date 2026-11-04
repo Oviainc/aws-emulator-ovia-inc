@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteThreatIntelSet
-//! IMPLEMENTED: accepts the deletion of the threat list the request's detector holds
-//! under `ThreatIntelSetId`, moving it to `DELETE_PENDING` with the clock owing it
-//! `DELETED`, which is what `GetThreatIntelSet` reports afterwards.
+//! IMPLEMENTED: deletes the threat list the request's detector holds under
+//! `ThreatIntelSetId`, settling it at once on the terminal `DELETED` status
+//! `GetThreatIntelSet` reports afterwards. The id stops being one the detector
+//! holds, so a SECOND delete of it is refused exactly like an id the detector never
+//! held.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -154,26 +156,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::detector_id_rejection(&input.detector_id),
             ));
         };
-        let Some(set) = detector.threat_intel_set(&input.threat_intel_set_id) else {
-            // A `ThreatIntelSetId` this detector does not hold is the absence every
-            // uploaded-list operation reports the same way
-            // ([`crate::state::SET_ID_NOT_FOUND_MESSAGE`]), exactly as
-            // `GetThreatIntelSet` reports it.
+        // A `ThreatIntelSetId` this detector does not hold is the absence every
+        // uploaded-list operation reports the same way
+        // ([`crate::state::SET_ID_NOT_FOUND_MESSAGE`]), exactly as
+        // `GetThreatIntelSet` reports it.
+        //
+        // A list a delete has already taken out of the detector's holdings is that
+        // same absence: the delete completed, so there is no second deletion to
+        // perform. The record is still RETAINED so `GetThreatIntelSet` can report
+        // its terminal status, but being readable on its own id is not the same as
+        // being a list this detector holds.
+        if detector
+            .threat_intel_set(&input.threat_intel_set_id)
+            .is_none_or(crate::state::ThreatIntelSetRecord::is_deleting)
+        {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::SET_ID_NOT_FOUND_MESSAGE,
             ));
-        };
-        // A second delete of the same id asks for the state the list is already in,
-        // so it writes nothing at all: the id still resolves, so the call is
-        // accepted, and it moves neither the record, nor the detector, nor an instant
-        // of this state's "this resource changed now" counter.
-        if set.is_deleting() {
-            return Ok(DeleteThreatIntelSetOutput {});
         }
 
-        // Past the refusals and past that no-op this is a MUTATION, so it advances
-        // this state's clock: the instant it hands out is when the deletion was
-        // accepted, and what the `DELETED` transition is owed from.
+        // Past the refusals this is a MUTATION, so it advances this state's clock:
+        // the instant it hands out is when the deletion happened.
         let now = state.tick_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // The detector resolved above under the same lock, so this cannot be
@@ -187,16 +190,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Deletes the ThreatIntelSet specified by the ThreatIntelSet ID" (this
-        // operation's own documentation): the list moves to `DELETE_PENDING` and the
-        // clock owes it `DELETED` — `GetThreatIntelSet`'s `Status` is `@required` and
-        // its enum carries both (`smithy_query(shape="ThreatIntelSetStatus")`), so
-        // the status after a delete is something a read reports rather than a
-        // refusal. A second delete of the same id is accepted and moves nothing: it
-        // returned above, before the clock was read.
+        // operation's own documentation). The delete is SYNCHRONOUS: a read straight
+        // afterwards reports `DELETED`, the terminal member of the status enum
+        // (`smithy_query(shape="ThreatIntelSetStatus")`), so the list settles on it
+        // here rather than being parked in the `DELETE_PENDING` the enum also
+        // carries — there is no span for a caller to observe.
+        // `delete_threat_intel_set` is what accepts the deletion and bounds the
+        // deleted records the detector retains so `GetThreatIntelSet` can still
+        // report that status.
         let accepted = detector
             .delete_threat_intel_set(&input.threat_intel_set_id, now)
             .unwrap_or(false);
         if accepted {
+            if let Some(set) = detector
+                .threat_intel_sets
+                .get_mut(&input.threat_intel_set_id)
+            {
+                set.status = crate::state::THREAT_INTEL_SET_DELETED.to_string();
+                set.pending_status = None;
+            }
             // The detector holds one fewer LIVE sub-resource than before, which is
             // the same change `CreateThreatIntelSet` records on it in the other
             // direction.

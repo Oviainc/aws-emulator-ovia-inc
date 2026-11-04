@@ -28,8 +28,9 @@
 //!    create persists nothing.
 //! 5. A `Name` may hold only letters, numbers, dash and underscore; anything else is
 //!    refused with HTTP 400.
-//! 6. An id the store does not hold is refused under the `InvalidInputException`
-//!    class, never answered with a hollow 200 — and the threat and trusted entity
+//! 6. An entity-set id the detector does not hold is refused with the entity-set
+//!    families' absence refusal — HTTP 404 under the `ResourceNotFoundException`
+//!    class — never answered with a hollow 200; and the threat and trusted entity
 //!    sets are separate resources: neither id resolves through the other's path.
 
 use serde_json::{json, Value};
@@ -37,6 +38,7 @@ use serde_json::{json, Value};
 use crate::detector_lifecycle::{
     call, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
 };
+use crate::set_delete_terminality::assert_entity_set_absent;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     ENTITY_SET_TRANSITION_MILLIS, THREAT_ENTITY_SETS_PER_DETECTOR,
 };
@@ -640,31 +642,15 @@ async fn an_id_the_store_does_not_hold_is_refused_rather_than_answered() {
     .await;
 
     // Each row is an id no store holds: a well-formed detector id, a value that
-    // cannot be one, a well-formed set id and a value that cannot be one.
-    let rows: Vec<(&str, String, String)> = vec![
-        (
-            "absent detector",
-            ABSENT_DETECTOR_ID.to_string(),
-            set_id.clone(),
-        ),
-        (
-            "malformed detector",
-            "not-a-detector".to_string(),
-            set_id.clone(),
-        ),
-        (
-            "absent set",
-            detector_id.clone(),
-            ABSENT_SET_ID.to_string(),
-        ),
-        (
-            "malformed set",
-            detector_id.clone(),
-            "not-a-set".to_string(),
-        ),
-    ];
-    for (case, detector, set) in rows {
-        let (status, got) = get_set(&router, &detector, &set).await;
+    // cannot be one, a well-formed set id and a value that cannot be one. The
+    // detector rows are refused with the detector family's own refusal and the set
+    // rows with the entity-set families' absence refusal, because they name
+    // different resources.
+    for (case, detector) in [
+        ("absent detector", ABSENT_DETECTOR_ID.to_string()),
+        ("malformed detector", "not-a-detector".to_string()),
+    ] {
+        let (status, got) = get_set(&router, &detector, &set_id).await;
         assert_eq!(
             status, 400,
             "case {case:?}: expected 400, got {status} {got:?}"
@@ -674,6 +660,17 @@ async fn an_id_the_store_does_not_hold_is_refused_rather_than_answered() {
             INVALID_INPUT,
             "case {case:?}: expected {INVALID_INPUT}, got {got:?}"
         );
+        assert!(
+            got.get("status").is_none(),
+            "case {case:?}: a refusal must report no entity set, got {got:?}"
+        );
+    }
+    for (case, set) in [
+        ("absent set", ABSENT_SET_ID),
+        ("malformed set", "not-a-set"),
+    ] {
+        let (status, got) = get_set(&router, &detector_id, set).await;
+        assert_entity_set_absent(case, status, &got, set);
         assert!(
             got.get("status").is_none(),
             "case {case:?}: a refusal must report no entity set, got {got:?}"
@@ -749,11 +746,14 @@ async fn a_threat_entity_set_and_a_trusted_entity_set_are_separate_resources() {
         "a token replayed across the two creates must not hand back the other resource, got {trusted_id}"
     );
 
-    // Neither id resolves through the other's path.
+    // Neither id resolves through the other's path: each family holds its own ids,
+    // so the other's is an id that family does not hold — its absence refusal.
     let (status, got) = get_set(&router, &detector_id, &trusted_id).await;
-    assert_eq!(
-        status, 400,
-        "case \"trusted id on the threat path\": expected 400, got {status} {got:?}"
+    assert_entity_set_absent(
+        "trusted id on the threat path",
+        status,
+        &got,
+        &trusted_id,
     );
     let (status, got) = call(
         &router,
@@ -762,10 +762,7 @@ async fn a_threat_entity_set_and_a_trusted_entity_set_are_separate_resources() {
         None,
     )
     .await;
-    assert_eq!(
-        status, 400,
-        "case \"threat id on the trusted path\": expected 400, got {status} {got:?}"
-    );
+    assert_entity_set_absent("threat id on the trusted path", status, &got, &threat_id);
 
     // Each read on its own path still reports its own set.
     let threat = read(&router, &detector_id, &threat_id, "threat").await;

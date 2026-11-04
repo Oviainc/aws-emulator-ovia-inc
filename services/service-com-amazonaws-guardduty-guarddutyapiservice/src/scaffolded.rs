@@ -207,6 +207,29 @@ pub const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
 /// failed on the server: see [`Scaffolded::in_progress`].
 pub const INTERNAL_SERVER_ERROR_EXCEPTION: &str = "InternalServerErrorException";
 
+/// The error CLASS GuardDuty names a request that addresses a resource the
+/// service does not hold, on the families whose absence refusal is a 404.
+///
+/// A modelled shape of this service (`httpError` 404, members `message` and
+/// `type` — `smithy_query(shape="ResourceNotFoundException")`), so an SDK
+/// resolves it from the `x-amzn-errortype` header and a caller's not-found
+/// branch fires. The operations that answer it are the ones whose family reports
+/// absence this way, whether or not their own error list names the shape: see
+/// [`Scaffolded::not_found`].
+pub const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// The sentence GuardDuty refuses an entity-set id the detector does not hold
+/// with: ONE fixed text for the whole class, naming neither the member that
+/// carried the id nor the value itself.
+///
+/// It is the ENTITY-SET families' absence refusal — a trusted entity set and a
+/// threat entity set, read, updated or deleted — and it is the same sentence
+/// whatever the FORM of the id and whoever minted it: a value no create ever
+/// minted, one minted under another detector and one a delete has already taken
+/// out of the detector's holdings are the same absence. Shared by both families'
+/// operations so the two cannot drift.
+pub const ENTITY_SET_NOT_FOUND_MESSAGE: &str = "The specified entity set does not exist.";
+
 /// `message` of a classified rejection, rendered with the `jsonName` the modeled
 /// envelope gives it (`smithy_query(shape="BadRequestException")`).
 ///
@@ -292,20 +315,30 @@ pub struct ClassifiedError {
     /// The modeled error shape the class is enveloped in, written to
     /// `x-amzn-errortype`.
     envelope: &'static str,
+    /// The HTTP status the refusal carries — the status of the modelled shape the
+    /// class belongs to, which is not the same for every class.
+    status: u16,
     /// Why the request was refused: built from the request, never from the store.
     message: String,
 }
 
 impl ClassifiedError {
-    /// A rejection of class `class`, enveloped in `envelope`, carrying `message`.
+    /// A rejection of class `class`, enveloped in `envelope`, answered with
+    /// `status` and carrying `message`.
     ///
     /// The body's `type` is set from `class` rather than taken separately: the two
     /// are the same fact, and a body whose `__type` and `type` disagreed would
     /// describe two different errors at once.
-    pub fn new(class: &'static str, envelope: &'static str, message: impl Into<String>) -> Self {
+    pub fn new(
+        class: &'static str,
+        envelope: &'static str,
+        status: u16,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             class,
             envelope,
+            status,
             message: message.into(),
         }
     }
@@ -313,6 +346,11 @@ impl ClassifiedError {
     /// The error class this rejection is named by on the wire.
     pub fn class(&self) -> &'static str {
         self.class
+    }
+
+    /// The HTTP status this rejection is answered with.
+    pub fn status(&self) -> u16 {
+        self.status
     }
 }
 
@@ -342,7 +380,8 @@ pub enum Scaffolded<E> {
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
     /// A client rejection rendered under GuardDuty's own error class rather than
-    /// under the `BadRequestException` envelope the model names. HTTP 400.
+    /// under the `BadRequestException` envelope the model names. The status is the
+    /// one the class's own modelled shape carries ([`ClassifiedError::status`]).
     Classified(ClassifiedError),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -396,6 +435,34 @@ impl<E> Scaffolded<E> {
         Self::Classified(ClassifiedError::new(
             INVALID_INPUT_EXCEPTION,
             BAD_REQUEST_EXCEPTION,
+            // `BadRequestException` carries `httpError` 400
+            // (`smithy_query(shape="BadRequestException")`), and the class is one
+            // of the rejections it envelopes.
+            400,
+            message,
+        ))
+    }
+
+    /// Refuse the request as GuardDuty refuses one that addresses a resource it
+    /// does not hold, on a family whose absence refusal is the 404
+    /// [`RESOURCE_NOT_FOUND_EXCEPTION`] class: that class in the body's `__type`,
+    /// in its `type` member AND in the `x-amzn-errortype` header, because the
+    /// class is itself a modelled shape of this service, so an SDK unmarshals the
+    /// response into it and a caller's not-found branch runs.
+    ///
+    /// Reach for it only where the family reports absence this way: the
+    /// uploaded-list families answer their own fixed sentence under
+    /// [`Self::invalid_input`] instead.
+    ///
+    /// `message` names neither the member nor the caller's value, as this
+    /// service's absence refusals do not.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::Classified(ClassifiedError::new(
+            RESOURCE_NOT_FOUND_EXCEPTION,
+            RESOURCE_NOT_FOUND_EXCEPTION,
+            // `ResourceNotFoundException` carries `httpError` 404
+            // (`smithy_query(shape="ResourceNotFoundException")`).
+            404,
             message,
         ))
     }
@@ -415,6 +482,9 @@ impl<E> Scaffolded<E> {
         Self::Classified(ClassifiedError::new(
             INTERNAL_SERVER_ERROR_EXCEPTION,
             INTERNAL_SERVER_ERROR_EXCEPTION,
+            // The status of a request the service will not perform rather than
+            // the shape's own 500: nothing failed on the server.
+            400,
             message,
         ))
     }
@@ -492,10 +562,12 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
-            // `BadRequestException` carries `httpError` 400
-            // (`smithy_query(shape="BadRequestException")`), and the class is one of
-            // the rejections it envelopes.
-            Self::Classified(_) => 400,
+            // The status of the modelled shape the rejection's class belongs to,
+            // carried on the rejection itself: `BadRequestException` is
+            // `httpError` 400 and `ResourceNotFoundException` 404
+            // (`smithy_query(shape="ResourceNotFoundException")`), so one
+            // constant could not answer for both.
+            Self::Classified(e) => e.status(),
             Self::ValidationException(_) => 400,
         }
     }

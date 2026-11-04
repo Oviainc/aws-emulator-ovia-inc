@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIPSet
-//! IMPLEMENTED: accepts the deletion of the IPSet the request's detector holds under
-//! `IpSetId`, moving it to `DELETE_PENDING` with the clock owing it `DELETED`, which
-//! is what `GetIPSet` reports afterwards.
+//! IMPLEMENTED: deletes the IPSet the request's detector holds under `IpSetId`,
+//! settling it at once on the terminal `DELETED` status `GetIPSet` reports
+//! afterwards. The id stops being one the detector holds, so a SECOND delete of it
+//! is refused exactly like an id the detector never held.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -152,26 +153,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::detector_id_rejection(&input.detector_id),
             ));
         };
-        let Some(ip_set) = detector.ip_sets.get(&input.ip_set_id) else {
-            // An `IpSetId` this detector does not hold is the absence every
-            // uploaded-list operation reports the same way
-            // ([`crate::state::SET_ID_NOT_FOUND_MESSAGE`]): one fixed sentence,
-            // whatever the form of the id and whoever minted it.
+        // An `IpSetId` this detector does not hold is the absence every
+        // uploaded-list operation reports the same way
+        // ([`crate::state::SET_ID_NOT_FOUND_MESSAGE`]): one fixed sentence,
+        // whatever the form of the id and whoever minted it.
+        //
+        // A list a delete has already taken out of the detector's holdings is that
+        // same absence: the delete completed, so there is no second deletion to
+        // perform and nothing left to accept. The record is still RETAINED so
+        // `GetIPSet` can report its terminal status, but being readable on its own
+        // id is not the same as being a list this detector holds.
+        if detector
+            .ip_sets
+            .get(&input.ip_set_id)
+            .is_none_or(crate::state::IpSetRecord::is_deleting)
+        {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::SET_ID_NOT_FOUND_MESSAGE,
             ));
-        };
-        // A second delete of the same id asks for the state the list is already in,
-        // so it writes nothing at all: the id still resolves, so the call is
-        // accepted, and it moves neither the record, nor the detector, nor an
-        // instant of this state's "this resource changed now" counter.
-        if ip_set.is_deleting() {
-            return Ok(DeleteIPSetOutput {});
         }
 
-        // Past the refusals and past that no-op this is a MUTATION, so it advances
-        // this state's clock: the instant it hands out is when the deletion was
-        // accepted, and what the DELETED transition is owed from.
+        // Past the refusals this is a MUTATION, so it advances this state's clock:
+        // the instant it hands out is when the deletion happened.
         let now = state.tick_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // The detector resolved above under the same lock, so this cannot be
@@ -183,16 +186,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Deletes the IPSet specified by the ipSetId" (this operation's own
-        // documentation): the list moves to `DELETE_PENDING` and the clock owes it
-        // `DELETED` — `GetIPSet`'s `Status` is `@required` and its enum carries both
-        // (`smithy_query(operation="GetIPSet")`), so the status after a delete is
-        // something a read reports rather than a refusal. A second delete of the same
-        // id is accepted and moves nothing: it returned above, before the clock was
-        // read.
+        // documentation). The delete is SYNCHRONOUS: a read straight afterwards
+        // reports `DELETED`, the terminal member of the status enum
+        // (`smithy_query(shape="IpSetStatus")`), so the list settles on it here
+        // rather than being parked in the `DELETE_PENDING` the enum also carries —
+        // there is no span for a caller to observe. `delete_ip_set` is what accepts
+        // the deletion and bounds the deleted records the detector retains so
+        // `GetIPSet` can still report that status.
         let accepted = detector
             .delete_ip_set(&input.ip_set_id, now)
             .unwrap_or(false);
         if accepted {
+            if let Some(ip_set) = detector.ip_sets.get_mut(&input.ip_set_id) {
+                ip_set.status = crate::state::IP_SET_DELETED.to_string();
+                ip_set.status_due_millis = None;
+            }
             // The detector holds one fewer LIVE sub-resource than before, which is
             // the same change `CreateIPSet` records on it in the other direction.
             detector.updated_at_millis = now;

@@ -5,7 +5,7 @@
 //!
 //! `threat_intel_sets.rs` owns the create-and-read half of the threat-list lifecycle;
 //! this suite owns the delete, which answered HTTP 501 `NotImplemented` and so left
-//! the `create -> (ACTIVATING -> ACTIVE) -> DELETE_PENDING -> DELETED` state machine
+//! the `create -> (ACTIVATING -> ACTIVE) -> DELETED` state machine
 //! unverifiable. Every request goes through
 //! [`smithy_server_runtime::MultiServiceRouter::dispatch`] (the harness lives in the
 //! `detector_lifecycle` suite), so routing, restJson1 (de)serialization,
@@ -13,13 +13,13 @@
 //!
 //! The rules under test, each asserted over a SET of inputs rather than one call:
 //!
-//! 1. `DeleteThreatIntelSet` moves the list to `DELETE_PENDING` and the CLOCK owes it
-//!    `DELETED` — `GetThreatIntelSet`'s `Status` is `@required` and its enum carries
-//!    both (`smithy_query(shape="ThreatIntelSetStatus")`), so the status after a
-//!    delete is something a read reports rather than a refusal — whatever status the
-//!    list was in when the delete arrived, and without touching any other member.
-//! 2. A repeated delete is accepted and moves nothing: it neither restarts the
-//!    transition nor walks a `DELETED` record backwards.
+//! 1. `DeleteThreatIntelSet` completes at once: the list settles on `DELETED`, the
+//!    terminal member of `GetThreatIntelSet`'s `@required` `Status` enum
+//!    (`smithy_query(shape="ThreatIntelSetStatus")`), so the status after a delete is
+//!    something a read reports rather than a refusal — whatever status the list was
+//!    in when the delete arrived, and without touching any other member.
+//! 2. The id stops being one the detector holds, so a SECOND delete is refused
+//!    exactly like an id it never held, and writes nothing.
 //! 3. A deleted list occupies none of the detector's
 //!    `state::THREAT_INTEL_SETS_PER_DETECTOR` slots, so a delete frees room for a
 //!    create, its `ClientToken` no longer resolves to it, `ListThreatIntelSets`
@@ -57,7 +57,6 @@ const ENVELOPE: &str = "BadRequestException";
 const INACTIVE: &str = "INACTIVE";
 const ACTIVATING: &str = "ACTIVATING";
 const ACTIVE: &str = "ACTIVE";
-const DELETE_PENDING: &str = "DELETE_PENDING";
 const DELETED: &str = "DELETED";
 
 /// A margin on top of a transition span, for the wall clock the handler reads.
@@ -69,7 +68,7 @@ pub(crate) fn past_activation() -> Duration {
     Duration::from_millis(span + SETTLE_MARGIN_MILLIS)
 }
 
-/// Long enough that a deleted list's `DELETE_PENDING` -> `DELETED` transition is due.
+/// Long enough that any transition this family opens would have come due.
 pub(crate) fn past_deletion() -> Duration {
     let span = u64::try_from(state::THREAT_INTEL_SET_DELETION_SPAN_MILLIS).unwrap_or_default();
     Duration::from_millis(span + SETTLE_MARGIN_MILLIS)
@@ -218,15 +217,14 @@ fn not_owned(member: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 1: a delete moves the list to DELETE_PENDING, whatever status it was in,
-// and only the clock settles it to DELETED.
+// Rule 1: a delete settles the list on DELETED, whatever status it was in.
 // ---------------------------------------------------------------------------
 
 /// The rows differ along the status the list was in when the delete arrived: the
 /// settled `INACTIVE`, the TRANSIENT `ACTIVATING` (a transition the clock had not
 /// settled yet), and the settled `ACTIVE`.
 #[tokio::test]
-async fn a_delete_moves_any_status_to_delete_pending_then_the_clock_owes_deleted() {
+async fn a_delete_settles_any_status_on_deleted() {
     for (case, request, wait_before_delete, status_before) in [
         (
             "a list nobody activated",
@@ -281,22 +279,22 @@ async fn a_delete_moves_any_status_to_delete_pending_then_the_clock_owes_deleted
 
         accepted_delete(&router, &detector_id, &set_id, case).await;
 
-        // The list is still READABLE on its own id, reporting the status the delete
-        // moved it to: `DELETE_PENDING` is a member of the modelled enum, so a
-        // delete is not an erasure a read refuses.
-        let pending = read(&router, &detector_id, &set_id, case).await;
+        // The list is still READABLE on its own id, reporting the terminal status
+        // the delete settled it on: `DELETED` is a member of the modelled enum, so a
+        // delete is not an erasure a read refuses. There is no span to observe, so
+        // the status is terminal STRAIGHT after the delete.
+        let deleted = read(&router, &detector_id, &set_id, case).await;
         assert_eq!(
-            pending["status"].as_str(),
-            Some(DELETE_PENDING),
-            "case {case:?}: a read straight after the delete must report {DELETE_PENDING}, \
-             got {:?}",
-            pending["status"]
+            deleted["status"].as_str(),
+            Some(DELETED),
+            "case {case:?}: a read straight after the delete must report {DELETED}, got {:?}",
+            deleted["status"]
         );
-        // Reading does not settle the deletion early.
+        // Reading changes nothing a later read sees.
         let again = read(&router, &detector_id, &set_id, case).await;
         assert_eq!(
-            again, pending,
-            "case {case:?}: reading must not move the status, got {pending:?} then {again:?}"
+            again, deleted,
+            "case {case:?}: reading must not move the status, got {deleted:?} then {again:?}"
         );
         // And the delete touched nothing else the create stored.
         for member in ["name", "format", "location", "expectedBucketOwner", "tags"] {
@@ -307,42 +305,35 @@ async fn a_delete_moves_any_status_to_delete_pending_then_the_clock_owes_deleted
                 Value::Null
             });
             assert_eq!(
-                pending[member], expected,
+                deleted[member], expected,
                 "case {case:?}: member {member} must survive the delete, got {:?}",
-                pending[member]
+                deleted[member]
             );
         }
 
         sleep(past_deletion());
 
-        let settled = read(&router, &detector_id, &set_id, case).await;
-        assert_eq!(
-            settled["status"].as_str(),
-            Some(DELETED),
-            "case {case:?}: once the deletion is due the status must be {DELETED}, got {:?}",
-            settled["status"]
-        );
-        // `DELETED` is terminal and persisted, not recomputed per call.
+        // `DELETED` is terminal and persisted, not recomputed per call: waiting out
+        // any span this service opens moves nothing.
         let stable = read(&router, &detector_id, &set_id, case).await;
         assert_eq!(
-            stable, settled,
-            "case {case:?}: a deleted list must read the same twice, got {settled:?} then \
-             {stable:?}"
+            stable, deleted,
+            "case {case:?}: {DELETED} is terminal, got {deleted:?} then {stable:?}"
         );
     }
 }
 
 // ---------------------------------------------------------------------------
-// Rule 2: a repeated delete is accepted and moves nothing.
+// Rule 2: a second delete is refused like an id the detector never held.
 // ---------------------------------------------------------------------------
 
-/// The rows differ along WHEN the second delete arrives: while the first deletion is
-/// still pending, and after the clock settled it to `DELETED`.
+/// The rows differ along WHEN the second delete arrives: straight after the first,
+/// and once every transition this service opens would have come due.
 #[tokio::test]
-async fn a_repeated_delete_is_accepted_and_moves_nothing() {
-    for (case, wait_before_second, expected) in [
-        ("a second delete while DELETE_PENDING", false, DELETE_PENDING),
-        ("a second delete once DELETED", true, DELETED),
+async fn a_repeated_delete_is_refused_and_moves_nothing() {
+    for (case, wait_before_second) in [
+        ("a second delete straight after the first", false),
+        ("a second delete a span later", true),
     ] {
         let router = new_router();
         let detector_id = enabled_detector(&router).await;
@@ -365,30 +356,27 @@ async fn a_repeated_delete_is_accepted_and_moves_nothing() {
         let before = read(&router, &detector_id, &set_id, case).await;
         assert_eq!(
             before["status"].as_str(),
-            Some(expected),
-            "case {case:?}: expected status {expected} before the second delete, got {:?}",
+            Some(DELETED),
+            "case {case:?}: expected status {DELETED} before the second delete, got {:?}",
             before["status"]
         );
 
-        // Accepted, exactly like the first: the id still resolves, and deleting an
-        // already-deleted list asks for the state it is already in.
-        accepted_delete(&router, &detector_id, &set_id, case).await;
+        // The id is no longer one the detector holds, so the second delete is
+        // refused with the family's absence sentence and writes nothing.
+        let (status, body) = delete_set(&router, &detector_id, &set_id).await;
+        assert_rejection(case, status, &body, SET_ID_NOT_FOUND_MESSAGE);
         let after = read(&router, &detector_id, &set_id, case).await;
         assert_eq!(
             after, before,
-            "case {case:?}: a repeated delete must move nothing, got {before:?} then {after:?}"
+            "case {case:?}: a refused delete must move nothing, got {before:?} then {after:?}"
         );
 
-        // Nor does it restart the transition: a list the clock had already settled to
-        // `DELETED` is still `DELETED` a span later, and a pending one still settles
-        // from the FIRST delete's due instant.
+        // Nor does it reopen a transition: the record is still DELETED a span later.
         sleep(past_deletion());
         let later = read(&router, &detector_id, &set_id, case).await;
         assert_eq!(
-            later["status"].as_str(),
-            Some(DELETED),
-            "case {case:?}: a repeated delete must not restart the transition, got {:?}",
-            later["status"]
+            later, before,
+            "case {case:?}: a refused delete must not reopen a transition, got {later:?}"
         );
     }
 }
@@ -480,13 +468,13 @@ async fn a_deleted_list_frees_a_slot_of_the_published_quota() {
         "case \"the list the second delete made room for\": got {got:?}"
     );
 
-    // Both deleted lists are still reported, and every list the deletes did not name
-    // is untouched — same name, same status.
+    // Both deleted lists are still reported, in their terminal status, and every
+    // list the deletes did not name is untouched — same name, same status.
     for (position, id) in ids.iter().enumerate().take(2) {
         let deleted = read(&router, &detector_id, id, "a deleted list of the quota run").await;
         assert_eq!(
             deleted["status"].as_str(),
-            Some(DELETE_PENDING),
+            Some(DELETED),
             "case \"deleted list {position}\": got {deleted:?}"
         );
     }
@@ -547,11 +535,12 @@ async fn a_deleted_list_is_no_longer_named_by_the_listing() {
             expected,
             "case {case:?}: the listing must drop the deleted list and keep the others"
         );
-        // Still readable on its own id, with the status the delete moved it to.
+        // Still readable on its own id, with the terminal status the delete settled
+        // it on.
         let deleted = read(&router, &detector_id, &ids[victim], case).await;
         assert_eq!(
             deleted["status"].as_str(),
-            Some(DELETE_PENDING),
+            Some(DELETED),
             "case {case:?}: the deleted list must still be readable, got {deleted:?}"
         );
     }
@@ -595,14 +584,14 @@ async fn the_retained_deleted_lists_are_bounded_oldest_deletion_first() {
         SET_ID_NOT_FOUND_MESSAGE,
     );
 
-    // Every later deletion is still reported, with the status its delete moved it to.
+    // Every later deletion is still reported, in the terminal status its delete
+    // settled it on.
     for (position, id) in ids.iter().enumerate().skip(1) {
         let got = read(&router, &detector_id, id, "a retained deleted list").await;
-        let status = got["status"].as_str().unwrap_or_default();
-        assert!(
-            status == DELETE_PENDING || status == DELETED,
-            "case \"retained deleted list {position}\": expected {DELETE_PENDING} or {DELETED}, \
-             got {got:?}"
+        assert_eq!(
+            got["status"].as_str(),
+            Some(DELETED),
+            "case \"retained deleted list {position}\": expected {DELETED}, got {got:?}"
         );
     }
 }
@@ -764,7 +753,7 @@ async fn only_the_region_that_created_a_list_may_delete_it() {
     let (_, got) = call_in(&router, home, "GET", &path, None).await;
     assert_eq!(
         got["status"].as_str(),
-        Some(DELETE_PENDING),
-        "case \"a delete from its own Region\": expected {DELETE_PENDING}, got {got:?}"
+        Some(DELETED),
+        "case \"a delete from its own Region\": expected {DELETED}, got {got:?}"
     );
 }

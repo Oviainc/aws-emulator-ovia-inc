@@ -23,14 +23,14 @@
 //!    status becomes the transitional one and only the CLOCK settles it
 //!    (`state::IP_SET_TRANSITION_MILLIS`); asking for the status the list already has
 //!    moves nothing, and an update that omits `Activate` leaves the status alone.
-//! 3. `DeleteIPSet` moves the list to `DELETE_PENDING` and the clock owes it
-//!    `DELETED` — `GetIPSet`'s `Status` is `@required` and its enum carries both
+//! 3. `DeleteIPSet` completes at once: the list settles on the terminal `DELETED`
+//!    — the terminal member of `GetIPSet`'s `@required` `Status` enum
 //!    (`smithy_query(operation="GetIPSet")`) — whatever status the list was in when
-//!    the delete arrived. A repeated delete is accepted and moves nothing, and an
-//!    update of a deleted list collides with the delete already running on it, so it
-//!    is refused under the `InternalServerErrorException` class with the 400 of a
-//!    request the service will not perform, carrying
-//!    `state::OPERATION_IN_PROGRESS_MESSAGE`.
+//!    the delete arrived, and the id stops being one the detector holds, so a SECOND
+//!    delete is refused exactly like an id it never held. An update of a deleted
+//!    list collides with the delete the service has served on it, so it is refused
+//!    under the `InternalServerErrorException` class with the 400 of a request the
+//!    service will not perform, carrying `state::OPERATION_IN_PROGRESS_MESSAGE`.
 //! 4. A deleted list occupies none of the detector's `state::IP_SETS_PER_DETECTOR`
 //!    slots, so a delete frees room for a create, and nothing a delete did touches
 //!    the detector's other IPSets.
@@ -48,8 +48,8 @@ use crate::detector_lifecycle::{
 use crate::ip_set_lifecycle::past_the_transition;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     DETECTOR_ID_MEMBER, IP_SETS_PER_DETECTOR, IP_SET_ACTIVATING, IP_SET_ACTIVE,
-    IP_SET_DEACTIVATING, IP_SET_DELETED, IP_SET_DELETE_PENDING, IP_SET_INACTIVE,
-    OPERATION_IN_PROGRESS_MESSAGE, SET_ID_NOT_FOUND_MESSAGE,
+    IP_SET_DEACTIVATING, IP_SET_DELETED, IP_SET_INACTIVE, OPERATION_IN_PROGRESS_MESSAGE,
+    SET_ID_NOT_FOUND_MESSAGE,
 };
 
 /// The error class every client rejection on this service carries in the body's
@@ -532,7 +532,7 @@ async fn an_update_moves_the_activation_status_only_through_the_clock() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 3: a delete reports DELETE_PENDING, then DELETED.
+// Rule 3: a delete settles the list on DELETED and the id stops resolving.
 // ---------------------------------------------------------------------------
 
 /// The statuses a list can be in when the delete arrives: both settled ones, and a
@@ -546,7 +546,7 @@ fn delete_rows() -> Vec<(&'static str, bool, bool)> {
 }
 
 #[tokio::test]
-async fn a_delete_reports_delete_pending_and_then_deleted() {
+async fn a_delete_settles_the_list_on_deleted_and_the_id_stops_resolving() {
     let router = new_router();
     let detector = enabled_detector(&router).await;
 
@@ -573,13 +573,12 @@ async fn a_delete_reports_delete_pending_and_then_deleted() {
             "case {case:?}: delete-ip-set expected the modelled 200, got {status} {body:?}"
         );
 
-        // The span is never zero, so a caller reading straight after the delete
-        // still observes DELETE_PENDING.
-        let pending = status_of(&router, &detector, &id, case).await;
+        // The delete completed, so a read STRAIGHT after it reports the terminal
+        // status: there is no pending span for a caller to observe.
+        let deleted = status_of(&router, &detector, &id, case).await;
         assert_eq!(
-            pending, IP_SET_DELETE_PENDING,
-            "case {case:?}: expected {IP_SET_DELETE_PENDING} straight after the delete, \
-             got {pending:?}"
+            deleted, IP_SET_DELETED,
+            "case {case:?}: expected {IP_SET_DELETED} straight after the delete, got {deleted:?}"
         );
 
         // The record is still reported, and reports what the create stored: a delete
@@ -593,42 +592,42 @@ async fn a_delete_reports_delete_pending_and_then_deleted() {
             body["name"]
         );
 
-        // A repeated delete is accepted and moves nothing.
+        // A second delete names an id the detector no longer holds, so it is refused
+        // like one it never held, and writes nothing.
         let detector_before = read_detector(&router, &detector, case).await;
         let (status, body) = delete_ip_set(&router, &detector, &id).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: a repeated delete must be accepted, got {status} {body:?}"
+            status, 400,
+            "case {case:?}: a second delete must be refused, got {status} {body:?}"
         );
-        let still_pending = status_of(&router, &detector, &id, case).await;
+        let class = error_code(&body);
         assert_eq!(
-            still_pending, IP_SET_DELETE_PENDING,
-            "case {case:?}: a repeated delete must not restart the transition, got \
-             {still_pending:?}"
+            class, INVALID_INPUT,
+            "case {case:?}: expected the {INVALID_INPUT} class, got {class:?} {body:?}"
+        );
+        assert_eq!(
+            body["message"].as_str().unwrap_or_default(),
+            SET_ID_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected the absence sentence, got {body:?}"
+        );
+        let still_deleted = status_of(&router, &detector, &id, case).await;
+        assert_eq!(
+            still_deleted, IP_SET_DELETED,
+            "case {case:?}: a refused second delete must change nothing, got {still_deleted:?}"
         );
         // The detector's own `UpdatedAt` moves when the set of LIVE sub-resources it
-        // holds changes, so the FIRST delete moved it and a repeat does not.
+        // holds changes, so the FIRST delete moved it and a refused repeat does not.
         let detector_after = read_detector(&router, &detector, case).await;
         assert_eq!(
             detector_after["updatedAt"], detector_before["updatedAt"],
-            "case {case:?}: a repeated delete must not move the detector's updatedAt, \
+            "case {case:?}: a refused second delete must not move the detector's updatedAt, \
              expected {:?}, got {:?}",
             detector_before["updatedAt"], detector_after["updatedAt"]
         );
 
+        // DELETED is terminal: waiting out any span this service opens does not move
+        // it.
         tokio::time::sleep(past_the_transition()).await;
-
-        let deleted = status_of(&router, &detector, &id, case).await;
-        assert_eq!(
-            deleted, IP_SET_DELETED,
-            "case {case:?}: expected {IP_SET_DELETED} once the clock owes it, got {deleted:?}"
-        );
-        // DELETED is terminal: nothing moves it again, a repeated delete included.
-        let (status, body) = delete_ip_set(&router, &detector, &id).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: a delete of a DELETED list must be accepted, got {status} {body:?}"
-        );
         let again = status_of(&router, &detector, &id, case).await;
         assert_eq!(
             again, IP_SET_DELETED,
@@ -637,17 +636,17 @@ async fn a_delete_reports_delete_pending_and_then_deleted() {
     }
 }
 
-/// An update of a list whose delete has been accepted collides with the delete
-/// already running on it — in both the transitional and the terminal status — and the
-/// refusal changes nothing.
+/// An update of a list whose delete the service has served collides with that
+/// delete — the record is retained, so the change is refused rather than ignored —
+/// and the refusal changes nothing.
 #[tokio::test]
 async fn an_update_of_a_deleted_ip_set_is_refused() {
     let router = new_router();
     let detector = enabled_detector(&router).await;
 
     for (case, wait) in [
-        ("while the delete is still DELETE_PENDING", false),
-        ("once the list is DELETED", true),
+        ("straight after the delete", false),
+        ("once every transition would have come due", true),
     ] {
         let id = created(
             &router,
@@ -785,12 +784,12 @@ async fn a_delete_frees_one_of_the_detectors_slots() {
          IPSet, got {replacement:?}"
     );
 
-    // The deleted list still reports its own status, and every other IPSet is
-    // exactly where it was.
+    // The deleted list still reports its own terminal status, and every other IPSet
+    // is exactly where it was.
     let deleted_status = status_of(&router, &detector, &freed, "the deleted list").await;
     assert_eq!(
-        deleted_status, IP_SET_DELETE_PENDING,
-        "case \"the deleted list\": expected {IP_SET_DELETE_PENDING}, got {deleted_status:?}"
+        deleted_status, IP_SET_DELETED,
+        "case \"the deleted list\": expected {IP_SET_DELETED}, got {deleted_status:?}"
     );
     for (index, id) in ids.iter().enumerate() {
         let case = format!("ip set {} after the delete", index + 1);

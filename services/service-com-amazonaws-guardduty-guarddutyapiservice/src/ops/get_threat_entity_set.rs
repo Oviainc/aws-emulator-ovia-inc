@@ -176,16 +176,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(set) = detector
             .threat_entity_sets
             .get_mut(&input.threat_entity_set_id)
+            .filter(|set| !set.is_deleting())
         else {
-            // Classified from the REQUEST, like every other id this service
-            // resolves: a value that cannot be an entity-set id at all is a
-            // parameter failure, a well-formed one this detector does not hold an
-            // ownership failure.
-            return Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::minted_id_rejection(
-                    crate::state::THREAT_ENTITY_SET_ID_MEMBER,
-                    &input.threat_entity_set_id,
-                ),
+            // An entity-set id this detector does not hold — one no create minted,
+            // one minted under another detector, and one a delete has taken out of
+            // the detector's holdings — is one absence, reported the way BOTH
+            // entity-set families report it
+            // ([`crate::scaffolded::ENTITY_SET_NOT_FOUND_MESSAGE`]): HTTP 404 under
+            // the `ResourceNotFoundException` class, with one fixed sentence that
+            // names neither the member nor the value.
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                crate::scaffolded::ENTITY_SET_NOT_FOUND_MESSAGE,
             ));
         };
         set.settle(now);

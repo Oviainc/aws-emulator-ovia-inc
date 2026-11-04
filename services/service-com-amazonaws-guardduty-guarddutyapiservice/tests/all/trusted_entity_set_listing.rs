@@ -13,9 +13,9 @@
 //! 1. `ListTrustedEntitySets` names exactly the trusted entity sets the request's detector
 //!    holds and GuardDuty still keeps — every id `CreateTrustedEntitySet` minted and
 //!    nothing else — in `TrustedEntitySetId` order, and each id it reports resolves
-//!    through `GetTrustedEntitySet`. A set whose delete has been accepted is no longer
-//!    one the detector holds, so the list stops naming it even while a read still
-//!    reports it.
+//!    through `GetTrustedEntitySet`. A set whose delete has been served is no longer
+//!    one the detector holds, so the list stops naming it and a read of it is
+//!    refused.
 //! 2. It is PAGINATED (`smithy_query(operation="ListTrustedEntitySets")` reports
 //!    `inputToken`/`outputToken` `NextToken`, `items` `TrustedEntitySetIds`, `pageSize`
 //!    `MaxResults`): walking the pages with any page size yields each id exactly once in
@@ -37,6 +37,7 @@ use serde_json::{json, Value};
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
 };
+use crate::set_delete_terminality::assert_entity_set_absent;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     DETECTOR_ID_MEMBER, ENTITY_SET_ACTIVATING, ENTITY_SET_INACTIVE,
     ENTITY_SET_TRANSITION_MILLIS, NEXT_TOKEN_MEMBER,
@@ -319,11 +320,11 @@ async fn a_list_names_every_live_trusted_entity_set_in_order() {
     }
 }
 
-/// A set GuardDuty is no longer keeping drops out of the list while a read still reports
-/// it, and the set a later create mints takes its place — asserted over several
+/// A set GuardDuty is no longer keeping drops out of the list AND out of the reader's
+/// reach, and the set a later create mints takes its place — asserted over several
 /// create-delete cycles, each create differing from the last.
 #[tokio::test]
-async fn a_deleted_trusted_entity_set_leaves_the_list_but_not_the_reader() {
+async fn a_deleted_trusted_entity_set_leaves_the_list_and_the_reader() {
     let router = new_router();
     let detector = enabled_detector(&router).await;
     let mut gone: Vec<String> = Vec::new();
@@ -351,14 +352,17 @@ async fn a_deleted_trusted_entity_set_leaves_the_list_but_not_the_reader() {
         );
         gone.push(id);
 
-        // The deleted records are still READ: the list naming nothing is about what
-        // GuardDuty keeps, not about what it can still report.
+        // The deleted records are out of the reader's reach too: for this family the
+        // detector no longer HAS the set, so its own id resolves nothing.
         for id in &gone {
-            let status = status_of(&router, &detector, id, &case).await;
-            assert!(
-                !status.is_empty(),
-                "case {case:?}: a deleted set must still report a status, got {status:?}"
-            );
+            let (status, body) = call(
+                &router,
+                "GET",
+                &format!("/detector/{detector}/trustedentityset/{id}"),
+                None,
+            )
+            .await;
+            assert_entity_set_absent(&case, status, &body, id);
         }
     }
 }
