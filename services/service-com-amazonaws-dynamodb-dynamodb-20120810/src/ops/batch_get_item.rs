@@ -317,10 +317,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let consistent_read = requested_keys.consistent_read.unwrap_or(false);
             let table = store.active_table_mut(&region, &name, now).map_err(lift)?;
             // A table the policies in force do not let this caller read answers the
-            // denial, not its items.
-            if let Some(denial) =
-                crate::state::policy_denial(&caller, table, "dynamodb:BatchGetItem", now)
-            {
+            // denial, not its items — decided against the partitions these keys address.
+            if let Some(denial) = crate::state::authorization::denial_addressing(
+                &caller,
+                table,
+                "dynamodb:BatchGetItem",
+                now,
+                &crate::state::authorization::AddressedKeys::of_maps(
+                    table,
+                    requested_keys.keys.iter(),
+                ),
+            ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
             let mut found: Vec<crate::state::Item> = Vec::new();

@@ -348,10 +348,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = {
             let table = store.active_table(&region, &name, now).map_err(lift)?;
             // A table the policies in force do not let this caller write is not deleted
-            // from: authorization is decided before anything is removed.
-            if let Some(denial) =
-                crate::state::policy_denial(&caller, table, "dynamodb:DeleteItem", now)
-            {
+            // from: authorization is decided before anything is removed, against the
+            // partition this delete addresses.
+            if let Some(denial) = crate::state::authorization::denial_addressing(
+                &caller,
+                table,
+                "dynamodb:DeleteItem",
+                now,
+                &crate::state::authorization::AddressedKeys::of_maps(table, [&input.key]),
+            ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
             table.key_of_key_map(&input.key).map_err(lift)?

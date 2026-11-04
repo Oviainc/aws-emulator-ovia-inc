@@ -451,8 +451,16 @@ fn read_transaction(
         let name = crate::state::resolve_table_name(&select.table).map_err(lift)?;
         let table = store.active_table(region, &name, now).map_err(lift)?;
         // A table the policies in force do not let this caller act on with this
-        // statement's own action is not read at all. PartiQL has its own four actions.
-        if let Some(denial) = crate::state::policy_denial(caller, table, statement.action(), now) {
+        // statement's own action is not read at all. PartiQL has its own four actions,
+        // and the partition the statement addresses is what a conditioned statement is
+        // decided against.
+        if let Some(denial) = crate::state::authorization::denial_addressing(
+            caller,
+            table,
+            statement.action(),
+            now,
+            &crate::state::authorization::AddressedKeys::of_statement(table, statement),
+        ) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
         if select.index.is_some() {
@@ -569,9 +577,13 @@ fn write_transaction(
             entry.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD");
         {
             let table = store.active_table(region, &name, now).map_err(lift)?;
-            if let Some(denial) =
-                crate::state::policy_denial(caller, table, statement.action(), now)
-            {
+            if let Some(denial) = crate::state::authorization::denial_addressing(
+                caller,
+                table,
+                statement.action(),
+                now,
+                &crate::state::authorization::AddressedKeys::of_statement(table, statement),
+            ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
         }

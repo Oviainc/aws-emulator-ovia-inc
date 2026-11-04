@@ -813,14 +813,20 @@ impl<'a> Requested<'a> {
 
 /// `AccessDeniedException` when the policies in force do not let `caller` perform the
 /// action `requested` performs on `table`, so authorization is decided before any item is
-/// read or keyed.
+/// read or keyed — against the partition the action addresses.
 fn deny(
     caller: &crate::state::authorization::Caller,
     table: &crate::state::Table,
     requested: &Requested<'_>,
     now: ::std::time::SystemTime,
 ) -> Result<(), TransactWriteItemsError> {
-    match crate::state::policy_denial(caller, table, requested.policy_action(), now) {
+    match crate::state::authorization::denial_addressing(
+        caller,
+        table,
+        requested.policy_action(),
+        now,
+        &crate::state::authorization::AddressedKeys::of_maps(table, [requested.addressed()]),
+    ) {
         Some(denial) => Err(crate::scaffolded::Scaffolded::access_denied(denial)),
         None => Ok(()),
     }

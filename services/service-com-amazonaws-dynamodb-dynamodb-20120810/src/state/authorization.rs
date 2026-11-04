@@ -53,11 +53,40 @@
 //!
 //! An expired session credential speaks for nobody: no statement names it, so every action
 //! it asks for is refused.
+//!
+//! ## What the request itself contributes to the decision
+//!
+//! A statement may be CONDITIONED, and a condition is decided against the keys the request
+//! carries values for. Two of them belong to a data-plane call of this service:
+//!
+//! * the partition this call addresses — [`AddressedKeys`], the value(s) of the table's
+//!   `HASH` key attribute the `Key`, the `Item`, the key condition or the statement names,
+//!   one per partition the call touches. A call that addresses no partition of its own (a
+//!   table or index walk) carries no value for it and models none, so a clause over it
+//!   cannot be decided and the statement carrying that clause neither grants nor is
+//!   weakened.
+//! * the session tags the calling principal carries, which is where a policy written with
+//!   `${aws:PrincipalTag/<key>}` takes the text it stands for. They are known for a
+//!   session this emulator's STS registry minted and for nobody else, so only such a
+//!   caller declares that an absent tag key is a tag it does not carry.
+//!
+//! Both are passed through [`::service_common::iam_authorization::Request`], so the clause
+//! is decided by the tree's one evaluation of policy documents rather than here.
 
 use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
 use ::service_common::iam_authorization::{self as iam, Decision};
 
 use super::*;
+
+/// The condition key whose value is the partition a data-plane call addresses: the first
+/// key attribute of the table, which is what a fine-grained identity policy scopes a
+/// caller to one partition with.
+const LEADING_KEYS_CONDITION_KEY: &str = "dynamodb:LeadingKeys";
+
+/// The condition-key FAMILY the calling principal's session tags are named in, each member
+/// after the tag key it carries: `aws:PrincipalTag/tenant` holds the value of the session
+/// tag `tenant`.
+const PRINCIPAL_TAG_CONDITION_KEY_FAMILY: &str = "aws:PrincipalTag/";
 
 /// The principal a request speaks for, and everything the decision is made from.
 ///
@@ -81,6 +110,15 @@ pub struct Caller {
     /// Set when the principal carries a policy whose document the IAM store does not hold
     /// — an AWS-managed policy (see the module docs).
     pub unreadable_attachment: bool,
+    /// The session tags the principal carries, as STS attached them when the session was
+    /// minted: the values `aws:PrincipalTag/<key>` holds for a request this credential
+    /// signs.
+    pub tags: Vec<(String, String)>,
+    /// Set when the principal's session tags are KNOWN — a session this emulator's STS
+    /// registry holds — which is what lets a clause over a tag key the principal does NOT
+    /// carry be decided rather than left undecided. A long-term credential's tags live in
+    /// IAM and are not read here, so such a caller declares nothing about them.
+    pub tags_known: bool,
 }
 
 impl Caller {
@@ -117,19 +155,31 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
             ctx.credential_store(),
             long_term.clone(),
         )
-        .map(|caller| (caller.identity.arn, caller.identity.account, caller.role_arn)),
+        .map(|caller| {
+            (
+                caller.identity.arn,
+                caller.identity.account,
+                caller.role_arn,
+                // The tags are this registry's record of the session, so they are known
+                // exactly for a credential it minted.
+                caller.kind.is_some(),
+                caller.tags,
+            )
+        }),
         // No STS store on this engine: the credential names no session, so it speaks for
         // the long-term identity it was resolved to.
         None => Ok((
             long_term.arn.clone(),
             long_term.account.clone(),
             None,
+            false,
+            Vec::new(),
         )),
     };
     // An expired session credential speaks for nobody: it carries no documents and no
     // principal spelling. The refusal still names what was presented, so a caller reading
     // it can tell an expired credential from an unauthorized one.
-    let Ok((arn, account, role_arn)) = resolved else {
+    let Ok((arn, account, role_arn, tags_known, tags)) = resolved else {
         return Caller {
             arn: format!("an expired session credential ({access_key_id})"),
             ..Caller::default()
@@ -140,6 +190,8 @@ pub fn request_caller<Eng: Send + Sync + 'static>(
         principals: vec![arn.clone()],
         account_principals: iam::account_principals(&arn),
         arn,
+        tags,
+        tags_known,
         ..Caller::default()
     };
     // An assumed-role session is also named by the ARN of the role it is a session of,
@@ -169,14 +221,158 @@ fn account_root_arn(account: &str) -> String {
     format!("arn:aws:iam::{account}:root")
 }
 
+/// The partitions a data-plane call addresses, as the condition key that reports them
+/// holds their values: one entry per partition the `Key`, the `Item`, the key condition or
+/// the PartiQL statement names, in the order the request named them.
+///
+/// A call that addresses no partition of its own — a table or index walk — knows no value
+/// for the key and MODELS none either, which is what [`Self::whole_table`] stands for: a
+/// clause over the key then stays undecided, so a statement carrying it neither grants nor
+/// is weakened. A call whose addressed partition cannot be read at all (a key map without
+/// the table's own `HASH` attribute, a value of another type than the one the table
+/// declared for it) is in that same position, because the value the clause would be
+/// decided against is not established — and such a request is refused for what is wrong
+/// with it once the decision is past.
+#[derive(Debug, Clone, Default)]
+pub struct AddressedKeys {
+    /// `None` when the call addresses no partition of its own (see the type docs).
+    values: Option<Vec<String>>,
+}
+
+impl AddressedKeys {
+    /// A call that addresses no partition of its own: a table or index walk.
+    #[must_use]
+    pub fn whole_table() -> Self {
+        Self { values: None }
+    }
+
+    /// The partitions the key or item maps `maps` address, read against `table`'s own
+    /// partition-key attribute.
+    #[must_use]
+    pub fn of_maps<'a, I: IntoIterator<Item = &'a Item>>(table: &Table, maps: I) -> Self {
+        let partition = table.partition_key_name();
+        Self::of_values(maps.into_iter().map(|map| map.get(partition)))
+    }
+
+    /// The partitions the attribute values `values` address: a `Query`'s partition-key
+    /// equality operand, or the value a key map carries for the partition attribute. A
+    /// value that is absent, or carries no text a condition key can hold, leaves the
+    /// addressed partitions unknown (see the type docs).
+    #[must_use]
+    pub fn of_values<'a, I: IntoIterator<Item = Option<&'a AttributeValue>>>(values: I) -> Self {
+        let mut addressed = Vec::new();
+        for value in values {
+            match value.and_then(condition_key_text) {
+                Some(text) => addressed.push(text),
+                None => return Self::whole_table(),
+            }
+        }
+        // A call that named no partition at all addresses the whole table, whatever the
+        // member it would have named one in: a request whose addressed partition this
+        // could not find is in the position of one that addresses none.
+        if addressed.is_empty() {
+            return Self::whole_table();
+        }
+        Self {
+            values: Some(addressed),
+        }
+    }
+
+    /// The partition one PartiQL statement addresses: the item an `INSERT` adds, or the
+    /// partition-key equality the `WHERE` clause of a `SELECT`, `UPDATE` or `DELETE` pins.
+    /// A `SELECT` that pins none walks the table.
+    #[must_use]
+    pub fn of_statement(table: &Table, statement: &PartiqlStatement) -> Self {
+        let pinned = |predicate: &Predicate| {
+            Self::of_values([pinned_equalities(predicate).get(table.partition_key_name())])
+        };
+        match statement {
+            PartiqlStatement::Insert(insert) => Self::of_maps(table, [&insert.item]),
+            PartiqlStatement::Select(select) => match &select.filter {
+                Some(filter) => pinned(filter),
+                None => Self::whole_table(),
+            },
+            PartiqlStatement::Update(update) => pinned(&update.filter),
+            PartiqlStatement::Delete(delete) => pinned(&delete.filter),
+        }
+    }
+}
+
+/// The text a condition key holds for one partition-key value: the string itself for an
+/// `S` value, the number in the canonical form this store holds it in for an `N` one (so
+/// two spellings of one figure address one partition and decide alike), and the base64 the
+/// wire carries for a `B` one — the three types a key attribute may be declared as.
+/// Anything else is no key value at all, so it names no text.
+fn condition_key_text(value: &AttributeValue) -> Option<String> {
+    match value {
+        AttributeValue::S(text) => Some(text.clone()),
+        AttributeValue::N(text) => canonical_number_text(text).ok(),
+        AttributeValue::B(bytes) => Some(::aws_smithy_types::base64::encode(bytes)),
+        _ => None,
+    }
+}
+
+/// The condition keys this request carries values for, as `(key, value)` pairs: one entry
+/// per partition it addresses, and one per session tag the calling principal carries.
+fn condition_context(caller: &Caller, addressed: &AddressedKeys) -> Vec<(String, String)> {
+    let mut context: Vec<(String, String)> = addressed
+        .values
+        .iter()
+        .flatten()
+        .map(|value| (LEADING_KEYS_CONDITION_KEY.to_string(), value.clone()))
+        .collect();
+    for (key, value) in &caller.tags {
+        context.push((
+            format!("{PRINCIPAL_TAG_CONDITION_KEY_FAMILY}{key}"),
+            value.clone(),
+        ));
+    }
+    context
+}
+
+/// The condition keys this request MODELS, whether or not it carries a value for each: the
+/// keys whose absence from the context means the request carries no value for them rather
+/// than that this emulator cannot answer for them.
+///
+/// A call that addresses partitions knows every one it addresses, and a caller whose
+/// session tags are known knows every tag it carries — so the whole tag FAMILY is
+/// published, which is what lets a clause over a tag key the principal does not carry be
+/// decided.
+fn published_condition_keys(caller: &Caller, addressed: &AddressedKeys) -> Vec<&'static str> {
+    let mut published = Vec::new();
+    if addressed.values.is_some() {
+        published.push(LEADING_KEYS_CONDITION_KEY);
+    }
+    if caller.tags_known {
+        published.push(PRINCIPAL_TAG_CONDITION_KEY_FAMILY);
+    }
+    published
+}
+
+/// The `AccessDeniedException` message a request that addresses no partition of its own
+/// earns when the policies in force do not permit it, or `None` when they do. See
+/// [`denial_addressing`], which this is the table-wide case of.
+pub fn denial(caller: &Caller, table: &Table, action: &str, now: SystemTime) -> Option<String> {
+    denial_addressing(caller, table, action, now, &AddressedKeys::whole_table())
+}
+
 /// The `AccessDeniedException` message a data-plane request earns when the policies in
 /// force do not permit it, or `None` when they do.
 ///
-/// `action` is the IAM action the operation performs (`dynamodb:GetItem`). The decision is
-/// the module docs' rule, over the table's own policy and the caller's identity-based
-/// documents; a table with no policy attached — or one whose application is not due yet —
-/// states nothing, so such a request is decided by the identity-based half alone.
-pub fn denial(caller: &Caller, table: &Table, action: &str, now: SystemTime) -> Option<String> {
+/// `action` is the IAM action the operation performs (`dynamodb:GetItem`) and `addressed`
+/// the partitions the request acts on. The decision is the module docs' rule, over the
+/// table's own policy and the caller's identity-based documents, with the request's own
+/// condition keys supplied so a CONDITIONED statement is decided on the request rather
+/// than left undecided; a table with no policy attached — or one whose application is not
+/// due yet — states nothing, so such a request is decided by the identity-based half
+/// alone.
+pub fn denial_addressing(
+    caller: &Caller,
+    table: &Table,
+    action: &str,
+    now: SystemTime,
+    addressed: &AddressedKeys,
+) -> Option<String> {
     let refusal = |reason: &str| {
         Some(format!(
             "User: {} is not authorized to perform: {action} on resource: {} {reason}",
@@ -212,7 +408,11 @@ pub fn denial(caller: &Caller, table: &Table, action: &str, now: SystemTime) -> 
         return None;
     }
 
-    let granting = iam::Request::new(action, &table.arn, &caller.principals);
+    let context = condition_context(caller, addressed);
+    let published = published_condition_keys(caller, addressed);
+    let granting = iam::Request::new(action, &table.arn, &caller.principals)
+        .with_context(&context)
+        .with_published_keys(&published);
     match iam::identity_decision(&caller.documents, &granting) {
         Decision::Denied => return refusal("with an explicit deny in an identity-based policy"),
         // A grant in the TABLE's own policy names this principal directly, which is a

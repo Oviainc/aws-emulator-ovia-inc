@@ -13,12 +13,11 @@
 //!
 //! The OPERATOR ROLE the request names is resolved against this account's IAM before
 //! anything is stored, because the provider manages compute AS that role: a role this
-//! account HOLDS whose stored trust policy does not admit this service is refused
-//! `InvalidParameterValueException` with nothing persisted (see
-//! `crate::state::capacity_provider::OPERATOR_ROLE_INVALID_MESSAGE`), while a role nothing
-//! is KNOWN about — another account's, whose IAM this emulator cannot ask, a name this
-//! account's IAM holds no role under, an unreadable answer, or no IAM mounted to ask — is
-//! served.
+//! account's IAM holds none of, and one it holds whose stored trust policy does not admit
+//! this service, are both refused `InvalidParameterValueException` with nothing persisted
+//! (see `crate::state::capacity_provider::OPERATOR_ROLE_INVALID_MESSAGE`), while a role
+//! nothing is KNOWN about — another account's, whose IAM this emulator cannot ask, an
+//! unreadable answer, or no IAM mounted to ask — is served.
 //!
 //! ## Shape of an operation
 //!

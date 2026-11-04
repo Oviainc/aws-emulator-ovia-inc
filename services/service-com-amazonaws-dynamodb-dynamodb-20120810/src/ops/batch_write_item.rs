@@ -319,12 +319,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The table and the caller's authorization for it are decided BEFORE any of
             // its requests is read: a table that is not there, or that the policies in
             // force do not let this caller write, is answered with that rather than with
-            // whatever is wrong with the items it was sent.
-            if let Some(denial) = crate::state::policy_denial(
+            // whatever is wrong with the items it was sent. The decision is made against
+            // the partitions this table's own writes address.
+            let table = store.active_table(&region, &name, now).map_err(lift)?;
+            let addressed = crate::state::authorization::AddressedKeys::of_maps(
+                table,
+                requests.iter().filter_map(|request| {
+                    request
+                        .put_request
+                        .as_ref()
+                        .map(|put| &put.item)
+                        .or_else(|| request.delete_request.as_ref().map(|delete| &delete.key))
+                }),
+            );
+            if let Some(denial) = crate::state::authorization::denial_addressing(
                 &caller,
-                store.active_table(&region, &name, now).map_err(lift)?,
+                table,
                 "dynamodb:BatchWriteItem",
                 now,
+                &addressed,
             ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }

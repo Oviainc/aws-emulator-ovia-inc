@@ -59,6 +59,15 @@ const TRUST_POLICY: &str = concat!(
     r#""Principal":{"AWS":"arn:aws:iam::000000000000:root"},"Action":"sts:AssumeRole"}]}"#
 );
 
+/// The same trust policy, also permitting the mint to carry SESSION TAGS: "to pass session
+/// tags … the role's trust policy must allow the `sts:TagSession` action"
+/// (`AssumeRoleRequest$Tags`).
+const TAGGING_TRUST_POLICY: &str = concat!(
+    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","#,
+    r#""Principal":{"AWS":"arn:aws:iam::000000000000:root"},"#,
+    r#""Action":["sts:AssumeRole","sts:TagSession"]}]}"#
+);
+
 /// The three services this rule spans, over ONE engine, as `core/router/src/lib.rs` mounts
 /// them.
 fn build_router() -> MultiServiceRouter {
@@ -159,12 +168,21 @@ fn message_of(body: &Value) -> String {
 
 /// Create an IAM role and return its ARN.
 async fn create_role(router: &MultiServiceRouter, role_name: &str) -> String {
+    create_role_trusting(router, role_name, TRUST_POLICY).await
+}
+
+/// Create an IAM role whose trust policy is `trust_policy`, and return its ARN.
+async fn create_role_trusting(
+    router: &MultiServiceRouter,
+    role_name: &str,
+    trust_policy: &str,
+) -> String {
     let (status, body) = query(
         router,
         "iam",
         format!(
             "Action=CreateRole&Version=2010-05-08&RoleName={role_name}\
-             &AssumeRolePolicyDocument={TRUST_POLICY}"
+             &AssumeRolePolicyDocument={trust_policy}"
         ),
     )
     .await;
@@ -508,5 +526,497 @@ async fn the_tables_own_policy_grants_and_denies_the_principal_it_names() {
         (400, "AccessDeniedException"),
         "case after the grant was revoked: expected AccessDeniedException, got {status} \
          {revoked}"
+    );
+}
+
+/// The table whose partitions are one tenant each, keyed on a STRING partition key.
+const TENANTS_TABLE: &str = "Tenants";
+
+/// A second table keyed on a NUMBER partition key, so the rule is exercised over a key
+/// type whose values are not text.
+const READINGS_TABLE: &str = "Readings";
+
+/// The session tag key every conditioned policy below interpolates.
+const TENANT_TAG: &str = "tenant";
+
+/// The ARN of a table of this account and region, which is the resource a statement names.
+fn arn_of(table: &str) -> String {
+    format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/{table}")
+}
+
+/// Create a table keyed on a partition key of type `key_type` — with a string sort key
+/// when `sorted`, the shape a single-table multi-tenant design uses — and seed one item in
+/// each of `partitions`, as the account's own credential.
+async fn seed(
+    router: &MultiServiceRouter,
+    table: &str,
+    key_type: &str,
+    sorted: bool,
+    partitions: &[Value],
+) {
+    let mut key_schema = vec![json!({"AttributeName": "pk", "KeyType": "HASH"})];
+    let mut definitions = vec![json!({"AttributeName": "pk", "AttributeType": key_type})];
+    if sorted {
+        key_schema.push(json!({"AttributeName": "sk", "KeyType": "RANGE"}));
+        definitions.push(json!({"AttributeName": "sk", "AttributeType": "S"}));
+    }
+    let (status, created) = ddb(
+        router,
+        AMBIENT_KEY,
+        "CreateTable",
+        json!({
+            "TableName": table,
+            "KeySchema": key_schema,
+            "AttributeDefinitions": definitions,
+            "BillingMode": "PAY_PER_REQUEST",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {table:?}: CreateTable expected 200, got {status} {created}"
+    );
+    tokio::time::sleep(Duration::from_millis(3400)).await;
+    for partition in partitions {
+        let mut item = serde_json::Map::new();
+        item.insert("pk".to_string(), partition.clone());
+        if sorted {
+            item.insert("sk".to_string(), json!({"S": "seed"}));
+        }
+        item.insert("v".to_string(), json!({"S": "seeded"}));
+        let (status, put) = ddb(
+            router,
+            AMBIENT_KEY,
+            "PutItem",
+            json!({"TableName": table, "Item": Value::Object(item)}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {table:?} {partition}: PutItem expected 200, got {status} {put}"
+        );
+    }
+}
+
+/// Assume `role_arn` under the session name `session_name`, carrying `tag` as a session tag
+/// when one is given, and return the access key id of the session STS minted.
+async fn assume_role_tagged(
+    router: &MultiServiceRouter,
+    role_arn: &str,
+    session_name: &str,
+    tag: Option<(&str, &str)>,
+) -> String {
+    let mut form = format!(
+        "Action=AssumeRole&Version=2011-06-15&RoleArn={role_arn}&RoleSessionName={session_name}"
+    );
+    if let Some((key, value)) = tag {
+        form.push_str(&format!(
+            "&Tags.member.1.Key={key}&Tags.member.1.Value={value}"
+        ));
+    }
+    let (status, body) = query(router, "sts", form).await;
+    assert_eq!(
+        status, 200,
+        "AssumeRole({role_arn}, {session_name}, {tag:?}) expected 200, got {status} {body}"
+    );
+    xml_element(&body, "AccessKeyId")
+        .unwrap_or_else(|| panic!("AssumeRole({role_arn}, {session_name}): no key in {body}"))
+}
+
+/// One identity-based statement whose `Condition` scopes `actions` on `resources` to the
+/// leading keys `leading` — written as the document a fine-grained DynamoDB policy is: "the
+/// `dynamodb:LeadingKeys` condition key … limits the user's access to only the items whose
+/// partition key value matches the user's identity", under `ForAllValues:StringEquals` so
+/// that EVERY partition the request addresses must satisfy it.
+fn conditioned(effect: &str, actions: Value, resources: Value, leading: Value) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": effect,
+            "Action": actions,
+            "Resource": resources,
+            "Condition": {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": leading}},
+        }],
+    })
+    .to_string()
+}
+
+/// A `GetItem` of one partition of the tenant table.
+fn tenant_read(partition: &str) -> Value {
+    json!({
+        "TableName": TENANTS_TABLE,
+        "Key": {"pk": {"S": partition}, "sk": {"S": "seed"}},
+    })
+}
+
+/// RULE: a conditioned identity-based statement is decided against the condition keys the
+/// data-plane request itself carries — `dynamodb:LeadingKeys` holding the partition-key
+/// value(s) the call addresses, and `aws:PrincipalTag/<key>` holding the session tag STS
+/// attached to the calling session, which is what a `${aws:PrincipalTag/<key>}` policy
+/// variable stands for. So one document admits each tagged session to its OWN partition and
+/// refuses it another tenant's, an untagged session of the same role is refused everywhere,
+/// and a conditioned `Deny` refuses only the partitions its condition names.
+///
+/// The rows span what the rule generalises over: the tag value (two tenants, and a numeric
+/// one), the partition-key TYPE (`S` and `N`), the operation (`GetItem`, `PutItem`,
+/// `Query`, `BatchGetItem`, `Scan`), how many partitions one call addresses (one, two), how
+/// the condition's value is written (a principal-tag variable, a literal), the effect it
+/// conditions (`Allow`, `Deny`), and whether the session carries the tag at all.
+#[tokio::test]
+async fn a_conditioned_statement_is_decided_against_the_partition_and_the_session_tags() {
+    let router = build_router();
+    seed(
+        &router,
+        TENANTS_TABLE,
+        "S",
+        true,
+        &[json!({"S": "tenant-one"}), json!({"S": "tenant-two"})],
+    )
+    .await;
+    seed(
+        &router,
+        READINGS_TABLE,
+        "N",
+        false,
+        &[json!({"N": "7"}), json!({"N": "8"})],
+    )
+    .await;
+
+    // ONE role, whose single statement scopes every item action it grants to the partition
+    // named by the caller's own session tag.
+    let tenant_role = "ddb-leading-keys-tenant-role";
+    let tenant_role_arn =
+        create_role_trusting(&router, tenant_role, TAGGING_TRUST_POLICY).await;
+    put_role_policy(
+        &router,
+        tenant_role,
+        &conditioned(
+            "Allow",
+            json!([
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:Query",
+                "dynamodb:BatchGetItem",
+                "dynamodb:Scan",
+            ]),
+            json!([arn_of(TENANTS_TABLE), arn_of(READINGS_TABLE)]),
+            json!([format!("${{aws:PrincipalTag/{TENANT_TAG}}}")]),
+        ),
+    )
+    .await;
+
+    // A second role conditions the same key on a LITERAL partition instead of a variable:
+    // the request's leading key is what the clause is decided against either way.
+    let literal_role = "ddb-leading-keys-literal-role";
+    let literal_role_arn = create_role(&router, literal_role).await;
+    put_role_policy(
+        &router,
+        literal_role,
+        &conditioned(
+            "Allow",
+            json!("dynamodb:GetItem"),
+            json!(arn_of(TENANTS_TABLE)),
+            json!(["tenant-two"]),
+        ),
+    )
+    .await;
+
+    // A third role is granted everything and DENIED the read of one partition: a deny whose
+    // condition does not hold for the addressed partition refuses nothing.
+    let denied_role = "ddb-leading-keys-denied-role";
+    let denied_role_arn = create_role(&router, denied_role).await;
+    put_role_policy(
+        &router,
+        denied_role,
+        &json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"},
+                {
+                    "Effect": "Deny",
+                    "Action": "dynamodb:GetItem",
+                    "Resource": "*",
+                    "Condition": {
+                        "ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["tenant-two"]},
+                    },
+                },
+            ],
+        })
+        .to_string(),
+    )
+    .await;
+
+    let one = assume_role_tagged(
+        &router,
+        &tenant_role_arn,
+        "one",
+        Some((TENANT_TAG, "tenant-one")),
+    )
+    .await;
+    let two = assume_role_tagged(
+        &router,
+        &tenant_role_arn,
+        "two",
+        Some((TENANT_TAG, "tenant-two")),
+    )
+    .await;
+    let seven = assume_role_tagged(&router, &tenant_role_arn, "seven", Some((TENANT_TAG, "7")))
+        .await;
+    let untagged = assume_role_tagged(&router, &tenant_role_arn, "untagged", None).await;
+    let literal = assume_role_tagged(&router, &literal_role_arn, "literal", None).await;
+    let denied = assume_role_tagged(&router, &denied_role_arn, "denied", None).await;
+
+    // (case, the session's key, the role behind it, the operation, its body, the status)
+    let rows: Vec<(&str, &String, &str, &str, Value, u16)> = vec![
+        (
+            "the tagged session reads its own partition",
+            &one,
+            tenant_role,
+            "GetItem",
+            tenant_read("tenant-one"),
+            200,
+        ),
+        (
+            "the tagged session reads another tenant's partition",
+            &one,
+            tenant_role,
+            "GetItem",
+            tenant_read("tenant-two"),
+            400,
+        ),
+        (
+            "the other tenant's session reads its own partition",
+            &two,
+            tenant_role,
+            "GetItem",
+            tenant_read("tenant-two"),
+            200,
+        ),
+        (
+            "the other tenant's session reads the first tenant's partition",
+            &two,
+            tenant_role,
+            "GetItem",
+            tenant_read("tenant-one"),
+            400,
+        ),
+        (
+            "an untagged session of the same role reads one partition",
+            &untagged,
+            tenant_role,
+            "GetItem",
+            tenant_read("tenant-one"),
+            400,
+        ),
+        (
+            "an untagged session of the same role reads the other partition",
+            &untagged,
+            tenant_role,
+            "GetItem",
+            tenant_read("tenant-two"),
+            400,
+        ),
+        (
+            "the tagged session writes its own partition",
+            &one,
+            tenant_role,
+            "PutItem",
+            json!({
+                "TableName": TENANTS_TABLE,
+                "Item": {"pk": {"S": "tenant-one"}, "sk": {"S": "written"}},
+            }),
+            200,
+        ),
+        (
+            "the tagged session writes another tenant's partition",
+            &one,
+            tenant_role,
+            "PutItem",
+            json!({
+                "TableName": TENANTS_TABLE,
+                "Item": {"pk": {"S": "tenant-two"}, "sk": {"S": "written"}},
+            }),
+            400,
+        ),
+        (
+            "the tagged session queries its own partition",
+            &one,
+            tenant_role,
+            "Query",
+            json!({
+                "TableName": TENANTS_TABLE,
+                "KeyConditionExpression": "pk = :p",
+                "ExpressionAttributeValues": {":p": {"S": "tenant-one"}},
+            }),
+            200,
+        ),
+        (
+            "the tagged session queries another tenant's partition",
+            &one,
+            tenant_role,
+            "Query",
+            json!({
+                "TableName": TENANTS_TABLE,
+                "KeyConditionExpression": "pk = :p",
+                "ExpressionAttributeValues": {":p": {"S": "tenant-two"}},
+            }),
+            400,
+        ),
+        (
+            "a batch addressing two keys of the session's own partition",
+            &one,
+            tenant_role,
+            "BatchGetItem",
+            json!({"RequestItems": {TENANTS_TABLE: {"Keys": [
+                {"pk": {"S": "tenant-one"}, "sk": {"S": "seed"}},
+                {"pk": {"S": "tenant-one"}, "sk": {"S": "absent"}},
+            ]}}}),
+            200,
+        ),
+        (
+            "a batch addressing one key of each tenant's partition",
+            &one,
+            tenant_role,
+            "BatchGetItem",
+            json!({"RequestItems": {TENANTS_TABLE: {"Keys": [
+                {"pk": {"S": "tenant-one"}, "sk": {"S": "seed"}},
+                {"pk": {"S": "tenant-two"}, "sk": {"S": "seed"}},
+            ]}}}),
+            400,
+        ),
+        (
+            // A table walk names no partition, so the request carries no value for the key
+            // AND declares that it models none: the clause stays undecided and the grant
+            // does not reach the call. The request is NOT read as carrying the empty set
+            // of leading keys, which `ForAllValues:` would hold on and so would turn this
+            // conditioned grant into table-wide access.
+            "a scan, which addresses no partition the condition could be decided on",
+            &one,
+            tenant_role,
+            "Scan",
+            json!({"TableName": TENANTS_TABLE}),
+            400,
+        ),
+        (
+            "a numeric partition the session's tag names",
+            &seven,
+            tenant_role,
+            "GetItem",
+            json!({"TableName": READINGS_TABLE, "Key": {"pk": {"N": "7"}}}),
+            200,
+        ),
+        (
+            "the same number spelled with a fraction, which names that same partition",
+            &seven,
+            tenant_role,
+            "GetItem",
+            json!({"TableName": READINGS_TABLE, "Key": {"pk": {"N": "7.0"}}}),
+            200,
+        ),
+        (
+            "a numeric partition the session's tag does not name",
+            &seven,
+            tenant_role,
+            "GetItem",
+            json!({"TableName": READINGS_TABLE, "Key": {"pk": {"N": "8"}}}),
+            400,
+        ),
+        (
+            "a literal condition value, on the partition it names",
+            &literal,
+            literal_role,
+            "GetItem",
+            tenant_read("tenant-two"),
+            200,
+        ),
+        (
+            "a literal condition value, on a partition it does not name",
+            &literal,
+            literal_role,
+            "GetItem",
+            tenant_read("tenant-one"),
+            400,
+        ),
+        (
+            "a conditioned deny, on a partition its condition does not name",
+            &denied,
+            denied_role,
+            "GetItem",
+            tenant_read("tenant-one"),
+            200,
+        ),
+        (
+            "a conditioned deny, on the partition its condition names",
+            &denied,
+            denied_role,
+            "GetItem",
+            tenant_read("tenant-two"),
+            400,
+        ),
+    ];
+
+    for (case, key, role_name, operation, body, expected) in rows {
+        let table = body
+            .get("TableName")
+            .and_then(Value::as_str)
+            .unwrap_or(TENANTS_TABLE)
+            .to_string();
+        let (status, answer) = ddb(&router, key, operation, body).await;
+        assert_eq!(
+            status, expected,
+            "case {case:?}: {operation} expected HTTP {expected}, got {status} {answer}"
+        );
+        if expected == 400 {
+            assert_eq!(
+                error_code(&answer),
+                "AccessDeniedException",
+                "case {case:?}: expected AccessDeniedException, got {answer}"
+            );
+            let message = message_of(&answer);
+            let session = format!("arn:aws:sts::{ACCOUNT}:assumed-role/{role_name}/");
+            assert!(
+                message.contains(&session)
+                    && message.contains(&format!("dynamodb:{operation}"))
+                    && message.contains(&arn_of(&table)),
+                "case {case:?}: the refusal is built from the request (a session of \
+                 {session}…, action dynamodb:{operation}, resource {}), got {message:?}",
+                arn_of(&table)
+            );
+        }
+    }
+
+    // The write the tagged session was allowed to make is really there, read back through
+    // the reader the same policy admits: the grant served a write, not just a 200.
+    let (status, written) = ddb(
+        &router,
+        &one,
+        "GetItem",
+        json!({
+            "TableName": TENANTS_TABLE,
+            "Key": {"pk": {"S": "tenant-one"}, "sk": {"S": "written"}},
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, written["Item"]["sk"].clone()),
+        (200, json!({"S": "written"})),
+        "case the admitted write: the item it stored is read back, got {status} {written}"
+    );
+    // And the write the refused row attempted left the other tenant's partition untouched.
+    let (status, other) = ddb(
+        &router,
+        AMBIENT_KEY,
+        "GetItem",
+        json!({
+            "TableName": TENANTS_TABLE,
+            "Key": {"pk": {"S": "tenant-two"}, "sk": {"S": "written"}},
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, other.get("Item").cloned()),
+        (200, None),
+        "case the refused write: nothing was written to the other tenant's partition, got \
+         {status} {other}"
     );
 }

@@ -461,8 +461,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.apply_due_transitions(now);
         let table = store.active_table(&region, &name, now).map_err(lift)?;
         // A table the policies in force do not let this caller read answers the denial,
-        // not its items.
-        if let Some(denial) = crate::state::policy_denial(&caller, table, "dynamodb:Query", now) {
+        // not its items — decided against the partition the key condition selects. The
+        // partition attribute is the TABLE's, which is the only one a query here can
+        // select on: a request naming an `IndexName` is refused as unserved above, so no
+        // index's own leading key reaches this point.
+        if let Some(denial) = crate::state::authorization::denial_addressing(
+            &caller,
+            table,
+            "dynamodb:Query",
+            now,
+            &crate::state::authorization::AddressedKeys::of_values(
+                comparisons
+                    .iter()
+                    .filter(|comparison| {
+                        comparison.attribute == table.partition_key_name()
+                            && comparison.operator == Operator::Equal
+                    })
+                    .map(|comparison| comparison.operands.first()),
+            ),
+        ) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
         // Which index this query reads, with the refusals that resolution carries: a

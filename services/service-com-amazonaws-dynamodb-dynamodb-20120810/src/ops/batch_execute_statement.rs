@@ -437,7 +437,13 @@ fn run_slot(
         let table = store
             .active_table(region, &name, now)
             .map_err(|error| SlotFailure::from(error).at(&name))?;
-        if let Some(denial) = crate::state::policy_denial(caller, table, statement.action(), now) {
+        if let Some(denial) = crate::state::authorization::denial_addressing(
+            caller,
+            table,
+            statement.action(),
+            now,
+            &crate::state::authorization::AddressedKeys::of_statement(table, &statement),
+        ) {
             return Err(SlotFailure::new(ACCESS_DENIED_CODE, denial).at(&name));
         }
     }

@@ -418,10 +418,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = {
             let table = store.active_table(&region, &name, now).map_err(lift)?;
             // A table the policies in force do not let this caller write is not written
-            // to at all: authorization is decided before the item is keyed.
-            if let Some(denial) =
-                crate::state::policy_denial(&caller, table, "dynamodb:PutItem", now)
-            {
+            // to at all: authorization is decided before the item is keyed, against the
+            // partition the item this put addresses belongs to.
+            if let Some(denial) = crate::state::authorization::denial_addressing(
+                &caller,
+                table,
+                "dynamodb:PutItem",
+                now,
+                &crate::state::authorization::AddressedKeys::of_maps(table, [&item]),
+            ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
             // The key attributes are bounded by the documented key-value limits, for
