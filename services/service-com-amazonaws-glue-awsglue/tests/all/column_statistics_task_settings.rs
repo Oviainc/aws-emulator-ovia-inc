@@ -44,11 +44,15 @@ use crate::column_statistics_task_runs::{already_past, far_future, set_due_insta
 use crate::wire::{call, emulator, emulator_on, error_code, error_message, ok, ACCOUNT_ID};
 
 /// The IAM role a create names: "The role used for running the column statistics."
-const ROLE: &str = "arn:aws:iam::000000000000:role/glue-column-stats-role";
+///
+/// Shared with the deletion suite ([`crate::column_statistics_task_settings_deletion`]),
+/// which writes the entries it deletes through the same create, so both suites state the
+/// same role rather than spelling it twice.
+pub const ROLE: &str = "arn:aws:iam::000000000000:role/glue-column-stats-role";
 
 /// A cron expression of the documented form, "to run something every day at 12:15 UTC"
 /// (`Schedule$ScheduleExpression`).
-const DAILY_SCHEDULE: &str = "cron(15 12 * * ? *)";
+pub const DAILY_SCHEDULE: &str = "cron(15 12 * * ? *)";
 
 /// An emulator plus the engine it runs on, so a test can move the due instant the run
 /// lifecycle turns on instead of waiting for it.
@@ -61,7 +65,12 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 /// the catalog state every create below is resolved against. A database several rows share
 /// is created once — a repeat create is the catalog's `AlreadyExistsException`, which is
 /// not what these tests are about.
-async fn store_table(router: &MultiServiceRouter, database: &str, table: &str, columns: &[&str]) {
+pub async fn store_table(
+    router: &MultiServiceRouter,
+    database: &str,
+    table: &str,
+    columns: &[&str],
+) {
     let (status, parsed) = call(
         router,
         "CreateDatabase",
@@ -92,7 +101,7 @@ async fn store_table(router: &MultiServiceRouter, database: &str, table: &str, c
 }
 
 /// A create body naming the three `@required` members, plus whatever `extra` adds.
-fn create_body(database: &str, table: &str, extra: Value) -> Value {
+pub fn create_body(database: &str, table: &str, extra: Value) -> Value {
     let mut body = json!({ "DatabaseName": database, "TableName": table, "Role": ROLE });
     if let Some(members) = extra.as_object() {
         for (member, value) in members {
@@ -103,7 +112,7 @@ fn create_body(database: &str, table: &str, extra: Value) -> Value {
 }
 
 /// The `ColumnStatisticsTaskSettings` structure a read reports for one table.
-async fn get_settings(router: &MultiServiceRouter, body: &Value) -> Value {
+pub async fn get_settings(router: &MultiServiceRouter, body: &Value) -> Value {
     let reported = ok(router, "GetColumnStatisticsTaskSettings", body).await;
     reported
         .get("ColumnStatisticsTaskSettings")
@@ -117,7 +126,7 @@ async fn get_settings(router: &MultiServiceRouter, body: &Value) -> Value {
 }
 
 /// The read body addressing one table.
-fn read_body(database: &str, table: &str) -> Value {
+pub fn read_body(database: &str, table: &str) -> Value {
     json!({ "DatabaseName": database, "TableName": table })
 }
 

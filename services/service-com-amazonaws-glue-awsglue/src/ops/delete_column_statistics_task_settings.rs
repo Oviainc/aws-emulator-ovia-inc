@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteColumnStatisticsTaskSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteColumnStatisticsTaskSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteColumnStatisticsTaskSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the column statistics task settings of ONE stored table — the entry
+//! `CreateColumnStatisticsTaskSettings` wrote and `GetColumnStatisticsTaskSettings` reports
+//! ([`crate::state::TableEntry::column_statistics_task_settings`]) — so after a delete the
+//! table carries no settings and that read answers its modelled miss again, while the table
+//! itself and the statistics runs recorded for it stay exactly as they were.
+//!
+//! The entry is addressed by the same two members a read addresses it by, so a delete that
+//! finds no entry under them — a database the catalog does not hold, a table the database
+//! does not hold, or a stored table no create has written settings for — is the operation's
+//! modelled `EntityNotFoundException` and removes nothing, rather than a success that
+//! deleted nothing.
+//!
+//! This operation models no access error, so a `CatalogID` of another account is simply a
+//! catalog this emulator holds nothing in: the delete reports the modelled miss rather than
+//! an exception the model does not declare for it, exactly as the read does.
 //!
 //! ## Shape of an operation
 //!
@@ -141,20 +148,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteColumnStatisticsTaskSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteColumnStatisticsTaskSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteColumnStatisticsTaskSettings"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as the operation's own timeout error, the same way `GetCrawler` reports it.
+            return Err(
+                DeleteColumnStatisticsTaskSettingsErrorModeled::OperationTimeoutException(
+                    OperationTimeoutException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let mut store = state.lock();
+
+        // `DatabaseName` and `TableName` are `@required` with `length 1..255`, so reaching
+        // here the only question is what the addressed catalog holds under them.
+        let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
+            return Err(not_found(crate::state::messages::database_not_found(
+                &input.database_name,
+            )));
+        };
+        // The entry hangs on a table, so a database holding no table under that name holds
+        // no entry to delete either: the same miss, in the same fixed wording, as a stored
+        // table carrying no settings.
+        let Some(table) = database
+            .tables
+            .get_mut(&crate::state::fold_name(&input.table_name))
+        else {
+            return Err(not_found(
+                crate::state::messages::COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND.to_string(),
+            ));
+        };
+        // Taking the entry out IS the delete; a table that carried none held nothing to
+        // delete, so the same miss is reported and the table is left exactly as it was.
+        if table.column_statistics_task_settings.take().is_none() {
+            return Err(not_found(
+                crate::state::messages::COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND.to_string(),
+            ));
+        }
+        ::tracing::info!(
+            operation = "DeleteColumnStatisticsTaskSettings",
+            catalog_id = %catalog_id,
+            database = %input.database_name,
+            table = %input.table_name,
+            "deleted the column statistics task settings of a Data Catalog table"
+        );
+
+        Ok(DeleteColumnStatisticsTaskSettingsOutput {})
     }
+}
+
+/// This operation's modelled miss: "A specified entity does not exist".
+fn not_found(message: String) -> DeleteColumnStatisticsTaskSettingsError {
+    DeleteColumnStatisticsTaskSettingsErrorModeled::EntityNotFoundException(
+        EntityNotFoundException {
+            message: Some(message),
+            from_federation_source: None,
+        },
+    )
+    .into()
 }

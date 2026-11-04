@@ -75,6 +75,8 @@ mod column_statistics_task_run_history;
 mod column_statistics_task_runs;
 #[path = "all/column_statistics_task_settings.rs"]
 mod column_statistics_task_settings;
+#[path = "all/column_statistics_task_settings_deletion.rs"]
+mod column_statistics_task_settings_deletion;
 #[path = "all/connection_deletion.rs"]
 mod connection_deletion;
 #[path = "all/connection_listing.rs"]
