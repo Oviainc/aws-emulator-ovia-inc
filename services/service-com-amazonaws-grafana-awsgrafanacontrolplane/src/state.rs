@@ -376,6 +376,23 @@ impl Workspace {
             .find(|account| account.id == id)
     }
 
+    /// Release the service account `id` names, handing back the record that was
+    /// removed, or `None` when this workspace holds no such account.
+    ///
+    /// Every token of the account goes with it, because the tokens live on the
+    /// account record: `DeleteWorkspaceServiceAccount` documents that it "will
+    /// delete any tokens created for the service account, as well", and the
+    /// workspace's own Grafana HTTP API recognises a presented key only by a
+    /// digest a stored token carries, so a released account's keys authorize
+    /// nothing.
+    pub fn remove_service_account(&mut self, id: &str) -> Option<ServiceAccount> {
+        let at = self
+            .service_accounts
+            .iter()
+            .position(|account| account.id == id)?;
+        Some(self.service_accounts.remove(at))
+    }
+
     /// Mint an id no service account of this workspace holds.
     ///
     /// Grafana identifies a service account by a positive integer, rendered as a
@@ -928,13 +945,14 @@ pub fn workspace_not_found(id: &str) -> ResourceNotFoundException {
 /// account of the workspace the request named — one never created, or already
 /// deleted.
 ///
-/// The message names the service account id the request asked about, the one part
-/// of the request that tells two refused calls apart, as a finished sentence; the
-/// workspace is already named by the path the caller sent, so it is not repeated
-/// here.
+/// The message names the account id the request asked about, the one part of the
+/// request that tells two refusals apart; the workspace is already named by the
+/// path the caller sent. It is worded the way the service words the same refusal
+/// about a service account's token, which [`service_account_token_not_found`]
+/// carries.
 pub fn service_account_not_found(account_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("Service account {account_id} not found."),
+        message: format!("Service Account with id={account_id} does not exist."),
         resource_id: account_id.to_string(),
         resource_type: SERVICE_ACCOUNT_RESOURCE_TYPE.to_string(),
     }

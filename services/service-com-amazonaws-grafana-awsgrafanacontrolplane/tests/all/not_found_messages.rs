@@ -12,8 +12,11 @@
 //! sentence — it ends in a period — whose only variable part is the sub-resource
 //! identifier taken verbatim from the request; the workspace id, which the request path
 //! already carries, is never repeated in it. For an API key the sentence is
-//! `API key <keyName> not found.`, and for a service account `Service account
-//! <serviceAccountId> not found.`
+//! `API key <keyName> not found.`, and for a service account `Service Account with
+//! id=<serviceAccountId> does not exist.` — the form the service uses for an id it cannot
+//! resolve, as a recorded refusal of an already-deleted service account shows, and the
+//! form its token refusal (`Service Account Token with id=<tokenId> does not exist.`) and
+//! its workspace refusal already carry.
 
 use std::sync::Arc;
 
@@ -266,7 +269,7 @@ async fn an_unknown_service_account_is_refused_with_the_account_id_alone() {
     ];
 
     for (case, account_id) in account_ids {
-        let expected = format!("Service account {account_id} not found.");
+        let expected = format!("Service Account with id={account_id} does not exist.");
 
         // The three operations whose path reaches a service account of a workspace.
         let listed = call(
