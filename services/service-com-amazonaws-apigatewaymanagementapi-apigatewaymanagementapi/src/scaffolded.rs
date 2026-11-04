@@ -177,6 +177,73 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic `BadRequestException` error shape.
+static BAD_REQUEST_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#BadRequestException$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `BadRequestException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the two shapes above: the
+/// shape is not in this service's model, so it must not collide with a modelled one.
+/// This service's model declares no client-input error at all — its three operations
+/// declare `ForbiddenException`, `GoneException`, `LimitExceededException` and
+/// `PayloadTooLargeException` (`smithy_query(query="digest")`) — while API Gateway
+/// refuses a request whose `ConnectionId` identifies no connection with HTTP 400
+/// `BadRequestException`, the code and status every API Gateway surface words such a
+/// refusal in. The wrapper is the only place an operation can answer an error its own
+/// model does not declare, which is what this variant is for.
+pub static BAD_REQUEST_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#BadRequestException",
+        "smithy.framework",
+        "BadRequestException",
+    ),
+    ShapeType::Structure,
+    &[&BAD_REQUEST_MESSAGE],
+);
+
+/// The payload of a `BadRequestException`: why the request was refused.
+#[derive(Debug, Clone)]
+pub struct BadRequestException {
+    pub message: String,
+}
+
+impl BadRequestException {
+    /// A `BadRequestException` carrying `message`.
+    ///
+    /// Word it the way the emulated service words it, naming the member that was wrong
+    /// and the value it carried: the caller has to fix the request from this text alone.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for BadRequestException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BadRequestException: {}", self.message)
+    }
+}
+
+impl std::error::Error for BadRequestException {}
+
+impl SerializableStruct for BadRequestException {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&BAD_REQUEST_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -196,6 +263,11 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// The request was refused as a BAD REQUEST: HTTP 400 with the error code
+    /// `BadRequestException`, the code API Gateway words such a refusal in. See
+    /// [`BAD_REQUEST_SCHEMA`] for why this service needs it and
+    /// [`Scaffolded::bad_request`] for when to answer it.
+    BadRequest(BadRequestException),
 }
 
 impl<E> Scaffolded<E> {
@@ -221,6 +293,16 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse the request with HTTP 400 `BadRequestException`.
+    ///
+    /// The same channel as [`Scaffolded::validation`], in the code the emulated service
+    /// words a refused request in: every API Gateway surface answers a request it cannot
+    /// accept with `BadRequestException`, so a client of THIS service branches on that
+    /// code and not on the framework's `ValidationException`.
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::BadRequest(BadRequestException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -229,6 +311,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::BadRequest(e) => write!(f, "{e}"),
         }
     }
 }
@@ -241,6 +324,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::BadRequest(e) => e.source(),
         }
     }
 }
@@ -255,6 +339,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::BadRequest(e) => e,
         }
     }
 
@@ -263,6 +348,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::BadRequest(_) => &BAD_REQUEST_SCHEMA,
         }
     }
 
@@ -275,6 +361,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            Self::BadRequest(_) => "BadRequestException",
         }
     }
 
@@ -287,6 +374,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            Self::BadRequest(_) => 400,
         }
     }
 
@@ -299,6 +387,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            Self::BadRequest(_) => None,
         }
     }
 }

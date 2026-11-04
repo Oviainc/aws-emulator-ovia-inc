@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/connection_error_envelope.rs"]
 mod connection_error_envelope;
+#[path = "all/connection_id_validity.rs"]
+mod connection_id_validity;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
 #[path = "all/invoke_path_routing.rs"]

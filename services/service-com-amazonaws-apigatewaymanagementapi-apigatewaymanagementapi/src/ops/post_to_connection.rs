@@ -7,8 +7,11 @@
 //! (in send order) and advances its `LastActiveAt` — data flowed, so the connection was
 //! active.
 //!
-//! An unregistered or already-deleted connection id answers the modeled `GoneException`
-//! (HTTP 410) and delivers nothing; see [`crate::state`] for the registration rule. A
+//! A connection id this service ISSUED whose connection has since been deleted answers
+//! the modeled `GoneException` (HTTP 410) and delivers nothing. A `ConnectionId` it never
+//! issued identifies no connection at all and is refused HTTP 400 `BadRequestException`
+//! before any connection is looked up; see [`crate::state`] for the registration rule
+//! and for why the two refusals are split. A
 //! payload past the modeled `@length` maximum answers `PayloadTooLargeException`
 //! (HTTP 413) — see [`MAX_DATA_BYTES`] and `crate::service::OversizedPayload` for where
 //! that bound is enforced.
@@ -209,9 +212,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut guard = state.lock();
+        // A `ConnectionId` this service never issued identifies no connection of its, so
+        // the request is refused before any connection is looked up: `GoneException`
+        // would tell the caller an id it never minted once named a live connection, and a
+        // caller prunes its own record of a connection on that answer
+        // (`crate::state::invalid_connection_id`).
+        if !guard.identifies_a_connection(&input.connection_id) {
+            return Err(crate::state::invalid_connection_id(&input.connection_id));
+        }
         let Some(connection) = guard.connections.get_mut(&input.connection_id) else {
-            // Nothing is recorded for a connection that was never registered or has
-            // already been deleted.
+            // Nothing is recorded for a connection that was issued and has since been
+            // deleted.
             return Err(PostToConnectionErrorModeled::GoneException(GoneException {}).into());
         };
         // Counts the delivery and keeps it in the connection's BOUNDED observation

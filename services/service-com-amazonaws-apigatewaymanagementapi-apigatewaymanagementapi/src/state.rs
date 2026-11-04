@@ -7,10 +7,19 @@
 //!
 //! `ApiGatewayManagementApi` models exactly three operations — `PostToConnection`,
 //! `GetConnection` and `DeleteConnection` — and all three address one WebSocket
-//! connection by its id. A connection id this registry does not hold is
-//! `GoneException` ("The connection with the provided id no longer exists") for all
-//! three, so **a missing [`connections`](ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState::connections)
-//! entry is the single source of truth for that error**.
+//! connection by its id. Two refusals come out of this state, split along whether the
+//! id is a connection IDENTIFIER of this service at all:
+//!
+//! * a `ConnectionId` the service never ISSUED
+//!   ([`issued`](ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState::issued))
+//!   identifies no connection, so it is refused as an invalid `ConnectionId` (HTTP 400
+//!   `BadRequestException`, [`invalid_connection_id`]) before any connection is looked
+//!   up;
+//! * an id it issued that the
+//!   [`connections`](ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState::connections)
+//!   registry no longer holds is `GoneException` ("The connection with the provided id no
+//!   longer exists"), **so a missing `connections` entry for an ISSUED id is the single
+//!   source of truth for that error**.
 //!
 //! # The registration seam, and the rule it follows
 //!
@@ -35,7 +44,7 @@
 //!   successful `PostToConnection`. `GetConnection` reports the registry and must
 //!   not alter what a later caller sees, so it never bumps it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
 
 pub use crate::ops::types::Identity;
@@ -124,6 +133,53 @@ impl Connection {
 pub struct ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState {
     /// The connection registry, keyed by `ConnectionId`.
     pub connections: HashMap<String, Connection>,
+    /// Every `ConnectionId` this service has ISSUED — the ids its connections are
+    /// identified by, whether or not the connection is still open.
+    ///
+    /// A connection id is not an arbitrary string a caller may invent: API Gateway mints
+    /// it when a client's handshake completes and the three `@connections` operations
+    /// address a connection BY it, so the service can tell a connection identifier it
+    /// issued from a value that is none. That distinction is what the two refusals are
+    /// split along ([`issued`]): an identifier whose connection has closed is
+    /// `GoneException`, and a value that never identified a connection is refused as an
+    /// invalid `ConnectionId` before any connection is looked up.
+    ///
+    /// An id stays here after `DeleteConnection` removes the connection — that is what
+    /// keeps a closed connection answering `GoneException` — so this set only grows, by
+    /// one entry per connection [`register_connection`] registers.
+    pub issued: BTreeSet<String>,
+}
+
+impl ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState {
+    /// Whether `connection_id` is an id this service issued, i.e. one of its connections
+    /// is or was identified by it. See [`Self::issued`].
+    pub fn identifies_a_connection(&self, connection_id: &str) -> bool {
+        self.issued.contains(connection_id)
+    }
+}
+
+/// The sentence the three `@connections` operations refuse a `ConnectionId` that
+/// identifies no connection of this service with: fixed text, then the `ConnectionId`
+/// the request sent, verbatim.
+///
+/// One wording for all three, because the refusal is about the request's own
+/// `ConnectionId` (`@httpLabel`) and not about what the operation would have done with
+/// the connection.
+pub fn invalid_connection_id_message(connection_id: &str) -> String {
+    format!("Invalid connectionId: {connection_id}")
+}
+
+/// The refusal for a `ConnectionId` that identifies no connection of this service, as
+/// the error channel of any of the three operations.
+///
+/// A value the service never issued is not a connection identifier at all, so it is a bad
+/// request (HTTP 400 `BadRequestException`) rather than a connection that is gone: HTTP
+/// 410 `GoneException` is "The connection with the provided id no longer exists", which
+/// says the id DID identify a connection. A caller prunes its own record of a connection
+/// on the 410, so answering it for an id that never existed makes that caller delete a
+/// record it should keep.
+pub fn invalid_connection_id<E>(connection_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::bad_request(invalid_connection_id_message(connection_id))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -176,6 +232,9 @@ pub fn register_connection<Eng: Send + Sync + 'static>(
     if guard.connections.contains_key(&connection_id) {
         return false;
     }
+    // Registering a connection is what ISSUES its id: from here on the id identifies a
+    // connection of this service, and it goes on doing so after the connection closes.
+    guard.issued.insert(connection_id.clone());
     guard.connections.insert(
         connection_id.clone(),
         Connection {

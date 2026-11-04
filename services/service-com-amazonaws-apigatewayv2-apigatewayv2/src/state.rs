@@ -13,10 +13,12 @@
 //!
 //! The pagination a collection reader serves — the page size a caller may ask for and
 //! the opaque `NextToken` that resumes a walk — lives in [`paging`], the module that
-//! holds those bounds, and is re-exported here so a handler reaches it the way it
-//! reaches everything else in this module.
+//! holds those bounds, and the selection expressions several members carry live in
+//! [`selection_expression`]. Both are re-exported here so a handler reaches them the way
+//! it reaches everything else in this module.
 
 pub mod paging;
+pub mod selection_expression;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
@@ -1890,6 +1892,31 @@ pub fn invalid_authorizer_reference_message(authorization_type: &str) -> String 
 /// The entry a CORS list carries to stand for "every value": the wildcard.
 pub const CORS_WILDCARD: &str = "*";
 
+/// `Ok(())`, or why an api of this `ProtocolType` cannot carry a CORS configuration at
+/// all — the message for the operation's `BadRequestException`.
+///
+/// `CorsConfiguration` is documented "Supported only for HTTP APIs", so a request that
+/// configures one on an api of another protocol asks for a setting that protocol has no
+/// behaviour for. API Gateway words THIS member's refusal in the member's own terms,
+/// naming the CORS feature and the protocol type that does not support it, rather than
+/// with the generic sentence [`validate_protocol_restricted_members`] builds for a
+/// restricted member: the refusal a WEBSOCKET create carrying a CORS configuration is
+/// answered with is `Cors is not supported for WEBSOCKET protocolType`. The protocol
+/// type is the variable part, so an api of any future non-HTTP protocol is refused in
+/// its own name.
+///
+/// Shared by every writer of an api's CORS document, so the create and the patch cannot
+/// word or gate it differently. `configured` is whether THIS request carries one; a
+/// request that carries none asks for nothing.
+pub fn validate_cors_protocol(protocol_type: &str, configured: bool) -> Result<(), String> {
+    if configured && protocol_type != HTTP_PROTOCOL_TYPE {
+        return Err(format!(
+            "Cors is not supported for {protocol_type} protocolType"
+        ));
+    }
+    Ok(())
+}
+
 /// `Ok(())`, or why this CORS configuration cannot hold together — the message for the
 /// operation's `BadRequestException`.
 ///
@@ -1923,49 +1950,9 @@ pub fn validate_cors_configuration(cors: &wire::Cors) -> Result<(), String> {
     Ok(())
 }
 
-/// The variable namespaces a selection expression may read, lowercased for comparison.
-///
-/// A selection expression selects a stored key by evaluating request DATA — the
-/// documented defaults name exactly these namespaces (`$request.header.x-api-key` for
-/// `Api$ApiKeySelectionExpression`, `$request.method $request.path` for an HTTP api's
-/// `RouteSelectionExpression`, `$context.*` for context variables) — so a `$`-token
-/// naming anything else names no variable at all.
-pub const SELECTION_EXPRESSION_VARIABLES: &[&str] = &["request", "context", "stagevariables"];
-
-/// `Ok(())`, or why this selection expression cannot be stored — the message for the
-/// operation's `BadRequestException`.
-///
-/// One rule: in a selection expression an unescaped `$` begins a VARIABLE reference, so
-/// every `$`-token has to name one of the variable namespaces the service evaluates
-/// ([`SELECTION_EXPRESSION_VARIABLES`]). A selection KEY that itself begins with `$` —
-/// `$default` is the one the service mints — is a literal, and a literal is written
-/// escaped (`\$default`); unescaped it reads as a variable the service does not define.
-pub fn validate_selection_expression(expression: &str) -> Result<(), String> {
-    let characters: Vec<char> = expression.chars().collect();
-    let mut index = 0;
-    while index < characters.len() {
-        match characters[index] {
-            // An escaped character is a literal: this is how a selection key beginning
-            // with `$` is written.
-            '\\' => index += 2,
-            '$' => {
-                let name: String = characters[index + 1..]
-                    .iter()
-                    .skip_while(|c| **c == '{')
-                    .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
-                    .collect();
-                if !SELECTION_EXPRESSION_VARIABLES.contains(&name.to_ascii_lowercase().as_str()) {
-                    return Err(format!(
-                        "Unexpected variable in selection expression: ${name}"
-                    ));
-                }
-                index += 1;
-            }
-            _ => index += 1,
-        }
-    }
-    Ok(())
-}
+// Selection expressions — the `$`-variable expressions several members of this service
+// carry, and what each member's protocol lets one select — live in
+// [`selection_expression`], whose public items this module re-exports below.
 
 /// `Ok(())`, or why this integration's payload format version cannot be stored — the
 /// message for the operation's `BadRequestException`.
@@ -4853,6 +4840,30 @@ pub use paging::first_page_token;
 
 /// A record a collection reader reports in creation order — see [`paging::CreatedInOrder`].
 pub use paging::CreatedInOrder;
+
+/// The variable namespaces a selection expression may read — see
+/// [`selection_expression::SELECTION_EXPRESSION_VARIABLES`].
+pub use selection_expression::SELECTION_EXPRESSION_VARIABLES;
+
+/// The reference a WEBSOCKET api's `RouteSelectionExpression` selects a route key with —
+/// see [`selection_expression::WEBSOCKET_ROUTE_SELECTION_REFERENCE_PREFIX`].
+pub use selection_expression::WEBSOCKET_ROUTE_SELECTION_REFERENCE_PREFIX;
+
+/// Every variable reference a selection expression makes — see
+/// [`selection_expression::selection_expression_references`].
+pub use selection_expression::selection_expression_references;
+
+/// The sentence a selection expression naming an unevaluated variable is refused with —
+/// see [`selection_expression::unexpected_selection_variable_message`].
+pub use selection_expression::unexpected_selection_variable_message;
+
+/// Whether a `RouteSelectionExpression` can select a route key on an api of this
+/// protocol — see [`selection_expression::validate_route_selection_expression`].
+pub use selection_expression::validate_route_selection_expression;
+
+/// Whether a selection expression names only variables this service evaluates — see
+/// [`selection_expression::validate_selection_expression`].
+pub use selection_expression::validate_selection_expression;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

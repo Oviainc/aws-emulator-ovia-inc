@@ -7,8 +7,10 @@
 //! in particular it does NOT bump `LastActiveAt`, which moves only when data actually
 //! flows to the connection.
 //!
-//! An unregistered or already-deleted connection id answers the modeled
-//! `GoneException` (HTTP 410); see [`crate::state`] for the registration rule.
+//! A connection id this service ISSUED whose connection has since been deleted answers
+//! the modeled `GoneException` (HTTP 410), and a `ConnectionId` it never issued is
+//! refused HTTP 400 `BadRequestException`; see [`crate::state`] for the registration
+//! rule and for why the two refusals are split.
 //!
 //! ## Shape of an operation
 //!
@@ -150,10 +152,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Clone the record out under the guard and release the guard before building
         // the response. Nothing here writes: a report must not change what a later
         // caller sees.
-        let connection = state.lock().connections.get(&input.connection_id).cloned();
+        let (issued, connection) = {
+            let guard = state.lock();
+            (
+                guard.identifies_a_connection(&input.connection_id),
+                guard.connections.get(&input.connection_id).cloned(),
+            )
+        };
+        // A `ConnectionId` this service never issued identifies no connection of its, so
+        // it is refused as an invalid `ConnectionId` rather than reported as a connection
+        // that once existed (`crate::state::invalid_connection_id`).
+        if !issued {
+            return Err(crate::state::invalid_connection_id(&input.connection_id));
+        }
         let Some(connection) = connection else {
-            // No registry entry: the connection was deleted, or was never registered.
-            // Either way it "no longer exists" as far as this API is concerned.
+            // No registry entry for an id this service issued: the connection was
+            // deleted, so it "no longer exists" as far as this API is concerned.
             return Err(GetConnectionErrorModeled::GoneException(GoneException {}).into());
         };
 

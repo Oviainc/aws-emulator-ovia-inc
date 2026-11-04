@@ -7,8 +7,11 @@
 //!
 //! Removal is what makes the connection gone: every later `GetConnection`,
 //! `PostToConnection` and `DeleteConnection` on the same id answers the modeled
-//! `GoneException` (HTTP 410), since a missing entry is this service's single source of
-//! truth for that error. See [`crate::state`] for the registration rule.
+//! `GoneException` (HTTP 410), since a missing entry for an ISSUED id is this service's
+//! single source of truth for that error. A `ConnectionId` this service never issued
+//! identifies no connection to delete and is refused HTTP 400 `BadRequestException`
+//! instead. See [`crate::state`] for the registration rule and for why the two refusals
+//! are split.
 //!
 //! ## Shape of an operation
 //!
@@ -164,8 +167,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Removing the entry IS the delete: the registry is the only record of the
-        // connection, so a second delete of the same id finds nothing.
-        let removed = state.lock().connections.remove(&input.connection_id);
+        // connection, so a second delete of the same id finds nothing. An id this
+        // service never issued is refused as an invalid `ConnectionId` instead, before
+        // anything is removed (`crate::state::invalid_connection_id`).
+        let mut guard = state.lock();
+        if !guard.identifies_a_connection(&input.connection_id) {
+            return Err(crate::state::invalid_connection_id(&input.connection_id));
+        }
+        let removed = guard.connections.remove(&input.connection_id);
         if removed.is_none() {
             return Err(DeleteConnectionErrorModeled::GoneException(GoneException {}).into());
         }

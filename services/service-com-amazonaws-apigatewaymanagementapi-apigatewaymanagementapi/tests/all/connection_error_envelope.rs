@@ -5,11 +5,11 @@
 //! reads before it looks at a body at all.
 //!
 //! The rule under test: **a `@connections` request is answered by this service in its
-//! own modelled restJson1 envelope — the HTTP status is the `@httpError` the model
-//! declares for the error shape (so always a terminal 4xx, never a retryable 5xx),
-//! `content-type` is `application/json`, and `x-amzn-errortype` names that error
-//! shape** — whichever operation it names, whichever endpoint path it is addressed
-//! through and whatever the connection id looks like.
+//! own modelled restJson1 envelope — the HTTP status is the one declared for the failure
+//! (the `@httpError` of the error shape for a modelled one, so always a terminal 4xx and
+//! never a retryable 5xx), `content-type` is `application/json`, and `x-amzn-errortype`
+//! names that failure's shape** — whichever operation it names, whichever endpoint path
+//! it is addressed through and whatever the connection id looks like.
 //!
 //! WHY it is pinned here. This service signs as `execute-api`, a signing name it SHARES
 //! with the Amazon Connect Participant Service, and the router resolves a request's
@@ -28,8 +28,8 @@
 //! (all three), the endpoint form the caller addresses (the modelled path, a deployed
 //! stage's invoke path, a custom domain's two-segment base path, on three different
 //! hosts), the connection-id form, the failure class (`GoneException` for a connection
-//! that was deleted and for one never registered, `PayloadTooLargeException` for an
-//! over-limit payload) and the payload size.
+//! that was issued and then deleted, `BadRequestException` for an id this service never
+//! issued, `PayloadTooLargeException` for an over-limit payload) and the payload size.
 //!
 //! The router, request builder and response readers live in `crate::support`.
 
@@ -49,6 +49,13 @@ use crate::support::{call_with_headers, register, HOST};
 /// three operations declare for a connection id the registry does not hold.
 const GONE_STATUS: u16 = 410;
 const GONE_TYPE: &str = "GoneException";
+
+/// The refusal of a `ConnectionId` this service never ISSUED. The model declares no
+/// client-input error for these operations, so the status and code are the ones API
+/// Gateway words such a refusal in (`crate::state::invalid_connection_id`), and the
+/// envelope is the service's own restJson1 one, exactly as a modelled failure's is.
+const INVALID_ID_STATUS: u16 = 400;
+const INVALID_ID_TYPE: &str = "BadRequestException";
 
 /// `PayloadTooLargeException` is a client error with `@httpError(413)`
 /// (`smithy_query(query="shape",shape="PayloadTooLargeException")`), declared by
@@ -168,10 +175,12 @@ fn assert_modelled_envelope(
     );
 }
 
-/// An id the registry never held is the modelled `GoneException`, in the modelled
-/// envelope, for every operation, every endpoint form and every id form.
+/// An id this service never ISSUED identifies no connection of its, so it is refused as
+/// an invalid `ConnectionId` — HTTP 400 `BadRequestException` — in the SAME envelope the
+/// modelled failures travel in, for every operation, every endpoint form and every id
+/// form.
 #[tokio::test]
-async fn an_unregistered_connection_answers_gone_in_the_modelled_envelope() {
+async fn an_id_this_service_never_issued_is_refused_in_the_same_envelope() {
     for (endpoint, host, prefix) in ENDPOINTS {
         for (id_form, connection_id) in ID_FORMS {
             for method in METHODS {
@@ -189,8 +198,8 @@ async fn an_unregistered_connection_answers_gone_in_the_modelled_envelope() {
                 let answer = call_with_headers(&engine, host, method, &path, payload).await;
                 assert_modelled_envelope(
                     &format!("{method} {path} on {host} ({endpoint}, {id_form})"),
-                    GONE_STATUS,
-                    GONE_TYPE,
+                    INVALID_ID_STATUS,
+                    INVALID_ID_TYPE,
                     &answer,
                 );
                 assert!(

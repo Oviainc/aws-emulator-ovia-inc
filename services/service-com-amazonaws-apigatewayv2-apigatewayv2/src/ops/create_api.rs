@@ -281,10 +281,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             }
         };
+        // And it names a variable this api's protocol selects a route key with — on a
+        // WEBSOCKET api, a field of the message body — so an expression that could never
+        // match a route key is refused rather than stored on an api that then looks
+        // routable (`crate::state::validate_route_selection_expression`).
+        if let Err(message) = crate::state::validate_route_selection_expression(
+            &input.protocol_type,
+            &route_selection_expression,
+        ) {
+            return Err(bad_request(&message));
+        }
 
         // `CorsConfiguration` is documented "Supported only for HTTP APIs", so it names a
         // setting an api of another protocol could never apply, and the protocol this
-        // request asks for is its OWN `ProtocolType`, there being no parent api.
+        // request asks for is its OWN `ProtocolType`, there being no parent api. API
+        // Gateway words this member's refusal in the member's own terms rather than with
+        // the sentence it words the other restricted members with; the whole rule, and
+        // that sentence, live in `crate::state::validate_cors_protocol`.
         //
         // The three QUICK CREATE members — `Target`, `RouteKey` and the quick-create
         // `CredentialsArn` — carry the same clause in their documentation and are
@@ -299,13 +312,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (and this service, like API Gateway, answers an HTTP api's CreateApi with the
         // default `ApiKeySelectionExpression`), so a value a caller supplies for one is a
         // value the resource reports back whatever its protocol.
-        let restricted = [crate::state::ProtocolRestrictedMember::http_only(
-            "CorsConfiguration",
+        if let Err(message) = crate::state::validate_cors_protocol(
+            &input.protocol_type,
             input.cors_configuration.is_some(),
-        )];
-        if let Err(message) =
-            crate::state::validate_protocol_restricted_members(&input.protocol_type, &restricted)
-        {
+        ) {
             return Err(bad_request(&message));
         }
         // `RouteKey` only names the route quick create mints, so a request that carries it

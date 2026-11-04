@@ -1,0 +1,62 @@
+Issue-Severity: CRITICAL
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: apigatewayv2__lambda__logs.agent-registration-reply-is-never-delivered-without-websocket-endpoint apigatewayv2__lambda__logs.connect-without-an-invoke-permission-is-rejected-with-500 apigatewayv2__lambda__logs.default-route-response-is-silent-until-redeployed-then-frames-the-handler-error-bodies apigatewayv2__lambda__logs.disconnect-route-deletes-the-connection-row-and-marks-the-node-disconnected apigatewayv2__lambda__logs.heartbeat-is-acknowledged-and-advances-the-node-last-seen apigatewayv2__lambda__logs.registration-prunes-a-stale-ui-connection-on-gone-and-still-notifies-the-live-ui apigatewayv2__lambda__logs.registration-reply-carries-the-node-id-stored-for-the-connection apigatewayv2__lambda__logs.registration-write-succeeds-but-no-reply-arrives-when-websocket-endpoint-is-unset apigatewayv2__lambda__logs.reply-is-denied-without-the-manage-connections-grant apigatewayv2__lambda__logs.unmatched-action-without-a-default-route-is-rejected-forbidden apigatewayv2__lambda__logs.unrouted-ping-action-is-swallowed-while-heartbeat-is-answered
+Issue-Key: apigatewayv2__lambda__logs.agent-registration-reply-is-never-delivered-without-websocket-endpoint|_ws_connect#3|AssertionError|assert status >= 500 and time.monotonic() < deadline, (
+Issue-Key: apigatewayv2__lambda__logs.connect-without-an-invoke-permission-is-rejected-with-500|run#5|AssertionError|assert seen == [500, 500, 500], f"without an invoke grant the upgrade answered {seen!r}"
+Issue-Key: apigatewayv2__lambda__logs.default-route-response-is-silent-until-redeployed-then-frames-the-handler-error-bodies|_ws_connect#4|AssertionError|assert status >= 500 and time.monotonic() < deadline, (
+Issue-Key: apigatewayv2__lambda__logs.disconnect-route-deletes-the-connection-row-and-marks-the-node-disconnected|_ws_connect#2|AssertionError|assert status >= 500 and time.monotonic() < deadline, (
+Issue-Key: apigatewayv2__lambda__logs.heartbeat-is-acknowledged-and-advances-the-node-last-seen|_ws_connect#2|AssertionError|assert status >= 500 and time.monotonic() < deadline, (
+Issue-Key: apigatewayv2__lambda__logs.registration-prunes-a-stale-ui-connection-on-gone-and-still-notifies-the-live-ui|_ws_connect#4|AssertionError|assert status >= 500 and time.monotonic() < deadline, (
+Issue-Key: apigatewayv2__lambda__logs.registration-reply-carries-the-node-id-stored-for-the-connection|_ws_connect#2|AssertionError|assert status >= 500 and time.monotonic() < deadline, (
+Issue-Key: apigatewayv2__lambda__logs.registration-write-succeeds-but-no-reply-arrives-when-websocket-endpoint-is-unset|_ws_connect#3|AssertionError|assert status >= 500 and time.monotonic() < deadline, (
+Issue-Key: apigatewayv2__lambda__logs.reply-is-denied-without-the-manage-connections-grant|_ws_connect#3|AssertionError|assert status >= 500 and time.monotonic() < deadline, (
+Issue-Key: apigatewayv2__lambda__logs.unmatched-action-without-a-default-route-is-rejected-forbidden|_ws_connect#2|AssertionError|assert status >= 500 and time.monotonic() < deadline, (
+Issue-Key: apigatewayv2__lambda__logs.unrouted-ping-action-is-swallowed-while-heartbeat-is-answered|_ws_connect#2|AssertionError|assert status >= 500 and time.monotonic() < deadline, (
+Issue-Commit: 86c9f1e4438a61fbe37b19dfcd3d77efce3d0679
+
+# apigatewayv2: the WEBSOCKET execute-api data plane still cannot complete an RFC 6455 upgrade — the front door has no seam that hands a service the connection (1 cause)
+
+> _Split out of `issues/things-that-now-work/20261102T090835Z-apigatewayv2-lambda-logs-websocket-api-data-plane-answers-404-unknownservice-on.md`, whose causes 2, 3 and 4 are fixed (an invalid `ConnectionId` is refused 400 `BadRequestException` instead of 410 `GoneException`, a WEBSOCKET api's `RouteSelectionExpression` must select a field of the message body, and the Cors protocol refusal uses API Gateway's own sentence). This report carries the replay keys of that report's cause 1, which do NOT pass, re-filed here so they are not recorded as working. Everything below is what that fix established about them; a later fixer starts from here rather than from scratch._
+>
+> _A twelfth check, `apigatewayv2__lambda__logs.post-to-a-malformed-connection-id-is-rejected-bad-request`, now gets past its own assertion (cause 2 of the parent, fixed) and fails at `_ws_connect#7` on the upgrade below; its replay key stays with the parent report._
+
+## Operation
+CreateApi
+
+## Description
+One cause, and it is a CAPABILITY the emulator does not have rather than a wrong answer.
+
+An RFC 6455 upgrade to a deployed WEBSOCKET API stage is answered `404 UnknownService`, so the whole WebSocket data plane is unreachable.
+
+AWS: recorded behavior only (the Smithy model covers only the control plane). An HTTP/1.1 GET with `Upgrade: websocket` / `Connection: Upgrade` / `Sec-WebSocket-Key` / `Sec-WebSocket-Version: 13` against `wss://<apiId>.execute-api.<region>.amazonaws.com/<stage>` on a deployed WEBSOCKET API is answered `HTTP/1.1 101 Switching Protocols` with the derived `Sec-WebSocket-Accept` when the `$connect` route authorizes the connection, and a 4xx/5xx from the gateway otherwise (500 when the route's integration cannot be invoked, 403 when the `$default` route is absent) — in every case the request reaches the API, not the service router. After the `101` the `$connect` / route-selection / `$disconnect` routes dispatch to their integrations over that socket, and the handler pushes its replies back through the stage's `https://` `@connections` callback URL.
+
+Emulator: the front door answers `HTTP/1.1 404 Not Found` with `content-type: application/x-amz-json-1.1` and `x-amzn-errortype: UnknownService` (the body length and date are per-run). The error type says no service claimed the request, so no stage, route, authorizer or integration was consulted. The apigatewayv2 crate DOES carry a WEBSOCKET data plane for this endpoint — `services/service-com-amazonaws-apigatewayv2-apigatewayv2/src/service/websocket.rs`, claimed from `Service::can_handle` and served from `Service::override_routing_error`, with its own suites in `tests/all/websocket_handshake_data_plane.rs` and `tests/all/websocket_connect_authorization.rs` — and in-process those suites pass, so whatever this handshake carries on the wire does not resolve through `websocket::resolve` (the host names no api id the store holds, or the path's stage segment resolves to no single WEBSOCKET api). That resolution is worth tracing first, but closing it only moves the answer to that module's `501`, which is not what these checks need.
+
+Why it cannot be closed from `services/` as the tree stands — the client reaches the emulator's ONE buffered front door, and nothing in the vendored path can hand a service the connection's byte stream:
+* `vendor/smithy-server-runtime/src/service.rs:312-427` — the whole `Service` trait. `can_handle(&Parts)`, `override_operation`, `override_routing_error(&RtRequest) -> Option<RtResponse>`: every seam takes an already-buffered request and returns a buffered response. There is no upgrade seam.
+* `vendor/smithy-server-runtime/src/multi_service_router.rs:509-528` — `http_response_from_runtime_api` strips `connection` and `upgrade` from every response, so even a hand-built `101` reaches the client without the fields RFC 6455 §4.1 requires of the server's handshake.
+* `vendor/server/src/lib.rs:956-974` — the production listener's fallback buffers the body and returns one `http::Response<Bytes>`. The hyper `OnUpgrade` extension survives into `OperationContext::parts()`, but only as `&Parts`, and `OnUpgrade` cannot be taken out of an immutable borrow, so no handler can await the upgrade.
+* `vendor/server/src/listeners.rs:588` — the core-owned per-resource listener refuses a WebSocket upgrade with `501` outright, so the loopback-listener route that a native data plane uses is closed for this protocol too.
+
+Required core change: a seam that lets the claiming service answer `101` and then receive the upgraded connection, and a response path that does not strip a `101`'s hop-by-hop fields. Answering `101` without it would be a fabricated success — the client would see the upgrade and then read EOF, with no socket to carry `$connect` and no session a minted connection id could address.
+
+Second blocker, independent of the transport: nine of these eleven checks assert what the ROUTE's Lambda handler did (a DynamoDB row written by `$connect`, a reply pushed through `@connections`, a heartbeat that advances a node's last-seen), and `Invoke` answers `501` for `RequestResponse` because no deployment package runs in this emulator (`services/service-com-amazonaws-lambda-awsgirapiservice/src/ops/invoke.rs:39-45`). `apigatewayv2__lambda__logs.connect-without-an-invoke-permission-is-rejected-with-500` is the one check that needs no handler to RUN — it expects `[500, 500, 500]` because the `$connect` integration cannot be invoked at all — but the data plane would still have to reach the Lambda resource policy to know that, and the serving seam it is answered from is synchronous and has no callback.
+
+Traces: apigatewayv2__lambda__logs.agent-registration-reply-is-never-delivered-without-websocket-endpoint, .connect-without-an-invoke-permission-is-rejected-with-500, .default-route-response-is-silent-until-redeployed-then-frames-the-handler-error-bodies, .disconnect-route-deletes-the-connection-row-and-marks-the-node-disconnected, .heartbeat-is-acknowledged-and-advances-the-node-last-seen, .registration-prunes-a-stale-ui-connection-on-gone-and-still-notifies-the-live-ui, .registration-reply-carries-the-node-id-stored-for-the-connection, .registration-write-succeeds-but-no-reply-arrives-when-websocket-endpoint-is-unset, .reply-is-denied-without-the-manage-connections-grant, .unmatched-action-without-a-default-route-is-rejected-forbidden, .unrouted-ping-action-is-swallowed-while-heartbeat-is-answered
+
+Related open reports of the same gap, filed from other check groups: `20261023T210711Z-apigateway-dynamodb-lambda-logs-five-checks-hang-to.md`, `20261023T223918Z-apigatewayv2-dynamodb-lambda-all-three-websocket-duplex-checks.md`, `20261023T223918Z-apigatewaymanagementapi-is-untestable-end-to-end-the-websocket.md`, `20261024T120951Z-apigatewayv2-the-execute-api-data-plane-never-serves.md`, `20261024T120951Z-apigatewayv2-dynamodb-lambda-logs-s3-the-websocket-upgrade.md`. One core seam closes all of them.
+
+## Evidence
+All from the simparity-behavioral-aws-v1 replay against the parent fix's branch (14 of 14 checks replayed; cause 3's key `fixed`, cause 2's key past its own assertion, these eleven unchanged).
+
+Eleven checks fail in `_ws_connect` with:
+  AssertionError: the WebSocket upgrade to the prod stage answered 404: 'HTTP/1.1 404 Not Found\r\ncontent-type: application/x-amz-json-1.1\r\nx-amzn-errortype: UnknownService\r\ncontent-length: 149\r\ndate: …'
+  `connect-without-an-invoke-permission-is-rejected-with-500` additionally records: AssertionError: without an invoke grant the upgrade answered [404, 404, 404] (expected [500, 500, 500]).
+  The host/port and date in these lines are per-environment and are not requirements; the 404 status and the `UnknownService` error type are. The assertion is inside a retry loop that treats a 5xx as transient, so a `501` from the data plane spins to the deadline and fails too: only a real `101`, with frames after it, passes.
+
+## Steps to Reproduce
+1. Boot the emulator from this checkout.
+2. Create a WEBSOCKET API with `$connect`/`$disconnect`/`$default` routes backed by a Lambda `AWS_PROXY` integration, create a stage and deploy it.
+3. Open a TCP/TLS socket to the stage's execute-api endpoint and send `GET /<stage> HTTP/1.1` with `Upgrade: websocket`, `Connection: Upgrade`, `Sec-WebSocket-Key: <base64 16 bytes>`, `Sec-WebSocket-Version: 13`.
+4. Observe `HTTP/1.1 404 Not Found` with `x-amzn-errortype: UnknownService` where AWS answers `101 Switching Protocols`; then re-replay the eleven check ids in trace_ids.

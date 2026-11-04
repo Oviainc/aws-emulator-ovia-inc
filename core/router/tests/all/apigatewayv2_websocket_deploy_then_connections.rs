@@ -15,8 +15,9 @@
 //! 3. The `@connections` operations of that api are then reachable at its invoke URL,
 //!    `https://{api-id}.execute-api.{region}.amazonaws.com/{stage}/@connections/{id}`,
 //!    and answer from the API Gateway Management API's connection registry: the modelled
-//!    200/200/204 for a registered connection and the modelled `GoneException` (410) for
-//!    one the registry does not hold.
+//!    200/200/204 for a registered connection, the modelled `GoneException` (410) once it
+//!    is deleted, and the invalid-`ConnectionId` refusal (400 `BadRequestException`) for
+//!    an id that service never issued.
 //!
 //! Two services, one engine, one router, so this is a router suite: the deploy half is
 //! served by the API Gateway V2 crate (signing name `apigateway`) and the data-plane
@@ -413,8 +414,9 @@ fn a_websocket_api_deploys_and_its_connections_endpoint_serves_the_registry() {
                         stored.messages
                     );
 
-                    // An id the registry does not hold is the modelled Gone, so the
-                    // endpoint is answering from state and not from the path.
+                    // An id this service never issued identifies no connection, so it is
+                    // refused as an invalid `ConnectionId` — the endpoint is answering
+                    // from state and not from the path.
                     let (status, text) = call(
                         &router,
                         EXECUTE_API_AUTHORIZATION,
@@ -425,14 +427,16 @@ fn a_websocket_api_deploys_and_its_connections_endpoint_serves_the_registry() {
                     )
                     .await;
                     assert_eq!(
-                        status, 410,
-                        "case {:?}: an unregistered id must answer 410, got {status} {text}",
+                        status, 400,
+                        "case {:?}: an id that was never issued must answer 400, got \
+                         {status} {text}",
                         row.case
                     );
                     assert_eq!(
                         error_code(&text),
-                        "GoneException",
-                        "case {:?}: an unregistered id must answer GoneException, got {text}",
+                        "BadRequestException",
+                        "case {:?}: an id that was never issued must answer \
+                         BadRequestException, got {text}",
                         row.case
                     );
 
@@ -499,9 +503,9 @@ fn the_two_execute_api_services_route_apart_under_one_signing_name() {
         status: Option<u16>,
     }
 
-    // `@connections` rows address a connection no registry holds, so the management
-    // API's own answer is its modelled `GoneException` (410) — an answer only that
-    // service can give.
+    // `@connections` rows address an id no registry holds — one this emulator never
+    // issued — so the management API's own answer is its invalid-`ConnectionId` refusal
+    // (400 `BadRequestException`), an answer only that service can give.
     const CLAIMS: &[Claim] = &[
         Claim {
             name: "GetConnection at the modelled path",
@@ -509,7 +513,7 @@ fn the_two_execute_api_services_route_apart_under_one_signing_name() {
             method: "GET",
             path: "/@connections/no-such-connection",
             body: "",
-            status: Some(410),
+            status: Some(400),
         },
         Claim {
             name: "GetConnection through a stage invoke path",
@@ -517,7 +521,7 @@ fn the_two_execute_api_services_route_apart_under_one_signing_name() {
             method: "GET",
             path: "/prod/@connections/no-such-connection",
             body: "",
-            status: Some(410),
+            status: Some(400),
         },
         Claim {
             name: "PostToConnection through a stage invoke path",
@@ -525,7 +529,7 @@ fn the_two_execute_api_services_route_apart_under_one_signing_name() {
             method: "POST",
             path: "/prod/@connections/no-such-connection",
             body: "hello",
-            status: Some(410),
+            status: Some(400),
         },
         Claim {
             name: "DeleteConnection through a custom domain base path",
@@ -533,7 +537,7 @@ fn the_two_execute_api_services_route_apart_under_one_signing_name() {
             method: "DELETE",
             path: "/v1/socket/@connections/no-such-connection",
             body: "",
-            status: Some(410),
+            status: Some(400),
         },
         Claim {
             name: "the participant service's own path space",
@@ -598,9 +602,9 @@ fn the_two_execute_api_services_route_apart_under_one_signing_name() {
                         // refusal this test exists for answered `500 AmbiguousService` in
                         // an `application/x-amz-json-1.1` body, so the media type and the
                         // error shape are as much a part of the fix as the status. Both
-                        // are the management API's restJson1 answer — `GoneException` is
-                        // the shape all three `@connections` operations declare for a
-                        // connection the registry does not hold.
+                        // are the management API's restJson1 answer — `BadRequestException`
+                        // is the shape all three `@connections` operations refuse a
+                        // `ConnectionId` that identifies no connection with.
                         assert_eq!(
                             header(&headers, "content-type"),
                             "application/json",
@@ -611,9 +615,9 @@ fn the_two_execute_api_services_route_apart_under_one_signing_name() {
                         );
                         assert_eq!(
                             header(&headers, "x-amzn-errortype"),
-                            "GoneException",
-                            "case {:?}: expected x-amzn-errortype to name the modelled \
-                             GoneException, got {:?} with {status} {text}",
+                            "BadRequestException",
+                            "case {:?}: expected x-amzn-errortype to name the owning \
+                             service's BadRequestException, got {:?} with {status} {text}",
                             claim.name,
                             header(&headers, "x-amzn-errortype")
                         );

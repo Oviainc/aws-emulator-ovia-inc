@@ -110,9 +110,13 @@ service's operations.
 
 This service's whole state is a registry of WebSocket connections, keyed by
 `ConnectionId`:
-`ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState::connections`. All
-three modelled operations address one entry of it, and **a missing entry is the single
-source of truth for `GoneException` (HTTP 410)**.
+`ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState::connections`, beside
+the set of every `ConnectionId` the service has ISSUED (`::issued`). All three modelled
+operations address one entry of the registry, and the two refusals are split along that
+set: **a missing entry for an ISSUED id is the single source of truth for
+`GoneException` (HTTP 410)**, while an id the service never issued identifies no
+connection at all and is refused `400 BadRequestException` with
+`Invalid connectionId: <id>` before any connection is looked up.
 
 None of the three CREATES a connection: in real AWS a connection exists because a
 client completed a WebSocket handshake against the API's own invoke endpoint, which
@@ -134,6 +138,9 @@ service_com_amazonaws_apigatewaymanagementapi_apigatewaymanagementapi::state::re
   `DeleteConnection` that removes it. There is deliberately **no auto-registration on
   first reference**: that would make `GetConnection` answer `200` for an id that never
   existed, which the real service never does.
+* Registering a connection is what ISSUES its id, and the id stays issued after the
+  connection closes — that is what keeps a closed connection answering `GoneException`
+  while a value nothing ever issued is refused as an invalid `ConnectionId`.
 * `ConnectedAt` is fixed at registration and never moves; re-registering a present id
   changes nothing.
 * `LastActiveAt` moves only when data actually flows to the connection — a successful

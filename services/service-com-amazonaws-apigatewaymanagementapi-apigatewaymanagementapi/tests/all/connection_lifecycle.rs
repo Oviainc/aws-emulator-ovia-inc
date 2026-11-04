@@ -7,8 +7,10 @@
 //! The rule under test, stated once: **every response is computed from the connection
 //! registry in this service's engine state** — a connection exists only from the moment
 //! the registration seam registered it until `DeleteConnection` removes it, each
-//! operation reads or writes that one record, and an id the registry does not hold is
-//! `GoneException` (HTTP 410) for all three operations.
+//! operation reads or writes that one record, an id the service ISSUED whose connection
+//! the registry no longer holds is `GoneException` (HTTP 410) for all three operations,
+//! and an id it never issued is refused as an invalid `ConnectionId` (HTTP 400
+//! `BadRequestException`).
 //!
 //! Each test asserts that rule over a TABLE of inputs rather than over one recorded
 //! call: the rows differ along connection-id form, identity values, registration
@@ -483,11 +485,13 @@ async fn delete_connection_removes_the_record_and_every_later_call_is_gone() {
     }
 }
 
-/// An id the registry never held is `GoneException` for all three operations — never a
-/// 200, never a 501, and never an auto-registration that would make the next
-/// `GetConnection` succeed.
+/// An id this service never ISSUED identifies no connection of its, so all three
+/// operations refuse it as an invalid `ConnectionId` (HTTP 400 `BadRequestException`
+/// naming the id) — never a 200, never a 501, never the `GoneException` that would claim
+/// the id once named a live connection, and never an auto-registration that would make
+/// the next `GetConnection` succeed.
 #[tokio::test]
-async fn an_unregistered_id_is_gone_for_every_operation() {
+async fn an_id_this_service_never_issued_is_an_invalid_connection_id_for_every_operation() {
     let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
 
     // One registered connection, so the failures below are about the id and not about
@@ -517,14 +521,16 @@ async fn an_unregistered_id_is_gone_for_every_operation() {
             let (status, body) = call(&engine, method, id, payload).await;
             assert_eq!(
                 status,
-                410,
-                "case {id:?}: {method} on an unregistered id must answer 410, got {status} {}",
+                400,
+                "case {id:?}: {method} on an id this service never issued must answer \
+                 400, got {status} {}",
                 error_code(&body)
             );
             assert_eq!(
                 error_code(&body),
-                "GoneException",
-                "case {id:?}: {method} on an unregistered id must name GoneException, got {body:?}"
+                "BadRequestException",
+                "case {id:?}: {method} on an id this service never issued must name \
+                 BadRequestException, got {body:?}"
             );
         }
         assert!(

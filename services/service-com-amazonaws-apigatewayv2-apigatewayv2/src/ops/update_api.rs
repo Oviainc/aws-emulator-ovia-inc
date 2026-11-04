@@ -237,13 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // api of either protocol. What refuses them on an api quick create never ran for
         // is the quick-create precondition below — there is no managed integration or
         // route to patch — which is the reason such a request is really refused.
-        let restricted = [crate::state::ProtocolRestrictedMember::http_only(
-            "CorsConfiguration",
+        if let Err(message) = crate::state::validate_cors_protocol(
+            &protocol_type,
             input.cors_configuration.is_some(),
-        )];
-        if let Err(message) =
-            crate::state::validate_protocol_restricted_members(&protocol_type, &restricted)
-        {
+        ) {
             return Err(bad_request(&message));
         }
         // A `Target` that patches the integration quick create minted names ONE of the two
@@ -323,6 +320,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Err(message) = crate::state::validate_cors_configuration(cors) {
                 return Err(bad_request(&message));
             }
+        }
+
+        // And the MERGED route selection expression is the one this api would select a
+        // route key with, so that is what has to name a variable its protocol selects one
+        // from (`crate::state::validate_route_selection_expression`): a patch that would
+        // leave a WEBSOCKET api matching its messages against something no route key can
+        // carry is refused, and the api keeps the expression it had.
+        if let Err(message) = crate::state::validate_route_selection_expression(
+            &protocol_type,
+            &updated.route_selection_expression,
+        ) {
+            return Err(bad_request(&message));
         }
 
         // Quick create's members patch the resources quick create minted: "The value

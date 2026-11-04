@@ -88,36 +88,105 @@ async fn get_connection_renders_iso8601_date_times_and_the_modeled_json_names() 
     }
 }
 
-/// Each modelled failure renders in the restJson1 error envelope with its own
-/// `@httpError` status: one row per error this service can answer from a request.
+/// Each failure this service answers renders in the restJson1 error envelope with its
+/// own status: one row per error it can answer from a request. The two refusals of a
+/// `ConnectionId` differ — an id the service never issued is the 400
+/// `BadRequestException`, an id it issued whose connection is closed is the modelled 410
+/// `GoneException` — so both are pinned here.
 #[tokio::test]
 async fn modeled_errors_render_with_their_own_status_and_type() {
-    // (case, method, request body length, expected status, expected __type)
-    let table: [(&str, &str, usize, u16, &str); 4] = [
-        ("get on an unknown id", "GET", 0, 410, "GoneException"),
-        ("post to an unknown id", "POST", 4, 410, "GoneException"),
-        ("delete an unknown id", "DELETE", 0, 410, "GoneException"),
+    /// Which connection id a row addresses.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Target {
+        /// An id this service never issued.
+        NeverIssued,
+        /// An id it issued whose connection the row deletes first.
+        Deleted,
+        /// A registered, open connection.
+        Open,
+    }
+
+    // (case, method, request body length, target, expected status, expected __type)
+    let table: [(&str, &str, usize, Target, u16, &str); 7] = [
+        (
+            "get on an id this service never issued",
+            "GET",
+            0,
+            Target::NeverIssued,
+            400,
+            "BadRequestException",
+        ),
+        (
+            "post to an id this service never issued",
+            "POST",
+            4,
+            Target::NeverIssued,
+            400,
+            "BadRequestException",
+        ),
+        (
+            "delete an id this service never issued",
+            "DELETE",
+            0,
+            Target::NeverIssued,
+            400,
+            "BadRequestException",
+        ),
+        (
+            "get on a closed connection",
+            "GET",
+            0,
+            Target::Deleted,
+            410,
+            "GoneException",
+        ),
+        (
+            "post to a closed connection",
+            "POST",
+            4,
+            Target::Deleted,
+            410,
+            "GoneException",
+        ),
+        (
+            "delete a closed connection",
+            "DELETE",
+            0,
+            Target::Deleted,
+            410,
+            "GoneException",
+        ),
         (
             "post one byte past the modelled maximum",
             "POST",
             mgmt::ops::post_to_connection::MAX_DATA_BYTES + 1,
+            Target::Open,
             413,
             "PayloadTooLargeException",
         ),
     ];
 
-    for (case, method, body_len, expected_status, expected_type) in table {
+    for (case, method, body_len, target, expected_status, expected_type) in table {
         let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
         // The oversized row needs a registered connection, so that its refusal is
         // about the payload and not about the id.
         register_at(&engine, "probe-err", 1_700_000_000);
 
-        let target = if expected_status == 413 {
-            "probe-err"
-        } else {
-            "not-registered"
+        let connection_id = match target {
+            Target::NeverIssued => "not-registered",
+            Target::Open => "probe-err",
+            Target::Deleted => {
+                register_at(&engine, "probe-gone", 1_700_000_000);
+                let (status, _) = call(&engine, "DELETE", "probe-gone", Vec::new()).await;
+                assert_eq!(
+                    status, 204,
+                    "case {case:?}: the delete that closes the connection must answer 204, \
+                     got {status}"
+                );
+                "probe-gone"
+            }
         };
-        let (status, body) = call(&engine, method, target, vec![b'x'; body_len]).await;
+        let (status, body) = call(&engine, method, connection_id, vec![b'x'; body_len]).await;
         assert_eq!(
             status, expected_status,
             "case {case:?}: expected HTTP {expected_status}, got {status} with body {body:?}"

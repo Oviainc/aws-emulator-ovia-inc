@@ -333,7 +333,8 @@ async fn the_modelled_failures_answer_the_same_under_an_invoke_prefix() {
     for row in ROWS {
         let engine = engine_with(row);
 
-        // An id the registry does not hold is Gone, whatever the prefix.
+        // An id this service never issued is refused as an invalid `ConnectionId`,
+        // whatever the prefix.
         let (status, body) = call_at(
             &engine,
             row.host,
@@ -343,14 +344,15 @@ async fn the_modelled_failures_answer_the_same_under_an_invoke_prefix() {
         )
         .await;
         assert_eq!(
-            status, 410,
-            "case {:?}: an unregistered id must answer 410, got {status} {body:?}",
+            status, 400,
+            "case {:?}: an id this service never issued must answer 400, got {status} {body:?}",
             row.case
         );
         assert_eq!(
             error_code(&body),
-            "GoneException",
-            "case {:?}: an unregistered id must answer GoneException, got {body:?}",
+            "BadRequestException",
+            "case {:?}: an id this service never issued must answer BadRequestException, \
+             got {body:?}",
             row.case
         );
 

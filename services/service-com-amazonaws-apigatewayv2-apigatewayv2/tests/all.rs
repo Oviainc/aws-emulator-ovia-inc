@@ -45,6 +45,8 @@ mod auto_deploy_republishes;
 mod child_resource_delete_is_applied;
 #[path = "all/cors_configuration.rs"]
 mod cors_configuration;
+#[path = "all/cors_protocol_refusal.rs"]
+mod cors_protocol_refusal;
 #[path = "all/constraint_refusal.rs"]
 mod constraint_refusal;
 #[path = "all/create_api_modelled_outcomes.rs"]
@@ -167,6 +169,8 @@ mod route_request_parameter;
 mod route_response_lifecycle;
 #[path = "all/route_response_update.rs"]
 mod route_response_update;
+#[path = "all/route_selection_expression_validation.rs"]
+mod route_selection_expression_validation;
 #[path = "all/route_settings_deletion.rs"]
 mod route_settings_deletion;
 #[path = "all/route_target_forms.rs"]
