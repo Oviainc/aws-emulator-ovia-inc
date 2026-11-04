@@ -10,8 +10,8 @@
 //! An id that addresses no connection the destination owner has a view of is the
 //! modelled missing-resource refusal, and a request this owner REFUSED is its own
 //! permanent record of that decision: there is nothing to delete, so the call is
-//! refused with the service's `ValidationException` naming the status the connection
-//! is in.
+//! refused with the service's `ValidationException` naming the connection the request
+//! addressed and the status it is in ([`connection_change_unavailable`]).
 //!
 //! ## Shape of an operation
 //!
@@ -76,7 +76,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{connection_change_unavailable, connection_not_found, CONNECTION_STATUS_REJECTED};
+use crate::state::{connection_not_found, CONNECTION_STATUS_REJECTED};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -93,7 +93,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-opensearch-amazonopense
 // (`@error("client") @httpError(400)`, and the data-source operations list it) while the
 // model's `errors` list for DeleteInboundConnection does not, and it is what a connection
 // whose status does not allow the change is refused with — see
-// `crate::state::connection_change_unavailable`.
+// [`connection_change_unavailable`].
 #[smithy_macros::operation_error(
     "com.amazonaws.opensearch#DeleteInboundConnection",
     extra_errors = ["ValidationException"]
@@ -103,6 +103,26 @@ pub enum DeleteInboundConnectionErrorModeled {
     DisabledOperationException(DisabledOperationException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+}
+
+/// The `ValidationException` payload for a change asked of a cross-cluster connection
+/// whose current status does not allow it.
+///
+/// A refusal about ONE named connection says WHICH connection it is about before it
+/// says why, by the id the request carried — the same subject-first shape every other
+/// refusal about a single connection carries (`Connection ID <id> does not exist`;
+/// `Connection <id> is in <status> state, not PENDING_ACCEPTANCE`) — so a caller
+/// driving several connections can tell which of its requests was refused. The reason
+/// is the status the connection is in, because that status is the whole reason the
+/// change cannot be made: a connection the destination owner refused is that owner's
+/// record OF the refusal, and a record of a decision is not something a later call
+/// takes back.
+fn connection_change_unavailable(connection_id: &str, status: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "Connection {connection_id} existing status is {status}, unable to make necessary change"
+        )),
+    }
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -185,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if connection.inbound_status() == CONNECTION_STATUS_REJECTED {
             let status = connection.inbound_status().to_string();
             return Err(DeleteInboundConnectionErrorModeled::ValidationException(
-                connection_change_unavailable(&status),
+                connection_change_unavailable(&input.connection_id, &status),
             )
             .into());
         }

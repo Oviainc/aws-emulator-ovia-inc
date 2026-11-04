@@ -147,6 +147,15 @@ pub(crate) fn error_message(answer: &Answer) -> String {
     answer.body["message"].as_str().unwrap_or_default().to_owned()
 }
 
+/// How this service words a change asked of a connection whose current status does not
+/// allow it: the connection the request addressed, then the status that is the reason.
+///
+/// Stated here, beside the calls that provoke it, so the suites that assert the refusal
+/// carry the wording once between them.
+pub(crate) fn connection_change_refusal(connection_id: &str, status: &str) -> String {
+    format!("Connection {connection_id} existing status is {status}, unable to make necessary change")
+}
+
 /// Create one connection and answer its `ConnectionId`.
 pub(crate) async fn created_connection(emulator: &Emulator, case: &str, body: Value) -> String {
     let answer = create_connection(emulator, body).await;

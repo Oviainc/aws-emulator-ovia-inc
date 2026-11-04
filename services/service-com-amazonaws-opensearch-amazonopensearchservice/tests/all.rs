@@ -45,6 +45,8 @@ mod config_change_cancellation;
 mod connection_decisions;
 #[path = "all/connection_records_at_rest.rs"]
 mod connection_records_at_rest;
+#[path = "all/connection_status_refusal.rs"]
+mod connection_status_refusal;
 #[path = "all/constraint_refusal_messages.rs"]
 mod constraint_refusal_messages;
 #[path = "all/control_plane_refusal_wording.rs"]

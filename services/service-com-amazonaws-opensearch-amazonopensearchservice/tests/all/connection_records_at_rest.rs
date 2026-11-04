@@ -39,9 +39,9 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 };
 
 use super::connection_decisions::{
-    accept, created_connection, delete_inbound, delete_outbound, error_message, inbound_status,
-    outbound_status, pending_connection, reject, rests_at_deleted, status_code, walks_to_rejected,
-    POLL_INTERVAL,
+    accept, connection_change_refusal, created_connection, delete_inbound, delete_outbound,
+    error_message, inbound_status, outbound_status, pending_connection, reject, rests_at_deleted,
+    status_code, walks_to_rejected, POLL_INTERVAL,
 };
 use super::cross_cluster_connections::{created_domain, domain_info, ACCOUNT, REGION};
 use super::domain_lifecycle::{error_code, Answer, Emulator, SETTLE_WAIT};
@@ -346,8 +346,9 @@ async fn a_refused_request_stays_the_destination_owners_record_of_the_refusal() 
         );
         assert_eq!(
             error_message(&refused),
-            format!("existing status is {CONNECTION_STATUS_REJECTED}, unable to make necessary change"),
-            "case {case}: expected the refusal to name the status the connection is in, got {:?}",
+            connection_change_refusal(id, CONNECTION_STATUS_REJECTED),
+            "case {case}: expected the refusal to name the connection the request addressed and \
+             the status it is in, got {:?}",
             refused.body
         );
         assert_eq!(
