@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourcePolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report the resource policies attached to one Systems Manager resource. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourcePolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Returns an array of the Policy object": the policies reported are the ones
+//! `PutResourcePolicy` attached to the resource the request's `ResourceArn` names, read
+//! out of the one store that write lands in
+//! ([`crate::state::resource_policies::ResourcePolicyStore`]) and reported with the
+//! `PolicyId` and `PolicyHash` an update or a delete addresses each of them by. A resource
+//! whose policy was deleted — or that never had one — is reported as holding none.
+//!
+//! This is a REPORT: it writes nothing of its own. The walk is in attachment order and
+//! resumes at the policy the previous page stopped at, so a token this operation did not
+//! issue is refused rather than silently read as the start of the list.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +82,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::resource_policies as policies;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -110,6 +116,17 @@ impl From<GetResourcePoliciesErrorModeled> for GetResourcePoliciesError {
     fn from(modeled: GetResourcePoliciesErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The modelled refusal for an input member whose value isn't valid, naming it.
+fn invalid_parameter(members: &[&str], message: &str) -> GetResourcePoliciesError {
+    GetResourcePoliciesErrorModeled::ResourcePolicyInvalidParameterException(
+        ResourcePolicyInvalidParameterException {
+            parameter_names: Some(members.iter().map(|member| (*member).to_string()).collect()),
+            message: Some(message.to_string()),
+        },
+    )
+    .into()
 }
 
 /// The `GetResourcePolicies` operation.
@@ -148,18 +165,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourcePolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourcePoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourcePolicies"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetResourcePoliciesErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the resource policy store is unavailable".to_string()),
+            })
+        })?;
+
+        // The same reading of a `ResourceArn` the write goes through: a value naming no
+        // resource that can hold a policy is a bad parameter, not a resource holding none,
+        // and an ARN naming another account or another Region names nothing reachable
+        // here.
+        let Some(resource) = policies::parse_policy_resource(&input.resource_arn) else {
+            return Err(invalid_parameter(
+                &[policies::RESOURCE_ARN_MEMBER],
+                policies::INVALID_PARAMETER,
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+        if !resource.is_local(&region) {
+            return Err(GetResourcePoliciesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(policies::RESOURCE_NOT_FOUND.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "The maximum number of items to return for this call", at most the modelled
+        // bound, which is also how many a call that asks for no number returns. The
+        // modelled `ResourcePolicyMaxResults` range is refused at the boundary before this
+        // handler runs, so the clamp here only keeps the page arithmetic total.
+        let page_size = input
+            .max_results
+            .map_or(policies::MAX_PAGE_SIZE, |asked| {
+                usize::try_from(asked).unwrap_or(policies::MAX_PAGE_SIZE)
+            })
+            .clamp(1, policies::MAX_PAGE_SIZE);
+
+        // A resource's policies are held under the Region whose endpoint the request
+        // reached, which is the same key the write stored them under. Nothing here is
+        // written: the policies a resource holds are what the writes left behind, and no
+        // clock-owed change can fall due on one.
+        let held_under = resource.key(&region);
+        let store = state.lock();
+        let attached = store.resource_policies.policies(&held_under);
+
+        // "A token to start the list": the id of the policy the previous page stopped at.
+        // A token naming no policy this resource holds was not issued by this operation.
+        let resume_at = match input.next_token.as_deref() {
+            None | Some("") => 0,
+            Some(token) => {
+                let Some(at) = attached
+                    .iter()
+                    .position(|held| held.policy_id == token)
+                else {
+                    return Err(invalid_parameter(
+                        &[policies::NEXT_TOKEN_MEMBER],
+                        crate::state::INVALID_NEXT_TOKEN,
+                    ));
+                };
+                at
+            }
+        };
+
+        let page: Vec<GetResourcePoliciesResponseEntry> = attached
+            .iter()
+            .skip(resume_at)
+            .take(page_size)
+            .map(policies::ResourcePolicyRecord::to_entry)
+            .collect();
+
+        // A policy is still waiting past this page: the caller resumes at its id. A token
+        // is therefore only as good as the policy it names — if that policy is deleted
+        // before the walk resumes, the token names nothing this resource holds and is
+        // refused, which is what a cursor into a set that changed under the caller can
+        // honestly say.
+        let next_token = attached
+            .get(resume_at + page.len())
+            .map(|held| held.policy_id.clone());
+
+        Ok(GetResourcePoliciesOutput {
+            policies: Some(page),
+            next_token,
+        })
     }
 }

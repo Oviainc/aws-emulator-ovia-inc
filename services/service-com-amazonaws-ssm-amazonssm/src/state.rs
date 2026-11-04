@@ -2,7 +2,8 @@
 
 //! Engine state for the com-amazonaws-ssm-amazonssm service.
 //!
-//! Four slices are modelled here. The first is **Parameter Store**: `PutParameter`
+//! The slices below are modelled here, each reached through the one store. The first is
+//! **Parameter Store**: `PutParameter`
 //! creates or updates a parameter, `GetParameter` reads one back,
 //! `GetParametersByPath` reads the parameters stored under one level of a hierarchy
 //! ([`parameter_path`], [`is_under_path`]) and `DescribeParameters` reports the metadata
@@ -57,19 +58,26 @@
 //! describe accepts are [`is_node_filter_key`] (the property describe) and
 //! [`is_instance_information_filter_key`] (the string-filter describe).
 //!
-//! The fourth is the **hybrid activations** ([`ActivationRecord`]), keyed by
+//! The fifth is the **hybrid activations** ([`ActivationRecord`]), keyed by
 //! `(region, activation id)`: `CreateActivation` mints one, `DescribeActivations`
 //! reports what it persisted through [`ActivationRecord::to_activation`], narrowed by
 //! the filter keys [`is_activation_filter_key`] accepts, and `DeleteActivation` drops it
 //! again. The code a create mints is the activation's password and is handed to its
 //! creator once; no read reports it.
 //!
-//! The fifth is the **cloud connectors** that connect Systems Manager to a third-party
+//! The sixth is the **cloud connectors** that connect Systems Manager to a third-party
 //! cloud environment, keyed by `(region, connector id)` and modelled in
 //! [`cloud_connectors`]: `CreateCloudConnector` mints one, `UpdateCloudConnector`
 //! replaces the members an update carries and `GetCloudConnector` reports what is held.
 //! A connector enters the store only by being created, and only under the id the create
 //! minted, so an id nothing created names no connector.
+//!
+//! The seventh is the **resource policies** attached to this account's Systems Manager
+//! resources ([`resource_policies`]): `PutResourcePolicy` attaches or rewrites one,
+//! `GetResourcePolicies` reports what a resource holds and `DeleteResourcePolicy`
+//! detaches it, all three reaching the one store below, keyed by the resource the policy
+//! is attached to ([`resource_policies::PolicyResourceKey`]) rather than by the text of
+//! the ARN that named it.
 //!
 //! Last are **OpsCenter's OpsItems**, which live in [`ops_items`]: `CreateOpsItem`
 //! mints one and `GetOpsItem` reports it, keyed by `(region, ops item id)` the same way,
@@ -94,6 +102,10 @@ pub mod secure_string;
 /// A command a caller sent to the managed nodes of one Region, and the invocation each of
 /// those nodes holds of it.
 pub mod commands;
+
+/// The resource policies attached to this account's Systems Manager resources, and the
+/// hash that keeps two writers from overwriting each other's.
+pub mod resource_policies;
 
 /// The OpsItems OpsCenter holds: the record a create persists, the rules it is held to
 /// and the store the reads project.
@@ -2584,6 +2596,11 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// account does, so there is no create to date them from. Captured ONCE, so two
     /// reads of one published document report the same `CreatedDate`.
     pub created_at: SystemTime,
+
+    /// Every resource policy this account holds, keyed by the resource it is attached to
+    /// — the one store `PutResourcePolicy` writes, `GetResourcePolicies` reads and
+    /// `DeleteResourcePolicy` removes from.
+    pub resource_policies: resource_policies::ResourcePolicyStore,
 }
 
 impl Default for ComAmazonawsSsmAmazonssmState {
@@ -2599,6 +2616,7 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             ops_items: BTreeMap::new(),
             ops_item_sequence: 0,
             created_at: SystemTime::now(),
+            resource_policies: resource_policies::ResourcePolicyStore::default(),
         }
     }
 }
@@ -2646,25 +2664,16 @@ impl ComAmazonawsSsmAmazonssmState {
     /// Mint the `CommandId` of a command being sent.
     ///
     /// "A unique identifier for this command" (`Command$CommandId`), modelled exactly 36
-    /// characters long — the hyphenated UUID form. The 16 bytes behind it are the Sha256
-    /// of this store's own creation instant and its mint counter, so no two commands of
-    /// one run collide and the value is not a count a caller can read off the wire; the
-    /// UUID LAYOUT — the group boundaries and the version and variant bits — is
-    /// `service_common`'s one rendering of 16 opaque bytes, so it is not restated here.
+    /// characters long — the hyphenated UUID form, minted through [`minted_uuid`] from
+    /// this store's own creation instant and its mint counter, so no two commands of one
+    /// run collide and the value is not a count a caller can read off the wire.
     pub fn mint_command_id(&mut self) -> String {
-        use ::sha2::Digest;
-
         self.minted_command_ids += 1;
         let since_epoch = self
             .created_at
             .duration_since(::std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let mut digest = ::sha2::Sha256::new();
-        digest.update(since_epoch.as_nanos().to_be_bytes());
-        digest.update(self.minted_command_ids.to_be_bytes());
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&digest.finalize()[..16]);
-        ::service_common::uuid_from_random_bytes(bytes)
+        minted_uuid(since_epoch.as_nanos(), self.minted_command_ids)
     }
 
     /// The document `name` names in `region`, or `None` when that Region holds none.
@@ -3484,6 +3493,31 @@ impl ActivationRecord {
                 .any(|wanted| operator_matches(OPERATOR_EQUAL, held, wanted))
         })
     }
+}
+
+/// This service's ONE minter of an opaque, UUID-shaped identifier: the Sha256 of an
+/// instant and a mint counter, rendered as a UUID.
+///
+/// Every id this service mints for a resource it creates goes through here — a
+/// `CommandId` ([`ComAmazonawsSsmAmazonssmState::mint_command_id`]), a resource policy's
+/// `PolicyId` ([`resource_policies::ResourcePolicyStore`]) — so the digest and the
+/// layout are written once. The 16 bytes are the digest's first half and the UUID LAYOUT
+/// (the group boundaries and the version and variant bits) is `service_common`'s one
+/// rendering of 16 opaque bytes, so neither is restated per caller.
+///
+/// `seed_nanos` is an instant of the store's own (its creation, or now) and `counter` the
+/// number of ids that minter has handed out, so two ids of one run differ, consecutive
+/// ones are unrelated, and the value is not a count a caller can read off the wire.
+/// Nothing of the request is in it.
+pub fn minted_uuid(seed_nanos: u128, counter: u64) -> String {
+    use ::sha2::Digest;
+
+    let mut digest = ::sha2::Sha256::new();
+    digest.update(seed_nanos.to_be_bytes());
+    digest.update(counter.to_be_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.finalize()[..16]);
+    ::service_common::uuid_from_random_bytes(bytes)
 }
 
 /// The region this request was signed for, from its SigV4 credential scope; the

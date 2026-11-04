@@ -362,10 +362,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut parameters = Vec::new();
         let mut next_token = None;
         // `Shared` asks for "parameters that are shared with you", which a parameter
-        // becomes through a resource share rather than by being created here.
-        // `PutResourcePolicy` — the operation that shares one — is still a scaffold, so
-        // no parameter in this store is shared with anybody, and a shared listing walks
-        // none of the account's own parameters.
+        // becomes through a resource share rather than by being created here. A policy
+        // `PutResourcePolicy` attached shares a parameter only once that share is promoted
+        // through Resource Access Manager — "otherwise, the parameter won't be returned by
+        // the Systems Manager DescribeParameters API operation using the --shared option"
+        // (`smithy_query(query="doc",shape="PutResourcePolicy")`) — and this service holds
+        // no promoted share, so a shared listing walks none of the account's own
+        // parameters.
         if !input.shared.unwrap_or(false) {
             for (name, record) in store.parameters_of_region(&region) {
                 if resume_from.is_some_and(|from| name < from) {

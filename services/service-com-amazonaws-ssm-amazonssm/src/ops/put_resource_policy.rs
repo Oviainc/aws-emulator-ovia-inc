@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Attach a resource policy to a Systems Manager resource, or rewrite the one it already
+//! holds. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Creates or updates a Systems Manager resource policy": a call that names no policy
+//! CREATES one, under a freshly minted `PolicyId`, and a call that names a `PolicyId` and
+//! a `PolicyHash` rewrites that policy's document — "to update a policy, you must specify
+//! `PolicyId` and `PolicyHash`" (`PutResourcePolicyResponse$PolicyId`), so a call naming
+//! one of the two names an update it cannot make.
+//!
+//! The hash is the document's own digest ([`crate::state::resource_policies::policy_hash`])
+//! and "helps to prevent a situation where multiple users attempt to overwrite a policy":
+//! an update proceeds only against the policy version the caller last read, so a hash that
+//! is not the stored one is refused `ResourcePolicyConflictException` and a `PolicyId` the
+//! resource holds no policy under is refused `ResourcePolicyNotFoundException`. What this
+//! writes lands in the one store `GetResourcePolicies` reports and `DeleteResourcePolicy`
+//! removes from ([`crate::state::resource_policies::ResourcePolicyStore`]).
+//!
+//! The two documented limits are the ones `ResourcePolicyLimitExceededException` reports:
+//! a policy document is at most [`crate::state::resource_policies::MAX_POLICY_SIZE`] bytes,
+//! and an OpsItemGroup holds at most
+//! [`crate::state::resource_policies::MAX_OPS_ITEM_GROUP_POLICIES`] policy.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +132,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::resource_policies as policies;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,6 +172,67 @@ impl From<PutResourcePolicyErrorModeled> for PutResourcePolicyError {
     }
 }
 
+/// The modelled refusal for a request whose parameters are not valid, naming the members
+/// that are not: "one or more parameters specified for the call aren't valid".
+fn invalid_parameter(members: &[&str]) -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::ResourcePolicyInvalidParameterException(
+        ResourcePolicyInvalidParameterException {
+            parameter_names: Some(members.iter().map(|member| (*member).to_string()).collect()),
+            message: Some(policies::INVALID_PARAMETER.to_string()),
+        },
+    )
+    .into()
+}
+
+/// The modelled refusal for an ARN naming a resource this endpoint holds none of — one of
+/// another account or Region, or one whose parameter or document this account never
+/// created.
+fn not_found() -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(policies::RESOURCE_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
+/// The modelled refusal for a `Policy` that is not a resource-policy document.
+fn malformed_document() -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::MalformedResourcePolicyDocumentException(
+        MalformedResourcePolicyDocumentException {
+            message: Some(policies::MALFORMED_POLICY_DOCUMENT.to_string()),
+        },
+    )
+    .into()
+}
+
+/// The modelled refusal for a `PolicyHash` that is not the stored policy's.
+fn hash_mismatch() -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::ResourcePolicyConflictException(ResourcePolicyConflictException {
+        message: Some(policies::POLICY_HASH_MISMATCH.to_string()),
+    })
+    .into()
+}
+
+/// The modelled refusal for a `PolicyId` the resource holds no policy under.
+fn policy_not_found() -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::ResourcePolicyNotFoundException(ResourcePolicyNotFoundException {
+        message: Some(policies::POLICY_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
+/// The modelled refusal for a request that would exceed one of the two documented
+/// `PutResourcePolicy` limits, reporting the limit it ran into.
+fn limit_exceeded(limit: usize, message: String) -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::ResourcePolicyLimitExceededException(
+        ResourcePolicyLimitExceededException {
+            limit: i32::try_from(limit).unwrap_or(i32::MAX),
+            limit_type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
 /// The `PutResourcePolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -194,18 +269,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutResourcePolicyErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the resource policy store is unavailable".to_string()),
+            })
+        })?;
+
+        // A policy is attached to the resource its ARN names, and only the resources this
+        // service documents as supporting a resource policy can hold one: a value naming
+        // anything else names no resource a policy could be attached to, which is a bad
+        // parameter rather than a resource that is missing.
+        let Some(resource) = policies::parse_policy_resource(&input.resource_arn) else {
+            return Err(invalid_parameter(&[policies::RESOURCE_ARN_MEMBER]));
+        };
+
+        // The resource is reached through the endpoint this request was signed for, which
+        // is the Region its parameters and documents live in, and the Region its policies
+        // are held under. An ARN naming another account or another Region names nothing
+        // reachable here, as every other name-taking operation of this service reads one.
+        let region = crate::state::request_region(ctx.parts());
+        if !resource.is_local(&region) {
+            return Err(not_found());
+        }
+
+        // The size limit is measured over the document as it was submitted, and applied
+        // BEFORE the document is read: it is what bounds the work a caller's text can ask
+        // the policy grammar and the renderer below to do.
+        if input.policy.len() > policies::MAX_POLICY_SIZE {
+            return Err(limit_exceeded(
+                policies::MAX_POLICY_SIZE,
+                policies::policy_too_large(),
+            ));
+        }
+
+        // "A policy you want to associate with a resource" is a document in the IAM JSON
+        // policy language, read through the one grammar every service that takes one reads
+        // it with. Only the document's FORM is judged here — what a statement grants is
+        // the caller's to decide.
+        if ::service_common::iam_policy::resource_policy_defect(&input.policy).is_some() {
+            return Err(malformed_document());
+        }
+
+        // Stored in the one layout an attached policy is reported in, so two callers who
+        // submit the same policy written differently read the same text — and the same
+        // hash — back.
+        let stored = ::service_common::iam_policy::canonical_document(&input.policy);
+
+        let held_under = resource.key(&region);
+        let mut store = state.lock();
+        store.materialize_due(::std::time::SystemTime::now());
+
+        // A policy is attached to a resource that EXISTS: an ARN naming a parameter or a
+        // document this account does not hold names nothing to share. An OpsItemGroup is
+        // the account's own OpsCenter grouping rather than a resource anything creates, so
+        // there is nothing to look up for one — and nothing to hold its id to either: the
+        // model publishes no grammar for it and no operation of this service creates one,
+        // so an id is taken as naming the group it spells rather than refused, and the one
+        // policy a group may hold is enforced per group below.
+        let resource_exists = match resource.kind {
+            policies::PolicyResourceKind::Parameter => {
+                store.parameter(&region, resource.name).is_some()
+            }
+            policies::PolicyResourceKind::Document => {
+                store.resolve_document(&region, resource.name).is_some()
+            }
+            policies::PolicyResourceKind::OpsItemGroup => true,
+        };
+        if !resource_exists {
+            return Err(not_found());
+        }
+
+        // An absent member and an empty one name the same thing here: neither names a
+        // policy to update.
+        let named_id = input.policy_id.as_deref().filter(|id| !id.is_empty());
+        let named_hash = input.policy_hash.as_deref().filter(|hash| !hash.is_empty());
+
+        let written = match (named_id, named_hash) {
+            // "To update a policy, you must specify PolicyId and PolicyHash": the update
+            // proceeds only against the policy version the caller last read.
+            (Some(policy_id), Some(policy_hash)) => {
+                let attached = store
+                    .resource_policies
+                    .policy(&held_under, policy_id)
+                    .map(|held| held.policy_hash.clone());
+                let Some(attached) = attached else {
+                    return Err(policy_not_found());
+                };
+                if attached != policy_hash {
+                    return Err(hash_mismatch());
+                }
+                match store
+                    .resource_policies
+                    .replace(&held_under, policy_id, stored)
+                {
+                    Some(written) => written,
+                    None => return Err(policy_not_found()),
+                }
+            }
+            // Neither named: a new policy, under an id this call mints.
+            (None, None) => {
+                let held = store.resource_policies.policies(&held_under).len();
+                if resource.kind == policies::PolicyResourceKind::OpsItemGroup
+                    && held >= policies::MAX_OPS_ITEM_GROUP_POLICIES
+                {
+                    return Err(limit_exceeded(
+                        policies::MAX_OPS_ITEM_GROUP_POLICIES,
+                        policies::ONE_POLICY_PER_OPS_ITEM_GROUP.to_string(),
+                    ));
+                }
+                // Every create adds a record for a resource the caller named, so what one
+                // process will hold is bounded here rather than by the caller.
+                if store.resource_policies.policy_count() >= policies::MAX_RESOURCE_POLICIES {
+                    return Err(limit_exceeded(
+                        policies::MAX_RESOURCE_POLICIES,
+                        policies::too_many_policies(),
+                    ));
+                }
+                store.resource_policies.attach(&held_under, stored)
+            }
+            // One of the pair named: the call names an update it cannot make, and the
+            // member it left out is the one that isn't valid.
+            (Some(_), None) => return Err(invalid_parameter(&[policies::POLICY_HASH_MEMBER])),
+            (None, Some(_)) => return Err(invalid_parameter(&[policies::POLICY_ID_MEMBER])),
+        };
+
+        Ok(PutResourcePolicyOutput {
+            policy_id: Some(written.policy_id),
+            policy_hash: Some(written.policy_hash),
+        })
     }
 }

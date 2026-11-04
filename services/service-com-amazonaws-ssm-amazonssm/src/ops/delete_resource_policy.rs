@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Detach a resource policy from a Systems Manager resource. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Deletes a Systems Manager resource policy": the policy removed is the one the request
+//! names by `PolicyId` on the resource its `ResourceArn` names, and it is removed from the
+//! one store `PutResourcePolicy` wrote it into
+//! ([`crate::state::resource_policies::ResourcePolicyStore`]), so a later
+//! `GetResourcePolicies` of that resource no longer reports it.
+//!
+//! Both the id and the hash are required, and the two are ONE address: the policy deleted
+//! is the one whose `PolicyId` and whose `PolicyHash` the request both name, so a pair
+//! naming no stored policy — an unknown id, or an obsolete hash of a policy that has since
+//! been rewritten — is refused `ResourcePolicyNotFoundException` and nothing is removed.
+//! "The hash helps to prevent multiple calls from attempting to overwrite a policy"
+//! (`DeleteResourcePolicyRequest$PolicyHash`), which is what makes a stale caller's delete
+//! a no-op.
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +101,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::resource_policies as policies;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -129,6 +138,17 @@ impl From<DeleteResourcePolicyErrorModeled> for DeleteResourcePolicyError {
     fn from(modeled: DeleteResourcePolicyErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The modelled refusal for a `ResourceArn` naming no resource that can hold a policy.
+fn invalid_parameter(members: &[&str]) -> DeleteResourcePolicyError {
+    DeleteResourcePolicyErrorModeled::ResourcePolicyInvalidParameterException(
+        ResourcePolicyInvalidParameterException {
+            parameter_names: Some(members.iter().map(|member| (*member).to_string()).collect()),
+            message: Some(policies::INVALID_PARAMETER.to_string()),
+        },
+    )
+    .into()
 }
 
 /// The `DeleteResourcePolicy` operation.
@@ -167,18 +187,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteResourcePolicyErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the resource policy store is unavailable".to_string()),
+            })
+        })?;
+
+        // The same reading of a `ResourceArn` the write goes through: a value naming no
+        // resource that can hold a policy is a bad parameter, and an ARN naming another
+        // account or another Region names nothing reachable here.
+        let Some(resource) = policies::parse_policy_resource(&input.resource_arn) else {
+            return Err(invalid_parameter(&[policies::RESOURCE_ARN_MEMBER]));
+        };
+        let region = crate::state::request_region(ctx.parts());
+        if !resource.is_local(&region) {
+            return Err(
+                DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(policies::RESOURCE_NOT_FOUND.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A resource's policies are held under the Region whose endpoint the request
+        // reached, which is the same key the write stored them under. No parameter or
+        // document is read here, so there is no clock-owed change to materialise first:
+        // what this call removes is a policy record, and no clock moves one.
+        let held_under = resource.key(&region);
+        let mut store = state.lock();
+
+        // The policy this call removes is the one BOTH its id and its hash name on that
+        // resource — looked up and removed in one step, so an unknown id and an obsolete
+        // hash are the same answer: "no policies with the specified policy ID and hash
+        // could be found" is one refusal over the pair, and neither names a policy nor
+        // removes one.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        // `DeletionMode` "applies only to the Document resource type" and chooses what
+        // becomes of that document's SHARING, which this service holds nothing of yet
+        // (`ModifyDocumentPermission` and `DescribeDocumentPermission` are still
+        // scaffolds). The policy itself is what this operation deletes, so it is detached
+        // under either mode.
+        let removed = store.resource_policies.detach_addressed(
+            &held_under,
+            &input.policy_id,
+            &input.policy_hash,
+        );
+        if !removed {
+            return Err(
+                DeleteResourcePolicyErrorModeled::ResourcePolicyNotFoundException(
+                    ResourcePolicyNotFoundException {
+                        message: Some(policies::POLICY_NOT_FOUND.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(DeleteResourcePolicyOutput {})
     }
 }
